@@ -4772,6 +4772,28 @@ impl GpuQwen35 {
     /// ADOPTS the cached KV pages + restores the DeltaNet state into the slot, and
     /// `done` starts at the resume position so only the divergent tail re-prefills.
     pub fn prefill_begin(&mut self, slot: usize, tokens: Vec<u32>) -> Result<(), GpuModelError> {
+        self.prefill_begin_hinted(slot, tokens, &[]).map(|_| ())
+    }
+
+    /// `prefill_begin` with the scheduler's checkpoint hints (see
+    /// `ChunkedPrefill::hints`): page-aligned here, kept strictly inside the
+    /// prompt, deduped - the scheduler passes raw divergence points. Returns
+    /// the resume point: how many leading tokens came out of the prefix
+    /// cache, which is what tells the scheduler whether this prompt still
+    /// has uncached work inside a span it shares with others.
+    pub fn prefill_begin_hinted(
+        &mut self,
+        slot: usize,
+        tokens: Vec<u32>,
+        hints: &[usize],
+    ) -> Result<usize, GpuModelError> {
+        let mut hints: Vec<usize> = hints
+            .iter()
+            .map(|&c| c / BLOCK_TOKENS * BLOCK_TOKENS)
+            .filter(|&c| c > 0 && c < tokens.len())
+            .collect();
+        hints.sort_unstable();
+        hints.dedup();
         let max_batch = self
             .batch
             .as_ref()
@@ -4803,8 +4825,13 @@ impl GpuQwen35 {
         // slot's KV table + DeltaNet state). `done` = resume position: the fused
         // tick covers only tokens[done..], attending the adopted prefix in KV.
         let done = self.prefix_resume_begin(slot, &tokens)?;
-        self.chunked.push(ChunkedPrefill { slot, tokens, done });
-        Ok(())
+        self.chunked.push(ChunkedPrefill {
+            slot,
+            tokens,
+            done,
+            hints,
+        });
+        Ok(done)
     }
 
     /// Drop slot `slot`'s queued chunked prefill (the client hung up). Refused
@@ -5364,10 +5391,10 @@ impl GpuQwen35 {
             // the second-to-last one whenever the trailing partial page is
             // shorter than the re-render's divergent generation header.
             let step = self.tier_ckpt_step();
-            let cuts = if absorb {
-                [0, 0]
+            let cuts: Vec<usize> = if absorb {
+                Vec::new()
             } else {
-                ckpt_cuts(ch.tokens.len(), step)
+                super::chunk_cuts(ch, step)
             };
             if let Some(&b) = cuts
                 .iter()
@@ -8182,7 +8209,8 @@ impl GpuQwen35 {
             let stage_of = Self::fused_stage_map(&shares);
             for (sidx, &(idx, slot, done, take, finishing, _)) in shares.iter().enumerate() {
                 let t_len = self.chunked[idx].tokens.len();
-                let cuts = ckpt_cuts(t_len, self.tier_ckpt_step());
+                let step = self.tier_ckpt_step();
+                let cuts = super::chunk_cuts(&self.chunked[idx], step);
                 let landed = done + take;
                 if !finishing && landed > 0 && cuts.contains(&landed) {
                     let toks: Vec<u32> = self.chunked[idx].tokens[..landed].to_vec();
@@ -9089,7 +9117,10 @@ impl GpuQwen35 {
                                     $y,
                                     b,
                                 )?;
-                            } else if b > kq_ks_min_batch() && b <= 64 && exec.has_kquant_mma_ks() {
+                            } else if b > kq_ks_min_batch(exec.sm_count())
+                                && b <= 64
+                                && exec.has_kquant_mma_ks()
+                            {
                                 exec.kquant_gemm_mma_ks(
                                     k,
                                     &bs.d_xq,

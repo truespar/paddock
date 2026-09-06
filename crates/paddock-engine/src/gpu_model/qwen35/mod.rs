@@ -96,6 +96,25 @@ const MIN_SNAPSHOT_LEN: usize = 3 * BLOCK_TOKENS;
 /// too short to be worth checkpointing. A hybrid model can only resume where
 /// state was snapshotted, so this is the single point where the fused prefill
 /// and the classic prefill both checkpoint.
+impl GpuQwen35 {
+    /// The shared-prefix length from which a prompt admitted BEHIND an
+    /// in-flight prompt would actually resume off the leader's published
+    /// pages + checkpoint. Mirrors the gate `prefix_resume_begin` applies:
+    /// `pos >= 32`, and `pos >= min_cache_prefix()` unless the serve is narrow
+    /// enough (`resume_live_max`) that every slot may resume. None = no prefix
+    /// cache, so the scheduler must hold nothing back.
+    pub(crate) fn prefix_share_floor(&self) -> Option<usize> {
+        let bs = self.batch.as_ref()?;
+        bs.paged_prefix.as_ref()?;
+        let narrow = bs.tables.len() <= resume_live_max();
+        Some(if narrow {
+            2 * BLOCK_TOKENS
+        } else {
+            min_cache_prefix().max(2 * BLOCK_TOKENS)
+        })
+    }
+}
+
 fn ckpt_pos(t_len: usize) -> usize {
     if t_len >= MIN_SNAPSHOT_LEN {
         (t_len - 1) / BLOCK_TOKENS * BLOCK_TOKENS
@@ -156,6 +175,29 @@ struct ChunkedPrefill {
     /// unified span covers `tokens[done..done+take]` and resumes the slot's
     /// DeltaNet state / conv window in place.
     done: usize,
+    /// Extra checkpoint cuts the scheduler asked for: page-aligned positions
+    /// strictly inside the prompt where prompts it is holding back diverge
+    /// from this one. The prefill lands a span on each so the state can be
+    /// snapshotted there, and the held-back prompts resume off it instead of
+    /// re-prefilling the shared prefix beside this one. See `chunk_cuts` and
+    /// `Generator::prefill_begin_hinted`.
+    hints: Vec<usize>,
+}
+
+/// The checkpoint boundaries a chunked prefill lands spans on: `ckpt_cuts`'s
+/// two trailing page boundaries plus every scheduler hint. Ascending, deduped,
+/// each strictly inside the prompt (a cut AT the prompt length is just the
+/// finishing span).
+fn chunk_cuts(ch: &ChunkedPrefill, step: usize) -> Vec<usize> {
+    let len = ch.tokens.len();
+    let mut v: Vec<usize> = ckpt_cuts(len, step)
+        .into_iter()
+        .chain(ch.hints.iter().copied())
+        .filter(|&c| c > 0 && c < len)
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
 }
 
 /// The prefill chunk the operator ASKED for. The one served is
@@ -2165,14 +2207,38 @@ fn ks_min_batch() -> usize {
 /// (one weight pass), at or below stay on the dp4a MT tile (one z-pass up to
 /// 16 rows, bandwidth-optimal). 16 = where dp4a starts re-reading weights;
 /// A6000-measured, retune via PADDOCK_KQ_KS_MIN when the shape set changes.
-fn kq_ks_min_batch() -> usize {
+/// The batch above which k-quant decode planes ride the pipelined K-split
+/// MMA (`kquant_gemm_mma_ks`) instead of the dp4a MT tile. Die-aware, and
+/// the number is a measurement, not a preference:
+///
+/// - Big dies (>= 128 SMs): 16, from the rung the doctrine records - the
+///   K-split took every qwen shape from B=24 on the 188-SM die, and B <= 16
+///   was left on the dp4a tile. B <= 16 was never A/B'd there; the small-die
+///   result below says it should be.
+/// - Small dies (< 128 SMs): 1. On the 36-SM RTX 5060 Ti (Qwen3.5-9B
+///   UD-Q4_K_XL, 2026-09-06) the dp4a tile held 84% of the width-8 tick at
+///   ~207 GB/s of a 448 GB/s card - it stages activations synchronously per
+///   512-element chunk and issues the weight loads from the compute loop
+///   with no ring, so every chunk exposes a full DRAM latency, and a 2048-deep
+///   plane has only four chunks to hide it in. The K-split's cp.async ring
+///   does not: c8 30.0 -> 17.9 ms per step (259 -> 425 tok/s aggregate,
+///   llama.cpp b10820 at 24.9 ms / 215), c4 26.7 -> 16.8 ms. That makes the
+///   decode ladder monotone on this die - b=1 14.6 ms (GEMV), b=2 16.4
+///   (nc), b=4 16.8, b=8 17.9 - where dp4a was the one outlier. Widths 2..3
+///   (and 4..5 on Q6K) still take the nc lane first, as before.
+///
+/// Passed the SM count rather than reading it here so the election is in
+/// code, not in an env default: `dev_var!` is a development instrument and a
+/// hardened build must land on the same arm. `PADDOCK_KQ_KS_MIN` overrides
+/// in dev builds (the A/B surface).
+fn kq_ks_min_batch(sm_count: usize) -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         paddock_models::dev_var!("PADDOCK_KQ_KS_MIN")
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|&n| n >= 1)
-            .unwrap_or(16)
+            .unwrap_or(if sm_count < 128 { 1 } else { 16 })
     })
 }
 

@@ -356,6 +356,8 @@ struct Scratch {
     d_bi: CudaSlice<f32>,
     d_inj: CudaSlice<f32>,
     d_mix: CudaSlice<f32>,
+    /// a wave's partial routed output on the expert-major prefill path
+    d_mix_wave: CudaSlice<f32>,
     // GDN
     d_qkv: CudaSlice<f32>,
     d_zg: CudaSlice<f32>,
@@ -3438,6 +3440,18 @@ fn kq_moe_routed(
 ) -> Result<(), GpuModelError> {
     let (h, k, ff) = (c.hidden, c.n_active, c.moe_ff);
     let rows = n * k;
+    // Expert-major prefill: more routed rows than slots, and the pack has
+    // the wave kernels. Bytes moved are bounded by one pass over the experts
+    // this launch touches (<= n_expert x slot bytes per layer), never by the
+    // rows - a 256-token prompt on the 5060 Ti went from 46 s of zero-copy
+    // reads to bulk fills once per expert. See `ExpertCache::n_waves`.
+    if let Some(cc) = cache
+        && rows > cc.slots
+        && rows <= cc.max_rows
+        && e.has_moe_wave()
+    {
+        return kq_moe_routed_waves(e, c, cc, sc, n);
+    }
     let cache = cache.filter(|cc| rows <= cc.slots && rows <= cc.max_rows);
     if let Some(cc) = cache {
         e.moe_cache_resolve(cc, &sc.d_idx, rows)?;
@@ -3487,6 +3501,76 @@ fn kq_moe_routed(
         k,
         n,
     )?;
+    Ok(())
+}
+
+/// The routed pair served expert-major through the slot cache (the prefill
+/// class of `kq_moe_routed`): plan the waves once, then per wave resolve +
+/// fill its experts and run the token-batched pair over all rows with every
+/// out-of-wave pair marked absent (its blocks exit at once). Wave 0's down writes
+/// `d_mix`; later waves write `d_mix_wave` and add - the row's k pairs are
+/// summed in wave order instead of pair order, the same f32 reassociation
+/// class the sorted MoE path carries. Waves are a fixed count so the launch
+/// sequence is capture-stable; an empty wave's pair kernels exit block by block.
+fn kq_moe_routed_waves(
+    e: &GpuExecutor,
+    c: &Qwen4ExpConfig,
+    cc: &ExpertCache,
+    sc: &mut Scratch,
+    n: usize,
+) -> Result<(), GpuModelError> {
+    let (h, k, ff) = (c.hidden, c.n_active, c.moe_ff);
+    let rows = n * k;
+    let needs = crate::gpu::kq_needs_sums;
+    let (g, u, d) = (&cc.gate, &cc.up, &cc.down);
+    e.moe_wave_plan(cc, &sc.d_idx, rows)?;
+    // block input -> int8 per 32, once for every wave
+    e.quantize_q8(&sc.d_bi, &mut sc.d_xq, &mut sc.d_xs, n * h)?;
+    let ng = needs(g.ty) || needs(u.ty);
+    if ng {
+        e.q8_sums_strided(&sc.d_xq, &mut sc.d_ssums, h, n)?;
+    }
+    let nd = needs(d.ty);
+    for w in 0..cc.n_waves {
+        e.moe_wave_resolve(cc, w)?;
+        e.moe_cache_fill(cc, cc.slots)?;
+        e.moe_wave_mask(cc, &sc.d_idx, rows, w)?;
+        let idx = cc.idx_wave();
+        e.kquant_moe_gate_up(
+            g,
+            u,
+            idx,
+            &sc.d_xq,
+            &sc.d_xs,
+            ng.then_some(&sc.d_ssums),
+            &mut sc.d_act,
+            k,
+            n,
+        )?;
+        e.quantize_q8(&sc.d_act, &mut sc.d_fq, &mut sc.d_fs, rows * ff)?;
+        if nd {
+            e.q8_sums_strided(&sc.d_fq, &mut sc.d_ssums, ff, rows)?;
+        }
+        let out = if w == 0 {
+            &mut sc.d_mix
+        } else {
+            &mut sc.d_mix_wave
+        };
+        e.kquant_moe_down(
+            d,
+            idx,
+            &sc.d_topw,
+            &sc.d_fq,
+            &sc.d_fs,
+            nd.then_some(&sc.d_ssums),
+            out,
+            k,
+            n,
+        )?;
+        if w > 0 {
+            e.add(&mut sc.d_mix, &sc.d_mix_wave, n * h)?;
+        }
+    }
     Ok(())
 }
 
@@ -3889,6 +3973,7 @@ impl Scratch {
             d_bi: e.alloc(t * h)?,
             d_inj: e.alloc(t * hc)?,
             d_mix: e.alloc(t * h)?,
+            d_mix_wave: e.alloc(t * h)?,
             d_qkv: e.alloc(t * c.gdn_qkv_rows())?,
             d_zg: e.alloc(t * c.gdn_z_rows())?,
             d_ab: e.alloc(t * 2 * c.gdn_v_heads)?,

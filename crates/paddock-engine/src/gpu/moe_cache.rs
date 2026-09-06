@@ -76,6 +76,20 @@ pub struct ExpertCache {
     n_jobs: CudaSlice<u32>,
     /// `[rows resolved, misses]`, accumulated by every resolve.
     stats: CudaSlice<u32>,
+    /// Expert-major prefill (waves): a prefill launch whose routed rows
+    /// exceed `slots` is served in `n_waves` (= ceil(n_expert / slots))
+    /// passes over the token-batched pair, each pass marking every
+    /// out-of-wave pair ABSENT (`MOE_CACHE_NONE` in the routing, which the
+    /// pair kernels skip). See `pd_moe_wave_plan` in the pack.
+    pub n_waves: usize,
+    /// `wave_of[n_expert]`: the wave each present expert landed in (NONE
+    /// when absent from the launch), written by the plan.
+    wave_of: CudaSlice<u32>,
+    /// `wave_ids[n_waves * slots]`, `wave_cnt[n_waves]`: the plan's lists.
+    wave_ids: CudaSlice<u32>,
+    wave_cnt: CudaSlice<u32>,
+    /// The wave's remapped routing (`max_rows`), written by the mask.
+    idx_wave: CudaSlice<u32>,
     /// Fill descriptors: mirror sources, slot destinations, bytes per expert -
     /// gate data, gate scales, up data, up scales, down data, down scales.
     src: [u64; 6],
@@ -88,6 +102,12 @@ impl ExpertCache {
     /// kernels take it in place of the expert ids.
     pub fn idx_slot(&self) -> &CudaSlice<u32> {
         &self.idx_slot
+    }
+
+    /// The routing the wave mask wrote (the MoE pair takes it like
+    /// `idx_slot` on the wave path).
+    pub fn idx_wave(&self) -> &CudaSlice<u32> {
+        &self.idx_wave
     }
 
     /// `(rows resolved, misses)` since load - a sync + tiny readback, for
@@ -118,6 +138,13 @@ impl ExpertCache {
 impl GpuExecutor {
     pub fn has_moe_cache(&self) -> bool {
         self.kernels.moe_cache_resolve.is_some() && self.kernels.moe_cache_fill.is_some()
+    }
+
+    /// The expert-major prefill path (slots 580-582) is in the pack.
+    pub fn has_moe_wave(&self) -> bool {
+        self.kernels.moe_wave_plan.is_some()
+            && self.kernels.moe_cache_resolve_dev.is_some()
+            && self.kernels.moe_wave_mask.is_some()
     }
 
     /// Build a `slots`-expert cache over three host-mapped planes of one
@@ -172,6 +199,7 @@ impl GpuExecutor {
                 ty: p.ty,
             });
         }
+        let n_waves = n_expert.div_ceil(slots);
         let down_p = planes.pop().expect("three planes pushed");
         let up_p = planes.pop().expect("three planes pushed");
         let gate_p = planes.pop().expect("three planes pushed");
@@ -190,6 +218,11 @@ impl GpuExecutor {
             jobs: self.to_device_u32(&vec![0u32; 2 * max_rows])?,
             n_jobs: self.to_device_u32(&[0u32])?,
             stats: self.to_device_u32(&[0u32, 0u32])?,
+            n_waves,
+            wave_of: self.to_device_u32(&vec![MOE_CACHE_NONE; n_expert])?,
+            wave_ids: self.to_device_u32(&vec![0u32; n_waves * slots])?,
+            wave_cnt: self.to_device_u32(&vec![0u32; n_waves])?,
+            idx_wave: self.to_device_u32(&vec![0u32; max_rows])?,
             src,
             dst,
             bytes,
@@ -239,6 +272,111 @@ impl GpuExecutor {
                 jb as *mut _,
                 nj as *mut _,
                 st as *mut _,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// Expert-major prefill, step 1: plan the waves for `rows` routed ids.
+    pub fn moe_wave_plan(
+        &self,
+        c: &ExpertCache,
+        idx: &CudaSlice<u32>,
+        rows: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .moe_wave_plan
+            .ok_or(GpuError::MissingOp("moe_wave_plan"))?;
+        if rows > c.max_rows {
+            return Err(GpuError::Driver(format!(
+                "expert wave plan: {rows} rows over {} scratch rows",
+                c.max_rows
+            )));
+        }
+        let (ip, _g0) = idx.device_ptr(&self.stream);
+        let (wo, _g1) = c.wave_of.device_ptr(&self.stream);
+        let (wi, _g2) = c.wave_ids.device_ptr(&self.stream);
+        let (wc, _g3) = c.wave_cnt.device_ptr(&self.stream);
+        // SAFETY: pack ABI v1 contract (slot 580); buffers sized at creation
+        check(unsafe {
+            f(
+                ip as *const _,
+                rows as u32,
+                c.n_expert as u32,
+                c.slots as u32,
+                c.n_waves as u32,
+                wo as *mut _,
+                wi as *mut _,
+                wc as *mut _,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// Expert-major prefill, step 2 (per wave): resolve the wave's ids
+    /// through the LRU and record the miss jobs - `moe_cache_fill(c,
+    /// c.slots)` copies them.
+    pub fn moe_wave_resolve(&self, c: &ExpertCache, wave: usize) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .moe_cache_resolve_dev
+            .ok_or(GpuError::MissingOp("moe_cache_resolve_dev"))?;
+        let (wi, _g0) = c.wave_ids.device_ptr(&self.stream);
+        let (wc, _g1) = c.wave_cnt.device_ptr(&self.stream);
+        let (so, _g2) = c.slot_of.device_ptr(&self.stream);
+        let (ei, _g3) = c.expert_in.device_ptr(&self.stream);
+        let (lu, _g4) = c.last_use.device_ptr(&self.stream);
+        let (tk, _g5) = c.tick.device_ptr(&self.stream);
+        let (jb, _g6) = c.jobs.device_ptr(&self.stream);
+        let (nj, _g7) = c.n_jobs.device_ptr(&self.stream);
+        let (st, _g8) = c.stats.device_ptr(&self.stream);
+        // SAFETY: pack ABI v1 contract (slot 581); the id list and its count
+        // are the plan's device outputs, offset to this wave
+        check(unsafe {
+            f(
+                (wi as usize + wave * c.slots * 4) as *const _,
+                (wc as usize + wave * 4) as *const _,
+                c.slots as u32,
+                so as *mut _,
+                ei as *mut _,
+                lu as *mut _,
+                tk as *mut _,
+                jb as *mut _,
+                nj as *mut _,
+                st as *mut _,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// Expert-major prefill, step 3 (per wave): the wave's routing into
+    /// `idx_wave` - in-wave pairs to their slots, the rest marked absent.
+    pub fn moe_wave_mask(
+        &self,
+        c: &ExpertCache,
+        idx: &CudaSlice<u32>,
+        rows: usize,
+        wave: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .moe_wave_mask
+            .ok_or(GpuError::MissingOp("moe_wave_mask"))?;
+        let (ip, _g0) = idx.device_ptr(&self.stream);
+        let (wo, _g1) = c.wave_of.device_ptr(&self.stream);
+        let (so, _g2) = c.slot_of.device_ptr(&self.stream);
+        let (iw, _g3) = c.idx_wave.device_ptr(&self.stream);
+        // SAFETY: pack ABI v1 contract (slot 582); rows <= max_rows checked by the plan
+        check(unsafe {
+            f(
+                ip as *const _,
+                rows as u32,
+                wo as *const _,
+                so as *const _,
+                wave as u32,
+                MOE_CACHE_NONE,
+                iw as *mut _,
                 self.stream_ptr(),
             )
         })

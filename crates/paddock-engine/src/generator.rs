@@ -621,6 +621,28 @@ pub trait Generator: Send {
         Err(GenError::Backend("chunked prefill not supported".into()))
     }
 
+    /// `prefill_begin` with checkpoint hints: positions inside `tokens` where
+    /// the scheduler knows OTHER queued prompts diverge from this one. The
+    /// backend snapshots resumable state as the prefill crosses each, so those
+    /// prompts adopt the shared prefix instead of re-prefilling it beside this
+    /// one. Backends without hint support ignore them. Returns the resume
+    /// point (leading tokens served from the prefix cache; 0 = cold).
+    fn prefill_begin_hinted(
+        &mut self,
+        slot: usize,
+        tokens: Vec<u32>,
+        _hints: &[usize],
+    ) -> Result<usize, GenError> {
+        self.prefill_begin(slot, tokens).map(|_| 0)
+    }
+
+    /// The shared-prefix length (tokens) from which a prompt queued behind an
+    /// in-flight prompt would resume off that prompt's published prefix once
+    /// it lands. None = no prefix cache: the scheduler holds nothing back.
+    fn prefix_share_floor(&self) -> Option<usize> {
+        None
+    }
+
     /// Abandon slot `slot`'s in-flight chunked prefill (client hung up).
     /// Returns true when the backend actually dropped it - false means "not
     /// now" (e.g. a fused span referencing the chunk is still in flight) and
@@ -1224,6 +1246,18 @@ impl Generator for crate::gpu_model::qwen35::GpuQwen35 {
     fn prefill_begin(&mut self, slot: usize, tokens: Vec<u32>) -> Result<(), GenError> {
         crate::gpu_model::qwen35::GpuQwen35::prefill_begin(self, slot, tokens)
             .map_err(|e| GenError::Backend(e.to_string()))
+    }
+    fn prefill_begin_hinted(
+        &mut self,
+        slot: usize,
+        tokens: Vec<u32>,
+        hints: &[usize],
+    ) -> Result<usize, GenError> {
+        crate::gpu_model::qwen35::GpuQwen35::prefill_begin_hinted(self, slot, tokens, hints)
+            .map_err(|e| GenError::Backend(e.to_string()))
+    }
+    fn prefix_share_floor(&self) -> Option<usize> {
+        crate::gpu_model::qwen35::GpuQwen35::prefix_share_floor(self)
     }
     fn prefill_abort(&mut self, slot: usize) -> bool {
         crate::gpu_model::qwen35::GpuQwen35::prefill_abort(self, slot)

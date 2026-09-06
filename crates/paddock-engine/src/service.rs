@@ -1043,6 +1043,55 @@ impl Engine {
                         &metrics,
                     );
                 }
+                // Batched warm wave. The serial run above touches the serial
+                // path only; the first real cohort then paid the batch path's
+                // cold start inside its own latency - measured on a 5060 Ti at
+                // c8: a 303 ms first prefill span against 155 ms warm, and the
+                // first width-8 decode graph captured under the clients. This
+                // is what vLLM's and SGLang's startup graph capture buys them:
+                // one synthetic cohort of `cap` prompts through the REAL
+                // scheduler (admission, chunked prefill, mixed ticks, the
+                // decode graph at every width the cohort passes through on its
+                // way out), on a private channel whose sender is dropped so
+                // the loop returns the moment the cohort has drained. One
+                // prompt is long enough to run the prefill span arms; the rest
+                // stay under the checkpoint-snapshot floor so the warm-up
+                // leaves at most two entries in the state pool.
+                if batched && paddock_models::dev_var_os!("PADDOCK_NO_WARMUP").is_none() {
+                    let n = cap.max(1);
+                    let vocab_n = generator.vocab().max(128);
+                    let max_ctx = generator.max_context().max(8);
+                    let (wtx, wrx) = std::sync::mpsc::channel::<GenRequest>();
+                    let mut keep_rx = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let len = if i == 0 { 256 } else { 40 }.min(max_ctx / 2).max(4);
+                        let prompt: Vec<u32> = (0..len)
+                            .map(|j| ((i * 7919 + j * 104_729 + 17) % (vocab_n - 64) + 32) as u32)
+                            .collect();
+                        let (etx, erx) = tokio::sync::mpsc::unbounded_channel();
+                        keep_rx.push(erx);
+                        let _ = wtx.send(GenRequest {
+                            prompt,
+                            max_tokens: 8,
+                            sampler: SamplingParams::default(),
+                            stop_tokens: Vec::new(),
+                            events: etx,
+                            mm_chunks: None,
+                            constraint: None,
+                            logprobs: None,
+                            submitted: None,
+                        });
+                    }
+                    drop(wtx);
+                    let t0 = std::time::Instant::now();
+                    let vocab = generator.vocab();
+                    run_batched(generator.as_mut(), &wrx, n, vocab, &metrics, &ctl);
+                    drop(keep_rx);
+                    tracing::info!(
+                        "engine: batched warm wave done ({n} prompts, {:.0} ms)",
+                        t0.elapsed().as_secs_f64() * 1e3
+                    );
+                }
                 // Build + enable_batch + warmup are all done - signal ready here, not
                 // right after build(), so the server starts listening only once warm.
                 // That moves the one-time cold-start cost into load time (a slightly
@@ -1726,6 +1775,39 @@ impl Slot {
 /// first token, seed the drafter. `rows` = the slot's KV position (the prompt
 /// token count for text; text + image rows for multimodal). Frees the slot on
 /// error or immediate completion.
+/// Longest common prefix of two token streams, in tokens.
+fn lcp_len(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// The in-flight leader (slot, shared tokens) a pending prompt would wait
+/// on: the first one it shares at least `floor` tokens with. None when there
+/// is no prefix cache (`floor` None) or nothing in flight shares its prefix.
+/// Only a leader that is still computing part of the shared span counts: one
+/// that itself resumed at or past the shared length took the prefix from the
+/// cache, so the prefix is already published and waiting on it would just
+/// serialize the followers (measured: one release per ~60 ms tick).
+fn shares_inflight(
+    inflight: &[(usize, Vec<u32>, usize)],
+    floor: Option<usize>,
+    k: usize,
+    prompt: &[u32],
+) -> Option<(usize, usize)> {
+    let f = floor?;
+    inflight
+        .iter()
+        .filter(|(j, _, _)| *j != k)
+        .map(|(j, q, resumed)| (*j, lcp_len(prompt, q), *resumed))
+        .find(|&(_, l, resumed)| l >= f && l > resumed)
+        .map(|(j, l, _)| (j, l))
+}
+
+/// How much of an in-flight prompt the scheduler keeps for shared-prefix
+/// matching. A follower that shares more than this with a leader still
+/// adopts everything the leader publishes; the cap only bounds the clone a
+/// 100k-token admission would otherwise make of itself.
+const PREFIX_LCP_CAP: usize = 8192;
+
 fn trace_us() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2311,6 +2393,22 @@ fn run_batched(
     // scheduler + backend queue bound on prompts advancing through mixed
     // ticks at once (see max_chunks_inflight)
     let mut chunking: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // In-flight shared-prefix dedupe - SGLang's in-batch prefix caching in
+    // the form a DeltaNet hybrid needs. A cohort that arrives together and
+    // shares a prefix (one system prompt, N users; a benchmark's shared
+    // prefix) used to prefill it N times: the radix only carries a prefix
+    // once its prefill has LANDED, and by then every peer had already been
+    // admitted beside it. Measured on a 5060 Ti at c8 x 427 shared tokens:
+    // TTFT p50 1184 ms and an inter-token p99 of 88 ms (the early finishers
+    // decoded inside the peers' prefill ticks), against 251 ms / 30.5 ms once
+    // the prefix was cached. So: the prompts currently chunking, by slot,
+    // with a prefix of their tokens; a pending prompt that shares at least
+    // `prefix_share_floor` tokens with one of them waits for that leader to
+    // land, and the leader is told where each follower diverges so it
+    // snapshots resumable state there (`prefill_begin_hinted`).
+    let mut inflight_prompts: Vec<(usize, Vec<u32>, usize)> = Vec::new();
+    // followers currently held back (trace bookkeeping: log each once)
+    let mut prefix_deferred: std::collections::HashSet<usize> = std::collections::HashSet::new();
     // Slots whose images the BACKEND is still encoding under its encoder budget
     // It owns their chunks - the slot's own `mm` is already gone -
     // so a slot in here must be offered to neither the mm wave (it has nothing
@@ -2974,6 +3072,12 @@ fn run_batched(
                     false
                 }
             };
+            // leaders that landed or were abandoned no longer hold anyone back
+            inflight_prompts.retain(|(k, _, _)| chunking.contains(k));
+            prefix_deferred.retain(|k| {
+                !chunking.contains(k) && slots[*k].as_ref().is_some_and(|sl| !sl.prefilled)
+            });
+            let share_floor = generator.prefix_share_floor();
             while !co_hold
                 && !adm_hold
                 && chunking.len().saturating_sub(mix_deferred.len()) < max_chunks_inflight()
@@ -2996,23 +3100,51 @@ fn run_batched(
                                     // the per-pass tier_pump's wake re-enters
                                     // it here. First call starts the restore.
                                     && !generator.tier_prefix_loading(*k, &sl.prompt)
+                                    // shared-prefix dedupe: wait for the leader
+                                    && shares_inflight(&inflight_prompts, share_floor, *k, &sl.prompt)
+                                        .is_none()
                             })
                     })
                     .map(|(k, _)| k);
                 let Some(k) = next_pending else { break };
+                // Checkpoint hints for this leader: where every OTHER pending
+                // prompt that will wait on it diverges (page-floored by the
+                // backend). Followers then resume exactly there.
+                let hints: Vec<usize> = match share_floor {
+                    Some(f) => {
+                        let lead = &slots[k].as_ref().expect("present").prompt;
+                        slots
+                            .iter()
+                            .enumerate()
+                            .filter(|(m, s)| {
+                                *m != k
+                                    && !chunking.contains(m)
+                                    && s.as_ref()
+                                        .is_some_and(|sl| !sl.prefilled && sl.mm.is_none())
+                            })
+                            .filter_map(|(_, s)| {
+                                let l = lcp_len(lead, &s.as_ref().expect("present").prompt);
+                                (l >= f).then_some(l)
+                            })
+                            .collect()
+                    }
+                    None => Vec::new(),
+                };
                 let prompt = std::mem::take(&mut slots[k].as_mut().expect("present").prompt);
                 let p_rows = prompt.len();
-                match generator.prefill_begin(k, prompt) {
-                    Ok(()) => {
+                let keep: Vec<u32> = prompt[..p_rows.min(PREFIX_LCP_CAP)].to_vec();
+                match generator.prefill_begin_hinted(k, prompt, &hints) {
+                    Ok(resumed) => {
                         if let Some(sl) = slots[k].as_mut() {
                             sl.chunk_started = Some(std::time::Instant::now());
                         }
                         if paddock_models::dev_var_os!("PADDOCK_REQ_TRACE").is_some() {
                             tracing::info!(
-                                "req-trace: chunk-start slot {k} rows {p_rows} at {}",
+                                "req-trace: chunk-start slot {k} rows {p_rows} resumed {resumed} hints {hints:?} at {}",
                                 trace_us()
                             );
                         }
+                        inflight_prompts.push((k, keep, resumed));
                         chunking.insert(k);
                         st_adm += 1;
                     }
@@ -3022,6 +3154,23 @@ fn run_batched(
                             let _ = s.events.send(TokenEvent::Error(EngineError::from_gen(&e)));
                         }
                     }
+                }
+            }
+        }
+        if paddock_models::dev_var_os!("PADDOCK_REQ_TRACE").is_some()
+            && let Some(f) = generator.prefix_share_floor()
+        {
+            for (m, s) in slots.iter().enumerate() {
+                let Some(sl) = s.as_ref() else { continue };
+                if sl.prefilled || chunking.contains(&m) || prefix_deferred.contains(&m) {
+                    continue;
+                }
+                if let Some((j, l)) = shares_inflight(&inflight_prompts, Some(f), m, &sl.prompt) {
+                    prefix_deferred.insert(m);
+                    tracing::info!(
+                        "req-trace: defer slot {m} - shares {l} tokens with in-flight slot {j} at {}",
+                        trace_us()
+                    );
                 }
             }
         }
@@ -4258,6 +4407,14 @@ fn run_batched(
                     chunking.clear();
                 }
             }
+            // Phase marks for the straggler self-report: this arm returns
+            // before the classic marks below are set, so a unified tick used
+            // to be booked as "sample+emit" - which is what a 300 ms cold
+            // first prefill on a 5060 Ti read as until the req-trace lines
+            // named it. The whole tick is mixed work here.
+            ph_mixed = tick_t0.elapsed();
+            ph_spec = ph_mixed;
+            ph_decode = ph_mixed;
             continue; // tick done - admissions and the next chunk re-check
         }
 

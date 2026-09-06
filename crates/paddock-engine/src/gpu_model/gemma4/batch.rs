@@ -385,6 +385,9 @@ use super::{GpuGemma4, LayerKv, LayerWeights, SwaPaging};
 /// 48 GB card ended up serving that model on the serial engine.
 /// 1 GiB matches every other family.
 const VRAM_HEADROOM: usize = 1 << 30;
+/// Retained-prefix slack above the addressable ceiling, in slots' worth of
+/// blocks: `min(slots, this) x blocks_per_slot`. See `enable_batch_impl`.
+const RETENTION_SLOTS_MAX: usize = 8;
 
 /// FlashDecoding split cap (gpt-oss convention).
 pub(super) const MAX_ATTN_SPLITS: usize = 16;
@@ -890,9 +893,18 @@ impl GpuGemma4 {
             blocks_per_slot: if pooled { bps } else { 0 },
             block_bytes: block_bytes as u64,
             per_slot_bytes: per_slot_for(span) as u64,
-            // admission slack for radix retention (nodes hold blocks after their
-            // sequence ends)
-            retention_blocks: if pooled { 8 * bps } else { 0 },
+            // Admission slack for radix retention (nodes hold blocks after
+            // their sequence ends), sized by DEMAND: one retained context per
+            // seated slot, capped at the eight every pool got before
+            // 2026-09-06. The flat 8 x bps let a one-slot 131k server fill the
+            // whole grant - a 43.8 GiB pool holding 1.15M tokens, nine times
+            // its own context, 84.6 GiB on the card for one user of the 31B.
+            // From eight slots up nothing changes.
+            retention_blocks: if pooled {
+                slots.min(RETENTION_SLOTS_MAX) * bps
+            } else {
+                0
+            },
             // Reserves carved out of the slot-fit budget in pooled mode. The
             // prefix checkpoint blobs build_prefix allocates after us are a flat
             // charge; the pool floor is not - charging a full 1536-block floor

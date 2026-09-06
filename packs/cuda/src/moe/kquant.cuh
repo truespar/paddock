@@ -53,6 +53,13 @@ __global__ void __launch_bounds__(256) pd_kquant_moe_gate_up_kernel(
     const uint32_t o = blockIdx.x, slot = blockIdx.y, b = blockIdx.z;
     const uint32_t tid = threadIdx.x, nth = blockDim.x;
     const uint32_t e = idx[(size_t)b * n_active + slot];
+    // Absent pair (the expert-major prefill's out-of-wave sentinel,
+    // PD_MOE_CACHE_NONE from moe/offload.cuh): this block has no expert to
+    // read. Leave `out` alone - the down kernel skips the same pair - and
+    // return before anything block-collective; e is block-uniform so the
+    // exit is too. Measured reason: without it a wave's cost scaled with
+    // EVERY routed pair (10 ms a launch on a 435-token prompt), not its own.
+    if (e == 0xFFFFFFFFu) return;
     const uint32_t gdb = pd_kq_datab(gdt), udb = pd_kq_datab(udt);
     const uint32_t gscb = pd_kq_scb(gdt), uscb = pd_kq_scb(udt);
     // row strides by type: whole superblocks, or IQ4_NL's flat 32-block rows
@@ -167,6 +174,10 @@ __global__ void __launch_bounds__(512) pd_kquant_moe_down_kernel(
     if (warp < n_active) {
         const size_t srow = (size_t)b * n_active + warp;
         const uint32_t e = idx[srow];
+        if (e == 0xFFFFFFFFu) {
+            // absent pair (expert-major prefill sentinel): contributes zero
+            if (lane == 0) sh[warp] = 0.0f;
+        } else {
         const uint32_t dscb = pd_kq_scb(ddt);
         // row strides by type (IQ4_NL: flat 32-block rows, no padding)
         const uint8_t* row = dd + ((size_t)e * embd + o) * pd_kq_row_datab(ddt, ff);
@@ -193,6 +204,7 @@ __global__ void __launch_bounds__(512) pd_kquant_moe_down_kernel(
         for (uint32_t s2 = 16; s2 > 0; s2 >>= 1)
             acc += __shfl_down_sync(0xffffffffu, acc, s2);
         if (lane == 0) sh[warp] = topk_w[srow] * acc;
+        }
     }
     __syncthreads();
     if (threadIdx.x == 0) {

@@ -100,6 +100,152 @@ __global__ void __launch_bounds__(256) pd_moe_cache_fill_kernel(
         dst[i] = src[i];
 }
 
+// ---- expert-major prefill through the cache (waves) ------------------------
+// A prefill launch routes n x top-k pairs - thousands of rows - against a
+// cache of S slots, so the LRU path above cannot serve it (rows > S would
+// evict what the tick reads) and the seats used to serve ZERO-COPY: every
+// pair's expert read over PCIe by the MoE kernels themselves, again per
+// row. Measured on the RTX 5060 Ti (Qwen3.8-Flash-Next UD-IQ1_S, 48 layers x
+// 512 experts, top-10, 82 slots): a 256-token prompt took 46 s - ~5 tok/s.
+//
+// Expert-major instead, the discipline every offloaded-MoE serving system
+// converges on (llama.cpp's CPU experts, ktransformers, fiddler): the
+// bytes a prompt moves are bounded by ONE pass over the experts it touches,
+// never by its rows. Per layer: plan = mark the experts present in the
+// launch, enumerate them, assign wave w = ordinal / S. Then per wave:
+// resolve its <= S ids through the SAME LRU (so the cache ends the prefill
+// warm with the last wave), fill the misses once, and run the token-batched
+// pair over ALL rows with every out-of-wave pair marked ABSENT
+// (PD_MOE_CACHE_NONE in the routing): the gate/up block and the down warp
+// of an absent pair return at once, so a wave costs its own pairs, and the
+// engine sums the waves' down partials. (A first cut pointed absent pairs
+// at a permanently zero slot instead, which is correct but priced every
+// wave at every pair: 10 ms a launch on a 435-token prompt, 77% of the
+// prefill.) Waves are a fixed count (ceil(n_expert / S)) so a captured
+// graph keeps its shape; an empty wave resolves nothing, fills nothing and
+// its pair kernels exit block by block.
+//
+// plan: one block. wave_of[e] = wave of expert e (NONE if absent) - the
+// mask kernel's whole input; wave_ids[w*S + i] = the wave's ids, wave_cnt[w].
+__global__ void pd_moe_wave_plan_kernel(
+    const unsigned int* __restrict__ idx, uint32_t rows, uint32_t n_expert,
+    uint32_t n_slots, uint32_t n_waves, unsigned int* __restrict__ wave_of,
+    unsigned int* __restrict__ wave_ids, unsigned int* __restrict__ wave_cnt) {
+    for (uint32_t e = threadIdx.x; e < n_expert; e += blockDim.x) wave_of[e] = PD_MOE_CACHE_NONE;
+    __syncthreads();
+    // mark present: same value from every writer, no atomics needed
+    for (uint32_t r = threadIdx.x; r < rows; r += blockDim.x) {
+        const unsigned int e = idx[r];
+        if (e < n_expert) wave_of[e] = 0u;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        uint32_t cnt = 0;
+        for (uint32_t e = 0; e < n_expert; ++e) {
+            if (wave_of[e] == PD_MOE_CACHE_NONE) continue;
+            const uint32_t w = cnt / n_slots;
+            if (w >= n_waves) break;   // cannot happen: n_waves = ceil(n_expert / S)
+            wave_of[e] = w;
+            wave_ids[w * n_slots + (cnt % n_slots)] = e;
+            ++cnt;
+        }
+        for (uint32_t w = 0; w < n_waves; ++w) {
+            const uint32_t lo = w * n_slots;
+            wave_cnt[w] = cnt > lo ? (cnt - lo < n_slots ? cnt - lo : n_slots) : 0u;
+        }
+    }
+}
+
+// resolve with a DEVICE-side id count: the wave's ids are a device list the
+// plan kernel filled, so the count cannot be a host argument on a captured
+// path. Same LRU walk as pd_moe_cache_resolve_kernel over `*n_ids` ids;
+// max_ids bounds the scratch (<= n_slots by construction).
+__global__ void pd_moe_cache_resolve_dev_kernel(
+    const unsigned int* __restrict__ ids, const unsigned int* __restrict__ n_ids,
+    uint32_t n_slots, unsigned int* __restrict__ slot_of,
+    unsigned int* __restrict__ expert_in, unsigned int* __restrict__ last_use,
+    unsigned int* __restrict__ tick, unsigned int* __restrict__ jobs,
+    unsigned int* __restrict__ n_jobs, unsigned int* __restrict__ stats) {
+    if (threadIdx.x != 0) return;
+    const unsigned int rows = *n_ids;
+    const unsigned int t = *tick + 1u;
+    *tick = t;
+    unsigned int nj = 0;
+    for (uint32_t r = 0; r < rows && r < n_slots; ++r) {
+        const unsigned int e = ids[r];
+        unsigned int s = slot_of[e];
+        if (s != PD_MOE_CACHE_NONE) {
+            last_use[s] = t;
+            continue;
+        }
+        unsigned int victim = PD_MOE_CACHE_NONE, best = 0xFFFFFFFFu;
+        for (uint32_t c = 0; c < n_slots; ++c) {
+            const unsigned int lu = last_use[c];
+            if (lu != t && lu < best) { best = lu; victim = c; }
+        }
+        if (victim == PD_MOE_CACHE_NONE) { nj |= 0x80000000u; continue; }
+        const unsigned int old = expert_in[victim];
+        if (old != PD_MOE_CACHE_NONE) slot_of[old] = PD_MOE_CACHE_NONE;
+        expert_in[victim] = e;
+        slot_of[e] = victim;
+        last_use[victim] = t;
+        jobs[2u * (nj & 0x7FFFFFFFu)] = victim;
+        jobs[2u * (nj & 0x7FFFFFFFu) + 1u] = e;
+        ++nj;
+    }
+    *n_jobs = nj;
+    stats[0] += rows;
+    stats[1] += nj & 0x7FFFFFFFu;
+}
+
+// mask: the wave's remapped routing - in-wave pairs take their slot, every
+// other pair `absent` (the engine passes PD_MOE_CACHE_NONE, which the pair
+// kernels skip).
+__global__ void pd_moe_wave_mask_kernel(
+    const unsigned int* __restrict__ idx, uint32_t rows,
+    const unsigned int* __restrict__ wave_of, const unsigned int* __restrict__ slot_of,
+    uint32_t wave, uint32_t absent, unsigned int* __restrict__ idx_slot) {
+    const uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    const unsigned int e = idx[r];
+    idx_slot[r] = (wave_of[e] == wave) ? slot_of[e] : absent;
+}
+
+PD_EXPORT
+int pd_moe_wave_plan(const void* idx, uint32_t rows, uint32_t n_expert, uint32_t n_slots,
+                     uint32_t n_waves, void* wave_of, void* wave_ids, void* wave_cnt,
+                     void* stream) {
+    if (rows == 0 || n_expert == 0 || n_slots == 0 || n_waves == 0) return cudaErrorInvalidValue;
+    if ((uint64_t)n_waves * n_slots < n_expert) return cudaErrorInvalidValue;
+    pd_moe_wave_plan_kernel<<<1, 256, 0, (cudaStream_t)stream>>>(
+        (const unsigned int*)idx, rows, n_expert, n_slots, n_waves,
+        (unsigned int*)wave_of, (unsigned int*)wave_ids, (unsigned int*)wave_cnt);
+    return pd_launch_status();
+}
+
+PD_EXPORT
+int pd_moe_cache_resolve_dev(const void* ids, const void* n_ids, uint32_t n_slots,
+                             void* slot_of, void* expert_in, void* last_use, void* tick,
+                             void* jobs, void* n_jobs, void* stats, void* stream) {
+    if (n_slots == 0) return cudaErrorInvalidValue;
+    pd_moe_cache_resolve_dev_kernel<<<1, 32, 0, (cudaStream_t)stream>>>(
+        (const unsigned int*)ids, (const unsigned int*)n_ids, n_slots,
+        (unsigned int*)slot_of, (unsigned int*)expert_in, (unsigned int*)last_use,
+        (unsigned int*)tick, (unsigned int*)jobs, (unsigned int*)n_jobs,
+        (unsigned int*)stats);
+    return pd_launch_status();
+}
+
+PD_EXPORT
+int pd_moe_wave_mask(const void* idx, uint32_t rows, const void* wave_of, const void* slot_of,
+                     uint32_t wave, uint32_t absent, void* idx_slot, void* stream) {
+    if (rows == 0) return 0;
+    pd_moe_wave_mask_kernel<<<(rows + 255u) / 256u, 256, 0, (cudaStream_t)stream>>>(
+        (const unsigned int*)idx, rows, (const unsigned int*)wave_of,
+        (const unsigned int*)slot_of, wave, absent, (unsigned int*)idx_slot);
+    return pd_launch_status();
+}
+
 PD_EXPORT
 int pd_moe_cache_resolve(const void* idx, uint32_t rows, uint32_t n_slots,
                          void* slot_of, void* expert_in, void* last_use,

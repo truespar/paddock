@@ -2815,6 +2815,22 @@ struct KernelTableV1 {
     // q4x_gdn_split_widen (slot for the interleave map).
     int (*q4x_gdn_split_widen_tiled)(const void*, void*, void*, void*, uint32_t,
                                      uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 580: expert-major prefill plan over the offload cache - mark the
+    // experts a launch routes, enumerate them into waves of n_slots.
+    // (idx, rows, n_expert, n_slots, n_waves, wave_of[n_expert],
+    // wave_ids[n_waves*n_slots], wave_cnt[n_waves], stream).
+    int (*moe_wave_plan)(const void*, uint32_t, uint32_t, uint32_t, uint32_t, void*,
+                         void*, void*, void*);
+    // 581: cache resolve over a DEVICE id list + device count (a wave):
+    // (ids, n_ids (device), n_slots, slot_of, expert_in, last_use, tick,
+    // jobs, n_jobs, stats, stream). Same LRU as slot 575, no idx_slot.
+    int (*moe_cache_resolve_dev)(const void*, const void*, uint32_t, void*, void*, void*,
+                                 void*, void*, void*, void*, void*);
+    // 582: the wave's remapped routing: (idx, rows, wave_of, slot_of, wave,
+    // absent, idx_slot[rows], stream) - out-of-wave pairs take `absent`
+    // (PD_MOE_CACHE_NONE), which the token-batched pair kernels skip.
+    int (*moe_wave_mask)(const void*, uint32_t, const void*, const void*, uint32_t,
+                         uint32_t, void*, void*);
 };
 
 } // extern "C"

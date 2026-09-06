@@ -513,95 +513,18 @@ impl GpuGranite {
             let _ = PF_ROWS_ELECT.set(PF_ROWS_W4A4);
         }
         let cap = pf_rows() + max_batch;
-        // scratch is dominated by the two cap × n_ff FFN planes plus the
-        // cap × wide quantize/partial planes; estimate before committing so
-        // the pool sizing below cannot starve them
-        let scratch_est = (cap * (2 * hp.n_ff + 3 * embd + 2 * q_dim) * 4)
-            + (cap * wide * 4)
-            + (8 * 192 * wide * 4)
-            + (max_batch * hp.n_vocab * 4)
-            + (256 << 20);
-        let px_on = !super::prefix::prefix_disabled();
-        let retain = if px_on {
-            super::prefix::retention_blocks()
-        } else {
-            0
-        };
-        // One arbiter sizes the KV store: crate::kv_plan. Granite's
-        // own arithmetic was already budget-correct - this is the same solve,
-        // moved somewhere a new family cannot forget to do it, and it reports the
-        // pool's TOKEN CAPACITY rather than leaving max_ctx to imply it.
-        let grant = self
-            .exec
-            .vram_headroom()
-            .ok_or_else(|| GpuError::Driver("no free-VRAM reading".into()))?;
-        let demand = kv_plan::Demand {
-            family: "granite",
-            max_ctx: self.max_ctx,
-            slots: max_batch,
-            blocks_per_slot: bps,
-            block_bytes: block_bytes as u64,
-            // One block id addresses every layer, so no KV is per-slot here.
-            per_slot_bytes: 0,
-            // The pool is capped at what (slots × max_ctx) can actually address
-            // plus explicit radix retention (blocks the tree may hold after their
-            // sequence ends). This bit on granite specifically, measured:
-            // every one of the 64 layers is full-attention, so one
-            // block id costs 4 MiB here versus laguna's ~1 MiB. Carrying over
-            // laguna's `(slots + 8) * bps` slack reserved 6144 blocks = 24 GiB at
-            // max_batch 4 / max_ctx 8192 when only 2048 blocks = 8 GiB can ever be
-            // addressed, and drove the card to 48.0 of 49.1 GB. Granite's
-            // retention is explicit and named rather than a slot multiple, for
-            // exactly that reason: retention_blocks() defaults to 512 = 2 GiB on
-            // granite-30b, 0.5 GiB on the 8b, and 0 when the cache is off.
-            retention_blocks: retain,
-            // every slot must at least be able to hold a full chunk's worth of
-            // prompt, or admission deadlocks on its own first chunk
-            floor_blocks_per_slot: pf_rows().div_ceil(16),
-            floor_blocks_min: 256,
-            reserves: {
-                let mut r = vec![
-                    kv_plan::Reserve::new("graph/scratch slack", VRAM_HEADROOM as u64),
-                    kv_plan::Reserve::new("prefill scratch", scratch_est as u64),
-                ];
-                // the tier's device staging extents are VRAM this arbiter
-                // must know about (kv-offload 1a.1: staging accounted here)
-                if px_on && super::prefix::tier_ram_bytes().is_some() {
-                    r.push(kv_plan::Reserve::new(
-                        "kv-tier staging",
-                        crate::kv_tier::ram_transport::device_staging_bytes(),
-                    ));
-                }
-                r
-            },
-            ..Default::default()
-        };
-        // A real Err, not a lying Ok(1): the caller (service.rs) treats Ok(c) as
-        // proof self.batch is genuinely populated at capacity c - an Ok(1) here
-        // would claim that while leaving self.batch None, and service.rs's
-        // single-user-batched-decode branch sets `batched=true` on any Ok(_)
-        // unconditionally. self.decode/scratch stay serially self-healing
-        // regardless (ensure_decode's lazy rebuild), so the caller's serial
-        // fallback on Err is safe.
-        let plan = demand
-            .plan(grant)
-            .map_err(|e| GpuModelError::WontFit(e.message))?;
-        plan.report(&demand, grant);
-        let pool_blocks = plan.pool_blocks;
-        let slots = plan.slots;
-
+        // Prefill scratch PROFILED at load (the qwen35 shape, 2026-09-06):
+        // allocated here, before the grant is read, so the plan meets its
+        // true cost in the ledger. It used to be a hand formula charged as a
+        // reserve - one that priced 2 n_ff per row where the planes hold 4
+        // (gate, up and the merged gate|up pad) and skipped k/v and the
+        // quantize staging - and the 1 GiB slack absorbed the difference.
+        // Slot-sized planes take the REQUESTED width: the plan may seat
+        // fewer, never more.
         let e = &self.exec;
-        let mut kv = Vec::with_capacity(n_layer);
-        let mut kv_bytes = 0u64;
-        for _ in 0..n_layer {
-            let bytes = pool_blocks * 16 * kv_dim * kvb;
-            kv_bytes += 2 * bytes as u64;
-            kv.push(LayerKv {
-                k: e.alloc_u8(bytes)?,
-                v: e.alloc_u8(bytes)?,
-            });
-        }
-
+        let v_scratch0 = cudarc::driver::result::mem_get_info()
+            .map(|(f, _)| f)
+            .unwrap_or(0);
         let q8 = |w: &GraniteW| matches!(w.quant(), Some(QuantW::Q8(_)));
         let any_q8 = q8(&self.lm_head)
             || self.layers.iter().any(|l| {
@@ -643,19 +566,114 @@ impl GpuGranite {
             d_pos: e.alloc_u32(cap)?,
             d_slots: e.alloc_u32(cap)?,
             pf_runs: e.alloc_u32(cap + 2)?,
-            head_logits: e.alloc(slots.max(SPEC_BATCH_MAX_ROWS) * hp.n_vocab)?,
-            d_par: e.alloc_u32(slots * 4)?,
-            d_out: e.alloc_u32(slots)?,
-            d_tpar: e.alloc_u32(slots.max(SPEC_BATCH_MAX_ROWS) * 4)?,
-            d_pipe_par: e.alloc_u32(2 * slots * 4)?,
-            d_pipe_tpar: e.alloc_u32(2 * slots * 4)?,
-            d_pipe_out: e.alloc_u32(2 * slots)?,
+            head_logits: e.alloc(max_batch.max(SPEC_BATCH_MAX_ROWS) * hp.n_vocab)?,
+            d_par: e.alloc_u32(max_batch * 4)?,
+            d_out: e.alloc_u32(max_batch)?,
+            d_tpar: e.alloc_u32(max_batch.max(SPEC_BATCH_MAX_ROWS) * 4)?,
+            d_pipe_par: e.alloc_u32(2 * max_batch * 4)?,
+            d_pipe_tpar: e.alloc_u32(2 * max_batch * 4)?,
+            d_pipe_out: e.alloc_u32(2 * max_batch)?,
             // sized for the DEEPEST split any election can pick - the vec8
             // walk (32) outsplits the fused walk (16); ~8 MB extra scratch on
             // the granite shape, cheap insurance against a silent overflow
-            attn_o: e.alloc(nh * slots * MAX_VEC8_SPLITS * hd)?,
-            attn_ml: e.alloc(nh * slots * MAX_VEC8_SPLITS * 2)?,
+            attn_o: e.alloc(nh * max_batch * MAX_VEC8_SPLITS * hd)?,
+            attn_ml: e.alloc(nh * max_batch * MAX_VEC8_SPLITS * 2)?,
         };
+        let v_scratch1 = cudarc::driver::result::mem_get_info()
+            .map(|(f, _)| f)
+            .unwrap_or(0);
+        let scratch_bytes = v_scratch0.saturating_sub(v_scratch1);
+        tracing::info!(
+            "granite VRAM  prefill scratch (cap={cap} rows)     {:>7.2} GB  (in the ledger before the grant)",
+            scratch_bytes as f64 / 1e9
+        );
+        let px_on = !super::prefix::prefix_disabled();
+        let retain = if px_on {
+            super::prefix::retention_blocks()
+        } else {
+            0
+        };
+        // One arbiter sizes the KV store: crate::kv_plan. Granite's
+        // own arithmetic was already budget-correct - this is the same solve,
+        // moved somewhere a new family cannot forget to do it, and it reports the
+        // pool's TOKEN CAPACITY rather than leaving max_ctx to imply it.
+        let grant = self
+            .exec
+            .vram_headroom()
+            .ok_or_else(|| GpuError::Driver("no free-VRAM reading".into()))?;
+        // What the process holds as the plan is made (weights, the profiled
+        // scratch): the audit at the end adds the plan's charges to it.
+        let ledger_at_plan = self.exec.process_mem_used().unwrap_or(0);
+        let demand = kv_plan::Demand {
+            family: "granite",
+            max_ctx: self.max_ctx,
+            slots: max_batch,
+            blocks_per_slot: bps,
+            block_bytes: block_bytes as u64,
+            // One block id addresses every layer, so no KV is per-slot here.
+            per_slot_bytes: 0,
+            // The pool is capped at what (slots × max_ctx) can actually address
+            // plus explicit radix retention (blocks the tree may hold after their
+            // sequence ends). This bit on granite specifically, measured:
+            // every one of the 64 layers is full-attention, so one
+            // block id costs 4 MiB here versus laguna's ~1 MiB. Carrying over
+            // laguna's `(slots + 8) * bps` slack reserved 6144 blocks = 24 GiB at
+            // max_batch 4 / max_ctx 8192 when only 2048 blocks = 8 GiB can ever be
+            // addressed, and drove the card to 48.0 of 49.1 GB. Granite's
+            // retention is explicit and named rather than a slot multiple, for
+            // exactly that reason: retention_blocks() defaults to 512 = 2 GiB on
+            // granite-30b, 0.5 GiB on the 8b, and 0 when the cache is off.
+            retention_blocks: retain,
+            // every slot must at least be able to hold a full chunk's worth of
+            // prompt, or admission deadlocks on its own first chunk
+            floor_blocks_per_slot: pf_rows().div_ceil(16),
+            floor_blocks_min: 256,
+            reserves: {
+                // graphs, the sampler planes, the decode state and allocator
+                // slack - the prefill scratch itself precedes the grant now
+                let mut r = vec![kv_plan::Reserve::new(
+                    "graph/scratch slack",
+                    VRAM_HEADROOM as u64,
+                )];
+                // the tier's device staging extents are VRAM this arbiter
+                // must know about (kv-offload 1a.1: staging accounted here)
+                if px_on && super::prefix::tier_ram_bytes().is_some() {
+                    r.push(kv_plan::Reserve::new(
+                        "kv-tier staging",
+                        crate::kv_tier::ram_transport::device_staging_bytes(),
+                    ));
+                }
+                r
+            },
+            ..Default::default()
+        };
+        // A real Err, not a lying Ok(1): the caller (service.rs) treats Ok(c) as
+        // proof self.batch is genuinely populated at capacity c - an Ok(1) here
+        // would claim that while leaving self.batch None, and service.rs's
+        // single-user-batched-decode branch sets `batched=true` on any Ok(_)
+        // unconditionally. self.decode/scratch stay serially self-healing
+        // regardless (ensure_decode's lazy rebuild), so the caller's serial
+        // fallback on Err is safe.
+        let plan = demand
+            .plan(grant)
+            .map_err(|e| GpuModelError::WontFit(e.message))?;
+        plan.report(&demand, grant);
+        let pool_blocks = plan.pool_blocks;
+        let slots = plan.slots;
+        let plan_reserved: u64 = demand.reserves.iter().map(|r| r.bytes).sum::<u64>()
+            + plan.pool_bytes
+            + plan.slot_bytes;
+
+        let mut kv = Vec::with_capacity(n_layer);
+        let mut kv_bytes = 0u64;
+        for _ in 0..n_layer {
+            let bytes = pool_blocks * 16 * kv_dim * kvb;
+            kv_bytes += 2 * bytes as u64;
+            kv.push(LayerKv {
+                k: e.alloc_u8(bytes)?,
+                v: e.alloc_u8(bytes)?,
+            });
+        }
 
         // KV tier (kv-offload 1a.3, dev flag): built against the freshly
         // allocated planes, arming the radix's chain keys before any insert
@@ -708,11 +726,19 @@ impl GpuGranite {
             (pool_blocks * block_bytes) as f64 / (1u64 << 30) as f64,
             pool_blocks * 16,
             pf_rows(),
-            grant
-                .saturating_sub((pool_blocks * block_bytes) as u64)
-                .saturating_sub(scratch_est as u64) as f64
-                / (1u64 << 30) as f64,
+            grant.saturating_sub(plan_reserved) as f64 / (1u64 << 30) as f64,
             grant as f64 / (1u64 << 30) as f64,
+        );
+        // Plan audit (the qwen35 line): the plan's charges on top of what the
+        // process held when it was made, against the ledger now. The gap is
+        // what `graph/scratch slack` has to cover; keep it visible.
+        let expected = ledger_at_plan + plan_reserved;
+        let actual = self.exec.process_mem_used().unwrap_or(0);
+        tracing::info!(
+            expected_gib = expected as f64 / (1u64 << 30) as f64,
+            ledger_gib = actual as f64 / (1u64 << 30) as f64,
+            unplanned_mib = actual.saturating_sub(expected) as f64 / (1u64 << 20) as f64,
+            "granite VRAM plan audit: ledger vs plan after enable_batch"
         );
         Ok(slots)
     }

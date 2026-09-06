@@ -6154,7 +6154,59 @@ pub struct KernelTableV1 {
     /// converter writes); `q4x_gdn_split_widen` keeps the raw-safetensors
     /// interleave map. Same signature.
     pub q4x_gdn_split_widen_tiled: Option<Q4xGdnSplitWidenFn>,
+    /// 580: expert-major prefill plan over the offload cache - marks the
+    /// experts a launch routes and enumerates them into waves of `n_slots`.
+    /// (idx, rows, n_expert, n_slots, n_waves, wave_of[n_expert],
+    /// wave_ids[n_waves*n_slots], wave_cnt[n_waves], stream).
+    pub moe_wave_plan: Option<MoeWavePlanFn>,
+    /// 581: cache resolve over a DEVICE id list with a device count (one
+    /// wave): (ids, n_ids, n_slots, slot_of, expert_in, last_use, tick, jobs,
+    /// n_jobs, stats, stream). Same LRU as slot 575, writes no idx_slot.
+    pub moe_cache_resolve_dev: Option<MoeCacheResolveDevFn>,
+    /// 582: the wave's remapped routing: (idx, rows, wave_of, slot_of, wave,
+    /// zero_slot, idx_slot[rows], stream) - out-of-wave pairs take zero_slot.
+    pub moe_wave_mask: Option<MoeWaveMaskFn>,
 }
+
+/// Expert-major prefill plan (see `KernelTableV1::moe_wave_plan`).
+pub type MoeWavePlanFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+) -> i32;
+
+/// Device-count cache resolve (see `KernelTableV1::moe_cache_resolve_dev`).
+pub type MoeCacheResolveDevFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+) -> i32;
+
+/// Wave routing mask (see `KernelTableV1::moe_wave_mask`).
+pub type MoeWaveMaskFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    u32,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+) -> i32;
 
 /// MoE expert-offload cache resolve (see `KernelTableV1::moe_cache_resolve`).
 pub type MoeCacheResolveFn = unsafe extern "C" fn(
@@ -6531,7 +6583,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 565;
+pub const KERNEL_TABLE_SLOTS: usize = 568;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,
