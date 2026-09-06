@@ -76,6 +76,13 @@ static pd_tmap_encode_fn pd_tmap_encode() {
                       "[tma] cuTensorMapEncodeTiled unavailable (driver CUDA %d, "
                       "pack built with CUDA %d) - TMA routes off\n",
                       drv, rt);
+            // The failed query is handled here, so its cudaErrorInvalidValue
+            // must not stay in the runtime's sticky last-error: every launcher
+            // reads that after its launch, and the next one - the engine's
+            // arch probe, once the table resolves this at load - would report
+            // a kernel that never launched as refused (status 1, "no working
+            // image for this arch").
+            (void)cudaGetLastError();
             return (pd_tmap_encode_fn) nullptr;
         }
         return (pd_tmap_encode_fn)p;

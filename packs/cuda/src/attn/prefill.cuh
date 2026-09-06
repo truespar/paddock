@@ -1754,7 +1754,6 @@ pd_attn_prefill_f16_v3w_kernel(
     constexpr uint32_t NR = PD_AF3W_NR, TK = PD_AF3W_TK;
     constexpr uint32_t HB = 4u;        // heads per block (half the 8-group)
     constexpr uint32_t DH = D / 2u;    // dims per warp
-    constexpr uint32_t KP = TK + 8u;
     constexpr uint32_t DPD = D + 8u;
 
     const uint32_t kvh = blockIdx.x;

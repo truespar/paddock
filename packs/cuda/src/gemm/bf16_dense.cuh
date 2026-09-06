@@ -1104,24 +1104,25 @@ __global__ void __launch_bounds__(NWARP * 32) pd_bf16_gemm_mma_kernel(
             }
         }
         return;
-    }
-    #pragma unroll
-    for (uint32_t rg = 0; rg < RG; ++rg) {
-        const uint32_t r0 = row_base + wr + rg * 16u + g;
-        const uint32_t r8 = r0 + 8u;
-        const float b0 = (bias && r0 < M) ? bias[r0] : 0.0f;
-        const float b8 = (bias && r8 < M) ? bias[r8] : 0.0f;
+    } else {
         #pragma unroll
-        for (uint32_t cg = 0; cg < CG; ++cg) {
-            const uint32_t c0 = col_base + wc + cg * 8u + 2u * t;
-            const uint32_t c1 = c0 + 1u;
-            if (r0 < M) {
-                if (c0 < N) put(r0, c0, acc[rg][cg][0] + b0);
-                if (c1 < N) put(r0, c1, acc[rg][cg][1] + b0);
-            }
-            if (r8 < M) {
-                if (c0 < N) put(r8, c0, acc[rg][cg][2] + b8);
-                if (c1 < N) put(r8, c1, acc[rg][cg][3] + b8);
+        for (uint32_t rg = 0; rg < RG; ++rg) {
+            const uint32_t r0 = row_base + wr + rg * 16u + g;
+            const uint32_t r8 = r0 + 8u;
+            const float b0 = (bias && r0 < M) ? bias[r0] : 0.0f;
+            const float b8 = (bias && r8 < M) ? bias[r8] : 0.0f;
+            #pragma unroll
+            for (uint32_t cg = 0; cg < CG; ++cg) {
+                const uint32_t c0 = col_base + wc + cg * 8u + 2u * t;
+                const uint32_t c1 = c0 + 1u;
+                if (r0 < M) {
+                    if (c0 < N) put(r0, c0, acc[rg][cg][0] + b0);
+                    if (c1 < N) put(r0, c1, acc[rg][cg][1] + b0);
+                }
+                if (r8 < M) {
+                    if (c0 < N) put(r8, c0, acc[rg][cg][2] + b8);
+                    if (c1 < N) put(r8, c1, acc[rg][cg][3] + b8);
+                }
             }
         }
     }

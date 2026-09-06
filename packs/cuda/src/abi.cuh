@@ -2834,6 +2834,23 @@ static unsigned int pd_pf_runs_maxn = 0;
 #define PD_ABI_VERSION 2u
 
 
+// Resident threads per SM of the device compilation target. A
+// __launch_bounds__ minBlocks hint whose product exceeds this is not
+// clamped by ptxas, it is silently dropped (".minnctapersm will be
+// ignored"), so every occupancy hint in the pack derives from it rather
+// than naming a block count. 2048: A100 (8.0), H100 (9.0), B200/B300
+// (10.0/10.3). 1536: GA10x/Ada (8.6/8.9), Thor (11.0) and every 12.x
+// consumer/pro Blackwell incl. DGX Spark (12.1). Measured, not assumed:
+// a 16x128 hint compiled per target with nvcc 13.0 on 2026-09-06 was dropped
+// on exactly sm_86/89/110/120/120a/121 and accepted on 80/90/100/100a/103.
+// Orin (8.7) is not built here; it would take the smaller figure too.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 900 || \
+                               __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030)
+#define PD_SM_MAX_THREADS 2048
+#else
+#define PD_SM_MAX_THREADS 1536
+#endif
+
 // ---- PDL cascade helpers  -----------------------------------------
 // The decode tick is a serial chain [GEMM -> rope/append -> attention ->
 // combine -> quant -> GEMM -> ...] and every GEMM already launches as a

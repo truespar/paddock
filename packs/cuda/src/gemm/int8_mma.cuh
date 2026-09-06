@@ -258,8 +258,8 @@ __global__ void __launch_bounds__(NWARP * 32) pd_q8_0_gemm_mma_kernel(
         // the next issue into the just-read buffer (same as the old ST=2
         // special case, which this generalizes byte-for-byte at ST=2).
         #pragma unroll
-        for (uint32_t s = 0; s < ST - 1u; ++s) {
-            const uint32_t kt = kt_lo + s * NSUBK;
+        for (int s = 0; s < (int)ST - 1; ++s) {
+            const uint32_t kt = kt_lo + (uint32_t)s * NSUBK;
             if (kt < kt_hi) stage(kt, s);
             pd_attn_cpa_commit(); // possibly empty - keeps group count fixed
         }
@@ -2296,8 +2296,26 @@ int pd_deltanet_split_gqa_norm(const void* conv, void* q_out, void* k_out, void*
 // source with only this define differing) measured a small but consistent
 // throughput win, which is what elected 16.
 // PD_DEFS=-DPD_DN2_MINB=0 reverts to the old codegen.
+//
+// The 16 is a B200 number: 16 blocks x 128 threads is exactly that die's
+// 2048 resident threads. On a 1536-thread SM (sm_86/89/110, every 12.x die)
+// the same 16 asks for 2048 and ptxas does not clamp it, it DROPS the hint
+// (".minnctapersm will be ignored", 22 instantiations x 6 targets) - so
+// those dies never had a hint at all. Hint only where it was elected:
+// PD_SM_MAX_THREADS >= 2048 keeps the 16 on B200/H100/A100 and passes no
+// minBlocks on the 1536-thread dies, which is byte-identical SASS to what
+// they ran before (per-kernel hash, 2026-09-06) with the warning gone. The
+// honest 1536-die hint would be 12 (R <= 42; the family sits at 40) - built
+// and hashed the same day: REG stays 40 but ptxas reschedules (v2<half>
+// 912 -> 896 instructions on sm_120a). Dropping the hint reschedules too
+// (18 of the 22 instantiations differ from the dropped-16 build), so all
+// three forms were served back to back on the RTX PRO 6000, qwen3.8-27b Q8,
+// 3 reps: dropped-16 c1 46.77 / c32 1016.85, none 46.78 / 1016.99, 12 46.79
+// / 1015.79 tok/s - a three-way tie inside 0.1%, i.e. the hint is inert on
+// this die (the kernel is SM-pipeline bound at 12 blocks either way). None
+// is the shipped form: no hint to be wrong about; 12 stays a probe arm.
 #ifndef PD_DN2_MINB
-#define PD_DN2_MINB 16
+#define PD_DN2_MINB (PD_SM_MAX_THREADS >= 2048 ? 16 : 0)
 #endif
 #if PD_DN2_MINB > 0
 #define PD_DN2_LB __launch_bounds__(32 * PD_DN2_WARPS, PD_DN2_MINB)

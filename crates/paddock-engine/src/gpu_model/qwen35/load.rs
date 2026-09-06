@@ -1949,7 +1949,16 @@ impl GpuQwen35 {
                         }
                         None => return None,
                     };
-                    let lin = exec.f8w_repack_lin(w, i, o).ok()?;
+                    // Tile-linear only where the lin lane is on: every consumer
+                    // routes an `is_lin()` plane to f8_gemm_lin_kt, and the pack
+                    // nulls that entry when its TMA encoder is unavailable, so a
+                    // lin head with the lane off is a MissingOp on the first
+                    // prefill. Row-major here keeps it on f8d_gemm_mma_ks.
+                    let lin = if f8lin_enabled(&exec) {
+                        exec.f8w_repack_lin(w, i, o).ok()?
+                    } else {
+                        w
+                    };
                     Some((lin, i, o))
                 })(),
                 _ => None,

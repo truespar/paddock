@@ -2502,7 +2502,7 @@ pub(super) fn prefill_ffn_f8w(
         exec.f8_gemm_w8(&gu8.0, ffh, xq, xs, ffn_up, gu8.1, ffh, r)?;
         exec.quantize_e4m3_swiglu(ffn_gate, ffn_up, xq, xs, r * d8.1)?;
     }
-    if o16 && exec.has_add_b16() {
+    if o16 && exec.has_f8_o16() && exec.has_add_b16() {
         exec.f8_gemm_w8_o16(&d8.0, 0, xq, xs, proj, d8.1, d8.2, r)?;
         Ok(true)
     } else {

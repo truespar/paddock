@@ -919,16 +919,16 @@ __global__ void pd_causal_conv1d_silu_qkv_vl_kernel(
     for (uint32_t ww = 0; ww < nwarps; ++ww) { qs += sh[ww]; ks += sh[4 + ww]; }
     const float qn = qj * rsqrtf(qs + 1e-6f) * rsqrtf((float)s);
     const float kn = kj * rsqrtf(ks + 1e-6f);
-    if (QKC) {
+    if constexpr (QKC) {
         const size_t oidx = ((size_t)row * n_k_heads + hk) * s + j;
         ((__nv_bfloat16*)q_out)[oidx] = __float2bfloat16(qn);
         ((__nv_bfloat16*)k_out)[oidx] = __float2bfloat16(kn);
-        return;
-    }
-    for (uint32_t hv = hk; hv < n_v_heads; hv += n_k_heads) {
-        const size_t oidx = ((size_t)row * n_v_heads + hv) * s + j;
-        q_out[oidx] = qn;
-        k_out[oidx] = kn;
+    } else {
+        for (uint32_t hv = hk; hv < n_v_heads; hv += n_k_heads) {
+            const size_t oidx = ((size_t)row * n_v_heads + hv) * s + j;
+            q_out[oidx] = qn;
+            k_out[oidx] = kn;
+        }
     }
 }
 

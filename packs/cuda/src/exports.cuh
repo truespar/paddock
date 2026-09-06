@@ -1669,6 +1669,39 @@ PD_EXPORT const KernelTableV1* paddock_pack_kernels_v1(void) {
         }
         if (cma != 10) {
         }
+        // Honest per-DRIVER capability: the launchers below have no route
+        // that does not start from a cuTensorMapEncodeTiled tensor map, and
+        // every one of them answers cudaErrorNotSupported (or InvalidValue)
+        // when pd_tmap_encode() is null - which it is whenever the driver
+        // cannot serve the entry point (a pack built with a toolkit newer
+        // than the driver was the 2026-09 case: 13.3 nvcc on a 13.2 driver,
+        // RTX PRO 6000 Max-Q, self-built). The engine elects these lanes by
+        // entry presence (has_f8_lin, has_f8_o16, the f4t elector...), so a
+        // non-null pointer here is exactly the Launch(801)-on-every-prefill
+        // failure the null-probe rule exists to prevent. Null = the engine
+        // keeps its non-TMA class; pd_tmap_encode() prints the [tma] witness
+        // once so the serve log names the driver as the cause. Launchers
+        // that fall back to a non-TMA route on their own (f8_gemm_w8, the pc
+        // family's -2 decline, the attention bulk paths, f8row, mxfp4_bs)
+        // keep their entries.
+        if (pd_tmap_encode() == nullptr) {
+            t.f8_gemm_lin_kt = NULL;
+            t.f8_gemm_lin_kt_r = NULL;
+            t.f8_gemm_w8_o16 = NULL;
+            t.f8t_gemm = NULL;
+            t.f8t_gemm2 = NULL;
+            t.f8bs_moe_gemm_gu = NULL;
+            t.f8bs_moe_gemm_dn = NULL;
+            t.f8bs_moe_gemm_gu_d32 = NULL;
+            t.f8bs_moe_gemm_dn_d32 = NULL;
+            t.nvf4_gemm_f4t = NULL;
+            t.nvf4_gemm_f4t_swq = NULL;
+            t.q8_0_moe_gate_up_g2_geglu = NULL;
+            t.q8_0_moe_gate_up_mma2t_geglu = NULL;
+            t.q8_0_moe_down_mma2t = NULL;
+            t.lowm_gemm = NULL;
+            t.lowm_warmup = NULL;
+        }
         resolved = 1;
     }
     return &t;

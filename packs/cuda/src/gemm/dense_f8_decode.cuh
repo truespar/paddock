@@ -1552,8 +1552,6 @@ static int pd_f8t_gemm_impl(const void* wtiles, const void* wrs, const void* xq,
         p_s_env = e ? atoi(e) : 0;
         if (p_s_env && (p_s_env < 3 || p_s_env > 6)) p_s_env = 6;
     }
-    constexpr uint32_t S = 6u, D = 5u;              // legacy arms below
-    const uint32_t smem = S * 24576u + 2u * S * 8u;
     static int no_ef = -1;
     if (no_ef < 0) no_ef = pd_env("PADDOCK_NO_L2EF") ? 1 : 0;
     //  arm (PADDOCK_C2COL=1): no-K-split cluster col-split for the M2

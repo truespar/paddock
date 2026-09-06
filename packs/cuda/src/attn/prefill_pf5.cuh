@@ -339,7 +339,7 @@ __global__ void __launch_bounds__(256, 1) pd_attn_prefill_pf5_kernel(
         const uint32_t nkeys_s = span - kt * TK < TK ? span - kt * TK : TK;
         __half* kb = ks + (size_t)bf * TK * HD;
         __half* vb = vs + (size_t)bf * TK * row_e;
-        if (F8) {
+        if constexpr (F8) {
             const unsigned char* pk8 = (const unsigned char*)pool_k;
             const unsigned char* pv8 = (const unsigned char*)pool_v;
             unsigned char* kstrip = (unsigned char*)kb + (size_t)TK * HD;
@@ -411,27 +411,28 @@ __global__ void __launch_bounds__(256, 1) pd_attn_prefill_pf5_kernel(
             }
             pd_attn_cpa_commit();
             return;
-        }
-        for (uint32_t i = tid; i < TK * (HD / 8u); i += 256u) {
-            const uint32_t kr = i / (HD / 8u), c16 = i % (HD / 8u);
-            const uint32_t t = c16 >> 3, c = c16 & 7u;
-            const uint32_t off16 = (kr >> 3) * 64u + (kr & 7u) * 8u + (c ^ (kr & 7u));
-            unsigned char* kdst = (unsigned char*)kb
-                + ((size_t)t * TK * 128u) + ((size_t)off16 << 4);
-            unsigned char* vdst = (unsigned char*)(vb + (size_t)kr * row_e + c16 * 8u);
-            if (kr < nkeys_s) {
-                const uint32_t gpos = k0s + kr;
-                const uint32_t blk = bt[gpos >> 4];
-                const size_t base = (size_t)blk * 16u * kv_dim
-                    + (size_t)(gpos & 15u) * kv_dim + (size_t)kvh * HD + c16 * 8u;
-                pd_attn_cpa16(kdst, (const char*)(pool_k + base));
-                pd_attn_cpa16(vdst, (const char*)(pool_v + base));
-            } else {
-                *(uint4*)kdst = make_uint4(0u, 0u, 0u, 0u);
-                *(uint4*)vdst = make_uint4(0u, 0u, 0u, 0u);
+        } else {
+            for (uint32_t i = tid; i < TK * (HD / 8u); i += 256u) {
+                const uint32_t kr = i / (HD / 8u), c16 = i % (HD / 8u);
+                const uint32_t t = c16 >> 3, c = c16 & 7u;
+                const uint32_t off16 = (kr >> 3) * 64u + (kr & 7u) * 8u + (c ^ (kr & 7u));
+                unsigned char* kdst = (unsigned char*)kb
+                    + ((size_t)t * TK * 128u) + ((size_t)off16 << 4);
+                unsigned char* vdst = (unsigned char*)(vb + (size_t)kr * row_e + c16 * 8u);
+                if (kr < nkeys_s) {
+                    const uint32_t gpos = k0s + kr;
+                    const uint32_t blk = bt[gpos >> 4];
+                    const size_t base = (size_t)blk * 16u * kv_dim
+                        + (size_t)(gpos & 15u) * kv_dim + (size_t)kvh * HD + c16 * 8u;
+                    pd_attn_cpa16(kdst, (const char*)(pool_k + base));
+                    pd_attn_cpa16(vdst, (const char*)(pool_v + base));
+                } else {
+                    *(uint4*)kdst = make_uint4(0u, 0u, 0u, 0u);
+                    *(uint4*)vdst = make_uint4(0u, 0u, 0u, 0u);
+                }
             }
+            pd_attn_cpa_commit();
         }
-        pd_attn_cpa_commit();
     };
 
     uint32_t done_ph = 0;
@@ -741,7 +742,7 @@ __global__ void __launch_bounds__(256, 1) pd_attn_prefill_pf5g_kernel(
         const uint32_t nkeys_s = span - kt * TK < TK ? span - kt * TK : TK;
         __half* kb = ks + (size_t)bf * TK * HD;
         __half* vb = vs + (size_t)bf * TK * row_e;
-        if (F8) {
+        if constexpr (F8) {
             // e4m3 bytes to the upper strips; zero-fill happens in
             // pd_pf5_f8_expand (stage-time zeros would race the strips)
             const unsigned char* pk8 = (const unsigned char*)pool_k;
@@ -763,27 +764,28 @@ __global__ void __launch_bounds__(256, 1) pd_attn_prefill_pf5g_kernel(
             }
             pd_attn_cpa_commit();
             return;
-        }
-        for (uint32_t i = tid; i < TK * (HD / 8u); i += 256u) {
-            const uint32_t kr = i / (HD / 8u), c16 = i % (HD / 8u);
-            const uint32_t t = c16 >> 3, c = c16 & 7u;
-            const uint32_t off16 = (kr >> 3) * 64u + (kr & 7u) * 8u + (c ^ (kr & 7u));
-            unsigned char* kdst = (unsigned char*)kb
-                + ((size_t)t * TK * 128u) + ((size_t)off16 << 4);
-            unsigned char* vdst = (unsigned char*)(vb + (size_t)kr * row_e + c16 * 8u);
-            if (kr < nkeys_s) {
-                const uint32_t gpos = k0s + kr;
-                const uint32_t blk = bt[gpos >> 4];
-                const size_t base = (size_t)blk * 16u * kv_dim
-                    + (size_t)(gpos & 15u) * kv_dim + (size_t)kvh * HD + c16 * 8u;
-                pd_attn_cpa16(kdst, (const char*)(pool_k + base));
-                pd_attn_cpa16(vdst, (const char*)(pool_v + base));
-            } else {
-                *(uint4*)kdst = make_uint4(0u, 0u, 0u, 0u);
-                *(uint4*)vdst = make_uint4(0u, 0u, 0u, 0u);
+        } else {
+            for (uint32_t i = tid; i < TK * (HD / 8u); i += 256u) {
+                const uint32_t kr = i / (HD / 8u), c16 = i % (HD / 8u);
+                const uint32_t t = c16 >> 3, c = c16 & 7u;
+                const uint32_t off16 = (kr >> 3) * 64u + (kr & 7u) * 8u + (c ^ (kr & 7u));
+                unsigned char* kdst = (unsigned char*)kb
+                    + ((size_t)t * TK * 128u) + ((size_t)off16 << 4);
+                unsigned char* vdst = (unsigned char*)(vb + (size_t)kr * row_e + c16 * 8u);
+                if (kr < nkeys_s) {
+                    const uint32_t gpos = k0s + kr;
+                    const uint32_t blk = bt[gpos >> 4];
+                    const size_t base = (size_t)blk * 16u * kv_dim
+                        + (size_t)(gpos & 15u) * kv_dim + (size_t)kvh * HD + c16 * 8u;
+                    pd_attn_cpa16(kdst, (const char*)(pool_k + base));
+                    pd_attn_cpa16(vdst, (const char*)(pool_v + base));
+                } else {
+                    *(uint4*)kdst = make_uint4(0u, 0u, 0u, 0u);
+                    *(uint4*)vdst = make_uint4(0u, 0u, 0u, 0u);
+                }
             }
+            pd_attn_cpa_commit();
         }
-        pd_attn_cpa_commit();
     };
 
     uint32_t done_ph = 0;
@@ -1101,7 +1103,7 @@ pd_attn_prefill_pf5g_c2_kernel(
         const uint32_t nkeys_s = span - kt * TK < TK ? span - kt * TK : TK;
         __half* kb = ks + (size_t)bf * TKH * HD;
         __half* vb = vs + (size_t)bf * TK * row_e;
-        if (F8) {
+        if constexpr (F8) {
             // e4m3 to the upper strips (K: this CTA's TKH-row half, local
             // rows; V: all TK); zero-fill lives in the expansion
             const unsigned char* pk8 = (const unsigned char*)pool_k;
@@ -1133,40 +1135,41 @@ pd_attn_prefill_pf5g_c2_kernel(
             }
             pd_attn_cpa_commit();
             return;
-        }
-        // K: this CTA's N-half = collective key cols [crank*TKH, +TKH)
-        for (uint32_t i = tid; i < TKH * (HD / 8u); i += 256u) {
-            const uint32_t krl = i / (HD / 8u), c16 = i % (HD / 8u);
-            const uint32_t kr = crank * TKH + krl;
-            const uint32_t t = c16 >> 3, c = c16 & 7u;
-            const uint32_t off16 = (krl >> 3) * 64u + (krl & 7u) * 8u + (c ^ (krl & 7u));
-            unsigned char* kdst = (unsigned char*)kb
-                + ((size_t)t * TKH * 128u) + ((size_t)off16 << 4);
-            if (kr < nkeys_s) {
-                const uint32_t gpos = k0s + kr;
-                const uint32_t blk = bt[gpos >> 4];
-                const size_t base = (size_t)blk * 16u * kv_dim
-                    + (size_t)(gpos & 15u) * kv_dim + (size_t)kvh * HD + c16 * 8u;
-                pd_attn_cpa16(kdst, (const char*)(pool_k + base));
-            } else {
-                *(uint4*)kdst = make_uint4(0u, 0u, 0u, 0u);
+        } else {
+            // K: this CTA's N-half = collective key cols [crank*TKH, +TKH)
+            for (uint32_t i = tid; i < TKH * (HD / 8u); i += 256u) {
+                const uint32_t krl = i / (HD / 8u), c16 = i % (HD / 8u);
+                const uint32_t kr = crank * TKH + krl;
+                const uint32_t t = c16 >> 3, c = c16 & 7u;
+                const uint32_t off16 = (krl >> 3) * 64u + (krl & 7u) * 8u + (c ^ (krl & 7u));
+                unsigned char* kdst = (unsigned char*)kb
+                    + ((size_t)t * TKH * 128u) + ((size_t)off16 << 4);
+                if (kr < nkeys_s) {
+                    const uint32_t gpos = k0s + kr;
+                    const uint32_t blk = bt[gpos >> 4];
+                    const size_t base = (size_t)blk * 16u * kv_dim
+                        + (size_t)(gpos & 15u) * kv_dim + (size_t)kvh * HD + c16 * 8u;
+                    pd_attn_cpa16(kdst, (const char*)(pool_k + base));
+                } else {
+                    *(uint4*)kdst = make_uint4(0u, 0u, 0u, 0u);
+                }
             }
-        }
-        // V: all TK keys (P.V is CTA-local)
-        for (uint32_t i = tid; i < TK * (HD / 8u); i += 256u) {
-            const uint32_t kr = i / (HD / 8u), c16 = i % (HD / 8u);
-            unsigned char* vdst = (unsigned char*)(vb + (size_t)kr * row_e + c16 * 8u);
-            if (kr < nkeys_s) {
-                const uint32_t gpos = k0s + kr;
-                const uint32_t blk = bt[gpos >> 4];
-                const size_t base = (size_t)blk * 16u * kv_dim
-                    + (size_t)(gpos & 15u) * kv_dim + (size_t)kvh * HD + c16 * 8u;
-                pd_attn_cpa16(vdst, (const char*)(pool_v + base));
-            } else {
-                *(uint4*)vdst = make_uint4(0u, 0u, 0u, 0u);
+            // V: all TK keys (P.V is CTA-local)
+            for (uint32_t i = tid; i < TK * (HD / 8u); i += 256u) {
+                const uint32_t kr = i / (HD / 8u), c16 = i % (HD / 8u);
+                unsigned char* vdst = (unsigned char*)(vb + (size_t)kr * row_e + c16 * 8u);
+                if (kr < nkeys_s) {
+                    const uint32_t gpos = k0s + kr;
+                    const uint32_t blk = bt[gpos >> 4];
+                    const size_t base = (size_t)blk * 16u * kv_dim
+                        + (size_t)(gpos & 15u) * kv_dim + (size_t)kvh * HD + c16 * 8u;
+                    pd_attn_cpa16(vdst, (const char*)(pool_v + base));
+                } else {
+                    *(uint4*)vdst = make_uint4(0u, 0u, 0u, 0u);
+                }
             }
+            pd_attn_cpa_commit();
         }
-        pd_attn_cpa_commit();
     };
 
     uint32_t done_ph = 0, peer_ph = 0;
@@ -1896,7 +1899,7 @@ pd_attn_prefill_pf6g_kernel(
     auto stage_kv = [&](uint32_t kt) {
         const uint32_t k0s = lo0 + kt * TK;
         const uint32_t nkeys_s = span - kt * TK < TK ? span - kt * TK : TK;
-        if (F8) {
+        if constexpr (F8) {
             // e4m3 strips to the upper byte halves; zero-fill in the expand
             const unsigned char* pk8 = (const unsigned char*)pool_k;
             const unsigned char* pv8 = (const unsigned char*)pool_v;
@@ -1935,45 +1938,46 @@ pd_attn_prefill_pf6g_kernel(
             }
             pd_attn_cpa_commit();
             return;
-        }
-        // f16 KV: K this CTA's N-half, SW128 (c2 walk)
-        for (uint32_t i = tid; i < TKH * (HD / 8u); i += 256u) {
-            const uint32_t krl = i / (HD / 8u), c16 = i % (HD / 8u);
-            const uint32_t kr = crank * TKH + krl;
-            const uint32_t t = c16 >> 3, c = c16 & 7u;
-            const uint32_t off16 = (krl >> 3) * 64u + (krl & 7u) * 8u + (c ^ (krl & 7u));
-            unsigned char* kdst = (unsigned char*)ks
-                + ((size_t)t * TKH * 128u) + ((size_t)off16 << 4);
-            if (kr < nkeys_s) {
-                const uint32_t gpos = k0s + kr;
-                const uint32_t blk = bt[gpos >> 4];
-                const size_t base = (size_t)blk * 16u * kv_dim
-                    + (size_t)(gpos & 15u) * kv_dim + (size_t)kvh * HD + c16 * 8u;
-                pd_attn_cpa16(kdst, (const char*)(pool_k + base));
-            } else {
-                *(uint4*)kdst = make_uint4(0u, 0u, 0u, 0u);
+        } else {
+            // f16 KV: K this CTA's N-half, SW128 (c2 walk)
+            for (uint32_t i = tid; i < TKH * (HD / 8u); i += 256u) {
+                const uint32_t krl = i / (HD / 8u), c16 = i % (HD / 8u);
+                const uint32_t kr = crank * TKH + krl;
+                const uint32_t t = c16 >> 3, c = c16 & 7u;
+                const uint32_t off16 = (krl >> 3) * 64u + (krl & 7u) * 8u + (c ^ (krl & 7u));
+                unsigned char* kdst = (unsigned char*)ks
+                    + ((size_t)t * TKH * 128u) + ((size_t)off16 << 4);
+                if (kr < nkeys_s) {
+                    const uint32_t gpos = k0s + kr;
+                    const uint32_t blk = bt[gpos >> 4];
+                    const size_t base = (size_t)blk * 16u * kv_dim
+                        + (size_t)(gpos & 15u) * kv_dim + (size_t)kvh * HD + c16 * 8u;
+                    pd_attn_cpa16(kdst, (const char*)(pool_k + base));
+                } else {
+                    *(uint4*)kdst = make_uint4(0u, 0u, 0u, 0u);
+                }
             }
-        }
-        // V rank slice, SW128 [TK x HDH]: local unit u of band t <-> global
-        // dim chunk t*8 + crank*4 + u (see the F8 strip above)
-        for (uint32_t i = tid; i < TK * (HDH / 8u); i += 256u) {
-            const uint32_t kr = i / (HDH / 8u), c16 = i % (HDH / 8u);
-            const uint32_t t = c16 >> 3, c = c16 & 7u;
-            const uint32_t off16 = (kr >> 3) * 64u + (kr & 7u) * 8u + (c ^ (kr & 7u));
-            unsigned char* vdst = (unsigned char*)vs
-                + ((size_t)t * TK * 128u) + ((size_t)off16 << 4);
-            if (kr < nkeys_s) {
-                const uint32_t c16g = (c16 >> 3) * 16u + crank * 8u + (c16 & 7u);
-                const uint32_t gpos = k0s + kr;
-                const uint32_t blk = bt[gpos >> 4];
-                const size_t base = (size_t)blk * 16u * kv_dim
-                    + (size_t)(gpos & 15u) * kv_dim + (size_t)kvh * HD + c16g * 8u;
-                pd_attn_cpa16(vdst, (const char*)(pool_v + base));
-            } else {
-                *(uint4*)vdst = make_uint4(0u, 0u, 0u, 0u);
+            // V rank slice, SW128 [TK x HDH]: local unit u of band t <-> global
+            // dim chunk t*8 + crank*4 + u (see the F8 strip above)
+            for (uint32_t i = tid; i < TK * (HDH / 8u); i += 256u) {
+                const uint32_t kr = i / (HDH / 8u), c16 = i % (HDH / 8u);
+                const uint32_t t = c16 >> 3, c = c16 & 7u;
+                const uint32_t off16 = (kr >> 3) * 64u + (kr & 7u) * 8u + (c ^ (kr & 7u));
+                unsigned char* vdst = (unsigned char*)vs
+                    + ((size_t)t * TK * 128u) + ((size_t)off16 << 4);
+                if (kr < nkeys_s) {
+                    const uint32_t c16g = (c16 >> 3) * 16u + crank * 8u + (c16 & 7u);
+                    const uint32_t gpos = k0s + kr;
+                    const uint32_t blk = bt[gpos >> 4];
+                    const size_t base = (size_t)blk * 16u * kv_dim
+                        + (size_t)(gpos & 15u) * kv_dim + (size_t)kvh * HD + c16g * 8u;
+                    pd_attn_cpa16(vdst, (const char*)(pool_v + base));
+                } else {
+                    *(uint4*)vdst = make_uint4(0u, 0u, 0u, 0u);
+                }
             }
+            pd_attn_cpa_commit();
         }
-        pd_attn_cpa_commit();
     };
 
     uint32_t done_ph = 0, peer_ph = 0, pv_ph = 0, pvd_ph = 0;

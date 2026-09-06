@@ -503,7 +503,6 @@ static int pd_f8_gemm_lin_go(const void* wlin, const void* wsc, const void* xq,
         if (nsm <= 0) nsm = 128;
     }
     const uint32_t tiles = (out_dim + 63u) / 64u;
-    const uint32_t nk = in_dim >> 7;
     // nz: die-filling tile counts run split-free (bench: 544 CTAs = 129 us);
     // small-tile shapes (fused down: 80) split at box granularity to fill.
     // PD_LIN_NZ overrides for rebuild-free tuning.
@@ -1036,7 +1035,7 @@ __global__ void __launch_bounds__(288, 1) pd_f8_gemm_lin_kt3(
         sp_hi = sp_lo + per < nsp ? sp_lo + per : nsp;
         if (!KF) y += (size_t)blockIdx.z * out_dim * batch;
         if (sp_lo >= sp_hi) {
-            if (KF) {
+            if constexpr (KF) {
                 // an empty split still owns a link in the tile's flag
                 // chain: z0 zeroes y (the sum of the live chains then
                 // starts from 0, like the combine's zeroed plane), z>0
@@ -1066,15 +1065,16 @@ __global__ void __launch_bounds__(288, 1) pd_f8_gemm_lin_kt3(
                         asm volatile("st.release.gpu.b32 [%0], %1;" ::"l"(fp), "r"(blockIdx.z + 1u) : "memory");
                 }
                 return;
+            } else {
+                // empty tail split still owns its plane region: zero this tile's
+                // rows/cols so the combine's sum stays exact
+                for (uint32_t i = tid; i < 128u * 128u; i += 288u) {
+                    const uint32_t r = row_base + (i & 127u);
+                    const uint32_t c = col_base + (i >> 7);
+                    if (r < out_dim && c < batch) y[(size_t)c * out_dim + r] = 0.f;
+                }
+                return;
             }
-            // empty tail split still owns its plane region: zero this tile's
-            // rows/cols so the combine's sum stays exact
-            for (uint32_t i = tid; i < 128u * 128u; i += 288u) {
-                const uint32_t r = row_base + (i & 127u);
-                const uint32_t c = col_base + (i >> 7);
-                if (r < out_dim && c < batch) y[(size_t)c * out_dim + r] = 0.f;
-            }
-            return;
         }
     }
 
@@ -2763,7 +2763,6 @@ __global__ void __launch_bounds__(320, 2) pd_f8_gemm_lin_kt64(
     const unsigned char* __restrict__ xs, float* __restrict__ y,
     uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_F8W8_TMA_OK
-    constexpr uint32_t HBOX = 8448u;   // 64-row half box: 8192 data + 256 scales
     constexpr uint32_t HDAT = 8192u;
     constexpr uint32_t PAIR16 = 16384u; // Y: 128 cols x 128 B
     extern __shared__ __align__(128) unsigned char pd_lin64_sh[];

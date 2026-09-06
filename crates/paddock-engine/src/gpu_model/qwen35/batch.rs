@@ -3721,7 +3721,7 @@ impl GpuQwen35 {
                                         r * d8.1,
                                     )?;
                                 }
-                                if o16 && exec.has_add_b16() {
+                                if o16 && exec.has_f8_o16() && exec.has_add_b16() {
                                     // bf16 down out (halves the last 42 MB/layer-tick
                                     // f32 store of the FFN) - the tail add reads bf16
                                     exec.f8_gemm_w8_o16(
@@ -7220,7 +7220,7 @@ impl GpuQwen35 {
                                 r * d8.1,
                             )?;
                         }
-                        if o16 && exec.has_add_b16() {
+                        if o16 && exec.has_f8_o16() && exec.has_add_b16() {
                             // bf16 down out (halves the last 42 MB/layer-tick
                             // f32 store of the FFN) - the tail add reads bf16
                             exec.f8_gemm_w8_o16(
