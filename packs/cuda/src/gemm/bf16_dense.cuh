@@ -1213,7 +1213,7 @@ __global__ void __launch_bounds__(NWARP * 32) pd_bf16_gemm_mma_kernel(
 #if defined(PD_BS_HOST) || defined(PD_TC5_HOST)
 template <uint32_t BN, uint32_t NWARP, uint32_t ST, uint32_t RG, uint32_t CG>
 __global__ void __launch_bounds__(NWARP * 32) pd_bf16_gemm_tma_kernel(
-        const __grid_constant__ CUtensorMap wmap, const float* __restrict__ X,
+        const __grid_constant__ PdTmap wmap, const float* __restrict__ X,
         const float* __restrict__ bias, float* __restrict__ Y,
         uint32_t K, uint32_t M, uint32_t N) {
 #if PD_BF16MMA_OK && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900)

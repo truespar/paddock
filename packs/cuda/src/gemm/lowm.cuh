@@ -26,7 +26,7 @@
 // 256 thr = 4 thr per row x 64 rows; each thread carries `batch` f32 accs.
 template <uint32_t NB>
 __global__ void __launch_bounds__(256) pd_lowm_kernel(
-        const __grid_constant__ CUtensorMap wmap,
+        const __grid_constant__ PdTmap wmap,
         const __half* __restrict__ x, float* __restrict__ y,
         uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_TC5_OK
@@ -278,7 +278,7 @@ static int pd_lowm_launch(const void* w16, const void* x16, void* y,
 // nto is fixed 16 (the b<=8 band), ncols 32.
 template <uint32_t S>
 __global__ void __launch_bounds__(192) pd_lowm5_kernel(
-    const __grid_constant__ CUtensorMap wmap, const float* __restrict__ x,
+    const __grid_constant__ PdTmap wmap, const float* __restrict__ x,
     float* __restrict__ y,
     uint32_t in_dim, uint32_t out_dim, uint32_t batch, uint32_t nto) {
 #if PD_TC5_OK

@@ -92,11 +92,12 @@ function statusLabel(s: string): string {
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : s
 }
 
-// A control that cannot work must not be offered. `notice` is null until the
-// probe answers AND when the answer is fine, so an unanswered probe still
+// A control that cannot work must not be offered. `blocked` is false until
+// the probe answers AND when the answer is fine, so an unanswered probe still
 // renders the ordinary first run rather than a stripped one - the rule being
-// to hide the start button when there is no supported card.
-const canRunHere = computed(() => !readiness.notice)
+// to hide the start button when there is no usable card. An untested card is
+// usable: the notice beside the button says what "untested" costs.
+const canRunHere = computed(() => !readiness.blocked)
 
 const hasAnything = computed(
   () =>

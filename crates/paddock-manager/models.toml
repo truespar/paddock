@@ -821,6 +821,49 @@ revision = "2026-08-15"
     sha256 = "bee238bbeb3dc0a34bde4d0dedbaee1f98c009e8bb4226f03070054c12fb1372"
     size = 17923394624
 
+  # The smaller 4-bit-class lane, for 24 GB cards where UD-Q4_K_XL's 17.9 GB
+  # leaves no room for context. The name is unsloth's tier label, not the
+  # recipe: measured on the file (paddock inspect, 2026-09-06) it is IQ4_XS
+  # x156 / IQ3_S x111 / Q5_K x26 / IQ3_XXS x34 / Q3_K x12 / Q4_K x36 / IQ2_S
+  # x15 / Q6_K x7 / IQ2_XS x4 / Q2_K x3 / IQ2_XXS x2 / IQ4_NL x2 - i-quant
+  # dominant, so it rides the dense i-quant lanes (gpu/types.rs kq_is_iq),
+  # not the Q3_K path. Keeps the nextn block, so spec/MTP survives. Verified
+  # on the RTX PRO 6000 before listing: same-weights greedy parity vs
+  # llama.cpp b10628 at the k-quant class verdict (step-0 17/18 with the miss
+  # a coin flip, delta-margin median 0.233 nats, 5/5 same finals), c1 decode
+  # at parity with llama.cpp on the same file. On a 21.5 GiB budget it serves
+  # one slot at up to ~15k context; a 16 GB card does not fit it at all.
+  [[model.artifact]]
+  id = "q3"
+  kind = "weights"
+  format = "gguf"
+  label = "Compact (smaller)"
+  quant = "UD-Q3_K_XL"
+
+  [model.artifact.shape]
+  weight_bytes = 14388711520
+  kind = "generative"
+  vocab = 248320
+  max_ctx = 262144
+  nextn_bytes = 351008768
+  source = "measured"
+  kv_layers = [
+    { k_dim = 1024, v_dim = 1024, count = 16 },
+  ]
+
+    [model.artifact.shape.recurrent]
+    layers = 48
+    state_elems = 786432
+    conv_elems = 30720
+    conv_dim = 10240
+    elem_bytes = 4
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q3_K_XL.gguf"
+    dest = "Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q3_K_XL.gguf"
+    sha256 = "8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e"
+    size = 13146393504
+
   [[model.artifact]]
   id = "vision"
   kind = "vision"

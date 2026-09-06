@@ -42,8 +42,12 @@ export const useReadinessStore = defineStore('readiness', () => {
   const info = ref<Readiness | null>(null)
   let inflight: Promise<void> | undefined
 
-  /** Whether models can run here at all - what the GPU instruments gate on. */
-  const canServe = computed(() => info.value?.state === 'ready')
+  /** Whether this computer cannot run models at all. An `untested` card
+   *  still can - the engine serves an unvalidated card under a warning - so
+   *  only a missing card, or a driver too old to load the kernels, blocks. */
+  const blocked = computed(
+    () => info.value?.state === 'no-card' || info.value?.state === 'driver-too-old',
+  )
   /** Whether there is any NVIDIA card to sample metrics from. True until the
    *  probe answers: a machine that has one must not watch its GPU button
    *  appear a moment after the page does. */
@@ -75,5 +79,5 @@ export const useReadinessStore = defineStore('readiness', () => {
     }
   }
 
-  return { info, canServe, hasCard, notice, load, ensureLoaded }
+  return { info, blocked, hasCard, notice, load, ensureLoaded }
 })

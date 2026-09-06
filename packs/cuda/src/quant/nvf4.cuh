@@ -2140,8 +2140,8 @@ int pd_mxfp4_gemm_bs_gu(const void* gate_data, const void* gate_scale,
 // (bench/nv4_swq_cmp.cu). SWQ=false is the original kernel.
 template <bool SWQ>
 __global__ void __launch_bounds__(384, 1) pd_nvf4_gemm_f4t_kernel(
-    const __grid_constant__ CUtensorMap wdm, const __grid_constant__ CUtensorMap wsm,
-    const __grid_constant__ CUtensorMap ydm, const __grid_constant__ CUtensorMap ysm,
+    const __grid_constant__ PdTmap wdm, const __grid_constant__ PdTmap wsm,
+    const __grid_constant__ PdTmap ydm, const __grid_constant__ PdTmap ysm,
     float* __restrict__ y, unsigned char* __restrict__ qo, unsigned char* __restrict__ qs,
     float scale2, const float* __restrict__ bias,
     uint32_t in_dim, uint32_t out_dim, uint32_t batch) {

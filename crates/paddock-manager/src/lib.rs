@@ -102,7 +102,8 @@ pub async fn run(cfg: Config) -> Result<(), Box<dyn std::error::Error>> {
         readiness::State::Untested => tracing::warn!(
             card = readiness.card.as_deref().unwrap_or("?"),
             "graphics card found, but paddock has not finished testing it - \
-             models will refuse to start unless PADDOCK_UNVALIDATED_ARCH=1"
+             models will run, stamped UNVALIDATED in their logs; speed and \
+             stability on this card are unmeasured"
         ),
         readiness::State::DriverTooOld => tracing::warn!(
             card = readiness.card.as_deref().unwrap_or("?"),

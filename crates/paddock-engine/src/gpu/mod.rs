@@ -316,20 +316,15 @@ impl GpuExecutor {
                  that first ships there. Pre-Ampere cards are not supported."
             )));
         }
-        // Validated-arch allowlist: exact-(major,minor) match
-        // against the closed bring-up campaigns, honest refusal otherwise.
-        // Must run before the trial launch - plain sm_120 SASS forward-loads
-        // onto any 12.x minor, so the baseline probe below would pass on a
-        // GB10/Spark while every sm_120a-only family is unloadable (the
-        // half-serve this gate exists to prevent). See gpu/arch.rs.
-        match arch::gate(
-            self.cc,
-            &device,
-            std::env::var_os("PADDOCK_UNVALIDATED_ARCH").is_some(),
-        ) {
+        // Validated-arch policy: exact-(major,minor) match against the closed
+        // bring-up campaigns serves silently; any other Ampere-or-newer die
+        // serves under the UNVALIDATED warning (see gpu/arch.rs). Runs before
+        // the trial launch so the stamp precedes any no-image refusal - and
+        // so a GB10/Spark, where plain sm_120 SASS forward-loads and the
+        // probe below passes, is named before an sm_120a-only family fails.
+        match arch::gate(self.cc, &device) {
             arch::Gate::Validated => {}
-            arch::Gate::Overridden(warn) => tracing::warn!("{warn}"),
-            arch::Gate::Refused(msg) => return Err(GpuError::Unsupported(msg)),
+            arch::Gate::Unvalidated(warn) => tracing::warn!("{warn}"),
         }
         // trial launch of the always-present elementwise add: proves this
         // pack's fatbin carries an image for this device before any model load

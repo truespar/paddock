@@ -18,8 +18,8 @@ export interface ArchFloor {
 const GEN_FOR_CC: Record<string, string> = { '12.0': 'a Blackwell GPU' }
 
 /** True when this GPU is known to sit below the artifact's floor. No floor, or
- *  no `cc` (silicon we do not recognise), makes no claim: the engine refuses
- *  an unvalidated arch outright, so a second refusal here would be noise. */
+ *  no `cc` (silicon we do not recognise), makes no claim: the engine already
+ *  warns on an unvalidated arch, so a guess here would be noise. */
 export function archBlocked(a: ArchFloor, cc: [number, number] | undefined): boolean {
   const need = a.min_cc
   if (!need || !cc) return false

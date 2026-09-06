@@ -45,7 +45,7 @@ __device__ __forceinline__ uint32_t pd_ts_smid() {
 
 template <uint32_t S>
 __global__ void __launch_bounds__(128) pd_f8row_gemm_tc5_kt(
-    const __grid_constant__ CUtensorMap wmap, const __grid_constant__ CUtensorMap ymap,
+    const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap ymap,
     const float* __restrict__ wrs, const float* __restrict__ xrs,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
     // grid.y = K-split z: decode-shaped grids (168 CTAs at gate/r<=128) fill
@@ -225,7 +225,7 @@ __device__ __forceinline__ void pd_tc5_store(float* y, size_t idx, uint32_t v) {
 
 template <uint32_t S>
 __global__ void __launch_bounds__(128) pd_f8bs_gemm_tc5_kt(
-    const __grid_constant__ CUtensorMap wmap, const __grid_constant__ CUtensorMap ymap,
+    const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ wsc, const unsigned char* __restrict__ xsc,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_TC5_OK
@@ -414,7 +414,7 @@ __global__ void __launch_bounds__(128) pd_f8bs_gemm_tc5_kt(
 // the loop, before the tcgen05.ld epilogue.
 template <uint32_t S>
 __global__ void __launch_bounds__(128) pd_f8bs_gemm_tc5pp_kt(
-    const __grid_constant__ CUtensorMap wmap, const __grid_constant__ CUtensorMap ymap,
+    const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ wsc, const unsigned char* __restrict__ xsc,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch,
     uint32_t dwait) {
@@ -607,7 +607,7 @@ __global__ void __launch_bounds__(128) pd_f8bs_gemm_tc5pp_kt(
 // tmem, and D cols are contiguous. N caps at 256 for kind::mxf8f6f4 ::1.
 template <uint32_t S, uint32_t NT, bool COL = false, bool WN = false>
 __global__ void __launch_bounds__(128) pd_f8bs_gemm_tc5w_kt(
-    const __grid_constant__ CUtensorMap wmap, const __grid_constant__ CUtensorMap ymap,
+    const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ wsc, const unsigned char* __restrict__ xsc,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_TC5_OK
@@ -846,7 +846,7 @@ __global__ void __launch_bounds__(128) pd_f8bs_gemm_tc5w_kt(
 // phases with independent parity masks (parity waits are non-consuming).
 template <uint32_t S, uint32_t NT, bool O16 = false>
 __global__ void __launch_bounds__(160) pd_f8bs_gemm_tc5v_kt(
-    const __grid_constant__ CUtensorMap wmap, const __grid_constant__ CUtensorMap ymap,
+    const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ wsc, const unsigned char* __restrict__ xsc,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_TC5_OK
@@ -1052,7 +1052,7 @@ __global__ void __launch_bounds__(160) pd_f8bs_gemm_tc5v_kt(
 // (stage kt-S) committed before stage kt's TMA was issued.
 template <uint32_t S, uint32_t NT>
 __global__ void __launch_bounds__(128) pd_f8bs_gemm_tc5z_kt(
-    const __grid_constant__ CUtensorMap wmap, const __grid_constant__ CUtensorMap ymap,
+    const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ wsc, const unsigned char* __restrict__ xsc,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_TC5_OK
@@ -1243,7 +1243,7 @@ __global__ void __launch_bounds__(128) pd_f8bs_gemm_tc5z_kt(
 // ks combine. The bar for this shape is ~5-6 TB/s of weight stream.
 template <uint32_t S>
 __global__ void __launch_bounds__(128) pd_f8bs_gemm_tc5d_kt(
-    const __grid_constant__ CUtensorMap wmap, const __grid_constant__ CUtensorMap ymap,
+    const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ wsc, const unsigned char* __restrict__ xsc,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch,
     uint32_t nz, uint32_t pdist) {
@@ -1474,7 +1474,7 @@ __global__ void pd_f8_tiles_repack_kernel(const unsigned char* __restrict__ src,
 // genuinely reused).
 template <uint32_t S, bool EF = false, bool PDL = false, bool TS = false>
 __global__ void __launch_bounds__(128) pd_f8row_gemm_tc5p_kt(
-    const unsigned char* __restrict__ wtiles, const __grid_constant__ CUtensorMap ymap,
+    const unsigned char* __restrict__ wtiles, const __grid_constant__ PdTmap ymap,
     const float* __restrict__ wrs, const float* __restrict__ xrs,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch,
     uint32_t nz, uint32_t pdist, float* __restrict__ yfin, uint32_t* __restrict__ tctr,
@@ -1749,7 +1749,7 @@ __global__ void __launch_bounds__(128) pd_f8row_gemm_tc5p_kt(
 // No-fold path only (batch > 8); the ksfold b<=8 regime keeps the ::1 form.
 template <uint32_t S, bool EF = false, bool PDL = false, bool TS = false>
 __global__ void __launch_bounds__(128) pd_f8row_gemm_tc5p_m2_kt(
-    const unsigned char* __restrict__ wtiles, const __grid_constant__ CUtensorMap ymap,
+    const unsigned char* __restrict__ wtiles, const __grid_constant__ PdTmap ymap,
     const float* __restrict__ wrs, const float* __restrict__ xrs,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch,
     uint32_t nz, uint32_t pdist, uint32_t l2pf) {
@@ -1998,7 +1998,7 @@ __global__ void __launch_bounds__(128) pd_f8row_gemm_tc5p_m2_kt(
 template <uint32_t S, bool EF = false, bool TS = false>
 __global__ void __launch_bounds__(128, 1) __cluster_dims__(2, 1, 1)
 pd_f8row_gemm_c2col_kt(
-    const unsigned char* __restrict__ wtiles, const __grid_constant__ CUtensorMap ymap,
+    const unsigned char* __restrict__ wtiles, const __grid_constant__ PdTmap ymap,
     const float* __restrict__ wrs, const float* __restrict__ xrs,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_TC5_OK
@@ -2379,7 +2379,7 @@ int pd_f8_repack_tiles(const void* rowmajor, void* tiles,
 // smem limit. Same per-element K accumulation order -> bit-identical gate.
 template <uint32_t S, bool EF = false, bool N2 = false, bool TS = false>
 __global__ void __launch_bounds__(128) pd_f8row_gemm_tc5q_kt(
-    const unsigned char* __restrict__ wtiles, const __grid_constant__ CUtensorMap ymap,
+    const unsigned char* __restrict__ wtiles, const __grid_constant__ PdTmap ymap,
     const float* __restrict__ wrs, const float* __restrict__ xrs,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch,
     uint32_t nz, uint32_t pdist, uint32_t* __restrict__ ctr) {
@@ -2802,7 +2802,7 @@ __global__ void __launch_bounds__(128) pd_f8row_gemm_tc5q_kt(
 // per tile, fixed-order combine). Ring: 48KB slots cap S=4 under 227KB.
 template <uint32_t S, bool EF = false>
 __global__ void __launch_bounds__(128) pd_f8row_gemm_tc5t_kt(
-    const unsigned char* __restrict__ wtiles, const __grid_constant__ CUtensorMap ymap,
+    const unsigned char* __restrict__ wtiles, const __grid_constant__ PdTmap ymap,
     const float* __restrict__ wrs, const float* __restrict__ xrs,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch,
     uint32_t nz, uint32_t pdist, uint32_t* __restrict__ ctr) {
@@ -3082,7 +3082,7 @@ __global__ void __launch_bounds__(128) pd_f8row_gemm_tc5t_kt(
 // route), same K walk order within the tile.
 template <uint32_t S>
 __global__ void __launch_bounds__(128) pd_f8row_gemm_tc5m_kt(
-    const unsigned char* __restrict__ wtiles, const __grid_constant__ CUtensorMap ymap,
+    const unsigned char* __restrict__ wtiles, const __grid_constant__ PdTmap ymap,
     const float* __restrict__ wrs, const float* __restrict__ xrs,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_TC5_OK
@@ -3884,7 +3884,7 @@ template <uint32_t S, uint32_t NT, uint32_t NW = 0, uint32_t KT = 1u,
           uint32_t BB = 16384u, uint32_t O16 = 0u>
 __global__ void __launch_bounds__(128) __cluster_dims__(2, 1, 1)
 pd_f8t_gemm_tc5r_kt(const unsigned char* __restrict__ wtiles,
-        const __grid_constant__ CUtensorMap ymap,
+        const __grid_constant__ PdTmap ymap,
         const float* __restrict__ wrs, const float* __restrict__ xrs,
         float* __restrict__ y, uint32_t in_dim, uint32_t out_dim,
         uint32_t batch) {
@@ -4179,7 +4179,7 @@ pd_f8t_gemm_tc5r_kt(const unsigned char* __restrict__ wtiles,
 template <uint32_t S, bool PF = false, bool O16 = false>
 __global__ void __launch_bounds__(320) __cluster_dims__(2, 1, 1)
 pd_f8bs_gemm_tc5s_kt(
-    const __grid_constant__ CUtensorMap wmap, const __grid_constant__ CUtensorMap ymap,
+    const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ wsc, const unsigned char* __restrict__ xsc,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_TC5_OK

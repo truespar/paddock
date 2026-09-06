@@ -125,7 +125,21 @@ if ($gencode.Count -eq 0) { throw "no supported arches to build" }
 # the break - it is Windows-only by construction. Satisfy the check rather than
 # define CCCL_IGNORE_MSVC_TRADITIONAL_PREPROCESSOR_WARNING: that silences the
 # diagnostic and keeps the non-conforming preprocessor CCCL is warning about.
-$crt = @('-Xcompiler', '/Zc:preprocessor')
+# /Zc:__cplusplus is not optional either, and it is a CORRECTNESS flag, not a
+# dialect nicety: without it MSVC reports __cplusplus as 199711L, nvcc mirrors
+# that value into the DEVICE pass, and cuda.h's CUtensorMap - which spells its
+# 128-byte alignment as `#if __cplusplus >= 201103L alignas(128)` - silently
+# degrades to an 8-byte-aligned struct. Every kernel that takes a tensor map
+# by value (`const __grid_constant__ CUtensorMap`) then gets it at whatever
+# 8-byte offset its parameter list dictates, and cp.async.bulk.tensor needs a
+# 64-byte-aligned tensor map: on the RTX 5060 Ti that is
+# CUDA_ERROR_MISALIGNED_ADDRESS on the first f8 lm_head call (the map sits at
+# offset 8, behind the weight pointer). The attention and f8row families
+# survived only because their maps are the FIRST parameters. NVIDIA's own
+# guidance for MSVC-hosted nvcc is this exact flag; tma_desc.cuh static_asserts
+# the alignment so a build that loses it fails at compile time, not on a
+# user's first request.
+$crt = @('-Xcompiler', '/Zc:preprocessor', '-Xcompiler', '/Zc:__cplusplus')
 if ($Static) { $crt += @('-Xcompiler', '/MT') }
 # PD_STATIC drops __declspec(dllexport) from every launcher - see abi.cuh. An
 # archive is resolved by address at link time, so exporting 430 kernel names

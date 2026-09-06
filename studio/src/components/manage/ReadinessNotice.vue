@@ -55,15 +55,10 @@ const head = computed(() => HEAD[rd.notice?.state ?? ''] ?? HEAD['no-card'])
 
     <template v-else-if="rd.notice.state === 'untested'">
       <p class="rn__txt">
-        <strong>Models can't run on {{ card }}.</strong>
-        Paddock only runs models on cards it has measured for itself, and this one hasn't been
-        tested yet - so it won't guess. Cloud models work normally.
+        <strong>{{ card }} hasn't been tested yet.</strong>
+        Models will run on it, but Paddock hasn't measured this card, so speed and stability are
+        unverified - every server started here says so in its log.
       </p>
-      <div class="rn__acts">
-        <RouterLink class="pk-btn pk-btn--primary" :to="{ name: 'cloud' }">
-          <Icon name="cloud" :size="14" /> Add a cloud model
-        </RouterLink>
-      </div>
     </template>
 
     <template v-else>
@@ -102,10 +97,10 @@ const head = computed(() => HEAD[rd.notice?.state ?? ''] ?? HEAD['no-card'])
   width: 100%;
   text-align: left;
 }
-.rn--no-card,
-.rn--untested {
+.rn--no-card {
   border-color: var(--pk-status-error);
 }
+.rn--untested,
 .rn--driver-too-old {
   border-color: var(--pk-status-warning);
 }
@@ -122,10 +117,10 @@ const head = computed(() => HEAD[rd.notice?.state ?? ''] ?? HEAD['no-card'])
   letter-spacing: 0.05em;
   color: var(--pk-text-primary);
 }
-.rn--no-card .rn__hd,
-.rn--untested .rn__hd {
+.rn--no-card .rn__hd {
   color: var(--pk-status-error);
 }
+.rn--untested .rn__hd,
 .rn--driver-too-old .rn__hd {
   color: var(--pk-status-warning);
 }

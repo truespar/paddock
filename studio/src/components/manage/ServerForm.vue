@@ -909,8 +909,8 @@ const gpuAdvOptions = computed(() => {
 // would send someone shopping for silicon we refuse.
 const fp8KvBlocked = computed<string | null>(() => {
   const cc = ready.info?.cc
-  // unrecognised silicon makes no claim - the engine refuses an unvalidated
-  // arch outright, so a second refusal here would be noise
+  // unrecognised silicon makes no claim - the engine already warns on an
+  // unvalidated arch, so a guess here would be noise
   if (!cc) return null
   return cc[0] > 8 || (cc[0] === 8 && cc[1] >= 9) ? null : 'this GPU has no FP8 tensor cores'
 })

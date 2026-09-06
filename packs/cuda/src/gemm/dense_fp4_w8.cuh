@@ -252,7 +252,7 @@ __global__ void __launch_bounds__(256, 2) pd_mxfp4_gemm_bs_kernel(
 // raw over packed bytes + nibble expand (e2m1 at bits 5:2, split order),
 // pd_bs_mma_kb e2m1.e4m3 block-scale. Scale staging identical (ue8m0/32).
 __global__ void __launch_bounds__(384, 1) pd_fp4_gemm_w8_tma_kt(
-    const __grid_constant__ CUtensorMap wmap, const __grid_constant__ CUtensorMap ymap,
+    const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ scale, const unsigned char* __restrict__ xs,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_BS_OK
@@ -1288,7 +1288,7 @@ __global__ void __launch_bounds__(384, 1) pd_f8_gemm_w8_ws_kt(
 // bar.arrive likely fences the loads/mma interleave on top.
 template <bool WIN = false, bool O16 = false>
 __global__ void __launch_bounds__(384, 1) pd_f8_gemm_w8_tma_kt(
-    const __grid_constant__ CUtensorMap wmap, const __grid_constant__ CUtensorMap ymap,
+    const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ scale, const unsigned char* __restrict__ xs,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_F8W8_TMA_OK
@@ -1515,7 +1515,7 @@ __global__ void __launch_bounds__(384, 1) pd_f8_gemm_w8_tma_kt(
 // bit-identical. Ring-depth variants are all falsified; the first stall
 // reading misattributed producer idle-at-barrier to the pipeline.
 __global__ void __launch_bounds__(384, 1) pd_f8_gemm_w8_tma4_kt(
-    const __grid_constant__ CUtensorMap wmap, const __grid_constant__ CUtensorMap ymap,
+    const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ scale, const unsigned char* __restrict__ xs,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_BS_OK
@@ -1694,7 +1694,7 @@ __global__ void __launch_bounds__(384, 1) pd_f8_gemm_w8_tma4_kt(
 // producer warps (64 threads stage 2 scale rows each). Per-element K-chain
 // identical to the baseline -> bit-identical output.
 __global__ void __launch_bounds__(576, 1) pd_f8_gemm_w8_tma16_kt(
-    const __grid_constant__ CUtensorMap wmap, const __grid_constant__ CUtensorMap ymap,
+    const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ scale, const unsigned char* __restrict__ xs,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_BS_OK
@@ -1877,7 +1877,7 @@ __global__ void __launch_bounds__(576, 1) pd_f8_gemm_w8_tma16_kt(
 // then wait Y. Two copies per pair, same as baseline (overpaid
 // with 4). Per-element accumulation order unchanged -> bit-identical.
 __global__ void __launch_bounds__(384, 1) pd_f8_gemm_w8_tma2s_kt(
-    const __grid_constant__ CUtensorMap wmap, const __grid_constant__ CUtensorMap ymap,
+    const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ scale, const unsigned char* __restrict__ xs,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_BS_OK
@@ -2095,7 +2095,7 @@ __global__ void __launch_bounds__(384, 1) pd_f8_gemm_w8_tma2s_kt(
 // (wait W -> half-0 A burst -> wait Y). Accumulation order unchanged ->
 // bit-identical.
 __global__ void __launch_bounds__(384, 1) pd_f8_gemm_w8_wy23_kt(
-    const __grid_constant__ CUtensorMap wmap, const __grid_constant__ CUtensorMap ymap,
+    const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ scale, const unsigned char* __restrict__ xs,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_BS_OK
@@ -2353,7 +2353,7 @@ __global__ void __launch_bounds__(384, 1) pd_f8_gemm_w8_wy23_kt(
 // fine at 320 (2 producer warps, 204-reg cap). Accumulation order unchanged
 // -> bit-identical.
 __global__ void __launch_bounds__(320, 1) pd_f8_gemm_w8_res_kt(
-    const __grid_constant__ CUtensorMap wmap, const __grid_constant__ CUtensorMap ymap,
+    const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ scale, const unsigned char* __restrict__ xs,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_BS_OK

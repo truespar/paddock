@@ -3716,8 +3716,8 @@ __global__ void __launch_bounds__(256, (STAGES <= 2u) ? 2 : 1) pd_f8row_gemm_kt(
 // 1143; the wave form is better at nearly every width.
 template <uint32_t STAGES>
 __global__ void __launch_bounds__(256) pd_f8row_gemm_tw_kernel(
-    const __grid_constant__ CUtensorMap wmap,
-    const __grid_constant__ CUtensorMap xmap,
+    const __grid_constant__ PdTmap wmap,
+    const __grid_constant__ PdTmap xmap,
     const float* __restrict__ wrs, const float* __restrict__ xrs,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_MMA_OK && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
@@ -3843,8 +3843,8 @@ __global__ void __launch_bounds__(256) pd_f8row_gemm_tw_kernel(
 // mbarrier handshake, no __syncthreads in loop, deep ring at 1 block/SM.
 template <uint32_t STAGES>
 __global__ void __launch_bounds__(288) pd_f8row_gemm_tw4_kernel(
-    const __grid_constant__ CUtensorMap wmap,
-    const __grid_constant__ CUtensorMap xmap,
+    const __grid_constant__ PdTmap wmap,
+    const __grid_constant__ PdTmap xmap,
     const float* __restrict__ wrs, const float* __restrict__ xrs,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_MMA_OK && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
@@ -3978,8 +3978,8 @@ __global__ void __launch_bounds__(288) pd_f8row_gemm_tw4_kernel(
 // Two h64 TMA boxes per operand per stage. Gate-shape geometry: 100 CTAs = 1 wave.
 template <uint32_t STAGES>
 __global__ void __launch_bounds__(544) pd_f8row_gemm_tw5_kernel(
-    const __grid_constant__ CUtensorMap wmap,
-    const __grid_constant__ CUtensorMap xmap,
+    const __grid_constant__ PdTmap wmap,
+    const __grid_constant__ PdTmap xmap,
     const float* __restrict__ wrs, const float* __restrict__ xrs,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_MMA_OK && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
@@ -4154,8 +4154,8 @@ static bool pd_tmap_2d_h64_cached(CUtensorMap* out, const void* base, uint64_t i
 
 template <uint32_t STAGES, uint32_t BN>
 __global__ void __launch_bounds__(288) pd_f8row_gemm_tw4d_kernel(
-    const __grid_constant__ CUtensorMap wmap,
-    const __grid_constant__ CUtensorMap xmap,
+    const __grid_constant__ PdTmap wmap,
+    const __grid_constant__ PdTmap xmap,
     const float* __restrict__ wrs, const float* __restrict__ xrs,
     float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_MMA_OK && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
@@ -4561,8 +4561,12 @@ int pd_add_rmsnorm_scaled_quant_e4m3_row(void* x, const void* proj, const void* 
 // construction) and launch as programmatic dependents. Kill (A/B only):
 // PADDOCK_NO_F8R_PDL (plain launches; the arm is a no-op under them).
 template <typename K, typename... Args>
+// Args by const reference, not by value: a CUtensorMap argument is 128-aligned
+// under /Zc:__cplusplus and MSVC refuses an over-aligned BY-VALUE parameter
+// (C2719); the launch expression below still copies it into the kernel's
+// PdTmap parameter (tma_desc.cuh).
 static inline void pd_f8r_go(K kern, dim3 grid, dim3 block, uint32_t smem,
-                             cudaStream_t st, Args... args) {
+                             cudaStream_t st, const Args&... args) {
     static const bool off = pd_env("PADDOCK_NO_F8R_PDL") != nullptr;
     if (off) { kern<<<grid, block, smem, st>>>(args...); return; }
     pd_pdl_go(kern, grid, block, smem, st, args...);

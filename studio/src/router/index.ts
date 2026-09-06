@@ -153,7 +153,7 @@ router.beforeEach(async (to) => {
   // time a guard runs, pinia is installed.
   const readiness = useReadinessStore()
   await readiness.ensureLoaded()
-  if (!readiness.notice) return true
+  if (!readiness.blocked) return true
   return to.name === 'embeddings' ? { name: 'home' } : { name: 'servers' }
 })
 

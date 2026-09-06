@@ -3099,7 +3099,7 @@ __host__ __device__ constexpr uint32_t pd_q2t_dn_stride(uint32_t rb) {
 #if PD_Q2T_DEV
 // one 128B-swizzled W tick (2 subtiles of RB rows) into dst, rows at wrow0
 template <uint32_t RB>
-__device__ __forceinline__ void pd_q2t_wtick(const CUtensorMap* map, uint32_t dst,
+__device__ __forceinline__ void pd_q2t_wtick(const void* map, uint32_t dst,
                                              uint32_t ck, uint32_t wrow0,
                                              uint32_t mbar) {
     asm volatile(
@@ -3157,7 +3157,7 @@ __device__ __forceinline__ void pd_q2t_wsc(__half* dst, const __half* ws, size_t
 
 template <uint32_t S, bool GELU, uint32_t RB>
 __global__ void __launch_bounds__(256, RB == 32u ? 4 : 2) pd_q8_0_moe_gate_up_mma2t_kernel(
-    const __grid_constant__ CUtensorMap gmap, const __grid_constant__ CUtensorMap umap,
+    const __grid_constant__ PdTmap gmap, const __grid_constant__ PdTmap umap,
     const __half* __restrict__ gate_scale, const __half* __restrict__ up_scale,
     const unsigned int* __restrict__ sorted_row, const unsigned int* __restrict__ block_expert,
     const int8_t* __restrict__ xq, const float* __restrict__ xs,
@@ -3403,7 +3403,7 @@ __global__ void __launch_bounds__(256, RB == 32u ? 4 : 2) pd_q8_0_moe_gate_up_mm
 
 template <uint32_t S, uint32_t RB>
 __global__ void __launch_bounds__(256, RB == 32u ? 4 : PD_QMMA2_OCC_DN) pd_q8_0_moe_down_mma2t_kernel(
-    const __grid_constant__ CUtensorMap dmap, const __half* __restrict__ down_scale,
+    const __grid_constant__ PdTmap dmap, const __half* __restrict__ down_scale,
     const unsigned int* __restrict__ sorted_row, const unsigned int* __restrict__ sorted_slot,
     const unsigned int* __restrict__ block_expert, const float* __restrict__ topk_w,
     const int8_t* __restrict__ fq, const float* __restrict__ fs,
@@ -3604,7 +3604,7 @@ __device__ __forceinline__ void pd_q2t_wsc64(__half* dst, const __half* ws,
 
 template <uint32_t S, bool GELU>
 __global__ void __launch_bounds__(320, 2) pd_q8_0_moe_gate_up_mma2w_kernel(
-    const __grid_constant__ CUtensorMap gmap, const __grid_constant__ CUtensorMap umap,
+    const __grid_constant__ PdTmap gmap, const __grid_constant__ PdTmap umap,
     const __half* __restrict__ gate_scale, const __half* __restrict__ up_scale,
     const unsigned int* __restrict__ sorted_row, const unsigned int* __restrict__ block_expert,
     const int8_t* __restrict__ xq, const float* __restrict__ xs,
@@ -3807,7 +3807,7 @@ __global__ void __launch_bounds__(320, 2) pd_q8_0_moe_gate_up_mma2w_kernel(
 
 template <uint32_t S>
 __global__ void __launch_bounds__(320, 2) pd_q8_0_moe_down_mma2w_kernel(
-    const __grid_constant__ CUtensorMap dmap, const __half* __restrict__ down_scale,
+    const __grid_constant__ PdTmap dmap, const __half* __restrict__ down_scale,
     const unsigned int* __restrict__ sorted_row, const unsigned int* __restrict__ sorted_slot,
     const unsigned int* __restrict__ block_expert, const float* __restrict__ topk_w,
     const int8_t* __restrict__ fq, const float* __restrict__ fs,
@@ -4173,7 +4173,7 @@ int pd_q8_0_moe_down_mma2t(const void*, const void*, const void*, const void*,
 
 template <uint32_t S, bool GELU>
 __global__ void __launch_bounds__(256, 2) pd_q8_0_moe_gate_up_g2_kernel(
-    const __grid_constant__ CUtensorMap gmap, const __grid_constant__ CUtensorMap umap,
+    const __grid_constant__ PdTmap gmap, const __grid_constant__ PdTmap umap,
     const __half* __restrict__ gate_scale, const __half* __restrict__ up_scale,
     const unsigned int* __restrict__ sorted_row, const unsigned int* __restrict__ sorted_slot,
     const unsigned int* __restrict__ block_expert, const unsigned int* __restrict__ pmap,

@@ -14,8 +14,8 @@ __device__ unsigned long long tc5d_stuck[4];
 
 template <uint32_t HD, uint32_t G, bool PROF = false>
 __global__ void __launch_bounds__(256) pd_attn_decode_tc5e_kernel(
-    const __grid_constant__ CUtensorMap tmk,
-    const __grid_constant__ CUtensorMap tmv,
+    const __grid_constant__ PdTmap tmk,
+    const __grid_constant__ PdTmap tmv,
     const float* __restrict__ q, float* __restrict__ out_o,
     const unsigned int* __restrict__ positions,
     const unsigned int* __restrict__ slots,

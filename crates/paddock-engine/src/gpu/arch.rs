@@ -1,20 +1,33 @@
-//! Validated-arch allowlist - "supported" is a TESTED claim, not a compile
+//! Validated-arch policy - "supported" is a TESTED claim, not a compile
 //! flag.
 //!
-//! Paddock is a specialized engine: a compute generation is served only after
-//! its bring-up is complete (kernels tuned on the real die, parity-gated,
-//! throughput measured). Everything else gets an honest refusal at
-//! startup - never a half-serve at unknown performance. CUDA's own rules make
-//! the half-serve the default failure mode without this gate: plain sm_120
-//! SASS forward-loads onto any 12.x minor (so a GB10 / DGX Spark "works"
-//! until the first `sm_120a`-only tensor-core lane launches and dies
-//! mid-request), and preflight's trial launch only proves the BASELINE image.
-//! An exact-(major,minor) allowlist is the only honest check.
+//! Paddock is a specialized engine: a compute generation is SUPPORTED only
+//! after its bring-up is complete (kernels tuned on the real die,
+//! parity-gated, throughput measured). Every other Ampere-or-newer die still
+//! serves - under a startup warning that names it UNVALIDATED, so a number
+//! measured on it can never masquerade as a supported result. The warning
+//! replaced the refusal and its `PADDOCK_UNVALIDATED_ARCH=1` override
+//! (2026-09-06): a person with an untested card gets to run and gets told
+//! what that means, instead of being sent to find an environment variable
+//! (which the Studio never honoured anyway - it hid the start button on any
+//! non-ready card).
 //!
-//! Lifecycle per generation: unknown -> refused; in bring-up -> serves only
-//! under `PADDOCK_UNVALIDATED_ARCH=1`, stamped UNVALIDATED in every log so a
-//! number measured mid-bring-up can never masquerade as a supported result;
-//! validated -> listed below, with the campaign that closed it.
+//! What stays a hard stop is what cannot run at all: pre-Ampere silicon (no
+//! int8 mma ladder to build on - `gpu/mod.rs` refuses it before this gate)
+//! and a die the pack carries no SASS for (the trial launch after this gate
+//! catches it - the fatbin has no PTX, so there is no limp mode to fall
+//! into).
+//!
+//! The case the refusal covered better is the same-major minor (GB10 / DGX
+//! Spark, sm_121): plain sm_120 SASS forward-loads onto it, the trial launch
+//! passes, and the `sm_120a`-only tensor-core families - which the pack's
+//! per-device table resolves by MAJOR (exports.cuh) - fail at their first
+//! launch rather than at startup. The warning says so; a Spark campaign is
+//! the fix, not a gate.
+//!
+//! Lifecycle per generation: unknown -> serves with the warning; in bring-up
+//! -> the same, with the campaign named; validated -> listed below, with the
+//! campaign that closed it.
 
 // The lists themselves are DATA, not code: `gpu-support.toml` at the repo
 // root, parsed once by paddock-models and read here and by the manager alike.
@@ -28,8 +41,8 @@ fn validated() -> Vec<(u32, u32, &'static str)> {
     rows(Status::Supported)
 }
 
-/// Capabilities with an open campaign - named in the refusal so the state is
-/// visible, and expected to run under the override meanwhile.
+/// Capabilities with an open campaign - named in the warning so the state is
+/// visible.
 fn in_bring_up() -> Vec<(u32, u32, &'static str)> {
     rows(Status::Bringup)
 }
@@ -45,38 +58,28 @@ fn rows(want: Status) -> Vec<(u32, u32, &'static str)> {
 pub(super) enum Gate {
     /// Campaign closed - serve normally.
     Validated,
-    /// Unvalidated silicon, operator override - serve, WARN with the stamp.
-    Overridden(String),
-    /// Unvalidated silicon, no override - refuse with the full sentence.
-    Refused(String),
+    /// Unvalidated silicon - serve, WARN with the stamp.
+    Unvalidated(String),
 }
 
-/// Pure decision (env read stays at the call site so this is testable).
-pub(super) fn gate(cc: (u32, u32), device: &str, override_set: bool) -> Gate {
-    gate_in(cc, device, override_set, &validated(), &in_bring_up())
+/// Pure decision, so it is testable.
+pub(super) fn gate(cc: (u32, u32), device: &str) -> Gate {
+    gate_in(cc, device, &validated(), &in_bring_up())
 }
 
 /// The decision against GIVEN lists, so the bring-up branch stays under test
-/// while `IN_BRING_UP` is empty. A branch nobody exercises is a branch that
+/// while `in_bring_up()` is empty. A branch nobody exercises is a branch that
 /// rots, and this one only wakes up when a new generation opens - exactly
 /// when it is least convenient to discover it stopped working.
 fn gate_in(
     cc: (u32, u32),
     device: &str,
-    override_set: bool,
     validated: &[(u32, u32, &str)],
     in_bring_up: &[(u32, u32, &str)],
 ) -> Gate {
     let (maj, min) = cc;
     if validated.iter().any(|&(a, b, _)| (a, b) == (maj, min)) {
         return Gate::Validated;
-    }
-    if override_set {
-        return Gate::Overridden(format!(
-            "SERVING ON UNVALIDATED ARCH sm_{maj}{min} ({device}) - \
-             PADDOCK_UNVALIDATED_ARCH override is set. Numbers from this \
-             machine are bring-up data, NOT supported results; label them so."
-        ));
     }
     let validated_list = validated
         .iter()
@@ -88,14 +91,13 @@ fn gate_in(
         .find(|&&(a, b, _)| (a, b) == (maj, min))
         .map(|&(.., note)| format!(" This generation's bring-up is IN PROGRESS ({note})."))
         .unwrap_or_default();
-    Gate::Refused(format!(
-        "{device} is sm_{maj}{min}, which this engine build has not validated \
-         (validated: {validated_list}).{bring_up} Paddock serves a compute \
-         generation only after its bring-up validation is complete - an unvalidated \
-         die would serve at unknown performance or fail mid-request, and an \
-         honest \"not yet\" beats both. Set PADDOCK_UNVALIDATED_ARCH=1 to \
-         serve anyway for bring-up/testing; every log is then stamped \
-         UNVALIDATED."
+    Gate::Unvalidated(format!(
+        "SERVING ON UNVALIDATED ARCH sm_{maj}{min} ({device}) - this engine build has \
+         validated {validated_list} only.{bring_up} Paddock has not tuned or measured \
+         its kernels on this generation: performance is unmeasured, and a kernel \
+         family with no image for this die fails at its first launch rather than \
+         at startup. Numbers from this machine are bring-up data, NOT supported \
+         results; label them so."
     ))
 }
 
@@ -104,53 +106,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validated_dies_serve() {
-        assert!(matches!(gate((8, 6), "A6000", false), Gate::Validated));
-        assert!(matches!(
-            gate((12, 0), "RTX PRO 6000", false),
-            Gate::Validated
-        ));
+    fn validated_dies_serve_silently() {
+        assert!(matches!(gate((8, 6), "A6000"), Gate::Validated));
+        assert!(matches!(gate((12, 0), "RTX PRO 6000"), Gate::Validated));
         // sm_100 joined when its campaign closed - before that it sat in
-        // IN_BRING_UP, serving only under the override.
-        assert!(matches!(gate((10, 0), "B200", false), Gate::Validated));
+        // bring-up, serving under the stamp.
+        assert!(matches!(gate((10, 0), "B200"), Gate::Validated));
     }
 
     /// The GB10 / DGX Spark case: same major as the validated consumer die,
-    /// different minor - exact matching must refuse it (plain-SASS forward
-    /// compatibility is precisely what made it half-serve before this gate).
+    /// different minor - exact matching must NOT read it as validated (plain
+    /// sm_120 SASS forward-loads onto it, which is precisely what made it
+    /// half-serve unannounced before this gate). It serves, stamped.
     #[test]
-    fn same_major_different_minor_is_refused() {
-        let Gate::Refused(msg) = gate((12, 1), "GB10", false) else {
-            panic!("sm_121 must be refused without the override");
+    fn same_major_different_minor_serves_with_the_stamp() {
+        let Gate::Unvalidated(warn) = gate((12, 1), "GB10") else {
+            panic!("sm_121 must not pass as validated");
         };
-        assert!(msg.contains("sm_121"));
-        assert!(msg.contains("PADDOCK_UNVALIDATED_ARCH"));
+        assert!(warn.contains("sm_121"), "{warn}");
+        assert!(warn.contains("UNVALIDATED"), "{warn}");
+        assert!(warn.contains("first launch"), "{warn}");
     }
 
-    /// A generation with an open campaign: refused by default with the
-    /// campaign named, served with the stamp under the override.
+    /// A generation with an open campaign: served with the campaign named.
     ///
-    /// Driven through a synthetic list because `IN_BRING_UP` is empty today -
+    /// Driven through a synthetic list because `in_bring_up()` is empty today -
     /// sm_100 was its last occupant and its campaign has closed. The behaviour
     /// has to keep working for whatever opens next, and an untested branch
     /// would not.
     #[test]
-    fn bring_up_arch_names_its_campaign_and_overrides_with_stamp() {
+    fn bring_up_arch_names_its_campaign_in_the_stamp() {
         const NEXT: &[(u32, u32, &str)] = &[(13, 0, "Rubin - campaign open")];
-        let Gate::Refused(msg) = gate_in((13, 0), "Rubin", false, &validated(), NEXT) else {
-            panic!("an open campaign must still be refused by default");
+        let Gate::Unvalidated(warn) = gate_in((13, 0), "Rubin", &validated(), NEXT) else {
+            panic!("an open campaign must serve under the stamp");
         };
-        assert!(msg.contains("IN PROGRESS"), "{msg}");
-        let Gate::Overridden(warn) = gate_in((13, 0), "Rubin", true, &validated(), NEXT) else {
-            panic!("override must serve");
-        };
+        assert!(warn.contains("IN PROGRESS"), "{warn}");
         assert!(warn.contains("UNVALIDATED"), "{warn}");
     }
 
-    /// A future major (Rubin-class) gets the same honest refusal - no PTX
-    /// limp mode, no cryptic driver error.
+    /// A future major (Rubin-class) gets the same stamp - the trial launch
+    /// after the gate is what refuses a die the pack has no image for.
     #[test]
-    fn future_major_is_refused() {
-        assert!(matches!(gate((13, 0), "Rubin", false), Gate::Refused(_)));
+    fn future_major_serves_with_the_stamp() {
+        assert!(matches!(gate((13, 0), "Rubin"), Gate::Unvalidated(_)));
+    }
+
+    /// The old override is gone for good: nothing in the decision reads the
+    /// environment, so a stale `PADDOCK_UNVALIDATED_ARCH` in a shell changes
+    /// nothing and the stamp never advertises it.
+    #[test]
+    fn the_stamp_does_not_advertise_an_override() {
+        let Gate::Unvalidated(warn) = gate((8, 9), "GeForce RTX 4090") else {
+            panic!("Ada is Built, not Supported");
+        };
+        assert!(!warn.contains("PADDOCK_"), "{warn}");
     }
 }

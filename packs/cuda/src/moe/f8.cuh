@@ -167,7 +167,7 @@ int pd_quantize_e4m3_geglu2_pad(const void* gu, void* q, void* scale, uint32_t n
 // compile time, so BN=128 instantiations keep the shipped PTX.
 template <uint32_t S, bool DN, uint32_t NT = 1u, uint32_t BN = 128u>
 __global__ void __launch_bounds__(128) pd_f8bs_moe_tc5_kt(
-    const __grid_constant__ CUtensorMap wmap, const __grid_constant__ CUtensorMap ymap,
+    const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ wsc, const unsigned char* __restrict__ xsc,
     const unsigned int* __restrict__ bexp, const unsigned int* __restrict__ srow,
     const unsigned int* __restrict__ sslot, const float* __restrict__ topk_w,
@@ -550,7 +550,7 @@ int pd_f8bs_moe_gemm_gu_d32(const void* wdata, const void* wsc, const void* xg,
 // it only if kbench shows the stall).
 template <uint32_t S>
 __global__ void __launch_bounds__(128) pd_f8bs_moe_dn_d32_kt(
-    const __grid_constant__ CUtensorMap wmap, const __grid_constant__ CUtensorMap ymap,
+    const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ wsc, const unsigned char* __restrict__ xsc,
     const unsigned int* __restrict__ bexp, const unsigned int* __restrict__ srow,
     const unsigned int* __restrict__ sslot, const float* __restrict__ topk_w,

@@ -30,9 +30,9 @@ pub enum Status {
     /// Bring-up campaign closed: kernels tuned on the real die, parity suites
     /// green, throughput measured. The engine serves it.
     Supported,
-    /// Campaign OPEN. Refused unless `PADDOCK_UNVALIDATED_ARCH=1`, and every
-    /// log from such a run is stamped UNVALIDATED so a mid-campaign number can
-    /// never masquerade as a supported result.
+    /// Campaign OPEN. Serves, with the campaign named in the startup warning
+    /// that stamps the run UNVALIDATED, so a mid-campaign number can never
+    /// masquerade as a supported result.
     Bringup,
     /// The next campaigns, not a shortfall: the engine refuses, because
     /// loading is not serving.
@@ -85,12 +85,12 @@ pub struct Arch {
     ///
     /// Every `Supported` die must have it (a card we promise to serve and then
     /// cannot load kernels for is the worst of both, and the test below
-    /// enforces it). It is also true for dies we do not serve, and that is the
-    /// whole point: the fatbin carries no PTX, so without SASS on board
-    /// `PADDOCK_UNVALIDATED_ARCH=1` - which the refusal text advertises, and
-    /// which is how a bring-up campaign STARTS - has nothing to run. Found
-    /// when the release began welding a validated-only pack into the binary:
-    /// the escape hatch still opened, onto a drop.
+    /// enforces it). It is also true for dies we have not validated, and that
+    /// is the whole point: the fatbin carries no PTX, so without SASS on
+    /// board an unvalidated card - which serves under the UNVALIDATED
+    /// warning, and that is how a bring-up campaign STARTS - has nothing to
+    /// run. Found when the release began welding a validated-only pack into
+    /// the binary: the (then) escape hatch still opened, onto a drop.
     ///
     /// Not serialized: this describes how we build, not what a user's card is,
     /// and the manager's supported-GPU sheet has no business rendering it.
@@ -228,16 +228,16 @@ pub static ALL: &[Arch] = &[
         )
     },
     Arch {
-        // The one UNSUPPORTED DIE we SHIP KERNELS FOR.
+        // The one UNVALIDATED DIE we SHIP KERNELS FOR.
         // Ada is the cheap-rental sweet spot named,
         // so it is where a bring-up campaign realistically starts - and a
-        // campaign starts by setting PADDOCK_UNVALIDATED_ARCH=1 on a SHIPPED
-        // binary. Without SASS on board that flag opens onto nothing, because
-        // the fatbin carries no PTX. ~5 MB to keep the escape hatch honest.
+        // campaign starts by running a SHIPPED binary on it (it serves under
+        // the UNVALIDATED warning). Without SASS on board that opens onto
+        // nothing, because the fatbin carries no PTX. ~5 MB to keep it honest.
         //
-        // It is still `Built`: the engine refuses it, no board exists, and
+        // It is still `Built`: the engine stamps it, no board exists, and
         // nothing here is a claim that Ada is fast. Carrying the kernels is a
-        // build decision; serving is a measurement.
+        // build decision; supporting is a measurement.
         in_pack: true,
         ..arch(
             (8, 9),

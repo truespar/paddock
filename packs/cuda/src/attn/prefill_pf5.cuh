@@ -185,7 +185,7 @@ int pd_pf_runs_register(const void* run_offs, unsigned int n_runs,
 template <uint32_t HD, uint32_t G, uint32_t TK, bool F8 = false, bool F8QK = false,
           bool KB = false>
 __global__ void __launch_bounds__(256, 1) pd_attn_prefill_pf5_kernel(
-    const __grid_constant__ CUtensorMap tmk, const __grid_constant__ CUtensorMap tmv,
+    const __grid_constant__ PdTmap tmk, const __grid_constant__ PdTmap tmv,
     const float* __restrict__ q, const __half* __restrict__ pool_k,
     const __half* __restrict__ pool_v, const float* __restrict__ sinks,
     float* __restrict__ out, const unsigned int* __restrict__ positions,

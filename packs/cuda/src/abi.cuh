@@ -3113,8 +3113,12 @@ static inline bool pd_pdl_dev_ok() {
     return ok == 1;
 }
 template <typename K, typename... Args>
+// Args by const reference, not by value: a CUtensorMap argument is 128-aligned
+// under /Zc:__cplusplus and MSVC refuses an over-aligned BY-VALUE parameter
+// (C2719); the launch expression below still copies it into the kernel's
+// PdTmap parameter (tma_desc.cuh).
 static inline void pd_pdl_go(K kern, dim3 grid, dim3 block, uint32_t smem,
-                             cudaStream_t st, Args... args) {
+                             cudaStream_t st, const Args&... args) {
     if (pd_pdl_off() || !pd_pdl_dev_ok()) {
         kern<<<grid, block, smem, st>>>(args...);
         return;

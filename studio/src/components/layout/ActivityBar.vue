@@ -27,10 +27,11 @@ const noChats = computed(() => chat.loaded && chat.conversations.length === 0)
 // Embeddings/rerank is a page for a running ENCODER, and an encoder only ever
 // runs on this box's GPU - there is no cloud embeddings lane. A machine that
 // cannot serve therefore has nothing behind that button, ever, so it is not
-// offered. `notice` is null while the probe is out and
-// null when the answer is fine, so the item never appears LATE on a good box;
-// it disappears on a bad one, which is the right way round.
-const canRunHere = computed(() => !readiness.notice)
+// offered. `blocked` is false while the probe is out and
+// false when the answer is fine, so the item never appears LATE on a good box;
+// it disappears on a bad one, which is the right way round. An untested card
+// is not a bad one - it serves, under a warning.
+const canRunHere = computed(() => !readiness.blocked)
 
 function go(name: string): void {
   // instrument's route requires a :tab param - a bare { name } push aborts

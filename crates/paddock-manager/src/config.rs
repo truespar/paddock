@@ -238,8 +238,6 @@ pub const ENV_SURFACE: &[&str] = &[
     "PADDOCK_API_BASE",
     // the box data root (paddock_admin::data_root_resolved)
     "PADDOCK_DATA",
-    // start on an arch we have not validated, having read the refusal
-    "PADDOCK_UNVALIDATED_ARCH",
     // let a model be started that the estimator says will not fit
     "PADDOCK_ALLOW_VRAM_OVERCOMMIT",
 ];

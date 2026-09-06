@@ -2214,8 +2214,8 @@ __global__ void pd_attn_decode_v5_kernel(
 #endif
 template <uint32_t HD, uint32_t G>
 __global__ void pd_attn_decode_v7_kernel(
-    const __grid_constant__ CUtensorMap tmk,
-    const __grid_constant__ CUtensorMap tmv,
+    const __grid_constant__ PdTmap tmk,
+    const __grid_constant__ PdTmap tmv,
     const float* __restrict__ q, float* __restrict__ out_o,
     float* __restrict__ out_ml, const unsigned int* __restrict__ positions,
     const unsigned int* __restrict__ slots,
@@ -2480,8 +2480,8 @@ __global__ void pd_attn_decode_v7_kernel(
 
 template <uint32_t HD, uint32_t G>
 __global__ void pd_attn_decode_v7ks_kernel(
-    const __grid_constant__ CUtensorMap tmk,
-    const __grid_constant__ CUtensorMap tmv,
+    const __grid_constant__ PdTmap tmk,
+    const __grid_constant__ PdTmap tmv,
     const float* __restrict__ q, float* __restrict__ out_o,
     float* __restrict__ out_ml, const unsigned int* __restrict__ positions,
     const unsigned int* __restrict__ slots,
@@ -2772,8 +2772,8 @@ __global__ void pd_attn_decode_v7ks_kernel(
 // pipeline, barriers, and mma paths are bit-identical to the f16 form.
 template <uint32_t HD, uint32_t G, bool F8 = false>
 __global__ void pd_attn_decode_v8_kernel(
-    const __grid_constant__ CUtensorMap tmk,
-    const __grid_constant__ CUtensorMap tmv,
+    const __grid_constant__ PdTmap tmk,
+    const __grid_constant__ PdTmap tmv,
     const float* __restrict__ q, float* __restrict__ out_o,
     float* __restrict__ out_ml, const unsigned int* __restrict__ positions,
     const unsigned int* __restrict__ slots,
@@ -3183,8 +3183,8 @@ __global__ void pd_attn_decode_v8_kernel(
 
 template <uint32_t HD, uint32_t G>
 __global__ void pd_attn_decode_v8ks_kernel(
-    const __grid_constant__ CUtensorMap tmk,
-    const __grid_constant__ CUtensorMap tmv,
+    const __grid_constant__ PdTmap tmk,
+    const __grid_constant__ PdTmap tmv,
     const float* __restrict__ q, float* __restrict__ out_o,
     float* __restrict__ out_ml, const unsigned int* __restrict__ positions,
     const unsigned int* __restrict__ slots,

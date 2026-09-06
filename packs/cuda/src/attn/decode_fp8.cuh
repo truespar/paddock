@@ -27,8 +27,8 @@
 // blockDim 288: warps 0-1 score, 2-7 V, 8 = V expander.
 template <uint32_t HD, uint32_t G>
 __global__ void __launch_bounds__(320, 3) pd_attn_decode_v8q_kernel(
-    const __grid_constant__ CUtensorMap tmk,
-    const __grid_constant__ CUtensorMap tmv,
+    const __grid_constant__ PdTmap tmk,
+    const __grid_constant__ PdTmap tmv,
     const float* __restrict__ q, float* __restrict__ out_o,
     float* __restrict__ out_ml, const unsigned int* __restrict__ positions,
     const unsigned int* __restrict__ slots,
@@ -482,8 +482,8 @@ int pd_vdim_sync(const void* pool, void* vdim, const void* positions,
 template <uint32_t HD, uint32_t G, uint32_t MB = 1u, uint32_t VD = 0u,
           uint32_t WS = 2u>
 __global__ void __launch_bounds__(256, MB) pd_attn_decode_v9q_kernel(
-    const __grid_constant__ CUtensorMap tmk,
-    const __grid_constant__ CUtensorMap tmv,
+    const __grid_constant__ PdTmap tmk,
+    const __grid_constant__ PdTmap tmv,
     const float* __restrict__ q, float* __restrict__ out_o,
     float* __restrict__ out_ml, const unsigned int* __restrict__ positions,
     const unsigned int* __restrict__ slots,
@@ -564,7 +564,7 @@ __global__ void __launch_bounds__(256, MB) pd_attn_decode_v9q_kernel(
              + sw8(kk & 15u, (dd & 127u) >> 4) + (dd & 15u);
     };
     // stage a SUPERTILE (2 blocks; the tail may have 1 - expect scales)
-    auto stage = [&](unsigned char* dstb, uint64_t* bar, const CUtensorMap* tm,
+    auto stage = [&](unsigned char* dstb, uint64_t* bar, const void* tm,
                      uint32_t st, bool isv) {
         // boxes per 16-token block = HD/128 (2 at hd256, 4 at hd512) - the
         // hd256-hardcoded 2 left half the bytes unstaged at hd512 and the
@@ -941,8 +941,8 @@ __global__ void __launch_bounds__(256, MB) pd_attn_decode_v9q_kernel(
 // (64+192=256 arrivals per generation), arrive2/sync2 once each.
 template <uint32_t HD, uint32_t G, uint32_t MB = 3u>
 __global__ void __launch_bounds__(256, MB) pd_attn_decode_v9q2_kernel(
-    const __grid_constant__ CUtensorMap tmk,
-    const __grid_constant__ CUtensorMap tmv,
+    const __grid_constant__ PdTmap tmk,
+    const __grid_constant__ PdTmap tmv,
     const float* __restrict__ q, float* __restrict__ out_o,
     float* __restrict__ out_ml, const unsigned int* __restrict__ positions,
     const unsigned int* __restrict__ slots,
@@ -1021,7 +1021,7 @@ __global__ void __launch_bounds__(256, MB) pd_attn_decode_v9q2_kernel(
              + sw8(kk & 15u, (dd & 127u) >> 4) + (dd & 15u);
     };
     // stage a 64-key WINDOW (up to 4 blocks; tails stage fewer - expect scales)
-    auto stage64 = [&](unsigned char* dstb, uint64_t* bar, const CUtensorMap* tm,
+    auto stage64 = [&](unsigned char* dstb, uint64_t* bar, const void* tm,
                        uint32_t st64) {
         constexpr uint32_t BPB = HD / 128u;
         const uint32_t blocks = min(4u, nblk - st64 * 4u);

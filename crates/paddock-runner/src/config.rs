@@ -728,8 +728,6 @@ pub const ENV_SURFACE: &[&str] = &[
     // --- outside merge_env ---
     // where the box's data lives (paddock_admin::data_root_resolved)
     "PADDOCK_DATA",
-    // serve on an arch we have not validated, having read the refusal
-    "PADDOCK_UNVALIDATED_ARCH",
 ];
 
 fn env_str(name: &str) -> Option<String> {

@@ -238,7 +238,7 @@ int pd_f8w_repack_lin_bs_gui(const void* data, void* dst, uint32_t in_dim,
 template <uint32_t BN, uint32_t STAGES, uint32_t MINB, bool BS = false, bool RW = false,
           uint32_t KP = 1u>
 __global__ void __launch_bounds__(256, MINB) pd_f8_gemm_lin_kernel(
-        const unsigned char* __restrict__ wlin, const __grid_constant__ CUtensorMap ymap,
+        const unsigned char* __restrict__ wlin, const __grid_constant__ PdTmap ymap,
         const unsigned char* __restrict__ xs, float* __restrict__ y,
         uint32_t in_dim, uint32_t out_dim, uint32_t batch,
         const float* __restrict__ wsc = nullptr,
@@ -649,7 +649,7 @@ int pd_f8_gemm_lin_r(const void* wlin, const void* wse, const void* xq,
 // went unnoticed for a long while.
 template <bool WIN = false, bool O16 = false>
 __global__ void __launch_bounds__(384, 1) pd_f8_gemm_lin_ktk(
-    const unsigned char* __restrict__ wlin, const __grid_constant__ CUtensorMap ymap,
+    const unsigned char* __restrict__ wlin, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ xs, float* __restrict__ y,
     uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_F8W8_TMA_OK
@@ -986,7 +986,7 @@ static size_t pd_lin_ktz_cap = 0;
 template <bool O16 = false, bool KS = false, bool KF = false, bool RW = false,
           bool SPLIT = false>
 __global__ void __launch_bounds__(288, 1) pd_f8_gemm_lin_kt3(
-    const unsigned char* __restrict__ wlin, const __grid_constant__ CUtensorMap ymap,
+    const unsigned char* __restrict__ wlin, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ xs, float* __restrict__ y,
     uint32_t in_dim, uint32_t out_dim, uint32_t batch,
     const unsigned char* __restrict__ wse = nullptr,
@@ -1381,7 +1381,7 @@ __global__ void __launch_bounds__(288, 1) pd_f8_gemm_lin_kt3(
 // mma issue, not the phase floor.
 template <bool O16 = false, bool KS = false>
 __global__ void __launch_bounds__(288, 1) pd_f8_gemm_lin_ktd(
-    const unsigned char* __restrict__ wlin, const __grid_constant__ CUtensorMap ymap,
+    const unsigned char* __restrict__ wlin, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ xs, float* __restrict__ y,
     uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_F8W8_TMA_OK && PD_BS_OK
@@ -1609,7 +1609,7 @@ __global__ void __launch_bounds__(288, 1) pd_f8_gemm_lin_ktd(
 // abi.cuh); PD_ACT_GELU reproduces the kernel byte-for-byte as it shipped.
 template <bool RW = false, int ACT = PD_ACT_GELU>
 __global__ void __launch_bounds__(288, 1) pd_f8_gemm_lin_kt3g(
-    const unsigned char* __restrict__ wlin, const __grid_constant__ CUtensorMap ymap,
+    const unsigned char* __restrict__ wlin, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ xs, unsigned char* __restrict__ q,
     unsigned char* __restrict__ qs, uint32_t in_dim, uint32_t out_dim,
     uint32_t batch, const unsigned char* __restrict__ wse = nullptr) {
@@ -1848,7 +1848,7 @@ static __device__ __forceinline__ void pd_kt4d_mma(
 // mainloop never read the strip, so the twin is pure byte diet.
 template <bool RW = false, int ACT = PD_ACT_GELU>
 __global__ void __launch_bounds__(288, 1) pd_f8_gemm_lin_kt4a(
-    const unsigned char* __restrict__ wlin, const __grid_constant__ CUtensorMap ymap,
+    const unsigned char* __restrict__ wlin, const __grid_constant__ PdTmap ymap,
     unsigned char* __restrict__ q, unsigned char* __restrict__ qs,
     const float* __restrict__ as, const float* __restrict__ wsg,
     const float* __restrict__ wsu, uint32_t in_dim, uint32_t out_dim,
@@ -2020,7 +2020,7 @@ __global__ void __launch_bounds__(288, 1) pd_f8_gemm_lin_kt4a(
 // kt4a's 627 on 16-wave grids); one 128-tile-wide grid pays one tail.
 template <bool O16 = false, bool RW = false, bool SEG = false>
 __global__ void __launch_bounds__(288, 1) pd_f8_gemm_lin_kt4(
-    const unsigned char* __restrict__ wlin, const __grid_constant__ CUtensorMap ymap,
+    const unsigned char* __restrict__ wlin, const __grid_constant__ PdTmap ymap,
     float* __restrict__ y, const float* __restrict__ as,
     const float* __restrict__ ws, uint32_t in_dim, uint32_t out_dim,
     uint32_t batch, float* __restrict__ yk, float* __restrict__ yv,
@@ -2170,7 +2170,7 @@ __global__ void __launch_bounds__(288, 1) pd_f8_gemm_lin_kt4(
 // RW: strip-free boxes (mainloop never read the strip - pure byte diet).
 template <bool O16 = false, bool RW = false>
 __global__ void __launch_bounds__(288, 1) pd_f8_gemm_lin_kt4d(
-    const unsigned char* __restrict__ wlin, const __grid_constant__ CUtensorMap ymap,
+    const unsigned char* __restrict__ wlin, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ xs, float* __restrict__ y,
     const float* __restrict__ ws, uint32_t in_dim, uint32_t out_dim,
     uint32_t batch) {
@@ -2337,7 +2337,7 @@ __global__ void pd_lin_ktz_combine_kernel(const float* __restrict__ part,
 // gate where PD_BS_OK holds; other passes get the stub body below.
 template <bool O16 = false>
 __global__ void __launch_bounds__(288, 1) pd_f8_gemm_lin_kt3c(
-    const unsigned char* __restrict__ wlin, const __grid_constant__ CUtensorMap ymap,
+    const unsigned char* __restrict__ wlin, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ xs, float* __restrict__ y,
     uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_F8W8_TMA_OK && PD_BS_OK
@@ -2547,7 +2547,7 @@ static __device__ __forceinline__ void pd_ktw_mma(
 // acc halves to 32 and the fragment file to 34, so it fits without spill.
 template <bool O16 = false>
 __global__ void __launch_bounds__(544, 1) pd_f8_gemm_lin_ktw(
-    const unsigned char* __restrict__ wlin, const __grid_constant__ CUtensorMap ymap,
+    const unsigned char* __restrict__ wlin, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ xs, float* __restrict__ y,
     uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_F8W8_TMA_OK
@@ -2759,7 +2759,7 @@ __global__ void __launch_bounds__(544, 1) pd_f8_gemm_lin_ktw(
 // 16 hw barriers -> occupancy 1; the Block-Limit-Barriers cliff).
 template <bool O16 = false>
 __global__ void __launch_bounds__(320, 2) pd_f8_gemm_lin_kt64(
-    const unsigned char* __restrict__ wlin, const __grid_constant__ CUtensorMap ymap,
+    const unsigned char* __restrict__ wlin, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ xs, float* __restrict__ y,
     uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_F8W8_TMA_OK
@@ -2990,7 +2990,7 @@ __global__ void __launch_bounds__(320, 2) pd_f8_gemm_lin_kt64(
 // consumer code, same fragments, same K order -> bit-identical outputs.
 template <bool O16 = false>
 __global__ void __launch_bounds__(320, 1) pd_f8_gemm_lin_ktp(
-    const unsigned char* __restrict__ wlin, const __grid_constant__ CUtensorMap ymap,
+    const unsigned char* __restrict__ wlin, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ xs, float* __restrict__ y,
     uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_F8W8_TMA_OK
@@ -3214,7 +3214,7 @@ __global__ void __launch_bounds__(320, 1) pd_f8_gemm_lin_ktp(
 // and free ysc via named barrier 3, keeping the pipeline depth intact).
 template <bool O16 = false>
 __global__ void __launch_bounds__(320, 1) pd_f8_gemm_lin_kt2(
-    const unsigned char* __restrict__ wlin, const __grid_constant__ CUtensorMap ymap,
+    const unsigned char* __restrict__ wlin, const __grid_constant__ PdTmap ymap,
     const unsigned char* __restrict__ xs, float* __restrict__ y,
     uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_F8W8_TMA_OK

@@ -43,6 +43,49 @@
 // decode-attention staging needs it on every build - while PD_BS_HOST is set
 // only when the arch list contains 120 or 100 (build.sh). Keeping the gate here
 // is what forced f32_qkv to carry its own byte-identical copy.
+// The tensor map MUST be a 64-byte-aligned type, at the type level, before any
+// kernel takes one by value. cuda.h spells CUtensorMap's alignment as
+// `#if __cplusplus >= 201103L alignas(128)`, and MSVC reports __cplusplus as
+// 199711L unless /Zc:__cplusplus is passed - nvcc mirrors the host value into
+// the device pass, so a Windows build without the flag compiles every
+// `const __grid_constant__ PdTmap` parameter as an 8-byte-aligned
+// 128-byte blob. cp.async.bulk.tensor / prefetch.tensormap need the map
+// 64-byte aligned; a map that lands at offset 8 (behind a pointer, the lin
+// GEMM family's layout) faults with CUDA_ERROR_MISALIGNED_ADDRESS on the first
+// launch, while a map that happens to be the first parameter (attention,
+// f8row, the w8 kt family) works by accident. Probed on an RTX 5060 Ti
+// (2026-09-06): the same kernel, same bytes, .param .align 8 -> misaligned
+// address, .param .align 128 -> clean. build.ps1 passes the flag; this makes a
+// build that loses it fail HERE instead of on a user's first request.
+static_assert(alignof(CUtensorMap) >= 64,
+              "CUtensorMap is under-aligned: the host compiler reports __cplusplus < 201103L "
+              "(MSVC without /Zc:__cplusplus), so cuda.h dropped alignas(128) and every "
+              "by-value tensor-map kernel parameter would fault with a misaligned address. "
+              "Build with -Xcompiler /Zc:__cplusplus (packs/cuda/build.ps1 does).");
+
+// The kernel-parameter carrier for a tensor map. Same 128 bytes as CUtensorMap;
+// aligned 128 in the DEVICE pass, so the kernel's .param slot is .align 128 and
+// cp.async.bulk.tensor / prefetch.tensormap see a 64-byte-aligned map - and only
+// 8 in the HOST pass, because MSVC refuses an over-aligned struct passed BY VALUE
+// (C2719, "formal parameter with requested alignment of 128 won't be aligned"),
+// and nvcc's launch stub hands every kernel parameter over by value. With
+// /Zc:__cplusplus in place a raw `const __grid_constant__ PdTmap` parameter
+// therefore fails to COMPILE on Windows (81 kernels, probed 2026-09-06); GCC has
+// no such rule, which is why the flag alone looked complete on Linux. The host
+// stub only needs the bytes: the runtime lays parameter space out from the
+// cubin, where this type is 128-aligned. Launch sites keep passing CUtensorMap
+// values - the converting constructor does the copy.
+#if defined(__CUDA_ARCH__)
+struct __align__(128) PdTmap {
+#else
+struct PdTmap {
+#endif
+    unsigned long long opaque[CU_TENSOR_MAP_NUM_QWORDS];
+    PdTmap() = default;
+    __host__ __device__ PdTmap(const CUtensorMap& m) { memcpy(opaque, &m, sizeof(opaque)); }
+};
+static_assert(sizeof(PdTmap) == sizeof(CUtensorMap), "PdTmap must carry exactly a CUtensorMap");
+
 typedef CUresult (*pd_tmap_encode_fn)(
     CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*,
     const cuuint64_t*, const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave,

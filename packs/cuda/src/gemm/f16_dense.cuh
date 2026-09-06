@@ -424,7 +424,7 @@ __global__ void __launch_bounds__(NWARP * 32) pd_f16_gemm_mma_kernel(
 template <uint32_t S>
 __global__ void __launch_bounds__(320) __cluster_dims__(2, 1, 1)
 pd_f16_gemm_tc5d_kernel(
-    const __grid_constant__ CUtensorMap wmap, const __grid_constant__ CUtensorMap xmap,
+    const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap xmap,
     float* __restrict__ y, float beta, uint32_t in_dim, uint32_t out_dim,
     uint32_t batch) {
 #if PD_TC5_OK
@@ -703,8 +703,8 @@ __device__ unsigned long long pd_tc5p_stamps[128 * 8];
 template <uint32_t S, uint32_t KS, uint32_t NT>
 __global__ void __launch_bounds__(320) __cluster_dims__(2, 1, 1)
 pd_f16_gemm_tc5p_kernel(
-    const __grid_constant__ CUtensorMap wmap, const __grid_constant__ CUtensorMap xmap,
-    const __grid_constant__ CUtensorMap ymap, float beta, uint32_t in_dim,
+    const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap xmap,
+    const __grid_constant__ PdTmap ymap, float beta, uint32_t in_dim,
     uint32_t out_dim, uint32_t batch) {
 #if PD_TC5_OK
     constexpr uint32_t XSL = NT * 128u;        // X bytes per 2-slab slot/rank
@@ -1071,8 +1071,8 @@ pd_f16_gemm_tc5p_kernel(
 #if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900)
 template <uint32_t S>
 __global__ void __launch_bounds__(192) pd_f16_gemm_tc5g_kernel(
-    const __grid_constant__ CUtensorMap wmap, const __grid_constant__ CUtensorMap xmap,
-    const __grid_constant__ CUtensorMap ymap,
+    const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap xmap,
+    const __grid_constant__ PdTmap ymap,
     float* __restrict__ y, float beta,
     uint32_t in_dim, uint32_t out_dim, uint32_t batch, uint32_t nto,
     uint32_t KS, uint32_t ncols) {
@@ -1395,8 +1395,8 @@ __global__ void __launch_bounds__(192) pd_f16_gemm_tc5g_kernel(
 // eaten 1:1 by the combine RMW needed to refill the grid via extra K-slices.
 template <uint32_t S>
 __global__ void __launch_bounds__(192) pd_f16_gemm_tc5gp_kernel(
-    const __grid_constant__ CUtensorMap wmap, const __grid_constant__ CUtensorMap xmap,
-    const __grid_constant__ CUtensorMap ymap,
+    const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap xmap,
+    const __grid_constant__ PdTmap ymap,
     float* __restrict__ y, float beta,
     uint32_t in_dim, uint32_t out_dim, uint32_t batch, uint32_t nto,
     uint32_t KS, uint32_t ncols) {
@@ -2329,7 +2329,7 @@ template <uint32_t NSLOT, // 8: 2-deep channels, 1 CTA/SM; 4: 1-deep, 2/SM
           uint32_t ROWS>  // 32 (CH=4) or 64 (CH=2) out-rows per CTA
 __global__ void __launch_bounds__(288, NSLOT == 4u ? 2 : 1)
 pd_f16_gemm_mmaf_kernel(
-    const __grid_constant__ CUtensorMap wmap,
+    const __grid_constant__ PdTmap wmap,
     const __half* __restrict__ X, float* __restrict__ Y, float beta,
     uint32_t K, uint32_t M, uint32_t N, uint32_t nto) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && PD_MMA_OK

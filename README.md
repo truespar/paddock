@@ -40,7 +40,8 @@ Paddock is aimed at making it easier for organizations and companies to run open
 in production, mainly on Blackwell GPUs such as the RTX 5090, RTX PRO 6000 and B200. Ampere
 is supported and tested as well: the RTX A6000 was the original bring-up card and still runs
 the heavy parity suites. Ada Lovelace kernels ship in the pack, but the architecture has no
-measured board yet, so the engine refuses it unless `PADDOCK_UNVALIDATED_ARCH=1` is set.
+measured board yet, so the engine serves it with an `UNVALIDATED` warning in the log rather
+than a supported claim - the same goes for any other card we have not measured.
 Hopper and the A100 have kernels in the source tree but no board and no place in the release
 pack. We hope contributors will help close those gaps.
 

@@ -47,8 +47,9 @@
 //!   seal is what makes them inert to a user.
 //! - **Operator surface**: what `merge_env` in the runner's and manager's
 //!   config reads - the documented env spelling of config/CLI. Stays.
-//! - **Escape hatches**: `PADDOCK_UNVALIDATED_ARCH`,
-//!   `PADDOCK_ALLOW_VRAM_OVERCOMMIT`, `PADDOCK_DATA`, `PADDOCK_RUNNER_BIN`.
+//! - **Escape hatches**: `PADDOCK_ALLOW_VRAM_OVERCOMMIT`, `PADDOCK_DATA`,
+//!   `PADDOCK_RUNNER_BIN`. (`PADDOCK_UNVALIDATED_ARCH` was one until
+//!   2026-09-06; an unvalidated arch now serves under a startup warning.)
 //!   Deliberately "do something unsupported", they name themselves in the
 //!   refusal text they belong to, and they are not tuning. Stay.
 //!
