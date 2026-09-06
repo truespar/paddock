@@ -1042,10 +1042,11 @@ impl GpuQwen35 {
             kv.push((e.alloc_u8(b)?, e.alloc_u8(b)?));
         }
         // Fusion width: the widest tapped walk. qwen35's span tick admits
-        // chunk_tick_rows() prefill rows; the verify adds live * (k+1); the
-        // window+block floor is what makes a truncating tap harmless.
+        // prefill_chunk_rows prefill rows (the elected chunk); the verify adds
+        // live * (k+1); the window+block floor is what makes a truncating tap
+        // harmless.
         let cap =
-            (super::chunk_tick_rows() + slots * (df.block + 1) + 64).max(df.window + df.block + 64);
+            (self.prefill_chunk_rows + slots * (df.block + 1) + 64).max(df.window + df.block + 64);
         let rows = max_blocks().min(slots) * df.block;
         let wide = embd.max(ff).max(q_dim);
         let conv_dim = df.conv.map_or(0, |(taps, _, ng)| 2 * taps * ng);

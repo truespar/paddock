@@ -143,29 +143,43 @@ pub(super) fn host_top64(row: &[f32]) -> Vec<(u32, f32)> {
 /// Varlen chunked-GDN route gate - the same env chain the unified tick's
 /// `vl_route` static checks (GDN formulation band); kept in
 /// sync by hand because that one is fn-local. Kill: PADDOCK_NO_DNC_VL.
-/// Divisor on the VRAM grant that the DeltaNet state-checkpoint pool may spend.
+/// DeltaNet state checkpoints the prefix cache holds PER SEATED SLOT.
 ///
-/// Each checkpoint is a whole recurrent-state snapshot (~170 MiB on the 27B: 48
-/// GDN layers of state + conv window), so this is a large, coarse budget and the
-/// old flat 256 pushed batch>1 over a 48 GB card.
-const STATE_CKPT_GRANT_DIV: u64 = 5;
+/// Sized by demand, not by the card. Each checkpoint is a whole recurrent-state
+/// snapshot (~150 MiB f32 on the 27B: 48 GDN layers of state + conv window),
+/// and the working set a slot generates is its own conversation at the two
+/// `ckpt_cuts` per prompt that multi-turn needs - so two per slot covers every
+/// seated session's latest turn with one to spare. Until 2026-09-06 the pool
+/// was a fifth of the grant regardless of width: 11.5 GiB of snapshots on a
+/// 96 GB card for a single-slot server that could use a handful, measured
+/// against vLLM's on-demand state pages and SGLang's int8 idle store as the
+/// largest single policy term in paddock's one-slot 262k floor.
+pub(super) const STATE_CKPTS_PER_SLOT: u64 = 2;
+/// Floor: keeps prefix reuse alive at width 1 and on small cards - a 16-turn
+/// restore window for one conversation. Mandatory: below it the plan refuses
+/// rather than serve without a prefix cache.
+pub(super) const STATE_CKPTS_MIN: u64 = 16;
+/// Cap: a 128-distinct-prefix working set at two cuts per prompt.
+pub(super) const STATE_CKPTS_MAX: u64 = 256;
 
 /// How many DeltaNet state checkpoints the prefix cache may hold.
 ///
-/// One definition, deliberately, called with the same budget by both the
-/// `kv_plan` reserve and the device allocation. They used to derive this
-/// separately - the reserve from `grant`, the allocation from
-/// `vram_headroom()` - and only the allocation honoured the override, so
-/// `PADDOCK_KV_STATE_CKPTS=256` asked the allocator for ~42.5 GiB against a
-/// 14.61 GiB reservation. That is not a bigger cache, it is an unplanned
-/// allocation, and it is why the 256-checkpoint arm read the widest
-/// spread of its ladder (30.8%, one leg at 1743) rather than the win its slot
-/// count promised.
+/// One definition, deliberately, called by both the `kv_plan` reserve and the
+/// device allocation. They used to derive this separately - the reserve from
+/// `grant`, the allocation from `vram_headroom()` - and only the allocation
+/// honoured the override, so `PADDOCK_KV_STATE_CKPTS=256` asked the allocator
+/// for ~42.5 GiB against a 14.61 GiB reservation. That is not a bigger cache,
+/// it is an unplanned allocation, and it is why the 256-checkpoint arm read
+/// the widest spread of its ladder (30.8%, one leg at 1743) rather than the
+/// win its slot count promised.
 ///
-/// The floor of 16 keeps prefix reuse alive on small cards; the cap of 256 is
-/// the point where the pool covers a 128-distinct-prefix working set at the two
-/// `ckpt_cuts` per prompt that multi-turn needs.
-fn state_ckpt_count(budget: u64, per_ckpt: u64) -> u32 {
+/// `leftover` is what the grant has left once every OTHER term is charged: the
+/// other reserves, the seated slots' state, and a full-context KV pool. The
+/// pool takes its demand out of that and never out of the KV a slot was
+/// promised, so a card that can seat the configuration but not the whole
+/// checkpoint want gets a smaller cache, not a refusal. The floor stays
+/// mandatory either way.
+fn state_ckpt_count(slots: usize, per_ckpt: u64, leftover: u64) -> u32 {
     if per_ckpt == 0 {
         return 0; // pure full-attn: no recurrent state to checkpoint
     }
@@ -176,7 +190,29 @@ fn state_ckpt_count(budget: u64, per_ckpt: u64) -> u32 {
     {
         return n;
     }
-    ((budget / STATE_CKPT_GRANT_DIV) / per_ckpt).clamp(16, 256) as u32
+    let want = (slots as u64 * STATE_CKPTS_PER_SLOT).clamp(STATE_CKPTS_MIN, STATE_CKPTS_MAX);
+    want.min(leftover / per_ckpt).max(STATE_CKPTS_MIN) as u32
+}
+
+/// The `graph pools + headroom` reserve: what the plan cannot meet in the
+/// ledger before it runs and what no other term names - CUDA graph
+/// instantiation for every captured width, the decode arena, per-width sampler
+/// planes, per-image vision transients, and allocator retained-not-live slack.
+///
+/// This is the residual of the old 3 GiB "graph/prefill scratch" guess once
+/// its two large tenants got honest accounting: the prefill scratch is now
+/// profiled at load (`enable_batch_sized` allocates it before the grant is
+/// read) and the wave-pass buffers are computed (`pf_bufs_bytes`). The
+/// operator's `graph_scratch_mib` override still applies, to this term.
+///
+/// Measured 2026-09-06 on the RTX PRO 6000, Qwen3.8-27B Q8_0, max_batch 32,
+/// spec on, vision, after the smoke sweep: see the audit log
+/// (`qwen35 VRAM plan audit`) - the constant is the measured residual with
+/// headroom, and the audit line is how to re-check it after a change.
+const GRAPH_POOLS_HEADROOM_MIB: u64 = 768;
+
+pub(super) fn graph_pools_headroom_bytes() -> u64 {
+    crate::kv_plan::graph_scratch_override_mib().unwrap_or(GRAPH_POOLS_HEADROOM_MIB) << 20
 }
 
 fn dnc_vl_on() -> bool {
@@ -231,7 +267,60 @@ impl GpuQwen35 {
         r
     }
 
-    fn enable_batch_sized(&mut self, max_batch: usize) -> Result<usize, GpuModelError> {
+    fn enable_batch_sized(&mut self, requested: usize) -> Result<usize, GpuModelError> {
+        // Profile the serving scratch at load. The widest prefill pass the
+        // scheduler can issue is allocated HERE, before the grant is read, so
+        // the plan meets its true cost in the ledger instead of a constant: it
+        // was charged 3 GiB and measured 6.17 GB on the 27B at 8192 rows, the
+        // difference riding on the 40% hedge this replaced. When the plan
+        // cannot seat the configuration beside that scratch, the prefill chunk
+        // steps down (8192 -> 4096 -> ...) and the scratch shrinks with it - a
+        // smaller chunk is slower prefill, a refused server is no server.
+        let mut chunk = super::chunk_tick_rows();
+        loop {
+            let rows = self.serving_scratch_rows(chunk, requested);
+            self.scratch = None;
+            self.exec.trim_mem_pool();
+            self.ensure_scratch(rows)?;
+            match self.enable_batch_at(requested, chunk)? {
+                Ok(width) => return Ok(width),
+                Err(refusal) if chunk > super::PREFILL_CHUNK_ROWS_MIN => {
+                    tracing::warn!(
+                        chunk_rows = chunk,
+                        next = chunk / 2,
+                        "qwen35: {refusal} - stepping the prefill chunk down so its scratch \
+                         stops eating the KV the configuration needs"
+                    );
+                    self.release_batch_attempt();
+                    chunk /= 2;
+                }
+                Err(refusal) => return Err(GpuModelError::Config(refusal)),
+            }
+        }
+    }
+
+    /// Rows the serving scratch must hold for a `chunk`-row prefill share at
+    /// `max_batch` decode rows: what the span tick asks of `ensure_scratch`,
+    /// the f8t chunk arm's doubled rows, and the unified tick's own floor.
+    fn serving_scratch_rows(&self, chunk: usize, max_batch: usize) -> usize {
+        let tick = chunk.max(unified_prefill_rows()).min(self.max_ctx) + max_batch;
+        let f8t = if f8t_unified_on() && self.bs_f8t_attn.iter().any(Option::is_some) {
+            2 * tick.min(f8t_chunk_rmax())
+        } else {
+            0
+        };
+        tick.max(f8t).max(64)
+    }
+
+    /// One plan-and-allocate attempt with the serving scratch already resident
+    /// for a `chunk`-row prefill share. `Ok(Err(refusal))` is the plan's own
+    /// refusal, which the caller may retry at a smaller chunk; `Err` is a real
+    /// failure and propagates.
+    fn enable_batch_at(
+        &mut self,
+        max_batch: usize,
+        chunk: usize,
+    ) -> Result<Result<usize, String>, GpuModelError> {
         let (max_batch, spec_live_cap) = self.width_by_vram(max_batch);
         // spec live degraded to buy width (see width_by_vram) - ensure_serve_spec
         // allocates at this cap instead of the env default
@@ -243,7 +332,6 @@ impl GpuQwen35 {
         // spec-batch graphs bake this batch state's buffer addresses (KV, conv
         // windows, recurrent states, d_slots) - a re-enable must rebuild them
         self.spec_batch = None;
-        self.ensure_scratch(max_batch)?;
         let e = &self.exec;
         let kv_dim = self.n_kv_heads * self.head_dim;
         let kv_bytes = self.kv_dtype.bytes();
@@ -311,16 +399,13 @@ impl GpuQwen35 {
                     .into(),
             )
         })?;
+        // What the process holds as the plan is made (weights, the profiled
+        // serving scratch): the audit below adds the plan's own charges to it
+        // and compares against the ledger once everything is allocated.
+        let ledger_at_plan = self.exec.process_mem_used().unwrap_or(0);
         let state_win = (state_elems + win_elems) as u64;
         let n_lin = self.n_linear_layers() as u64;
-        // Charge the SELF-SIZED checkpoint pool, not the 256 worst case - the
-        // flat charge zeroed the pool budget on big-state hybrids at low free
-        // VRAM. `state_ckpt_count` is the same call the P5c allocation below
-        // makes, with the same budget, so the reservation and the allocation
-        // cannot drift apart (they used to; see the fn docs).
         let per_ckpt = n_lin * state_win * 4;
-        let n_ckpt_planned = state_ckpt_count(grant, per_ckpt);
-        let n_ckpt_est = n_ckpt_planned as u64;
         // The serving-spec draft state allocates LAZILY (first spec round), so the
         // plan must leave room for it or the card over-commits once spec engages.
         // 27B-Q4 measured: honest reserves alone budgeted an 11.8 GB pool, the
@@ -371,43 +456,59 @@ impl GpuQwen35 {
         } else {
             0
         };
+        // Every term the plan charges, named. conv_ext + conv_out are
+        // span-sized; the wave buffers are what `ensure_pf_bufs` will allocate
+        // for a chunk-row wave (computed by the same arithmetic, checked
+        // against the allocator on first use); the residual is measured.
+        let conv_staging = 2
+            * (self.conv_k as u64 - 1 + unified_prefill_rows().max(8192) as u64)
+            * self.conv_dim as u64
+            * 4;
+        let ckpt_staging = 2 * n_lin * state_win * 4;
+        let wave_bufs = self.pf_bufs_bytes(chunk, chunk, max_batch);
+        let graph_headroom = graph_pools_headroom_bytes();
+        let tier_staging = if crate::kv_tier::pool_tier::tier_ram_bytes().is_some() {
+            crate::kv_tier::ram_transport::device_staging_bytes()
+        } else {
+            0
+        };
+        let block_bytes = per_block_bytes as u64 + mtp_stripe_bytes + dflash_stripe_bytes;
+        // recurrent + conv state, this slot's logits row, its block table
+        let per_slot_bytes =
+            n_lin * state_win * 4 + self.vocab as u64 * 4 + blocks_per_slot as u64 * 4;
+        // The checkpoint pool is sized by demand out of what the grant has left
+        // once everything else - including a full-context pool for every slot -
+        // is charged. Same count for the reserve and the P5c allocation below.
+        let charged_without_pool = conv_staging
+            + ckpt_staging
+            + spec_est
+            + wave_bufs
+            + graph_headroom
+            + tier_staging
+            + max_batch as u64 * per_slot_bytes
+            + max_batch as u64 * blocks_per_slot as u64 * block_bytes;
+        let n_ckpt_planned = state_ckpt_count(
+            max_batch,
+            per_ckpt,
+            grant.saturating_sub(charged_without_pool),
+        );
+        let n_ckpt_est = n_ckpt_planned as u64;
         let demand = kv_plan::Demand {
             family: "qwen35",
             max_ctx: self.max_ctx,
             slots: max_batch,
             blocks_per_slot,
-            block_bytes: per_block_bytes as u64 + mtp_stripe_bytes + dflash_stripe_bytes,
-            // recurrent + conv state, this slot's logits row, its block table
-            per_slot_bytes: n_lin * state_win * 4
-                + self.vocab as u64 * 4
-                + blocks_per_slot as u64 * 4,
+            block_bytes,
+            per_slot_bytes,
             floor_blocks_per_slot: 128,
             reserves: vec![
-                // conv_ext + conv_out, span-sized
-                kv_plan::Reserve::new(
-                    "conv staging",
-                    2 * (self.conv_k as u64 - 1 + unified_prefill_rows().max(8192) as u64)
-                        * self.conv_dim as u64
-                        * 4,
-                ),
-                kv_plan::Reserve::new("prefix state pool", n_ckpt_est * n_lin * state_win * 4),
-                kv_plan::Reserve::new("checkpoint staging", 2 * n_lin * state_win * 4),
+                kv_plan::Reserve::new("conv staging", conv_staging),
+                kv_plan::Reserve::new("prefix state pool", n_ckpt_est * per_ckpt),
+                kv_plan::Reserve::new("checkpoint staging", ckpt_staging),
                 kv_plan::Reserve::new("draft state (spec)", spec_est),
-                // prefill scratch + graph pools + allocator headroom. The width
-                // sizer's 1.5 GB margin is a different, separately-measured
-                // budget - see width_by_vram.
-                kv_plan::Reserve::new(
-                    "graph/prefill scratch",
-                    crate::kv_plan::graph_scratch_reserve_bytes(),
-                ),
-                kv_plan::Reserve::new(
-                    "kv-tier staging",
-                    if crate::kv_tier::pool_tier::tier_ram_bytes().is_some() {
-                        crate::kv_tier::ram_transport::device_staging_bytes()
-                    } else {
-                        0
-                    },
-                ),
+                kv_plan::Reserve::new("prefill wave buffers", wave_bufs),
+                kv_plan::Reserve::new("graph pools + headroom", graph_headroom),
+                kv_plan::Reserve::new("kv-tier staging", tier_staging),
             ],
             // Issue 2: when the budget cannot back --max-ctx ×
             // --max-batch, refuse loudly instead of silently under-sizing -
@@ -423,15 +524,30 @@ impl GpuQwen35 {
             } else {
                 kv_plan::WhenShort::Refuse
             },
-            // `reserves` above is hand-enumerated, so cap the damage of an
-            // omission at 40% of the grant.
-            hedge_fraction: Some(0.4),
+            // No hedge (was 40% of the grant, 2026-08 .. 2026-09-06): every
+            // post-plan allocation is now either in the ledger before the grant
+            // is read (the profiled serving scratch) or a named reserve above,
+            // and the plan audit at the end of this function is what keeps it
+            // that way. The hedge alone refused a 64.5 GiB budget for one 262k
+            // slot that needed 16 GiB of KV - "only 14.96 fits" - with 26 GiB
+            // of grant unspent.
+            hedge_fraction: None,
             ..Default::default()
         };
-        let plan = demand
-            .plan(grant)
-            .map_err(|e| GpuModelError::Config(e.message))?;
+        let plan = match demand.plan(grant) {
+            Ok(p) => p,
+            Err(e) => return Ok(Err(e.message)),
+        };
         plan.report(&demand, grant);
+        self.prefill_chunk_rows = chunk;
+        if chunk < super::chunk_tick_rows() {
+            tracing::warn!(
+                elected = chunk,
+                requested = super::chunk_tick_rows(),
+                "qwen35 prefill chunk elected below the request: the serving scratch for \
+                 the full chunk would not fit beside the KV this configuration needs"
+            );
+        }
         // What the plan leaves after its pools and every listed reserve is
         // the expert-offload slot cache's budget (sized at the end of this
         // function, once the pools are allocated).
@@ -795,7 +911,7 @@ impl GpuQwen35 {
         if paddock_models::dev_var_os!("PADDOCK_NO_QWEN35_PRESIZE_SCRATCH").is_none() {
             // ensure_scratch pads by max_batch itself, so this is the prefill
             // share alone.
-            let tick_rows = super::chunk_tick_rows().max(super::unified_prefill_rows());
+            let tick_rows = self.prefill_chunk_rows.max(super::unified_prefill_rows());
             self.ensure_scratch(tick_rows.min(self.max_ctx))?;
         }
         // Route-B overlap lane: fork a second execution lane so the
@@ -833,7 +949,24 @@ impl GpuQwen35 {
         // taps are baked into the pf/decode/verify graphs, so an armed-after
         // capture would leave every span untapped and every slot cold.
         self.dflash_ensure_state().map_err(GpuModelError::from)?;
-        Ok(max_batch)
+        // Plan audit: what the plan charged (on top of what the process held
+        // when it was made) against what the process holds now that every
+        // pool, slot, stage and cache is allocated. The gap is what the old
+        // 40% hedge silently covered; it belongs in `graph pools + headroom`
+        // (or a new named term) and this line is how it stays visible. Serving
+        // adds only what that reserve names - graphs, the decode arena, the
+        // lazily seated spec state (its own reserve) - so a later reading of
+        // the ledger against `expected` is the same check under load.
+        let expected = ledger_at_plan + plan_reserved;
+        let actual = self.exec.process_mem_used().unwrap_or(0);
+        tracing::info!(
+            expected_gib = expected as f64 / (1u64 << 30) as f64,
+            ledger_gib = actual as f64 / (1u64 << 30) as f64,
+            unplanned_mib = actual.saturating_sub(expected) as f64 / (1u64 << 20) as f64,
+            moe_cache_active = self.moe_cache_active(),
+            "qwen35 VRAM plan audit: ledger vs plan after enable_batch"
+        );
+        Ok(Ok(max_batch))
     }
 
     /// P5 budget pool: grow slot `slot`'s block table to back logical position
@@ -1499,6 +1632,31 @@ impl GpuQwen35 {
     /// persistent `prefill_batch_pass` buffers (see `PfPassBufs`).
     /// Grow-only with headroom; growth moves device addresses, so it drops
     /// every captured pass graph.
+    /// Bytes `ensure_pf_bufs(max_take, r, n_sh)` allocates - the same
+    /// arithmetic, so the plan's `prefill wave buffers` reserve is what the
+    /// wave pass will take. Kept next to the allocation it prices;
+    /// `ensure_pf_bufs` checks itself against this on every allocation.
+    pub(super) fn pf_bufs_bytes(&self, max_take: usize, r: usize, n_sh: usize) -> u64 {
+        let vl_need = |rc: usize, nc: usize| 2 * (rc / 64 + nc) + 4 * nc;
+        let take_cap = (max_take + 63) & !63usize;
+        let r_cap = r + 256;
+        let n_cap = n_sh.max(32);
+        let q_dim = self.n_heads * self.head_dim;
+        // f32 planes: dq, dk, dv, dattn (value_dim); g, beta (n_v_heads); qn,
+        // attn (q_dim)
+        let f32s = take_cap * (4 * self.value_dim + 2 * self.n_v_heads + 2 * q_dim);
+        // u32 planes: seg_slot, seg_bound, seg_pos (take); vl; items; win;
+        // gidx; tokens, pos, slots (r); mrope (4 r)
+        let u32s = 3 * take_cap
+            + vl_need(r_cap, n_cap)
+            + 8 * n_cap
+            + 4 * n_cap
+            + n_cap
+            + 3 * r_cap
+            + 4 * r_cap;
+        4 * (f32s + u32s) as u64
+    }
+
     fn ensure_pf_bufs(
         &mut self,
         max_take: usize,
@@ -1517,6 +1675,9 @@ impl GpuQwen35 {
             }
         }
         // headroom so steady serving settles after one growth
+        let v_pf0 = cudarc::driver::result::mem_get_info()
+            .map(|(f, _)| f)
+            .unwrap_or(0);
         let take_cap = (max_take + 63) & !63usize;
         let r_cap = r + 256;
         let n_cap = n_sh.max(32);
@@ -1566,6 +1727,22 @@ impl GpuQwen35 {
         // touch these, so dropping mid-pipe is safe.
         bs.pf_bufs = Some(bufs);
         bs.pf_pass_graphs.clear();
+        // The reserve was computed from the same arithmetic; a buffer added
+        // here and not there is exactly the drift the hedge used to hide.
+        let priced = self.pf_bufs_bytes(max_take, r, n_sh);
+        let measured = v_pf0.saturating_sub(
+            cudarc::driver::result::mem_get_info()
+                .map(|(f, _)| f)
+                .unwrap_or(v_pf0),
+        );
+        if measured as u64 > priced + (16 << 20) {
+            tracing::warn!(
+                priced_mib = priced >> 20,
+                measured_mib = measured >> 20,
+                "qwen35 prefill wave buffers cost more than pf_bufs_bytes priced - \
+                 a buffer was added to ensure_pf_bufs without its term"
+            );
+        }
         Ok(())
     }
 
@@ -4660,7 +4837,7 @@ impl GpuQwen35 {
         &mut self,
         budget: usize,
     ) -> Result<Vec<(usize, Vec<f32>, usize)>, GpuModelError> {
-        let cap = budget.min(chunk_tick_rows());
+        let cap = budget.min(self.prefill_chunk_rows);
         // With a DFlash drafter armed the soft cap is HARD past prompt 0. The
         // drafter's fusion accumulator is sized for chunk_tick_rows() prefill
         // rows (+ the verify/decode share), and the soft cap's overshoot -

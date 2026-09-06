@@ -142,8 +142,10 @@ pub struct Cli {
     /// can't fit it refuses (co-resident servers can't oversubscribe the card)
     #[arg(long = "vram-budget", value_name = "MIB")]
     pub vram_budget: Option<u64>,
-    /// Override the fixed 3 GiB graph/prefill scratch KV-plan reserve, in MiB
-    /// (8 GB cards: the default starves KV and the moe_offload slot cache)
+    /// Override the KV plan's graph/scratch reserve, in MiB (gpt-oss: the
+    /// fixed 3 GiB graph/prefill scratch, which starves KV and the moe_offload
+    /// slot cache on 8 GB cards; qwen35: only the 768 MiB graph-pools residual,
+    /// its prefill scratch is profiled at load)
     #[arg(long = "graph-scratch-mib", value_name = "MIB")]
     pub graph_scratch_mib: Option<u64>,
     /// Default max output tokens per reply (when a request doesn't specify)

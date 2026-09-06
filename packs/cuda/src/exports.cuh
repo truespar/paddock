@@ -1621,6 +1621,19 @@ PD_EXPORT const KernelTableV1* paddock_pack_kernels_v1(void) {
             //  decode-band f8 GEMMs ride the same sm_100a-only class
             t.f8bs_moe_gemm_gu_d32 = NULL;
             t.f8bs_moe_gemm_dn_d32 = NULL;
+            // slots 543/544: pd_lowm_gemm dispatches ONLY the tcgen05/TMEM
+            // form (pd_lowm5_kernel, body under PD_TC5_OK == sm_100a). On any
+            // other die the entry was a lie in both pack flavours: a
+            // multi-arch pack launched an EMPTY kernel (warm-up "passed",
+            // and PADDOCK_Q38FN_LOWM=1 would have returned zeros), an
+            // sm_120-only pack answered 801 and the engine printed a
+            // warm-up-refused warning on every Flash-Next load (5060 Ti,
+            // 2026-09-06). Null = the engine sees the arm as absent and
+            // never warms it up. The gen-1 SIMT cluster kernel in lowm.cuh
+            // is not dispatched anywhere, so there is no non-tcgen05 route
+            // to keep.
+            t.lowm_gemm = NULL;
+            t.lowm_warmup = NULL;
         }
         if (cma < 9 && !(cma == 8 && cmi >= 9)) {
             t.add_rmsnorm_e4m3_xn_b16 = NULL;

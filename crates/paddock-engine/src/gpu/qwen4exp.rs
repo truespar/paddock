@@ -243,6 +243,15 @@ impl GpuExecutor {
         Ok(true)
     }
 
+    /// Does this pack carry the low-M cluster arm (slots 543/544) for THIS
+    /// die? The pack nulls both on anything but sm_100 (the kernel is
+    /// tcgen05/TMEM), so presence is the honest per-device answer and the
+    /// load-time warm-up keys off it instead of discovering absence by
+    /// launching.
+    pub fn has_lowm(&self) -> bool {
+        self.kernels.lowm_gemm.is_some() && self.kernels.lowm_warmup.is_some()
+    }
+
     /// slot 543: low-M cluster GEMM over a Dual plane's f16 twin. Returns
     /// false when the pack lacks the slot or the launcher declines.
     pub fn lowm_gemm(

@@ -142,6 +142,9 @@ fn ckpt_cuts(t_len: usize, step: usize) -> [usize; 2] {
 // the service-matching 8192 is elected. The scratch grows on demand
 // (cap = t + headroom), so the only cost is transient VRAM.
 const CHUNK_TICK_ROWS_DEFAULT: usize = 8192;
+/// Floor of the chunk election: below this the scratch is small change and a
+/// refusal names the real term.
+pub(super) const PREFILL_CHUNK_ROWS_MIN: usize = 512;
 
 /// One in-flight prompt queued for chunked prefill on `slot`. The unified tick
 /// (`forward_unified_sampled`) advances it a budgeted SPAN per tick from `done`
@@ -155,6 +158,10 @@ struct ChunkedPrefill {
     done: usize,
 }
 
+/// The prefill chunk the operator ASKED for. The one served is
+/// `GpuQwen35::prefill_chunk_rows`, elected at `enable_batch`: it starts here
+/// and halves while the chunk's profiled scratch would not fit beside the KV
+/// the configuration needs (never below `PREFILL_CHUNK_ROWS_MIN`).
 fn chunk_tick_rows() -> usize {
     static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *ROWS.get_or_init(|| {
@@ -1584,6 +1591,9 @@ pub struct GpuQwen35 {
     /// spec live-count cap chosen by width_by_vram when the draft-state
     /// reservation would otherwise eat batch width (None = env default)
     spec_live_vram_cap: Option<usize>,
+    /// Prefill rows one tick admits - `chunk_tick_rows()` unless
+    /// `enable_batch` had to step it down to fit the profiled scratch.
+    prefill_chunk_rows: usize,
     /// Persistent per-layer state for O(1)/token incremental decode (KV caches +
     /// DeltaNet recurrent matrix state + conv windows). None until first `step`.
     decode: Option<DecodeState>,

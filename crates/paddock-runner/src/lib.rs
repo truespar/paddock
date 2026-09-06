@@ -256,7 +256,7 @@ pub async fn run(
         paddock_engine::kv_plan::set_graph_scratch_mib(mib);
         tracing::info!(
             graph_scratch_mib = mib,
-            "graph/prefill scratch reserve overridden (default 3072 MiB)"
+            "KV-plan graph/scratch reserve overridden (defaults: gpt-oss 3072 MiB graph/prefill scratch, qwen35 768 MiB graph pools + headroom)"
         );
     }
     if ram_armed {

@@ -75,20 +75,29 @@ impl Reserve {
         Self { what, bytes }
     }
 }
-/// The `graph/prefill scratch` reserve, settable by the operator: the fixed
-/// 3 GiB default is sized for 16-48 GB cards and starves 8 GB cards of both
-/// KV and - since `[moe_offload]` - the slot cache the plan's leftovers seat.
+/// The operator's graph/scratch reserve override (`graph_scratch_mib`).
+///
+/// gpt-oss still charges a fixed 3 GiB "graph/prefill scratch" by default and
+/// this overrides it. qwen35 profiles its prefill scratch at load and computes
+/// its wave buffers, so there the override applies only to the small residual
+/// it still names (`graph pools + headroom`). The fixed default was sized for
+/// 16-48 GB cards and starves 8 GB cards of both KV and - since
+/// `[moe_offload]` - the slot cache the plan's leftovers seat.
 static GRAPH_SCRATCH_MIB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 /// Arm the override once before any model loads (the same shape as
 /// `pool_tier::set_tier_ram_bytes` / `gpu::set_moe_offload`). `None` = keep
-/// the 3 GiB default.
+/// each family's default.
 pub fn set_graph_scratch_mib(mib: u64) {
     let _ = GRAPH_SCRATCH_MIB.set(mib);
 }
-/// The armed override, or the 3 GiB default. Both production call sites
-/// (qwen35 and gpt-oss `graph/prefill scratch` reserves) charge this.
+/// The armed override, if any, in MiB.
+pub fn graph_scratch_override_mib() -> Option<u64> {
+    GRAPH_SCRATCH_MIB.get().copied()
+}
+/// The armed override, or the 3 GiB default (gpt-oss's `graph/prefill
+/// scratch` reserve).
 pub fn graph_scratch_reserve_bytes() -> u64 {
-    GRAPH_SCRATCH_MIB.get().copied().unwrap_or(3 * (1 << 30))
+    graph_scratch_override_mib().map_or(3 * (1 << 30), |m| m << 20)
 }
 
 /// What to do when the grant cannot back a full `max_ctx` for every slot asked
@@ -146,7 +155,10 @@ pub struct Demand {
     /// serial fallback. Measured on 27B-Q4: honestly-enumerated reserves still
     /// budgeted an 11.8 GB pool, the lazily-allocated spec state then pushed
     /// past free, and c1 collapsed 74 -> 31 t/s. Families that enumerate
-    /// completely pass `None`, and the goal is for every family to.
+    /// completely pass `None`, and the goal is for every family to - qwen35
+    /// got there 2026-09-06 (profiled scratch, computed wave buffers, a
+    /// measured residual, and a ledger audit after allocation); gpt-oss still
+    /// hedges.
     pub hedge_fraction: Option<f64>,
 }
 
@@ -557,13 +569,16 @@ mod tests {
                 Reserve::new("prefix state pool", mib(2396.0)),
                 Reserve::new("checkpoint staging", mib(297.0)),
                 Reserve::new("draft state (spec)", mib(1106.0)),
-                Reserve::new("graph/prefill scratch", 3 * GIB),
+                Reserve::new("prefill wave buffers", mib(1160.0)),
+                Reserve::new("graph pools + headroom", mib(768.0)),
             ],
             when_short: WhenShort::Refuse,
-            hedge_fraction: Some(0.4),
+            // qwen35 no longer hedges: the terms above are the enumeration.
+            hedge_fraction: None,
             ..Default::default()
         };
-        // What was left of the 30 GiB budget once the weights were resident.
+        // What was left of the 30 GiB budget once the weights AND the profiled
+        // serving scratch were resident (the scratch precedes the grant now).
         let grant = mib(11510.0);
         let e = d.plan(grant).unwrap_err();
         // It must refuse rather than reserve the full 8 GiB window...

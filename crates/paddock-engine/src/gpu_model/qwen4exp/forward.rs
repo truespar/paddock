@@ -3834,23 +3834,42 @@ impl Scratch {
         let kdim = c.gdn_v_heads * c.gdn_k_dim;
         let mut lowm_refused = false;
         let d_lowm_warm: CudaSlice<f32> = {
-            let w = e.f16_to_device(&vec![half::f16::from_f32(0.0); 64 * 128])?;
-            let xd: CudaSlice<f32> = e.alloc(128)?;
             // slot 544 stores a full 64-row TILE, not 64 scalars: memcheck
             // flags a 4-byte write 1 past a 64-float y here, which fails
             // the whole load under compute-sanitizer. Slack, not 64.
             let mut yd: CudaSlice<f32> = e.alloc(256)?;
-            // The lane is opt-in (PADDOCK_Q38FN_LOWM) and bf16-only; a
-            // card that refuses its cluster launch (sm_120 consumer
-            // Blackwell answers cudaErrorNotSupported) must not lose the
-            // whole model over a warm-up for a lane it will never take.
-            match e.lowm_warmup(&w, &xd, &mut yd) {
-                Ok(_) => e.synchronize()?,
-                Err(err) => {
-                    lowm_refused = true;
-                    tracing::warn!("qwen4exp: low-M cluster warm-up refused ({err}) - lane off");
-                    eprintln!("[q4x] low-M cluster warm-up refused ({err}) - lane off");
+            // Warm up only where the arm can exist at all. Two gates, both
+            // structural rather than discovered by launching:
+            //   - the pack nulls slots 543/544 on every die but sm_100 (the
+            //     kernel is tcgen05/TMEM), so `has_lowm` is the per-device
+            //     truth - a 5060 Ti used to see "warm-up refused (801)" on
+            //     every Flash-Next load for an arm it could never take;
+            //   - the arm consumes `DensePlane::Dual` (the safetensors
+            //     lane's bf16+f16 twin); the GGUF lane's dense planes are
+            //     k-quant, so there is nothing for it to serve there.
+            // A pack that HAS the entry and still refuses is the case worth
+            // a warning: that is a real launch failure on a die the pack
+            // claims to serve, and the lane goes off rather than the model.
+            if !kq_lanes && e.has_lowm() {
+                let w = e.f16_to_device(&vec![half::f16::from_f32(0.0); 64 * 128])?;
+                let xd: CudaSlice<f32> = e.alloc(128)?;
+                match e.lowm_warmup(&w, &xd, &mut yd) {
+                    Ok(_) => e.synchronize()?,
+                    Err(err) => {
+                        lowm_refused = true;
+                        tracing::warn!(
+                            "qwen4exp: low-M cluster warm-up refused ({err}) - lane off"
+                        );
+                        eprintln!("[q4x] low-M cluster warm-up refused ({err}) - lane off");
+                    }
                 }
+            } else {
+                lowm_refused = true;
+                tracing::debug!(
+                    "qwen4exp: low-M cluster arm absent (pack entry {}, k-quant dense planes {}) - arm off",
+                    e.has_lowm(),
+                    kq_lanes
+                );
             }
             yd
         };

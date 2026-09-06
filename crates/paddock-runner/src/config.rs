@@ -108,11 +108,13 @@ pub struct Config {
     pub kv_offload: KvOffload,
     /// See [`MoeOffload`].
     pub moe_offload: MoeOffload,
-    /// Override the fixed 3 GiB `graph/prefill scratch` KV-plan reserve, in
-    /// MiB. The default is sized for 16-48 GB cards; on 8 GB cards it alone
-    /// exhausts the grant and starves both the KV pool and the
-    /// `[moe_offload]` slot cache (which is sized from the plan's leftovers).
-    /// None = keep the 3 GiB default.
+    /// Override the KV plan's graph/scratch reserve, in MiB. gpt-oss charges
+    /// a fixed 3 GiB `graph/prefill scratch` by default (sized for 16-48 GB
+    /// cards; on 8 GB cards it alone exhausts the grant and starves both the
+    /// KV pool and the `[moe_offload]` slot cache). qwen35 profiles its
+    /// prefill scratch at load and computes its wave buffers, so there this
+    /// overrides only the small `graph pools + headroom` residual (768 MiB).
+    /// None = each family's default.
     pub graph_scratch_mib: Option<u64>,
     /// Default max output tokens per reply when a request doesn't specify.
     pub max_tokens: Option<usize>,
@@ -800,7 +802,7 @@ mod tests {
     }
     #[test]
     fn graph_scratch_mib_parses_and_defaults_to_none() {
-        // absent -> None (the 3 GiB engine default stands)
+        // absent -> None (each family's engine default stands)
         let c: Config = toml::from_str("").expect("empty config");
         assert!(c.graph_scratch_mib.is_none());
         // explicit value

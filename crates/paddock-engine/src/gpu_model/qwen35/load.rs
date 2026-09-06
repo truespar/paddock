@@ -2531,6 +2531,7 @@ impl GpuQwen35 {
             spec_warm_wanted: true,
             spec_ring_probed: false,
             spec_live_vram_cap: None,
+            prefill_chunk_rows: super::chunk_tick_rows(),
             history: Vec::new(),
             decode: None,
             vision: None,
@@ -2611,24 +2612,26 @@ impl GpuQwen35 {
         let bps = self.max_ctx.div_ceil(BLOCK_TOKENS) as u64;
         let per_block = (BLOCK_TOKENS * kv_dim * kv_bytes) as u64 * 2 * n_full;
         let state_win = (state_elems + win_elems) as u64;
-        // width-independent: conv staging, prefix-state pool, ckpt staging,
-        // and the same graph-capture margin the pool sizer reserves. The ckpt
-        // pool SELF-SIZES to (free/5)/per_ckpt clamped 16..256 (enable_batch
-        // below), so charge what it will actually take, not the 256 worst
-        // case - charging the cap clamped a 27B to width 1 on 18.9 GB free.
-        let ckpt_pool = (256 * n_lin * state_win * 4).min(free / 5);
+        // width-independent: conv staging, the demand-sized prefix-state pool
+        // (STATE_CKPTS_PER_SLOT per requested slot, clamped - the plan may
+        // shrink it further into what the grant has left), ckpt staging, the
+        // wave buffers for a full chunk, and the graph/headroom residual. The
+        // profiled serving scratch is already in the ledger by the time `free`
+        // is read (enable_batch_sized allocates it first).
+        let ckpt_pool = (requested as u64 * super::batch::STATE_CKPTS_PER_SLOT)
+            .clamp(super::batch::STATE_CKPTS_MIN, super::batch::STATE_CKPTS_MAX)
+            * n_lin
+            * state_win
+            * 4;
+        let chunk = super::chunk_tick_rows();
         let fixed: u64 = 2
             * (self.conv_k as u64 - 1 + unified_prefill_rows().max(8192) as u64)
             * self.conv_dim as u64
             * 4
             + ckpt_pool
             + 2 * n_lin * state_win * 4
-            // graph/scratch margin: 1.5 GB (was 3). Measured 35B-Q8 steady
-            // state (graphs captured, spec + prefill scratch live) leaves
-            // 3.4 GB of the old margin untouched - the fat cost 2 bits of
-            // width (8 vs 22-24 on 8.5 GB free) and the spawn halving-retry
-            // backstop already guards a miss.
-            + 3 * 1024 * 1024 * 1024 / 2;
+            + self.pf_bufs_bytes(chunk, chunk, requested)
+            + super::batch::graph_pools_headroom_bytes();
         // per slot: recurrent+conv state, the pool's per-slot block floor,
         // a batched logits row, and the block-table row
         let per_slot: u64 =
