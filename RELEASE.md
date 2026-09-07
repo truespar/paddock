@@ -1,68 +1,69 @@
-# Paddock 0.1.3
+# Paddock 0.1.5
 
 A feature release. Windows x64 and Linux x64, NVIDIA GPUs, driver 580 or newer.
 
-The theme is memory: this release gives a large amount of video memory back to
-the cache, and adds a place for the cache to overflow to when it still runs out.
+The theme is small cards: 1-, 2- and 3-bit files now serve, and the largest
+mixture-of-experts models reach a 16 GB card through expert offload.
 
 ## New
 
-- **KV cache offloading to RAM and disk.** When a conversation is evicted from
-  video memory its cache is now demoted to system RAM, and optionally to a
-  disk store, instead of being thrown away - so returning to an older chat
-  re-uses what was already computed rather than re-reading the whole prompt.
-  The disk tier survives a restart, retires its oldest entries under quota
-  pressure, and holds itself to a daily write budget so it cannot wear an SSD.
-  Off by default; a switch in the Advanced tab, and the fit estimate prices
-  what it costs the box.
+- **1-, 2- and 3-bit GGUF files serve.** The ggml i-quant family (IQ1_S,
+  IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL) and the Q2_K and
+  Q3_K formats load and serve end to end, for dense weights and for MoE
+  experts alike, with decoders written here from the format specification.
+  Prompt processing on these files runs on the same tiled GEMM as the 4-bit
+  files, so a long prompt costs the same as it does at 4 bits. A file is
+  named by its real bit width everywhere it appears. Contributed by
+  NodeNestor (#17, #21).
 
-- **fp8 KV cache on every supported GPU.** Halving the bytes each cached token
-  costs was previously limited to cards with fp8 tensor cores. It needs fp8
-  *storage*, not fp8 math, so it is now available everywhere - including
-  Ampere - roughly doubling the context that fits in a given cache.
+- **Qwen 3.8 Flash-Next serves from GGUF on RTX 50-series cards.** The
+  mixture-of-experts lane loads unsloth's UD files, and with expert offload
+  the UD-IQ1_S file serves on a 16 GB card at llama.cpp parity. Prompt
+  processing streams the offloaded experts through the cache expert by
+  expert: a 427-token prompt went from 308 s to 37 s, and the first token of
+  a 1,500-word prompt from 31 s to 15 s, on an RTX 5060 Ti. Blackwell only in
+  this release; the family's kernels are built for sm_100 and sm_120.
+  Contributed by NodeNestor (#18).
 
-- **Gemma QAT checkpoints serve natively.** Google's quantization-aware-trained
-  Gemma files store their weights at Q4_0, which is what the model was trained
-  at rather than a lossy conversion of it. Paddock now serves those tensors
-  directly instead of refusing the file.
+- **Qwen 3.8 27B has a Compact lane** in the catalog: the UD-Q3_K_XL file,
+  for cards where the standard file does not fit.
 
 ## Improved
 
-- **A large amount of video memory came back.** Several model families were
-  keeping two copies of the same weights resident - one for each of two
-  execution lanes. On Qwen 3.8 27B the memory held outside the cache fell from
-  **31.8 GiB to 6.9 GiB**; Gemma 4's attention weights fell from 4.95 GB to
-  0.82 GB. On a 96 GB card that moved Qwen 3.8's planned cache from the
-  smallest of the three major serving engines to the largest. Everything freed
-  becomes context.
+- **Shared-prefix serving under load.** Requests that arrive with the same
+  prefix, the shape of an agent fleet, are now recognised at admission and
+  warmed in one batched wave instead of each recomputing the prefix. With
+  eight concurrent sessions on a shared prompt the time to first token fell
+  from **1184 ms to 248 ms** and the p99 gap between tokens from 88 ms to
+  31 ms.
 
-- **Speculative decoding is more selective.** The controller now pools its
-  acceptance measurements across speculation depths instead of learning each
-  one separately, and speculation is switched off in the cases where it
-  measurably loses to not speculating at all.
+- **Small cards decode faster with many streams.** The k-quant K-split path
+  now takes batched decode, so on an RTX 5060 Ti eight concurrent streams of
+  a Qwen 3.5/3.6 k-quant file step in **17.8 ms instead of 30.0 ms**, twice
+  llama.cpp's aggregate on the same card.
 
-- **The fit estimate stopped overstating.** "This model" was counting memory
-  that belongs to other things on the card; a reserved ceiling was being
-  reported as memory currently in use; and when something does not fit, the
-  estimate now says what is short and against what, instead of blaming the
-  card.
+- **Memory planned by demand.** Prompt-processing scratch is profiled at
+  load, and state checkpoints and cache retention are sized by what the
+  configuration actually needs, across Qwen 3.5/3.6, Gemma 4, Granite,
+  Laguna and Nemotron. Laguna serves batched. A `graph_scratch_mib` setting
+  in the Advanced tab reserves extra scratch by hand (ErikBPF, #14).
 
-- Dependencies swept to current across the tree - Rust 1.98, MCP revision
-  2026-07-28, and a newer SQLite binding.
+- **A GPU the engine has not validated serves under a startup warning**
+  instead of a refusal.
 
 ## Fixed
 
-- Embedding requests failed with an out-of-memory error at around 4,000 tokens
-  on Qwen3-Embedding-8B. The internal size buckets were 64x coarser than
-  intended, so a modest request reserved an enormous one.
-- On GPUs older than Ada, two attention paths were selected for the fp8 cache
-  that have no implementation on that hardware, and they produced wrong output
-  rather than refusing. They are no longer selected there.
-- Asking for native fp8 weights from a directory that cannot be read now fails
-  with an error naming the problem, instead of silently serving the 8-bit
-  fallback and reporting success.
-- On servers configured with a large maximum context, working memory was sized
-  from that maximum rather than from what a step actually uses, which left no
-  room for the prefix cache and silently disabled it.
-- Qwen 3.5 produced corrupt output on short prompts under one of the projection
-  paths (a numeric bug in the small-batch epilogue).
+- Blackwell kernels on Windows could fail: the Windows build laid out
+  tensor-map kernel parameters at 8-byte alignment where the hardware wants
+  128 (#6).
+- The multi-column weight kernel faulted on narrow planes at two concurrent
+  streams on sm_120 (#19, reported by L4GN).
+- A dense i-quant kernel's launch grid overflowed past 134 million outputs.
+- Qwen 3.5/3.6: a failed attempt to enable batching is released before the
+  width ladder retries (ErikBPF, #15).
+
+## Known
+
+- The fp8 KV cache's paged attention on RTX 50-series cards shows a small
+  numeric deviation in one split configuration (#5). Being fixed on an fp8
+  card.

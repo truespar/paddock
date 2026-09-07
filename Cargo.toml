@@ -33,7 +33,7 @@ members = [
 # workspace this size is not something to publish 19 crates of by accident, and
 # a git dependency would block it anyway. Publishing is its own later decision.
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 publish = false
