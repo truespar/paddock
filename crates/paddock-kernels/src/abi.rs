@@ -6175,6 +6175,11 @@ pub struct KernelTableV1 {
     /// 584: `kquant_moe_down` striding a device-counted token list and
     /// ACCUMULATING into out: the plain arguments + (rows, n_rows).
     pub kquant_moe_down_list: Option<KquantMoeDownListFn>,
+    /// 585: capability marker - `kquant_gemm_w4a8_pipe2` (and the v1 / pipe
+    /// launchers, which forward to it) serve the i-quant family + Q2_K /
+    /// Q3_K / IQ4_NL: the >64-row prefill tile for dense i-quant planes.
+    /// Without it such a plane stays on the per-token dp4a walk.
+    pub kquant_iq_tile: Option<unsafe extern "C" fn() -> i32>,
 }
 
 /// Expert-major prefill plan (see `KernelTableV1::moe_wave_plan`).
@@ -6639,7 +6644,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 570;
+pub const KERNEL_TABLE_SLOTS: usize = 571;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,

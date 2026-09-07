@@ -528,3 +528,116 @@ fn gguf_teacher_forced_agreement() {
         "llama's chosen token fell to rank {worst_rank} (> top-5)"
     );
 }
+
+/// The dense k-quant planes above 64 rows: the W4A8 tile (`kq_matmul`'s
+/// pipe2 route) against the dp4a lane on the same per-32 quantized
+/// activations - the same exact-int class, so the bar is tight. 163 rows
+/// is one tile column plus a ragged second; the file's Q5_K / Q6_K planes.
+#[test]
+fn gguf_kq_dense_tile_matches_dp4a() {
+    let Some(path) = common::model("QWEN38FN_GGUF", &[]) else {
+        common::missing("QWEN38FN_GGUF");
+        return;
+    };
+    let Some(exec) = common::gpu_arc() else {
+        return;
+    };
+    if !exec.has_kquant_gemm_w4a8_pipe2() {
+        eprintln!("pack lacks kquant_gemm_w4a8_pipe2 - skipping");
+        return;
+    }
+    let map = MappedGguf::open(&path).expect("open gguf");
+    let rel = |a: &[f32], b: &[f32]| {
+        let (mut n, mut d) = (0f64, 0f64);
+        for (x, y) in a.iter().zip(b) {
+            n += ((x - y) as f64).powi(2);
+            d += (*y as f64).powi(2);
+        }
+        (n / d.max(1e-30)).sqrt()
+    };
+    let batch = 163usize;
+    for name in [
+        "blk.0.ssm_out.weight",
+        "blk.0.attn_qkv.weight",
+        "blk.3.attn_output.weight",
+        "blk.0.ffn_gate_shexp.weight",
+    ] {
+        let (info, _) = map.tensor_bytes(name).expect("tensor");
+        let (in_dim, out_dim) = (info.dims[0] as usize, info.dims[1] as usize);
+        let w = exec.load_quantw(&map, name).expect("load_quantw");
+        let paddock_engine::gpu::QuantW::Kq(k) = &w else {
+            panic!("{name}: not k-quant");
+        };
+        let needs = matches!(
+            k.ty,
+            GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q4_0 | GgmlType::Q2K
+        );
+        let x: Vec<f32> = (0..batch * in_dim)
+            .map(|i| (((i as u64 * 2654435761) >> 13) % 2001) as f32 / 1000.0 - 1.0)
+            .collect();
+        let d_x = exec.to_device(&x).expect("x");
+        let mut d_xq = exec.alloc_i8(batch * in_dim).expect("xq");
+        let mut d_xs = exec.alloc(batch * in_dim / 32).expect("xs");
+        exec.quantize_q8(&d_x, &mut d_xq, &mut d_xs, batch * in_dim)
+            .expect("quant");
+        let mut d_sums = exec.alloc(batch * in_dim / 16).expect("sums");
+        exec.q8_sums_strided(&d_xq, &mut d_sums, in_dim, batch)
+            .expect("sums");
+        let mut d_y = exec.alloc(batch * out_dim).expect("y");
+        exec.kquant_gemm_dp4a(k, &d_xq, &d_xs, needs.then_some(&d_sums), &mut d_y, batch)
+            .expect("dp4a");
+        let y_dp4a = exec.to_host(&d_y).expect("h");
+        let n_chunks = in_dim.div_ceil(128);
+        let batch_pad = batch.div_ceil(128) * 128;
+        let mut d_yq = exec.alloc_u8(n_chunks * batch_pad * 144).expect("yq");
+        exec.quantize_q8_mmq(&d_x, &mut d_yq, in_dim, batch)
+            .expect("quantize mmq");
+        let mut d_msums = exec.alloc(n_chunks * batch_pad * 4).expect("msums");
+        exec.mmq_sums(&d_yq, &mut d_msums, in_dim, batch)
+            .expect("mmq sums");
+        let mut d_yt = exec.alloc(batch * out_dim).expect("yt");
+        exec.kquant_gemm_w4a8_pipe2(k, &d_yq, needs.then_some(&d_msums), &mut d_yt, batch)
+            .expect("pipe2");
+        let y_tile = exec.to_host(&d_yt).expect("h");
+        let e = rel(&y_tile, &y_dp4a);
+        eprintln!(
+            "{name} {:?} [{in_dim}->{out_dim}] b={batch}: tile vs dp4a {e:.2e}",
+            k.ty
+        );
+        assert!(
+            e < 1e-5,
+            "{name}: the W4A8 tile diverged from the dp4a lane ({e:.2e})"
+        );
+
+        // the same rows through kq_matmul's chunk walk: 100-row chunks off a
+        // chunk-sized scratch, stitched by the row-offset launchers
+        let chunk = 100usize;
+        let cpad = chunk.div_ceil(128) * 128;
+        let mut c_yq = exec.alloc_u8(n_chunks * cpad * 144).expect("cyq");
+        let mut c_sums = exec.alloc(n_chunks * cpad * 4).expect("csums");
+        let mut d_ys = exec.alloc(batch * out_dim).expect("ys");
+        let mut off = 0;
+        while off < batch {
+            let rows = (batch - off).min(chunk);
+            exec.quantize_q8_mmq_rows(&d_x, off, &mut c_yq, in_dim, rows)
+                .expect("quantize rows");
+            exec.mmq_sums(&c_yq, &mut c_sums, in_dim, rows)
+                .expect("sums rows");
+            exec.kquant_gemm_w4a8_pipe2_rows(
+                k,
+                &c_yq,
+                needs.then_some(&c_sums),
+                &mut d_ys,
+                off,
+                rows,
+            )
+            .expect("pipe2 rows");
+            off += rows;
+        }
+        let y_chunked = exec.to_host(&d_ys).expect("h");
+        assert!(
+            y_chunked == y_tile,
+            "{name}: the chunked walk differs from the one-shot tile"
+        );
+    }
+}

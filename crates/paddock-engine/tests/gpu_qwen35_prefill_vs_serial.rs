@@ -111,3 +111,52 @@ fn batched_prefill_matches_serial_step() {
         "batched prefill and serial step disagree by {worst_lp:.4} nats on the winner's logprob"
     );
 }
+
+/// Batched prefill rate on the oracle file: `prefill` over a 2048-token
+/// prompt (the chunk width the serving path feeds the GEMM lanes), best of
+/// three after a warm-up. Heavy + ignored:
+/// `cargo test ... prefill_rate_bench -- --ignored --nocapture`.
+/// `QWEN35_ORACLE_LONG` sets the token count.
+#[test]
+#[ignore]
+fn prefill_rate_bench() {
+    if !common::heavy() {
+        return;
+    }
+    let Some(path) = common::model("QWEN35_ORACLE_GGUF", common::QWEN35_9B_UD_IQ2) else {
+        return;
+    };
+    let Some(exec) = common::gpu_arc() else {
+        return;
+    };
+    let map = MappedGguf::open(&path).expect("open gguf");
+    let tok = GgufTokenizer::from_gguf(map.gguf()).expect("tokenizer");
+    let n = std::env::var("QWEN35_ORACLE_LONG")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2048usize);
+    let mut m = GpuQwen35::load(exec, &map, n.max(2048)).expect("load");
+    let unit = tok.encode(LONG_UNIT).expect("encode");
+    let prompt: Vec<u32> = unit.iter().cycle().take(n).copied().collect();
+    let mut best = f64::MAX;
+    for i in 0..4 {
+        m.reset();
+        let t = std::time::Instant::now();
+        let logits = m.prefill(&prompt).expect("prefill");
+        let dt = t.elapsed().as_secs_f64();
+        if i > 0 {
+            best = best.min(dt);
+        }
+        eprintln!(
+            "prefill {n} tokens: {:.1} ms ({:.0} tok/s), top-1 {}",
+            dt * 1e3,
+            n as f64 / dt,
+            argmax(&logits)
+        );
+    }
+    eprintln!(
+        "best: {:.1} ms = {:.0} tok/s over {n} tokens",
+        best * 1e3,
+        n as f64 / best
+    );
+}

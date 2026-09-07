@@ -787,6 +787,18 @@ impl Qwen4ExpGpu {
             } else {
                 1
             })?,
+            // the > 64-row tile's mmq tiles for one KQ_TILE_ROWS-row chunk:
+            // 144 B per (128-wide k chunk, row), and 4 per-32 sums per pair
+            yq: exec.alloc_u8(if kq_lanes {
+                cfg.hc_width().div_ceil(128) * super::KQ_TILE_ROWS * 144
+            } else {
+                1
+            })?,
+            xsums: exec.alloc(if kq_lanes {
+                cfg.hc_width().div_ceil(128) * super::KQ_TILE_ROWS * 4
+            } else {
+                1
+            })?,
             // the widest activation any dense plane reads is the 4-stream state
             x16: exec.alloc_f16(max_tokens * cfg.hc_width())?,
             xb16: exec.stream_alloc_bf16(max_tokens * cfg.hc_width())?,

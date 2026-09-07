@@ -657,15 +657,29 @@ impl GpuExecutor {
         in_dim: usize,
         batch: usize,
     ) -> Result<(), GpuError> {
+        self.quantize_q8_mmq_rows(x, 0, yq, in_dim, batch)
+    }
+
+    /// [`Self::quantize_q8_mmq`] from row `x_row0` of `x` - a chunk of a
+    /// wider activation quantized into a chunk-sized `yq`.
+    pub fn quantize_q8_mmq_rows(
+        &self,
+        x: &CudaSlice<f32>,
+        x_row0: usize,
+        yq: &mut CudaSlice<u8>,
+        in_dim: usize,
+        batch: usize,
+    ) -> Result<(), GpuError> {
         let f = self
             .kernels
             .quantize_q8_mmq
             .ok_or(GpuError::MissingOp("quantize_q8_mmq"))?;
+        debug_assert!(x.len() >= (x_row0 + batch) * in_dim);
         let (xp, _g1) = x.device_ptr(&self.stream);
         let (yp, _g2) = yq.device_ptr_mut(&self.stream);
         check(unsafe {
             f(
-                xp as *const _,
+                (xp + (x_row0 * in_dim * 4) as u64) as *const _,
                 yp as *mut _,
                 in_dim as u32,
                 batch as u32,

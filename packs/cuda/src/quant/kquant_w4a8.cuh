@@ -650,11 +650,22 @@ int pd_kquant_gemm_dp4a(const void* data, const void* scales, const void* xq,
 }
 
 PD_EXPORT
+int pd_kquant_gemm_w4a8_pipe2(const void* data, const void* scales, const void* yq,
+                              const void* xsums, void* y, uint32_t in_dim,
+                              uint32_t out_dim, uint32_t batch, uint32_t dtype,
+                              void* stream);
+
+PD_EXPORT
 int pd_kquant_gemm_w4a8(const void* data, const void* scales, const void* yq,
                         const void* xsums, void* y, uint32_t in_dim,
                         uint32_t out_dim, uint32_t batch, uint32_t dtype,
                         void* stream) {
     if (out_dim == 0 || batch == 0) return 0;
+    // the i-quant family has one tile rung, pipe2 (its raw ring is sized per
+    // type and its tile builds through the shared window unpack)
+    if (pd_kq_valid_iq(dtype))
+        return pd_kquant_gemm_w4a8_pipe2(data, scales, yq, xsums, y, in_dim, out_dim,
+                                         batch, dtype, stream);
     if ((in_dim & 255u) != 0u) return cudaErrorInvalidValue;
     if (!pd_kq_valid(dtype)) return cudaErrorInvalidValue;
     const bool mu = pd_kq_has_mu(dtype);
@@ -720,6 +731,16 @@ __device__ __forceinline__ void pd_kq_cpa8p(void* smem, const void* gmem, bool o
     const unsigned sm = (unsigned)__cvta_generic_to_shared(smem);
     asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" ::"r"(sm), "l"(gmem),
                  "r"(ok ? 8u : 0u));
+#endif
+}
+
+// 4-byte predicated cp.async: the i-quant scale records (quant/iquant.cuh
+// pd_iq_scb) are 4-24 B and only 4-B aligned. src-size 0 zero-fills.
+__device__ __forceinline__ void pd_kq_cpa4p(void* smem, const void* gmem, bool ok) {
+#if PD_MMA_OK
+    const unsigned sm = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;" ::"r"(sm), "l"(gmem),
+                 "r"(ok ? 4u : 0u));
 #endif
 }
 
@@ -2761,6 +2782,9 @@ int pd_kquant_gemm_w4a8_pipe(const void* data, const void* scales, const void* y
                              uint32_t out_dim, uint32_t batch, uint32_t dtype,
                              void* stream) {
     if (out_dim == 0 || batch == 0) return 0;
+    if (pd_kq_valid_iq(dtype))
+        return pd_kquant_gemm_w4a8_pipe2(data, scales, yq, xsums, y, in_dim, out_dim,
+                                         batch, dtype, stream);
     if ((in_dim & 255u) != 0u) return cudaErrorInvalidValue;
     if (!pd_kq_valid(dtype)) return cudaErrorInvalidValue;
     const bool mu = pd_kq_has_mu(dtype);
@@ -2829,7 +2853,27 @@ int pd_kquant_gemm_w4a8_pipe(const void* data, const void* scales, const void* y
 // loads into the other buffer, commit, wait_group(1) (guarantees the OLDER
 // of the two outstanding commit groups - this kt's own data - has landed),
 // consume; wait_group(0) drains the last chunk once there's no next one.
+// The i-quant family + Q2_K / Q3_K / IQ4_NL ride the same kernel: the raw
+// ring is sized per type (quant/iquant.cuh pd_iq_datab / pd_iq_scb), the
+// half tile_x is built through the shared 16-weight window unpack
+// (pd_iq_win_unpack_t) into 48-int rows - 32 payload words in k order, the 8
+// windows' f32 scales at [32, 40) and, for Q2_K, their per-16 min at
+// [40, 48) - and consumed on the Q6_K (per-16 scale, m16n8k16) path. Q2_K's
+// min term multiplies per-16 activation sums the kernel builds itself from
+// the mmq tile (the launcher's per-32 xsums do not serve a per-16 min), 8
+// f32 per column in tile_s. The format's codebook is staged in shared after
+// tile_s (2-16 KB). Every type stays under sm_120's 101,376 B single-block
+// cap: IQ4_NL is the largest at 79,872 B, IQ1_S/M carry the 16 KB grid at
+// 72,704 B.
 __host__ __device__ __forceinline__ uint32_t pd_kwh2_smem_bytes(uint32_t dt) {
+    if (pd_kq_valid_iq(dt)) {
+        const uint32_t raw_w2 = 2u * 128u * pd_iq_datab(dt);
+        const uint32_t raw_r2 = 2u * 128u * pd_iq_scb(dt);
+        const uint32_t tile_x_sz = 128u * 48u * 4u;
+        const uint32_t tile_y_sz = 128u * PD_MMQ_YK * 4u;
+        const uint32_t tile_s_sz = dt == PD_KQ_Q2K_ID ? 128u * 8u * 4u : 16u;
+        return raw_w2 + raw_r2 + tile_x_sz + tile_y_sz + tile_s_sz + pd_iq_tabs_bytes(dt);
+    }
     const uint32_t datab = pd_kq_datab(dt);
     const bool mu = pd_kq_has_mu(dt);
     const uint32_t raw_w2 = 2u * 128u * datab;
@@ -2846,13 +2890,20 @@ __global__ void __launch_bounds__(256, 1) pd_kquant_w4a8_pipe2_kernel(
         const uint8_t* __restrict__ yq, const float* __restrict__ xsums,
         float* __restrict__ y, uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
 #if PD_MMA_OK
+    constexpr bool IQ = pd_kq_valid_iq(DT);
     constexpr bool MU = (DT == PD_KQ_Q4K || DT == PD_KQ_Q5K || DT == PD_KQ_Q40);
-    constexpr bool K16 = (DT == PD_KQ_Q6K);
-    constexpr uint32_t DATAB = DT == PD_KQ_Q6K ? PD_KQ6_DATA
+    constexpr bool MU16 = (DT == PD_KQ_Q2K_ID);  // per-16 min (the window unpack's g)
+    constexpr bool K16 = (DT == PD_KQ_Q6K) || IQ;
+    constexpr uint32_t DATAB = IQ ? pd_iq_datab(DT)
+                             : DT == PD_KQ_Q6K ? PD_KQ6_DATA
                              : DT == PD_KQ_Q5K ? PD_KQ5_DATA : PD_KQ4_DATA;
+    constexpr uint32_t SCB = IQ ? pd_iq_scb(DT) : PD_KQ_SCB;
     constexpr uint32_t RAW_W = 128u * DATAB;
-    constexpr uint32_t RAW_R = 128u * PD_KQ_SCB;
-    constexpr uint32_t KWH_XK = 40u;  // half-superblock tile_x row: 32 payload + 8 scale/mu
+    constexpr uint32_t RAW_R = 128u * SCB;
+    // half-superblock tile_x row: 32 payload + 8 scale/mu (k-quant) or + 8
+    // window scales + 8 window mins (i-quant)
+    constexpr uint32_t KWH_XK = IQ ? 48u : 40u;
+    constexpr uint32_t TS_F = MU ? 128u * 4u : MU16 ? 128u * 8u : 4u;  // tile_s floats
 
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u, warp = tid >> 5u;
@@ -2880,6 +2931,11 @@ __global__ void __launch_bounds__(256, 1) pd_kquant_w4a8_pipe2_kernel(
     int* const tile_x = (int*)(raw_r1 + RAW_R);
     int* const tile_y = tile_x + 128 * KWH_XK;
     float* const tile_s = (float*)(tile_y + 128 * PD_MMQ_YK);
+    PdIqTabs tabs = {nullptr, nullptr};
+    if (IQ) {
+        tabs = pd_iq_tabs_stage(DT, (uint8_t*)(tile_s + TS_F));
+        __syncthreads();
+    }
     float acc[16][4] = {};
 
     // Same byte layout as pd_kquant_w4a8_pipe_kernel's stage(), parameterized
@@ -2895,12 +2951,23 @@ __global__ void __launch_bounds__(256, 1) pd_kquant_w4a8_pipe2_kernel(
                           data + ((size_t)(row_base + row) * n_super + kt) * DATAB
                               + c * 16u, ok);
         }
-        for (uint32_t i = tid; i < 128u * 3u; i += 256u) {
-            const uint32_t row = i / 3u, c = i % 3u;
-            const bool ok = (row_base + row) < out_dim;
-            pd_kq_cpa8p(rr + row * PD_KQ_SCB + c * 8u,
-                        scales + ((size_t)(row_base + row) * n_super + kt) *
-                            PD_KQ_SCB + c * 8u, ok);
+        if (IQ) {
+            constexpr uint32_t RCH = SCB / 4u;
+            for (uint32_t i = tid; i < 128u * RCH; i += 256u) {
+                const uint32_t row = i / RCH, c = i % RCH;
+                const bool ok = (row_base + row) < out_dim;
+                pd_kq_cpa4p(rr + row * SCB + c * 4u,
+                            scales + ((size_t)(row_base + row) * n_super + kt) * SCB
+                                + c * 4u, ok);
+            }
+        } else {
+            for (uint32_t i = tid; i < 128u * 3u; i += 256u) {
+                const uint32_t row = i / 3u, c = i % 3u;
+                const bool ok = (row_base + row) < out_dim;
+                pd_kq_cpa8p(rr + row * PD_KQ_SCB + c * 8u,
+                            scales + ((size_t)(row_base + row) * n_super + kt) *
+                                PD_KQ_SCB + c * 8u, ok);
+            }
         }
     };
 
@@ -2920,6 +2987,22 @@ __global__ void __launch_bounds__(256, 1) pd_kquant_w4a8_pipe2_kernel(
                 tile_s[l] = xsums[((size_t)chunk * batch_pad + col_base) * 4u + l];
             }
         }
+        if (MU16) {
+            // per-16 activation sums x their per-32 scale, straight off the
+            // mmq tile: 128 columns x 8 windows, four per thread
+            #pragma unroll
+            for (uint32_t it = 0; it < 4u; ++it) {
+                const uint32_t i = it * 256u + tid;
+                const uint32_t col = i >> 3u, w = i & 7u;
+                const int* pw = by + col * PD_MMQ_YK + 4u + 4u * w;
+                int sm = __dp4a(pw[0], 0x01010101, 0);
+                sm = __dp4a(pw[1], 0x01010101, sm);
+                sm = __dp4a(pw[2], 0x01010101, sm);
+                sm = __dp4a(pw[3], 0x01010101, sm);
+                const float scl = ((const float*)by)[col * PD_MMQ_YK + (w >> 1u)];
+                tile_s[col * 8u + w] = scl * (float)sm;
+            }
+        }
     };
 
     // Build the HALF-width tile_x for super `kt`'s `half` (0 or 1) out of
@@ -2933,6 +3016,30 @@ __global__ void __launch_bounds__(256, 1) pd_kquant_w4a8_pipe2_kernel(
     auto build_half = [&](uint32_t half, uint32_t buf) {
         unsigned char* const rw = buf ? raw_w1 : raw_w0;
         unsigned char* const rr = buf ? raw_r1 : raw_r0;
+        if (IQ) {
+            // 128 rows x 8 windows of 16 through the shared window unpack:
+            // the 4 packed-s8 words land in k order at [wl*4, wl*4+4), the
+            // window's f32 scale at [32 + wl], Q2_K's per-16 min at [40 + wl].
+            // Dead rows (zero-filled raw) write zeros.
+            #pragma unroll
+            for (uint32_t it = 0; it < 4u; ++it) {
+                const uint32_t i = it * 256u + tid;
+                const uint32_t row = i >> 3u, wl = i & 7u;
+                const bool live = (row_base + row) < out_dim;
+                int wq[4] = {0, 0, 0, 0};
+                float f = 0.0f, gm = 0.0f;
+                if (live)
+                    pd_iq_win_unpack_t(DT, rw + row * DATAB, rr + row * SCB, half * 8u + wl,
+                                       wq, &f, &gm, tabs);
+                int* const xr = tile_x + row * KWH_XK;
+                *reinterpret_cast<int4*>(xr + wl * 4u) = make_int4(wq[0], wq[1], wq[2], wq[3]);
+                reinterpret_cast<float*>(xr)[32u + wl] = f;
+                if (MU16) reinterpret_cast<float*>(xr)[40u + wl] = gm;
+            }
+            __syncthreads();
+            return;
+        }
+        if (IQ) return;  // (the k-quant build below is not instantiated for IQ)
         #pragma unroll
         for (uint32_t it = 0; it < 2u; ++it) {  // 128 rows * 4 ci = 512 = 2*256
             const uint32_t i = it * 256u + tid;
@@ -3077,6 +3184,7 @@ __global__ void __launch_bounds__(256, 1) pd_kquant_w4a8_pipe2_kernel(
         float dA[2][2][4];
         float muA[2][2][4];
         float sA[2][2][8];
+        float mA16[2][2][8];
         #pragma unroll
         for (uint32_t n = 0; n < 2u; ++n) {
             const uint32_t r0 = (i0 + n * 16u + g) * KWH_XK;
@@ -3094,6 +3202,12 @@ __global__ void __launch_bounds__(256, 1) pd_kquant_w4a8_pipe2_kernel(
                     sA[n][0][2u * kk + 1u] = ((const float*)tile_x)[r0 + so + 1u];
                     sA[n][1][2u * kk] = ((const float*)tile_x)[r8 + so];
                     sA[n][1][2u * kk + 1u] = ((const float*)tile_x)[r8 + so + 1u];
+                    if (MU16) {
+                        mA16[n][0][2u * kk] = ((const float*)tile_x)[r0 + so + 8u];
+                        mA16[n][0][2u * kk + 1u] = ((const float*)tile_x)[r0 + so + 9u];
+                        mA16[n][1][2u * kk] = ((const float*)tile_x)[r8 + so + 8u];
+                        mA16[n][1][2u * kk + 1u] = ((const float*)tile_x)[r8 + so + 9u];
+                    }
                 } else {
                     dA[n][0][kk] = ((const float*)tile_x)[r0 + 32u + kk];
                     dA[n][1][kk] = ((const float*)tile_x)[r8 + 32u + kk];
@@ -3119,6 +3233,13 @@ __global__ void __launch_bounds__(256, 1) pd_kquant_w4a8_pipe2_kernel(
                     S0 = tile_s[(jc + 2u * t) * 4u + kk];
                     S1 = tile_s[(jc + 2u * t + 1u) * 4u + kk];
                 }
+                float S0a = 0.0f, S0b = 0.0f, S1a = 0.0f, S1b = 0.0f;
+                if (MU16) {
+                    S0a = tile_s[(jc + 2u * t) * 8u + 2u * kk];
+                    S0b = tile_s[(jc + 2u * t) * 8u + 2u * kk + 1u];
+                    S1a = tile_s[(jc + 2u * t + 1u) * 8u + 2u * kk];
+                    S1b = tile_s[(jc + 2u * t + 1u) * 8u + 2u * kk + 1u];
+                }
                 #pragma unroll
                 for (uint32_t n = 0; n < 2u; ++n) {
                     if (K16) {
@@ -3138,6 +3259,14 @@ __global__ void __launch_bounds__(256, 1) pd_kquant_w4a8_pipe2_kernel(
                         acc[(j0 >> 3) + n][1] += dB1 * (sa0 * (float)d1 + sa1 * (float)e1);
                         acc[(j0 >> 3) + n][2] += dB0 * (sb0_ * (float)d2 + sb1_ * (float)e2);
                         acc[(j0 >> 3) + n][3] += dB1 * (sb0_ * (float)d3 + sb1_ * (float)e3);
+                        if (MU16) {
+                            const float ma0 = mA16[n][0][2u * kk], mb0 = mA16[n][0][2u * kk + 1u];
+                            const float ma8 = mA16[n][1][2u * kk], mb8 = mA16[n][1][2u * kk + 1u];
+                            acc[(j0 >> 3) + n][0] += ma0 * S0a + mb0 * S0b;
+                            acc[(j0 >> 3) + n][1] += ma0 * S1a + mb0 * S1b;
+                            acc[(j0 >> 3) + n][2] += ma8 * S0a + mb8 * S0b;
+                            acc[(j0 >> 3) + n][3] += ma8 * S1a + mb8 * S1b;
+                        }
                     } else {
                         int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
                         asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
@@ -3217,8 +3346,10 @@ int pd_kquant_gemm_w4a8_pipe2(const void* data, const void* scales, const void* 
                               void* stream) {
     if (out_dim == 0 || batch == 0) return 0;
     if ((in_dim & 255u) != 0u) return cudaErrorInvalidValue;
-    if (!pd_kq_valid(dtype)) return cudaErrorInvalidValue;
-    const bool mu = pd_kq_has_mu(dtype);
+    if (!pd_kq_valid(dtype) && !pd_kq_valid_iq(dtype)) return cudaErrorInvalidValue;
+    // Q2_K's per-16 min term is built in-kernel off the mmq tile; the
+    // per-32 xsums are neither needed nor read for the i-quant family
+    const bool mu = pd_kq_has_mu(dtype) && !pd_kq_valid_iq(dtype);
     if (mu && xsums == nullptr) return cudaErrorInvalidValue;
     const uint32_t batch_pad = (batch + 127u) & ~127u;
     const uint32_t ntiles = ((out_dim + 127u) / 128u) * (batch_pad >> 7u);
@@ -3240,8 +3371,23 @@ int pd_kquant_gemm_w4a8_pipe2(const void* data, const void* scales, const void* 
         case PD_KQ_Q4K: PD_KWH2_LAUNCH(PD_KQ_Q4K); break;
         case PD_KQ_Q5K: PD_KWH2_LAUNCH(PD_KQ_Q5K); break;
         case PD_KQ_Q6K: PD_KWH2_LAUNCH(PD_KQ_Q6K); break;
+        case PD_KQ_IQ2XXS: PD_KWH2_LAUNCH(PD_KQ_IQ2XXS); break;
+        case PD_KQ_IQ2XS: PD_KWH2_LAUNCH(PD_KQ_IQ2XS); break;
+        case PD_KQ_IQ2S: PD_KWH2_LAUNCH(PD_KQ_IQ2S); break;
+        case PD_KQ_IQ3XXS: PD_KWH2_LAUNCH(PD_KQ_IQ3XXS); break;
+        case PD_KQ_IQ3S: PD_KWH2_LAUNCH(PD_KQ_IQ3S); break;
+        case PD_KQ_IQ1S: PD_KWH2_LAUNCH(PD_KQ_IQ1S); break;
+        case PD_KQ_IQ1M: PD_KWH2_LAUNCH(PD_KQ_IQ1M); break;
+        case PD_KQ_IQ4NL_ID: PD_KWH2_LAUNCH(PD_KQ_IQ4NL_ID); break;
+        case PD_KQ_Q2K_ID: PD_KWH2_LAUNCH(PD_KQ_Q2K_ID); break;
+        case PD_KQ_Q3K_ID: PD_KWH2_LAUNCH(PD_KQ_Q3K_ID); break;
         default: PD_KWH2_LAUNCH(PD_KQ_IQ4XS); break;
     }
     #undef PD_KWH2_LAUNCH
     return pd_launch_status();
 }
+
+// Capability marker (slot 580): the >64-row W4A8 tile GEMM serves the
+// i-quant family + Q2_K / Q3_K / IQ4_NL - the engine's prefill can keep a
+// dense i-quant plane on the tile rung instead of the per-token dp4a walk.
+PD_EXPORT int pd_kquant_iq_tile(void) { return 0; }

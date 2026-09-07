@@ -1497,6 +1497,7 @@ static const KernelTableV1 PD_KERNELS = {
     pd_moe_wave_mask,
     pd_kquant_moe_gate_up_list,
     pd_kquant_moe_down_list,
+    pd_kquant_iq_tile,
 };
 
 PD_EXPORT const PackInfo* paddock_pack_info(void) {

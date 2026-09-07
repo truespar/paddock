@@ -3445,3 +3445,181 @@ fn iq_dense_gemv_bench() {
         );
     }
 }
+
+/// The >64-row W4A8 tile (`kquant_gemm_w4a8_pipe2`, slot 580) on dense
+/// i-quant planes: against the raw-bytes CPU dequant at 65 rows (the first
+/// width the tile serves, one tile column with pad) and against the dp4a
+/// lane - the same exact-int class off the same per-32 quantization - at
+/// 144 and 1024 rows (two tile columns, ragged; the prefill-chunk width).
+/// The v1 / pipe launchers forward the type to pipe2, so they are checked
+/// to agree bit for bit.
+#[test]
+fn iq_w4a8_tile_matches_reference() {
+    let Some(model) = common::model("QWEN35_IQ2_GGUF", common::QWEN35_9B_UD_IQ2) else {
+        return;
+    };
+    let Some(exec) = common::gpu() else {
+        return;
+    };
+    if !exec.has_kquant_iq() || !exec.has_kquant_iq_dense() || !exec.has_kquant_iq_tile() {
+        eprintln!("pack lacks the i-quant tile rung (slot 580) - skipping");
+        return;
+    }
+    let map = MappedGguf::open(&model).expect("open gguf");
+    let mut checked = 0usize;
+    // the 9B UD-IQ2_XXS file: IQ2_XXS qkv / gate / up, IQ3_XXS attn_gate,
+    // Q2_K / IQ2_S / IQ3_S down planes by layer, Q3_K token_embd
+    for name in [
+        "blk.0.attn_qkv.weight",
+        "blk.0.attn_gate.weight",
+        "blk.0.ffn_gate.weight",
+        "blk.0.ffn_down.weight",
+        "blk.1.ffn_down.weight",
+        "blk.18.ffn_down.weight",
+        "token_embd.weight",
+    ] {
+        // PADDOCK_TEST_PLANES=a,b narrows the walk (compute-sanitizer runs)
+        if let Ok(list) = std::env::var("PADDOCK_TEST_PLANES")
+            && !list.split(',').any(|p| p == name)
+        {
+            continue;
+        }
+        let Ok((info, raw)) = map.tensor_bytes(name) else {
+            continue;
+        };
+        let is_iq = matches!(
+            info.ggml_type,
+            GgmlType::Iq1S
+                | GgmlType::Iq1M
+                | GgmlType::Iq2Xxs
+                | GgmlType::Iq2Xs
+                | GgmlType::Iq2S
+                | GgmlType::Iq3Xxs
+                | GgmlType::Iq3S
+                | GgmlType::Iq4Nl
+                | GgmlType::Q2K
+                | GgmlType::Q3K
+        );
+        if !is_iq {
+            eprintln!("{name}: {:?}, not i-quant - skipped", info.ggml_type);
+            continue;
+        }
+        let w = exec.repack_kquant(&map, name).expect("repack");
+        let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
+        let needs = w.ty == GgmlType::Q2K;
+        let n_chunks = in_dim.div_ceil(128);
+
+        // 65 rows against the CPU reference on the dequantized activations
+        // (planes up to 64M weights - the vocab-wide ones take the GPU checks)
+        if in_dim * out_dim <= 64 << 20 {
+            let batch = 65usize;
+            let mut deq = vec![0f32; in_dim * out_dim];
+            paddock_kernels::reference::iq::dequant_iq(w.ty.raw(), raw, &mut deq)
+                .expect("raw dequant");
+            let x = deterministic_input(batch * in_dim, 31);
+            let mut xdq = vec![0f32; batch * in_dim];
+            for r in 0..batch {
+                let (qq, ss) = cpu_quantize_q8(&x[r * in_dim..(r + 1) * in_dim]);
+                for i in 0..in_dim {
+                    xdq[r * in_dim + i] = qq[i] as f32 * ss[i / 32];
+                }
+            }
+            let mut yref = vec![0f32; batch * out_dim];
+            for r in 0..batch {
+                for o in 0..out_dim {
+                    let mut a = 0f64;
+                    for i in 0..in_dim {
+                        a += deq[o * in_dim + i] as f64 * xdq[r * in_dim + i] as f64;
+                    }
+                    yref[r * out_dim + o] = a as f32;
+                }
+            }
+            let d_x = exec.to_device(&x).expect("x");
+            let batch_pad = batch.div_ceil(128) * 128;
+            let mut d_yq = exec.alloc_u8(n_chunks * batch_pad * 144).expect("yq");
+            exec.quantize_q8_mmq(&d_x, &mut d_yq, in_dim, batch)
+                .expect("quantize");
+            let mut d_sums = exec.alloc(n_chunks * batch_pad * 4).expect("sums");
+            exec.mmq_sums(&d_yq, &mut d_sums, in_dim, batch)
+                .expect("sums");
+            let mut d_y = exec.alloc(out_dim * batch).expect("y");
+            exec.kquant_gemm_w4a8_pipe2(&w, &d_yq, needs.then_some(&d_sums), &mut d_y, batch)
+                .expect("pipe2");
+            let y = exec.to_host(&d_y).expect("y host");
+            let e = rel_err(&y, &yref);
+            eprintln!(
+                "{name} {:?} [{in_dim}->{out_dim}] b={batch}: pipe2 vs cpu {e:.2e}",
+                w.ty
+            );
+            if e > 2e-5 {
+                eprintln!("  ref   {:?}", &yref[..4]);
+                eprintln!("  pipe2 {:?}", &y[..4]);
+            }
+            assert!(
+                e < 2e-5,
+                "{name} b={batch}: pipe2 tile vs CPU reference ({e:.2e})"
+            );
+        }
+
+        // 144 / 1024 rows against the dp4a lane, and v1 / pipe forward to pipe2
+        for batch in [144usize, 1024] {
+            let x = deterministic_input(batch * in_dim, 37);
+            let d_x = exec.to_device(&x).expect("x");
+            let mut d_xq = exec.alloc_i8(batch * in_dim).expect("xq");
+            let mut d_xs = exec.alloc(batch * in_dim / 32).expect("xs");
+            exec.quantize_q8(&d_x, &mut d_xq, &mut d_xs, batch * in_dim)
+                .expect("quant");
+            let mut d_ssums = exec.alloc(batch * in_dim / 16).expect("ssums");
+            exec.q8_sums_strided(&d_xq, &mut d_ssums, in_dim, batch)
+                .expect("ssums");
+            let mut d_y0 = exec.alloc(out_dim * batch).expect("y0");
+            exec.kquant_gemm_dp4a(
+                &w,
+                &d_xq,
+                &d_xs,
+                needs.then_some(&d_ssums),
+                &mut d_y0,
+                batch,
+            )
+            .expect("dp4a");
+            let y_dp4a = exec.to_host(&d_y0).expect("h");
+
+            let batch_pad = batch.div_ceil(128) * 128;
+            let mut d_yq = exec.alloc_u8(n_chunks * batch_pad * 144).expect("yq");
+            exec.quantize_q8_mmq(&d_x, &mut d_yq, in_dim, batch)
+                .expect("quantize");
+            let mut d_sums = exec.alloc(n_chunks * batch_pad * 4).expect("sums");
+            exec.mmq_sums(&d_yq, &mut d_sums, in_dim, batch)
+                .expect("sums");
+            let mut d_y = exec.alloc(out_dim * batch).expect("y");
+            exec.kquant_gemm_w4a8_pipe2(&w, &d_yq, needs.then_some(&d_sums), &mut d_y, batch)
+                .expect("pipe2");
+            let y = exec.to_host(&d_y).expect("y host");
+            let e = rel_err(&y, &y_dp4a);
+            eprintln!("{name} {:?} b={batch}: pipe2 vs dp4a {e:.2e}", w.ty);
+            assert!(
+                e < 1e-5,
+                "{name} b={batch}: pipe2 tile vs dp4a lane ({e:.2e})"
+            );
+
+            let mut d_y1 = exec.alloc(out_dim * batch).expect("y1");
+            exec.kquant_gemm_w4a8(&w, &d_yq, needs.then_some(&d_sums), &mut d_y1, batch)
+                .expect("w4a8 v1 -> pipe2");
+            let y1 = exec.to_host(&d_y1).expect("h");
+            assert!(
+                y1 == y,
+                "{name} b={batch}: the v1 launcher did not forward to pipe2"
+            );
+            let mut d_y2 = exec.alloc(out_dim * batch).expect("y2");
+            exec.kquant_gemm_w4a8_pipe(&w, &d_yq, needs.then_some(&d_sums), &mut d_y2, batch)
+                .expect("w4a8 pipe -> pipe2");
+            let y2 = exec.to_host(&d_y2).expect("h");
+            assert!(
+                y2 == y,
+                "{name} b={batch}: the pipe launcher did not forward to pipe2"
+            );
+        }
+        checked += 1;
+    }
+    assert!(checked > 0, "no i-quant plane in the file");
+}

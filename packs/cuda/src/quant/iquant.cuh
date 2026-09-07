@@ -54,7 +54,7 @@
 
 #define PD_IQ1S_DELTA 0.125f
 
-__host__ __device__ __forceinline__ bool pd_kq_valid_iq(uint32_t dt) {
+__host__ __device__ constexpr bool pd_kq_valid_iq(uint32_t dt) {
     return dt == PD_KQ_IQ2XXS || dt == PD_KQ_IQ2XS || dt == PD_KQ_IQ2S ||
            dt == PD_KQ_IQ3XXS || dt == PD_KQ_IQ3S || dt == PD_KQ_IQ1S ||
            dt == PD_KQ_IQ1M || dt == PD_KQ_IQ4NL_ID ||
@@ -82,7 +82,7 @@ __host__ __device__ __forceinline__ uint32_t pd_iq_srcb(uint32_t dt) {
 // to 4. The k-quant family keeps its fixed 24-byte record (PD_KQ_SCB); the
 // slimmer i-quant records are what let a 1-2 bit expert set stay near its
 // raw size in host-mapped memory (a 24-byte record is +48% on IQ1_S).
-__host__ __device__ __forceinline__ uint32_t pd_iq_scb(uint32_t dt) {
+__host__ __device__ constexpr uint32_t pd_iq_scb(uint32_t dt) {
     switch (dt) {
         case PD_KQ_IQ2XXS: return 4u;   // d
         case PD_KQ_IQ2XS: return 12u;   // d + scales[8]
@@ -98,7 +98,7 @@ __host__ __device__ __forceinline__ uint32_t pd_iq_scb(uint32_t dt) {
 }
 
 // repacked data bytes per super-block (16-byte multiples)
-__host__ __device__ __forceinline__ uint32_t pd_iq_datab(uint32_t dt) {
+__host__ __device__ constexpr uint32_t pd_iq_datab(uint32_t dt) {
     switch (dt) {
         case PD_KQ_IQ2XXS: return 64u;
         case PD_KQ_IQ2XS: return 64u;

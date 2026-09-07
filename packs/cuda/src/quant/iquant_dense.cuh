@@ -121,7 +121,11 @@ __global__ void __launch_bounds__(256) pd_iqd_dp4a_kernel(
         const int8_t* __restrict__ xq, const float* __restrict__ xs,
         const float* __restrict__ xsums, float* __restrict__ y,
         uint32_t in_dim, uint32_t out_dim, uint32_t batch, uint32_t dtype) {
-    const uint32_t task = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    // 8 warps per block, block-major: blockIdx.x * 8 stays in 32 bits for
+    // every (out_dim, batch) the launcher admits, where the thread-linear
+    // form (blockIdx.x * 256 + tid) overflowed past 134M outputs - the
+    // vocab-wide head at batch 1024 wrote its first 88% of rows only.
+    const uint32_t task = blockIdx.x * 8u + (threadIdx.x >> 5u);
     const uint32_t lane = threadIdx.x & 31u;
     if (task >= out_dim * batch) return;
     const uint32_t o = task / batch, b = task - o * batch;
@@ -505,8 +509,9 @@ int pd_kq_iq_dense_dp4a(const void* data, const void* scales, const void* xq,
             return pd_launch_status();
         }
     }
+    if ((size_t)out_dim * batch > 0xFFFFFFFFull) return cudaErrorInvalidValue;
     const uint32_t tasks = out_dim * batch;
-    const uint32_t blocks = (tasks * 32u + 255u) / 256u;
+    const uint32_t blocks = (tasks + 7u) / 8u;  // 8 warps (tasks) per block
     pd_iqd_dp4a_kernel<<<blocks, 256, 0, (cudaStream_t)stream>>>(
         (const uint8_t*)data, (const uint8_t*)scales, (const int8_t*)xq, (const float*)xs,
         (const float*)xsums, (float*)y, in_dim, out_dim, batch, dtype);

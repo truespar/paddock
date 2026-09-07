@@ -232,6 +232,12 @@ pub struct DenseStage {
     /// partials the ks GEMM wants. Empty (len 0) when no Kq plane loaded.
     pub xs: CudaSlice<f32>,
     pub ssums: CudaSlice<f32>,
+    /// `Kq` class above 64 rows: the mmq-layout int8 tiles
+    /// (`quantize_q8_mmq`) and their per-32 sums the W4A8 tile GEMM reads,
+    /// for one `KQ_TILE_ROWS`-row chunk of the widest dense plane (the
+    /// launch loops over chunks); len 1 without Kq.
+    pub yq: CudaSlice<u8>,
+    pub xsums: CudaSlice<f32>,
     /// f16 view of the activation the F16 class feeds `pd_f16_gemm`. One cast
     /// per (plane, tick); the same buffer serves every plane because the walk
     /// is strictly sequential inside a layer.
@@ -1008,6 +1014,10 @@ impl DensePlane {
 /// quantize per-32 into `stage.q`/`stage.xs` and the int8 dp4a GEMM runs
 /// (the Q4/Q5 min term needs the per-16 sums). Q8_0 planes take the
 /// repacked GEMM off f32 rows directly, as qwen35's `mm_q8` does.
+/// Rows per launch of the > 64-row W4A8 tile in [`kq_matmul`]: four tile
+/// columns, so the mmq scratch stays a few MB at any context length.
+pub(crate) const KQ_TILE_ROWS: usize = 512;
+
 fn kq_matmul(
     e: &GpuExecutor,
     w: &QuantW,
@@ -1038,6 +1048,43 @@ fn kq_matmul(
                 )));
             }
             let needs = crate::gpu::kq_needs_sums(k.ty);
+            // > 64 rows: the mmq tiles and the W4A8 tile GEMM - the qwen35
+            // prefill rung (`kq_mm_pre`) - read the plane once per 128-column
+            // tile where the dp4a walk below reads it once per token, in
+            // KQ_TILE_ROWS-row chunks off a fixed scratch. An i-quant plane
+            // needs the pack's window-unpack tile (slot 580).
+            let iq = crate::gpu::kq_is_iq(k.ty);
+            let chunk_rows = in_dim.div_ceil(128) * KQ_TILE_ROWS;
+            if batch > 64
+                && in_dim.is_multiple_of(256)
+                && e.has_kquant_gemm_w4a8_pipe2()
+                && (!iq || e.has_kquant_iq_tile())
+                && stage.yq.len() >= chunk_rows * 144
+                && stage.xsums.len() >= chunk_rows * 4
+                && paddock_models::dev_var_os!("PADDOCK_Q4X_NO_KQ_TILE").is_none()
+            {
+                // Q2_K's per-16 min is built inside the tile; the per-32
+                // sums serve the k-quant mu formats only
+                let sums = needs && !iq;
+                let mut off = 0;
+                while off < batch {
+                    let rows = (batch - off).min(KQ_TILE_ROWS);
+                    e.quantize_q8_mmq_rows(x, off, &mut stage.yq, in_dim, rows)?;
+                    if sums {
+                        e.mmq_sums(&stage.yq, &mut stage.xsums, in_dim, rows)?;
+                    }
+                    e.kquant_gemm_w4a8_pipe2_rows(
+                        k,
+                        &stage.yq,
+                        sums.then_some(&stage.xsums),
+                        y,
+                        off,
+                        rows,
+                    )?;
+                    off += rows;
+                }
+                return Ok(());
+            }
             if batch == 1 {
                 // the qwen35 serving class (`kq_w4a8_b1`): int8 activations
                 // through the W4A8 GEMV, the exact-f32 GEMV stays the oracle

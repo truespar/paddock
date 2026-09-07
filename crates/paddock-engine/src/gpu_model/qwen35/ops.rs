@@ -1822,12 +1822,12 @@ pub(crate) fn prefill_quant(
 ) -> Result<(), GpuModelError> {
     if batch > 64 {
         exec.quantize_q8_mmq(x, yq, in_dim, batch)?;
-        // A dense i-quant plane has no mmq tile lane yet and reads the
-        // row-major int8 pair at every width (kq_mm_pre); until the tile lane
-        // lands, files that carry such a plane pay one extra memory-bound
-        // pass here. Measured 2026-09-06 without it: the >64-row route read
-        // stale xq and a 110-token prompt decoded to gibberish.
-        if exec.dense_iq_seen() {
+        // A pack without the i-quant tile rung (slot 580) keeps a dense
+        // i-quant plane on the row-major dp4a walk at every width
+        // (kq_mm_pre), so such a file pays one extra memory-bound pass here.
+        // Measured 2026-09-06 without it: the >64-row route read stale xq
+        // and a 110-token prompt decoded to gibberish.
+        if iq_rowmajor_needed(exec) {
             exec.quantize_q8(x, xq, xs, batch * in_dim)?;
         }
     } else {
@@ -2078,18 +2078,13 @@ pub(crate) fn kq_mm_pre(
     batch: usize,
 ) -> Result<(), GpuModelError> {
     let needs = crate::gpu::kq_needs_sums(k.ty);
-    // The W4A8 tile GEMMs (pipe / pipe2 / the plain w4a8) stage raw k-quant
-    // super-blocks and have no i-quant tile loader - the pack refuses the
-    // type with cudaErrorInvalidValue - so an i-quant plane takes the dp4a
-    // lane at EVERY width. Measured 2026-09-06 on Qwen3.5-9B UD-IQ2_XXS:
-    // any prompt past 64 tokens died with "CUDA error 1" before this.
-    //
-    // INTERIM, NOT SOTA: the i-quant dp4a lane re-reads the weight plane
-    // once per token (warp per (row, token)), so a 2048-token chunk costs
-    // 2048x the plane's bytes. The target is an int8-mma tile lane whose
-    // loader unpacks i-quant windows into the mma_ks / pipe2 smem tiles;
-    // until it exists, prefill on dense i-quant files is correct and slow.
-    if batch > 64 && !crate::gpu::kq_is_iq(k.ty) {
+    // An i-quant plane rides the tile rung only when the pack's pipe2 builds
+    // its tile through the i-quant window unpack (slot 580); a pack without
+    // it refuses the type with cudaErrorInvalidValue, and the plane stays
+    // on the dp4a walk at every width - correct, but re-reading the plane
+    // once per token (any prompt past 64 tokens died with "CUDA error 1"
+    // before the guard, 2026-09-06, Qwen3.5-9B UD-IQ2_XXS).
+    if batch > 64 && kq_tile_ok(exec, k) {
         if needs {
             exec.mmq_sums(yq, xsums, k.dims[0], batch)?;
         }
@@ -2111,6 +2106,22 @@ pub(crate) fn kq_mm_pre(
         exec.kquant_gemm_dp4a(k, xq, xs, needs.then_some(&*ssums), y, batch)?;
     }
     Ok(())
+}
+
+/// The plane may take the >64-row W4A8 tile: every k-quant type, and the
+/// i-quant family when the pack's tile builds through the window unpack
+/// (slot 580).
+pub(crate) fn kq_tile_ok(exec: &GpuExecutor, k: &RepackedKQ) -> bool {
+    // IQ4_NL rows lie flat at any multiple of 32; the tile walks whole
+    // super-blocks, so such a width stays on the dp4a lane
+    !crate::gpu::kq_is_iq(k.ty) || (exec.has_kquant_iq_tile() && k.dims[0].is_multiple_of(256))
+}
+
+/// True when a dense i-quant plane was loaded and the pack cannot tile it:
+/// the >64-row producers then keep the row-major int8 pair for the dp4a
+/// walk as well as the mmq tiles.
+pub(crate) fn iq_rowmajor_needed(exec: &GpuExecutor) -> bool {
+    exec.dense_iq_seen() && !exec.has_kquant_iq_tile()
 }
 
 /// QuantW dispatch over [`prefill_mm_pre`] - Q8_0 keeps its exact ladder,
@@ -2179,11 +2190,12 @@ pub(crate) fn prefill_ffn_down_any(
     match w {
         QuantW::Q8(q) => prefill_ffn_down(exec, q, xq, xs, yq, skfix, gate, up, y, ff, batch),
         QuantW::Kq(k) => {
-            // the fused swiglu+quantize writes ONLY the mmq tiles; an i-quant
-            // down plane reads the row-major pair (kq_mm_pre), so it takes the
-            // two-step form at every width - this was the site that fed stale
-            // xq to a 110-token prompt and decoded gibberish (2026-09-06)
-            if batch > 64 && !crate::gpu::kq_is_iq(k.ty) {
+            // the fused swiglu+quantize writes ONLY the mmq tiles; a down
+            // plane the pack cannot tile reads the row-major pair (kq_mm_pre),
+            // so it takes the two-step form at every width - this was the
+            // site that fed stale xq to a 110-token prompt and decoded
+            // gibberish (2026-09-06)
+            if batch > 64 && kq_tile_ok(exec, k) {
                 exec.quantize_q8_mmq_swiglu(gate, up, yq, k.dims[0], batch)?;
             } else {
                 exec.swiglu(gate, up, batch * ff)?;
@@ -2285,11 +2297,11 @@ pub(crate) fn prefill_add_norm_quant(
 ) -> Result<(), GpuModelError> {
     if batch > 64 && n.is_multiple_of(4) && n <= 24576 {
         // The fused kernel writes the mmq tiles (yq) only. A dense i-quant
-        // plane downstream reads the row-major pair (kq_mm_pre), so keep xn
-        // and quantize it as well - the width bisect on Qwen3.5-9B UD-IQ2_XXS
-        // (2026-09-06) passed at 64 rows and decoded gibberish at 65, and this
-        // was the site. Interim until the i-quant mma tile lane (prefill_quant).
-        let iq = exec.dense_iq_seen();
+        // plane the pack cannot tile reads the row-major pair downstream
+        // (kq_mm_pre), so keep xn and quantize it as well - the width bisect
+        // on Qwen3.5-9B UD-IQ2_XXS (2026-09-06) passed at 64 rows and decoded
+        // gibberish at 65, and this was the site.
+        let iq = iq_rowmajor_needed(exec);
         let xn_opt = if write_xn || iq { Some(&mut *xn) } else { None };
         exec.add_rmsnorm_quant_mmq(x, proj, proj_b16, w, xn_opt, yq, n, batch, eps)?;
         if iq {

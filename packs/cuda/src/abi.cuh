@@ -2845,6 +2845,10 @@ struct KernelTableV1 {
                                 const void*, const void*, const void*, void*, uint32_t,
                                 uint32_t, uint32_t, uint32_t, uint32_t, const void*,
                                 const void*, void*);
+    // 585: kquant_iq_tile - capability marker: kquant_gemm_w4a8_pipe2 (and
+    // the v1 / pipe launchers, which forward) serve the i-quant family +
+    // Q2_K / Q3_K / IQ4_NL - the >64-row prefill tile for dense i-quant planes.
+    int (*kquant_iq_tile)(void);
 };
 
 } // extern "C"
