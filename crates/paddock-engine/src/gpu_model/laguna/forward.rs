@@ -493,6 +493,23 @@ impl Generator for GpuLaguna {
     // stall" - a flat ~9 s cohort TTFT at 1k×1k c32). These three methods
     // put it on the mixed path.
 
+    /// The serial prefill API, routed through the batched lane once one
+    /// exists (granite's shape). Without this the trait default loops
+    /// `forward(t)`, whose serial state is a DENSE max_ctx KV for all 40
+    /// layers - 20 GiB at 131k on the XS - built by the service's post-enable
+    /// warm-up and then held for the life of a server that never touches the
+    /// serial path again (measured 2026-09-06: 51.6 GiB with, 31.6 without).
+    fn forward_prefill_stream(&mut self, tokens: &[u32]) -> Result<Vec<f32>, GenError> {
+        if self.batch.is_some() {
+            return self.forward_prefill_impl(0, tokens).map_err(gen_err);
+        }
+        let mut logits = Vec::new();
+        for &t in tokens {
+            logits = self.forward(t)?;
+        }
+        Ok(logits)
+    }
+
     fn supports_chunked_prefill(&self) -> bool {
         self.batch.is_some()
     }

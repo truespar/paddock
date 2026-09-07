@@ -40,6 +40,15 @@
 // launcher): every thread walks one window, so a 256-thread launch is only
 // right when in_dim >= 4096. Laguna's in_dim is 2048 - half the block used
 // to walk zero windows and still pay the __syncthreads and the tid-0 fold.
+// LIST: the expert-major prefill's form - grid (ff, P) with a fixed P, each
+// block striding over a device-counted list of (token*n_active + slot) pair
+// indices (the wave's in-wave pairs, moe/offload.cuh's mask+compact). The
+// plain form's grid enumerates every pair, and on a 2000-token prompt that
+// is billions of blocks per prefill exiting on the absent check; the list
+// form launches P blocks per output row and does only the wave's work.
+// Same body, same per-pair math and fold order (a pair's output does not
+// depend on which block computed it).
+template <bool LIST>
 __global__ void __launch_bounds__(256) pd_kquant_moe_gate_up_kernel(
     // cascade (laguna chain): xq/idx are the quantize and
     // topk predecessors' outputs - armed at top, launched via pd_pdl_go
@@ -48,18 +57,30 @@ __global__ void __launch_bounds__(256) pd_kquant_moe_gate_up_kernel(
     const unsigned int* __restrict__ idx, const int8_t* __restrict__ xq,
     const float* __restrict__ xs, const float* __restrict__ xsums,
     float* __restrict__ out, uint32_t in_dim, uint32_t ff, uint32_t n_active,
-    uint32_t gdt, uint32_t udt) {
+    uint32_t gdt, uint32_t udt, const unsigned int* __restrict__ list,
+    const unsigned int* __restrict__ n_list) {
     PD_PDL_ARM();
-    const uint32_t o = blockIdx.x, slot = blockIdx.y, b = blockIdx.z;
+    const uint32_t o = blockIdx.x;
     const uint32_t tid = threadIdx.x, nth = blockDim.x;
+    const uint32_t p_hi = LIST ? *n_list : 1u;
+    for (uint32_t p = LIST ? blockIdx.y : 0u; p < p_hi; p += LIST ? gridDim.y : 1u) {
+    uint32_t slot, b;
+    if (LIST) {
+        const uint32_t pr = list[p];
+        b = pr / n_active;
+        slot = pr - b * n_active;
+    } else {
+        slot = blockIdx.y;
+        b = blockIdx.z;
+    }
     const uint32_t e = idx[(size_t)b * n_active + slot];
     // Absent pair (the expert-major prefill's out-of-wave sentinel,
     // PD_MOE_CACHE_NONE from moe/offload.cuh): this block has no expert to
     // read. Leave `out` alone - the down kernel skips the same pair - and
-    // return before anything block-collective; e is block-uniform so the
-    // exit is too. Measured reason: without it a wave's cost scaled with
+    // skip before anything block-collective; e is block-uniform so the
+    // skip is too. Measured reason: without it a wave's cost scaled with
     // EVERY routed pair (10 ms a launch on a 435-token prompt), not its own.
-    if (e == 0xFFFFFFFFu) return;
+    if (e == 0xFFFFFFFFu) continue;
     const uint32_t gdb = pd_kq_datab(gdt), udb = pd_kq_datab(udt);
     const uint32_t gscb = pd_kq_scb(gdt), uscb = pd_kq_scb(udt);
     // row strides by type: whole superblocks, or IQ4_NL's flat 32-block rows
@@ -112,6 +133,10 @@ __global__ void __launch_bounds__(256) pd_kquant_moe_gate_up_kernel(
         // silu(g) * u - same epilogue as the Q8 pair
         out[((size_t)b * n_active + slot) * ff + o] = (g / (1.0f + __expf(-g))) * u;
     }
+    // LIST: wsum is reused by the next pair this block takes - tid 0 must be
+    // done reading it before any lane writes again
+    if (LIST) __syncthreads();
+    }
 }
 
 PD_EXPORT
@@ -143,11 +168,44 @@ int pd_kquant_moe_gate_up(const void* gate_data, const void* gate_scales,
     // while costing a summation-order change - not worth the parity vetting.
     uint32_t nth = (in_dim >> 4) < 256u ? (((in_dim >> 4) + 31u) & ~31u) : 256u;
     if (nth < 32u) nth = 32u;
-    pd_pdl_go(pd_kquant_moe_gate_up_kernel, grid, nth, 0u, (cudaStream_t)stream,
+    pd_pdl_go(pd_kquant_moe_gate_up_kernel<false>, grid, nth, 0u, (cudaStream_t)stream,
         (const uint8_t*)gate_data, (const uint8_t*)gate_scales,
         (const uint8_t*)up_data, (const uint8_t*)up_scales,
         (const unsigned int*)idx, (const int8_t*)xq, (const float*)xs,
-        (const float*)xsums, (float*)out, in_dim, ff, n_active, gdt, udt);
+        (const float*)xsums, (float*)out, in_dim, ff, n_active, gdt, udt,
+        (const unsigned int*)nullptr, (const unsigned int*)nullptr);
+    return pd_launch_status();
+}
+
+// slot 583: the LIST form (see the kernel note). `pairs`/`n_pairs` are the
+// wave's compacted in-wave pair indices and their device count; the grid is
+// (ff, PD_KQ_MOE_LIST_P) regardless of the count.
+#define PD_KQ_MOE_LIST_P 96u
+PD_EXPORT
+int pd_kquant_moe_gate_up_list(const void* gate_data, const void* gate_scales,
+                               const void* up_data, const void* up_scales,
+                               const void* idx, const void* xq, const void* xs,
+                               const void* xsums, void* out, uint32_t in_dim,
+                               uint32_t ff, uint32_t n_active, uint32_t batch,
+                               uint32_t gdt, uint32_t udt, const void* pairs,
+                               const void* n_pairs, void* stream) {
+    if (ff == 0 || n_active == 0 || batch == 0) return 0;
+    if ((in_dim & 31u) != 0) return cudaErrorInvalidValue;
+    if ((in_dim & 255u) != 0 && !(gdt == PD_KQ_IQ4NL_ID && udt == PD_KQ_IQ4NL_ID))
+        return cudaErrorInvalidValue;
+    if (!(pd_kq_valid(gdt) || pd_kq_valid_iq(gdt)) || !(pd_kq_valid(udt) || pd_kq_valid_iq(udt)))
+        return cudaErrorInvalidValue;
+    if ((pd_kq_has_mu(gdt) || pd_kq_has_mu(udt)) && xsums == nullptr) return cudaErrorInvalidValue;
+    if (pairs == nullptr || n_pairs == nullptr) return cudaErrorInvalidValue;
+    dim3 grid(ff, PD_KQ_MOE_LIST_P, 1u);
+    uint32_t nth = (in_dim >> 4) < 256u ? (((in_dim >> 4) + 31u) & ~31u) : 256u;
+    if (nth < 32u) nth = 32u;
+    pd_pdl_go(pd_kquant_moe_gate_up_kernel<true>, grid, nth, 0u, (cudaStream_t)stream,
+        (const uint8_t*)gate_data, (const uint8_t*)gate_scales,
+        (const uint8_t*)up_data, (const uint8_t*)up_scales,
+        (const unsigned int*)idx, (const int8_t*)xq, (const float*)xs,
+        (const float*)xsums, (float*)out, in_dim, ff, n_active, gdt, udt,
+        (const unsigned int*)pairs, (const unsigned int*)n_pairs);
     return pd_launch_status();
 }
 
@@ -158,19 +216,28 @@ int pd_kquant_moe_gate_up(const void* gate_data, const void* gate_scales,
 // adds shared expert + residual). 16 matches pd_moe_topk_warp's existing
 // top-k ceiling (sel_logit[16]) - was hard-capped at 8 (XS-2.1's top-8);
 // Laguna S-2.1's top-10 MoE hit the cap.
+// LIST: grid (embd, R), each block striding over a device-counted list of
+// TOKENS that hold at least one in-wave pair; the token's absent pairs
+// contribute zero and the block ACCUMULATES into out (one writer per
+// element per wave, waves in sequence - deterministic). See the gate_up note.
+template <bool LIST>
 __global__ void __launch_bounds__(512) pd_kquant_moe_down_kernel(
     const uint8_t* __restrict__ dd, const uint8_t* __restrict__ dsc,
     const unsigned int* __restrict__ idx, const float* __restrict__ topk_w,
     const int8_t* __restrict__ fq, const float* __restrict__ fs,
     const float* __restrict__ fsums, float* __restrict__ out, uint32_t ff,
-    uint32_t embd, uint32_t n_active, uint32_t ddt) {
+    uint32_t embd, uint32_t n_active, uint32_t ddt,
+    const unsigned int* __restrict__ rows_list, const unsigned int* __restrict__ n_rows) {
     // cascade: fq/topk_w are the gate_up-quantize and topk outputs
     PD_PDL_ARM();
-    const uint32_t o = blockIdx.x, b = blockIdx.y;
+    const uint32_t o = blockIdx.x;
     const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     const uint32_t ddb = pd_kq_datab(ddt);
     const bool mu = pd_kq_has_mu(ddt);
     __shared__ float sh[16];
+    const uint32_t i_hi = LIST ? *n_rows : 1u;
+    for (uint32_t i = LIST ? blockIdx.y : 0u; i < i_hi; i += LIST ? gridDim.y : 1u) {
+    const uint32_t b = LIST ? rows_list[i] : blockIdx.y;
     if (warp < n_active) {
         const size_t srow = (size_t)b * n_active + warp;
         const uint32_t e = idx[srow];
@@ -210,7 +277,10 @@ __global__ void __launch_bounds__(512) pd_kquant_moe_down_kernel(
     if (threadIdx.x == 0) {
         float v = 0.0f;
         for (uint32_t w = 0; w < n_active; ++w) v += sh[w];
-        out[(size_t)b * embd + o] = v;
+        if (LIST) out[(size_t)b * embd + o] += v;
+        else out[(size_t)b * embd + o] = v;
+    }
+    if (LIST) __syncthreads();   // sh is reused by this block's next token
     }
 }
 
@@ -228,11 +298,126 @@ int pd_kquant_moe_down(const void* down_data, const void* down_scales,
     if ((pd_kq_has_mu(ddt)) && fsums == nullptr)
         return cudaErrorInvalidValue;
     dim3 grid(embd, batch);
-    pd_pdl_go(pd_kquant_moe_down_kernel, grid, 32u * n_active, 0u, (cudaStream_t)stream,
+    pd_pdl_go(pd_kquant_moe_down_kernel<false>, grid, 32u * n_active, 0u, (cudaStream_t)stream,
         (const uint8_t*)down_data, (const uint8_t*)down_scales,
         (const unsigned int*)idx, (const float*)topk_w, (const int8_t*)fq,
         (const float*)fs, (const float*)fsums, (float*)out, ff, embd, n_active,
-        ddt);
+        ddt, (const unsigned int*)nullptr, (const unsigned int*)nullptr);
+    return pd_launch_status();
+}
+
+// ---- token-major down for the expert-major prefill (slot 584) --------------
+// The (column, token) geometry above is wrong for a wave: with top-10 over
+// seven waves nearly every token holds an in-wave pair in every wave, so a
+// per-(column, token) block ran once per wave with nine of its ten warps
+// skipping - 18 ms a launch at 435 tokens, 57% of the prefill (nsys).
+// Here a block owns ONE token from the wave's token list and walks that
+// token's in-wave pairs in order (1-3 of them): the pair's fq row + scales
+// are staged to smem once, every thread computes a strided set of output
+// columns over the whole 640-deep row, and the topk-weighted sum lands in
+// registers. One writer per (token, column) per wave, pair order fixed by
+// the routing, waves in sequence: deterministic, and a wave costs its own
+// pairs. A thread's column dot is a serial window walk (the plain kernel's
+// 32-lane tree is a different f32 order; the wave-order reassociation is
+// already the class this path carries).
+template <uint32_t NTH>
+__global__ void __launch_bounds__(NTH) pd_kquant_moe_down_rows_kernel(
+    const uint8_t* __restrict__ dd, const uint8_t* __restrict__ dsc,
+    const unsigned int* __restrict__ idx, const float* __restrict__ topk_w,
+    const int8_t* __restrict__ fq, const float* __restrict__ fs,
+    const float* __restrict__ fsums, float* __restrict__ out, uint32_t ff,
+    uint32_t embd, uint32_t n_active, uint32_t ddt,
+    const unsigned int* __restrict__ rows_list, const unsigned int* __restrict__ n_rows) {
+    PD_PDL_ARM();
+    extern __shared__ __align__(16) unsigned char pd_dnr_sh[];
+    int8_t* sx = (int8_t*)pd_dnr_sh;                         // ff int8
+    float* sxs = (float*)(pd_dnr_sh + ff);                   // ff/32 scales
+    float* sxm = sxs + (ff >> 5);                            // ff/16 sums
+    const uint32_t ddb = pd_kq_datab(ddt);
+    const uint32_t dscb = pd_kq_scb(ddt);
+    const bool mu = pd_kq_has_mu(ddt);
+    const uint32_t rowb = pd_kq_row_datab(ddt, ff), rows_b = pd_kq_row_scb(ddt, ff);
+    const uint32_t nwin = ff >> 4;
+    // columns per thread: embd / NTH rounded up, compile-time bound 16
+    constexpr uint32_t MAXC = 16u;
+    const uint32_t i_hi = *n_rows;
+    for (uint32_t i = blockIdx.x; i < i_hi; i += gridDim.x) {
+        const uint32_t b = rows_list[i];
+        float acc[MAXC];
+        #pragma unroll
+        for (uint32_t c = 0; c < MAXC; ++c) acc[c] = 0.0f;
+        for (uint32_t j = 0; j < n_active; ++j) {
+            const size_t srow = (size_t)b * n_active + j;
+            const uint32_t e = idx[srow];
+            if (e == 0xFFFFFFFFu) continue;           // block-uniform
+            // stage this pair's quantized activation row
+            __syncthreads();                          // previous pair's readers done
+            for (uint32_t t = threadIdx.x; t < (ff >> 4); t += NTH)
+                ((int4*)sx)[t] = ((const int4*)(fq + srow * ff))[t];
+            for (uint32_t t = threadIdx.x; t < (ff >> 5); t += NTH) sxs[t] = fs[srow * (ff >> 5) + t];
+            if (mu)
+                for (uint32_t t = threadIdx.x; t < (ff >> 4); t += NTH) sxm[t] = fsums[srow * (ff >> 4) + t];
+            __syncthreads();
+            const float wj = topk_w[srow];
+            const uint8_t* erow = dd + (size_t)e * embd * rowb;
+            const uint8_t* erec = dsc + (size_t)e * embd * rows_b;
+            #pragma unroll
+            for (uint32_t c = 0; c < MAXC; ++c) {
+                const uint32_t o = threadIdx.x + c * NTH;
+                if (o >= embd) break;
+                const uint8_t* row = erow + (size_t)o * rowb;
+                const uint8_t* rrec = erec + (size_t)o * rows_b;
+                float a = 0.0f;
+                for (uint32_t w16 = 0; w16 < nwin; ++w16) {
+                    const uint32_t base = w16 << 4;
+                    const uint32_t s = base >> 8, w = (base >> 4) & 15u;
+                    const int4 xv = *reinterpret_cast<const int4*>(sx + base);
+                    int wq[4];
+                    float f, g;
+                    pd_kq_win_unpack(ddt, row + (size_t)s * ddb, rrec + (size_t)s * dscb, w, wq, &f, &g);
+                    int si = __dp4a(wq[0], xv.x, 0);
+                    si = __dp4a(wq[1], xv.y, si);
+                    si = __dp4a(wq[2], xv.z, si);
+                    si = __dp4a(wq[3], xv.w, si);
+                    const float x_s = sxs[base >> 5];
+                    a += f * (x_s * (float)si);
+                    if (mu) a += g * (x_s * sxm[base >> 4]);
+                }
+                acc[c] += wj * a;
+            }
+        }
+        #pragma unroll
+        for (uint32_t c = 0; c < MAXC; ++c) {
+            const uint32_t o = threadIdx.x + c * NTH;
+            if (o < embd) out[(size_t)b * embd + o] += acc[c];
+        }
+    }
+}
+
+// slot 584: the token-major form - accumulates into `out` over the tokens
+// in `rows`/`n_rows` (the caller zeroes `out` before the first wave).
+#define PD_KQ_MOE_LIST_R 512u
+PD_EXPORT
+int pd_kquant_moe_down_list(const void* down_data, const void* down_scales,
+                            const void* idx, const void* topk_w, const void* fq,
+                            const void* fs, const void* fsums, void* out,
+                            uint32_t ff, uint32_t embd, uint32_t n_active,
+                            uint32_t batch, uint32_t ddt, const void* rows,
+                            const void* n_rows, void* stream) {
+    if (embd == 0 || n_active == 0 || batch == 0) return 0;
+    if ((ff & 31u) != 0 || n_active > 16u) return cudaErrorInvalidValue;
+    if ((ff & 255u) != 0 && ddt != PD_KQ_IQ4NL_ID) return cudaErrorInvalidValue;
+    if (!pd_kq_valid(ddt) && !pd_kq_valid_iq(ddt)) return cudaErrorInvalidValue;
+    if ((pd_kq_has_mu(ddt)) && fsums == nullptr) return cudaErrorInvalidValue;
+    if (rows == nullptr || n_rows == nullptr) return cudaErrorInvalidValue;
+    if (embd > 16u * 256u) return cudaErrorInvalidValue;   // MAXC columns per thread
+    const uint32_t smem = ff + (ff >> 5) * 4u + (ff >> 4) * 4u;
+    dim3 grid(PD_KQ_MOE_LIST_R);
+    pd_pdl_go(pd_kquant_moe_down_rows_kernel<256u>, grid, 256u, smem, (cudaStream_t)stream,
+        (const uint8_t*)down_data, (const uint8_t*)down_scales,
+        (const unsigned int*)idx, (const float*)topk_w, (const int8_t*)fq,
+        (const float*)fs, (const float*)fsums, (float*)out, ff, embd, n_active,
+        ddt, (const unsigned int*)rows, (const unsigned int*)n_rows);
     return pd_launch_status();
 }
 

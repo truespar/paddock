@@ -2826,11 +2826,25 @@ struct KernelTableV1 {
     // jobs, n_jobs, stats, stream). Same LRU as slot 575, no idx_slot.
     int (*moe_cache_resolve_dev)(const void*, const void*, uint32_t, void*, void*, void*,
                                  void*, void*, void*, void*, void*);
-    // 582: the wave's remapped routing: (idx, rows, wave_of, slot_of, wave,
-    // absent, idx_slot[rows], stream) - out-of-wave pairs take `absent`
-    // (PD_MOE_CACHE_NONE), which the token-batched pair kernels skip.
-    int (*moe_wave_mask)(const void*, uint32_t, const void*, const void*, uint32_t,
-                         uint32_t, void*, void*);
+    // 582: the wave's remapped routing + compaction: (idx, rows, n_active,
+    // wave_of, slot_of, wave, absent, idx_slot[rows], pairs[rows], n_pairs,
+    // rows_list[rows/n_active], n_rows, stream) - out-of-wave pairs take
+    // `absent` (PD_MOE_CACHE_NONE); pairs/rows_list are the in-wave pair
+    // indices and the tokens holding one, device-counted.
+    int (*moe_wave_mask)(const void*, uint32_t, uint32_t, const void*, const void*,
+                         uint32_t, uint32_t, void*, void*, void*, void*, void*, void*);
+    // 583: kquant_moe_gate_up over a device-counted pair list (grid strides
+    // over it): the plain arguments + (pairs, n_pairs) before the stream.
+    int (*kquant_moe_gate_up_list)(const void*, const void*, const void*, const void*,
+                                   const void*, const void*, const void*, const void*,
+                                   void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                                   uint32_t, uint32_t, const void*, const void*, void*);
+    // 584: kquant_moe_down over a device-counted token list, ACCUMULATING
+    // into out: the plain arguments + (rows, n_rows) before the stream.
+    int (*kquant_moe_down_list)(const void*, const void*, const void*, const void*,
+                                const void*, const void*, const void*, void*, uint32_t,
+                                uint32_t, uint32_t, uint32_t, uint32_t, const void*,
+                                const void*, void*);
 };
 
 } // extern "C"

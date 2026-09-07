@@ -90,6 +90,13 @@ pub struct ExpertCache {
     wave_cnt: CudaSlice<u32>,
     /// The wave's remapped routing (`max_rows`), written by the mask.
     idx_wave: CudaSlice<u32>,
+    /// The wave's compacted in-wave pair indices (`max_rows`) + device
+    /// count, and the tokens holding at least one (`max_rows`, over-sized)
+    /// + count - what the LIST pair kernels stride over.
+    pairs_w: CudaSlice<u32>,
+    n_pairs_w: CudaSlice<u32>,
+    rows_w: CudaSlice<u32>,
+    n_rows_w: CudaSlice<u32>,
     /// Fill descriptors: mirror sources, slot destinations, bytes per expert -
     /// gate data, gate scales, up data, up scales, down data, down scales.
     src: [u64; 6],
@@ -108,6 +115,18 @@ impl ExpertCache {
     /// `idx_slot` on the wave path).
     pub fn idx_wave(&self) -> &CudaSlice<u32> {
         &self.idx_wave
+    }
+
+    /// The wave's pair list + count and token list + count (see the mask).
+    pub fn wave_lists(
+        &self,
+    ) -> (
+        &CudaSlice<u32>,
+        &CudaSlice<u32>,
+        &CudaSlice<u32>,
+        &CudaSlice<u32>,
+    ) {
+        (&self.pairs_w, &self.n_pairs_w, &self.rows_w, &self.n_rows_w)
     }
 
     /// `(rows resolved, misses)` since load - a sync + tiny readback, for
@@ -145,6 +164,8 @@ impl GpuExecutor {
         self.kernels.moe_wave_plan.is_some()
             && self.kernels.moe_cache_resolve_dev.is_some()
             && self.kernels.moe_wave_mask.is_some()
+            && self.kernels.kquant_moe_gate_up_list.is_some()
+            && self.kernels.kquant_moe_down_list.is_some()
     }
 
     /// Build a `slots`-expert cache over three host-mapped planes of one
@@ -223,6 +244,10 @@ impl GpuExecutor {
             wave_ids: self.to_device_u32(&vec![0u32; n_waves * slots])?,
             wave_cnt: self.to_device_u32(&vec![0u32; n_waves])?,
             idx_wave: self.to_device_u32(&vec![0u32; max_rows])?,
+            pairs_w: self.to_device_u32(&vec![0u32; max_rows])?,
+            n_pairs_w: self.to_device_u32(&[0u32])?,
+            rows_w: self.to_device_u32(&vec![0u32; max_rows])?,
+            n_rows_w: self.to_device_u32(&[0u32])?,
             src,
             dst,
             bytes,
@@ -357,6 +382,7 @@ impl GpuExecutor {
         c: &ExpertCache,
         idx: &CudaSlice<u32>,
         rows: usize,
+        n_active: usize,
         wave: usize,
     ) -> Result<(), GpuError> {
         let f = self
@@ -367,16 +393,25 @@ impl GpuExecutor {
         let (wo, _g1) = c.wave_of.device_ptr(&self.stream);
         let (so, _g2) = c.slot_of.device_ptr(&self.stream);
         let (iw, _g3) = c.idx_wave.device_ptr(&self.stream);
+        let (pw, _g4) = c.pairs_w.device_ptr(&self.stream);
+        let (npw, _g5) = c.n_pairs_w.device_ptr(&self.stream);
+        let (rw, _g6) = c.rows_w.device_ptr(&self.stream);
+        let (nrw, _g7) = c.n_rows_w.device_ptr(&self.stream);
         // SAFETY: pack ABI v1 contract (slot 582); rows <= max_rows checked by the plan
         check(unsafe {
             f(
                 ip as *const _,
                 rows as u32,
+                n_active as u32,
                 wo as *const _,
                 so as *const _,
                 wave as u32,
                 MOE_CACHE_NONE,
                 iw as *mut _,
+                pw as *mut _,
+                npw as *mut _,
+                rw as *mut _,
+                nrw as *mut _,
                 self.stream_ptr(),
             )
         })

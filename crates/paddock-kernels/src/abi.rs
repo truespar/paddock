@@ -6163,9 +6163,18 @@ pub struct KernelTableV1 {
     /// wave): (ids, n_ids, n_slots, slot_of, expert_in, last_use, tick, jobs,
     /// n_jobs, stats, stream). Same LRU as slot 575, writes no idx_slot.
     pub moe_cache_resolve_dev: Option<MoeCacheResolveDevFn>,
-    /// 582: the wave's remapped routing: (idx, rows, wave_of, slot_of, wave,
-    /// zero_slot, idx_slot[rows], stream) - out-of-wave pairs take zero_slot.
+    /// 582: the wave's remapped routing + compaction: (idx, rows, n_active,
+    /// wave_of, slot_of, wave, absent, idx_slot[rows], pairs[rows], n_pairs,
+    /// rows_list, n_rows, stream) - out-of-wave pairs take `absent`; the two
+    /// lists are the in-wave pair indices and the tokens holding one,
+    /// device-counted, for the LIST pair kernels.
     pub moe_wave_mask: Option<MoeWaveMaskFn>,
+    /// 583: `kquant_moe_gate_up` striding a device-counted pair list:
+    /// the plain arguments + (pairs, n_pairs) before the stream.
+    pub kquant_moe_gate_up_list: Option<KquantMoeGateUpListFn>,
+    /// 584: `kquant_moe_down` striding a device-counted token list and
+    /// ACCUMULATING into out: the plain arguments + (rows, n_rows).
+    pub kquant_moe_down_list: Option<KquantMoeDownListFn>,
 }
 
 /// Expert-major prefill plan (see `KernelTableV1::moe_wave_plan`).
@@ -6196,15 +6205,62 @@ pub type MoeCacheResolveDevFn = unsafe extern "C" fn(
     *mut core::ffi::c_void,
 ) -> i32;
 
-/// Wave routing mask (see `KernelTableV1::moe_wave_mask`).
+/// Wave routing mask + compaction (see `KernelTableV1::moe_wave_mask`).
 pub type MoeWaveMaskFn = unsafe extern "C" fn(
     *const core::ffi::c_void,
+    u32,
     u32,
     *const core::ffi::c_void,
     *const core::ffi::c_void,
     u32,
     u32,
     *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+) -> i32;
+
+/// LIST gate_up (see `KernelTableV1::kquant_moe_gate_up_list`).
+pub type KquantMoeGateUpListFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+) -> i32;
+
+/// LIST down (see `KernelTableV1::kquant_moe_down_list`).
+pub type KquantMoeDownListFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
     *mut core::ffi::c_void,
 ) -> i32;
 
@@ -6583,7 +6639,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 568;
+pub const KERNEL_TABLE_SLOTS: usize = 570;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,

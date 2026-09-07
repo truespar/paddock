@@ -560,7 +560,9 @@ extern "C" int pd_q4x_gdn_split_widen(const void*, void*, void*, void*, uint32_t
 extern "C" int pd_q4x_gdn_split_widen_tiled(const void*, void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_moe_wave_plan(const void*, uint32_t, uint32_t, uint32_t, uint32_t, void*, void*, void*, void*);
 extern "C" int pd_moe_cache_resolve_dev(const void*, const void*, uint32_t, void*, void*, void*, void*, void*, void*, void*, void*);
-extern "C" int pd_moe_wave_mask(const void*, uint32_t, const void*, const void*, uint32_t, uint32_t, void*, void*);
+extern "C" int pd_moe_wave_mask(const void*, uint32_t, uint32_t, const void*, const void*, uint32_t, uint32_t, void*, void*, void*, void*, void*, void*);
+extern "C" int pd_kquant_moe_gate_up_list(const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, const void*, const void*, void*);
+extern "C" int pd_kquant_moe_down_list(const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, const void*, const void*, void*);
 extern "C" int pd_q4x_add_gated_row(void*, const void*, const void*, uint32_t, uint32_t, void*);
 extern "C" int pd_q4x_add_gated_row_s(void*, const void*, const void*, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_moe_topk_batch_s(const void*, const void*, uint32_t, uint32_t, uint32_t, void*, void*, uint32_t, void*);
@@ -1493,6 +1495,8 @@ static const KernelTableV1 PD_KERNELS = {
     pd_moe_wave_plan,
     pd_moe_cache_resolve_dev,
     pd_moe_wave_mask,
+    pd_kquant_moe_gate_up_list,
+    pd_kquant_moe_down_list,
 };
 
 PD_EXPORT const PackInfo* paddock_pack_info(void) {

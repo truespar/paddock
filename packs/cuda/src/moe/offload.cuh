@@ -198,17 +198,36 @@ __global__ void pd_moe_cache_resolve_dev_kernel(
     stats[1] += nj & 0x7FFFFFFFu;
 }
 
-// mask: the wave's remapped routing - in-wave pairs take their slot, every
-// other pair `absent` (the engine passes PD_MOE_CACHE_NONE, which the pair
-// kernels skip).
+// mask + compact: the wave's remapped routing (in-wave pairs to their slot,
+// every other pair `absent`), plus the two lists the LIST pair kernels
+// stride over - the wave's pair indices and the tokens holding at least one
+// of them - with device counts. One block: the mask is parallel, the
+// compaction a serial walk by thread 0 (rows are at most max_rows, tens of
+// thousands: tens of microseconds, 7 waves x 48 layers = well under a
+// tick's worth per prompt). Pairs of a token are adjacent in `idx`
+// (token*n_active + slot), so the token list is the run boundaries.
 __global__ void pd_moe_wave_mask_kernel(
-    const unsigned int* __restrict__ idx, uint32_t rows,
+    const unsigned int* __restrict__ idx, uint32_t rows, uint32_t n_active,
     const unsigned int* __restrict__ wave_of, const unsigned int* __restrict__ slot_of,
-    uint32_t wave, uint32_t absent, unsigned int* __restrict__ idx_slot) {
-    const uint32_t r = blockIdx.x * blockDim.x + threadIdx.x;
-    if (r >= rows) return;
-    const unsigned int e = idx[r];
-    idx_slot[r] = (wave_of[e] == wave) ? slot_of[e] : absent;
+    uint32_t wave, uint32_t absent, unsigned int* __restrict__ idx_slot,
+    unsigned int* __restrict__ pairs, unsigned int* __restrict__ n_pairs,
+    unsigned int* __restrict__ rows_list, unsigned int* __restrict__ n_rows) {
+    for (uint32_t r = threadIdx.x; r < rows; r += blockDim.x) {
+        const unsigned int e = idx[r];
+        idx_slot[r] = (wave_of[e] == wave) ? slot_of[e] : absent;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        uint32_t m = 0, mr = 0, last_b = 0xFFFFFFFFu;
+        for (uint32_t r = 0; r < rows; ++r) {
+            if (idx_slot[r] == absent) continue;
+            pairs[m++] = r;
+            const uint32_t b = r / n_active;
+            if (b != last_b) { rows_list[mr++] = b; last_b = b; }
+        }
+        *n_pairs = m;
+        *n_rows = mr;
+    }
 }
 
 PD_EXPORT
@@ -237,12 +256,15 @@ int pd_moe_cache_resolve_dev(const void* ids, const void* n_ids, uint32_t n_slot
 }
 
 PD_EXPORT
-int pd_moe_wave_mask(const void* idx, uint32_t rows, const void* wave_of, const void* slot_of,
-                     uint32_t wave, uint32_t absent, void* idx_slot, void* stream) {
-    if (rows == 0) return 0;
-    pd_moe_wave_mask_kernel<<<(rows + 255u) / 256u, 256, 0, (cudaStream_t)stream>>>(
-        (const unsigned int*)idx, rows, (const unsigned int*)wave_of,
-        (const unsigned int*)slot_of, wave, absent, (unsigned int*)idx_slot);
+int pd_moe_wave_mask(const void* idx, uint32_t rows, uint32_t n_active, const void* wave_of,
+                     const void* slot_of, uint32_t wave, uint32_t absent, void* idx_slot,
+                     void* pairs, void* n_pairs, void* rows_list, void* n_rows, void* stream) {
+    if (rows == 0 || n_active == 0) return 0;
+    pd_moe_wave_mask_kernel<<<1, 1024, 0, (cudaStream_t)stream>>>(
+        (const unsigned int*)idx, rows, n_active, (const unsigned int*)wave_of,
+        (const unsigned int*)slot_of, wave, absent, (unsigned int*)idx_slot,
+        (unsigned int*)pairs, (unsigned int*)n_pairs, (unsigned int*)rows_list,
+        (unsigned int*)n_rows);
     return pd_launch_status();
 }
 

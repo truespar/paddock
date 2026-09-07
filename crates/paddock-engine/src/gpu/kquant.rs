@@ -944,6 +944,139 @@ impl GpuExecutor {
     /// SORTED-CONTIGUOUS (max_blocks*32 rows of ff); `xsums` (per-16 sums off
     /// `xq`) required when the type is Q4_K/Q5_K.
     #[allow(clippy::too_many_arguments)]
+    /// `kquant_moe_gate_up` over the expert-major prefill's compacted pair
+    /// list (slot 583): the wave's in-wave pairs and their device count; the
+    /// grid strides the list, so the launch costs the wave's pairs only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kquant_moe_gate_up_list(
+        &self,
+        gate: &RepackedKQ,
+        up: &RepackedKQ,
+        idx: &CudaSlice<u32>,
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<f32>,
+        xsums: Option<&CudaSlice<f32>>,
+        out: &mut CudaSlice<f32>,
+        n_active: usize,
+        batch: usize,
+        pairs: &CudaSlice<u32>,
+        n_pairs: &CudaSlice<u32>,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .kquant_moe_gate_up_list
+            .ok_or(GpuError::MissingOp("kquant_moe_gate_up_list"))?;
+        let (gid, _, _) = kq_params(gate.ty).expect("RepackedKQ holds a k-quant type");
+        let (uid, _, _) = kq_params(up.ty).expect("RepackedKQ holds a k-quant type");
+        let (in_dim, ff) = (gate.dims[0], gate.dims[1]);
+        debug_assert!(out.len() >= batch * n_active * ff);
+        let (gdp, _g1) = gate.data.device_ptr(&self.stream);
+        let (gsp, _g2) = gate.scales.device_ptr(&self.stream);
+        let (udp, _g3) = up.data.device_ptr(&self.stream);
+        let (usp, _g4) = up.scales.device_ptr(&self.stream);
+        let (ip, _g5) = idx.device_ptr(&self.stream);
+        let (xqp, _g6) = xq.device_ptr(&self.stream);
+        let (xsp, _g7) = xs.device_ptr(&self.stream);
+        let (sump, _gs);
+        let sp: *const core::ffi::c_void = match xsums {
+            Some(s) => {
+                (sump, _gs) = s.device_ptr(&self.stream);
+                sump as *const _
+            }
+            None => core::ptr::null(),
+        };
+        let (op, _g8) = out.device_ptr_mut(&self.stream);
+        let (pp, _g9) = pairs.device_ptr(&self.stream);
+        let (npp, _g10) = n_pairs.device_ptr(&self.stream);
+        // SAFETY: pack ABI v1 contract (slot 583); pointers + stream live across the call
+        check(unsafe {
+            f(
+                gdp as *const _,
+                gsp as *const _,
+                udp as *const _,
+                usp as *const _,
+                ip as *const _,
+                xqp as *const _,
+                xsp as *const _,
+                sp,
+                op as *mut _,
+                in_dim as u32,
+                ff as u32,
+                n_active as u32,
+                batch as u32,
+                gid,
+                uid,
+                pp as *const _,
+                npp as *const _,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// `kquant_moe_down` over the wave's compacted token list (slot 584),
+    /// ACCUMULATING into `out` - zero it before the first wave.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kquant_moe_down_list(
+        &self,
+        down: &RepackedKQ,
+        idx: &CudaSlice<u32>,
+        topk_w: &CudaSlice<f32>,
+        fq: &CudaSlice<i8>,
+        fs: &CudaSlice<f32>,
+        fsums: Option<&CudaSlice<f32>>,
+        out: &mut CudaSlice<f32>,
+        n_active: usize,
+        batch: usize,
+        rows: &CudaSlice<u32>,
+        n_rows: &CudaSlice<u32>,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .kquant_moe_down_list
+            .ok_or(GpuError::MissingOp("kquant_moe_down_list"))?;
+        let (did, _, _) = kq_params(down.ty).expect("RepackedKQ holds a k-quant type");
+        let (ff, embd) = (down.dims[0], down.dims[1]);
+        debug_assert!(out.len() >= batch * embd);
+        let (ddp, _g1) = down.data.device_ptr(&self.stream);
+        let (dsp, _g2) = down.scales.device_ptr(&self.stream);
+        let (ip, _g3) = idx.device_ptr(&self.stream);
+        let (twp, _g4) = topk_w.device_ptr(&self.stream);
+        let (fqp, _g5) = fq.device_ptr(&self.stream);
+        let (fsp, _g6) = fs.device_ptr(&self.stream);
+        let (sump, _gs);
+        let sp: *const core::ffi::c_void = match fsums {
+            Some(s) => {
+                (sump, _gs) = s.device_ptr(&self.stream);
+                sump as *const _
+            }
+            None => core::ptr::null(),
+        };
+        let (op, _g7) = out.device_ptr_mut(&self.stream);
+        let (rp, _g8) = rows.device_ptr(&self.stream);
+        let (nrp, _g9) = n_rows.device_ptr(&self.stream);
+        // SAFETY: pack ABI v1 contract (slot 584); pointers + stream live across the call
+        check(unsafe {
+            f(
+                ddp as *const _,
+                dsp as *const _,
+                ip as *const _,
+                twp as *const _,
+                fqp as *const _,
+                fsp as *const _,
+                sp,
+                op as *mut _,
+                ff as u32,
+                embd as u32,
+                n_active as u32,
+                batch as u32,
+                did,
+                rp as *const _,
+                nrp as *const _,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     pub fn kquant_moe_gate_up_mma(
         &self,
         gate: &RepackedKQ,

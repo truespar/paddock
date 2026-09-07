@@ -532,15 +532,51 @@ impl GpuNemotron {
             .exec
             .vram_headroom()
             .ok_or_else(|| GpuError::Driver("no free-VRAM reading".into()))?;
+        // What the process holds as the plan is made: the audit at the end
+        // adds the plan's charges to it.
+        let ledger_at_plan = self.exec.process_mem_used().unwrap_or(0);
+        // Mamba state checkpoints for the prefix cache, sized by DEMAND and
+        // charged as a reserve (the qwen35 rule, 2026-09-06): two per
+        // requested slot, clamped 16..256, then capped by what the grant has
+        // left once every other term - including a full-context pool for
+        // every slot - is charged. It used to be computed AFTER the plan as a
+        // fifth of whatever was still free, clamped to 256, with no reserve:
+        // 256 f32 snapshots (~6 GiB) for a one-slot server on a 96 GB card.
+        let state_ckpt_f32 = n_mamba * (state_elems + win_elems);
+        let per_ckpt = (state_ckpt_f32 * 4) as u64;
+        let tier_staging: u64 = if crate::kv_tier::pool_tier::tier_ram_bytes().is_some() {
+            crate::kv_tier::ram_transport::device_staging_bytes()
+        } else {
+            0
+        };
+        // the Mamba arenas: one recurrent state + conv window per slot per
+        // mamba layer (`arena_bytes` was max_batch x this)
+        let per_slot_bytes = (n_mamba * (state_elems + win_elems) * 4) as u64;
+        let charged_without_pool = VRAM_HEADROOM as u64
+            + scratch_est as u64
+            + tier_staging
+            + max_batch as u64 * per_slot_bytes
+            + (max_batch * bps * block_bytes) as u64;
+        let n_ckpt: u32 = if !px_on || per_ckpt == 0 {
+            0
+        } else if let Some(n) = paddock_models::dev_var!("PADDOCK_KV_STATE_CKPTS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| n > 0)
+        {
+            n
+        } else {
+            let want = (max_batch as u64 * 2).clamp(16, 256);
+            let leftover = grant.saturating_sub(charged_without_pool);
+            want.min(leftover / per_ckpt).max(16) as u32
+        };
         let demand = kv_plan::Demand {
             family: "nemotron",
             max_ctx: self.max_ctx,
             slots: max_batch,
             blocks_per_slot: bps,
             block_bytes: block_bytes as u64,
-            // the Mamba arenas: one recurrent state + conv window per slot per
-            // mamba layer (`arena_bytes` was max_batch x this)
-            per_slot_bytes: (n_mamba * (state_elems + win_elems) * 4) as u64,
+            per_slot_bytes,
             // Cap the pool at what (slots × max_ctx) can actually ADDRESS plus
             // explicit radix retention (blocks the tree may hold after their
             // sequence ends - cheap here at 96 KiB/block-set, ~48 MB default).
@@ -552,14 +588,8 @@ impl GpuNemotron {
             reserves: vec![
                 kv_plan::Reserve::new("graph/scratch slack", VRAM_HEADROOM as u64),
                 kv_plan::Reserve::new("prefill scratch", scratch_est as u64),
-                kv_plan::Reserve::new(
-                    "kv-tier staging",
-                    if crate::kv_tier::pool_tier::tier_ram_bytes().is_some() {
-                        crate::kv_tier::ram_transport::device_staging_bytes()
-                    } else {
-                        0
-                    },
-                ),
+                kv_plan::Reserve::new("prefix state pool", n_ckpt as u64 * per_ckpt),
+                kv_plan::Reserve::new("kv-tier staging", tier_staging),
             ],
             ..Default::default()
         };
@@ -572,6 +602,9 @@ impl GpuNemotron {
         plan.report(&demand, grant);
         let pool_blocks = plan.pool_blocks;
         let slots = plan.slots;
+        let plan_reserved: u64 = demand.reserves.iter().map(|r| r.bytes).sum::<u64>()
+            + plan.pool_bytes
+            + plan.slot_bytes;
 
         let e = &self.exec;
         let mut kv: Vec<Option<LayerKvPaged>> = Vec::with_capacity(hp.n_layer);
@@ -694,20 +727,9 @@ impl GpuNemotron {
 
         // Stage D: the radix + mamba state-checkpoint pool. Each checkpoint
         // is a full 23-layer state snapshot (~48 MB on this geometry), so
-        // the count auto-sizes to a slice of what's still free after the
-        // pool + arenas + scratch (qwen35's policy: ~1/5 of the remainder,
-        // clamped 16..256; PADDOCK_KV_STATE_CKPTS overrides).
-        let state_ckpt_f32 = n_mamba * (state_elems + win_elems);
-        let (prefix, d_state_pool, d_ckpt_stage, n_ckpt) = if px_on {
-            let n_ckpt = paddock_models::dev_var!("PADDOCK_KV_STATE_CKPTS")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .filter(|&n| n > 0)
-                .unwrap_or_else(|| {
-                    let per = (state_ckpt_f32 * 4) as u64;
-                    let now_free = self.exec.vram_headroom().unwrap_or(0);
-                    ((now_free / 5) / per.max(1)).clamp(16, 256) as u32
-                });
+        // The checkpoint pool at the count the plan charged (see the reserve
+        // above) - the reservation and the allocation cannot drift apart.
+        let (prefix, d_state_pool, d_ckpt_stage, n_ckpt) = if px_on && n_ckpt > 0 {
             let mut pr = crate::paged_radix::PagedRadix::new();
             pr.set_state_capacity(n_ckpt);
             let pool_f32 = self.exec.alloc(n_ckpt as usize * state_ckpt_f32)?;
@@ -814,12 +836,18 @@ impl GpuNemotron {
             pool_blocks * 16,
             arena_bytes as f64 / (1u64 << 30) as f64,
             PREFILL_CHUNK,
-            grant
-                .saturating_sub((pool_blocks * block_bytes) as u64)
-                .saturating_sub(arena_bytes as u64)
-                .saturating_sub(scratch_est as u64) as f64
-                / (1u64 << 30) as f64,
+            grant.saturating_sub(plan_reserved) as f64 / (1u64 << 30) as f64,
             grant as f64 / (1u64 << 30) as f64,
+        );
+        // Plan audit (the qwen35 line): the plan's charges on top of what the
+        // process held when it was made, against the ledger now.
+        let expected = ledger_at_plan + plan_reserved;
+        let actual = self.exec.process_mem_used().unwrap_or(0);
+        tracing::info!(
+            expected_gib = expected as f64 / (1u64 << 30) as f64,
+            ledger_gib = actual as f64 / (1u64 << 30) as f64,
+            unplanned_mib = actual.saturating_sub(expected) as f64 / (1u64 << 20) as f64,
+            "nemotron VRAM plan audit: ledger vs plan after enable_batch"
         );
         Ok(slots)
     }

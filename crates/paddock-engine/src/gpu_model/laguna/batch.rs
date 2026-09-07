@@ -164,6 +164,9 @@ impl PfCuts {
 
 /// VRAM slack the slot-fit math leaves untouched (graph/scratch churn).
 const VRAM_HEADROOM: usize = 1 << 30;
+/// Retained-prefix slack above the addressable ceiling, in slots' worth of
+/// blocks: `min(slots, this) x blocks_per_slot` (the gemma4 rule, 2026-09-06).
+const RETENTION_SLOTS_MAX: usize = 8;
 
 /// Cap on ragged verify rows one spec round may carry - sizes head_logits
 /// and the spec sampler planes at enable (addresses must never move: the
@@ -600,96 +603,15 @@ impl GpuLaguna {
         // the shared pool
         let per_slot = n_swa * ring * 16 * kv_dim * 2 * kvb;
         let block_bytes = n_full * 16 * kv_dim * 2 * kvb;
-        // batched scratch, dominated by the PF_ROWS × 8192 planes (q/qn/attn/
-        // ffn pair ≈ 200 MB) + head logits; generous flat estimate
-        let scratch_est = 512 << 20;
-        // One arbiter sizes the KV store: crate::kv_plan. Laguna's own
-        // arithmetic was already budget-correct - this is the same solve, moved
-        // somewhere a new family cannot forget to do it, and it reports the pool's
-        // TOKEN CAPACITY rather than leaving max_ctx to imply it.
-        let grant = self
-            .exec
-            .vram_headroom()
-            .ok_or_else(|| GpuError::Driver("no free-VRAM reading".into()))?;
-        let demand = kv_plan::Demand {
-            family: "laguna",
-            max_ctx: self.max_ctx,
-            slots: max_batch,
-            blocks_per_slot: bps,
-            block_bytes: block_bytes as u64,
-            // rings are the only per-slot KV cost; the full layers ride the pool
-            per_slot_bytes: per_slot as u64,
-            // admission slack for radix retention: nodes hold blocks after their
-            // sequence ends. Cheap here (~1 MiB/block-set) - granite prices the
-            // same slack explicitly instead, because one block costs it 4 MiB.
-            retention_blocks: 8 * bps,
-            // a pool floor so slots cannot starve the full layers: enough blocks
-            // for every slot to hold a PF_ROWS-deep prompt, or admission
-            // deadlocks on its own first chunk
-            floor_blocks_per_slot: pf_rows().div_ceil(16),
-            floor_blocks_min: 256,
-            reserves: {
-                let mut r = vec![
-                    kv_plan::Reserve::new("graph/scratch slack", VRAM_HEADROOM as u64),
-                    // batched scratch, dominated by the PF_ROWS × 8192 planes
-                    // (q/qn/attn/ffn pair ≈ 200 MB) + head logits
-                    kv_plan::Reserve::new("prefill scratch", scratch_est as u64),
-                    kv_plan::Reserve::new("prefix checkpoints", self.prefix_vram_estimate() as u64),
-                ];
-                if crate::kv_tier::pool_tier::tier_ram_bytes().is_some() {
-                    r.push(kv_plan::Reserve::new(
-                        "kv-tier staging",
-                        crate::kv_tier::ram_transport::device_staging_bytes(),
-                    ));
-                }
-                r
-            },
-            ..Default::default()
-        };
-        let plan = demand
-            .plan(grant)
-            .map_err(|e| GpuModelError::WontFit(e.message))?;
-        let slots = plan.slots;
-        if slots <= 1 {
-            // A real Err, not a lying Ok(1) - see granite/batch.rs's identical
-            // note: service.rs's single-user-batched-decode branch treats any
-            // Ok(_) as proof self.batch is genuinely populated. Whether a
-            // one-slot BATCH lane would beat the serial engine here is still
-            // open (the serial lane measured far faster at B=1) - a real
-            // decision with a number behind it, not something to flip in passing
-            // while unifying the sizers.
-            return Err(GpuModelError::WontFit(format!(
-                "laguna enable_batch: VRAM fits {slots} slot(s) - staying serial \
-                 (grant {:.1} GiB, per-slot rings {:.2} GiB)",
-                grant as f64 / (1u64 << 30) as f64,
-                per_slot as f64 / (1u64 << 30) as f64
-            )));
-        }
-        plan.report(&demand, grant);
-        let pool_blocks = plan.pool_blocks;
-
-        // static ring table (gemma4 build_swa_paging shape)
-        let mut swa_host = vec![0u32; slots * bps];
-        for s in 0..slots {
-            for j in 0..bps {
-                swa_host[s * bps + j] = (s * ring + (j % ring)) as u32;
-            }
-        }
+        // Prefill scratch PROFILED at load (the qwen35/granite shape,
+        // 2026-09-06): allocated here, before the grant is read, so the plan
+        // meets its true cost in the ledger. It was a flat 512 MiB reserve.
+        // Slot-sized planes take the REQUESTED width: the plan may seat
+        // fewer, never more.
         let e = &self.exec;
-        let swa_bt = e.to_device_u32(&swa_host)?;
-
-        let mut kv = Vec::with_capacity(self.layers.len());
-        let mut kv_bytes = 0u64;
-        for l in &self.layers {
-            let blocks = if l.is_swa { slots * ring } else { pool_blocks };
-            let bytes = blocks * 16 * kv_dim * kvb;
-            kv_bytes += 2 * bytes as u64;
-            kv.push(LayerKv {
-                k: e.alloc_u8(bytes)?,
-                v: e.alloc_u8(bytes)?,
-            });
-        }
-
+        let v_scratch0 = cudarc::driver::result::mem_get_info()
+            .map(|(f, _)| f)
+            .unwrap_or(0);
         let m = &hp.moe;
         let n_heads_max = hp.n_heads.iter().copied().max().unwrap_or(64);
         let q_max = n_heads_max * hp.head_dim;
@@ -734,7 +656,7 @@ impl GpuLaguna {
         // divide straight into prefill throughput (a 1024 -> 992 chunk
         // measured -3.2% on 2048×128 c32). Costs slots/pf_rows of the scratch
         // (~3% at the 32-slot / 1024-row default).
-        let cap = pf_rows() + slots;
+        let cap = pf_rows() + max_batch;
         // sorted-MoE worst case: every expert pads its last block
         let sorted_rows = (cap * m.n_active + m.n_expert * 31).div_ceil(32) * 32;
         let sc = BatchScratch {
@@ -779,16 +701,108 @@ impl GpuLaguna {
             d_pos: e.alloc_u32(cap)?,
             d_slots: e.alloc_u32(cap)?,
             d_mrope: e.alloc_u32(4 * cap)?,
-            head_logits: e.alloc(slots.max(SPEC_ROWS) * hp.n_vocab)?,
+            head_logits: e.alloc(max_batch.max(SPEC_ROWS) * hp.n_vocab)?,
             d_spec_par: e.alloc_u32(SPEC_ROWS * 4)?,
             d_spec_out: e.alloc_u32(SPEC_ROWS)?,
-            d_par: e.alloc_u32(2 * slots * 4)?,
-            d_out: e.alloc_u32(2 * slots)?,
-            d_tpar: e.alloc_u32(2 * slots * 4)?,
+            d_par: e.alloc_u32(2 * max_batch * 4)?,
+            d_out: e.alloc_u32(2 * max_batch)?,
+            d_tpar: e.alloc_u32(2 * max_batch * 4)?,
             d_spec_tpar: e.alloc_u32(SPEC_ROWS * 4)?,
-            attn_o: e.alloc(n_heads_max * slots * MAX_ATTN_SPLITS * hp.head_dim)?,
-            attn_ml: e.alloc(n_heads_max * slots * MAX_ATTN_SPLITS * 2)?,
+            attn_o: e.alloc(n_heads_max * max_batch * MAX_ATTN_SPLITS * hp.head_dim)?,
+            attn_ml: e.alloc(n_heads_max * max_batch * MAX_ATTN_SPLITS * 2)?,
         };
+        let v_scratch1 = cudarc::driver::result::mem_get_info()
+            .map(|(f, _)| f)
+            .unwrap_or(0);
+        tracing::info!(
+            "laguna VRAM  prefill scratch (cap={cap} rows)      {:>7.2} GB  (in the ledger before the grant)",
+            v_scratch0.saturating_sub(v_scratch1) as f64 / 1e9
+        );
+        // One arbiter sizes the KV store: crate::kv_plan. Laguna's own
+        // arithmetic was already budget-correct - this is the same solve, moved
+        // somewhere a new family cannot forget to do it, and it reports the pool's
+        // TOKEN CAPACITY rather than leaving max_ctx to imply it.
+        let grant = self
+            .exec
+            .vram_headroom()
+            .ok_or_else(|| GpuError::Driver("no free-VRAM reading".into()))?;
+        // What the process holds as the plan is made (weights, the profiled
+        // scratch): the audit at the end adds the plan's charges to it.
+        let ledger_at_plan = self.exec.process_mem_used().unwrap_or(0);
+        let demand = kv_plan::Demand {
+            family: "laguna",
+            max_ctx: self.max_ctx,
+            slots: max_batch,
+            blocks_per_slot: bps,
+            block_bytes: block_bytes as u64,
+            // rings are the only per-slot KV cost; the full layers ride the pool
+            per_slot_bytes: per_slot as u64,
+            // admission slack for radix retention: nodes hold blocks after their
+            // sequence ends. Cheap here (~1 MiB/block-set) - granite prices the
+            // same slack explicitly instead, because one block costs it 4 MiB.
+            // Retained-prefix slack sized by demand (the gemma4 rule): one
+            // retained context per seated slot, capped at eight - a flat
+            // 8 x bps let a one-slot server fill the grant with a pool nine
+            // times its own context.
+            retention_blocks: max_batch.min(RETENTION_SLOTS_MAX) * bps,
+            // a pool floor so slots cannot starve the full layers: enough blocks
+            // for every slot to hold a PF_ROWS-deep prompt, or admission
+            // deadlocks on its own first chunk
+            floor_blocks_per_slot: pf_rows().div_ceil(16),
+            floor_blocks_min: 256,
+            reserves: {
+                let mut r = vec![
+                    kv_plan::Reserve::new("graph/scratch slack", VRAM_HEADROOM as u64),
+                    kv_plan::Reserve::new("prefix checkpoints", self.prefix_vram_estimate() as u64),
+                ];
+                if crate::kv_tier::pool_tier::tier_ram_bytes().is_some() {
+                    r.push(kv_plan::Reserve::new(
+                        "kv-tier staging",
+                        crate::kv_tier::ram_transport::device_staging_bytes(),
+                    ));
+                }
+                r
+            },
+            ..Default::default()
+        };
+        let plan = demand
+            .plan(grant)
+            .map_err(|e| GpuModelError::WontFit(e.message))?;
+        let slots = plan.slots;
+        // One seated slot is a batched server, not a reason to go serial: a
+        // `--max-batch 1` request seats exactly one and still wants the
+        // prefix cache, the paged lanes and the drafter. The old
+        // `slots <= 1 -> WontFit("staying serial")` guard sent every
+        // single-user laguna server to the serial engine (dense serial KV, no
+        // prefix reuse: 42 GiB for a 21.8 GB model at 131k on 2026-09-06).
+        // A wider request the plan narrows to one still builds here; the
+        // service decides what to do with a width of one.
+        plan.report(&demand, grant);
+        let pool_blocks = plan.pool_blocks;
+        let plan_reserved: u64 = demand.reserves.iter().map(|r| r.bytes).sum::<u64>()
+            + plan.pool_bytes
+            + plan.slot_bytes;
+
+        // static ring table (gemma4 build_swa_paging shape)
+        let mut swa_host = vec![0u32; slots * bps];
+        for s in 0..slots {
+            for j in 0..bps {
+                swa_host[s * bps + j] = (s * ring + (j % ring)) as u32;
+            }
+        }
+        let swa_bt = e.to_device_u32(&swa_host)?;
+
+        let mut kv = Vec::with_capacity(self.layers.len());
+        let mut kv_bytes = 0u64;
+        for l in &self.layers {
+            let blocks = if l.is_swa { slots * ring } else { pool_blocks };
+            let bytes = blocks * 16 * kv_dim * kvb;
+            kv_bytes += 2 * bytes as u64;
+            kv.push(LayerKv {
+                k: e.alloc_u8(bytes)?,
+                v: e.alloc_u8(bytes)?,
+            });
+        }
 
         self.batch = Some(BatchState {
             n_slots: slots,
@@ -824,6 +838,16 @@ impl GpuLaguna {
              {:.2} GiB/slot) + {n_full}-layer pool {pool_blocks} blocks ({:.2} GiB)",
             per_slot as f64 / (1u64 << 30) as f64,
             (pool_blocks * block_bytes) as f64 / (1u64 << 30) as f64,
+        );
+        // Plan audit (the qwen35 line): the plan's charges on top of what the
+        // process held when it was made, against the ledger now.
+        let expected = ledger_at_plan + plan_reserved;
+        let actual = self.exec.process_mem_used().unwrap_or(0);
+        tracing::info!(
+            expected_gib = expected as f64 / (1u64 << 30) as f64,
+            ledger_gib = actual as f64 / (1u64 << 30) as f64,
+            unplanned_mib = actual.saturating_sub(expected) as f64 / (1u64 << 20) as f64,
+            "laguna VRAM plan audit: ledger vs plan after enable_batch"
         );
         Ok(slots)
     }

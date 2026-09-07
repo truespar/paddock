@@ -356,8 +356,6 @@ struct Scratch {
     d_bi: CudaSlice<f32>,
     d_inj: CudaSlice<f32>,
     d_mix: CudaSlice<f32>,
-    /// a wave's partial routed output on the expert-major prefill path
-    d_mix_wave: CudaSlice<f32>,
     // GDN
     d_qkv: CudaSlice<f32>,
     d_zg: CudaSlice<f32>,
@@ -3506,12 +3504,15 @@ fn kq_moe_routed(
 
 /// The routed pair served expert-major through the slot cache (the prefill
 /// class of `kq_moe_routed`): plan the waves once, then per wave resolve +
-/// fill its experts and run the token-batched pair over all rows with every
-/// out-of-wave pair marked absent (its blocks exit at once). Wave 0's down writes
-/// `d_mix`; later waves write `d_mix_wave` and add - the row's k pairs are
-/// summed in wave order instead of pair order, the same f32 reassociation
-/// class the sorted MoE path carries. Waves are a fixed count so the launch
-/// sequence is capture-stable; an empty wave's pair kernels exit block by block.
+/// fill its experts, mask + compact its pairs, and run the LIST pair kernels
+/// over exactly those pairs - gate_up striding the pair list, down striding
+/// the token list and accumulating into a zeroed `d_mix`. A row's k pairs
+/// are summed in wave order instead of pair order, the same f32
+/// reassociation class the sorted MoE path carries; every (token, column)
+/// has one writer per wave and the waves run in sequence, so the result is
+/// deterministic. Waves are a fixed count so the launch sequence is
+/// capture-stable; an empty wave resolves nothing, its lists are empty and
+/// its LIST launches return at the count.
 fn kq_moe_routed_waves(
     e: &GpuExecutor,
     c: &Qwen4ExpConfig,
@@ -3531,12 +3532,14 @@ fn kq_moe_routed_waves(
         e.q8_sums_strided(&sc.d_xq, &mut sc.d_ssums, h, n)?;
     }
     let nd = needs(d.ty);
+    e.zero_region(&mut sc.d_mix, 0, n * h)?;
     for w in 0..cc.n_waves {
         e.moe_wave_resolve(cc, w)?;
         e.moe_cache_fill(cc, cc.slots)?;
-        e.moe_wave_mask(cc, &sc.d_idx, rows, w)?;
+        e.moe_wave_mask(cc, &sc.d_idx, rows, k, w)?;
         let idx = cc.idx_wave();
-        e.kquant_moe_gate_up(
+        let (pairs, n_pairs, rws, n_rws) = cc.wave_lists();
+        e.kquant_moe_gate_up_list(
             g,
             u,
             idx,
@@ -3546,30 +3549,27 @@ fn kq_moe_routed_waves(
             &mut sc.d_act,
             k,
             n,
+            pairs,
+            n_pairs,
         )?;
+        // the act rows of absent pairs hold stale values; down skips them
         e.quantize_q8(&sc.d_act, &mut sc.d_fq, &mut sc.d_fs, rows * ff)?;
         if nd {
             e.q8_sums_strided(&sc.d_fq, &mut sc.d_ssums, ff, rows)?;
         }
-        let out = if w == 0 {
-            &mut sc.d_mix
-        } else {
-            &mut sc.d_mix_wave
-        };
-        e.kquant_moe_down(
+        e.kquant_moe_down_list(
             d,
             idx,
             &sc.d_topw,
             &sc.d_fq,
             &sc.d_fs,
             nd.then_some(&sc.d_ssums),
-            out,
+            &mut sc.d_mix,
             k,
             n,
+            rws,
+            n_rws,
         )?;
-        if w > 0 {
-            e.add(&mut sc.d_mix, &sc.d_mix_wave, n * h)?;
-        }
     }
     Ok(())
 }
@@ -3973,7 +3973,6 @@ impl Scratch {
             d_bi: e.alloc(t * h)?,
             d_inj: e.alloc(t * hc)?,
             d_mix: e.alloc(t * h)?,
-            d_mix_wave: e.alloc(t * h)?,
             d_qkv: e.alloc(t * c.gdn_qkv_rows())?,
             d_zg: e.alloc(t * c.gdn_z_rows())?,
             d_ab: e.alloc(t * 2 * c.gdn_v_heads)?,
