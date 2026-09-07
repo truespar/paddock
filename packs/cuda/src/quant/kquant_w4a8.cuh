@@ -3016,7 +3016,7 @@ __global__ void __launch_bounds__(256, 1) pd_kquant_w4a8_pipe2_kernel(
     auto build_half = [&](uint32_t half, uint32_t buf) {
         unsigned char* const rw = buf ? raw_w1 : raw_w0;
         unsigned char* const rr = buf ? raw_r1 : raw_r0;
-        if (IQ) {
+        if constexpr (IQ) {
             // 128 rows x 8 windows of 16 through the shared window unpack:
             // the 4 packed-s8 words land in k order at [wl*4, wl*4+4), the
             // window's f32 scale at [32 + wl], Q2_K's per-16 min at [40 + wl].
@@ -3039,7 +3039,9 @@ __global__ void __launch_bounds__(256, 1) pd_kquant_w4a8_pipe2_kernel(
             __syncthreads();
             return;
         }
-        if (IQ) return;  // (the k-quant build below is not instantiated for IQ)
+        // (the k-quant build below is not instantiated for IQ: `if constexpr`
+        // keeps nvcc from warning that its loops are unreachable)
+        else {
         #pragma unroll
         for (uint32_t it = 0; it < 2u; ++it) {  // 128 rows * 4 ci = 512 = 2*256
             const uint32_t i = it * 256u + tid;
@@ -3172,6 +3174,7 @@ __global__ void __launch_bounds__(256, 1) pd_kquant_w4a8_pipe2_kernel(
             }
         }
         __syncthreads();
+        }
     };
 
     // MMA off the just-built half tile_x and this h's tile_y/tile_s -
@@ -3387,7 +3390,7 @@ int pd_kquant_gemm_w4a8_pipe2(const void* data, const void* scales, const void* 
     return pd_launch_status();
 }
 
-// Capability marker (slot 580): the >64-row W4A8 tile GEMM serves the
+// Capability marker (slot 585): the >64-row W4A8 tile GEMM serves the
 // i-quant family + Q2_K / Q3_K / IQ4_NL - the engine's prefill can keep a
 // dense i-quant plane on the tile rung instead of the per-token dp4a walk.
 PD_EXPORT int pd_kquant_iq_tile(void) { return 0; }

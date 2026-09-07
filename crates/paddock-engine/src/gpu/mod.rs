@@ -80,6 +80,11 @@ pub struct GpuExecutor {
     /// `prefill_quant`), and only the loader knows a plane's type. Goes
     /// with the tile lane when it lands.
     dense_iq_seen: std::sync::atomic::AtomicBool,
+    /// A dense i-quant plane whose rows are not whole super-blocks (IQ4_NL's
+    /// flat 32-block rows) was loaded: the tile rung cannot take it, so the
+    /// over-64-row producers must keep the row-major int8 pair even on a pack
+    /// that carries the i-quant tile marker.
+    dense_iq_flat_seen: std::sync::atomic::AtomicBool,
     /// The forked branch's completion event, recorded by `side_end` and
     /// stream-waited by `side_join` before the joint consumer launches.
     /// Parked here so the event outlives graph capture.
@@ -148,6 +153,15 @@ impl GpuExecutor {
     }
     pub(crate) fn note_dense_iq(&self) {
         self.dense_iq_seen
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// See the `dense_iq_flat_seen` field.
+    pub fn dense_iq_flat_seen(&self) -> bool {
+        self.dense_iq_flat_seen
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub(crate) fn note_dense_iq_flat(&self) {
+        self.dense_iq_flat_seen
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -287,6 +301,7 @@ impl GpuExecutor {
             side_stream,
             side_armed: std::sync::atomic::AtomicBool::new(false),
             dense_iq_seen: std::sync::atomic::AtomicBool::new(false),
+            dense_iq_flat_seen: std::sync::atomic::AtomicBool::new(false),
             side_pending: std::sync::Mutex::new(None),
             pack,
             kernels,
@@ -722,6 +737,7 @@ impl GpuExecutor {
             side_stream,
             side_armed: std::sync::atomic::AtomicBool::new(false),
             dense_iq_seen: std::sync::atomic::AtomicBool::new(false),
+            dense_iq_flat_seen: std::sync::atomic::AtomicBool::new(false),
             side_pending: std::sync::Mutex::new(None),
             pack: self.pack.clone(),
             kernels: self.kernels,

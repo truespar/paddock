@@ -64,7 +64,7 @@ impl GpuExecutor {
     }
 
     /// The >64-row W4A8 tile GEMM (`kquant_gemm_w4a8_pipe2`) serves the
-    /// i-quant family + Q2_K / Q3_K / IQ4_NL (slot 580): prefill on a dense
+    /// i-quant family + Q2_K / Q3_K / IQ4_NL (slot 585): prefill on a dense
     /// i-quant plane rides the tile instead of re-reading the plane per token.
     pub fn has_kquant_iq_tile(&self) -> bool {
         self.kernels.kquant_iq_tile.is_some()
@@ -135,7 +135,11 @@ impl GpuExecutor {
                     )));
                 }
                 self.note_dense_iq();
-                Ok(QuantW::Kq(self.repack_kquant(map, name)?))
+                let kq = self.repack_kquant(map, name)?;
+                if !kq.dims[0].is_multiple_of(256) {
+                    self.note_dense_iq_flat();
+                }
+                Ok(QuantW::Kq(kq))
             }
             ty if kq_params(ty).is_some() => {
                 if !self.has_kquant() {

@@ -3446,7 +3446,7 @@ fn iq_dense_gemv_bench() {
     }
 }
 
-/// The >64-row W4A8 tile (`kquant_gemm_w4a8_pipe2`, slot 580) on dense
+/// The >64-row W4A8 tile (`kquant_gemm_w4a8_pipe2`, slot 585) on dense
 /// i-quant planes: against the raw-bytes CPU dequant at 65 rows (the first
 /// width the tile serves, one tile column with pad) and against the dp4a
 /// lane - the same exact-int class off the same per-32 quantization - at
@@ -3462,7 +3462,7 @@ fn iq_w4a8_tile_matches_reference() {
         return;
     };
     if !exec.has_kquant_iq() || !exec.has_kquant_iq_dense() || !exec.has_kquant_iq_tile() {
-        eprintln!("pack lacks the i-quant tile rung (slot 580) - skipping");
+        eprintln!("pack lacks the i-quant tile rung (slot 585) - skipping");
         return;
     }
     let map = MappedGguf::open(&model).expect("open gguf");

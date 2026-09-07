@@ -1052,7 +1052,7 @@ fn kq_matmul(
             // prefill rung (`kq_mm_pre`) - read the plane once per 128-column
             // tile where the dp4a walk below reads it once per token, in
             // KQ_TILE_ROWS-row chunks off a fixed scratch. An i-quant plane
-            // needs the pack's window-unpack tile (slot 580).
+            // needs the pack's window-unpack tile (slot 585).
             let iq = crate::gpu::kq_is_iq(k.ty);
             let chunk_rows = in_dim.div_ceil(128) * KQ_TILE_ROWS;
             if batch > 64
