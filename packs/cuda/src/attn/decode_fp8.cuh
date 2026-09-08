@@ -744,7 +744,7 @@ __global__ void __launch_bounds__(256, MB) pd_attn_decode_v9q_kernel(
                 s_psum[warp][rr] = ps;
                 if (warp == 0) { s_corr[slot2][rr] = corr; s_m[rr] = mnew; }
             }
-            asm volatile("bar.sync 1, %0;" ::"r"(WS * 32u));
+            asm volatile("bar.sync 1, %0;" ::"r"(WS * 32u) : "memory");
             // WS==2 keeps the exact old sum: (s_l*corr + psum[0]) + psum[1]
             if (d < G) {
                 float lacc = s_l[d] * s_corr[slot2][d];
@@ -755,9 +755,9 @@ __global__ void __launch_bounds__(256, MB) pd_attn_decode_v9q_kernel(
         };
         if (nst) {
             score_t(0u);
-            asm volatile("bar.sync 1, %0;" ::"r"(WS * 32u));
+            asm volatile("bar.sync 1, %0;" ::"r"(WS * 32u) : "memory");
             fold_t(0u);
-            asm volatile("bar.arrive 2, 256;");
+            asm volatile("bar.arrive 2, 256;" ::: "memory");
         }
         for (uint32_t j = 0; j < nst; ++j) {
             const uint32_t t = j + 1u;
@@ -766,10 +766,10 @@ __global__ void __launch_bounds__(256, MB) pd_attn_decode_v9q_kernel(
                                                 &s_bk[(t + 1u) & 1u], &tmk, t + 1u,
                                                 false);
             score_t(t);
-            asm volatile("bar.sync 1, %0;" ::"r"(WS * 32u));
-            asm volatile("bar.sync 3, 256;");
+            asm volatile("bar.sync 1, %0;" ::"r"(WS * 32u) : "memory");
+            asm volatile("bar.sync 3, 256;" ::: "memory");
             fold_t(t);
-            asm volatile("bar.arrive 2, 256;");
+            asm volatile("bar.arrive 2, 256;" ::: "memory");
         }
     } else {
         // ---------- V side: 8-WS warps, fp8 PV with gather-built B ----------
@@ -793,11 +793,11 @@ __global__ void __launch_bounds__(256, MB) pd_attn_decode_v9q_kernel(
             o_acc[i][0] = 0.0f; o_acc[i][1] = 0.0f;
         }
         for (uint32_t j = 0; j < nst; ++j) {
-            asm volatile("bar.sync 2, 256;");
+            asm volatile("bar.sync 2, 256;" ::: "memory");
             if (warp == WS && j + 2u < nst) stage(s_v8 + ((j + 2u) % 3u) * STB,
                                                 &s_bv[(j + 2u) % 3u], &tmv, j + 2u,
                                                 true);
-            asm volatile("bar.arrive 3, 256;");
+            asm volatile("bar.arrive 3, 256;" ::: "memory");
             const uint32_t slot2 = j & 1u;
             const uint32_t vbf = j % 3u;
             bar_wait(&s_bv[vbf], pv[vbf]); pv[vbf] ^= 1u;
@@ -831,7 +831,7 @@ __global__ void __launch_bounds__(256, MB) pd_attn_decode_v9q_kernel(
                             make_uint4(0u, 0u, 0u, 0u);
                     }
                 }
-                asm volatile("bar.sync 4, %0;" ::"r"(NV * 32u));
+                asm volatile("bar.sync 4, %0;" ::"r"(NV * 32u) : "memory");
             }
             {
                 const uint32_t rr = lane >> 2;

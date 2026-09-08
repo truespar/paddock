@@ -21,7 +21,9 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MANIFEST="$HERE/prebuilt.json"
-PLATFORM="${1:-linux-x64}"
+# Default to this box's CPU: aarch64 (DGX Spark, Jetson) takes the arm64 lane.
+case "$(uname -m)" in aarch64|arm64) default_platform="linux-arm64" ;; *) default_platform="linux-x64" ;; esac
+PLATFORM="${1:-$default_platform}"
 
 # The manifest is small and its shape is ours, but parse it properly anyway:
 # a hand-rolled grep would break the day the manifest is re-emitted with

@@ -478,12 +478,19 @@ impl GpuQwen35 {
                         )?;
                     }
                 }
-                Ffn::Nvf4Dense { gate, up, down } => {
+                Ffn::Nvf4Dense { gu, down } => {
                     // exact family, not W4A4 - spec single-class rule (see
                     // the note on the batch-draft site above /)
-                    nvf4_mm(&exec, gate, &sc.d_xn, &mut sc.d_ffn_gate, r)?;
-                    nvf4_mm(&exec, up, &sc.d_xn, &mut sc.d_ffn_up, r)?;
-                    exec.swiglu(&mut sc.d_ffn_gate, &sc.d_ffn_up, r * ff)?;
+                    nvf4_gu_swiglu(
+                        &exec,
+                        gu,
+                        &sc.d_xn,
+                        &mut sc.d_ffn_gate,
+                        &mut sc.d_ffn_up,
+                        &mut sc.d_ffn_gu,
+                        ff,
+                        r,
+                    )?;
                     nvf4_mm(&exec, down, &sc.d_ffn_gate, &mut sc.d_proj, r)?;
                 }
                 Ffn::Moe(w) => {
@@ -743,15 +750,22 @@ impl GpuQwen35 {
                 exec.swiglu(&mut sc.d_ffn_gate, &sc.d_ffn_up, r * ff)?;
                 mm(&exec, down, &sc.d_ffn_gate, &mut sc.d_proj, r)?;
             }
-            Ffn::Nvf4Dense { gate, up, down } => {
+            Ffn::Nvf4Dense { gu, down } => {
                 // stays on the exact scalar/tc family, not the W4A4 arm
                 // the spec paths keep one numeric class so
                 // draft and verify rows agree - flipping verify to lossy
                 // e2m1 activations without an acceptance measurement risks
                 // the fp8-KV-costs-acceptance failure mode
-                nvf4_mm(&exec, gate, &sc.d_xn, &mut sc.d_ffn_gate, r)?;
-                nvf4_mm(&exec, up, &sc.d_xn, &mut sc.d_ffn_up, r)?;
-                exec.swiglu(&mut sc.d_ffn_gate, &sc.d_ffn_up, r * ff)?;
+                nvf4_gu_swiglu(
+                    &exec,
+                    gu,
+                    &sc.d_xn,
+                    &mut sc.d_ffn_gate,
+                    &mut sc.d_ffn_up,
+                    &mut sc.d_ffn_gu,
+                    ff,
+                    r,
+                )?;
                 nvf4_mm(&exec, down, &sc.d_ffn_gate, &mut sc.d_proj, r)?;
             }
             Ffn::Moe(w) => {
@@ -1605,7 +1619,7 @@ impl GpuQwen35 {
                     r,
                 )?;
             }
-            Ffn::Nvf4Dense { gate, up, down } => {
+            Ffn::Nvf4Dense { gu, down } => {
                 // W4A4 class election for the batched DRAFTER: the batch
                 // decode path serves W4A4 above the row band, so the old
                 // exact-family pin here was both slower -
@@ -1619,8 +1633,7 @@ impl GpuQwen35 {
                 // nvf4_ffn falls back to the exact chain below the row band.
                 nvf4_ffn(
                     &exec,
-                    gate,
-                    up,
+                    gu,
                     down,
                     &sc.d_xn,
                     &mut sc.d_pxq,
@@ -1628,6 +1641,9 @@ impl GpuQwen35 {
                     &mut sc.d_nv4part,
                     &mut sc.d_ffn_gate,
                     &mut sc.d_ffn_up,
+                    &mut sc.d_ffn_gu,
+                    &mut sc.d_swq_q,
+                    &mut sc.d_swq_s,
                     &mut sc.d_proj,
                     ff,
                     r,
@@ -3032,7 +3048,7 @@ impl GpuQwen35 {
                         )?;
                     }
                 }
-                Ffn::Nvf4Dense { gate, up, down } => {
+                Ffn::Nvf4Dense { gu, down } => {
                     // the verify walk gets the same arm the batch
                     // decode path elects (batch.rs, Ffn::Nvf4Dense). It did
                     // not, and on this die that was the whole spec lane:
@@ -3103,8 +3119,7 @@ impl GpuQwen35 {
                         // for the full note).
                         nvf4_ffn(
                             &exec,
-                            gate,
-                            up,
+                            gu,
                             down,
                             &sc.d_xn,
                             &mut sc.d_pxq,
@@ -3112,6 +3127,9 @@ impl GpuQwen35 {
                             &mut sc.d_nv4part,
                             &mut sc.d_ffn_gate,
                             &mut sc.d_ffn_up,
+                            &mut sc.d_ffn_gu,
+                            &mut sc.d_swq_q,
+                            &mut sc.d_swq_s,
                             &mut sc.d_proj,
                             ff,
                             r,

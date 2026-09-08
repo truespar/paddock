@@ -1611,7 +1611,7 @@ impl GpuQwen35 {
                         )?;
                     }
                 }
-                Ffn::Nvf4Dense { gate, up, down } => {
+                Ffn::Nvf4Dense { gu, down } => {
                     // Above the row band the chain takes the same f8w arm the
                     // Dense lane runs, off planes load.rs builds from the
                     // NVFP4 checkpoint's own values. Without it this path
@@ -1653,8 +1653,7 @@ impl GpuQwen35 {
                     } else {
                         nvf4_ffn(
                             &exec,
-                            gate,
-                            up,
+                            gu,
                             down,
                             &sc.d_xn,
                             &mut sc.d_pxq,
@@ -1662,6 +1661,9 @@ impl GpuQwen35 {
                             &mut sc.d_nv4part,
                             &mut sc.d_ffn_gate,
                             &mut sc.d_ffn_up,
+                            &mut sc.d_ffn_gu,
+                            &mut sc.d_swq_q,
+                            &mut sc.d_swq_s,
                             &mut sc.d_proj,
                             ff,
                             r,
@@ -2733,7 +2735,7 @@ impl GpuQwen35 {
                         )?;
                     }
                 }
-                Ffn::Nvf4Dense { gate, up, down } => {
+                Ffn::Nvf4Dense { gu, down } => {
                     // Above the row band the chain takes the same f8w arm the
                     // Dense lane runs, off planes load.rs builds from the
                     // NVFP4 checkpoint's own values. Without it this path
@@ -2775,8 +2777,7 @@ impl GpuQwen35 {
                     } else {
                         nvf4_ffn(
                             &exec,
-                            gate,
-                            up,
+                            gu,
                             down,
                             &sc.d_xn,
                             &mut sc.d_pxq,
@@ -2784,6 +2785,9 @@ impl GpuQwen35 {
                             &mut sc.d_nv4part,
                             &mut sc.d_ffn_gate,
                             &mut sc.d_ffn_up,
+                            &mut sc.d_ffn_gu,
+                            &mut sc.d_swq_q,
+                            &mut sc.d_swq_s,
                             &mut sc.d_proj,
                             ff,
                             r,

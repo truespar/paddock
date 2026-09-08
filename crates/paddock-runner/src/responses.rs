@@ -569,7 +569,8 @@ fn prepare(
             .into_iter()
             .map(crate::chat::RequestImage::into_chunk)
             .collect();
-        let mm = build_mm_chunks(&prompt_ids, pad, media)?;
+        let task = crate::chat::fired_task_tag(&prompt, &model.task_tags);
+        let mm = build_mm_chunks(&prompt_ids, pad, media, task)?;
         (Some(mm.chunks), mm.text_ids)
     };
     // resolved crop override -> directive chunk the OCR engine consumes

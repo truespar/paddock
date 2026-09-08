@@ -23,8 +23,12 @@ fn main() {
     // Windows and Linux only, deliberately. An unknown
     // target should say so here rather than fail as a pile of unresolved
     // FPDF_* symbols at the end of a long link.
+    // Linux splits by CPU: an aarch64 box (DGX Spark's Grace, Jetson) links
+    // the arm64 library, cross-built by the same recipe with target_cpu set.
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let (dir, file) = match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
         Ok("windows") => ("win-x64", "pdfium.lib"),
+        Ok("linux") if arch == "aarch64" => ("linux-arm64", "libpdfium.a"),
         Ok("linux") => ("linux-x64", "libpdfium.a"),
         Ok(other) => {
             panic!("paddock does not target {other}: pdfium is built for windows and linux only")

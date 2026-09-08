@@ -99,6 +99,11 @@ pub struct GpuExecutor {
     /// Compute capability (major, minor) - kernel-class routing (e.g. the
     /// sm_120a block-scale MoE) keys on it.
     cc: (u32, u32),
+    /// Unified-memory (integrated) die - DGX Spark GB10, Jetson: the GPU has
+    /// no memory of its own, so "free VRAM" is an OS question, not a driver
+    /// one. Read at construction from CU_DEVICE_ATTRIBUTE_INTEGRATED, never
+    /// inferred from the compute capability (`device_mem_info` explains).
+    integrated: bool,
     /// Hard VRAM budget in bytes (0 = none). Set once by the runner from its
     /// config file (`vram_budget`, the manager writes it at admission) before
     /// the model loads. Every free-VRAM sizer goes through `vram_headroom`,
@@ -294,6 +299,10 @@ impl GpuExecutor {
             ctx.attribute(Attr::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
                 .map_err(drv)? as u32,
         );
+        let integrated = ctx
+            .attribute(Attr::CU_DEVICE_ATTRIBUTE_INTEGRATED)
+            .map_err(drv)?
+            != 0;
         let exec = Self {
             ctx,
             stream,
@@ -307,6 +316,7 @@ impl GpuExecutor {
             kernels,
             sm_count,
             cc,
+            integrated,
             vram_budget: std::sync::atomic::AtomicU64::new(0),
             staging: std::sync::Mutex::new(None),
             conv_scratch: std::sync::Mutex::new(None),
@@ -398,18 +408,121 @@ impl GpuExecutor {
                 gib(budget),
             ));
         }
-        let Ok((free, total)) = cudarc::driver::result::mem_get_info() else {
+        let Some((free, total)) = self.device_mem_info() else {
             return Ok(()); // no honest number - the allocations themselves decide
         };
-        if weights_bytes + FLOOR > free as u64 {
+        if weights_bytes + FLOOR > free {
+            if self.integrated {
+                // MemAvailable is a FLOOR on a unified-memory die, not the
+                // truth. The NVIDIA driver (>= 590, system-memory pools)
+                // parks the pages an exiting CUDA process frees in its own
+                // shrinker-backed pools: /proc/meminfo books them as used,
+                // MemAvailable does not count them - and the driver serves
+                // the next allocation from them without touching the
+                // kernel's free pages. Measured 2026-09-07 on GB10 right
+                // after a 27B runner exited: MemAvailable 25 GiB, a 40 GiB
+                // cudaMalloc + memset succeeded in 0.27 s, MemAvailable
+                // moved by 0.5 GiB. The gate refused every load for the
+                // next several minutes on that reading. So before refusing,
+                // ask the one party that knows: a trial allocation of the
+                // weights' size. Success is the proof (the pages go straight
+                // back and the load takes them for real); failure keeps the
+                // refusal, which is the honest answer on a box that is
+                // truly full.
+                let need = weights_bytes + FLOOR;
+                match unsafe { cudarc::driver::result::malloc_sync(need as usize) } {
+                    Ok(ptr) => {
+                        // SAFETY: ptr came from malloc_sync just above and is
+                        // freed exactly once, on the same context.
+                        if let Err(e) = unsafe { cudarc::driver::result::free_sync(ptr) } {
+                            tracing::warn!(error = %e, "trial allocation: free failed");
+                        }
+                        tracing::warn!(
+                            model,
+                            need_gib = gib(need),
+                            available_gib = gib(free),
+                            "unified-memory die: MemAvailable would refuse this load, but a \
+                             trial allocation of the weights' size succeeded - the driver's \
+                             retained pools cover it. Loading."
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "{model} will not fit: weights need {:.1} GiB but only {:.1} GiB of this box's {:.1} GiB unified memory is available (MemAvailable), and a trial allocation of {:.1} GiB was refused by the driver ({e}). Another process likely holds the rest - stop it first, or pick a smaller quant. Refusing to load: on unified memory an oversubscribed load thrashes the whole machine rather than failing cleanly.",
+                            gib(weights_bytes),
+                            gib(free),
+                            gib(total),
+                            gib(need),
+                        ));
+                    }
+                }
+            }
             return Err(format!(
                 "{model} will not fit: weights need {:.1} GiB but only {:.1} GiB of {:.1} GiB VRAM is free. Another model likely holds the rest - stop it first, or pick a smaller quant. Refusing to load: oversubscribed VRAM pages into system RAM and can freeze the machine.",
                 gib(weights_bytes),
-                gib(free as u64),
-                gib(total as u64),
+                gib(free),
+                gib(total),
             ));
         }
         Ok(())
+    }
+
+    /// `(free, total)` device bytes as every sizer must read them.
+    ///
+    /// Discrete cards: cuMemGetInfo, unchanged. Integrated (unified-memory)
+    /// dies - DGX Spark GB10, Jetson - answer differently: the driver reports
+    /// total = the box's RAM and free = the kernel's MemFree, which counts the
+    /// page cache as USED and ignores the pages the driver itself parks in
+    /// its freed-allocation pools (open kernel module >= 590,
+    /// NVreg_EnableSystemMemoryPools). Measured 2026-09-07 on a Spark: free
+    /// read 0.9 GiB while 112 GiB of cudaMalloc succeeded, and the load gate
+    /// refused a 9 GB model on a 121 GB box. Every engine that serves on this
+    /// class of box reads the OS instead - NVIDIA's own Spark guidance (the
+    /// getAvailableMemory snippet in the DGX Spark known-issues page),
+    /// llama.cpp (ggml PR #17368), vLLM (PR #35356), SGLang (PR #11287) -
+    /// so that is the reading here: free = MemAvailable (a hugetlb-configured
+    /// box: HugePages_Free x Hugepagesize, per the same snippet), total =
+    /// the smaller of the driver's total and MemTotal. SwapFree is
+    /// deliberately not added: past the limit this class of box thrashes and
+    /// wedges rather than failing an allocation.
+    ///
+    /// Still pessimistic right after a large CUDA process exits: the pooled
+    /// pages sit in no /proc/meminfo category, so MemAvailable does not see
+    /// them until the kernel's shrinker runs (memory pressure, or
+    /// drop_caches=2). The gate's refusal says so; nothing here tries to be
+    /// clever about it.
+    pub fn device_mem_info(&self) -> Option<(u64, u64)> {
+        let (free, total) = cudarc::driver::result::mem_get_info().ok()?;
+        let (free, total) = (free as u64, total as u64);
+        if !self.integrated {
+            return Some((free, total));
+        }
+        static SAID: std::sync::Once = std::sync::Once::new();
+        match unified_available_memory() {
+            Some((avail, mem_total)) => {
+                let total = total.min(mem_total);
+                SAID.call_once(|| {
+                    tracing::info!(
+                        box_gib = total as f64 / (1u64 << 30) as f64,
+                        available_gib = avail as f64 / (1u64 << 30) as f64,
+                        driver_free_gib = free as f64 / (1u64 << 30) as f64,
+                        "unified-memory die: free VRAM is read as the OS's MemAvailable \
+                         (the driver's own free figure counts the page cache as used)"
+                    );
+                });
+                Some((avail, total))
+            }
+            None => {
+                SAID.call_once(|| {
+                    tracing::warn!(
+                        "unified-memory die but /proc/meminfo could not be read - \
+                         falling back to the driver's free figure, which undercounts"
+                    );
+                });
+                Some((free, total))
+            }
+        }
     }
 
     /// Share of the CARD one runner may occupy when its config sets no
@@ -470,7 +583,7 @@ impl GpuExecutor {
     /// input; `free` stays only as a safety clamp so we still never
     /// over-commit a card someone else is using.
     pub fn vram_headroom(&self) -> Option<u64> {
-        let (free, total) = cudarc::driver::result::mem_get_info().ok()?;
+        let (free, total) = self.device_mem_info()?;
         let (budget, explicit) = match self.vram_budget() {
             Some(b) => (b, true),
             None => (
@@ -482,7 +595,7 @@ impl GpuExecutor {
         // Say it once when the derived default is what binds - a pool quietly
         // smaller than the card is exactly the kind of thing the no-silent-
         // failures rule exists for, and the number is otherwise invisible.
-        if !explicit && allowance < free as u64 {
+        if !explicit && allowance < free {
             static SAID: std::sync::Once = std::sync::Once::new();
             SAID.call_once(|| {
                 tracing::info!(
@@ -496,7 +609,7 @@ impl GpuExecutor {
                 );
             });
         }
-        Some((free as u64).min(allowance))
+        Some(free.min(allowance))
     }
 
     /// Device bytes this PROCESS holds live in its stream-ordered mempool -
@@ -743,6 +856,7 @@ impl GpuExecutor {
             kernels: self.kernels,
             sm_count: self.sm_count,
             cc: self.cc,
+            integrated: self.integrated,
             // same process, same mempool ledger - the lanes share one budget
             vram_budget: std::sync::atomic::AtomicU64::new(
                 self.vram_budget.load(std::sync::atomic::Ordering::Relaxed),
@@ -794,4 +908,46 @@ impl GpuExecutor {
             }
         })
     }
+}
+
+/// `(MemAvailable, MemTotal)` in bytes for an integrated die, from
+/// /proc/meminfo - the reading NVIDIA publishes for the DGX Spark and the one
+/// llama.cpp, vLLM and SGLang all take. A box with hugetlb pages configured
+/// reports `HugePages_Free x Hugepagesize` instead, because that is the only
+/// memory CUDA can then use (same rule as NVIDIA's snippet). `None` where
+/// there is no /proc/meminfo, and on any other OS: no integrated NVIDIA die
+/// exists outside Linux today, and the caller keeps the driver's figure.
+fn unified_available_memory() -> Option<(u64, u64)> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let mut total = None;
+    let mut avail = None;
+    let mut huge_total = 0u64;
+    let mut huge_free = 0u64;
+    let mut huge_size = 0u64;
+    for line in text.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let kb: u64 = rest
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        match key {
+            "MemTotal" => total = Some(kb * 1024),
+            "MemAvailable" => avail = Some(kb * 1024),
+            "HugePages_Total" => huge_total = kb, // a count, not kB
+            "HugePages_Free" => huge_free = kb,
+            "Hugepagesize" => huge_size = kb * 1024,
+            _ => {}
+        }
+    }
+    let (total, mut avail) = (total?, avail?);
+    if huge_total > 0 && huge_size > 0 {
+        avail = huge_free * huge_size;
+    }
+    Some((avail, total))
 }

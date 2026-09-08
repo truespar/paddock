@@ -238,6 +238,12 @@ pub struct DenseStage {
     /// launch loops over chunks); len 1 without Kq.
     pub yq: CudaSlice<u8>,
     pub xsums: CudaSlice<f32>,
+    /// K-split scratch for the narrow-out Q8 planes (slot 588): partials
+    /// `[batch, out_dim, split]` and their arrival counters, both caller-owned
+    /// and address-stable so the captured decode tick can see them. The
+    /// counters are allocated zeroed and the kernel returns them to zero.
+    pub sk_part: CudaSlice<f32>,
+    pub sk_cnt: CudaSlice<u32>,
     /// f16 view of the activation the F16 class feeds `pd_f16_gemm`. One cast
     /// per (plane, tick); the same buffer serves every plane because the walk
     /// is strictly sequential inside a layer.
@@ -538,6 +544,51 @@ pub(crate) fn attn_fmha_enabled() -> bool {
 
 /// The f16 lane's fine-M decode arm (batch 5..32). Default on since the
 /// intra-pair park race was fixed; `PADDOCK_Q38FN_MMAF=0` declines it.
+/// A/B pin for the pre-normed, P-split GDN walk (slot 596):
+/// `PADDOCK_Q38FN_GDN_PN=0` puts the prefill recurrence back on the shipped
+/// single-column walk. Its two dots re-associate across the split lanes, so
+/// this is also how a numeric question about the recurrence gets bisected.
+pub(crate) fn gdn_pn_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("PADDOCK_Q38FN_GDN_PN").ok().as_deref(),
+            Some("0") | Some("off")
+        )
+    })
+}
+
+/// A/B pin for the REGISTER-TILED prefill MoE gate+up (slot 592):
+/// `PADDOCK_Q38FN_MOE_TILE=0` puts the pair back on the grouped kernel. The
+/// tile's f32 association differs from that kernel's (a thread owns whole
+/// dots), so this is also how a numeric question gets bisected.
+pub(crate) fn moe_tile_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("PADDOCK_Q38FN_MOE_TILE").ok().as_deref(),
+            Some("0") | Some("off")
+        )
+    })
+}
+
+/// A/B pin for the expert-GROUPED prefill MoE gate+up (slot 586):
+/// `PADDOCK_Q38FN_MOE_GRP=0` puts the routed pair back on the per-row kernel.
+/// The two are bit-identical by construction, so this exists to price the
+/// grouping and to bisect a pack, not to pick a regime.
+pub(crate) fn moe_grp_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("PADDOCK_Q38FN_MOE_GRP").ok().as_deref(),
+            Some("0") | Some("off")
+        )
+    })
+}
+
 pub(crate) fn mmaf_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -1018,6 +1069,26 @@ impl DensePlane {
 /// columns, so the mmq scratch stays a few MB at any context length.
 pub(crate) const KQ_TILE_ROWS: usize = 512;
 
+/// K-split rung bounds (slot 588). `SK_BLOCKS_PER_SM` is what this die holds
+/// of the 128-thread GEMV block (Ada-class SM: 1536 resident threads = 12);
+/// a launch with fewer than half that many blocks per SM is the shape the
+/// split exists for. `SK_MIN_CHUNK` keeps a chunk deep enough that its own
+/// block reduction is not the cost, and the out/batch caps keep the partials
+/// plane small enough to live beside the walk.
+pub(crate) const SK_BLOCKS_PER_SM: usize = 12;
+pub(crate) const SK_MIN_CHUNK: usize = 1024;
+pub(crate) const SK_MAX_SPLIT: usize = 16;
+pub(crate) const SK_MAX_OUT: usize = 2048;
+pub(crate) const SK_MAX_BATCH: usize = 32;
+/// Rows per block of the batched row-parallel arm (`pd_q8_0_gemm_repacked_mt`,
+/// 8 warps x 2 rows) - the grid it launches is what the split has to beat.
+pub(crate) const SK_MT_TILE: usize = 16;
+
+/// A repacked Q8_0 plane's K extent (`dims = [in_dim, out_dim]`).
+fn in_dim_of(q: &crate::gpu::RepackedQ8) -> usize {
+    q.dims[0]
+}
+
 fn kq_matmul(
     e: &GpuExecutor,
     w: &QuantW,
@@ -1029,9 +1100,85 @@ fn kq_matmul(
     match w {
         QuantW::Q8(q) => {
             // the qwen35 `mm_q8` ladder: gemv, the small-batch tiled GEMM,
-            // the plain per-row GEMM above 12 rows
+            // the plain per-row GEMM above 12 rows - and above 64 rows the
+            // mmq TILE, which is the prefill class.
+            //
+            // The per-row GEMM reads the whole plane once per TOKEN: the two
+            // hyper-connection planes are 3.5 MB each, so a 200-token prefill
+            // moved 1.4 GB per mix per layer and the two mixes owned 37% of
+            // the walk at ~1 TB/s - the kernel was at its roof doing 200x the
+            // necessary traffic. The 128x128 mmq tile reads it once per row
+            // tile. Same rung the k-quant planes above take at the same
+            // width; the f32 order is the tile's, not the row walk's, which
+            // is the prefill-vs-decode class split this lane already carries.
+            let mmq_rows = in_dim_of(q).div_ceil(128) * KQ_TILE_ROWS * 144;
+            // K-SPLIT rung (slot 588) for planes whose row count cannot fill
+            // the die. The hyper-connection down plane is [10240, 320]: the
+            // row-per-block GEMV launches 320 blocks on 148 SMs and the mt
+            // tile TWENTY, so a 3.5 MB plane ran at ~175 GB/s and the two
+            // mixes owned 29% of the decode tick. The split is derived from
+            // the shape (rows the launch has vs the blocks the die holds),
+            // not chosen: it is the factor that fills the machine, capped so
+            // each chunk stays deep enough to amortize its own reduction.
+            let (in_dim, out_dim) = (q.dims[0], q.dims[1]);
+            // What the row-parallel arm this would replace actually launches:
+            // one block per output row at batch 1, one per MT tile above it.
+            // A narrow-out plane's tile count does not grow with batch at all
+            // ([10240, 320] is TWENTY blocks at every width), so that arm
+            // covers a batch at `grid_arm / want` of the die while the split
+            // covers it at full fill for `batch` plane reads - which is the
+            // comparison this gate makes.
+            let grid_arm = if batch == 1 {
+                out_dim
+            } else {
+                out_dim.div_ceil(SK_MT_TILE)
+            };
+            let blocks = grid_arm * batch;
+            let want = e.sm_count() * SK_BLOCKS_PER_SM;
+            let sk = (batch <= SK_MAX_BATCH
+                && out_dim <= SK_MAX_OUT
+                && blocks < want
+                && in_dim >= SK_MIN_CHUNK * 2
+                && in_dim.is_multiple_of(32)
+                && e.has_q8_0_gemv_sk()
+                && stage.sk_part.len() >= batch * out_dim * 2
+                && paddock_models::dev_var_os!("PADDOCK_Q4X_NO_Q8_SK").is_none())
+            .then(|| {
+                let by_die = want.div_ceil((out_dim * batch).max(1));
+                let by_depth = in_dim / SK_MIN_CHUNK;
+                let cap = stage.sk_part.len() / (batch * out_dim).max(1);
+                by_die.min(by_depth).min(cap).clamp(2, SK_MAX_SPLIT)
+            });
+            if let Some(split) = sk {
+                return e.q8_0_gemv_sk(
+                    q,
+                    None,
+                    x,
+                    y,
+                    &mut stage.sk_part,
+                    &mut stage.sk_cnt,
+                    batch,
+                    split,
+                );
+            }
             if batch == 1 {
                 e.q8_0_gemv_repacked(q, None, x, y)
+            } else if batch > 64
+                && e.has_q8_0_gemm_mmq()
+                && stage.yq.len() >= mmq_rows
+                && paddock_models::dev_var_os!("PADDOCK_Q4X_NO_Q8_TILE").is_none()
+            {
+                let in_dim = in_dim_of(q);
+                let mut off = 0;
+                while off < batch {
+                    let rows = (batch - off).min(KQ_TILE_ROWS);
+                    e.quantize_q8_mmq_rows(x, off, &mut stage.yq, in_dim, rows)?;
+                    // no fixup plane: plain tiling, which is the bit-exact
+                    // class against the mma route
+                    e.q8_0_gemm_mmq_rows(q, &stage.yq, None, y, off, rows)?;
+                    off += rows;
+                }
+                Ok(())
             } else if batch <= 12 {
                 e.q8_0_gemm_repacked_mt(q, None, x, y, batch)
             } else {

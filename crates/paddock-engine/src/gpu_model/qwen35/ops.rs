@@ -151,8 +151,7 @@ pub(crate) fn nvf4_w4a4_min_rows() -> usize {
 #[track_caller]
 pub(crate) fn nvf4_ffn(
     exec: &GpuExecutor,
-    gate: &crate::gpu::Nvf4Plane,
-    up: &crate::gpu::Nvf4Plane,
+    gu: &super::Nvf4Gu,
     down: &crate::gpu::Nvf4Plane,
     xn: &CudaSlice<f32>,
     xq: &mut CudaSlice<i8>,
@@ -160,10 +159,54 @@ pub(crate) fn nvf4_ffn(
     part: &mut CudaSlice<f32>,
     ffn_gate: &mut CudaSlice<f32>,
     ffn_up: &mut CudaSlice<f32>,
+    ffn_gu: &mut CudaSlice<f32>,
+    swq_q: &mut CudaSlice<i8>,
+    swq_s: &mut CudaSlice<u8>,
     proj: &mut CudaSlice<f32>,
     ff: usize,
     rows: usize,
 ) -> Result<(), GpuModelError> {
+    nvf4_ffn_staged(
+        exec, gu, down, xn, xq, xs, part, ffn_gate, ffn_up, ffn_gu, swq_q, swq_s, proj, ff, rows,
+        false,
+    )
+}
+
+/// `nvf4_ffn` with the activation ALREADY quantized: `xq_ready` says the
+/// caller's prenorm staged x's e2m1 bytes + scales in (`xq`, `xs`) itself
+/// (the fused add+rmsnorm+nvf4-quant prenorm on the unified prefill tick,
+/// 2026-09-08), so the W4A4 arms skip their own `quantize_nvf4` - one f32
+/// [rows, embd] read fewer per layer. Ignored where the arm never quantizes
+/// (the W4A16 spine reads `xn`).
+#[allow(clippy::too_many_arguments)]
+#[track_caller]
+pub(crate) fn nvf4_ffn_staged(
+    exec: &GpuExecutor,
+    gu: &super::Nvf4Gu,
+    down: &crate::gpu::Nvf4Plane,
+    xn: &CudaSlice<f32>,
+    xq: &mut CudaSlice<i8>,
+    xs: &mut CudaSlice<u8>,
+    part: &mut CudaSlice<f32>,
+    ffn_gate: &mut CudaSlice<f32>,
+    ffn_up: &mut CudaSlice<f32>,
+    ffn_gu: &mut CudaSlice<f32>,
+    swq_q: &mut CudaSlice<i8>,
+    swq_s: &mut CudaSlice<u8>,
+    proj: &mut CudaSlice<f32>,
+    ff: usize,
+    rows: usize,
+    xq_ready: bool,
+) -> Result<(), GpuModelError> {
+    let (gate, up) = match gu {
+        super::Nvf4Gu::Split { gate, up } => (gate, up),
+        super::Nvf4Gu::Fused(gup) => {
+            return nvf4_ffn_fused(
+                exec, gup, down, xn, xq, xs, part, ffn_gate, ffn_gu, swq_q, swq_s, proj, ff, rows,
+                xq_ready,
+            );
+        }
+    };
     // Site witness. The W4A16 chain below is the software-dequant
     // class the decode lane and the verify walk both left behind; the imax
     // census still shows pd_nvf4_gemm_tcp at 9.4% of the die, so some caller
@@ -195,7 +238,9 @@ pub(crate) fn nvf4_ffn(
         }
     }
     if rows >= nvf4_w4a4_min_rows() && exec.has_nvf4_gemm_f4() {
-        exec.quantize_nvf4(xn, xq, xs, rows * gate.in_dim)?;
+        if !xq_ready {
+            exec.quantize_nvf4(xn, xq, xs, rows * gate.in_dim)?;
+        }
         exec.nvf4_gemm_f4(gate, xq, xs, ffn_gate, None, rows, Some(part))?;
         exec.nvf4_gemm_f4(up, xq, xs, ffn_up, None, rows, Some(part))?;
         exec.quantize_nvf4_swiglu(ffn_gate, ffn_up, xq, xs, rows * ff)?;
@@ -205,6 +250,131 @@ pub(crate) fn nvf4_ffn(
         nvf4_mm(exec, up, xn, ffn_up, rows)?;
         exec.swiglu(ffn_gate, ffn_up, rows * ff)?;
         nvf4_mm(exec, down, ffn_gate, proj, rows)?;
+    }
+    Ok(())
+}
+
+/// The FUSED gate|up chain (`Nvf4Gu::Fused`, see mod.rs). Three arms by width:
+///   at 128 rows and up: `nvf4_gemm_f4t_swq` - the GEMM's epilogue computes
+///     silu(gate)*up on the accumulators and quantizes it to the down GEMM's
+///     e2m1 operand (slot 533; bit-identical to {f4t gate, f4t up,
+///     quantize_nvf4_swiglu} - bench/nv4_gb10_bench.cu FUSED=1). No [rows,
+///     2ff] f32 landing, no swiglu-quant pass: on GB10 those were 2 x 71 MB
+///     written and 144 MB read per layer at 1k rows, on a die whose fp4 GEMM
+///     is bound by exactly that traffic (Spark session 5).
+///   2..127 rows (the W4A4 decode arms): ONE GEMM over the fused plane into
+///     the interleaved landing, then `swiglu_fused_nvf4_il` (slot 534)
+///     quantizes pairs in place of the two-plane pass.
+///   the serial spine / below the W4A4 floor: `nvf4_mm` over the fused plane,
+///     `swiglu_fused_il` (slot 535) to f32, then down.
+/// `PADDOCK_NO_NVF4_SWQ=1` pins the landing path at every width (A/B; the
+/// scratch grows to the full row cap for it).
+#[allow(clippy::too_many_arguments)]
+#[track_caller]
+pub(crate) fn nvf4_ffn_fused(
+    exec: &GpuExecutor,
+    gup: &crate::gpu::Nvf4Plane,
+    down: &crate::gpu::Nvf4Plane,
+    xn: &CudaSlice<f32>,
+    xq: &mut CudaSlice<i8>,
+    xs: &mut CudaSlice<u8>,
+    part: &mut CudaSlice<f32>,
+    ffn_gate: &mut CudaSlice<f32>,
+    ffn_gu: &mut CudaSlice<f32>,
+    swq_q: &mut CudaSlice<i8>,
+    swq_s: &mut CudaSlice<u8>,
+    proj: &mut CudaSlice<f32>,
+    ff: usize,
+    rows: usize,
+    xq_ready: bool,
+) -> Result<(), GpuModelError> {
+    static NO_SWQ: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let no_swq =
+        *NO_SWQ.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_NVF4_SWQ").is_some());
+    let w4a4 = rows >= nvf4_w4a4_min_rows() && exec.has_nvf4_gemm_f4();
+    let swq = w4a4 && rows >= 128 && !no_swq && exec.has_nvf4_gemm_f4t_swq();
+    {
+        use std::sync::Mutex;
+        static SEEN: Mutex<Option<std::collections::HashSet<(&'static str, u32, u8, usize)>>> =
+            Mutex::new(None);
+        let loc = std::panic::Location::caller();
+        let arm: u8 = if swq {
+            2
+        } else if w4a4 {
+            1
+        } else {
+            0
+        };
+        let key = (loc.file(), loc.line(), arm, rows.next_power_of_two());
+        let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if g.get_or_insert_with(Default::default).insert(key) {
+            tracing::warn!(
+                "[nvf4-ffn-site] {}:{} arm={} rows={} ff={} (fused gate|up plane)",
+                loc.file(),
+                loc.line(),
+                ["W4A16-SOFTWARE-DEQUANT-il", "w4a4-il", "w4a4-SWQ"][arm as usize],
+                rows,
+                ff,
+            );
+        }
+    }
+    if swq {
+        if !xq_ready {
+            exec.quantize_nvf4(xn, xq, xs, rows * gup.in_dim)?;
+        }
+        exec.nvf4_gemm_f4t_swq(gup, xq, xs, swq_q, swq_s, rows)?;
+        exec.nvf4_gemm_f4(down, swq_q, swq_s, proj, None, rows, Some(part))?;
+        return Ok(());
+    }
+    if ffn_gu.len() < rows * 2 * ff {
+        return Err(GpuModelError::Config(format!(
+            "fused gate|up landing holds {} rows, {rows} asked (PADDOCK_NO_NVF4_SWQ off the wide band needs the full cap)",
+            ffn_gu.len() / (2 * ff)
+        )));
+    }
+    if w4a4 {
+        if !xq_ready {
+            exec.quantize_nvf4(xn, xq, xs, rows * gup.in_dim)?;
+        }
+        exec.nvf4_gemm_f4(gup, xq, xs, ffn_gu, None, rows, Some(part))?;
+        exec.swiglu_fused_nvf4_il(ffn_gu, xq, xs, ff, rows)?;
+        exec.nvf4_gemm_f4(down, xq, xs, proj, None, rows, Some(part))?;
+    } else {
+        nvf4_mm(exec, gup, xn, ffn_gu, rows)?;
+        exec.swiglu_fused_il(ffn_gu, ffn_gate, ff, rows)?;
+        nvf4_mm(exec, down, ffn_gate, proj, rows)?;
+    }
+    Ok(())
+}
+
+/// The serial spine's gate|up -> swiglu step (the spec verify walks), for
+/// either representation: leaves silu(gate)*up in `ffn_gate` ([rows, ff] f32).
+pub(crate) fn nvf4_gu_swiglu(
+    exec: &GpuExecutor,
+    gu: &super::Nvf4Gu,
+    xn: &CudaSlice<f32>,
+    ffn_gate: &mut CudaSlice<f32>,
+    ffn_up: &mut CudaSlice<f32>,
+    ffn_gu: &mut CudaSlice<f32>,
+    ff: usize,
+    rows: usize,
+) -> Result<(), GpuModelError> {
+    match gu {
+        super::Nvf4Gu::Split { gate, up } => {
+            nvf4_mm(exec, gate, xn, ffn_gate, rows)?;
+            nvf4_mm(exec, up, xn, ffn_up, rows)?;
+            exec.swiglu(ffn_gate, ffn_up, rows * ff)?;
+        }
+        super::Nvf4Gu::Fused(gup) => {
+            if ffn_gu.len() < rows * 2 * ff {
+                return Err(GpuModelError::Config(format!(
+                    "fused gate|up landing holds {} rows, {rows} asked",
+                    ffn_gu.len() / (2 * ff)
+                )));
+            }
+            nvf4_mm(exec, gup, xn, ffn_gu, rows)?;
+            exec.swiglu_fused_il(ffn_gu, ffn_gate, ff, rows)?;
+        }
     }
     Ok(())
 }

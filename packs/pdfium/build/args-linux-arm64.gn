@@ -1,0 +1,50 @@
+# GN args: pdfium as ONE self-contained static library for linux-arm64
+# (aarch64: DGX Spark's Grace, Jetson). Cross-built on an x64 host by the
+# same Dockerfile with TARGET_CPU=arm64; Chromium's clang targets arm64 out of
+# the box once the arm64 sysroot is installed.
+#
+# Twin of args-linux.gn and args-win.gn - see there for why each flag is what it is. Keep the
+# two in sync: a feature enabled on one platform and not the other is a link
+# error that only reproduces on one OS.
+
+target_os = "linux"
+target_cpu = "arm64"
+
+is_debug = false
+is_clang = true
+
+pdf_is_standalone = true
+pdf_is_complete_lib = true
+
+pdf_enable_v8 = false
+pdf_enable_xfa = false
+pdf_use_skia = false
+
+is_component_build = false
+symbol_level = 0
+treat_warnings_as_errors = false
+
+# Platform libstdc++ rather than Chromium's bundled libc++ - see args-win.gn
+# for the measured reason. Pairs with pdfium-render's `libstdc++` feature.
+use_custom_libcxx = false
+
+# No glib. Nothing in a rasterizer wants it, and asking for it makes gn shell
+# out to pkg-config at GENERATE time - which failed the first Linux build
+# outright (lector's WASM args dodge this the same way).
+use_glib = false
+
+# Chromium's bundled sysroot (an old Debian) rather than the build container's
+# glibc. This is what sets the glibc floor of the final paddock-runner: objects
+# compiled against an ancient glibc link fine into a binary built on anything
+# NEWER, but the reverse is not true. Building in Ubuntu 24.04 without this
+# would quietly stamp glibc 2.39 as the minimum for every Linux user.
+use_sysroot = true
+
+# Deliberate divergence from args-linux-x64.gn: Chromium's build emits ELF
+# compact relocations (CREL, `-Wa,--crel`) whenever `is_linux && use_lld`,
+# and GNU ld cannot read them (binutils 2.42 reports "unknown architecture of
+# input file"). On x64 nobody notices because Rust links with its bundled
+# rust-lld; on aarch64 Rust still calls the system `cc`, i.e. GNU ld. Turning
+# use_lld off only changes how pdfium's own test binaries would be linked and
+# drops the CREL flag from every object, so the library links with any linker.
+use_lld = false

@@ -1109,6 +1109,22 @@ pub(crate) fn f8row_ffn_enabled(exec: &GpuExecutor) -> bool {
 /// the class the lane already serves at decode. `PADDOCK_NVF4_F8W=<n>`
 /// (n > 0) builds the twin again and elects it above n rows - the labeled
 /// A/B; `=0` or unset takes this election.
+impl GpuQwen35 {
+    /// Any layer serving the FUSED gate|up NVFP4 plane (sizes the interleaved
+    /// landing and the SWQ staging in the scratch).
+    pub(crate) fn nvf4_gu_fused(&self) -> bool {
+        self.layers.iter().any(|l| {
+            matches!(
+                &l.ffn,
+                Ffn::Nvf4Dense {
+                    gu: Nvf4Gu::Fused(_),
+                    ..
+                }
+            )
+        })
+    }
+}
+
 pub(crate) fn nvf4_wide_w4a4(exec: &GpuExecutor) -> bool {
     let forced_twin = paddock_models::dev_var!("PADDOCK_NVF4_F8W")
         .ok()
@@ -1377,11 +1393,55 @@ enum Ffn {
     /// f8t, W8) build for an Nvf4Dense layer, which is also what makes the
     /// lane fit: ~150 MB/layer of fp4 instead of ~284 MB of Q8_0.
     Nvf4Dense {
-        gate: crate::gpu::Nvf4Plane,
-        up: crate::gpu::Nvf4Plane,
+        gu: Nvf4Gu,
         down: crate::gpu::Nvf4Plane,
     },
     Moe(MoeFfnWeights),
+}
+
+/// The checkpoint-NVFP4 FFN's gate and up planes: either the two planes the
+/// checkpoint ships, or ONE interleaved plane (row 2j = gate_j, row 2j+1 =
+/// up_j, `Nvf4Plane::gu_pairs`) built at load when both share a global scale
+/// and the pack carries the consumers of an interleaved landing (slots
+/// 533-536). Fused, the wide prefill runs `nvf4_gemm_f4t_swq`: silu(gate)
+/// times up and the e2m1 quantization of the down GEMM's operand happen in
+/// the GEMM's epilogue, so the [rows, 2ff] f32 landing (142 MB per layer at 1k rows on
+/// the 27B) and the separate swiglu-quant pass over it never exist - and the
+/// decode widths read the plane as one GEMM whose interleaved output the
+/// `_il` twins consume. Measured on GB10 2026-09-08 (Spark
+/// session 6); `PADDOCK_NO_NVF4_GU_FUSE=1` keeps the split planes.
+pub enum Nvf4Gu {
+    Split {
+        gate: crate::gpu::Nvf4Plane,
+        up: crate::gpu::Nvf4Plane,
+    },
+    Fused(crate::gpu::Nvf4Plane),
+}
+
+impl Nvf4Gu {
+    /// Rows of the gate (= up) plane, i.e. the FFN width.
+    pub fn ff(&self) -> usize {
+        match self {
+            Nvf4Gu::Split { gate, .. } => gate.out_dim,
+            Nvf4Gu::Fused(p) => p.out_dim / 2,
+        }
+    }
+    pub fn in_dim(&self) -> usize {
+        match self {
+            Nvf4Gu::Split { gate, .. } => gate.in_dim,
+            Nvf4Gu::Fused(p) => p.in_dim,
+        }
+    }
+    pub fn fused(&self) -> bool {
+        matches!(self, Nvf4Gu::Fused(_))
+    }
+    /// Every plane, for the VRAM audit.
+    pub fn planes(&self) -> Vec<&crate::gpu::Nvf4Plane> {
+        match self {
+            Nvf4Gu::Split { gate, up } => vec![gate, up],
+            Nvf4Gu::Fused(p) => vec![p],
+        }
+    }
 }
 
 /// MoE geometry (None on dense models).
@@ -2271,20 +2331,58 @@ fn kq_nc_off() -> bool {
 struct AuSum {
     bytes: u64,
     allocs: u32,
+    /// Dev-only (`PADDOCK_LOAD_CHECKSUM=1`): fold every visited slice's
+    /// bytes into an FNV-1a hash, downloaded synchronously. The load-time
+    /// determinism probe - two processes loading the same files must print
+    /// the same hashes, or the planes themselves differ (GB10, 2026-09-08:
+    /// greedy text differed across restarts while three requests inside one
+    /// process were bit-identical - the hashes are how load was separated
+    /// from compute).
+    hashing: bool,
+    hash: u64,
 }
 
 impl AuSum {
+    fn h<T: cudarc::driver::DeviceRepr + Default + Clone>(&mut self, s: &CudaSlice<T>) {
+        if !self.hashing {
+            return;
+        }
+        let Ok(v) = s.stream().clone_dtoh(s) else {
+            return;
+        };
+        // SAFETY: a Vec<T> of plain device-repr values viewed as its bytes.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v.as_slice()))
+        };
+        let mut x = if self.hash == 0 {
+            0xcbf29ce484222325u64
+        } else {
+            self.hash
+        };
+        for c in bytes.chunks(8) {
+            let mut w = [0u8; 8];
+            w[..c.len()].copy_from_slice(c);
+            x ^= u64::from_le_bytes(w);
+            x = x.wrapping_mul(0x100000001b3);
+        }
+        self.hash = x;
+    }
     fn dt(&mut self, t: &DeviceTensor) {
         self.bytes += (t.buf.len() * 4) as u64;
         self.allocs += 1;
+        self.h(&t.buf);
     }
     fn q8(&mut self, w: &RepackedQ8) {
         self.bytes += (w.data.len() + w.scale.len()) as u64;
         self.allocs += 2;
+        self.h(&w.data);
+        self.h(&w.scale);
     }
     fn kq(&mut self, w: &crate::gpu::RepackedKQ) {
         self.bytes += (w.data.len() + w.scales.len()) as u64;
         self.allocs += 2;
+        self.h(&w.data);
+        self.h(&w.scales);
     }
     fn qw(&mut self, w: &QuantW) {
         match w {
@@ -2303,6 +2401,8 @@ impl AuSum {
     fn fp4(&mut self, w: &RepackedMxfp4) {
         self.bytes += (w.data.len() + w.scale.len()) as u64;
         self.allocs += 2;
+        self.h(&w.data);
+        self.h(&w.scale);
     }
     fn attn(&mut self, w: &FullAttnWeights) {
         self.qw(&w.wq);
@@ -2333,6 +2433,8 @@ impl AuSum {
     fn nvf4(&mut self, w: &crate::gpu::Nvf4Plane) {
         self.bytes += (w.data.len() + w.scale.len()) as u64;
         self.allocs += 2;
+        self.h(&w.data);
+        self.h(&w.scale);
     }
     fn ffn(&mut self, f: &Ffn) {
         match f {
@@ -2341,9 +2443,10 @@ impl AuSum {
                 self.qw(up);
                 self.qw(down);
             }
-            Ffn::Nvf4Dense { gate, up, down } => {
-                self.nvf4(gate);
-                self.nvf4(up);
+            Ffn::Nvf4Dense { gu, down } => {
+                for p in gu.planes() {
+                    self.nvf4(p);
+                }
                 self.nvf4(down);
             }
             Ffn::Moe(m) => {
@@ -2401,7 +2504,7 @@ fn dn_vb16(exec: &GpuExecutor, r: usize, state_size: usize) -> bool {
 /// the expanded pair. The CALLER must additionally require an all-vl tick:
 /// every other consumer of d_dq/d_dk (chunked_at, recurrent v2/_packed)
 /// reads f32 expanded.
-fn dn_qkc(exec: &GpuExecutor) -> bool {
+pub(super) fn dn_qkc(exec: &GpuExecutor) -> bool {
     static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let on = *ENV.get_or_init(|| {
         paddock_models::dev_var_os!("PADDOCK_DNC_QKC").is_some_and(|v| v != "0")
@@ -2704,6 +2807,18 @@ fn attn_fill_blocks(sm_count: usize) -> usize {
     3 * sm_count
 }
 
+/// The SM count the split COLLAPSE boundary is computed from - and, because
+/// the partial scratch is sized from the same boundary, the count the
+/// scratch is sized from. Small dies (< 128 SMs) take the 188-SM boundary:
+/// the collapse is a walk-length question, not an occupancy one (see
+/// `attn_splits`), and sizing the scratch from the die's own count while
+/// collapsing at the bigger boundary overflowed it (GB10 2026-09-08: the
+/// spec=auto verify rows split into a scratch sized for 12 rows - garbage
+/// from the first token). One function, both readers.
+pub(super) fn attn_boundary_sms(sm_count: usize) -> usize {
+    if sm_count < 128 { 188 } else { sm_count }
+}
+
 /// KV splits for decode-class full attention. The unsplit kernel is n_heads
 /// blocks - 16 on qwen - which starves a big die at any context (GB202 kbench:
 /// 25-29 GB/s effective unsplit at every ctx; split 2x faster at ctx=128, 8.5x
@@ -2736,7 +2851,18 @@ fn attn_splits(n_heads: usize, batch: usize, sm_count: usize) -> usize {
     if paddock_models::dev_var_os!("PADDOCK_NO_ATTN_SPLIT").is_some() {
         return 1;
     }
-    if n_heads * batch >= 2 * attn_fill_blocks(sm_count) {
+    // The collapse boundary is a WALK-LENGTH question, not an occupancy one:
+    // the single kernel gives every (head, row) CTA the row's whole history
+    // serially, so past the boundary the wall is one CTA's walk however many
+    // CTAs the die holds. Scaling the boundary with the SM count made a
+    // 48-SM die (GB10) collapse at 12 rows of 24 heads: the unified tick's
+    // 16-row tail shares after a checkpoint cut ran 942 us per layer over a
+    // 1k history (15 ms of a 500 ms prefill, 2026-09-08), and the spec
+    // gates' pair (r=K+1 vs r=B*(K+1)) straddled it - one side split, the
+    // other walked. Small dies take the 188-SM boundary (1128 CTAs at 24
+    // heads) so they make the RTX PRO's decisions; big dies are unchanged.
+    // The partial scratch (forward.rs) is sized from the SAME boundary.
+    if n_heads * batch >= 2 * attn_fill_blocks(attn_boundary_sms(sm_count)) {
         return 1;
     }
     if let Some(n) = paddock_models::dev_var!("PADDOCK_ATTN_SPLITS")
@@ -2795,6 +2921,15 @@ struct Scratch {
     d_dq: CudaSlice<f32>,
     d_dk: CudaSlice<f32>,
     d_dv: CudaSlice<f32>,
+    /// COMPACT bf16 q/k planes ([rows, HK, s], the conv qkc twin's layout)
+    /// for the unified tick's varlen spans - a separate pair, because the
+    /// expanded f32 rows of the other spans live in d_dq/d_dk at 3x the
+    /// pitch and the two layouts would overlap in one buffer. 1-element
+    /// stubs when the qkc pair is off.
+    d_dqc: CudaSlice<f32>,
+    d_dkc: CudaSlice<f32>,
+    /// all-zero row0s plane (cap rows) for the per-span compact conv
+    d_row0s_zero: CudaSlice<u32>,
     d_a: CudaSlice<f32>,
     d_b: CudaSlice<f32>,
     /// x2-v3 fused decay activations [cap, 2*n_v_heads] (alpha||beta rows)
@@ -2816,6 +2951,15 @@ struct Scratch {
     d_dnc_cg: CudaSlice<f64>,
     // FFN
     d_ffn_gate: CudaSlice<f32>,
+    /// The fused gate|up plane's interleaved [rows, 2ff] f32 landing for the
+    /// decode-width arms (rows < 128; the wide band never lands - its swiglu
+    /// + quant live in the GEMM epilogue). 1-elem stub off the fused lane.
+    d_ffn_gu: CudaSlice<f32>,
+    /// The SWQ epilogue's output = the down GEMM's e2m1 operand ([rows, ff/2]
+    /// nibbles + [rows, ff/16] e4m3 scales), its own staging because the
+    /// GEMM reads the FFN input from d_pxq/d_nvs while it writes.
+    d_swq_q: CudaSlice<i8>,
+    d_swq_s: CudaSlice<u8>,
     // MoE scratch (1-element dummies on dense models)
     d_moe_logits: CudaSlice<f32>,
     d_moe_idx: CudaSlice<u32>,

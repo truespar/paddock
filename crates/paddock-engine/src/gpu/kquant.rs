@@ -1038,6 +1038,450 @@ impl GpuExecutor {
         })
     }
 
+    /// True when the pack carries the expert-GROUPED gate+up (slot 586).
+    pub fn has_kquant_moe_grp(&self) -> bool {
+        self.kernels.kquant_moe_gate_up_grp.is_some()
+    }
+
+    /// The group size a routing of `rows` over `n_expert` experts wants: one
+    /// block should hold a whole expert's rows, because the unpack this saves
+    /// is per BLOCK. Derived from the shape, never chosen by a knob - at 3.9
+    /// rows/expert (a 200-token prompt on top-10 of 512) the 8-row group
+    /// already puts each expert in one block, and a longer prompt climbs the
+    /// ladder on its own.
+    ///
+    /// The ladder stops at 16 on measurement, not on principle: a 32-row
+    /// group holds more of a wide prefill's rows per block but costs the
+    /// accumulators to do it, and at a 2114-row wave that traded 9.31 ms a
+    /// layer for 10.80 (2026-09-08). It is also what the grouped DOWN can
+    /// stage in shared at ff = 640.
+    pub fn kq_moe_group_for(rows: usize, n_expert: usize) -> usize {
+        let avg = rows / n_expert.max(1);
+        if avg >= 12 { 16 } else { 8 }
+    }
+
+    /// Expert-grouped k-quant MoE gate+up+SwiGLU (slot 586): one block per
+    /// (expert group, out row) over a `moe_align_bm(bm = group)` layout, so a
+    /// weight window is unpacked once per group instead of once per routed
+    /// row. `out` takes the PAIR-major layout the token-batched kernel writes
+    /// - the quantize and the down kernel after it are unchanged - and the
+    ///   numbers are bit-identical to that kernel's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kquant_moe_gate_up_grp(
+        &self,
+        gate: &RepackedKQ,
+        up: &RepackedKQ,
+        sorted_row: &CudaSlice<u32>,
+        sorted_slot: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<f32>,
+        xsums: Option<&CudaSlice<f32>>,
+        out: &mut CudaSlice<f32>,
+        n_active: usize,
+        batch: usize,
+        max_blocks: usize,
+        group: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .kquant_moe_gate_up_grp
+            .ok_or(GpuError::MissingOp("kquant_moe_gate_up_grp"))?;
+        let (gid, _, _) = kq_params(gate.ty).expect("RepackedKQ holds a k-quant type");
+        let (uid, _, _) = kq_params(up.ty).expect("RepackedKQ holds a k-quant type");
+        let (in_dim, ff) = (gate.dims[0], gate.dims[1]);
+        debug_assert_eq!(up.dims[0], in_dim);
+        debug_assert_eq!(up.dims[1], ff);
+        debug_assert!(out.len() >= batch * n_active * ff);
+        debug_assert!(sorted_row.len() >= max_blocks * group);
+        debug_assert!(sorted_slot.len() >= max_blocks * group);
+        debug_assert!(block_expert.len() >= max_blocks);
+        let (gdp, _g1) = gate.data.device_ptr(&self.stream);
+        let (gsp, _g2) = gate.scales.device_ptr(&self.stream);
+        let (udp, _g3) = up.data.device_ptr(&self.stream);
+        let (usp, _g4) = up.scales.device_ptr(&self.stream);
+        let (srp, _g5) = sorted_row.device_ptr(&self.stream);
+        let (ssp, _g6) = sorted_slot.device_ptr(&self.stream);
+        let (bep, _g7) = block_expert.device_ptr(&self.stream);
+        let (xqp, _g8) = xq.device_ptr(&self.stream);
+        let (xsp, _g9) = xs.device_ptr(&self.stream);
+        let (sump, _gs);
+        let sp: *const core::ffi::c_void = match xsums {
+            Some(s) => {
+                (sump, _gs) = s.device_ptr(&self.stream);
+                sump as *const _
+            }
+            None => core::ptr::null(),
+        };
+        let (op, _g10) = out.device_ptr_mut(&self.stream);
+        // SAFETY: pack ABI v1 contract (slot 586); pointers + stream live across the call
+        check(unsafe {
+            f(
+                gdp as *const _,
+                gsp as *const _,
+                udp as *const _,
+                usp as *const _,
+                srp as *const _,
+                ssp as *const _,
+                bep as *const _,
+                xqp as *const _,
+                xsp as *const _,
+                sp,
+                op as *mut _,
+                in_dim as u32,
+                ff as u32,
+                n_active as u32,
+                max_blocks as u32,
+                group as u32,
+                gid,
+                uid,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// True when the pack carries the register-tiled grouped gate+up (592).
+    pub fn has_kquant_moe_gate_up_tile(&self) -> bool {
+        self.kernels.kquant_moe_gate_up_tile.is_some()
+    }
+
+    /// The row-group the tiled pair's CSR must carry: BM is the kernel's tile,
+    /// not the caller's choice.
+    pub const KQ_MOE_TILE_BM: usize = 16;
+
+    /// Register-tiled grouped k-quant MoE gate+up+SwiGLU (slot 592): a
+    /// BM x BN tile whose operands are both staged per BK slice, so the
+    /// group's activations are read once per column TILE where the grouped
+    /// pair kernel read them once per column. Same PAIR-major output; the
+    /// association of its f32 sum is the tile's (a thread owns whole dots),
+    /// which is the prefill class this lane already carries for dense planes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kquant_moe_gate_up_tile(
+        &self,
+        gate: &RepackedKQ,
+        up: &RepackedKQ,
+        sorted_row: &CudaSlice<u32>,
+        sorted_slot: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<f32>,
+        xsums: Option<&CudaSlice<f32>>,
+        out: &mut CudaSlice<f32>,
+        n_active: usize,
+        batch: usize,
+        max_blocks: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .kquant_moe_gate_up_tile
+            .ok_or(GpuError::MissingOp("kquant_moe_gate_up_tile"))?;
+        let (gid, _, _) = kq_params(gate.ty).expect("RepackedKQ holds a k-quant type");
+        let (uid, _, _) = kq_params(up.ty).expect("RepackedKQ holds a k-quant type");
+        let (in_dim, ff) = (gate.dims[0], gate.dims[1]);
+        debug_assert!(out.len() >= batch * n_active * ff);
+        debug_assert!(sorted_row.len() >= max_blocks * Self::KQ_MOE_TILE_BM);
+        let (gdp, _g1) = gate.data.device_ptr(&self.stream);
+        let (gsp, _g2) = gate.scales.device_ptr(&self.stream);
+        let (udp, _g3) = up.data.device_ptr(&self.stream);
+        let (usp, _g4) = up.scales.device_ptr(&self.stream);
+        let (srp, _g5) = sorted_row.device_ptr(&self.stream);
+        let (ssp, _g6) = sorted_slot.device_ptr(&self.stream);
+        let (bep, _g7) = block_expert.device_ptr(&self.stream);
+        let (xqp, _g8) = xq.device_ptr(&self.stream);
+        let (xsp, _g9) = xs.device_ptr(&self.stream);
+        let (sump, _gs);
+        let sp: *const core::ffi::c_void = match xsums {
+            Some(x) => {
+                (sump, _gs) = x.device_ptr(&self.stream);
+                sump as *const _
+            }
+            None => core::ptr::null(),
+        };
+        let (op, _g10) = out.device_ptr_mut(&self.stream);
+        // SAFETY: pack ABI v1 contract (slot 592); pointers + stream live across the call
+        check(unsafe {
+            f(
+                gdp as *const _,
+                gsp as *const _,
+                udp as *const _,
+                usp as *const _,
+                srp as *const _,
+                ssp as *const _,
+                bep as *const _,
+                xqp as *const _,
+                xsp as *const _,
+                sp,
+                op as *mut _,
+                in_dim as u32,
+                ff as u32,
+                n_active as u32,
+                max_blocks as u32,
+                gid,
+                uid,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// True when the pack carries the register-tiled routed down (slot 593).
+    pub fn has_kquant_moe_down_tile(&self) -> bool {
+        self.kernels.kquant_moe_down_tile.is_some()
+    }
+
+    /// Register-tiled routed down over one column chunk (slot 593): the tiled
+    /// twin of [`Self::kquant_moe_down_grp`], writing the same partials for
+    /// [`Self::moe_part_fold_at`]. A thread owns whole dots, so the warp fold
+    /// the grouped kernel needed is gone with it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kquant_moe_down_tile(
+        &self,
+        down: &RepackedKQ,
+        sorted_row: &CudaSlice<u32>,
+        sorted_slot: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        topk_w: &CudaSlice<f32>,
+        fq: &CudaSlice<i8>,
+        fs: &CudaSlice<f32>,
+        fsums: Option<&CudaSlice<f32>>,
+        part: &mut CudaSlice<f32>,
+        o0: usize,
+        ocols: usize,
+        n_active: usize,
+        rows: usize,
+        max_blocks: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .kquant_moe_down_tile
+            .ok_or(GpuError::MissingOp("kquant_moe_down_tile"))?;
+        let (did, _, _) = kq_params(down.ty).expect("RepackedKQ holds a k-quant type");
+        let (ff, embd) = (down.dims[0], down.dims[1]);
+        debug_assert!(part.len() >= rows * n_active * ocols);
+        let (ddp, _g1) = down.data.device_ptr(&self.stream);
+        let (dsp, _g2) = down.scales.device_ptr(&self.stream);
+        let (srp, _g3) = sorted_row.device_ptr(&self.stream);
+        let (ssp, _g4) = sorted_slot.device_ptr(&self.stream);
+        let (bep, _g5) = block_expert.device_ptr(&self.stream);
+        let (twp, _g6) = topk_w.device_ptr(&self.stream);
+        let (fqp, _g7) = fq.device_ptr(&self.stream);
+        let (fsp, _g8) = fs.device_ptr(&self.stream);
+        let (sump, _gs);
+        let sp: *const core::ffi::c_void = match fsums {
+            Some(x) => {
+                (sump, _gs) = x.device_ptr(&self.stream);
+                sump as *const _
+            }
+            None => core::ptr::null(),
+        };
+        let (pp, _g9) = part.device_ptr_mut(&self.stream);
+        // SAFETY: pack ABI v1 contract (slot 593); pointers + stream live across the call
+        check(unsafe {
+            f(
+                ddp as *const _,
+                dsp as *const _,
+                srp as *const _,
+                ssp as *const _,
+                bep as *const _,
+                twp as *const _,
+                fqp as *const _,
+                fsp as *const _,
+                sp,
+                pp as *mut _,
+                ff as u32,
+                embd as u32,
+                o0 as u32,
+                ocols as u32,
+                n_active as u32,
+                max_blocks as u32,
+                did,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// True when the pack carries the expert-grouped down + its slot fold
+    /// (slots 589/590) - the prefill class for the routed down half.
+    pub fn has_kquant_moe_down_grp(&self) -> bool {
+        self.kernels.kquant_moe_down_grp.is_some() && self.kernels.moe_part_fold_at.is_some()
+    }
+
+    /// Expert-grouped routed down over one column chunk (slot 589): stages the
+    /// group's activation rows once and unpacks each column's weight row once,
+    /// writing one partial per (pair, column). Fold with
+    /// [`Self::moe_part_fold_at`] - a grouped block holds different tokens, so
+    /// the slot sum cannot happen inside it. Bit-identical to
+    /// `kquant_moe_down` per (pair, column) and in the fold order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kquant_moe_down_grp(
+        &self,
+        down: &RepackedKQ,
+        sorted_row: &CudaSlice<u32>,
+        sorted_slot: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        topk_w: &CudaSlice<f32>,
+        fq: &CudaSlice<i8>,
+        fs: &CudaSlice<f32>,
+        fsums: Option<&CudaSlice<f32>>,
+        part: &mut CudaSlice<f32>,
+        o0: usize,
+        ocols: usize,
+        n_active: usize,
+        rows: usize,
+        max_blocks: usize,
+        group: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .kquant_moe_down_grp
+            .ok_or(GpuError::MissingOp("kquant_moe_down_grp"))?;
+        let (did, _, _) = kq_params(down.ty).expect("RepackedKQ holds a k-quant type");
+        let (ff, embd) = (down.dims[0], down.dims[1]);
+        debug_assert!(part.len() >= rows * n_active * ocols);
+        let (ddp, _g1) = down.data.device_ptr(&self.stream);
+        let (dsp, _g2) = down.scales.device_ptr(&self.stream);
+        let (srp, _g3) = sorted_row.device_ptr(&self.stream);
+        let (ssp, _g4) = sorted_slot.device_ptr(&self.stream);
+        let (bep, _g5) = block_expert.device_ptr(&self.stream);
+        let (twp, _g6) = topk_w.device_ptr(&self.stream);
+        let (fqp, _g7) = fq.device_ptr(&self.stream);
+        let (fsp, _g8) = fs.device_ptr(&self.stream);
+        let (sump, _gs);
+        let sp: *const core::ffi::c_void = match fsums {
+            Some(x) => {
+                (sump, _gs) = x.device_ptr(&self.stream);
+                sump as *const _
+            }
+            None => core::ptr::null(),
+        };
+        let (pp, _g9) = part.device_ptr_mut(&self.stream);
+        // SAFETY: pack ABI v1 contract (slot 589); pointers + stream live across the call
+        check(unsafe {
+            f(
+                ddp as *const _,
+                dsp as *const _,
+                srp as *const _,
+                ssp as *const _,
+                bep as *const _,
+                twp as *const _,
+                fqp as *const _,
+                fsp as *const _,
+                sp,
+                pp as *mut _,
+                ff as u32,
+                embd as u32,
+                o0 as u32,
+                ocols as u32,
+                n_active as u32,
+                max_blocks as u32,
+                group as u32,
+                did,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// Fold a column chunk of [`Self::kquant_moe_down_grp`] partials into
+    /// `out` in ascending slot order (slot 590).
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_part_fold_at(
+        &self,
+        part: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        embd: usize,
+        o0: usize,
+        ocols: usize,
+        n_active: usize,
+        rows: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .moe_part_fold_at
+            .ok_or(GpuError::MissingOp("moe_part_fold_at"))?;
+        let (pp, _g1) = part.device_ptr(&self.stream);
+        let (op, _g2) = out.device_ptr_mut(&self.stream);
+        // SAFETY: pack ABI v1 contract (slot 590)
+        check(unsafe {
+            f(
+                pp as *const _,
+                op as *mut _,
+                embd as u32,
+                o0 as u32,
+                ocols as u32,
+                n_active as u32,
+                rows as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// True when the pack carries the column-tiled routed down (slot 587).
+    pub fn has_kquant_moe_down_cols(&self) -> bool {
+        self.kernels.kquant_moe_down_cols.is_some()
+    }
+
+    /// Column-tiled routed k-quant down (slot 587): one block per (token,
+    /// `cols` columns), which is the prefill shape - the plain kernel writes
+    /// ONE float per block and spends the launch waiting on its own weight
+    /// loads. Bit-identical to `kquant_moe_down`; the caller keeps narrow
+    /// widths on that one, where cols-fewer blocks would leave the die idle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kquant_moe_down_cols(
+        &self,
+        down: &RepackedKQ,
+        idx: &CudaSlice<u32>,
+        topk_w: &CudaSlice<f32>,
+        fq: &CudaSlice<i8>,
+        fs: &CudaSlice<f32>,
+        fsums: Option<&CudaSlice<f32>>,
+        out: &mut CudaSlice<f32>,
+        n_active: usize,
+        batch: usize,
+        cols: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .kquant_moe_down_cols
+            .ok_or(GpuError::MissingOp("kquant_moe_down_cols"))?;
+        let (did, _, _) = kq_params(down.ty).expect("RepackedKQ holds a k-quant type");
+        let (ff, embd) = (down.dims[0], down.dims[1]);
+        debug_assert!(out.len() >= batch * embd);
+        let (ddp, _g1) = down.data.device_ptr(&self.stream);
+        let (dsp, _g2) = down.scales.device_ptr(&self.stream);
+        let (ip, _g3) = idx.device_ptr(&self.stream);
+        let (twp, _g4) = topk_w.device_ptr(&self.stream);
+        let (fqp, _g5) = fq.device_ptr(&self.stream);
+        let (fsp, _g6) = fs.device_ptr(&self.stream);
+        let (sump, _gs);
+        let sp: *const core::ffi::c_void = match fsums {
+            Some(x) => {
+                (sump, _gs) = x.device_ptr(&self.stream);
+                sump as *const _
+            }
+            None => core::ptr::null(),
+        };
+        let (op, _g7) = out.device_ptr_mut(&self.stream);
+        // SAFETY: pack ABI v1 contract (slot 587); pointers + stream live across the call
+        check(unsafe {
+            f(
+                ddp as *const _,
+                dsp as *const _,
+                ip as *const _,
+                twp as *const _,
+                fqp as *const _,
+                fsp as *const _,
+                sp,
+                op as *mut _,
+                ff as u32,
+                embd as u32,
+                n_active as u32,
+                batch as u32,
+                cols as u32,
+                did,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// `kquant_moe_down` over the wave's compacted token list (slot 584),
     /// ACCUMULATING into `out` - zero it before the first wave.
     #[allow(clippy::too_many_arguments)]

@@ -1757,7 +1757,16 @@ export function useChatStream() {
   async function maybeDocRun(conv: Conversation, at?: string | null): Promise<boolean> {
     const modelId = conv.model
     const caps = await models.capsFor(modelId)
-    if (!caps.docParser) return false
+    // Two kinds of model take this path. A document PARSER always does. A
+    // chat vision model with task tags (granite-vision) does for a TASK turn
+    // over a document with several pages: its template rebuilds a tagged turn
+    // as IBM's canned prompt around ONE image slot, so a multi-page document
+    // in one request renders one slot for N pages and the runner refuses it
+    // (rightly - dropping N-1 pages would be worse). The tasks are single-page
+    // by design, and one page per request is how IBM's own document pipeline
+    // (Docling) drives the model. A single image stays on the ordinary path.
+    const taskModel = !caps.docParser && (caps.taskTags?.length ?? 0) > 0
+    if (!caps.docParser && !taskModel) return false
     // The document is STICKY (lib/docrun.ts): the most recent doc-bearing
     // turn stands; a text-only follow-up re-runs it with the new instruction
     // ("now as markdown") - the decoders cannot chat, the conversation can.
@@ -1775,16 +1784,24 @@ export function useChatStream() {
     if (!user) return false
     const ctx = all.find((c) => c.source === user) ?? rasterContext(conv)
     if (!ctx) return false
-    if (conv.activeDocId !== ctx.source.id) {
-      conv.activeDocId = ctx.source.id
-      chat.persist(conv)
-    }
     const { images, pdf } = ctx
     const instruction = user.content
       .filter((p): p is Extract<ContentPart, { type: 'text' }> => p.type === 'text')
       .map((p) => p.text)
       .join('\n')
       .trim()
+    // The task-model gate (see above): a task tag, and more than one page to
+    // send - a PDF (any page count; one page through here is one request) or
+    // several images. Anything else is a conversation and takes the single
+    // request the ordinary path builds.
+    if (taskModel) {
+      const multiPage = pdf != null || images.length > 1
+      if (!isTaskTurn(instruction, caps.taskTags) || !multiPage) return false
+    }
+    if (conv.activeDocId !== ctx.source.id) {
+      conv.activeDocId = ctx.source.id
+      chat.persist(conv)
+    }
 
     // `at` carries the branch point on a REGENERATE: the answer being
     // re-rolled is still in the tree now (it used to be spliced away), so

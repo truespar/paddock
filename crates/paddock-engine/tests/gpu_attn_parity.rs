@@ -1152,8 +1152,30 @@ fn qkv_rope_append_batch_paged_bytes_match_dense() {
 /// the last three hit the GQA-FUSED partial (group ∈ [2,8], n_kv_heads ≥ 4 - the
 /// P3b-2 paged GQA kernel, both tile classes 32/16). Covers head_dim 64/128/256,
 /// split counts that divide/don't/over-split, and a sliding window.
+///
+/// One paged-ONLY arm is pinned off for the comparison: the v9q fp8 decode
+/// (fp8 KV, hd128, G4, batch >= 2 - granite's shape) has no dense twin and is
+/// a different NUMERICS CLASS (P e4m3-rounded before PV, the industry fp8
+/// path), so "paged == dense" cannot hold through it - measured 4.4e-3 on a
+/// GB10 the day the vec8 batch gate moved this shape onto v9q, and traced
+/// to the class, not the die (`paged_fp8_hd128_v9q_matches_p8_class_reference`
+/// is that arm's own gate). Addressing is what this test proves; the class
+/// arm is proven where its class is the reference.
 #[test]
 fn attn_partial_batch_paged_bitwise_matches_dense() {
+    let _arm = V9Q_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    paddock_engine::envset::set_env("PADDOCK_NO_V9Q", "1");
+    attn_partial_batch_paged_bitwise_matches_dense_body();
+    // SAFETY: single-threaded w.r.t. every reader of this env - the mutex
+    // above serialises the two tests that touch it
+    unsafe { std::env::remove_var("PADDOCK_NO_V9Q") };
+}
+
+/// The two tests that pin/unpin PADDOCK_NO_V9Q run under one lock: cargo runs
+/// tests on parallel threads and the pack reads the env at every launch.
+static V9Q_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn attn_partial_batch_paged_bitwise_matches_dense_body() {
     let Some(exec) = common::gpu() else {
         return;
     };
@@ -1258,12 +1280,13 @@ fn attn_partial_batch_paged_bitwise_matches_dense() {
                 );
                 // fp16 is bitwise: pool and dense are the same bytes under the
                 // identity table, so the same kernel reads the same values in
-                // the same order. At e4m3 hd=128 they part by ~4e-8 - a last-ulp
-                // accumulation-ORDER difference, which means the two entries do
-                // not pick the same fp8 arm at that shape (one is taking a
-                // wider-load specialisation the other lacks). Worth knowing and
-                // worth fixing, but it is not corruption, so hold it to the f32
-                // rounding scale rather than pretending bitwise still holds.
+                // the same order. At e4m3 the two entries may still pick
+                // different f32-class arms at a shape (the vec8 register walk
+                // vs the GQA walk parted by ~4e-8 while vec8 took hd128/G4) -
+                // a last-ulp accumulation-ORDER difference, not corruption, so
+                // hold fp8 to the f32 rounding scale rather than pretending
+                // bitwise still holds. The e4m3-P class arm is pinned off
+                // above; anything past 1e-6 here is addressing, and a bug.
                 if dt == KvDtype::Fp16 {
                     assert!(
                         bitwise,
@@ -1278,6 +1301,227 @@ fn attn_partial_batch_paged_bitwise_matches_dense() {
             }
         }
     }
+}
+
+/// The v9q fp8 decode arm (fp8 KV, hd128, G4, batch >= 2 - granite) against
+/// a reference of ITS class: Q*scale cast to e4m3, f32 scores, online softmax
+/// over 32-key supertiles aligned to 16-token blocks from the split's first
+/// block, P = exp(x - m) ROUNDED to e4m3 for the PV product, l accumulated
+/// from the unrounded weights, splits merged like the combine. Measured on
+/// the GB10 that surfaced it: 1.5e-8..6e-8 at every split count and length
+/// (accumulation order), where the exact-f32 reference sits 1.6e-3..5.9e-3
+/// away - that gap IS the class, the same P.to(fp8) the industry fp8 paths
+/// ship, and the number a reviewer should expect from this arm.
+///
+/// Two contracts, both covered: n_splits >= 2 writes partials + ml for the
+/// combine (the engine clamps this arm to 2..4 splits), and n_splits == 1 is
+/// the in-kernel FINALIZE - [b][head][hd] rows straight into the final
+/// buffer, out_ml untouched, no sink (granite has none) and NO combine after
+/// it (granite's `v9q_ns1` branch). Combining a finalized buffer reads
+/// garbage ml and was exactly the harness mistake that first made this arm
+/// look 0.4 wrong.
+#[test]
+fn paged_fp8_hd128_v9q_matches_p8_class_reference() {
+    let _arm = V9Q_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: serialised against the only other writer by the mutex
+    unsafe { std::env::remove_var("PADDOCK_NO_V9Q") };
+    let Some(exec) = common::gpu() else {
+        return;
+    };
+    if !exec.has_attn_partial_batch_paged() {
+        eprintln!("pack has no paged FlashDecoding partial - skipping");
+        return;
+    }
+    // The v9q bodies exist only in sm_90+ passes (PD_ATTN_TMA_OK): below
+    // that the same export runs the f32-class partial, and its distance from
+    // the P8-class reference is the class gap this test documents (4.5e-3 on
+    // an A6000), not a defect. Only a die that runs v9q can be held to 1e-6.
+    if exec.compute_capability().0 < 9 {
+        eprintln!(
+            "v9q needs the sm_90+ fp8 mma bodies; this die runs the f32-class arm - skipping"
+        );
+        return;
+    }
+    let dt = KvDtype::Fp8E4m3;
+    let (n_heads, n_kv_heads, head_dim) = (16usize, 4usize, 128usize);
+    let kv_dim = n_kv_heads * head_dim;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let max_ctx = 256usize;
+    let bps = max_ctx / 16;
+    let batch = 4usize;
+    let qdim = n_heads * head_dim;
+    for positions in [
+        [10u32, 47, 128, 200],
+        [200u32, 200, 200, 200],
+        [15u32, 16, 17, 31],
+    ] {
+        let (mut q, mut kc, mut vc) = (Vec::new(), Vec::new(), Vec::new());
+        for b in 0..batch {
+            q.extend(det(qdim, 1 + b as u64));
+            kc.extend(det(max_ctx * kv_dim, 100 + b as u64));
+            vc.extend(det(max_ctx * kv_dim, 200 + b as u64));
+        }
+        let sinks = det(n_heads, 4);
+        let d_q = exec.to_device(&q).expect("q");
+        let d_k = kv_dev_u8(&exec, &kc, dt);
+        let d_v = kv_dev_u8(&exec, &vc, dt);
+        let d_s = exec.to_device(&sinks).expect("sinks");
+        let d_pos = exec.stream.clone_htod(&positions.to_vec()).expect("pos");
+        let bt_host: Vec<u32> = (0..(batch * bps) as u32).collect();
+        let d_bt = exec.stream.clone_htod(&bt_host).expect("bt");
+        let kr = kv_round(&kc, dt);
+        let vr = kv_round(&vc, dt);
+        let reference = |n_splits: usize, sinks: &[f32]| -> Vec<f32> {
+            let mut r = Vec::with_capacity(batch * qdim);
+            for b in 0..batch {
+                r.extend(cpu_attn_p8(
+                    &q[b * qdim..(b + 1) * qdim],
+                    &kr[b * max_ctx * kv_dim..(b + 1) * max_ctx * kv_dim],
+                    &vr[b * max_ctx * kv_dim..(b + 1) * max_ctx * kv_dim],
+                    sinks,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    positions[b] as usize + 1,
+                    kv_dim,
+                    scale,
+                    n_splits,
+                ));
+            }
+            r
+        };
+        let maxd = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max)
+        };
+        for n_splits in [2usize, 3, 4, 8] {
+            let mut d_o = exec
+                .alloc(n_heads * batch * n_splits * head_dim)
+                .expect("o");
+            let mut d_ml = exec.alloc(n_heads * batch * n_splits * 2).expect("ml");
+            let mut d_out = exec.alloc(batch * qdim).expect("out");
+            exec.attn_partial_batch_paged(
+                &d_q, &d_k, &d_v, &mut d_o, &mut d_ml, &d_pos, None, &d_bt, bps, n_heads,
+                n_kv_heads, head_dim, kv_dim, 0, n_splits, batch, scale, dt,
+            )
+            .expect("paged partial");
+            exec.attn_combine_batch(
+                &d_o, &d_ml, &d_s, &mut d_out, n_heads, head_dim, n_splits, batch,
+            )
+            .expect("combine");
+            let out = exec.to_host(&d_out).expect("out");
+            let d = maxd(&out, &reference(n_splits, &sinks));
+            eprintln!(
+                "v9q fp8 hd128 G4 pos={positions:?} splits={n_splits}: max_abs vs P8-class ref {d:.2e}"
+            );
+            assert!(
+                d < 1e-6,
+                "v9q splits={n_splits}: {d} is past accumulation-order noise"
+            );
+        }
+        // the finalize contract: one split, final rows, no combine, no sink
+        let mut d_out = exec.alloc(batch * qdim).expect("out1");
+        let mut d_ml = exec.alloc(n_heads * batch * 2).expect("ml1");
+        exec.attn_partial_batch_paged(
+            &d_q, &d_k, &d_v, &mut d_out, &mut d_ml, &d_pos, None, &d_bt, bps, n_heads, n_kv_heads,
+            head_dim, kv_dim, 0, 1, batch, scale, dt,
+        )
+        .expect("paged finalize");
+        let out = exec.to_host(&d_out).expect("out1");
+        let no_sink = vec![f32::NEG_INFINITY; n_heads];
+        let d = maxd(&out, &reference(1, &no_sink));
+        eprintln!("v9q fp8 hd128 G4 pos={positions:?} finalize: max_abs vs P8-class ref {d:.2e}");
+        assert!(
+            d < 1e-6,
+            "v9q finalize: {d} is past accumulation-order noise"
+        );
+    }
+}
+
+/// P8-class CPU reference for the v9q arm - see the test above for the recipe.
+#[allow(clippy::too_many_arguments)]
+fn cpu_attn_p8(
+    q: &[f32],
+    kr: &[f32],
+    vr: &[f32],
+    sinks: &[f32],
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    n_pos: usize,
+    kv_dim: usize,
+    scale: f32,
+    n_splits: usize,
+) -> Vec<f32> {
+    let group = n_heads / n_kv_heads;
+    let mut out = vec![0f32; n_heads * head_dim];
+    let chunk = n_pos.div_ceil(n_splits);
+    for h in 0..n_heads {
+        let kvh = h / group;
+        let q8: Vec<f32> = q[h * head_dim..(h + 1) * head_dim]
+            .iter()
+            .map(|&x| e4m3_decode(e4m3_encode(x * scale)))
+            .collect();
+        let score = |p: usize| -> f32 {
+            let base = p * kv_dim + kvh * head_dim;
+            q8.iter()
+                .zip(&kr[base..base + head_dim])
+                .map(|(a, b)| a * b)
+                .sum::<f32>()
+        };
+        let mut parts: Vec<(f32, f32, Vec<f32>)> = Vec::new();
+        for sp in 0..n_splits {
+            let lo = sp * chunk;
+            let hi = (lo + chunk).min(n_pos);
+            if lo >= hi {
+                continue;
+            }
+            let (mut m, mut l, mut o) = (f32::NEG_INFINITY, 0f32, vec![0f32; head_dim]);
+            let mut st = (lo >> 4) * 16; // supertiles start at the split's first block
+            while st < hi {
+                let keys: Vec<usize> = (st.max(lo)..(st + 32).min(hi)).collect();
+                st += 32;
+                if keys.is_empty() {
+                    continue;
+                }
+                let xs: Vec<f32> = keys.iter().map(|&p| score(p)).collect();
+                let mnew = xs.iter().fold(m, |a, &b| a.max(b));
+                let corr = (m - mnew).exp();
+                l *= corr;
+                for v in o.iter_mut() {
+                    *v *= corr;
+                }
+                for (&p, &x) in keys.iter().zip(&xs) {
+                    let w = (x - mnew).exp();
+                    let w8 = e4m3_decode(e4m3_encode(w));
+                    l += w;
+                    let base = p * kv_dim + kvh * head_dim;
+                    for (od, &vd) in o.iter_mut().zip(&vr[base..base + head_dim]) {
+                        *od += w8 * vd;
+                    }
+                }
+                m = mnew;
+            }
+            parts.push((m, l, o));
+        }
+        let mg = parts.iter().map(|p| p.0).fold(f32::NEG_INFINITY, f32::max);
+        let mut l = 0f32;
+        let mut o = vec![0f32; head_dim];
+        for (m, li, oi) in &parts {
+            let c = (m - mg).exp();
+            l += li * c;
+            for (a, b) in o.iter_mut().zip(oi) {
+                *a += b * c;
+            }
+        }
+        l += (sinks[h] - mg).exp();
+        for (i, v) in o.iter().enumerate() {
+            out[h * head_dim + i] = v / l;
+        }
+    }
+    out
 }
 
 /// Paged tiled prefill (P4b, pd_attn_prefill_paged) vs the dense tiled prefill

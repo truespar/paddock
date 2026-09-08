@@ -125,15 +125,40 @@ static __device__ __forceinline__ void pd_dnrs_cb16(const float (&fr)[4],
 // absorbs the 192-CTAs-on-188-SMs tail - the 4 doubled SMs serialize and
 // the wall goes ~2x CTA-time (187 -> 272 us at T=2048). Any deeper ring
 // must stay under ~49.5 KB/block or shrink the grid below the SM count.
+#ifndef PD_DNC_PROBE
+#define PD_DNC_PROBE 0
+#endif
+#ifndef PD_DNRS_QK_TOKENMAJOR
+#define PD_DNRS_QK_TOKENMAJOR 0
+#endif
+// walk mma alias: PD_DNC_PROBE=4 strips the mma (keeps the ldmatrix / shfl
+// operand chain alive through a bit fold) for the GB10 phase split
+#if PD_DNC_PROBE == 4
+#define PD_DNRS_WALK_MMA(acc, a, b) do { (acc)[0] += __uint_as_float((a)[0] & 1u) + __uint_as_float((b)[0] & 1u); } while (0)
+#else
+#define PD_DNRS_WALK_MMA(acc, a, b) pd_dnrs_mma16((acc), (a), (b))
+#endif
 #define PD_DNRS_SLOT_B 10240u
-#define PD_DNRS_SMEM (4u * PD_DNRS_SLOT_B)
+#define PD_DNRS_SMEM (4u * PD_DNRS_SLOT_B)   // the deep-ring shape's dynamic smem (the attribute opt-in)
 
 // ST: the walk touches state only at entry load and final
 // writeback (registers in between), so the narrow-state class rides two
 // helper swaps. f16 state passed the DN PPL gate at +0.09%; bf16 stays
 // falsified and is excluded at every launch gate.
-template <typename ST = float>
-__global__ void __launch_bounds__(128)
+// QKD (2026-09-08, GB10): the walk reads q/k straight from the conv's
+// COMPACT bf16 plane ([tick row][HK][D]) by k-head - on the qkc route the
+// stage1 panes hold exactly those bytes, so the 25 MB expanded copies
+// stage1 emitted and the walk re-read were the same values in a wider
+// coat. qc/kc/n_k_heads carry the plane; qb/kb are unused under QKD.
+// S = ring depth in items, MINB = the launch-bounds block floor: the
+// co-residency shape. Shipped big-die shape <4, 1> (41 KB, ~168 registers,
+// 1-2 CTAs/SM); small dies (< 128 SMs) take <2, 4> - a 20 KB ring under a
+// 128-register cap puts 4 CTAs on each SM, so the 192-CTA grid is ONE wave
+// on 48 SMs instead of two (GB10 2026-09-08: the pair 812 -> 752 us at
+// 1024 rows, byte-identical; the shallower ring is hidden by the three
+// co-resident CTAs where the deep ring hid it within one).
+template <typename ST = float, bool QKD = false, uint32_t S = 4u, int MINB = 1>
+__global__ void __launch_bounds__(128, MINB)
 pd_dnc_walk_rs_kernel(const __nv_bfloat16* __restrict__ qb,
                       const __nv_bfloat16* __restrict__ kb, ST* __restrict__ state,
                       const __nv_bfloat16* __restrict__ dwb,
@@ -141,9 +166,18 @@ pd_dnc_walk_rs_kernel(const __nv_bfloat16* __restrict__ qb,
                       const float* __restrict__ gsh,
                       const __nv_bfloat16* __restrict__ cb, float* __restrict__ out,
                       uint32_t n_tokens, uint32_t n_heads,
-                      const uint32_t* __restrict__ vl_items = nullptr) {
+                      const uint32_t* __restrict__ vl_items = nullptr,
+                      const __nv_bfloat16* __restrict__ qc = nullptr,
+                      const __nv_bfloat16* __restrict__ kc = nullptr,
+                      uint32_t n_k_heads = 0u) {
     constexpr uint32_t D = PD_DNC_D, C = PD_DNC_C, G = PD_DNC_G;
-    const uint32_t h = blockIdx.x, col0 = blockIdx.y * G;
+    // grid (D/G, H): the column group is blockIdx.x so a head's four CTAs
+    // are adjacent in launch order. On GB10 (2 CTAs/SM, 192 CTAs = two
+    // waves, 24 MB L2) the head-fastest order had each head's groups in
+    // different waves, and the walk re-read the shared dw/q/k/coef items
+    // from DRAM once per group: ~190 MB per layer at 273 GB/s is the 735
+    // us it measured (the chain alone: 166; the unique bytes: ~57 MB).
+    const uint32_t h = blockIdx.y, col0 = blockIdx.x * G;
     // varlen span items (GDN formulation band):
     // blockIdx.z picks the span; each item is (first launch chunk, span
     // rows, state f32 offset, out row0). Every operand is re-based here so
@@ -157,6 +191,10 @@ pd_dnc_walk_rs_kernel(const __nv_bfloat16* __restrict__ qb,
         n_tokens = it[1];
         state += (size_t)it[2];
         out += (size_t)it[3] * n_heads * D;
+        if (QKD) {   // the span's rows in the tick's compact plane
+            qc += (size_t)it[3] * n_k_heads * D;
+            kc += (size_t)it[3] * n_k_heads * D;
+        }
         qb += (size_t)cb0 * C * n_heads * D;
         kb += (size_t)cb0 * C * n_heads * D;
         dwb += (size_t)cb0 * n_heads * C * D;
@@ -168,6 +206,7 @@ pd_dnc_walk_rs_kernel(const __nv_bfloat16* __restrict__ qb,
     const uint32_t g8 = lane >> 2, t4 = lane & 3u;
     const uint32_t nc = (n_tokens + C - 1u) / C;
     const uint32_t cw = warp * 8u;  // warp's V-col slice within the CTA's G
+    const uint32_t hk = QKD ? (h % n_k_heads) : 0u;   // the k-head this v-head shares
 
     extern __shared__ char shm_rs[];
     __shared__ float sh_w[C], sh_gam[C];
@@ -178,12 +217,16 @@ pd_dnc_walk_rs_kernel(const __nv_bfloat16* __restrict__ qb,
     // Empty commits past nc keep the wait counts aligned.
     auto issue_item = [&](uint32_t it) {
         const uint32_t ch = it / 8u;
+#if PD_DNC_PROBE == 3
+        if (false) {   // probe: no ring loads, the chain runs on stale panes
+#else
         if (ch < nc) {
+#endif
             const uint32_t ty = it % 8u;
             const uint32_t c0i = ch * C;
             const uint32_t cli = min(C, n_tokens - c0i);
             const size_t tbi = (size_t)ch * n_heads + h;
-            char* pane = shm_rs + (size_t)(it & 3u) * PD_DNRS_SLOT_B;
+            char* pane = shm_rs + (size_t)(it % S) * PD_DNRS_SLOT_B;
             if (ty < 4u) {
                 const uint32_t k0s = ty * 32u;
                 __nv_bfloat16* wp = (__nv_bfloat16*)pane;
@@ -194,12 +237,23 @@ pd_dnc_walk_rs_kernel(const __nv_bfloat16* __restrict__ qb,
                                  r < cli ? 16u : 0u);
                 }
                 __nv_bfloat16* qp = (__nv_bfloat16*)(pane + C * PD_DNRS_SW * 2u);
+#if PD_DNC_PROBE != 5
                 for (uint32_t u = tid; u < C * 4u; u += 128u) {
                     const uint32_t i = u / 4u, ce = (u % 4u) * 8u;
+#if PD_DNRS_QK_TOKENMAJOR
                     pd_dnc_cpa16(qp + i * PD_DNRS_SW + ce,
                                  qb + ((size_t)(c0i + i) * n_heads + h) * D + k0s + ce,
                                  i < cli ? 16u : 0u);
+#else
+                    pd_dnc_cpa16(qp + i * PD_DNRS_SW + ce,
+                                 QKD ? qc + ((size_t)(c0i + i) * n_k_heads + hk) * D + k0s + ce
+                                     : qb + (tbi * C + i) * D + k0s + ce,
+                                 i < cli ? 16u : 0u);
+#endif
                 }
+#else
+                (void)qp;
+#endif
             } else if (ty == 4u) {
                 __nv_bfloat16* up = (__nv_bfloat16*)pane;
                 for (uint32_t u = tid; u < C * (G / 8u); u += 128u) {
@@ -219,18 +273,31 @@ pd_dnc_walk_rs_kernel(const __nv_bfloat16* __restrict__ qb,
             } else {
                 const uint32_t a0 = (ty - 6u) * 64u;
                 __nv_bfloat16* kp = (__nv_bfloat16*)pane;
+#if PD_DNC_PROBE != 5
                 for (uint32_t u = tid; u < C * 8u; u += 128u) {
                     const uint32_t j = u / 8u, c8 = (u % 8u) * 8u;
+#if PD_DNRS_QK_TOKENMAJOR
                     pd_dnc_cpa16(kp + j * PD_DNRS_SK + c8,
                                  kb + ((size_t)(c0i + j) * n_heads + h) * D + a0 + c8,
                                  j < cli ? 16u : 0u);
+#else
+                    pd_dnc_cpa16(kp + j * PD_DNRS_SK + c8,
+                                 QKD ? kc + ((size_t)(c0i + j) * n_k_heads + hk) * D + a0 + c8
+                                     : kb + (tbi * C + j) * D + a0 + c8,
+                                 j < cli ? 16u : 0u);
+#endif
                 }
+#else
+                (void)a0; (void)kp;
+#endif
             }
         }
         asm volatile("cp.async.commit_group;" ::: "memory");
     };
     auto ring_wait = [&] {
-        asm volatile("cp.async.wait_group 3;" ::: "memory");
+        if constexpr (S == 4u) asm volatile("cp.async.wait_group 3;" ::: "memory");
+        else if constexpr (S == 3u) asm volatile("cp.async.wait_group 2;" ::: "memory");
+        else asm volatile("cp.async.wait_group 1;" ::: "memory");
         __syncthreads();
     };
 
@@ -247,7 +314,7 @@ pd_dnc_walk_rs_kernel(const __nv_bfloat16* __restrict__ qb,
             st[ma][e] = pd_dns_ld(s_head + (size_t)c * D + a);
         }
 
-    issue_item(0); issue_item(1); issue_item(2); issue_item(3);
+    for (uint32_t i = 0; i < S; ++i) issue_item(i);
     __syncthreads();
 
     for (uint32_t ch = 0; ch < nc; ++ch) {
@@ -277,7 +344,7 @@ pd_dnc_walk_rs_kernel(const __nv_bfloat16* __restrict__ qb,
 #pragma unroll
         for (uint32_t slab = 0; slab < 4u; ++slab) {
             ring_wait();
-            const char* pane = shm_rs + (size_t)((it0 + slab) & 3u) * PD_DNRS_SLOT_B;
+            const char* pane = shm_rs + (size_t)((it0 + slab) % S) * PD_DNRS_SLOT_B;
             const __nv_bfloat16* wp = (const __nv_bfloat16*)pane;
             const __nv_bfloat16* qp = (const __nv_bfloat16*)(pane + C * PD_DNRS_SW * 2u);
 #pragma unroll
@@ -288,13 +355,13 @@ pd_dnc_walk_rs_kernel(const __nv_bfloat16* __restrict__ qb,
                 for (uint32_t mi = 0; mi < 4u; ++mi) {
                     uint32_t aw[4], aq[4];
                     pd_dnrs_lda(wp, PD_DNRS_SW, mi * 16u, kk, aw);
-                    pd_dnrs_mma16(dl[mi], aw, br);
+                    PD_DNRS_WALK_MMA(dl[mi], aw, br);
                     pd_dnrs_lda(qp, PD_DNRS_SW, mi * 16u, kk, aq);
-                    pd_dnrs_mma16(o[mi], aq, br);
+                    PD_DNRS_WALK_MMA(o[mi], aq, br);
                 }
             }
             __syncthreads();
-            issue_item(it0 + slab + 4u);
+            issue_item(it0 + slab + S);
         }
 
         // ---- delta = du - dl (explicit zero past cl) + the gam pre-scale
@@ -302,7 +369,7 @@ pd_dnc_walk_rs_kernel(const __nv_bfloat16* __restrict__ qb,
         {
             ring_wait();  // du item it0+4
             const __nv_bfloat16* dup =
-                (const __nv_bfloat16*)(shm_rs + (size_t)((it0 + 4u) & 3u) * PD_DNRS_SLOT_B);
+                (const __nv_bfloat16*)(shm_rs + (size_t)((it0 + 4u) % S) * PD_DNRS_SLOT_B);
 #pragma unroll
             for (uint32_t mi = 0; mi < 4u; ++mi)
 #pragma unroll
@@ -316,14 +383,14 @@ pd_dnc_walk_rs_kernel(const __nv_bfloat16* __restrict__ qb,
                     o[mi][e] *= sh_gam[min(i, cl - 1u)];
                 }
             __syncthreads();
-            issue_item(it0 + 8u);
+            issue_item(it0 + 4u + S);
         }
 
         // ---- pass 2: o += coef @ deltaT, then the guarded writeback.
         {
             ring_wait();  // coef item it0+5
             const __nv_bfloat16* cf =
-                (const __nv_bfloat16*)(shm_rs + (size_t)((it0 + 5u) & 3u) * PD_DNRS_SLOT_B);
+                (const __nv_bfloat16*)(shm_rs + (size_t)((it0 + 5u) % S) * PD_DNRS_SLOT_B);
 #pragma unroll
             for (uint32_t j0 = 0; j0 < C; j0 += 16u) {
                 uint32_t br[2];
@@ -332,7 +399,7 @@ pd_dnc_walk_rs_kernel(const __nv_bfloat16* __restrict__ qb,
                 for (uint32_t mi = 0; mi < 4u; ++mi) {
                     uint32_t ac[4];
                     pd_dnrs_lda(cf, PD_DNRS_SK, mi * 16u, j0, ac);
-                    pd_dnrs_mma16(o[mi], ac, br);
+                    PD_DNRS_WALK_MMA(o[mi], ac, br);
                 }
             }
 #pragma unroll
@@ -345,7 +412,7 @@ pd_dnc_walk_rs_kernel(const __nv_bfloat16* __restrict__ qb,
                         out[((size_t)(c0 + i) * n_heads + h) * D + c] = o[mi][e];
                 }
             __syncthreads();
-            issue_item(it0 + 9u);
+            issue_item(it0 + 5u + S);
         }
 
         // ---- hop: S^T = gall*S^T + kT @ (w o deltaT), one 64-a-col half
@@ -360,7 +427,7 @@ pd_dnc_walk_rs_kernel(const __nv_bfloat16* __restrict__ qb,
             ring_wait();  // k half item it0+6+half
             const __nv_bfloat16* kp =
                 (const __nv_bfloat16*)(shm_rs +
-                                       (size_t)((it0 + 6u + half) & 3u) * PD_DNRS_SLOT_B);
+                                       (size_t)((it0 + 6u + half) % S) * PD_DNRS_SLOT_B);
 #pragma unroll
             for (uint32_t j0 = 0; j0 < C; j0 += 16u) {
                 uint32_t br[2];
@@ -369,11 +436,11 @@ pd_dnc_walk_rs_kernel(const __nv_bfloat16* __restrict__ qb,
                 for (uint32_t mt = 0; mt < 4u; ++mt) {
                     uint32_t ak[4];
                     pd_dnrs_ldat(kp, PD_DNRS_SK, j0, mt * 16u, ak);
-                    pd_dnrs_mma16(st[half * 4u + mt], ak, br);
+                    PD_DNRS_WALK_MMA(st[half * 4u + mt], ak, br);
                 }
             }
             __syncthreads();
-            issue_item(it0 + 10u + half);
+            issue_item(it0 + 6u + half + S);
         }
     }
 
@@ -389,6 +456,31 @@ pd_dnc_walk_rs_kernel(const __nv_bfloat16* __restrict__ qb,
 }
 
 // ==================== stage1 RS (bf16-operand rebuild) =====================
+
+// One launch helper for the three launch sites: the small-die shape is a
+// per-die election, PADDOCK_NO_DNRS_ONEWAVE=1 pins the big-die shape.
+static inline bool pd_dnrs_small_die() {
+    static int nsm = 0;
+    if (nsm == 0) { int d = 0; cudaGetDevice(&d); cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, d); if (nsm <= 0) nsm = 148; }
+    static const bool off = pd_env("PADDOCK_NO_DNRS_ONEWAVE") != nullptr;
+    return nsm < 128 && !off;
+}
+template <typename ST, bool QKD>
+static inline void pd_dnrs_walk_go(dim3 gw, cudaStream_t s, const __nv_bfloat16* qb,
+                                   const __nv_bfloat16* kb, ST* state,
+                                   const __nv_bfloat16* dw, const __nv_bfloat16* du,
+                                   const float* gsh, const __nv_bfloat16* cb, float* out,
+                                   uint32_t n_tokens, uint32_t n_heads,
+                                   const uint32_t* items, const __nv_bfloat16* qc,
+                                   const __nv_bfloat16* kc, uint32_t n_k_heads) {
+    if (pd_dnrs_small_die())
+        pd_dnc_walk_rs_kernel<ST, QKD, 2u, 4><<<gw, 128, 2u * PD_DNRS_SLOT_B, s>>>(
+            qb, kb, state, dw, du, gsh, cb, out, n_tokens, n_heads, items, qc, kc, n_k_heads);
+    else
+        pd_dnc_walk_rs_kernel<ST, QKD, 4u, 1><<<gw, 128, 4u * PD_DNRS_SLOT_B, s>>>(
+            qb, kb, state, dw, du, gsh, cb, out, n_tokens, n_heads, items, qc, kc, n_k_heads);
+}
+
 // pd_dnc_stage1_rs_kernel (dnc chunk rung): the walk's own
 // operand-class transformation applied to its un-rebuilt sibling. Profiling
 // stage1_v2 at PREC=1 (B200): issue-starved (0.47 inst/cycle,
@@ -645,10 +737,25 @@ pd_dnc_stage1_rs_kernel(const float* __restrict__ q, const float* __restrict__ k
     // qb16/kb16: pure pane copies (the same f32->bf16 rounds the panes
     // already hold). Runs pre-barrier: reads race nothing (panes stable,
     // sh_mt writes disjoint), and the q pane dies right after.
-    for (uint32_t u = tid; u < C * (D / 8u); u += 256u) {
+    // qb16 == nullptr: the walk reads the compact plane itself (QKD, the
+    // qkc varlen route on small dies) and the 25 MB emission is skipped.
+    for (uint32_t u = tid; u < C * (D / 8u) && qb16 != nullptr; u += 256u) {
         const uint32_t r = u >> 4, c8 = (u & 15u) * 8u;
         if (r < cl) {
+            // CHUNK-HEAD-MAJOR (2026-09-08, GB10): the copies used to sit
+            // token-major ([launch row][H][D]), so the walk's per-chunk q
+            // slabs and k halves were 64-byte gathers at a 12 KB stride -
+            // fine on a 128 MB L2 that held the whole working set, but on a
+            // 24 MB L2 the walk read them from DRAM at ~100 GB/s and its
+            // 735 us was 570 us of ring loads (the chain alone runs in 166).
+            // Same bytes, [chunk*H + h][C][D] like dw/du: every walk item is
+            // one contiguous 16 KB block. PD_DNRS_QK_TOKENMAJOR=1 keeps the
+            // old layout for A/B (bench only).
+#if PD_DNRS_QK_TOKENMAJOR
             const size_t dst = ((size_t)(ch * C + r) * n_heads + h) * D + c8;
+#else
+            const size_t dst = ((size_t)(ch * n_heads + h) * C + r) * D + c8;
+#endif
             *(uint4*)(kb16 + dst) = *(const uint4*)(sh_kb + r * SKB + c8);
             *(uint4*)(qb16 + dst) = *(const uint4*)(sh_qb + r * SKB + c8);
         }

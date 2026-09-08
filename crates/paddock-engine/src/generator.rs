@@ -1392,7 +1392,8 @@ impl Generator for crate::gpu_model::qwen35::GpuQwen35 {
         crate::gpu_model::qwen35::GpuQwen35::forward_prefill_batch(self, items).map_err(to_gen_err)
     }
     fn forward_prefill_stream(&mut self, tokens: &[u32]) -> Result<Vec<f32>, GenError> {
-        crate::gpu_model::qwen35::GpuQwen35::prefill(self, tokens).map_err(to_gen_err)
+        // batched: slot 0 through the served lane; serial: the token spine
+        crate::gpu_model::qwen35::GpuQwen35::prefill_stream(self, tokens).map_err(to_gen_err)
     }
     fn forward_multimodal(
         &mut self,

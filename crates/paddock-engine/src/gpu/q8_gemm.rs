@@ -739,6 +739,106 @@ impl GpuExecutor {
         })
     }
 
+    pub fn has_add_rmsnorm_quant_e4m3_pf(&self) -> bool {
+        self.kernels.add_rmsnorm_quant_e4m3_pf.is_some()
+    }
+    pub fn has_add_rmsnorm_quant_nvf4_pf(&self) -> bool {
+        self.kernels.add_rmsnorm_quant_nvf4_pf.is_some()
+    }
+
+    /// The prefill prenorm with the e4m3 (per-32) quant epilogue: the same
+    /// norm as `add_rmsnorm_quant_mmq`, the same staging as `quantize_e4m3`,
+    /// one pass. `xn` optional. Bit-identical to the three-kernel chain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_rmsnorm_quant_e4m3_pf(
+        &self,
+        x: &mut CudaSlice<f32>,
+        proj: Option<&CudaSlice<f32>>,
+        proj_b16: bool,
+        w: &CudaSlice<f32>,
+        xn: Option<&mut CudaSlice<f32>>,
+        q: &mut CudaSlice<i8>,
+        scale: &mut CudaSlice<u8>,
+        n: usize,
+        batch: usize,
+        eps: f32,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .add_rmsnorm_quant_e4m3_pf
+            .ok_or(GpuError::MissingOp("add_rmsnorm_quant_e4m3_pf"))?;
+        self.add_rmsnorm_quant_pf_call(f, x, proj, proj_b16, w, xn, q, scale, n, batch, eps)
+    }
+
+    /// The prefill prenorm with the nvf4 (e2m1 + per-16 e4m3 scale) quant
+    /// epilogue - `quantize_nvf4`'s staging for the fp4 GEMMs. `xn` optional.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_rmsnorm_quant_nvf4_pf(
+        &self,
+        x: &mut CudaSlice<f32>,
+        proj: Option<&CudaSlice<f32>>,
+        proj_b16: bool,
+        w: &CudaSlice<f32>,
+        xn: Option<&mut CudaSlice<f32>>,
+        q: &mut CudaSlice<i8>,
+        scale: &mut CudaSlice<u8>,
+        n: usize,
+        batch: usize,
+        eps: f32,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .add_rmsnorm_quant_nvf4_pf
+            .ok_or(GpuError::MissingOp("add_rmsnorm_quant_nvf4_pf"))?;
+        self.add_rmsnorm_quant_pf_call(f, x, proj, proj_b16, w, xn, q, scale, n, batch, eps)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_rmsnorm_quant_pf_call(
+        &self,
+        f: paddock_kernels::abi::AddRmsnormQuantPfFn,
+        x: &mut CudaSlice<f32>,
+        proj: Option<&CudaSlice<f32>>,
+        proj_b16: bool,
+        w: &CudaSlice<f32>,
+        xn: Option<&mut CudaSlice<f32>>,
+        q: &mut CudaSlice<i8>,
+        scale: &mut CudaSlice<u8>,
+        n: usize,
+        batch: usize,
+        eps: f32,
+    ) -> Result<(), GpuError> {
+        let (xp, _g1) = x.device_ptr_mut(&self.stream);
+        let proj_guard = proj.map(|p| p.device_ptr(&self.stream));
+        let pp = match &proj_guard {
+            Some((p, _)) => *p as *const core::ffi::c_void,
+            None => std::ptr::null(),
+        };
+        let (wp, _g2) = w.device_ptr(&self.stream);
+        let xn_guard = xn.map(|p| p.device_ptr_mut(&self.stream));
+        let xnp = match &xn_guard {
+            Some((p, _)) => *p as *mut core::ffi::c_void,
+            None => std::ptr::null_mut(),
+        };
+        let (qp, _g3) = q.device_ptr_mut(&self.stream);
+        let (sp, _g4) = scale.device_ptr_mut(&self.stream);
+        check(unsafe {
+            f(
+                xp as *mut _,
+                pp,
+                wp as *const _,
+                xnp,
+                qp as *mut _,
+                sp as *mut _,
+                n as u32,
+                batch as u32,
+                eps,
+                proj_b16 as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// SwiGLU fused into the mmq quantize: `yq = quantize(silu(gate) * up)`
     /// without materializing the f32 activation. Bit-identical values to
     /// `swiglu` + `quantize_q8_mmq` run separately.
@@ -859,6 +959,117 @@ impl GpuExecutor {
                 yqp as *const _,
                 fxp,
                 yp as *mut _,
+                in_dim as u32,
+                out_dim as u32,
+                batch as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// True when the pack carries the K-split Q8_0 GEMV (slot 588).
+    pub fn has_q8_0_gemv_sk(&self) -> bool {
+        self.kernels.q8_0_gemv_sk.is_some()
+    }
+
+    /// K-split Q8_0 GEMV/GEMM (slot 588) for planes whose row count cannot
+    /// fill the die. `partials` needs `batch * out_dim * split` floats and
+    /// `counters` `batch * out_dim` u32s, zeroed at allocation (the kernel
+    /// returns them to zero, so one zeroing lasts the process).
+    #[allow(clippy::too_many_arguments)]
+    pub fn q8_0_gemv_sk(
+        &self,
+        w: &RepackedQ8,
+        bias: Option<&CudaSlice<f32>>,
+        x: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        partials: &mut CudaSlice<f32>,
+        counters: &mut CudaSlice<u32>,
+        batch: usize,
+        split: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .q8_0_gemv_sk
+            .ok_or(GpuError::MissingOp("q8_0_gemv_sk"))?;
+        let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
+        debug_assert!(partials.len() >= batch * out_dim * split);
+        debug_assert!(counters.len() >= batch * out_dim);
+        let (dp, _g1) = w.data.device_ptr(&self.stream);
+        let (scp, _g2) = w.scale.device_ptr(&self.stream);
+        let bp = match bias {
+            Some(b) => b.device_ptr(&self.stream).0 as *const core::ffi::c_void,
+            None => core::ptr::null(),
+        };
+        let (xp, _g3) = x.device_ptr(&self.stream);
+        let (yp, _g4) = y.device_ptr_mut(&self.stream);
+        let (pp, _g5) = partials.device_ptr_mut(&self.stream);
+        let (cp, _g6) = counters.device_ptr_mut(&self.stream);
+        // SAFETY: pack ABI v1 contract (slot 588); pointers + stream live across the call
+        check(unsafe {
+            f(
+                dp as *const _,
+                scp as *const _,
+                bp,
+                xp as *const _,
+                yp as *mut _,
+                pp as *mut _,
+                cp as *mut _,
+                in_dim as u32,
+                out_dim as u32,
+                batch as u32,
+                split as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// True when the pack carries the 128x128 mmq tile GEMM (slot 245).
+    pub fn has_q8_0_gemm_mmq(&self) -> bool {
+        self.kernels.q8_0_gemm_mmq.is_some()
+    }
+
+    /// [`Self::q8_0_gemm_mmq`] writing rows `[y_row0, y_row0 + batch)` of `y`
+    /// from a chunk-local `yq` - the launcher takes no row offset, so the
+    /// output pointer carries it. Lets a wide prefill run the tile in
+    /// fixed-size chunks off one staging buffer instead of sizing the buffer
+    /// for the widest walk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn q8_0_gemm_mmq_rows(
+        &self,
+        w: &RepackedQ8,
+        yq: &CudaSlice<u8>,
+        fixup: Option<&mut CudaSlice<f32>>,
+        y: &mut CudaSlice<f32>,
+        y_row0: usize,
+        batch: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .q8_0_gemm_mmq
+            .ok_or(GpuError::MissingOp("q8_0_gemm_mmq"))?;
+        let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
+        debug_assert!(y.len() >= (y_row0 + batch) * out_dim);
+        let (dp, _g1) = w.data.device_ptr(&self.stream);
+        let (scp, _g2) = w.scale.device_ptr(&self.stream);
+        let (yqp, _g3) = yq.device_ptr(&self.stream);
+        let fxp = match fixup {
+            Some(fx) => {
+                let (p, _g) = fx.device_ptr_mut(&self.stream);
+                p as *mut core::ffi::c_void
+            }
+            None => std::ptr::null_mut(),
+        };
+        let (yp, _g4) = y.device_ptr_mut(&self.stream);
+        // SAFETY: pack ABI contract; the row offset stays inside `y` (asserted
+        // above), pointers + stream live across the call
+        check(unsafe {
+            f(
+                dp as *const _,
+                scp as *const _,
+                yqp as *const _,
+                fxp,
+                (yp + (y_row0 * out_dim * 4) as u64) as *mut _,
                 in_dim as u32,
                 out_dim as u32,
                 batch as u32,

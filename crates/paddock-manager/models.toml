@@ -888,10 +888,16 @@ revision = "2026-08-15"
   # model, not a second model (the muse DFlash1/2 rule).
   # Upstream: incoai/Qwen3.8-27B-DFlash2-GGUF (z-lab mirrors it), file
   # Qwen3.8-27B-DFlash2-Q4_K_M.gguf. Verified identical to what we mirror,
-  # not assumed: HF's x-linked-etag (the LFS sha256) is
+  # not assumed: HF's x-linked-etag (the LFS sha256) WAS
   # 18a380efc9b7ed8d88677fc895f5c11ae170653434ee378f7348f715c14d0594 and its
   # x-linked-size 1143006752 - both match the bytes below exactly. The name
   # differs because this tree's drafters are named by role (muse precedent).
+  # Upstream moved on 2026-08-29 ("Add dflash.rope.dimension_sections to
+  # GGUFs (mrope fix)": +64 bytes, sha256 1a25c568...131ebd, both HF repos).
+  # The mirror keeps the 2026-08-18 bytes on purpose: paddock's drafter
+  # loader (qwen35/dflash.rs) reads no such key, so the two files draft
+  # identically here; re-verified on the DGX Spark 2026-09-07. Re-pin when
+  # the loader learns the key, not before.
   [[model.artifact]]
   id = "drafter2"
   kind = "drafter"
@@ -999,6 +1005,93 @@ revision = "2026-08-15"
     dest = "Qwen3.8-27B-NVFP4/vocab.json"
     sha256 = "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
     size = 6722759
+
+# Qwen3.8-Flash-Next sourcing: the weights are unsloth's UD export of
+# Qwen/Qwen3.8-Flash-Next (quantiser repo huggingface.co/unsloth, recorded in
+# the file's own general.repo_url); the three shard sha256s here are the
+# upstream LFS oids, re-verified against the bytes at upload.
+#
+# UD-IQ3_XXS is not a taste - it is the largest upstream file whose ROUTED
+# expert seats are all i-quant (IQ2_S gate/up, IQ4_NL down, IQ3_S on one
+# layer). The 4-bit UD files upcast some expert planes to Q8_0 and Q5_1, and
+# the engine has no seat for those in the routed path, so it refuses them.
+# NVFP4 is a separate lane and not published here: 84 GB resident before KV
+# does not fit a 96 GB card.
+#
+# The n-gram embedding is 51B of the parameter count and stays HOST-MAPPED -
+# the engine gathers 8 rows a token straight from the file's mmap - so the
+# resident figure below is far under the 76 GB of download, and a cold page
+# cache costs a disk seek per row on the first pass.
+
+[[model]]
+id = "qwen3.8-flash-next"
+vendor = "Alibaba"
+display = "Qwen 3.8 Flash Next"
+family = "qwen3.8"
+capability = ["chat", "tools", "reasoning"]
+license = "qwen-community-1.0"
+revision = "2026-09-08"
+
+  [model.specs]
+  params = "125B · 6B active (+51B n-gram)"
+  context = "256K"
+  homepage = "https://huggingface.co/Qwen/Qwen3.8-Flash-Next"
+  about = "Alibaba's preview of the Qwen4 architecture - a very large sparse model that runs only 6B of itself per token, so it answers at small-model speed."
+  strengths = [
+    "Only 10 of 512 experts run per token - flagship-scale weights at a fast token",
+    "Hybrid Gated DeltaNet + sparse attention · 256K context",
+    "Reasoning depth tunable per request (reasoning_effort)",
+  ]
+  tradeoffs = [
+    "The 51B n-gram embedding is read from the file per token - keep the weights on fast local storage, not a network mount",
+    "This export is text-only: the vendor's vision encoder is not in the GGUF",
+    "No in-file MTP block, so speculative decoding has nothing to draft with here",
+  ]
+
+  # The only quant this lane serves - see the seat note above.
+  [[model.artifact]]
+  id = "iq3"
+  kind = "weights"
+  format = "gguf"
+  label = "Compact"
+  quant = "UD-IQ3_XXS"
+  default = true
+
+  [model.artifact.shape]
+  weight_bytes = 56559859968
+  kind = "generative"
+  vocab = 248320
+  max_ctx = 262144
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = [
+    { k_dim = 512, v_dim = 512, count = 12 },
+  ]
+
+    [model.artifact.shape.recurrent]
+    layers = 36
+    state_elems = 786432
+    conv_elems = 30720
+    conv_dim = 10240
+    elem_bytes = 4
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-GGUF/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf"
+    dest = "Qwen3.8-Flash-Next-GGUF/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf"
+    sha256 = "268f81fdedf3149a538f252308927a4d5d1f6e062c178568a51e3b519744f8a8"
+    size = 10946624
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-GGUF/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00002-of-00003.gguf"
+    dest = "Qwen3.8-Flash-Next-GGUF/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00002-of-00003.gguf"
+    sha256 = "cfe600b236b88c7fad1613a5ca5e83b9f2beb63cbd44c32b2be50a44747c695f"
+    size = 49567921344
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Qwen3.8-Flash-Next-GGUF/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00003-of-00003.gguf"
+    dest = "Qwen3.8-Flash-Next-GGUF/UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00003-of-00003.gguf"
+    sha256 = "f1912ba34c79427d2295a58dcb2b732b5931af5bef7a373c60557a57d9ee7250"
+    size = 32382955968
 
 # Laguna sourcing: official
 # poolside repos only - the Q4_K_M below is poolside's own GGUF, the one

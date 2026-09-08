@@ -6,7 +6,7 @@
     "These are not a third party's binaries - they are our own compilation of",
     "PDFium at the pin in VERSION, built by packs/pdfium/build/. The recipe is the",
     "provenance; this file is only the shortcut that saves every developer a",
-    "15-minute Chromium build. Bumping the pin means: rebuild both platforms,",
+    "15-minute Chromium build. Bumping the pin means: rebuild all three platforms,",
     "re-publish, and replace this file with the manifest that run emits.",
     "",
     "The sha256s are checked on download. They exist to catch a truncated or",
@@ -27,6 +27,13 @@
       "url": "https://models.truespar.io/runtime/pdfium-chromium-8009/linux-x64/libpdfium.a",
       "sha256": "dc5b086f8f37fbec3825b325b85bebc744d7761b1596d1746966eb3cd0ae0f35",
       "size": 22657324
+    },
+    {
+      "platform": "linux-arm64",
+      "name": "libpdfium.a",
+      "url": "https://models.truespar.io/runtime/pdfium-chromium-8009/linux-arm64/libpdfium.a",
+      "sha256": "0f030c52810659c5c204a0c6f6d25e6625fe11d7df210c6b8db1b55828759858",
+      "size": 26795592
     }
   ]
 }

@@ -84,6 +84,42 @@ static inline bool pd_env_on(const char* name) {
     return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
 }
 
+// Host half of PD_BS_OK: does the RUNNING device have the block-scale
+// (sm_120a feature-target) kernel bodies in this pack? The device gate is
+// `__CUDA_ARCH__ >= 1200 && __CUDA_ARCH_FEAT_SM120_ALL`, which only the
+// sm_120a pass satisfies - so the answer is an EXACT cc 12.0 match, never
+// a major-only test. Every host election of a BS-bodied arm (the table
+// resolution in exports.cuh, the lin kt3/ktz family, the nv4 tile arm)
+// reads this one function, so the rule cannot drift per launcher again.
+//
+// Probed 2026-09-07 on a DGX Spark (GB10, cc 12.1, plain sm_121 SASS in
+// the fatbin): the table resolution already matched exactly, but the kt3
+// election in f8_lin.cuh tested `cma == 12` alone, elected kt3, and every
+// tile-linear fp8 prefill GEMM launched a stub body - no fault, no error,
+// untouched output planes, garbage logits from the first token. A minor
+// revision must fall back to the portable arm, not no-op.
+//
+// The widening (same day): build.sh adds the sm_121a feature target beside
+// plain sm_121 and defines PD_BS_SM121, PD_BS_OK accepts
+// __CUDA_ARCH_FEAT_SM121_ALL, and 12.1 answers true here ONLY under that
+// define - a pack built without 121a keeps GB10 on the portable arms. The
+// fatbin picks the most specific image (probed: sm_120a does not load on
+// 12.1 at all; sm_121a does, with its feature macro), so the bodies the
+// host elects are the bodies the device runs.
+static inline bool pd_dev_bs_sass() {
+    static const bool v = [] {
+        int dev = 0, cma = 0, cmi = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&cma, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&cmi, cudaDevAttrComputeCapabilityMinor, dev);
+#ifdef PD_BS_SM121
+        if (cma == 12 && cmi == 1) return true;
+#endif
+        return cma == 12 && cmi == 0;
+    }();
+    return v;
+}
+
 namespace wmma = nvcuda::wmma;
 
 // Configurable KV cache element type for the (unified) batched attention path.
@@ -2849,6 +2885,82 @@ struct KernelTableV1 {
     // the v1 / pipe launchers, which forward) serve the i-quant family +
     // Q2_K / Q3_K / IQ4_NL - the >64-row prefill tile for dense i-quant planes.
     int (*kquant_iq_tile)(void);
+    // 586: expert-GROUPED gate+up over a pd_moe_align_bm(bm = group) layout:
+    // (gate_data, gate_scales, up_data, up_scales, sorted_row, sorted_slot,
+    // block_expert, xq, xs, xsums, out, in_dim, ff, n_active, max_blocks,
+    // group, gdt, udt, stream). One block per (expert group, out row) - the
+    // window unpack happens once for the group instead of once per routed
+    // row. Output layout and numerics are slot 494's exactly.
+    int (*kquant_moe_gate_up_grp)(const void*, const void*, const void*, const void*,
+                                  const void*, const void*, const void*, const void*,
+                                  const void*, const void*, void*, uint32_t, uint32_t,
+                                  uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                                  void*);
+    // 587: COLUMN-TILED routed down: slot 495's arguments plus `cols` (4, 8,
+    // 16) before the dtype. One block owns `cols` output columns and reuses
+    // each activation window across them, which is what gives the prefill's
+    // dependent row loads something to overlap. Numerics are slot 495's.
+    int (*kquant_moe_down_cols)(const void*, const void*, const void*, const void*,
+                                const void*, const void*, const void*, void*, uint32_t,
+                                uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 588: K-SPLIT Q8_0 GEMV/GEMM for narrow-out planes: (data, scale, bias,
+    // x, y, partials, counters, in_dim, out_dim, batch, split). grid is
+    // (out_dim, split, batch) - the row-per-block launch stops filling the die
+    // long before the plane stops being big. Deterministic fold, counters
+    // self-reset for graph replay. `partials` >= batch*out_dim*split floats,
+    // `counters` >= batch*out_dim u32, zeroed once by the caller.
+    int (*q8_0_gemv_sk)(const void*, const void*, const void*, const void*, void*,
+                        void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 589: nvf4_gemm_f4t4 - the f4t TMA ring at four 128-K stages in the same
+    // 72 KB (GB10 2026-09-07); slot 430's contract, NULL wherever 430 is NULL.
+    int (*nvf4_gemm_f4t4)(const void*, const void*, const void*, const void*,
+                          const void*, void*, float, uint32_t, uint32_t,
+                          uint32_t, void*);
+    // 590: expert-GROUPED routed down over one COLUMN CHUNK: (down_data,
+    // down_scales, sorted_row, sorted_slot, block_expert, topk_w, fq, fs,
+    // fsums, part, ff, embd, o0, ocols, n_active, max_blocks, group). Writes
+    // one partial per (pair, column) - slot 591 folds them in slot order.
+    int (*kquant_moe_down_grp)(const void*, const void*, const void*, const void*,
+                               const void*, const void*, const void*, const void*,
+                               const void*, void*, uint32_t, uint32_t, uint32_t,
+                               uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                               void*);
+    // 591: fold slot 590's chunk into out[token, o0 + c] in ASCENDING slot
+    // order: (part, out, embd, o0, ocols, n_active, rows).
+    int (*moe_part_fold_at)(const void*, void*, uint32_t, uint32_t, uint32_t,
+                            uint32_t, uint32_t, void*);
+    // 592: REGISTER-TILED grouped gate+up: (gate_data, gate_scales, up_data,
+    // up_scales, sorted_row, sorted_slot, block_expert, xq, xs, xsums, out,
+    // in_dim, ff, n_active, max_blocks, gdt, udt). BM x BN tile off a
+    // moe_align_bm(16) CSR, both operands staged per BK slice, pair-major
+    // output. in_dim must be a multiple of the kernel's BK (128).
+    int (*kquant_moe_gate_up_tile)(const void*, const void*, const void*, const void*,
+                                   const void*, const void*, const void*, const void*,
+                                   const void*, const void*, void*, uint32_t, uint32_t,
+                                   uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 593: the register-tiled DOWN twin of 592, over one column chunk:
+    // (down_data, down_scales, sorted_row, sorted_slot, block_expert, topk_w,
+    // fq, fs, fsums, part, ff, embd, o0, ocols, n_active, max_blocks). Writes
+    // slot 591's partials; `ff` must be a multiple of the tile's BK (128).
+    int (*kquant_moe_down_tile)(const void*, const void*, const void*, const void*,
+                                const void*, const void*, const void*, const void*,
+                                const void*, void*, uint32_t, uint32_t, uint32_t,
+                                uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 594/595: prefill-class add+rmsnorm+quantize with an e4m3 / nvf4
+    // epilogue (2026-09-08): the mmq prenorm's norm phase verbatim, the
+    // standalone quantizer's staging. (x, proj|NULL, w, xn|NULL, q, scale,
+    // n, batch, eps, proj_b16, stream).
+    int (*add_rmsnorm_quant_e4m3_pf)(void*, const void*, const void*, void*, void*,
+                                     void*, uint32_t, uint32_t, float, uint32_t, void*);
+    int (*add_rmsnorm_quant_nvf4_pf)(void*, const void*, const void*, void*, void*,
+                                     void*, uint32_t, uint32_t, float, uint32_t, void*);
+    // 596: the single-sequence GDN walk, P-SPLIT and PRE-NORMED: slot 533's
+    // arguments plus caller-owned `rn` (n_tokens * n_heads * 2 floats). P
+    // threads share a state column, the norms come from the companion pass,
+    // and the token loop carries no barrier at all.
+    int (*gated_delta_recurrent_pn)(const void*, const void*, const void*, const void*,
+                                    const void*, void*, void*, uint32_t, uint32_t,
+                                    uint32_t, void*, void*);
 };
 
 } // extern "C"

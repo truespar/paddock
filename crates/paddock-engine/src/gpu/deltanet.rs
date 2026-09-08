@@ -378,6 +378,69 @@ impl GpuExecutor {
         })
     }
 
+    /// `causal_conv1d_silu_qkv_vl_qkc` on ONE fresh span at a row offset
+    /// (the unified tick's per-span conv form, GB10 2026-09-08): the kernel
+    /// indexes rows relative to the pointers it gets and reads `row0s[row]`
+    /// for the zero-pad edge, so a fresh span is the same launch at offset
+    /// pointers with an all-zero row0s plane (>= `n_tokens` entries). q/k
+    /// land COMPACT bf16 [rows, HK, s] at `out_row_off` in the compact
+    /// planes; v lands expanded f32 as always.
+    #[allow(clippy::too_many_arguments)]
+    pub fn causal_conv1d_silu_qkv_vl_qkc_at(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &CudaSlice<f32>,
+        row0s_zero: &CudaSlice<u32>,
+        q: &mut CudaSlice<f32>,
+        k: &mut CudaSlice<f32>,
+        v: &mut CudaSlice<f32>,
+        in_row_off: usize,
+        out_row_off: usize,
+        n_tokens: usize,
+        n_k_heads: usize,
+        n_v_heads: usize,
+        s: usize,
+        conv_k: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .causal_conv1d_silu_qkv_vl_qkc
+            .ok_or(GpuError::MissingOp("causal_conv1d_silu_qkv_vl_qkc"))?;
+        if row0s_zero.len() < n_tokens {
+            return Err(GpuError::Unsupported(format!(
+                "conv qkc at: row0s zero plane holds {} rows, {n_tokens} asked",
+                row0s_zero.len()
+            )));
+        }
+        let conv_dim = (2 * n_k_heads + n_v_heads) * s;
+        let (xp, _g1) = x.device_ptr(&self.stream);
+        let (wp, _g2) = w.device_ptr(&self.stream);
+        let (rp, _g3) = row0s_zero.device_ptr(&self.stream);
+        let (qp, _g4) = q.device_ptr_mut(&self.stream);
+        let (kp, _g5) = k.device_ptr_mut(&self.stream);
+        let (vp, _g6) = v.device_ptr_mut(&self.stream);
+        let xp = xp + (in_row_off * conv_dim * std::mem::size_of::<f32>()) as u64;
+        // compact bf16 rows: n_k_heads * s * 2 bytes per row
+        let qk_off = (out_row_off * n_k_heads * s * 2) as u64;
+        let v_off = (out_row_off * n_v_heads * s * std::mem::size_of::<f32>()) as u64;
+        check(unsafe {
+            f(
+                xp as *const _,
+                wp as *const _,
+                rp as *const _,
+                (qp + qk_off) as *mut _,
+                (kp + qk_off) as *mut _,
+                (vp + v_off) as *mut _,
+                n_tokens as u32,
+                n_k_heads as u32,
+                n_v_heads as u32,
+                s as u32,
+                conv_k as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// DeltaNet gate math: `beta = sigmoid(b)`, `g = ssm_a·softplus(a+dt_bias)`.
     /// `a`/`b` are [n_tokens, n_heads]; `ssm_a`/`dt_bias` are [n_heads].
     #[allow(clippy::too_many_arguments)]
@@ -1949,6 +2012,66 @@ impl GpuExecutor {
             )
         })?;
         Ok(true)
+    }
+
+    /// True when the pack carries the pre-normed, P-split single-sequence
+    /// walk (slot 596) - the wave-prefill class of `gated_delta_recurrent_at`.
+    pub fn has_gated_delta_recurrent_pn(&self) -> bool {
+        self.kernels.gated_delta_recurrent_pn.is_some()
+    }
+
+    /// [`Self::gated_delta_recurrent_at`] on slot 596: `rn` is caller-owned
+    /// scratch of `n_tokens * n_heads * 2` floats (the plane the runs_pn
+    /// entry already sizes). Its norms are the tree's bits; the two dots
+    /// re-associate across the split lanes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_recurrent_pn_at(
+        &self,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &CudaSlice<f32>,
+        g: &CudaSlice<f32>,
+        beta: &CudaSlice<f32>,
+        state: &mut CudaSlice<f32>,
+        state_elem_off: usize,
+        out: &mut CudaSlice<f32>,
+        rn: &mut CudaSlice<f32>,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .gated_delta_recurrent_pn
+            .ok_or(GpuError::MissingOp("gated_delta_recurrent_pn"))?;
+        debug_assert!(state_elem_off + n_heads * head_dim * head_dim <= state.len());
+        debug_assert!(rn.len() >= n_tokens * n_heads * 2);
+        let (qp, _g1) = q.device_ptr(&self.stream);
+        let (kp, _g2) = k.device_ptr(&self.stream);
+        let (vp, _g3) = v.device_ptr(&self.stream);
+        let (gp, _g4) = g.device_ptr(&self.stream);
+        let (bp, _g5) = beta.device_ptr(&self.stream);
+        let (sp, _g6) = state.device_ptr_mut(&self.stream);
+        let (op, _g7) = out.device_ptr_mut(&self.stream);
+        let (rp, _g8) = rn.device_ptr_mut(&self.stream);
+        let sp_off = sp + state_elem_off as u64 * Self::dn_state_esz();
+        // SAFETY: pack ABI v1 contract (slot 596); pointers + stream live across the call
+        check(unsafe {
+            f(
+                qp as *const _,
+                kp as *const _,
+                vp as *const _,
+                gp as *const _,
+                bp as *const _,
+                sp_off as *mut _,
+                op as *mut _,
+                n_tokens as u32,
+                n_heads as u32,
+                head_dim as u32,
+                rp as *mut _,
+                self.stream_ptr(),
+            )
+        })
     }
 
     pub fn gated_delta_recurrent_at(

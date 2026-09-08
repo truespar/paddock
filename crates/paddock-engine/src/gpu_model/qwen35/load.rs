@@ -975,15 +975,80 @@ impl GpuQwen35 {
                     exec.nvf4_upload(v.packed, v.scales, v.scale2, v.n, v.k)
                         .ok()
                 };
-                let gate = plane(&format!("blk.{i}.ffn_gate.weight"))?;
-                let up = plane(&format!("blk.{i}.ffn_up.weight"))?;
+                // The fused gate|up plane (Nvf4Gu::Fused): rows interleaved on
+                // the host before upload, so the wide band's swiglu + e2m1
+                // quant run in the GEMM epilogue (slot 533) and the decode
+                // widths read one plane. Requires the W4A4 wide arm (the
+                // dies whose f4 family is live), the epilogue and the `_il`
+                // consumers, and ONE global scale for gate and up (the
+                // epilogue applies one scale2; this checkpoint has 56/56
+                // equal - a checkpoint that differs keeps the split planes,
+                // exactly as before). PADDOCK_NO_NVF4_GU_FUSE=1 keeps them too.
+                let fuse_ok = super::nvf4_wide_w4a4(&exec)
+                    && exec.has_nvf4_gemm_f4t_swq()
+                    && exec.has_swiglu_fused_nvf4_il()
+                    && exec.has_swiglu_fused_il()
+                    && paddock_models::dev_var_os!("PADDOCK_NO_NVF4_GU_FUSE").is_none();
+                let fused = if fuse_ok {
+                    (|| -> Option<crate::gpu::Nvf4Plane> {
+                        let view = |gguf: &str| {
+                            let hf = paddock_models::safetensors::qwen35_hf_name(gguf)?;
+                            let prefix = hf.strip_suffix(".weight")?.to_string();
+                            paddock_models::modelopt::nvfp4_view(st, &prefix).ok()
+                        };
+                        let g = view(&format!("blk.{i}.ffn_gate.weight"))?;
+                        let u = view(&format!("blk.{i}.ffn_up.weight"))?;
+                        if g.n != u.n
+                            || g.k != u.k
+                            || g.scale2 != u.scale2
+                            || !(2 * g.n).is_multiple_of(256)
+                        {
+                            if i == 0 {
+                                tracing::info!(
+                                    gate_scale2 = g.scale2,
+                                    up_scale2 = u.scale2,
+                                    "qwen35 nvf4 FFN: gate|up not fused (shape or global scale differ) - split planes"
+                                );
+                            }
+                            return None;
+                        }
+                        let (rb, sb) = (g.k / 2, g.k / 16);
+                        let mut packed = vec![0u8; 2 * g.n * rb];
+                        let mut scales = vec![0u8; 2 * g.n * sb];
+                        for j in 0..g.n {
+                            packed[(2 * j) * rb..(2 * j + 1) * rb]
+                                .copy_from_slice(&g.packed[j * rb..(j + 1) * rb]);
+                            packed[(2 * j + 1) * rb..(2 * j + 2) * rb]
+                                .copy_from_slice(&u.packed[j * rb..(j + 1) * rb]);
+                            scales[(2 * j) * sb..(2 * j + 1) * sb]
+                                .copy_from_slice(&g.scales[j * sb..(j + 1) * sb]);
+                            scales[(2 * j + 1) * sb..(2 * j + 2) * sb]
+                                .copy_from_slice(&u.scales[j * sb..(j + 1) * sb]);
+                        }
+                        let mut p = exec
+                            .nvf4_upload(&packed, &scales, g.scale2, 2 * g.n, g.k)
+                            .ok()?;
+                        p.gu_pairs = true;
+                        Some(p)
+                    })()
+                } else {
+                    None
+                };
+                let gu = match fused {
+                    Some(p) => super::Nvf4Gu::Fused(p),
+                    None => super::Nvf4Gu::Split {
+                        gate: plane(&format!("blk.{i}.ffn_gate.weight"))?,
+                        up: plane(&format!("blk.{i}.ffn_up.weight"))?,
+                    },
+                };
                 let down = plane(&format!("blk.{i}.ffn_down.weight"))?;
                 if i == 0 {
                     tracing::info!(
-                        "qwen35 nvf4 FFN lane: checkpoint-exact W4A16 planes (first layer {i})"
+                        fused = gu.fused(),
+                        "qwen35 nvf4 FFN lane: checkpoint-exact W4A16 planes (first layer {i}; fused gate|up = SWQ epilogue on the wide band)"
                     );
                 }
-                Some(Ffn::Nvf4Dense { gate, up, down })
+                Some(Ffn::Nvf4Dense { gu, down })
             })() {
                 bs_gu_planes.push(None);
                 nv
@@ -1233,7 +1298,14 @@ impl GpuQwen35 {
                     // band (`nvf4_wide_w4a4`): the twin measures slower than
                     // f4t at every prefill width and costs ~15 GB.
                     Ffn::Nvf4Dense { .. } if nvf4_wide_w4a4(&exec) => None,
-                    Ffn::Nvf4Dense { gate, up, down } => {
+                    Ffn::Nvf4Dense {
+                        gu: super::Nvf4Gu::Fused(_),
+                        ..
+                    } => None,
+                    Ffn::Nvf4Dense {
+                        gu: super::Nvf4Gu::Split { gate, up },
+                        down,
+                    } => {
                         (|| -> Option<[(RepackedMxfp4, usize, usize); 2]> {
                             // one f32 dequant buffer at a time (4 B/param) plus
                             // the ~1.03 B/param that stays resident, per plane
@@ -1334,7 +1406,14 @@ impl GpuQwen35 {
                     // of headroom, and paying ~1 byte/param buys ~2.7x the
                     // wide-batch throughput. Gated on real headroom so the
                     // small-card configuration keeps the fp4 residency.
-                    Ffn::Nvf4Dense { gate, up, down } => {
+                    Ffn::Nvf4Dense {
+                        gu: super::Nvf4Gu::Fused(_),
+                        ..
+                    } => None,
+                    Ffn::Nvf4Dense {
+                        gu: super::Nvf4Gu::Split { gate, up },
+                        down,
+                    } => {
                         (|| -> Option<[crate::gpu::F8TilePlane; 2]> {
                             // one f32 dequant buffer at a time (4 B/param) plus the
                             // 1 B/param that stays resident, per plane
@@ -2303,7 +2382,11 @@ impl GpuQwen35 {
             // toward heap granularity.
             // What remains as slack after both groups is genuine allocator
             // rounding - the 7-8% class the estimator models.
-            let mut bb = AuSum::default();
+            let hashing = paddock_models::dev_var_os!("PADDOCK_LOAD_CHECKSUM").is_some();
+            let mut bb = AuSum {
+                hashing,
+                ..Default::default()
+            };
             for l in &layers {
                 bb.dt(&l.attn_norm);
                 bb.dt(&l.post_norm);
@@ -2313,7 +2396,10 @@ impl GpuQwen35 {
                 }
                 bb.ffn(&l.ffn);
             }
-            let mut mt = AuSum::default();
+            let mut mt = AuSum {
+                hashing,
+                ..Default::default()
+            };
             if let Some(m) = &mtp {
                 mt.qw(&m.eh_proj);
                 mt.dt(&m.enorm);
@@ -2324,13 +2410,20 @@ impl GpuQwen35 {
                 mt.attn(&m.attn);
                 mt.ffn(&m.ffn);
             }
-            let mut hd = AuSum::default();
+            let mut hd = AuSum {
+                hashing,
+                ..Default::default()
+            };
             hd.qw(&output);
             hd.dt(&out_norm);
             hd.bytes += (sinks.len() * 4) as u64;
             hd.allocs += 1;
+            hd.h(&sinks);
             // derived lanes, by group
-            let mut dv_f8ffn = AuSum::default();
+            let mut dv_f8ffn = AuSum {
+                hashing,
+                ..Default::default()
+            };
             for e in bs_f8ffn_planes
                 .iter()
                 .chain(bs_f8ffn_bs_planes.iter())
@@ -2343,9 +2436,14 @@ impl GpuQwen35 {
                 for pl in [&p.gate, &p.up, &p.down] {
                     dv_f8ffn.bytes += (pl.data.len() + pl.scale.len() * 4) as u64;
                     dv_f8ffn.allocs += 2;
+                    dv_f8ffn.h(&pl.data);
+                    dv_f8ffn.h(&pl.scale);
                 }
             }
-            let mut dv_proj = AuSum::default();
+            let mut dv_proj = AuSum {
+                hashing,
+                ..Default::default()
+            };
             for w in bs_w8.iter().chain(bs_nv4.iter()) {
                 for p in [&w.wq, &w.wk, &w.wv, &w.wo, &w.in_qkv, &w.gate_w, &w.out_w]
                     .into_iter()
@@ -2362,13 +2460,27 @@ impl GpuQwen35 {
                         + t.scale_il.as_ref().map_or(0, |s| s.len() * 4))
                         as u64;
                     dv_proj.allocs += 2;
+                    dv_proj.h(&t.tiles);
+                    dv_proj.h(&t.scale);
+                    if let Some(f) = &t.flat {
+                        dv_proj.h(f);
+                    }
+                    if let Some(s) = &t.scale_il {
+                        dv_proj.h(s);
+                    }
                 }
             }
-            let mut dv_fused = AuSum::default();
+            let mut dv_fused = AuSum {
+                hashing,
+                ..Default::default()
+            };
             for p in bs_gu_planes.iter().chain(bs_dn_planes.iter()).flatten() {
                 dv_fused.q8(p);
             }
-            let mut dv_head = AuSum::default();
+            let mut dv_head = AuSum {
+                hashing,
+                ..Default::default()
+            };
             if let Some((p, _, _)) = &out_f8 {
                 dv_head.fp4(p);
             }
@@ -2377,6 +2489,27 @@ impl GpuQwen35 {
                     (t.tiles.len() + t.scale.len() * 4 + t.flat.as_ref().map_or(0, |f| f.len()))
                         as u64;
                 dv_head.allocs += 2;
+                dv_head.h(&t.tiles);
+                dv_head.h(&t.scale);
+                if let Some(f) = &t.flat {
+                    dv_head.h(f);
+                }
+            }
+            if hashing {
+                // stderr as well: the examples run without a tracing subscriber
+                let line = format!(
+                    "[load-checksum] backbone={:016x} mtp={:016x} head={:016x} f8ffn={:016x} \
+                     proj={:016x} fused={:016x} f8head={:016x}",
+                    bb.hash,
+                    mt.hash,
+                    hd.hash,
+                    dv_f8ffn.hash,
+                    dv_proj.hash,
+                    dv_fused.hash,
+                    dv_head.hash
+                );
+                tracing::warn!("{line}");
+                eprintln!("{line}");
             }
             let ctx = v_start.saturating_sub(v_embd).saturating_sub(embd_bytes);
             let planes = embd_bytes + bb.bytes + mt.bytes + hd.bytes;

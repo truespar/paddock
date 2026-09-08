@@ -6180,7 +6180,234 @@ pub struct KernelTableV1 {
     /// Q3_K / IQ4_NL: the >64-row prefill tile for dense i-quant planes.
     /// Without it such a plane stays on the per-token dp4a walk.
     pub kquant_iq_tile: Option<unsafe extern "C" fn() -> i32>,
+    /// 586: expert-GROUPED `kquant_moe_gate_up` over a
+    /// `moe_align_bm(bm = group)` layout: (gate_data, gate_scales, up_data,
+    /// up_scales, sorted_row, sorted_slot, block_expert, xq, xs, xsums, out,
+    /// in_dim, ff, n_active, max_blocks, group, gdt, udt). One block per
+    /// (expert group, out row), so the i-quant window unpack is paid once per
+    /// group instead of once per routed row - the prefill class. Same output
+    /// layout and the same numerics as slot 494.
+    pub kquant_moe_gate_up_grp: Option<KquantMoeGateUpGrpFn>,
+    /// 587: COLUMN-TILED routed down - slot 495's arguments plus `cols`
+    /// (4, 8, 16) before the dtype. One block owns `cols` output columns and
+    /// reuses each activation window across them; at prefill widths the grid
+    /// is still full with `cols` times fewer blocks, and the dependent weight
+    /// loads finally have something to overlap. Numerics are slot 495's.
+    pub kquant_moe_down_cols: Option<KquantMoeDownColsFn>,
+    /// 588: K-SPLIT Q8_0 GEMV/GEMM for NARROW-OUT planes - (data, scale,
+    /// bias, x, y, partials, counters, in_dim, out_dim, batch, split), grid
+    /// (out_dim, split, batch). A row-per-block GEMV stops filling the die
+    /// long before the plane stops being big (the hyper-connection down plane
+    /// is [10240, 320]: 320 blocks on 148 SMs, and the batched mt tile makes
+    /// twenty). Deterministic ascending fold; counters self-reset so a
+    /// captured graph replays identically.
+    pub q8_0_gemv_sk: Option<Q80GemvSkFn>,
+    /// Slot 589: `pd_nvf4_gemm_f4t4` - the f4t TMA ring at four 128-K stages in
+    /// the same smem (GB10 2026-09-07). Same contract as slot 430; NULL wherever
+    /// 430 is NULL.
+    pub nvf4_gemm_f4t4: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            f32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// 590: expert-GROUPED routed down over one COLUMN CHUNK - (down_data,
+    /// down_scales, sorted_row, sorted_slot, block_expert, topk_w, fq, fs,
+    /// fsums, part, ff, embd, o0, ocols, n_active, max_blocks, group). The
+    /// group's activation rows are staged once and each column's weight row
+    /// unpacked once, so the unpack falls by the rows per group; a grouped
+    /// block holds different tokens, so it writes one partial per (pair,
+    /// column) and slot 591 does the fold.
+    pub kquant_moe_down_grp: Option<KquantMoeDownGrpFn>,
+    /// 591: fold a chunk of slot 590's partials into `out` in ASCENDING slot
+    /// order - (part, out, embd, o0, ocols, n_active, rows).
+    pub moe_part_fold_at: Option<MoePartFoldAtFn>,
+    /// 592: REGISTER-TILED grouped gate+up - a BM x BN tile off a
+    /// `moe_align_bm(16)` CSR with both operands staged per BK slice, so a
+    /// thread owns whole dots and the activations are read once per column
+    /// TILE instead of once per column. Pair-major output like slot 586's;
+    /// `in_dim` must be a multiple of the kernel's BK (128). Its f32
+    /// association is the tile's, not the pair kernel's.
+    pub kquant_moe_gate_up_tile: Option<KquantMoeGateUpTileFn>,
+    /// 593: the register-tiled DOWN twin of 592, over one column chunk -
+    /// (down_data, down_scales, sorted_row, sorted_slot, block_expert, topk_w,
+    /// fq, fs, fsums, part, ff, embd, o0, ocols, n_active, max_blocks). Writes
+    /// the partials slot 591 folds; `ff` must be a multiple of the tile's BK.
+    pub kquant_moe_down_tile: Option<KquantMoeDownTileFn>,
+    /// Slots 594/595: `pd_add_rmsnorm_quant_{e4m3,nvf4}_pf` - the prefill
+    /// prenorm (the mmq kernel's exact norm phase) with the e4m3 / nvf4 quant
+    /// epilogue in place of the mmq tiles (GB10 2026-09-08). xn nullable.
+    pub add_rmsnorm_quant_e4m3_pf: Option<AddRmsnormQuantPfFn>,
+    pub add_rmsnorm_quant_nvf4_pf: Option<AddRmsnormQuantPfFn>,
+    /// 596: the single-sequence GDN walk, P-SPLIT and PRE-NORMED - slot 533's
+    /// arguments plus caller-owned `rn` (n_tokens * n_heads * 2 floats, the
+    /// buffer the runs_pn entry already sizes). P threads share a state
+    /// column, so the walk stops being register-bound; the norms come from the
+    /// companion pass, so its token loop carries no barrier.
+    pub gated_delta_recurrent_pn: Option<GatedDeltaRecurrentPnFn>,
 }
+
+/// Pre-normed single-sequence GDN walk (see `KernelTableV1::gated_delta_recurrent_pn`).
+pub type GatedDeltaRecurrentPnFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+) -> i32;
+
+/// Register-tiled routed down (see `KernelTableV1::kquant_moe_down_tile`).
+pub type KquantMoeDownTileFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> i32;
+
+/// Register-tiled grouped gate+up (see `KernelTableV1::kquant_moe_gate_up_tile`).
+pub type KquantMoeGateUpTileFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> i32;
+
+/// Expert-grouped routed down (see `KernelTableV1::kquant_moe_down_grp`).
+pub type KquantMoeDownGrpFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> i32;
+
+/// Slot fold for the grouped down (see `KernelTableV1::moe_part_fold_at`).
+pub type MoePartFoldAtFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> i32;
+
+/// K-split Q8_0 GEMV (see `KernelTableV1::q8_0_gemv_sk`).
+pub type Q80GemvSkFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> i32;
+
+/// Column-tiled routed down (see `KernelTableV1::kquant_moe_down_cols`).
+pub type KquantMoeDownColsFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> i32;
+
+/// Expert-grouped gate+up (see `KernelTableV1::kquant_moe_gate_up_grp`).
+pub type KquantMoeGateUpGrpFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> i32;
 
 /// Expert-major prefill plan (see `KernelTableV1::moe_wave_plan`).
 pub type MoeWavePlanFn = unsafe extern "C" fn(
@@ -6644,7 +6871,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 571;
+pub const KERNEL_TABLE_SLOTS: usize = 582;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,
@@ -9320,6 +9547,24 @@ pub type AddRmsnormQuantMmqFn = unsafe extern "C" fn(
     n: u32,
     batch: u32,
     eps: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// Prefill add+rmsnorm+quantize with an e4m3 / nvf4 epilogue (see
+/// `KernelTableV1::add_rmsnorm_quant_e4m3_pf`). `proj_b16` != 0 reads the
+/// residual as bf16.
+#[allow(clippy::too_many_arguments)]
+pub type AddRmsnormQuantPfFn = unsafe extern "C" fn(
+    x: *mut core::ffi::c_void,
+    proj: *const core::ffi::c_void,
+    w: *const core::ffi::c_void,
+    xn: *mut core::ffi::c_void,
+    q: *mut core::ffi::c_void,
+    scale: *mut core::ffi::c_void,
+    n: u32,
+    batch: u32,
+    eps: f32,
+    proj_b16: u32,
     stream: *mut core::ffi::c_void,
 ) -> KernelStatus;
 

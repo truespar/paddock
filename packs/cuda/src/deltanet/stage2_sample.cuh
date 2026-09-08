@@ -1199,6 +1199,13 @@ static int pd_gated_delta_chunked_go(bool vb16, const void* q, const void* k,
         (const float*)beta, (__nv_bfloat16*)dw, (__nv_bfloat16*)du,            \
         (__nv_bfloat16*)aqk, (double*)cg, n_tokens, n_heads, rs_qb, rs_kb,     \
         rs_gsh)
+// PD_DNC_PROBE (bench-only, default 0): 1 = stage1 only (no walk), 2 = walk
+// only (on whatever the scratch holds) - the GB10 phase split
+// (bench/dnc_gb10_bench.cu, 2026-09-08). Never set by the pack build.
+#ifndef PD_DNC_PROBE
+#define PD_DNC_PROBE 0
+#endif
+#if PD_DNC_PROBE != 2
             if (pd_dnc_s1rs_on()) {
                 if (vb16) PD_RS_S1RS_GO(__nv_bfloat16);
                 else PD_RS_S1RS_GO(float);
@@ -1209,25 +1216,25 @@ static int pd_gated_delta_chunked_go(bool vb16, const void* q, const void* k,
                 if (rs_s1prec == 1u) PD_RS_S1_GO(1u, float);
                 else PD_RS_S1_GO(3u, float);
             }
+#endif
 #undef PD_RS_S1RS_GO
 #undef PD_RS_S1_GO
-            dim3 gw(n_heads, PD_DNC_D / PD_DNC_G);
+            // column groups FASTEST (2026-09-08, GB10): a head's four CTAs
+            // share dw/q/k/coef, and on a 48-SM die with a 24 MB L2 they
+            // must sit in the same wave to share them through L2 - head-
+            // fastest order put them two waves apart (walk_rs.cuh note).
+            dim3 gw(PD_DNC_D / PD_DNC_G, n_heads);
             const int rs_cls = pd_dns_state_class();
+#if PD_DNC_PROBE == 1
+            (void)gw; (void)rs_cls;
+            return pd_launch_status();
+#endif
             if (rs_cls == 3)
-                pd_dnc_walk_rs_kernel<__nv_fp8_e4m3><<<gw, 128, PD_DNRS_SMEM, s>>>(
-                    rs_qb, rs_kb, (__nv_fp8_e4m3*)state, (const __nv_bfloat16*)dw,
-                    (const __nv_bfloat16*)du, rs_gsh,
-                    (const __nv_bfloat16*)aqk, (float*)out, n_tokens, n_heads);
+                pd_dnrs_walk_go<__nv_fp8_e4m3, false>(gw, s, rs_qb, rs_kb, (__nv_fp8_e4m3*)state, (const __nv_bfloat16*)dw, (const __nv_bfloat16*)du, rs_gsh, (const __nv_bfloat16*)aqk, (float*)out, n_tokens, n_heads, nullptr, nullptr, nullptr, 0u);
             else if (rs_cls == 2)
-                pd_dnc_walk_rs_kernel<__half><<<gw, 128, PD_DNRS_SMEM, s>>>(
-                    rs_qb, rs_kb, (__half*)state, (const __nv_bfloat16*)dw,
-                    (const __nv_bfloat16*)du, rs_gsh,
-                    (const __nv_bfloat16*)aqk, (float*)out, n_tokens, n_heads);
+                pd_dnrs_walk_go<__half, false>(gw, s, rs_qb, rs_kb, (__half*)state, (const __nv_bfloat16*)dw, (const __nv_bfloat16*)du, rs_gsh, (const __nv_bfloat16*)aqk, (float*)out, n_tokens, n_heads, nullptr, nullptr, nullptr, 0u);
             else
-                pd_dnc_walk_rs_kernel<float><<<gw, 128, PD_DNRS_SMEM, s>>>(
-                    rs_qb, rs_kb, (float*)state, (const __nv_bfloat16*)dw,
-                    (const __nv_bfloat16*)du, rs_gsh,
-                    (const __nv_bfloat16*)aqk, (float*)out, n_tokens, n_heads);
+                pd_dnrs_walk_go<float, false>(gw, s, rs_qb, rs_kb, (float*)state, (const __nv_bfloat16*)dw, (const __nv_bfloat16*)du, rs_gsh, (const __nv_bfloat16*)aqk, (float*)out, n_tokens, n_heads, nullptr, nullptr, nullptr, 0u);
             return pd_launch_status();
         }
     }
@@ -1485,7 +1492,11 @@ static int pd_gated_delta_chunked_go(bool vb16, const void* q, const void* k,
                 float* d_dt;
                 if (cudaMallocAsync(&d_dt, (size_t)nc3 * n_heads * CD3 * 4u, s))
                     return cudaErrorMemoryAllocation;
-                dim3 gw(n_heads, PD_DNC_D / PD_DNC_G);
+                // column groups FASTEST (2026-09-08, GB10): a head's four CTAs
+            // share dw/q/k/coef, and on a 48-SM die with a 24 MB L2 they
+            // must sit in the same wave to share them through L2 - head-
+            // fastest order put them two waves apart (walk_rs.cuh note).
+            dim3 gw(n_heads, PD_DNC_D / PD_DNC_G);   // walk3 decodes the head from blockIdx.x (the rs walk's swap does not apply here)
                 dim3 go3(n_heads, PD_DNC_D / PD_DNC_G, nc3);
                 const float* qf3 = (const float*)q;
                 const float* kf3 = (const float*)k;
@@ -1762,6 +1773,15 @@ static int pd_gdc_rs_vl_go(
         cudaFuncSetAttribute(
             (const void*)pd_dnc_stage1_rs_kernel<float, 0, true>,
             cudaFuncAttributeMaxDynamicSharedMemorySize, PD_DNS1RS_SMEM);
+        cudaFuncSetAttribute((const void*)pd_dnc_walk_rs_kernel<float, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             PD_DNRS_SMEM);
+        cudaFuncSetAttribute((const void*)pd_dnc_walk_rs_kernel<__half, true>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             PD_DNRS_SMEM);
+        cudaFuncSetAttribute(
+            (const void*)pd_dnc_walk_rs_kernel<__nv_fp8_e4m3, true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, PD_DNRS_SMEM);
         ::fprintf(stderr, "[dnc-vl] ENGAGED (varlen chunked-GDN)\n");
         vl_attr = true;
     }
@@ -1782,6 +1802,12 @@ static int pd_gdc_rs_vl_go(
             (const float*)g, (const float*)beta, (__nv_bfloat16*)dw,           \
             (__nv_bfloat16*)du, (__nv_bfloat16*)aqk, (double*)cg, n_tokens,    \
             n_heads, rs_qb, rs_kb, rs_gsh, (const uint32_t*)chunk_items)
+    // QKD (2026-09-08, GB10): on the qkc route the walk reads the compact
+    // plane itself (walk_rs.cuh), so stage1 skips its 25 MB emission
+    // (qb16/kb16 = NULL). PADDOCK_NO_DNC_QKD=1 keeps the copies for A/B.
+    static const bool qkd_off = pd_env("PADDOCK_NO_DNC_QKD") != nullptr;
+    const bool qkd = qkc && !qkd_off;
+#if PD_DNC_PROBE != 2
     if (qkc) {
         // compact pair (slot 447): the ENGINE guarantees conv wrote the
         // compact bf16 planes and that the rs stage1 route is live; a
@@ -1792,7 +1818,8 @@ static int pd_gdc_rs_vl_go(
         pd_dnc_stage1_rs_kernel<float, 0, true><<<g1, 256, PD_DNS1RS_SMEM, s>>>(
             (const float*)q, (const float*)k, (const float*)v, (const float*)g,
             (const float*)beta, (__nv_bfloat16*)dw, (__nv_bfloat16*)du,
-            (__nv_bfloat16*)aqk, (double*)cg, n_tokens, n_heads, rs_qb, rs_kb,
+            (__nv_bfloat16*)aqk, (double*)cg, n_tokens, n_heads,
+            qkd ? nullptr : rs_qb, qkd ? nullptr : rs_kb,
             rs_gsh, (const uint32_t*)chunk_items, n_k_heads);
     } else if (pd_dnc_s1rs_on())
         pd_dnc_stage1_rs_kernel<float><<<g1, 256, PD_DNS1RS_SMEM, s>>>(
@@ -1802,24 +1829,30 @@ static int pd_gdc_rs_vl_go(
             rs_gsh, (const uint32_t*)chunk_items);
     else if (rs_s1prec == 1u) PD_RS_VL_S1(1u);
     else PD_RS_VL_S1(3u);
+#endif
 #undef PD_RS_VL_S1
-    dim3 gw(n_heads, PD_DNC_D / PD_DNC_G, n_spans);
+    dim3 gw(PD_DNC_D / PD_DNC_G, n_heads, n_spans);   // column groups fastest (walk_rs.cuh note)
+#if PD_DNC_PROBE == 1
+    (void)gw; return pd_launch_status();
+#endif
     const int vl_cls = pd_dns_state_class();
+    if (qkd) {
+        const __nv_bfloat16* qc = (const __nv_bfloat16*)q;
+        const __nv_bfloat16* kc = (const __nv_bfloat16*)k;
+        if (vl_cls == 3)
+            pd_dnrs_walk_go<__nv_fp8_e4m3, true>(gw, s, rs_qb, rs_kb, (__nv_fp8_e4m3*)state, (const __nv_bfloat16*)dw, (const __nv_bfloat16*)du, rs_gsh, (const __nv_bfloat16*)aqk, (float*)out, n_tokens, n_heads, (const uint32_t*)span_items, qc, kc, n_k_heads);
+        else if (vl_cls == 2)
+            pd_dnrs_walk_go<__half, true>(gw, s, rs_qb, rs_kb, (__half*)state, (const __nv_bfloat16*)dw, (const __nv_bfloat16*)du, rs_gsh, (const __nv_bfloat16*)aqk, (float*)out, n_tokens, n_heads, (const uint32_t*)span_items, qc, kc, n_k_heads);
+        else
+            pd_dnrs_walk_go<float, true>(gw, s, rs_qb, rs_kb, (float*)state, (const __nv_bfloat16*)dw, (const __nv_bfloat16*)du, rs_gsh, (const __nv_bfloat16*)aqk, (float*)out, n_tokens, n_heads, (const uint32_t*)span_items, qc, kc, n_k_heads);
+        return pd_launch_status();
+    }
     if (vl_cls == 3)
-        pd_dnc_walk_rs_kernel<__nv_fp8_e4m3><<<gw, 128, PD_DNRS_SMEM, s>>>(
-            rs_qb, rs_kb, (__nv_fp8_e4m3*)state, (const __nv_bfloat16*)dw,
-            (const __nv_bfloat16*)du, rs_gsh, (const __nv_bfloat16*)aqk,
-            (float*)out, n_tokens, n_heads, (const uint32_t*)span_items);
+        pd_dnrs_walk_go<__nv_fp8_e4m3, false>(gw, s, rs_qb, rs_kb, (__nv_fp8_e4m3*)state, (const __nv_bfloat16*)dw, (const __nv_bfloat16*)du, rs_gsh, (const __nv_bfloat16*)aqk, (float*)out, n_tokens, n_heads, (const uint32_t*)span_items, nullptr, nullptr, 0u);
     else if (vl_cls == 2)
-        pd_dnc_walk_rs_kernel<__half><<<gw, 128, PD_DNRS_SMEM, s>>>(
-            rs_qb, rs_kb, (__half*)state, (const __nv_bfloat16*)dw,
-            (const __nv_bfloat16*)du, rs_gsh, (const __nv_bfloat16*)aqk,
-            (float*)out, n_tokens, n_heads, (const uint32_t*)span_items);
+        pd_dnrs_walk_go<__half, false>(gw, s, rs_qb, rs_kb, (__half*)state, (const __nv_bfloat16*)dw, (const __nv_bfloat16*)du, rs_gsh, (const __nv_bfloat16*)aqk, (float*)out, n_tokens, n_heads, (const uint32_t*)span_items, nullptr, nullptr, 0u);
     else
-        pd_dnc_walk_rs_kernel<float><<<gw, 128, PD_DNRS_SMEM, s>>>(
-            rs_qb, rs_kb, (float*)state, (const __nv_bfloat16*)dw,
-            (const __nv_bfloat16*)du, rs_gsh, (const __nv_bfloat16*)aqk,
-            (float*)out, n_tokens, n_heads, (const uint32_t*)span_items);
+        pd_dnrs_walk_go<float, false>(gw, s, rs_qb, rs_kb, (float*)state, (const __nv_bfloat16*)dw, (const __nv_bfloat16*)du, rs_gsh, (const __nv_bfloat16*)aqk, (float*)out, n_tokens, n_heads, (const uint32_t*)span_items, nullptr, nullptr, 0u);
     return pd_launch_status();
 }
 

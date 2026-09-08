@@ -4798,11 +4798,23 @@ int pd_f8row_gemm(const void* data, const void* w_rowscale, const void* xq,
         // down (199 vs 264), 17% on wq/wo (76 vs 91); at M=768 tw_s3 still
         // wins (502 vs 525), so the band 541..1023 stays. Kill: PADDOCK_NO_F8R_TW5K.
         static const bool tw5k_off = pd_env("PADDOCK_NO_F8R_TW5K") != nullptr;
+        // Small dies (< 128 SMs, GB10 2026-09-08): the 541..1023 band that
+        // keeps narrow-out planes on tw was a GRID-FILL valley on 148/188
+        // SMs (down at M=768: 40 x 6 = 240 CTAs, 1.3 waves of tw5's one
+        // CTA per SM). On 48 SMs the same grid is five waves, and the census
+        // had the 8 fp8-MLP down projections ([5120 x 17408], 1017 rows) on
+        // tw at 1727 us (106 TF/s) beside gate/up on tw5 at 149 TF/s. The
+        // band closes there: tw5 from 384 rows (40 x 3 = 120 CTAs = 2.5
+        // waves). Same kill switch as the 1024-row rule.
+        static int nsm_tw = 0;
+        if (nsm_tw == 0) { int d = 0; cudaGetDevice(&d); cudaDeviceGetAttribute(&nsm_tw, cudaDevAttrMultiProcessorCount, d); if (nsm_tw <= 0) nsm_tw = 148; }
+        const bool small_die = nsm_tw < 128;
         const bool tw5_want = !tw5_off
             && ((out_dim >= 16384u)
                 || (out_dim >= 8192u && (batch <= 128u || batch >= 256u))
                 || (out_dim < 8192u && batch >= 384u && batch <= 540u)
-                || (!tw5k_off && out_dim < 8192u && batch >= 1024u));
+                || (!tw5k_off && out_dim < 8192u && batch >= 1024u)
+                || (!tw5k_off && small_die && out_dim < 8192u && batch >= 384u));
         const bool tw4_want = !tw4_off && out_dim < 8192u && in_dim >= 8192u
             && batch <= 128u;
         if (!tw_off && batch >= 65u && (out_dim & 63u) == 0u && (in_dim & 127u) == 0u

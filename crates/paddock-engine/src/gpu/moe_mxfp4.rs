@@ -184,6 +184,11 @@ impl GpuExecutor {
         })
     }
 
+    /// True when the pack carries the block-tile `moe_align` (slot 474).
+    pub fn has_moe_align_bm(&self) -> bool {
+        self.kernels.moe_align_bm.is_some()
+    }
+
     /// `moe_align` with a caller-chosen power-of-two block tile (bs64 path).
     #[allow(clippy::too_many_arguments)]
     pub fn moe_align_bm(

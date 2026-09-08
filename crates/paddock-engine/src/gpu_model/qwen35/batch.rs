@@ -12,6 +12,11 @@ use cudarc::driver::sys::CUstreamCaptureMode;
 
 /// Max rows a tick may overdraw to absorb a prompt tail that would otherwise
 /// ride a whole extra tick (chunk-tail finding).
+/// Staged DeltaNet checkpoint blobs per tick (`d_ckpt_stage`): the number of
+/// checkpoint seams the unified tick can fuse. Two covers one prompt's two
+/// boundaries; a cold cohort's other prompts overflow it (see the overflow
+/// absorb in `unified_launch_core`).
+const CKPT_STAGE_BLOBS: usize = 2;
 const TAIL_SLOP: usize = 64;
 
 /// f8t unified arm master switch (see the bs_f8t_attn_p note in
@@ -830,7 +835,9 @@ impl GpuQwen35 {
                 .alloc((self.conv_k - 1 + unified_prefill_rows().max(8192)) * self.conv_dim)?,
             d_ckpt_stage: {
                 let blob = self.n_linear_layers() * (state_elems + win_elems);
-                vec![e.alloc(blob)?, e.alloc(blob)?]
+                (0..CKPT_STAGE_BLOBS)
+                    .map(|_| e.alloc(blob))
+                    .collect::<Result<Vec<_>, _>>()?
             },
             mrope_delta: vec![0; max_batch],
             paged,
@@ -3966,7 +3973,7 @@ impl GpuQwen35 {
                                 )?;
                             }
                         }
-                        Ffn::Nvf4Dense { gate, up, down } => {
+                        Ffn::Nvf4Dense { gu, down } => {
                             // f8t tile arm first, off the planes load.rs builds from
                             // the NVFP4 checkpoint's own values - same chain and same
                             // election as the Dense arm above. write_xn stays true:
@@ -4061,8 +4068,7 @@ impl GpuQwen35 {
                                 // checkpoint-exact W4A16 walk
                                 nvf4_ffn(
                                     &exec,
-                                    gate,
-                                    up,
+                                    gu,
                                     down,
                                     &sc.d_xn,
                                     &mut sc.d_pxq,
@@ -4070,6 +4076,9 @@ impl GpuQwen35 {
                                     &mut sc.d_nv4part,
                                     &mut sc.d_ffn_gate,
                                     &mut sc.d_ffn_up,
+                                    &mut sc.d_ffn_gu,
+                                    &mut sc.d_swq_q,
+                                    &mut sc.d_swq_s,
                                     &mut sc.d_proj,
                                     ff,
                                     r,
@@ -5384,8 +5393,32 @@ impl GpuQwen35 {
             // one pass; the real fix is fusing both shares into one tick
             // with a mid-tick staged snapshot (d_ckpt_stage pattern).
             static ABSORB: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let absorb = *ABSORB
+            let absorb_all = *ABSORB
                 .get_or_init(|| paddock_models::dev_var_os!("PADDOCK_CKPT_ABSORB").is_some());
+            // Overflow absorb (DEFAULT on dies under 128 SMs, measured on GB10
+            // 2026-09-07): the fused-tail budget below is the two stage blobs,
+            // so in a cold cohort only the first prompt (or two) gets its
+            // checkpoint tails fused into this tick; every other prompt's
+            // <=16-row tails ride LATER ticks, one full weight pass each. On
+            // a 273 GB/s die a pass is ~350 ms regardless of rows (launch +
+            // stream fixed cost), so an 8-prompt 143-row cohort took three
+            // ticks (1.37 s to the median first token) where one 1144-row
+            // tick is 0.53 s; `PADDOCK_CKPT_ABSORB=1` measured 615 ms at
+            // 128x128 c8 and 3257 vs 3717 ms at 1024x1024 c8, c1 unchanged.
+            // So once the stage budget is spent, the remaining prompts of the
+            // tick run WHOLE (no cut) - they trade their resumable prefix
+            // checkpoint for finishing in this tick; the prompts that got
+            // the blobs keep theirs. On 188-SM dies a tail tick is ~30 ms
+            // and the cut stays (unmeasured there in this shape).
+            // `PADDOCK_NO_CKPT_ABSORB_OVERFLOW=1` reverts; the real fix is
+            // more stage blobs (one per seam per prompt), the same
+            // `d_ckpt_stage` machinery sized per tick.
+            static OVERFLOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let overflow_absorb = *OVERFLOW.get_or_init(|| {
+                paddock_models::dev_var_os!("PADDOCK_NO_CKPT_ABSORB_OVERFLOW").is_none()
+                    && self.exec.sm_count() < 128
+            });
+            let absorb = absorb_all || (overflow_absorb && fuse_stages >= CKPT_STAGE_BLOBS);
             // Both checkpoint boundaries (see ckpt_cuts): land a span on each so
             // the state can be snapshotted there - the next-turn resume needs
             // the second-to-last one whenever the trailing partial page is
@@ -5455,7 +5488,7 @@ impl GpuQwen35 {
             // finish-side takes the live snapshot for an unfused landing).
             if fuse && cut_at_ckpt {
                 let mut from = ch.done + take;
-                while room > 0 && fuse_stages < 2 && from < ch.tokens.len() {
+                while room > 0 && fuse_stages < CKPT_STAGE_BLOBS && from < ch.tokens.len() {
                     let next_stop = cuts
                         .iter()
                         .copied()
@@ -5977,10 +6010,55 @@ impl GpuQwen35 {
             .as_mut()
             .filter(|d| d.state.is_some() && !super::dflash::fuse_off());
 
+        // Prefill glue on the W8 / NVFP4 lanes (GB10 census, 2026-09-08): the
+        // FFN residual add, the mmq prenorm and the e4m3 re-quant of xn were
+        // three memory-bound passes per layer (226 + 206 + 95 us at 1k rows
+        // on a 273 GB/s die), and the FFN prenorm's mmq tiles were written
+        // for nobody on the NVFP4 lane, which then re-read xn to quantize it
+        // to e2m1. `add_rmsnorm_quant_{e4m3,nvf4}_pf` do each side in one
+        // pass with the mmq prenorm's exact norm phase and the standalone
+        // quantizer's staging (bit-identical; the decode-band fused kernels
+        // sum in f64 and are a different class - measured). So the FFN
+        // residual is HOISTED into the next layer's prenorm the way
+        // prefill_batch_pass's P73 hoist does it, flushed before a drafter
+        // tap (it reads the raw residual) and before the final norm.
+        // PADDOCK_NO_PF_RES_HOIST=1 keeps the three-pass chain for A/B.
+        let pf_hoist = {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ON.get_or_init(|| {
+                paddock_models::dev_var_os!("PADDOCK_NO_PF_RES_HOIST").is_none()
+                    && paddock_models::dev_var_os!("PADDOCK_DBG_NORM").is_none()
+            })
+        } && r > 64;
+        let mut pend_ffn: Option<bool> = None;
+        // Compact q/k for the varlen DeltaNet spans (GB10 2026-09-08): the
+        // conv wrote q and k EXPANDED to the v-heads (3x for 16 k-heads /
+        // 48 v-heads) and the chunk kernels read them so - ~50 MB written
+        // and 50 read per layer for nothing at 1k rows. The pack's qkc pair
+        // (slots 446/447: conv emits Hg-compact bf16 q/k, the vl chunked-GDN
+        // entry reads them, bit-identical values) was only wired on
+        // prefill_batch_pass. Here it rides per SPAN: fresh vl spans land
+        // compact in d_dqc/d_dkc, every other span keeps the expanded f32
+        // planes and its expanded consumers, so the tick no longer has to be
+        // all-vl. Resumed vl spans (the ext-build conv + split) have no
+        // compact producer yet, so a tick with one stays expanded.
+        let qkc_tick = super::dn_qkc(&exec)
+            && d_dn_vl.is_some()
+            && sc.d_dqc.len() > 1
+            && vl_share
+                .iter()
+                .enumerate()
+                .all(|(si, &v)| !v || shares[si].2 == 0);
+
         for (li, layer) in layers.iter().enumerate() {
             if let Some(df) = dtap.as_mut()
                 && let Some(band) = df.target_layers.iter().position(|&t| t == li)
             {
+                match pend_ffn.take() {
+                    Some(true) => exec.add_b16(&mut sc.d_x, &sc.d_proj, r * embd)?,
+                    Some(false) => exec.add(&mut sc.d_x, &sc.d_proj, r * embd)?,
+                    None => {}
+                }
                 super::dflash::tap_band(&exec, df, &sc.d_x, band, embd, r)?;
             }
             let lw8 = bs_w8_all.get(li).filter(|_| r > w8_min);
@@ -6005,21 +6083,58 @@ impl GpuQwen35 {
                 && 2 * r <= sc.cap
                 && bs_f8t_attn_p.get(li).and_then(|o| o.as_ref()).is_some();
             let keep_xn = matches!(&layer.mixer, Mixer::Linear(_)) || lw8.is_some() || f8t_u;
-            prefill_add_norm_quant(
-                &exec,
-                &mut sc.d_x,
-                None,
-                false,
-                &layer.attn_norm.buf,
-                &mut sc.d_xn,
-                keep_xn,
-                &mut sc.d_pxq,
-                &mut sc.d_pxs,
-                &mut sc.d_yq,
-                embd,
-                r,
-                eps,
-            )?;
+            // W8 arms: one fused add+rmsnorm+e4m3 pass stages (d_pxq, d_exs)
+            // for wq/wk/wv or in_qkv and writes xn - the quantize_e4m3 those
+            // arms would run below is then skipped (e4m3_staged).
+            let mut e4m3_staged = false;
+            // r > 64: the band where prefill_add_norm_quant runs the mmq
+            // prenorm this kernel reproduces; below it the chain's norm is
+            // rmsnorm_batch (the width-stable decode class) and fusing would
+            // move those rows across a class boundary (measured on the
+            // 6-row probe and the b=1 decode rows, w8_min being 0).
+            let fuse_e4m3 = lw8.is_some()
+                && r > 64
+                && !f8t_u
+                && embd.is_multiple_of(32)
+                && paddock_models::dev_var_os!("PADDOCK_NO_PF_E4M3_FUSE").is_none()
+                && exec.has_add_rmsnorm_quant_e4m3_pf();
+            if fuse_e4m3 {
+                let pend = pend_ffn.take();
+                exec.add_rmsnorm_quant_e4m3_pf(
+                    &mut sc.d_x,
+                    pend.map(|_| &sc.d_proj),
+                    pend == Some(true),
+                    &layer.attn_norm.buf,
+                    Some(&mut sc.d_xn),
+                    &mut sc.d_pxq,
+                    &mut sc.d_exs,
+                    embd,
+                    r,
+                    eps,
+                )?;
+                e4m3_staged = true;
+            } else {
+                match pend_ffn.take() {
+                    Some(true) => exec.add_b16(&mut sc.d_x, &sc.d_proj, r * embd)?,
+                    Some(false) => exec.add(&mut sc.d_x, &sc.d_proj, r * embd)?,
+                    None => {}
+                }
+                prefill_add_norm_quant(
+                    &exec,
+                    &mut sc.d_x,
+                    None,
+                    false,
+                    &layer.attn_norm.buf,
+                    &mut sc.d_xn,
+                    keep_xn,
+                    &mut sc.d_pxq,
+                    &mut sc.d_pxs,
+                    &mut sc.d_yq,
+                    embd,
+                    r,
+                    eps,
+                )?;
+            }
             let mut mixer_b16 = false;
             match &layer.mixer {
                 Mixer::Full(w) => {
@@ -6096,7 +6211,9 @@ impl GpuQwen35 {
                     } else if let Some(l8) = lw8 {
                         // One e4m3 quant of the normed hidden feeds wq/wk/wv
                         // (same W8 branch as the serial/batched prefill paths)
-                        exec.quantize_e4m3(&sc.d_xn, &mut sc.d_pxq, &mut sc.d_exs, r * embd)?;
+                        if !e4m3_staged {
+                            exec.quantize_e4m3(&sc.d_xn, &mut sc.d_pxq, &mut sc.d_exs, r * embd)?;
+                        }
                         if qnf {
                             let nqkv = w.wq.dims()[1] + w.wk.dims()[1] + w.wv.dims()[1];
                             exec.f8_gemm_w8(
@@ -6614,7 +6731,9 @@ impl GpuQwen35 {
                         dn_fused = true;
                         f8t_ow_u = Some(ow_t);
                     } else if let Some(l8) = lw8 {
-                        exec.quantize_e4m3(&sc.d_xn, &mut sc.d_pxq, &mut sc.d_exs, r * embd)?;
+                        if !e4m3_staged {
+                            exec.quantize_e4m3(&sc.d_xn, &mut sc.d_pxq, &mut sc.d_exs, r * embd)?;
+                        }
                         static DNF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                         if *DNF
                             .get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_DNF").is_none())
@@ -6684,7 +6803,24 @@ impl GpuQwen35 {
                             // ext build. Then commit the trailing k-1
                             // rows as the slot's persistent window (short
                             // spans land in the pre-zeroed tail).
-                            if exec.has_conv_silu_qkv() {
+                            if qkc_tick && vl_share[si] {
+                                // compact bf16 q/k for the vl chunk pair
+                                exec.causal_conv1d_silu_qkv_vl_qkc_at(
+                                    &sc.d_mixed,
+                                    &w.conv_w.buf,
+                                    &sc.d_row0s_zero,
+                                    &mut sc.d_dqc,
+                                    &mut sc.d_dkc,
+                                    &mut sc.d_dv,
+                                    rb,
+                                    rb,
+                                    take,
+                                    n_k_heads,
+                                    n_v_heads,
+                                    state_size,
+                                    conv_k,
+                                )?;
+                            } else if exec.has_conv_silu_qkv() {
                                 // fused conv+split+norm straight to q/k/v -
                                 // this span's rows skip the split below
                                 exec.causal_conv1d_silu_qkv_at(
@@ -7013,26 +7149,50 @@ impl GpuQwen35 {
                         // One stage1+walk pair for every varlen-eligible span
                         // (n_tokens is per-span from the items; the total
                         // argument is informational only on this path)
-                        exec.gated_delta_chunked_rs_vl(
-                            &sc.d_dq,
-                            &sc.d_dk,
-                            &sc.d_dv,
-                            &sc.d_g,
-                            &sc.d_beta,
-                            bs.recur[li].as_mut().expect("DeltaNet layer state"),
-                            &mut sc.d_dattn,
-                            &mut sc.d_dnc_dw,
-                            &mut sc.d_dnc_du,
-                            &mut sc.d_dnc_coef,
-                            &mut sc.d_dnc_cg,
-                            d_vl,
-                            *n_chunks,
-                            *span_off,
-                            *n_spans,
-                            rb,
-                            n_v_heads,
-                            state_size,
-                        )?;
+                        if qkc_tick {
+                            exec.gated_delta_chunked_rs_vl_qkc(
+                                &sc.d_dqc,
+                                &sc.d_dkc,
+                                &sc.d_dv,
+                                &sc.d_g,
+                                &sc.d_beta,
+                                bs.recur[li].as_mut().expect("DeltaNet layer state"),
+                                &mut sc.d_dattn,
+                                &mut sc.d_dnc_dw,
+                                &mut sc.d_dnc_du,
+                                &mut sc.d_dnc_coef,
+                                &mut sc.d_dnc_cg,
+                                d_vl,
+                                *n_chunks,
+                                *span_off,
+                                *n_spans,
+                                rb,
+                                n_v_heads,
+                                n_k_heads,
+                                state_size,
+                            )?;
+                        } else {
+                            exec.gated_delta_chunked_rs_vl(
+                                &sc.d_dq,
+                                &sc.d_dk,
+                                &sc.d_dv,
+                                &sc.d_g,
+                                &sc.d_beta,
+                                bs.recur[li].as_mut().expect("DeltaNet layer state"),
+                                &mut sc.d_dattn,
+                                &mut sc.d_dnc_dw,
+                                &mut sc.d_dnc_du,
+                                &mut sc.d_dnc_coef,
+                                &mut sc.d_dnc_cg,
+                                d_vl,
+                                *n_chunks,
+                                *span_off,
+                                *n_spans,
+                                rb,
+                                n_v_heads,
+                                state_size,
+                            )?;
+                        }
                         // deferred ckpt boundary stages for VL leaders:
                         // post-leader state, captured before the packed
                         // launch below advances the slot with the tails -
@@ -7492,7 +7652,7 @@ impl GpuQwen35 {
                         )?;
                     }
                 }
-                Ffn::Nvf4Dense { gate, up, down } => {
+                Ffn::Nvf4Dense { gu, down } => {
                     // f8t tile arm first, off the planes load.rs builds from
                     // the NVFP4 checkpoint's own values - same chain and same
                     // election as the Dense arm above. write_xn stays true:
@@ -7511,21 +7671,51 @@ impl GpuQwen35 {
                             && r > nvf4_f8w_min_rows(w8_min)
                             && paddock_models::dev_var_os!("PADDOCK_F8_ROWSCALE").is_none()
                     });
-                    prefill_add_norm_quant(
-                        &exec,
-                        &mut sc.d_x,
-                        Some(&sc.d_proj),
-                        mixer_b16,
-                        &layer.post_norm.buf,
-                        &mut sc.d_xn,
-                        true,
-                        &mut sc.d_pxq,
-                        &mut sc.d_pxs,
-                        &mut sc.d_yq,
-                        embd,
-                        r,
-                        eps,
-                    )?;
+                    // nvf4_ffn arm: the fused add+rmsnorm+nvf4 prenorm stages
+                    // (d_pxq, d_nvs) for the fp4 GEMMs directly (bit-exact to
+                    // add + rmsnorm_batch + quantize_nvf4), instead of mmq
+                    // tiles nobody reads plus a second pass over xn.
+                    let mut xq_ready = false;
+                    let fuse_nvf4 = f8t_ffn.is_none()
+                        && f8f.is_none()
+                        && r > 64
+                        && r >= super::ops::nvf4_w4a4_min_rows()
+                        && exec.has_nvf4_gemm_f4()
+                        && embd.is_multiple_of(32)
+                        && paddock_models::dev_var_os!("PADDOCK_NO_PF_NVF4_FUSE").is_none()
+                        && exec.has_add_rmsnorm_quant_nvf4_pf();
+                    if fuse_nvf4 {
+                        // xn None: the W4A4 arms read only the e2m1 staging
+                        exec.add_rmsnorm_quant_nvf4_pf(
+                            &mut sc.d_x,
+                            Some(&sc.d_proj),
+                            mixer_b16,
+                            &layer.post_norm.buf,
+                            None,
+                            &mut sc.d_pxq,
+                            &mut sc.d_nvs,
+                            embd,
+                            r,
+                            eps,
+                        )?;
+                        xq_ready = true;
+                    } else {
+                        prefill_add_norm_quant(
+                            &exec,
+                            &mut sc.d_x,
+                            Some(&sc.d_proj),
+                            mixer_b16,
+                            &layer.post_norm.buf,
+                            &mut sc.d_xn,
+                            true,
+                            &mut sc.d_pxq,
+                            &mut sc.d_pxs,
+                            &mut sc.d_yq,
+                            embd,
+                            r,
+                            eps,
+                        )?;
+                    }
                     if let Some([gu_t, dn_t]) = f8t_ffn {
                         exec.quantize_e4m3_row(
                             &sc.d_xn,
@@ -7578,10 +7768,9 @@ impl GpuQwen35 {
                     } else {
                         // no plane pair (small card / kill switch): the
                         // checkpoint-exact W4A16 walk
-                        nvf4_ffn(
+                        super::ops::nvf4_ffn_staged(
                             &exec,
-                            gate,
-                            up,
+                            gu,
                             down,
                             &sc.d_xn,
                             &mut sc.d_pxq,
@@ -7589,9 +7778,13 @@ impl GpuQwen35 {
                             &mut sc.d_nv4part,
                             &mut sc.d_ffn_gate,
                             &mut sc.d_ffn_up,
+                            &mut sc.d_ffn_gu,
+                            &mut sc.d_swq_q,
+                            &mut sc.d_swq_s,
                             &mut sc.d_proj,
                             ff,
                             r,
+                            xq_ready,
                         )?;
                     }
                 }
@@ -7646,11 +7839,20 @@ impl GpuQwen35 {
                     )?;
                 }
             }
-            if proj_is_b16 {
+            if pf_hoist {
+                pend_ffn = Some(proj_is_b16);
+            } else if proj_is_b16 {
                 exec.add_b16(&mut sc.d_x, &sc.d_proj, r * embd)?;
             } else {
                 exec.add(&mut sc.d_x, &sc.d_proj, r * embd)?;
             }
+        }
+        // hoist flush: the last layer's FFN residual lands before the final
+        // norm (which has no residual arm)
+        match pend_ffn.take() {
+            Some(true) => exec.add_b16(&mut sc.d_x, &sc.d_proj, r * embd)?,
+            Some(false) => exec.add(&mut sc.d_x, &sc.d_proj, r * embd)?,
+            None => {}
         }
         exec.rmsnorm_batch(&sc.d_x, &out_norm.buf, &mut sc.d_h, embd, eps, r)?;
 
@@ -10504,7 +10706,7 @@ impl GpuQwen35 {
                         }
                     } // end tcgen05-vs-warp arm (PADDOCK_QWEN_F8T)
                 }
-                Ffn::Nvf4Dense { gate, up, down } => {
+                Ffn::Nvf4Dense { gu, down } => {
                     // f8t tile arm first, exactly as the Dense arm above and
                     // off the same planes - load.rs builds them from the
                     // NVFP4 checkpoint's own values when headroom allows.
@@ -10559,8 +10761,7 @@ impl GpuQwen35 {
                         // above the row band the chain takes the W4A4 arm
                         nvf4_ffn(
                             &exec,
-                            gate,
-                            up,
+                            gu,
                             down,
                             &sc.d_xn,
                             &mut sc.d_pxq,
@@ -10568,6 +10769,9 @@ impl GpuQwen35 {
                             &mut sc.d_nv4part,
                             &mut sc.d_ffn_gate,
                             &mut sc.d_ffn_up,
+                            &mut sc.d_ffn_gu,
+                            &mut sc.d_swq_q,
+                            &mut sc.d_swq_s,
                             &mut sc.d_proj,
                             ff,
                             b,

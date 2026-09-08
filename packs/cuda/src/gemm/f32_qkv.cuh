@@ -573,15 +573,25 @@ static int pd_f32nt_ks_go(const float* w, const float* x, float* y,
     const uint32_t mtiles = (batch + 63u) / 64u, ntiles = out_dim / 32u;
     const uint32_t kw_steps = (in_dim / PD_RGEMM_BK + S - 1u) / S;
     const uint32_t kwin = kw_steps * PD_RGEMM_BK;
-    float* part;
-    if (cudaMallocAsync(&part, (size_t)S * batch * out_dim * 4u, s))
-        return cudaErrorMemoryAllocation;
+    // grow-once partial planes (2026-09-08): the per-call cudaMallocAsync /
+    // FreeAsync pair was this arm's only cost over the tf32 one (the c16
+    // TTFT p90 straggler class on the big die) and kept it opt-in.
+    // Launchers run under the engine's per-stream serialization, so the
+    // statics are safe; the buffer never shrinks.
+    static float* part = nullptr;
+    static size_t part_cap = 0;
+    const size_t need = (size_t)S * batch * out_dim * 4u;
+    if (need > part_cap) {
+        if (part) cudaFree(part);
+        part = nullptr; part_cap = 0;
+        if (cudaMalloc(&part, need) != cudaSuccess) { part = nullptr; return cudaErrorMemoryAllocation; }
+        part_cap = need;
+    }
     dim3 g(mtiles, ntiles, S);
     pd_gemm_f32_nt_ks_kernel<4u, 2u><<<g, 256, 0, s>>>(w, x, part, in_dim,
                                                        out_dim, batch, kwin);
     const uint32_t n = batch * out_dim;
     pd_f32nt_comb_kernel<<<(n / 4u + 255u) / 256u, 256u, 0, s>>>(part, y, n, S);
-    cudaFreeAsync(part, s);
     return pd_launch_status();
 }
 
@@ -1007,7 +1017,13 @@ int pd_matvec_f32_batch(const void* w, const void* x, void* out, uint32_t in_dim
         const char* e = pd_env("PADDOCK_BA_TF32");
         return e ? (e[0] == 'p' ? 1 : (atoi(e) != 0 ? 3 : 0)) : 0;
     }();
-    if (ba_tf32 && batch >= 1024u && out_dim <= 128u && (out_dim % 32u) == 0u &&
+    // PADDOCK_ROUTER_GEMM_MIN (bench/A-B): the row floor the three tiled
+    // arms engage at (default 1024, the big-die measurement)
+    static const uint32_t rg_min = [] {
+        const char* e = pd_env("PADDOCK_ROUTER_GEMM_MIN");
+        return e ? (uint32_t)atoi(e) : 1024u;
+    }();
+    if (ba_tf32 && batch >= rg_min && out_dim <= 128u && (out_dim % 32u) == 0u &&
         (in_dim % PD_RGEMM_BK) == 0u) {
         dim3 grid((batch + 31u) / 32u, out_dim / 32u);
         if (ba_tf32 == 1)
@@ -1020,7 +1036,20 @@ int pd_matvec_f32_batch(const void* w, const void* x, void* out, uint32_t in_dim
                 batch);
         return pd_launch_status();
     }
-    if (nt_ks && batch >= 1024u && out_dim <= 128u && (out_dim % 32u) == 0u &&
+    // Small dies (< 128 SMs, GB10 2026-09-08): the K-split arm is the
+    // election for skinny-out planes from 256 rows, no env needed. The
+    // qwen3.8-27b alpha/beta plane ([96 x 5120] f32, 48 layers) on the tile
+    // matvec re-reads x 12x and w 255x per launch (~760 MB through a 24 MB
+    // L2 for a 23 MB problem): 516 us at 1017 rows, 284 at 512, 153 at
+    // 256. Measured on the same die (bench/skinny_f32_gb10_bench.cu, best
+    // of 8): K-split 199 / 135 / 95 us, 3xTF32 200 / 137 / 108, exact-f32
+    // tiles 227 / 180 / 168. Exact f32 FMA in a fixed-order combine (the
+    // regroup class the tile matvec itself ships under - the token gates
+    // arbitrate); the big-die floors are untouched.
+    static int nsm_sk = 0;
+    if (nsm_sk == 0) { int d = 0; cudaGetDevice(&d); cudaDeviceGetAttribute(&nsm_sk, cudaDevAttrMultiProcessorCount, d); if (nsm_sk <= 0) nsm_sk = 148; }
+    const bool ks_small = nsm_sk < 128 && batch >= 256u && pd_env("PADDOCK_NO_F32NT_KS") == nullptr;
+    if ((nt_ks || ks_small) && (ks_small || batch >= rg_min) && out_dim <= 128u && (out_dim % 32u) == 0u &&
         (in_dim % PD_RGEMM_BK) == 0u) {
         const uint32_t base = ((batch + 63u) / 64u) * (out_dim / 32u);
         const uint32_t S = base >= 376u ? 1u : (376u + base - 1u) / base > 16u ? 16u : (376u + base - 1u) / base;
@@ -1028,7 +1057,7 @@ int pd_matvec_f32_batch(const void* w, const void* x, void* out, uint32_t in_dim
             return pd_f32nt_ks_go((const float*)w, (const float*)x, (float*)out,
                                   in_dim, out_dim, batch, S, (cudaStream_t)stream);
     }
-    if (rgemm && batch >= 1024u && (out_dim % 32u) == 0u &&
+    if (rgemm && batch >= rg_min && (out_dim % 32u) == 0u &&
         (in_dim % PD_RGEMM_BK) == 0u) {
         // Tile by GRID FILL. Per output element the K walk (k0 chunks, kk
         // ascending, one owning thread) is tile-size-invariant, so every

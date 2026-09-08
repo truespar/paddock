@@ -411,6 +411,10 @@ impl GpuExecutor {
 
     /// Slot 534: [`Self::swiglu_fused`] over an INTERLEAVED [rows, 2ff]
     /// landing (gate at 2j, up at 2j+1 -- `Nvf4Plane::gu_pairs`).
+    pub fn has_swiglu_fused_il(&self) -> bool {
+        self.kernels.swiglu_fused_il.is_some()
+    }
+
     pub fn swiglu_fused_il(
         &self,
         fused: &CudaSlice<f32>,

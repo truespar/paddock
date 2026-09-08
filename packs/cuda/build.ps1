@@ -89,6 +89,14 @@ foreach ($a in $Arches) {
             $gencode += "-gencode=arch=compute_120a,code=sm_120a"
             $bsHost = $true
         }
+        # 121 (DGX Spark GB10) mirrors build.sh: its 'a' twin carries the same
+        # block-scale MMA family, and PD_BS_SM121 lets pd_dev_bs_sass elect
+        # those bodies on a 12.1 die (2026-09-07).
+        if ($a -eq 121) {
+            $gencode += "-gencode=arch=compute_121a,code=sm_121a"
+            $bsHost = $true
+            $defines += "-DPD_BS_SM121=1"
+        }
         # sm_100 (B200): mirrors build.sh (an audit caught this script
         # shipping SM100 without its own TCGEN05 route).
         # The 100a feature target carries tcgen05 (tensor-memory MMA) for the

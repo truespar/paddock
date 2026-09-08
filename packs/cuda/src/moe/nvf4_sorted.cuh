@@ -350,11 +350,7 @@ __global__ void __launch_bounds__(256, 2) pd_nvf4_moe_up_relu2_bs_kernel(
 // *_bs kernels are sm_120a SASS, and no other die implements packed-fp4 MMA.
 static bool pd_nv4t_arm() {
     static const bool v = [] {
-        int dev = 0, cma = 0, cmi = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&cma, cudaDevAttrComputeCapabilityMajor, dev);
-        cudaDeviceGetAttribute(&cmi, cudaDevAttrComputeCapabilityMinor, dev);
-        return !(cma == 12 && cmi == 0) && pd_env("PADDOCK_NO_NV4TILE") == nullptr;
+        return !pd_dev_bs_sass() && pd_env("PADDOCK_NO_NV4TILE") == nullptr;
     }();
     return v;
 }

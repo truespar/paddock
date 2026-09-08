@@ -19,11 +19,14 @@
 //! into).
 //!
 //! The case the refusal covered better is the same-major minor (GB10 / DGX
-//! Spark, sm_121): plain sm_120 SASS forward-loads onto it, the trial launch
-//! passes, and the `sm_120a`-only tensor-core families - which the pack's
-//! per-device table resolves by MAJOR (exports.cuh) - fail at their first
-//! launch rather than at startup. The warning says so; a Spark campaign is
-//! the fix, not a gate.
+//! Spark, sm_121): the trial launch passes on the fatbin's sm_121 image, and
+//! an `sm_120a`-only tensor-core family reached through a host election that
+//! tests only the MAJOR does not fail at all - it launches the stub body the
+//! sm_121 pass compiled (measured 2026-09-07: the lin kt3 election did
+//! exactly that, untouched output planes, garbage from the first token). The
+//! pack's rule since then is one host function, `pd_dev_bs_sass` (abi.cuh),
+//! matched exactly. The warning says the die is unmeasured; a Spark campaign
+//! (an sm_121a target with its own probes) is the fix, not a gate.
 //!
 //! Lifecycle per generation: unknown -> serves with the warning; in bring-up
 //! -> the same, with the campaign named; validated -> listed below, with the

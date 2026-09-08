@@ -1,4 +1,4 @@
-# Build pdfium from source as ONE static library for linux-x64.
+# Build pdfium from source as ONE static library for linux-x64 or linux-arm64.
 #
 # Retargeted from lector's WASM build (c:\dev\lector packages/pdfium-wasm/build):
 # same depot_tools + gclient recipe, native clang toolchain instead of
@@ -11,6 +11,7 @@
 #   PDFIUM_VERSION  - pdfium branch to build (e.g. chromium/8009). The default
 #                     below is the pin; packs/pdfium/VERSION is what everything
 #                     else reads, and the two must agree.
+#   TARGET_CPU      - x64 (default) or arm64; picks args-linux-<cpu>.gn.
 
 # Pinned by digest, matching lector's base: the floating `24.04` tag drifts and
 # a base-image update would silently invalidate the layer cache AND change the
@@ -66,9 +67,14 @@ RUN git clone https://pdfium.googlesource.com/pdfium.git /build/pdfium \
 # Hooks fetch clang, gn, ninja and the sysroot - separate layer so a hook
 # failure is distinguishable from a source-fetch failure.
 RUN cd /build && gclient runhooks
+# --- Layer 4b: the target CPU. x64 is the release lane; arm64 is cross-built
+# for aarch64 boxes (DGX Spark, Jetson) and needs Chromium's arm64 sysroot on
+# top of the host one the hooks fetched.
+ARG TARGET_CPU=x64
+RUN if [ "${TARGET_CPU}" = "arm64" ]; then       cd /build/pdfium && python3 build/linux/sysroot_scripts/install-sysroot.py --arch=arm64;     fi
 
 # --- Layer 5: configure + build ---
-COPY args-linux.gn /build/pdfium/out/static/args.gn
+COPY args-linux-${TARGET_CPU}.gn /build/pdfium/out/static/args.gn
 WORKDIR /build/pdfium
 RUN gn gen out/static
 RUN ninja -C out/static pdfium -j$(nproc)

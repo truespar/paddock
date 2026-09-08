@@ -331,6 +331,107 @@ __global__ __launch_bounds__(D) void pd_gated_delta_recurrent_kernel_t(
     for (uint32_t i = 0; i < D; ++i) s_head[(size_t)i * D + j] = col[i];
 }
 
+// Single-sequence walk, P-SPLIT + PRE-NORMED (slot 596's kernel). Three
+// things happen here that the shipped walk could not do at once:
+//
+//  * P threads share a state COLUMN, each owning D/P of its rows. The columns
+//    of the delta rule never interact - (I - beta k k^T) mixes ROWS, and a
+//    column needs only its own rows plus the head's (q, k) - so the split
+//    costs nothing across blocks, just a P-lane butterfly for the two dots.
+//    The unsplit walk held a whole column in registers: ncu measured 255
+//    registers a thread, a block limit of TWO an SM, 12.57% occupancy, with
+//    n_heads = 48 blocks on a 148-SM die.
+//  * the norms come PRE-COMPUTED in `rn` (the companion pass below), where
+//    the shipped walk ran two shared trees a token - ~15 barriers.
+//  * with only D/P rows to serve, a thread reads its own q and k straight
+//    from global instead of staging the head's vectors in shared, so the
+//    token loop has NO barrier at all. A warp's lanes cover one column's
+//    rows contiguously, so those reads coalesce.
+//
+// Measured on Flash-Next IQ3_XXS at a 2114-row prefill, ms a layer: 3.85
+// unsplit, 3.48 at P=4, 3.03 at P=16 (the split alone stops paying because
+// every block redid the trees), and this form at P=16.
+//
+// The norms are bit-identical to the tree (same order, same pass). What
+// re-associates is the two dots - a P-lane butterfly where one thread summed
+// D terms - which is the wave-prefill class this lane already carries; the
+// decode entries below keep the unsplit order.
+template <uint32_t D, uint32_t P>
+__global__ __launch_bounds__(128) void pd_gated_delta_recurrent_pn_kernel_t(
+        const float* __restrict__ q, const float* __restrict__ k,
+        const float* __restrict__ v, const float* __restrict__ g,
+        const float* __restrict__ beta, float* __restrict__ state,
+        float* __restrict__ out, const float* __restrict__ rn,
+        uint32_t n_tokens, uint32_t n_heads) {
+    constexpr uint32_t C = 128u / P;      // state columns a block owns
+    constexpr uint32_t R = D / P;         // state rows a thread owns
+    constexpr uint32_t SPLITS = D / C;    // blocks a head takes
+    const uint32_t h = blockIdx.x / SPLITS;
+    const uint32_t spl = blockIdx.x % SPLITS;
+    if (h >= n_heads) return;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t cl = tid / P, pp = tid % P;
+    const uint32_t j = spl * C + cl;      // this thread's state column
+    const uint32_t i0 = pp * R;           // its first state row
+    const float scale = rsqrtf((float)D);
+
+    float col[R];
+    float* s_head = state + (size_t)h * D * D;
+    #pragma unroll
+    for (uint32_t ii = 0; ii < R; ++ii) col[ii] = s_head[(size_t)(i0 + ii) * D + j];
+
+    for (uint32_t t = 0; t < n_tokens; ++t) {
+        const size_t base = ((size_t)t * n_heads + h) * (size_t)D;
+        const float r0 = rn[((size_t)t * n_heads + h) * 2u];
+        const float r1 = rn[((size_t)t * n_heads + h) * 2u + 1u];
+        float qv[R], kv[R];
+        #pragma unroll
+        for (uint32_t ii = 0; ii < R; ++ii) {
+            qv[ii] = q[base + i0 + ii] * r0 * scale;
+            kv[ii] = k[base + i0 + ii] * r1;
+        }
+        const float vj = v[base + j];
+        const float g_t = expf(g[(size_t)t * n_heads + h]);
+        const float beta_t = beta[(size_t)t * n_heads + h];
+
+        // four accumulators: the dot is a dependent f32 chain ptxas cannot
+        // break, and a single chain of D terms is pure latency per token
+        float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
+        #pragma unroll
+        for (uint32_t ii = 0; ii < R; ii += 4u) {
+            col[ii] *= g_t; col[ii + 1u] *= g_t; col[ii + 2u] *= g_t; col[ii + 3u] *= g_t;
+            u0 += col[ii] * kv[ii];
+            u1 += col[ii + 1u] * kv[ii + 1u];
+            u2 += col[ii + 2u] * kv[ii + 2u];
+            u3 += col[ii + 3u] * kv[ii + 3u];
+        }
+        float u = (u0 + u1) + (u2 + u3);
+        #pragma unroll
+        for (uint32_t m = 1; m < P; m <<= 1) u += __shfl_xor_sync(0xffffffffu, u, m);
+        const float delta = beta_t * (vj - u);
+
+        float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+        #pragma unroll
+        for (uint32_t ii = 0; ii < R; ii += 4u) {
+            col[ii] += kv[ii] * delta;
+            col[ii + 1u] += kv[ii + 1u] * delta;
+            col[ii + 2u] += kv[ii + 2u] * delta;
+            col[ii + 3u] += kv[ii + 3u] * delta;
+            o0 += col[ii] * qv[ii];
+            o1 += col[ii + 1u] * qv[ii + 1u];
+            o2 += col[ii + 2u] * qv[ii + 2u];
+            o3 += col[ii + 3u] * qv[ii + 3u];
+        }
+        float o = (o0 + o1) + (o2 + o3);
+        #pragma unroll
+        for (uint32_t m = 1; m < P; m <<= 1) o += __shfl_xor_sync(0xffffffffu, o, m);
+        if (pp == 0u) out[base + j] = o;
+    }
+
+    #pragma unroll
+    for (uint32_t ii = 0; ii < R; ++ii) s_head[(size_t)(i0 + ii) * D + j] = col[ii];
+}
+
 // PRE-NORM pass (slot 541 companion): the walk's two per-token tree
 // reductions are over PER-TOKEN data - nothing in them is serial - and they
 // cost the walk most of its ~17 __syncthreads per token (the load-prefetch
@@ -363,11 +464,26 @@ __global__ __launch_bounds__(D) void pd_gdn_qk_rnorm_kernel(
 }
 
 // Runs walk, pre-normed twin: reads the scalars, keeps one staging barrier
-// per token where the tree form paid ~15. Arithmetic and order inside the
-// serial chain are identical to the tree kernel - the norms are the same
-// bits, the col update is untouched.
-template <uint32_t D>
-__global__ __launch_bounds__(D) void pd_gated_delta_recurrent_runs_pn_kernel_t(
+// per token where the tree form paid ~15. The norms are the same bits.
+//
+// P-SPLIT: `P` threads share a state COLUMN, each owning D/P of its rows.
+// The columns of the delta rule never interact - (I - beta k k^T) mixes ROWS,
+// and a column's update needs only that column's own rows plus the shared
+// (q, k) vectors - so the split needs no cross-block anything, just a P-lane
+// butterfly for the two dots. It exists because the unsplit walk holds the
+// whole column in registers: ncu says 255 registers a thread, a block limit
+// of TWO an SM and 12.57% achieved occupancy, with 48 blocks on a 148-SM die
+// and nothing resident to hide the serial chain. At P=4 the state costs D/4
+// registers, the grid is 4x the blocks, and the per-token chain is a quarter
+// as long.
+//
+// Thread layout is column-major (tid = c * P + p) so a column's P threads are
+// consecutive LANES and the butterfly is __shfl_xor, never shared memory.
+// The reduction across those lanes is a reassociation of the dot the unsplit
+// walk did in one thread - the wave prefill's own class, and the decode
+// entries below keep the unsplit order.
+template <uint32_t D, uint32_t P>
+__global__ __launch_bounds__(128) void pd_gated_delta_recurrent_runs_pn_kernel_t(
         const float* __restrict__ q, const float* __restrict__ k,
         const float* __restrict__ v, const float* __restrict__ g,
         const float* __restrict__ beta, float* __restrict__ state,
@@ -375,52 +491,86 @@ __global__ __launch_bounds__(D) void pd_gated_delta_recurrent_runs_pn_kernel_t(
         const unsigned int* __restrict__ run_len,
         const unsigned int* __restrict__ run_slot,
         const float* __restrict__ rn, uint32_t n_heads) {
-    const uint32_t h = blockIdx.x;
-    const uint32_t r = blockIdx.y;
-    const uint32_t j = threadIdx.x;
+    constexpr uint32_t C = 128u / P;        // state columns a block owns
+    constexpr uint32_t R = D / P;           // state rows a thread owns
+    constexpr uint32_t SPLITS = D / C;      // blocks a head takes
+    const uint32_t h = blockIdx.x / SPLITS;
+    const uint32_t sp = blockIdx.x % SPLITS;
+    const uint32_t r_run = blockIdx.y;
     if (h >= n_heads) return;
-    const uint32_t off = run_off[r];
-    const uint32_t len = run_len[r];
+    const uint32_t off = run_off[r_run];
+    const uint32_t len = run_len[r_run];
     if (len == 0) return;
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t cl = tid / P;            // column inside the block
+    const uint32_t pp = tid % P;            // which row slice
+    const uint32_t j = sp * C + cl;         // the state column this thread serves
+    const uint32_t i0 = pp * R;             // its first state row
 
     extern __shared__ float smem[];
     float* q_sh = smem;
     float* k_sh = smem + D;
     const float scale = rsqrtf((float)D);
 
-    float col[D];
+    float col[R];
     float* s_head = state
-        + ((size_t)run_slot[r] * (size_t)n_heads + (size_t)h) * (size_t)D * (size_t)D;
+        + ((size_t)run_slot[r_run] * (size_t)n_heads + (size_t)h) * (size_t)D * (size_t)D;
     #pragma unroll
-    for (uint32_t i = 0; i < D; ++i) col[i] = s_head[(size_t)i * D + j];
+    for (uint32_t ii = 0; ii < R; ++ii) col[ii] = s_head[(size_t)(i0 + ii) * D + j];
 
     for (uint32_t t = 0; t < len; ++t) {
         const size_t base = ((size_t)(off + t) * n_heads + h) * (size_t)D;
-        const float qj = q[base + j];
-        const float kj = k[base + j];
-        const float vj = v[base + j];
-        const float r0 = rn[((size_t)(off + t) * n_heads + h) * 2u];
-        const float r1 = rn[((size_t)(off + t) * n_heads + h) * 2u + 1u];
-        q_sh[j] = qj * r0 * scale;
-        k_sh[j] = kj * r1;
+        // stage the head's (q, k) once a token: every column reads all D rows
+        for (uint32_t i = tid; i < D; i += 128u) {
+            const float r0 = rn[((size_t)(off + t) * n_heads + h) * 2u];
+            const float r1 = rn[((size_t)(off + t) * n_heads + h) * 2u + 1u];
+            q_sh[i] = q[base + i] * r0 * scale;
+            k_sh[i] = k[base + i] * r1;
+        }
         __syncthreads();
 
+        const float vj = v[base + j];
         const float g_t = expf(g[(size_t)(off + t) * n_heads + h]);
         const float beta_t = beta[(size_t)(off + t) * n_heads + h];
 
-        float u = 0.0f;
+        // four accumulators: `u += col[i] * k[i]` is a dependent f32 chain and
+        // ptxas cannot break it (f32 add is not associative)
+        float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
         #pragma unroll
-        for (uint32_t i = 0; i < D; ++i) { col[i] *= g_t; u += col[i] * k_sh[i]; }
+        for (uint32_t ii = 0; ii < R; ii += 4u) {
+            col[ii] *= g_t; col[ii + 1u] *= g_t; col[ii + 2u] *= g_t; col[ii + 3u] *= g_t;
+            u0 += col[ii] * k_sh[i0 + ii];
+            u1 += col[ii + 1u] * k_sh[i0 + ii + 1u];
+            u2 += col[ii + 2u] * k_sh[i0 + ii + 2u];
+            u3 += col[ii + 3u] * k_sh[i0 + ii + 3u];
+        }
+        float u = (u0 + u1) + (u2 + u3);
+        #pragma unroll
+        for (uint32_t m = 1; m < P; m <<= 1) u += __shfl_xor_sync(0xffffffffu, u, m);
         const float delta = beta_t * (vj - u);
-        float o = 0.0f;
+
+        float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
         #pragma unroll
-        for (uint32_t i = 0; i < D; ++i) { col[i] += k_sh[i] * delta; o += col[i] * q_sh[i]; }
-        out[base + j] = o;
+        for (uint32_t ii = 0; ii < R; ii += 4u) {
+            col[ii] += k_sh[i0 + ii] * delta;
+            col[ii + 1u] += k_sh[i0 + ii + 1u] * delta;
+            col[ii + 2u] += k_sh[i0 + ii + 2u] * delta;
+            col[ii + 3u] += k_sh[i0 + ii + 3u] * delta;
+            o0 += col[ii] * q_sh[i0 + ii];
+            o1 += col[ii + 1u] * q_sh[i0 + ii + 1u];
+            o2 += col[ii + 2u] * q_sh[i0 + ii + 2u];
+            o3 += col[ii + 3u] * q_sh[i0 + ii + 3u];
+        }
+        float o = (o0 + o1) + (o2 + o3);
+        #pragma unroll
+        for (uint32_t m = 1; m < P; m <<= 1) o += __shfl_xor_sync(0xffffffffu, o, m);
+        if (pp == 0u) out[base + j] = o;
         __syncthreads();
     }
 
     #pragma unroll
-    for (uint32_t i = 0; i < D; ++i) s_head[(size_t)i * D + j] = col[i];
+    for (uint32_t ii = 0; ii < R; ++ii) s_head[(size_t)(i0 + ii) * D + j] = col[ii];
 }
 
 // Runs twin (slot 534): `n_runs` INDEPENDENT sequences in one launch, each
@@ -557,14 +707,18 @@ int pd_gated_delta_recurrent_runs_pn(const void* q, const void* k, const void* v
     if (head_dim > PD_DN_MAX_D) return cudaErrorInvalidValue;
     const size_t shmem = ((size_t)2 * head_dim) * sizeof(float);
     const dim3 ngrid(n_tokens, n_heads);
-    const dim3 wgrid(n_heads, n_runs);
-#define PD_DN_RUNS_PN_T(DD)                                                   \
+    // P is the row split (see the kernel note): the walk is register-bound,
+    // so a head takes D/(128/P) blocks of 128 threads instead of one block of
+    // D threads holding whole columns.
+#define PD_DN_RUNS_PN_T(DD, PP)                                               \
     do {                                                                      \
+        constexpr uint32_t C_ = 128u / (PP);                                  \
+        const dim3 wgrid(n_heads * ((DD) / C_), n_runs);                      \
         pd_gdn_qk_rnorm_kernel<DD>                                            \
             <<<ngrid, (DD), shmem, (cudaStream_t)stream>>>(                   \
                 (const float*)q, (const float*)k, (float*)rn, n_heads);       \
-        pd_gated_delta_recurrent_runs_pn_kernel_t<DD>                         \
-            <<<wgrid, (DD), shmem, (cudaStream_t)stream>>>(                   \
+        pd_gated_delta_recurrent_runs_pn_kernel_t<DD, PP>                     \
+            <<<wgrid, 128u, shmem, (cudaStream_t)stream>>>(                   \
                 (const float*)q, (const float*)k, (const float*)v,            \
                 (const float*)g, (const float*)beta, (float*)state,           \
                 (float*)out, (const unsigned int*)run_off,                    \
@@ -572,8 +726,8 @@ int pd_gated_delta_recurrent_runs_pn(const void* q, const void* k, const void* v
                 (const float*)rn, n_heads);                                   \
         return pd_launch_status();                                            \
     } while (0)
-    if (head_dim == 128u) PD_DN_RUNS_PN_T(128u);
-    if (head_dim == 64u) PD_DN_RUNS_PN_T(64u);
+    if (head_dim == 128u) PD_DN_RUNS_PN_T(128u, 4u);
+    if (head_dim == 64u) PD_DN_RUNS_PN_T(64u, 2u);
 #undef PD_DN_RUNS_PN_T
     return cudaErrorInvalidValue;
 }
@@ -588,7 +742,15 @@ int pd_gated_delta_recurrent(const void* q, const void* k, const void* v, const 
     if (n_tokens == 0 || n_heads == 0 || head_dim == 0) return 0;
     if (head_dim > PD_DN_MAX_D) return cudaErrorInvalidValue;
     size_t shmem = ((size_t)2 * head_dim + 2) * sizeof(float);
-#define PD_DN_REC_T(DD)                                                            do {                                                                               pd_gated_delta_recurrent_kernel_t<DD>                                              <<<n_heads, (DD), shmem, (cudaStream_t)stream>>>(                                  (const float*)q, (const float*)k, (const float*)v,                             (const float*)g, (const float*)beta, (float*)state,                            (float*)out, n_tokens, n_heads);                                       return pd_launch_status();                                                 } while (0)
+#define PD_DN_REC_T(DD)                                                       \
+    do {                                                                      \
+        pd_gated_delta_recurrent_kernel_t<DD>                                 \
+            <<<n_heads, (DD), shmem, (cudaStream_t)stream>>>(                 \
+                (const float*)q, (const float*)k, (const float*)v,            \
+                (const float*)g, (const float*)beta, (float*)state,           \
+                (float*)out, n_tokens, n_heads);                              \
+        return pd_launch_status();                                            \
+    } while (0)
     if (!pd_dn_rec_generic_env()) {
         if (head_dim == 128u) PD_DN_REC_T(128u);
         if (head_dim == 64u) PD_DN_REC_T(64u);
@@ -598,6 +760,41 @@ int pd_gated_delta_recurrent(const void* q, const void* k, const void* v, const 
         (const float*)q, (const float*)k, (const float*)v, (const float*)g,
         (const float*)beta, (float*)state, (float*)out, n_tokens, n_heads, head_dim);
     return pd_launch_status();
+}
+
+// slot 596: the single-sequence walk, P-SPLIT and PRE-NORMED. Same arguments
+// as slot 533 plus caller-owned `rn` scratch (n_tokens * n_heads * 2 floats,
+// what the runs_pn entry already sizes). The norms are the tree's bits; the
+// two dots re-associate across the split lanes, so this is the wave-prefill
+// class - the legacy entry above is untouched for every other caller.
+PD_EXPORT
+int pd_gated_delta_recurrent_pn(const void* q, const void* k, const void* v,
+                                const void* g, const void* beta, void* state,
+                                void* out, uint32_t n_tokens, uint32_t n_heads,
+                                uint32_t head_dim, void* rn, void* stream) {
+    if (pd_dns_nonf32_env()) return cudaErrorInvalidValue;
+    if (n_tokens == 0 || n_heads == 0 || head_dim == 0) return 0;
+    if (head_dim > PD_DN_MAX_D) return cudaErrorInvalidValue;
+    if (rn == nullptr) return cudaErrorInvalidValue;
+#define PD_DN_REC_PN_T(DD, PP)                                                \
+    do {                                                                      \
+        constexpr uint32_t C_ = 128u / (PP);                                  \
+        const dim3 ngrid_(n_tokens, n_heads);                                 \
+        pd_gdn_qk_rnorm_kernel<DD>                                            \
+            <<<ngrid_, (DD), (size_t)2 * (DD) * sizeof(float),                \
+               (cudaStream_t)stream>>>(                                       \
+                (const float*)q, (const float*)k, (float*)rn, n_heads);       \
+        pd_gated_delta_recurrent_pn_kernel_t<DD, PP>                          \
+            <<<n_heads * ((DD) / C_), 128u, 0u, (cudaStream_t)stream>>>(      \
+                (const float*)q, (const float*)k, (const float*)v,            \
+                (const float*)g, (const float*)beta, (float*)state,           \
+                (float*)out, (const float*)rn, n_tokens, n_heads);            \
+        return pd_launch_status();                                            \
+    } while (0)
+    if (head_dim == 128u) PD_DN_REC_PN_T(128u, 16u);
+    if (head_dim == 64u) PD_DN_REC_PN_T(64u, 8u);
+#undef PD_DN_REC_PN_T
+    return cudaErrorInvalidValue;
 }
 
 // Depthwise causal conv1d (kernel k) + SiLU - DeltaNet input conv. One thread per
@@ -2131,6 +2328,102 @@ int pd_q8_0_gemv_repacked(const void* data, const void* scale, const void* bias,
     pd_pdl_go(pd_q8_0_gemv_repacked_kernel, out_dim, threads, shmem, (cudaStream_t)stream,
         (const int8_t*)data, (const __half*)scale, (const float*)bias, (const float*)x,
         (float*)y, in_dim, out_dim);
+    return pd_launch_status();
+}
+
+// ---- K-SPLIT Q8_0 GEMV/GEMM for NARROW-OUT planes (slot 588) --------------
+// One block per output row is the right shape until the row count stops
+// filling the die: the hyper-connection down plane is [in 10240, out 320], so
+// the plain GEMV launches 320 blocks on a 148-SM machine (2 per SM against
+// the 12 it can hold) and the batched mt kernel is worse - its 16-row tile
+// makes TWENTY blocks. The plane is 3.5 MB and the walk runs 96 of these a
+// tick, which is how a bandwidth-shaped kernel ended up at ~175 GB/s.
+//
+// Here the row's dot is split over `split` blocks of K, each accumulating its
+// own chunk; the last block to finish a row folds the partials in ASCENDING
+// split order and writes. Deterministic (fixed fold order, counters reset to
+// zero so a captured graph replays identically), and the per-chunk math is
+// the plain kernel's - only the outer sum is regrouped, the same class the
+// f32 split-K matvec already carries.
+__global__ void pd_q8_0_gemv_sk_kernel(
+    const int8_t* __restrict__ data, const __half* __restrict__ scale,
+    const float* __restrict__ bias, const float* __restrict__ x,
+    float* __restrict__ y, float* __restrict__ partials,
+    unsigned int* __restrict__ counters, uint32_t in_dim, uint32_t out_dim,
+    uint32_t split) {
+    const uint32_t o = blockIdx.x, sp = blockIdx.y, b = blockIdx.z;
+    if (o >= out_dim) return;
+    const uint32_t tid = threadIdx.x, nth = blockDim.x;
+    const uint32_t n_blocks = in_dim >> 5;
+    // 32-aligned chunks: a 16-element thread chunk then lies wholly inside one
+    // Q8_0 block, exactly as in the plain kernel, so the scale lookup is the
+    // same single shared read.
+    const uint32_t cblocks = (n_blocks + split - 1u) / split;
+    const uint32_t k0 = sp * cblocks * 32u;
+    const uint32_t k1 = min(k0 + cblocks * 32u, in_dim);
+    extern __shared__ float ssc[];
+    const __half* srow = scale + (size_t)o * n_blocks;
+    for (uint32_t i = tid; k0 + i * 32u < k1; i += nth)
+        ssc[i] = __half2float(srow[(k0 >> 5) + i]);
+    PD_PDL_ARM();
+    __shared__ float wsum[32];
+    __syncthreads();
+    const int8_t* row = data + (size_t)o * in_dim;
+    const float* xr = x + (size_t)b * in_dim;
+    float acc = 0.0f;
+    for (uint32_t base = k0 + tid * 16u; base < k1; base += nth * 16u) {
+        int4 wv = *reinterpret_cast<const int4*>(row + base);
+        const int8_t* wb = reinterpret_cast<const int8_t*>(&wv);
+        float4 x0 = *reinterpret_cast<const float4*>(xr + base);
+        float4 x1 = *reinterpret_cast<const float4*>(xr + base + 4);
+        float4 x2 = *reinterpret_cast<const float4*>(xr + base + 8);
+        float4 x3 = *reinterpret_cast<const float4*>(xr + base + 12);
+        float s = (float)wb[0] * x0.x + (float)wb[1] * x0.y + (float)wb[2] * x0.z + (float)wb[3] * x0.w
+                + (float)wb[4] * x1.x + (float)wb[5] * x1.y + (float)wb[6] * x1.z + (float)wb[7] * x1.w
+                + (float)wb[8] * x2.x + (float)wb[9] * x2.y + (float)wb[10] * x2.z + (float)wb[11] * x2.w
+                + (float)wb[12] * x3.x + (float)wb[13] * x3.y + (float)wb[14] * x3.z + (float)wb[15] * x3.w;
+        acc += ssc[(base - k0) >> 5] * s;
+    }
+    for (uint32_t s2 = 16; s2 > 0; s2 >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, s2);
+    const uint32_t warp = tid >> 5, lane = tid & 31u;
+    if (lane == 0) wsum[warp] = acc;
+    __syncthreads();
+    if (tid == 0) {
+        float v = 0.0f;
+        const uint32_t nwarps = (nth + 31u) >> 5;
+        for (uint32_t w = 0; w < nwarps; ++w) v += wsum[w];
+        const size_t oi = (size_t)b * out_dim + o;
+        partials[oi * split + sp] = v;
+        __threadfence();
+        const unsigned int prev = atomicAdd(&counters[oi], 1u);
+        if (prev == split - 1u) {
+            float sum = 0.0f;
+            for (uint32_t t = 0; t < split; ++t) sum += partials[oi * split + t];
+            if (bias) sum += bias[o];
+            y[oi] = sum;
+            counters[oi] = 0u;   // graph-replay safe: back to the initial state
+        }
+    }
+}
+
+PD_EXPORT
+int pd_q8_0_gemv_sk(const void* data, const void* scale, const void* bias,
+                    const void* x, void* y, void* partials, void* counters,
+                    uint32_t in_dim, uint32_t out_dim, uint32_t batch,
+                    uint32_t split, void* stream) {
+    if (out_dim == 0 || batch == 0) return 0;
+    if (split < 2u || split > 32u) return cudaErrorInvalidValue;
+    if (in_dim & 31u) return cudaErrorInvalidValue;
+    const uint32_t n_blocks = in_dim >> 5;
+    if (split > n_blocks) return cudaErrorInvalidValue;
+    const uint32_t threads = 128;
+    const uint32_t cblocks = (n_blocks + split - 1u) / split;
+    const uint32_t shmem = cblocks * (uint32_t)sizeof(float);
+    dim3 grid(out_dim, split, batch);
+    pd_pdl_go(pd_q8_0_gemv_sk_kernel, grid, threads, shmem, (cudaStream_t)stream,
+        (const int8_t*)data, (const __half*)scale, (const float*)bias,
+        (const float*)x, (float*)y, (float*)partials, (unsigned int*)counters,
+        in_dim, out_dim, split);
     return pd_launch_status();
 }
 

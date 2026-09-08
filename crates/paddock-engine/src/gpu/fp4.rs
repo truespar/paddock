@@ -1028,16 +1028,17 @@ impl GpuExecutor {
                 scales.len()
             )));
         }
-        let mut data = self.alloc_u8(packed.len())?;
-        let mut scale = self.alloc_u8(scales.len())?;
-        {
-            let (dp, _g1) = data.device_ptr_mut(&self.stream);
-            // SAFETY: freshly allocated device range of exactly packed.len()
-            unsafe { cudarc::driver::result::memcpy_htod_sync(dp, packed).map_err(drv)? };
-            let (sp, _g2) = scale.device_ptr_mut(&self.stream);
-            // SAFETY: freshly allocated device range of exactly scales.len()
-            unsafe { cudarc::driver::result::memcpy_htod_sync(sp, scales).map_err(drv)? };
-        }
+        // Stream-ordered upload (clone_htod: alloc + copy on the engine
+        // stream). Until 2026-09-08 this was alloc_zeros + a raw cuMemcpyHtoD:
+        // the engine stream is non-blocking, so the legacy-stream copy was
+        // unordered against the memset still pending on it, and whenever the
+        // memset landed second the plane came up partly ZEROED - a different
+        // slice per process, fixed for the process's life. Found on GB10 as
+        // greedy text that differed across restarts of the NVFP4 lane while
+        // three requests inside one process were bit-identical (Spark
+        // session 6).
+        let data = self.stream.clone_htod(packed).map_err(drv)?;
+        let scale = self.stream.clone_htod(scales).map_err(drv)?;
         Ok(Nvf4Plane {
             data,
             scale,
@@ -1110,16 +1111,10 @@ impl GpuExecutor {
                     .copy_from_slice(&scales[r * (in_dim / 16) + ks * 8..][..8]);
             }
         }
-        let mut data = self.alloc_u8(ptm.len())?;
-        let mut scale = self.alloc_u8(stm.len())?;
-        {
-            let (dp, _g1) = data.device_ptr_mut(&self.stream);
-            // SAFETY: freshly allocated device range of exactly ptm.len()
-            unsafe { cudarc::driver::result::memcpy_htod_sync(dp, &ptm).map_err(drv)? };
-            let (sp, _g2) = scale.device_ptr_mut(&self.stream);
-            // SAFETY: freshly allocated device range of exactly stm.len()
-            unsafe { cudarc::driver::result::memcpy_htod_sync(sp, &stm).map_err(drv)? };
-        }
+        // stream-ordered upload - see nvf4_upload's note on the 2026-09-08
+        // race (alloc_zeros + a raw cuMemcpyHtoD zeroed planes at random)
+        let data = self.stream.clone_htod(&ptm).map_err(drv)?;
+        let scale = self.stream.clone_htod(&stm).map_err(drv)?;
         Ok(Nvf4Plane {
             data,
             scale,
@@ -1181,16 +1176,10 @@ impl GpuExecutor {
                     .copy_from_slice(&scales[r * (in_dim / 16) + ks * 8..][..8]);
             }
         }
-        let mut data = self.alloc_u8(ptm.len())?;
-        let mut scale = self.alloc_u8(stm.len())?;
-        {
-            let (dp, _g1) = data.device_ptr_mut(&self.stream);
-            // SAFETY: freshly allocated device range of exactly ptm.len()
-            unsafe { cudarc::driver::result::memcpy_htod_sync(dp, &ptm).map_err(drv)? };
-            let (sp, _g2) = scale.device_ptr_mut(&self.stream);
-            // SAFETY: freshly allocated device range of exactly stm.len()
-            unsafe { cudarc::driver::result::memcpy_htod_sync(sp, &stm).map_err(drv)? };
-        }
+        // stream-ordered upload - see nvf4_upload's note on the 2026-09-08
+        // race (alloc_zeros + a raw cuMemcpyHtoD zeroed planes at random)
+        let data = self.stream.clone_htod(&ptm).map_err(drv)?;
+        let scale = self.stream.clone_htod(&stm).map_err(drv)?;
         Ok(Nvf4Plane {
             data,
             scale,
@@ -1751,6 +1740,47 @@ impl GpuExecutor {
                 .map(|v| v != "0")
                 .unwrap_or(true)
         });
+        // f4t4: the same ring four 128-K stages deep in the same 72 KB
+        // (quant/nvf4.cuh). Elected on dies under 128 SMs, where the 2-stage
+        // ring measured ~46% of the fp4 roof (GB10 2026-09-07: three loads
+        // in flight instead of one is the whole difference); the 188-SM die
+        // keeps f4t until it is measured there. PADDOCK_NVF4_F4T4=1 forces
+        // it anywhere, =0 kills it. Bit-exact vs f4t/f4c (same K order).
+        static F4T4: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+        let f4t4_pin = *F4T4.get_or_init(|| {
+            paddock_models::dev_var!("PADDOCK_NVF4_F4T4")
+                .ok()
+                .map(|v| v != "0")
+        });
+        // Shape rule from the bench: f4t4 wins where the epilogue dominates
+        // (out_dim > in_dim: gate/up 782 vs 839 us at 1k rows, 1552 vs 1685
+        // at 2k) and loses 3-4% on the down plane (out_dim < in_dim), so the
+        // default election takes the wide-output planes only.
+        let f4t4_on = f4t4_pin.unwrap_or(self.sm_count() < 128 && w.out_dim > w.in_dim);
+        if f4t_on
+            && f4t4_on
+            && w.in_dim.is_multiple_of(256)
+            && batch >= 128
+            && ntiles >= 64
+            && let Some(ft4) = self.kernels.nvf4_gemm_f4t4
+        {
+            // SAFETY: ABI contract (slot 586 = slot 430's); geometry validated above
+            return check(unsafe {
+                ft4(
+                    dp as *const _,
+                    sp as *const _,
+                    bp,
+                    xqp as *const _,
+                    xsp as *const _,
+                    yp as *mut _,
+                    w.scale2,
+                    w.in_dim as u32,
+                    w.out_dim as u32,
+                    batch as u32,
+                    self.stream_ptr(),
+                )
+            });
+        }
         if f4t_on
             && w.in_dim.is_multiple_of(256)
             && batch >= 128
@@ -2205,16 +2235,10 @@ impl GpuExecutor {
                 n_expert
             )));
         }
-        let mut data = self.alloc_u8(packed.len())?;
-        let mut scale = self.alloc_u8(scales.len())?;
-        {
-            let (dp, _g1) = data.device_ptr_mut(&self.stream);
-            // SAFETY: freshly allocated device range of exactly packed.len()
-            unsafe { cudarc::driver::result::memcpy_htod_sync(dp, packed).map_err(drv)? };
-            let (sp, _g2) = scale.device_ptr_mut(&self.stream);
-            // SAFETY: freshly allocated device range of exactly scales.len()
-            unsafe { cudarc::driver::result::memcpy_htod_sync(sp, scales).map_err(drv)? };
-        }
+        // stream-ordered upload - see nvf4_upload's note on the 2026-09-08
+        // race (alloc_zeros + a raw cuMemcpyHtoD zeroed planes at random)
+        let data = self.stream.clone_htod(packed).map_err(drv)?;
+        let scale = self.stream.clone_htod(scales).map_err(drv)?;
         let scale2 = self.stream.clone_htod(scale2).map_err(drv)?;
         Ok(Nvf4MoePlane {
             data,
@@ -2285,16 +2309,10 @@ impl GpuExecutor {
                 }
             }
         }
-        let mut data = self.alloc_u8(ptm.len())?;
-        let mut scale = self.alloc_u8(stm.len())?;
-        {
-            let (dp, _g1) = data.device_ptr_mut(&self.stream);
-            // SAFETY: freshly allocated device range of exactly ptm.len()
-            unsafe { cudarc::driver::result::memcpy_htod_sync(dp, &ptm).map_err(drv)? };
-            let (sp, _g2) = scale.device_ptr_mut(&self.stream);
-            // SAFETY: freshly allocated device range of exactly stm.len()
-            unsafe { cudarc::driver::result::memcpy_htod_sync(sp, &stm).map_err(drv)? };
-        }
+        // stream-ordered upload - see nvf4_upload's note on the 2026-09-08
+        // race (alloc_zeros + a raw cuMemcpyHtoD zeroed planes at random)
+        let data = self.stream.clone_htod(&ptm).map_err(drv)?;
+        let scale = self.stream.clone_htod(&stm).map_err(drv)?;
         let scale2 = self.stream.clone_htod(scale2).map_err(drv)?;
         Ok(Nvf4MoePlane {
             data,

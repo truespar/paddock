@@ -562,6 +562,14 @@ extern "C" int pd_moe_wave_plan(const void*, uint32_t, uint32_t, uint32_t, uint3
 extern "C" int pd_moe_cache_resolve_dev(const void*, const void*, uint32_t, void*, void*, void*, void*, void*, void*, void*, void*);
 extern "C" int pd_moe_wave_mask(const void*, uint32_t, uint32_t, const void*, const void*, uint32_t, uint32_t, void*, void*, void*, void*, void*, void*);
 extern "C" int pd_kquant_moe_gate_up_list(const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, const void*, const void*, void*);
+extern "C" int pd_kquant_moe_gate_up_grp(const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_kquant_moe_down_cols(const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_q8_0_gemv_sk(const void*, const void*, const void*, const void*, void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_kquant_moe_down_grp(const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_moe_part_fold_at(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_kquant_moe_gate_up_tile(const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_kquant_moe_down_tile(const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_gated_delta_recurrent_pn(const void*, const void*, const void*, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, void*, void*);
 extern "C" int pd_kquant_moe_down_list(const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, const void*, const void*, void*);
 extern "C" int pd_q4x_add_gated_row(void*, const void*, const void*, uint32_t, uint32_t, void*);
 extern "C" int pd_q4x_add_gated_row_s(void*, const void*, const void*, uint32_t, uint32_t, uint32_t, void*);
@@ -1498,6 +1506,22 @@ static const KernelTableV1 PD_KERNELS = {
     pd_kquant_moe_gate_up_list,
     pd_kquant_moe_down_list,
     pd_kquant_iq_tile,
+    pd_kquant_moe_gate_up_grp,
+    pd_kquant_moe_down_cols,
+    pd_q8_0_gemv_sk,
+    // 589: nvf4_gemm_f4t4 - the f4t ring at four 128-K stages (block-scale
+    // SASS like 430; NULLed with it). Small-die election, see fp4.rs.
+    pd_nvf4_gemm_f4t4,
+    pd_kquant_moe_down_grp,
+    pd_moe_part_fold_at,
+    pd_kquant_moe_gate_up_tile,
+    pd_kquant_moe_down_tile,
+    // 594/595: prefill add+rmsnorm with the e4m3 / nvf4 quant epilogue
+    // (the mmq prenorm's exact norm; generic CUDA + the fp8 cvt, no NULL rule
+    // beyond the arch floor every fp8 quant already has).
+    pd_add_rmsnorm_quant_e4m3_pf,
+    pd_add_rmsnorm_quant_nvf4_pf,
+    pd_gated_delta_recurrent_pn,
 };
 
 PD_EXPORT const PackInfo* paddock_pack_info(void) {
@@ -1530,7 +1554,9 @@ PD_EXPORT const KernelTableV1* paddock_pack_kernels_v1(void) {
         // reports cma==12, so a major-only test would advertise these entries
         // on a die whose SASS was compiled with PD_BS_OK=0 -- empty kernel
         // bodies, silently. Minor revisions must fall back, not no-op.
-        if (!(cma == 12 && cmi == 0)) {
+        // pd_dev_bs_sass (abi.cuh) IS that rule; the in-launcher elections
+        // read the same function, after the kt3 one drifted to major-only.
+        if (!pd_dev_bs_sass()) {
             t.mxfp4_moe_gate_up_bs = NULL;
             t.mxfp4_moe_down_bs = NULL;
             t.mxfp4_moe_down_bs_res = NULL;
@@ -1547,6 +1573,7 @@ PD_EXPORT const KernelTableV1* paddock_pack_kernels_v1(void) {
             t.nvf4_gemm_f4s = NULL;
             t.nvf4_gemm_f4c = NULL;
             t.nvf4_gemm_f4t = NULL;
+            t.nvf4_gemm_f4t4 = NULL;
             t.q8_0_to_nvf4_rot = NULL;
             t.mxfp4_gemm_bs_gu = NULL;
             t.q8_0_to_nvf4_smooth = NULL;
@@ -1719,6 +1746,7 @@ PD_EXPORT const KernelTableV1* paddock_pack_kernels_v1(void) {
             t.f8bs_moe_gemm_gu_d32 = NULL;
             t.f8bs_moe_gemm_dn_d32 = NULL;
             t.nvf4_gemm_f4t = NULL;
+            t.nvf4_gemm_f4t4 = NULL;
             t.nvf4_gemm_f4t_swq = NULL;
             t.q8_0_moe_gate_up_g2_geglu = NULL;
             t.q8_0_moe_gate_up_mma2t_geglu = NULL;

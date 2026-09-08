@@ -155,6 +155,25 @@ static bool pd_tmap_2d(CUtensorMap* map, const void* base, uint64_t inner,
                CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
+// 64-byte-inner variant: 64B x 128-row boxes with the 64B swizzle, for a
+// TMA ring that stages 128 K of e2m1 (64 bytes) per stage instead of 256
+// (f4t4, quant/nvf4.cuh). Under SWIZZLE_64B the 16-byte chunk c of row r
+// lands at chunk c ^ ((r >> 1) & 3) (CUTLASS Swizzle<2,4,3>: offset bits
+// 7..8 fold into bits 4..5), where the 128B mode folds r & 7.
+static bool pd_tmap_2d_k64(CUtensorMap* map, const void* base, uint64_t inner,
+                           uint64_t rows) {
+    pd_tmap_encode_fn enc = pd_tmap_encode();
+    if (!enc || ((uintptr_t)base & 15u) || (inner & 15u)) return false;
+    const cuuint64_t gdim[2] = {inner, rows};
+    const cuuint64_t gstride[1] = {inner};
+    const cuuint32_t box[2] = {64u, 128u};
+    const cuuint32_t estride[2] = {1u, 1u};
+    return enc(map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2u, (void*)base, gdim, gstride,
+               box, estride, CU_TENSOR_MAP_INTERLEAVE_NONE,
+               CU_TENSOR_MAP_SWIZZLE_64B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+               CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
+}
+
 // half-row variant for: 128B x 64-row boxes, 128B swizzle kept
 static bool pd_tmap_2d_h64(CUtensorMap* map, const void* base, uint64_t inner,
                            uint64_t rows) {

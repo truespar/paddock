@@ -300,7 +300,33 @@ impl GpuQwen35 {
         Ok(())
     }
 
-    /// Batched prefill: run the whole `tokens` chunk through the backbone with one
+    /// The `Generator::forward_prefill_stream` entry: one stream, no scheduler.
+    /// Batched (the served configuration at every width, max_batch=1
+    /// included): the stream owns slot 0 and takes the same slot prefill the
+    /// scheduler drives per request, so the service warm-up exercises the
+    /// lane that will serve and the decode pipe that follows it finds its
+    /// prompt in slot 0. Routing this through the serial `prefill` instead
+    /// cost a dense max_ctx KV per full-attention layer + the MTP layer from
+    /// `ensure_decode` - 17 GiB at 262k on the k-quant lanes, allocated by
+    /// the warm-up after the plan audit had closed at zero unplanned and
+    /// never released (measured 2026-09-07: UD-Q3_K_XL 1x262k 58.5 GiB on
+    /// a 42.3 GiB plan; on Q8_0 the reclaim guard below refused it, so the
+    /// warm-up silently did nothing at all). Serial (no batch lane): the
+    /// token-by-token spine is the only path and stays the parity reference.
+    pub fn prefill_stream(&mut self, tokens: &[u32]) -> Result<Vec<f32>, GpuModelError> {
+        if self.batch.is_some() {
+            // run_request reaches this only with no request live (the
+            // service warm-up before the loop; the scheduler's hand-offs
+            // happen at active == 0), so every slot is idle: return what a
+            // previous stream left in slot 0 before reusing it
+            self.release_inactive_slots(&[]);
+            return self.forward_prefill_slot(0, tokens);
+        }
+        self.prefill(tokens)
+    }
+
+    /// Serial-lane prefill (no batch lane: the parity reference, the ppl gate,
+    /// the load tests): run the whole `tokens` chunk through the backbone with one
     /// GEMM pass per weight (batch-tiled - the weight is read once per 16 tokens,
     /// not per token; llama's pp lever), writing the persistent per-layer state (KV
     /// rows at slot 0, DeltaNet recurrent state, conv window) exactly as `step`-ing
@@ -309,6 +335,9 @@ impl GpuQwen35 {
     /// attention/norm/recurrence reuse the identical batched kernels, and the
     /// prefill conv from a zero window equals `conv_step`'s zero-window chain.
     /// Returns the last token's logits. Requires a fresh sequence (pos == 0).
+    /// Allocates the dense serial decode state (`ensure_decode`, a max_ctx KV
+    /// per full-attention layer) - a served generator enters through
+    /// `prefill_stream`, never here.
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>, GpuModelError> {
         let t_len = tokens.len();
         assert!(t_len > 0, "empty prefill");
@@ -861,7 +890,7 @@ impl GpuQwen35 {
                     }
                     dbg_norm!(li, "ffn_proj", &sc.d_proj, t_len * embd);
                 }
-                Ffn::Nvf4Dense { gate, up, down } => {
+                Ffn::Nvf4Dense { gu, down } => {
                     // off the f32 xn - write_xn=true, the int8 staging
                     // outputs are unused (the chain quantizes to nvf4 itself
                     // on the W4A4 arm, and consumes f32 below the band)
@@ -882,8 +911,7 @@ impl GpuQwen35 {
                     )?;
                     nvf4_ffn(
                         &exec,
-                        gate,
-                        up,
+                        gu,
                         down,
                         &sc.d_xn,
                         &mut sc.d_pxq,
@@ -891,6 +919,9 @@ impl GpuQwen35 {
                         &mut sc.d_nv4part,
                         &mut sc.d_ffn_gate,
                         &mut sc.d_ffn_up,
+                        &mut sc.d_ffn_gu,
+                        &mut sc.d_swq_q,
+                        &mut sc.d_swq_s,
                         &mut sc.d_proj,
                         ff,
                         t_len,
@@ -1425,7 +1456,7 @@ impl GpuQwen35 {
                     exec.swiglu(&mut sc.d_ffn_gate, &sc.d_ffn_up, ff)?;
                     gemv_any(&exec, down, &sc.d_ffn_gate, &mut sc.d_proj)?;
                 }
-                Ffn::Nvf4Dense { gate, up, down } => {
+                Ffn::Nvf4Dense { gu, down } => {
                     // f8t tile arm first, off the planes load.rs builds from
                     // the NVFP4 checkpoint's own values (see the Dense arm
                     // above - same chain, same planes).
@@ -1471,8 +1502,7 @@ impl GpuQwen35 {
                         // fused-gate note above applies - memory-bound)
                         nvf4_ffn(
                             &exec,
-                            gate,
-                            up,
+                            gu,
                             down,
                             &sc.d_xn,
                             &mut sc.d_pxq,
@@ -1480,6 +1510,9 @@ impl GpuQwen35 {
                             &mut sc.d_nv4part,
                             &mut sc.d_ffn_gate,
                             &mut sc.d_ffn_up,
+                            &mut sc.d_ffn_gu,
+                            &mut sc.d_swq_q,
+                            &mut sc.d_swq_s,
                             &mut sc.d_proj,
                             ff,
                             1,
@@ -1635,14 +1668,31 @@ impl GpuQwen35 {
             // n_heads*rows < 2*fill_blocks, so partial rows are bounded by
             // 2*fill*MAX_ATTN_SPLITS regardless of batch/row count (~37 MB at
             // 188 SMs, head_dim 256).
-            d_attn_o: e
-                .alloc(2 * attn_fill_blocks(e.sm_count()) * MAX_ATTN_SPLITS * self.head_dim)?,
-            d_attn_ml: e.alloc(2 * attn_fill_blocks(e.sm_count()) * MAX_ATTN_SPLITS * 2)?,
+            d_attn_o: e.alloc(
+                2 * attn_fill_blocks(super::attn_boundary_sms(e.sm_count()))
+                    * MAX_ATTN_SPLITS
+                    * self.head_dim,
+            )?,
+            d_attn_ml: e.alloc(
+                2 * attn_fill_blocks(super::attn_boundary_sms(e.sm_count())) * MAX_ATTN_SPLITS * 2,
+            )?,
             d_mixed: e.alloc(cap * self.conv_dim)?,
             d_conv: e.alloc(cap * self.conv_dim)?,
             d_dq: e.alloc(cap * self.value_dim)?,
             d_dk: e.alloc(cap * self.value_dim)?,
             d_dv: e.alloc(cap * self.value_dim)?,
+            // compact q/k: HK * s bf16 per row = (conv_dim - value_dim) / 2 halves
+            d_dqc: e.alloc(if super::dn_qkc(e) {
+                cap * (self.conv_dim - self.value_dim) / 4
+            } else {
+                1
+            })?,
+            d_dkc: e.alloc(if super::dn_qkc(e) {
+                cap * (self.conv_dim - self.value_dim) / 4
+            } else {
+                1
+            })?,
+            d_row0s_zero: e.alloc_u32(cap)?,
             d_a: e.alloc(cap * self.n_v_heads)?,
             d_b: e.alloc(cap * self.n_v_heads)?,
             d_ab: e.alloc(cap * 2 * self.n_v_heads)?,
@@ -1659,6 +1709,28 @@ impl GpuQwen35 {
             d_dnc_coef: e.alloc((cap.div_ceil(64) + 32) * self.n_v_heads * 64 * 64)?,
             d_dnc_cg: e.alloc_f64((cap.div_ceil(64) + 32) * self.n_v_heads * 64)?,
             d_ffn_gate: e.alloc(cap * self.ff)?,
+            // 128 rows: the wide band (>= 128) never lands (SWQ epilogue) - unless
+            // PADDOCK_NO_NVF4_SWQ pins the landing path for A/B, then every width
+            d_ffn_gu: e.alloc(if self.nvf4_gu_fused() {
+                let rows = if paddock_models::dev_var_os!("PADDOCK_NO_NVF4_SWQ").is_some() {
+                    cap
+                } else {
+                    cap.min(128)
+                };
+                rows * 2 * self.ff
+            } else {
+                1
+            })?,
+            d_swq_q: e.alloc_i8(if self.nvf4_gu_fused() {
+                cap * self.ff / 2
+            } else {
+                1
+            })?,
+            d_swq_s: e.alloc_u8(if self.nvf4_gu_fused() {
+                cap * self.ff / 16
+            } else {
+                1
+            })?,
             d_moe_logits: e.alloc(self.moe.map_or(1, |m| cap * m.n_expert))?,
             d_moe_idx: e.alloc_u32(self.moe.map_or(1, |m| cap * m.n_active))?,
             d_moe_w: e.alloc(self.moe.map_or(1, |m| cap * m.n_active))?,

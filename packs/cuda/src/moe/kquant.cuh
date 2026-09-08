@@ -60,7 +60,15 @@ __global__ void __launch_bounds__(256) pd_kquant_moe_gate_up_kernel(
     uint32_t gdt, uint32_t udt, const unsigned int* __restrict__ list,
     const unsigned int* __restrict__ n_list) {
     PD_PDL_ARM();
-    const uint32_t o = blockIdx.x;
+    // PLAIN grid is (batch, n_active, ff): the out row is the SLOW axis, so a
+    // row's whole pair set dispatches together. What the grouped kernel below
+    // left this one is the DECODE band (routed rows <= n_expert), and that is
+    // where the order pays - measured on Flash-Next IQ3_XXS 2026-09-07, same
+    // pack otherwise: c32 260.2 vs 248.0 out_tok/s, imax 277.6 vs 244.0. At
+    // prefill widths it was neutral either way (the grouped kernel serves
+    // those now). Index mapping only: same block, same math, same fold,
+    // bit-identical output.
+    const uint32_t o = LIST ? blockIdx.x : blockIdx.z;
     const uint32_t tid = threadIdx.x, nth = blockDim.x;
     const uint32_t p_hi = LIST ? *n_list : 1u;
     for (uint32_t p = LIST ? blockIdx.y : 0u; p < p_hi; p += LIST ? gridDim.y : 1u) {
@@ -71,7 +79,7 @@ __global__ void __launch_bounds__(256) pd_kquant_moe_gate_up_kernel(
         slot = pr - b * n_active;
     } else {
         slot = blockIdx.y;
-        b = blockIdx.z;
+        b = blockIdx.x;
     }
     const uint32_t e = idx[(size_t)b * n_active + slot];
     // Absent pair (the expert-major prefill's out-of-wave sentinel,
@@ -155,7 +163,7 @@ int pd_kquant_moe_gate_up(const void* gate_data, const void* gate_scales,
     const bool mu = pd_kq_has_mu(gdt) ||
                     pd_kq_has_mu(udt);
     if (mu && xsums == nullptr) return cudaErrorInvalidValue;
-    dim3 grid(ff, n_active, batch);
+    dim3 grid(batch, n_active, ff);   // out row SLOW - see the kernel note
     // Block width = one thread per 16-weight window, warp-rounded, capped at
     // 256. BIT-EXACT against the old flat-256 launch: a thread's window is
     // tid*16 either way, so the surviving threads hold the same partial in the
@@ -209,6 +217,158 @@ int pd_kquant_moe_gate_up_list(const void* gate_data, const void* gate_scales,
     return pd_launch_status();
 }
 
+// ---- expert-grouped gate+up (the prefill class) ----------------------------
+// The pair kernel above unpacks a weight window per ROUTED ROW: at 512
+// experts x top-10 a 200-token prompt routes ~3.9 rows to each expert, so
+// every expert's rows were unpacked 3.9 times over. ncu on the shipped pair
+// kernel: SM 52% of peak against DRAM 23% - i-quant UNPACK, not bandwidth, is
+// what a prefill spends its MoE time on, and a grid transpose (L2 reuse) moved
+// it 0%. Here a block owns (expert group, out row) from the moe_align layout:
+// each thread unpacks its 16-weight window ONCE and walks the group's up-to-T
+// routed rows against it. T=8 covers a whole expert at this density (one block
+// per expert), so the unpack cost falls by the rows-per-expert factor while the
+// dp4a work - which is per row either way - is unchanged.
+//
+// BIT-IDENTICAL to the pair kernel: same per-window math in the same order,
+// same 32-lane shuffle tree per row, same ascending-warp fold. A row's output
+// does not depend on which block computed it, and PAD lanes write nothing.
+template <uint32_t T>
+__global__ void __launch_bounds__(256, 4) pd_kquant_moe_gate_up_grp_kernel(
+    const uint8_t* __restrict__ gd, const uint8_t* __restrict__ gsc,
+    const uint8_t* __restrict__ ud_, const uint8_t* __restrict__ usc,
+    const unsigned int* __restrict__ sorted_row,
+    const unsigned int* __restrict__ sorted_slot,
+    const unsigned int* __restrict__ block_expert, const int8_t* __restrict__ xq,
+    const float* __restrict__ xs, const float* __restrict__ xsums,
+    float* __restrict__ out, uint32_t in_dim, uint32_t ff, uint32_t n_active,
+    uint32_t gdt, uint32_t udt) {
+    PD_PDL_ARM();
+    const uint32_t blk = blockIdx.x, o = blockIdx.y;
+    const uint32_t e = block_expert[blk];
+    if (e == PD_MOE_PAD) return;
+    const uint32_t tid = threadIdx.x, nth = blockDim.x;
+
+    __shared__ unsigned int srow_sh[T], sslot_sh[T];
+    if (tid < T) {
+        srow_sh[tid] = sorted_row[(size_t)blk * T + tid];
+        sslot_sh[tid] = sorted_slot[(size_t)blk * T + tid];
+    }
+    __syncthreads();
+
+    const uint32_t gdb = pd_kq_datab(gdt), udb = pd_kq_datab(udt);
+    const uint32_t gscb = pd_kq_scb(gdt), uscb = pd_kq_scb(udt);
+    const uint8_t* grow = gd + ((size_t)e * ff + o) * pd_kq_row_datab(gdt, in_dim);
+    const uint8_t* grec = gsc + ((size_t)e * ff + o) * pd_kq_row_scb(gdt, in_dim);
+    const uint8_t* urow = ud_ + ((size_t)e * ff + o) * pd_kq_row_datab(udt, in_dim);
+    const uint8_t* urec = usc + ((size_t)e * ff + o) * pd_kq_row_scb(udt, in_dim);
+    const bool gmu = pd_kq_has_mu(gdt);
+    const bool umu = pd_kq_has_mu(udt);
+
+    // The group's rows read `xq` straight from global: staging them in shared
+    // was measured (2026-09-08) and LOSES here - at in_dim 2560 a 16-row group
+    // is 46 KB of shared, which costs more occupancy than the re-reads cost
+    // traffic (8.97 -> 11.24 ms a layer at a 2114-row wave). The down half,
+    // whose rows are ff = 640 wide, stages and wins.
+    float accg[T], accu[T];
+    #pragma unroll
+    for (uint32_t i = 0; i < T; ++i) { accg[i] = 0.0f; accu[i] = 0.0f; }
+
+    for (uint32_t base = tid * 16u; base < in_dim; base += nth * 16u) {
+        const uint32_t s = base >> 8, w = (base >> 4) & 15u;
+        int wqg[4], wqu[4];
+        float fg, gg, fu, gu;
+        pd_kq_win_unpack(gdt, grow + (size_t)s * gdb, grec + (size_t)s * gscb, w, wqg, &fg, &gg);
+        pd_kq_win_unpack(udt, urow + (size_t)s * udb, urec + (size_t)s * uscb, w, wqu, &fu, &gu);
+        for (uint32_t i = 0; i < T; ++i) {
+            const unsigned int b = srow_sh[i];
+            if (b == PD_MOE_PAD) continue;
+            const int4 xv = *reinterpret_cast<const int4*>(xq + (size_t)b * in_dim + base);
+            const float x_s = xs[(size_t)b * (in_dim >> 5) + (base >> 5)];
+            int si = __dp4a(wqg[0], xv.x, 0);
+            si = __dp4a(wqg[1], xv.y, si);
+            si = __dp4a(wqg[2], xv.z, si);
+            si = __dp4a(wqg[3], xv.w, si);
+            accg[i] += fg * (x_s * (float)si);
+            if (gmu) accg[i] += gg * (x_s * xsums[(size_t)b * (in_dim >> 4) + (base >> 4)]);
+            si = __dp4a(wqu[0], xv.x, 0);
+            si = __dp4a(wqu[1], xv.y, si);
+            si = __dp4a(wqu[2], xv.z, si);
+            si = __dp4a(wqu[3], xv.w, si);
+            accu[i] += fu * (x_s * (float)si);
+            if (umu) accu[i] += gu * (x_s * xsums[(size_t)b * (in_dim >> 4) + (base >> 4)]);
+        }
+    }
+
+    __shared__ float wsum[2][T][8];
+    const uint32_t lane = tid & 31u, warp = tid >> 5, nwarps = (nth + 31u) >> 5;
+    for (uint32_t i = 0; i < T; ++i) {
+        float g = accg[i], u = accu[i];
+        for (uint32_t s2 = 16; s2 > 0; s2 >>= 1) {
+            g += __shfl_down_sync(0xffffffffu, g, s2);
+            u += __shfl_down_sync(0xffffffffu, u, s2);
+        }
+        if (lane == 0) { wsum[0][i][warp] = g; wsum[1][i][warp] = u; }
+    }
+    __syncthreads();
+    if (tid < T) {
+        const unsigned int b = srow_sh[tid];
+        if (b != PD_MOE_PAD) {
+            float g = 0.0f, u = 0.0f;
+            for (uint32_t w2 = 0; w2 < nwarps; ++w2) {
+                g += wsum[0][tid][w2];
+                u += wsum[1][tid][w2];
+            }
+            out[((size_t)b * n_active + sslot_sh[tid]) * ff + o] =
+                (g / (1.0f + __expf(-g))) * u;
+        }
+    }
+}
+
+// slot 586: the grouped form. `sorted_row`/`sorted_slot`/`block_expert` are a
+// pd_moe_align_bm(bm = group) layout over the SAME idx the pair kernel reads;
+// `group` is 8, 16 or 32 (the caller elects it from rows/n_expert - a whole
+// expert per block is the point). Output layout is the pair kernel's, so the
+// down kernel and the quantize between them are unchanged.
+PD_EXPORT
+int pd_kquant_moe_gate_up_grp(const void* gate_data, const void* gate_scales,
+                              const void* up_data, const void* up_scales,
+                              const void* sorted_row, const void* sorted_slot,
+                              const void* block_expert, const void* xq,
+                              const void* xs, const void* xsums, void* out,
+                              uint32_t in_dim, uint32_t ff, uint32_t n_active,
+                              uint32_t max_blocks, uint32_t group, uint32_t gdt,
+                              uint32_t udt, void* stream) {
+    if (ff == 0 || n_active == 0 || max_blocks == 0) return 0;
+    if ((in_dim & 31u) != 0) return cudaErrorInvalidValue;
+    if ((in_dim & 255u) != 0 && !(gdt == PD_KQ_IQ4NL_ID && udt == PD_KQ_IQ4NL_ID))
+        return cudaErrorInvalidValue;
+    if (!(pd_kq_valid(gdt) || pd_kq_valid_iq(gdt)) || !(pd_kq_valid(udt) || pd_kq_valid_iq(udt)))
+        return cudaErrorInvalidValue;
+    if ((pd_kq_has_mu(gdt) || pd_kq_has_mu(udt)) && xsums == nullptr)
+        return cudaErrorInvalidValue;
+    if (sorted_row == nullptr || sorted_slot == nullptr || block_expert == nullptr)
+        return cudaErrorInvalidValue;
+    uint32_t nth = (in_dim >> 4) < 256u ? (((in_dim >> 4) + 31u) & ~31u) : 256u;
+    if (nth < 32u) nth = 32u;
+    dim3 grid(max_blocks, ff);
+#define PD_KQ_GRP_GO(TV)                                                       \
+    pd_pdl_go(pd_kquant_moe_gate_up_grp_kernel<TV>, grid, nth, 0u,             \
+        (cudaStream_t)stream, (const uint8_t*)gate_data,                       \
+        (const uint8_t*)gate_scales, (const uint8_t*)up_data,                  \
+        (const uint8_t*)up_scales, (const unsigned int*)sorted_row,            \
+        (const unsigned int*)sorted_slot, (const unsigned int*)block_expert,   \
+        (const int8_t*)xq, (const float*)xs, (const float*)xsums, (float*)out, \
+        in_dim, ff, n_active, gdt, udt)
+    switch (group) {
+        case 8u: PD_KQ_GRP_GO(8u); break;
+        case 16u: PD_KQ_GRP_GO(16u); break;
+        case 32u: PD_KQ_GRP_GO(32u); break;
+        default: return cudaErrorInvalidValue;
+    }
+#undef PD_KQ_GRP_GO
+    return pd_launch_status();
+}
+
 // Routed k-quant down + weighted combine: out[b][o] = sum_slot topk_w *
 // dot(down[e][o], fused_q[b][slot]). grid (embd, batch); warp w owns slot w
 // (n_active <= 16, launcher sizes the block to 32*n_active), lanes stride ff
@@ -230,14 +390,17 @@ __global__ void __launch_bounds__(512) pd_kquant_moe_down_kernel(
     const unsigned int* __restrict__ rows_list, const unsigned int* __restrict__ n_rows) {
     // cascade: fq/topk_w are the gate_up-quantize and topk outputs
     PD_PDL_ARM();
-    const uint32_t o = blockIdx.x;
+    // PLAIN grid is (batch, embd) for the same reason as the gate_up pair
+    // above: the output column is the slow axis, and what this kernel still
+    // serves is the narrow decode band.
+    const uint32_t o = LIST ? blockIdx.x : blockIdx.y;
     const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     const uint32_t ddb = pd_kq_datab(ddt);
     const bool mu = pd_kq_has_mu(ddt);
     __shared__ float sh[16];
     const uint32_t i_hi = LIST ? *n_rows : 1u;
     for (uint32_t i = LIST ? blockIdx.y : 0u; i < i_hi; i += LIST ? gridDim.y : 1u) {
-    const uint32_t b = LIST ? rows_list[i] : blockIdx.y;
+    const uint32_t b = LIST ? rows_list[i] : blockIdx.x;
     if (warp < n_active) {
         const size_t srow = (size_t)b * n_active + warp;
         const uint32_t e = idx[srow];
@@ -297,12 +460,663 @@ int pd_kquant_moe_down(const void* down_data, const void* down_scales,
     if (!pd_kq_valid(ddt) && !pd_kq_valid_iq(ddt)) return cudaErrorInvalidValue;
     if ((pd_kq_has_mu(ddt)) && fsums == nullptr)
         return cudaErrorInvalidValue;
-    dim3 grid(embd, batch);
+    dim3 grid(batch, embd);   // column SLOW - see the kernel note
     pd_pdl_go(pd_kquant_moe_down_kernel<false>, grid, 32u * n_active, 0u, (cudaStream_t)stream,
         (const uint8_t*)down_data, (const uint8_t*)down_scales,
         (const unsigned int*)idx, (const float*)topk_w, (const int8_t*)fq,
         (const float*)fs, (const float*)fsums, (float*)out, ff, embd, n_active,
         ddt, (const unsigned int*)nullptr, (const unsigned int*)nullptr);
+    return pd_launch_status();
+}
+
+// ---- column-tiled down (the prefill class, slot 587) -----------------------
+// The plain down kernel above computes ONE output float per block: 10 warps
+// each walk their slot's 640-weight row with 1.25 windows per lane, then the
+// block folds and writes. ncu: SM 32% of peak, DRAM 21%, 57% warps active -
+// nothing is saturated, the block is waiting on its own dependent loads with
+// no other work to hide them. Here a block owns COLS columns instead of one:
+// the activation window is loaded ONCE and reused across the COLS weight rows,
+// so each lane carries COLS independent dot chains and the row loads overlap.
+//
+// BIT-IDENTICAL to the plain kernel: per (token, column, slot) the same
+// lane-strided window walk in the same order, the same 32-lane tree, and the
+// same ascending slot fold. Columns are independent, so grouping them changes
+// no sum.
+template <uint32_t COLS>
+__global__ void __launch_bounds__(512) pd_kquant_moe_down_cols_kernel(
+    const uint8_t* __restrict__ dd, const uint8_t* __restrict__ dsc,
+    const unsigned int* __restrict__ idx, const float* __restrict__ topk_w,
+    const int8_t* __restrict__ fq, const float* __restrict__ fs,
+    const float* __restrict__ fsums, float* __restrict__ out, uint32_t ff,
+    uint32_t embd, uint32_t n_active, uint32_t ddt) {
+    PD_PDL_ARM();
+    const uint32_t b = blockIdx.x;
+    const uint32_t o0 = blockIdx.y * COLS;
+    const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const uint32_t ddb = pd_kq_datab(ddt), dscb = pd_kq_scb(ddt);
+    const bool mu = pd_kq_has_mu(ddt);
+    __shared__ float sh[COLS][16];
+    if (warp < n_active) {
+        const size_t srow = (size_t)b * n_active + warp;
+        const uint32_t e = idx[srow];
+        float acc[COLS];
+        #pragma unroll
+        for (uint32_t c = 0; c < COLS; ++c) acc[c] = 0.0f;
+        if (e != 0xFFFFFFFFu) {
+            const int8_t* xrow = fq + srow * ff;
+            const float* xsc = fs + srow * (ff >> 5);
+            const float* xsm = fsums + srow * (ff >> 4);
+            for (uint32_t base = lane * 16u; base < ff; base += 32u * 16u) {
+                const uint32_t s = base >> 8, w = (base >> 4) & 15u;
+                const int4 xv = *reinterpret_cast<const int4*>(xrow + base);
+                const float x_s = xsc[base >> 5];
+                const float x_m = mu ? xsm[base >> 4] : 0.0f;
+                #pragma unroll
+                for (uint32_t c = 0; c < COLS; ++c) {
+                    const uint32_t o = o0 + c;
+                    if (o >= embd) continue;
+                    const uint8_t* row = dd + ((size_t)e * embd + o) * pd_kq_row_datab(ddt, ff);
+                    const uint8_t* rrec = dsc + ((size_t)e * embd + o) * pd_kq_row_scb(ddt, ff);
+                    int wq[4];
+                    float f, g;
+                    pd_kq_win_unpack(ddt, row + (size_t)s * ddb, rrec + (size_t)s * dscb, w, wq, &f, &g);
+                    int si = __dp4a(wq[0], xv.x, 0);
+                    si = __dp4a(wq[1], xv.y, si);
+                    si = __dp4a(wq[2], xv.z, si);
+                    si = __dp4a(wq[3], xv.w, si);
+                    acc[c] += f * (x_s * (float)si);
+                    if (mu) acc[c] += g * (x_s * x_m);
+                }
+            }
+        }
+        #pragma unroll
+        for (uint32_t c = 0; c < COLS; ++c) {
+            float v = acc[c];
+            for (uint32_t s2 = 16; s2 > 0; s2 >>= 1) v += __shfl_down_sync(0xffffffffu, v, s2);
+            if (lane == 0) sh[c][warp] = (e == 0xFFFFFFFFu) ? 0.0f : topk_w[(size_t)b * n_active + warp] * v;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < COLS) {
+        const uint32_t o = o0 + threadIdx.x;
+        if (o < embd) {
+            float v = 0.0f;
+            for (uint32_t w = 0; w < n_active; ++w) v += sh[threadIdx.x][w];
+            out[(size_t)b * embd + o] = v;
+        }
+    }
+}
+
+// slot 587: the column-tiled down. Same arguments as slot 495 plus `cols`
+// (4, 8 or 16); the caller takes it at prefill widths, where the grid stays
+// full at COLS times fewer blocks. Numerics are slot 495's exactly.
+PD_EXPORT
+int pd_kquant_moe_down_cols(const void* down_data, const void* down_scales,
+                            const void* idx, const void* topk_w, const void* fq,
+                            const void* fs, const void* fsums, void* out,
+                            uint32_t ff, uint32_t embd, uint32_t n_active,
+                            uint32_t batch, uint32_t cols, uint32_t ddt,
+                            void* stream) {
+    if (embd == 0 || n_active == 0 || batch == 0) return 0;
+    if ((ff & 31u) != 0 || n_active > 16u) return cudaErrorInvalidValue;
+    if ((ff & 255u) != 0 && ddt != PD_KQ_IQ4NL_ID) return cudaErrorInvalidValue;
+    if (!pd_kq_valid(ddt) && !pd_kq_valid_iq(ddt)) return cudaErrorInvalidValue;
+    if (pd_kq_has_mu(ddt) && fsums == nullptr) return cudaErrorInvalidValue;
+    cudaStream_t st = (cudaStream_t)stream;
+#define PD_KQ_DNC_GO(CV)                                                       \
+    do {                                                                       \
+        dim3 grid(batch, (embd + (CV) - 1u) / (CV));                           \
+        pd_pdl_go(pd_kquant_moe_down_cols_kernel<CV>, grid, 32u * n_active, 0u, \
+            st, (const uint8_t*)down_data, (const uint8_t*)down_scales,         \
+            (const unsigned int*)idx, (const float*)topk_w, (const int8_t*)fq,  \
+            (const float*)fs, (const float*)fsums, (float*)out, ff, embd,       \
+            n_active, ddt);                                                     \
+    } while (0)
+    switch (cols) {
+        case 4u: PD_KQ_DNC_GO(4u); break;
+        case 8u: PD_KQ_DNC_GO(8u); break;
+        case 16u: PD_KQ_DNC_GO(16u); break;
+        default: return cudaErrorInvalidValue;
+    }
+#undef PD_KQ_DNC_GO
+    return pd_launch_status();
+}
+
+// ---- REGISTER-TILED grouped gate+up (the wave-prefill class, slot 592) ----
+// The grouped pair kernel above pays one block per (expert group, OUT ROW), so
+// it re-reads the group's activations for every one of the ff output rows: 47
+// GB a layer at a 2114-row wave with in_dim 2560 and a 16-row group, which is
+// what it was actually waiting on. (The evidence that it is TRAFFIC and not
+// unpack: a 32-row group unpacks 237M windows against a 16-row group's 369M
+// and is SLOWER - 10.80 vs 8.97 ms a layer - because it moves 60 GB instead
+// of 47.)
+//
+// Here a block owns BM routed rows x BN output columns and stages BOTH sides
+// of a BK slice once: the activations land in shared, and the weight windows
+// are UNPACKED into shared as int8 with their per-window scales. Every thread
+// then owns TN whole columns of one row, so its dots need no cross-thread
+// reduction at all - the shuffle tree and the ascending warp fold of the pair
+// kernels disappear with it. Activation traffic falls by BN.
+//
+// NUMERIC CLASS: a thread accumulates its K windows in ascending order, where
+// the pair kernels split K across the block and folded the pieces. Same
+// per-window math, different association - the prefill-vs-decode split this
+// lane already carries for its dense planes, and the wave prefill has never
+// been bit-equal to the token walk anyway.
+#define PD_KQT_BM 16u
+#define PD_KQT_BN 64u
+#define PD_KQT_BK 128u
+#define PD_KQT_XW (PD_KQT_BK + 16u)   // padded row strides: a 128-byte stride
+#define PD_KQT_WW (PD_KQT_BK + 16u)   // puts every lane in the same bank set
+
+template <bool MU>
+__global__ void __launch_bounds__(256, 4) pd_kquant_moe_gate_up_tile_kernel(
+    const uint8_t* __restrict__ gd, const uint8_t* __restrict__ gsc,
+    const uint8_t* __restrict__ ud_, const uint8_t* __restrict__ usc,
+    const unsigned int* __restrict__ sorted_row,
+    const unsigned int* __restrict__ sorted_slot,
+    const unsigned int* __restrict__ block_expert, const int8_t* __restrict__ xq,
+    const float* __restrict__ xs, const float* __restrict__ xsums,
+    float* __restrict__ out, uint32_t in_dim, uint32_t ff, uint32_t n_active,
+    uint32_t gdt, uint32_t udt) {
+    PD_PDL_ARM();
+    const uint32_t blk = blockIdx.x;
+    const uint32_t e = block_expert[blk];
+    if (e == PD_MOE_PAD) return;
+    const uint32_t o0 = blockIdx.y * PD_KQT_BN;
+    const uint32_t tid = threadIdx.x;
+
+    __shared__ int8_t sx[PD_KQT_BM * PD_KQT_XW];
+    __shared__ float sxs[PD_KQT_BM][PD_KQT_BK / 32u];
+    __shared__ float sxm[MU ? PD_KQT_BM : 1u][MU ? PD_KQT_BK / 16u : 1u];
+    __shared__ int8_t swg[PD_KQT_BN * PD_KQT_WW];
+    __shared__ int8_t swu[PD_KQT_BN * PD_KQT_WW];
+    __shared__ float sfg[PD_KQT_BN][PD_KQT_BK / 16u];
+    __shared__ float sfu[PD_KQT_BN][PD_KQT_BK / 16u];
+    __shared__ float sgg[MU ? PD_KQT_BN : 1u][MU ? PD_KQT_BK / 16u : 1u];
+    __shared__ float sgu[MU ? PD_KQT_BN : 1u][MU ? PD_KQT_BK / 16u : 1u];
+    __shared__ unsigned int srow[PD_KQT_BM], sslt[PD_KQT_BM];
+
+    if (tid < PD_KQT_BM) {
+        srow[tid] = sorted_row[(size_t)blk * PD_KQT_BM + tid];
+        sslt[tid] = sorted_slot[(size_t)blk * PD_KQT_BM + tid];
+    }
+    __syncthreads();
+
+    // this thread: row `r`, the four columns starting at `c0`
+    const uint32_t r = tid & (PD_KQT_BM - 1u);
+    const uint32_t c0 = (tid / PD_KQT_BM) * 4u;
+    float accg[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float accu[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    const uint32_t gdb = pd_kq_datab(gdt), udb = pd_kq_datab(udt);
+    const uint32_t gscb = pd_kq_scb(gdt), uscb = pd_kq_scb(udt);
+    const uint32_t grb = pd_kq_row_datab(gdt, in_dim), grs = pd_kq_row_scb(gdt, in_dim);
+    const uint32_t urb = pd_kq_row_datab(udt, in_dim), urs = pd_kq_row_scb(udt, in_dim);
+
+    for (uint32_t k0 = 0; k0 < in_dim; k0 += PD_KQT_BK) {
+        __syncthreads();
+        // ---- stage the activations: BM rows x BK bytes, 8 bytes a thread ----
+        {
+            const uint32_t rr = tid >> 4, off = (tid & 15u) * 8u;
+            if (rr < PD_KQT_BM) {
+                const unsigned int b = srow[rr];
+                const bool live = b != PD_MOE_PAD;
+                const int2 v = live
+                    ? *reinterpret_cast<const int2*>(xq + (size_t)b * in_dim + k0 + off)
+                    : make_int2(0, 0);
+                *reinterpret_cast<int2*>(&sx[rr * PD_KQT_XW + off]) = v;
+                if ((tid & 15u) < PD_KQT_BK / 32u) {
+                    const uint32_t sbk = tid & 15u;
+                    sxs[rr][sbk] = live ? xs[(size_t)b * (in_dim >> 5) + (k0 >> 5) + sbk] : 0.0f;
+                }
+                if (MU && (tid & 15u) < PD_KQT_BK / 16u) {
+                    const uint32_t mb = tid & 15u;
+                    sxm[rr][mb] = live ? xsums[(size_t)b * (in_dim >> 4) + (k0 >> 4) + mb] : 0.0f;
+                }
+            }
+        }
+        // ---- stage the weights: BN columns x BK, UNPACKED, 2 windows a thread ----
+        #pragma unroll
+        for (uint32_t t = 0; t < 2u; ++t) {
+            const uint32_t idx = tid + t * 256u;              // 512 (column, window) pairs
+            const uint32_t cc = idx / (PD_KQT_BK / 16u);
+            const uint32_t jj = idx % (PD_KQT_BK / 16u);
+            const uint32_t o = o0 + cc;
+            const uint32_t base = k0 + jj * 16u;
+            const uint32_t sb = base >> 8, w = (base >> 4) & 15u;
+            const uint32_t oc = o < ff ? o : ff - 1u;
+            int wq[4];
+            float f, g;
+            const size_t row_e = (size_t)e * ff + oc;
+            pd_kq_win_unpack(gdt, gd + row_e * grb + (size_t)sb * gdb,
+                             gsc + row_e * grs + (size_t)sb * gscb, w, wq, &f, &g);
+            *reinterpret_cast<int4*>(&swg[cc * PD_KQT_WW + jj * 16u]) =
+                make_int4(wq[0], wq[1], wq[2], wq[3]);
+            sfg[cc][jj] = (o < ff) ? f : 0.0f;
+            if (MU) sgg[cc][jj] = (o < ff) ? g : 0.0f;
+            pd_kq_win_unpack(udt, ud_ + row_e * urb + (size_t)sb * udb,
+                             usc + row_e * urs + (size_t)sb * uscb, w, wq, &f, &g);
+            *reinterpret_cast<int4*>(&swu[cc * PD_KQT_WW + jj * 16u]) =
+                make_int4(wq[0], wq[1], wq[2], wq[3]);
+            sfu[cc][jj] = (o < ff) ? f : 0.0f;
+            if (MU) sgu[cc][jj] = (o < ff) ? g : 0.0f;
+        }
+        __syncthreads();
+        // ---- the tile: this row's BK windows against this thread's 4 columns ----
+        if (srow[r] != PD_MOE_PAD) {
+            #pragma unroll
+            for (uint32_t j = 0; j < PD_KQT_BK / 16u; ++j) {
+                const int4 xv = *reinterpret_cast<const int4*>(&sx[r * PD_KQT_XW + j * 16u]);
+                const float x_s = sxs[r][j >> 1];
+                const float x_m = MU ? sxm[r][j] : 0.0f;
+                #pragma unroll
+                for (uint32_t cc = 0; cc < 4u; ++cc) {
+                    const uint32_t c = c0 + cc;
+                    const int4 wg = *reinterpret_cast<const int4*>(&swg[c * PD_KQT_WW + j * 16u]);
+                    int si = __dp4a(wg.x, xv.x, 0);
+                    si = __dp4a(wg.y, xv.y, si);
+                    si = __dp4a(wg.z, xv.z, si);
+                    si = __dp4a(wg.w, xv.w, si);
+                    accg[cc] += sfg[c][j] * (x_s * (float)si);
+                    if (MU) accg[cc] += sgg[c][j] * (x_s * x_m);
+                    const int4 wu = *reinterpret_cast<const int4*>(&swu[c * PD_KQT_WW + j * 16u]);
+                    si = __dp4a(wu.x, xv.x, 0);
+                    si = __dp4a(wu.y, xv.y, si);
+                    si = __dp4a(wu.z, xv.z, si);
+                    si = __dp4a(wu.w, xv.w, si);
+                    accu[cc] += sfu[c][j] * (x_s * (float)si);
+                    if (MU) accu[cc] += sgu[c][j] * (x_s * x_m);
+                }
+            }
+        }
+    }
+
+    const unsigned int b = srow[r];
+    if (b == PD_MOE_PAD) return;
+    #pragma unroll
+    for (uint32_t cc = 0; cc < 4u; ++cc) {
+        const uint32_t o = o0 + c0 + cc;
+        if (o >= ff) continue;
+        const float g = accg[cc], u = accu[cc];
+        out[((size_t)b * n_active + sslt[r]) * ff + o] = (g / (1.0f + __expf(-g))) * u;
+    }
+}
+
+// The register-tiled DOWN twin (slot 593). Same tile as the gate+up pair
+// above - BM routed rows x BN output columns, both operands staged per BK
+// slice, a thread owning whole dots - but its activations are the SORTED
+// pairs' swiglu rows (`fq`, pair-major) and its output is the per-(pair,
+// column) partial that `pd_moe_part_fold_at` folds in slot order. The
+// grouped down it replaces still read the staged rows once per column and
+// reduced across a warp; here neither happens.
+template <bool MU>
+__global__ void __launch_bounds__(256, 4) pd_kquant_moe_down_tile_kernel(
+    const uint8_t* __restrict__ dd, const uint8_t* __restrict__ dsc,
+    const unsigned int* __restrict__ sorted_row,
+    const unsigned int* __restrict__ sorted_slot,
+    const unsigned int* __restrict__ block_expert, const float* __restrict__ topk_w,
+    const int8_t* __restrict__ fq, const float* __restrict__ fs,
+    const float* __restrict__ fsums, float* __restrict__ part, uint32_t ff,
+    uint32_t embd, uint32_t o0, uint32_t ocols, uint32_t n_active, uint32_t ddt) {
+    PD_PDL_ARM();
+    const uint32_t blk = blockIdx.x;
+    const uint32_t e = block_expert[blk];
+    if (e == PD_MOE_PAD) return;
+    const uint32_t cbase = blockIdx.y * PD_KQT_BN;
+    const uint32_t tid = threadIdx.x;
+
+    __shared__ int8_t sx[PD_KQT_BM * PD_KQT_XW];
+    __shared__ float sxs[PD_KQT_BM][PD_KQT_BK / 32u];
+    __shared__ float sxm[MU ? PD_KQT_BM : 1u][MU ? PD_KQT_BK / 16u : 1u];
+    __shared__ int8_t swd[PD_KQT_BN * PD_KQT_WW];
+    __shared__ float sfd[PD_KQT_BN][PD_KQT_BK / 16u];
+    __shared__ float sgd[MU ? PD_KQT_BN : 1u][MU ? PD_KQT_BK / 16u : 1u];
+    __shared__ unsigned int srow[PD_KQT_BM], sslt[PD_KQT_BM];
+
+    if (tid < PD_KQT_BM) {
+        srow[tid] = sorted_row[(size_t)blk * PD_KQT_BM + tid];
+        sslt[tid] = sorted_slot[(size_t)blk * PD_KQT_BM + tid];
+    }
+    __syncthreads();
+
+    const uint32_t r = tid & (PD_KQT_BM - 1u);
+    const uint32_t c0 = (tid / PD_KQT_BM) * 4u;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint32_t ddb = pd_kq_datab(ddt), dscb = pd_kq_scb(ddt);
+    const uint32_t drb = pd_kq_row_datab(ddt, ff), drs = pd_kq_row_scb(ddt, ff);
+
+    for (uint32_t k0 = 0; k0 < ff; k0 += PD_KQT_BK) {
+        __syncthreads();
+        {   // the group's swiglu rows: BM x BK, 8 bytes a thread
+            const uint32_t rr = tid >> 4, off = (tid & 15u) * 8u;
+            if (rr < PD_KQT_BM) {
+                const unsigned int b = srow[rr];
+                const bool live = b != PD_MOE_PAD;
+                const size_t pair = live ? (size_t)b * n_active + sslt[rr] : 0u;
+                const int2 v = live
+                    ? *reinterpret_cast<const int2*>(fq + pair * ff + k0 + off)
+                    : make_int2(0, 0);
+                *reinterpret_cast<int2*>(&sx[rr * PD_KQT_XW + off]) = v;
+                if ((tid & 15u) < PD_KQT_BK / 32u) {
+                    const uint32_t sbk = tid & 15u;
+                    sxs[rr][sbk] = live ? fs[pair * (ff >> 5) + (k0 >> 5) + sbk] : 0.0f;
+                }
+                if (MU && (tid & 15u) < PD_KQT_BK / 16u) {
+                    const uint32_t mb = tid & 15u;
+                    sxm[rr][mb] = live ? fsums[pair * (ff >> 4) + (k0 >> 4) + mb] : 0.0f;
+                }
+            }
+        }
+        #pragma unroll
+        for (uint32_t t = 0; t < 2u; ++t) {
+            const uint32_t idx = tid + t * 256u;
+            const uint32_t cc = idx / (PD_KQT_BK / 16u);
+            const uint32_t jj = idx % (PD_KQT_BK / 16u);
+            const uint32_t c = cbase + cc;
+            const uint32_t o = o0 + c;
+            const bool live = c < ocols && o < embd;
+            const uint32_t oc = live ? o : embd - 1u;
+            const uint32_t base = k0 + jj * 16u;
+            const uint32_t sb = base >> 8, w = (base >> 4) & 15u;
+            int wq[4];
+            float f, g;
+            const size_t row_e = (size_t)e * embd + oc;
+            pd_kq_win_unpack(ddt, dd + row_e * drb + (size_t)sb * ddb,
+                             dsc + row_e * drs + (size_t)sb * dscb, w, wq, &f, &g);
+            *reinterpret_cast<int4*>(&swd[cc * PD_KQT_WW + jj * 16u]) =
+                make_int4(wq[0], wq[1], wq[2], wq[3]);
+            sfd[cc][jj] = live ? f : 0.0f;
+            if (MU) sgd[cc][jj] = live ? g : 0.0f;
+        }
+        __syncthreads();
+        if (srow[r] != PD_MOE_PAD) {
+            #pragma unroll
+            for (uint32_t j = 0; j < PD_KQT_BK / 16u; ++j) {
+                const int4 xv = *reinterpret_cast<const int4*>(&sx[r * PD_KQT_XW + j * 16u]);
+                const float x_s = sxs[r][j >> 1];
+                const float x_m = MU ? sxm[r][j] : 0.0f;
+                #pragma unroll
+                for (uint32_t cc = 0; cc < 4u; ++cc) {
+                    const uint32_t c = c0 + cc;
+                    const int4 wv = *reinterpret_cast<const int4*>(&swd[c * PD_KQT_WW + j * 16u]);
+                    int si = __dp4a(wv.x, xv.x, 0);
+                    si = __dp4a(wv.y, xv.y, si);
+                    si = __dp4a(wv.z, xv.z, si);
+                    si = __dp4a(wv.w, xv.w, si);
+                    acc[cc] += sfd[c][j] * (x_s * (float)si);
+                    if (MU) acc[cc] += sgd[c][j] * (x_s * x_m);
+                }
+            }
+        }
+    }
+
+    const unsigned int b = srow[r];
+    if (b == PD_MOE_PAD) return;
+    const size_t pair = (size_t)b * n_active + sslt[r];
+    #pragma unroll
+    for (uint32_t cc = 0; cc < 4u; ++cc) {
+        const uint32_t c = cbase + c0 + cc;
+        if (c >= ocols || o0 + c >= embd) continue;
+        part[pair * ocols + c] = topk_w[pair] * acc[cc];
+    }
+}
+
+// slot 593: the register-tiled down over one column chunk. `ff` must be a
+// multiple of the tile's BK (128) and the CSR must be a moe_align_bm(16).
+PD_EXPORT
+int pd_kquant_moe_down_tile(const void* down_data, const void* down_scales,
+                            const void* sorted_row, const void* sorted_slot,
+                            const void* block_expert, const void* topk_w,
+                            const void* fq, const void* fs, const void* fsums,
+                            void* part, uint32_t ff, uint32_t embd, uint32_t o0,
+                            uint32_t ocols, uint32_t n_active, uint32_t max_blocks,
+                            uint32_t ddt, void* stream) {
+    if (embd == 0 || n_active == 0 || max_blocks == 0 || ocols == 0) return 0;
+    if ((ff % PD_KQT_BK) != 0 || n_active > 16u) return cudaErrorInvalidValue;
+    if (!pd_kq_valid(ddt) && !pd_kq_valid_iq(ddt)) return cudaErrorInvalidValue;
+    const bool mu = pd_kq_has_mu(ddt);
+    if (mu && fsums == nullptr) return cudaErrorInvalidValue;
+    if (sorted_row == nullptr || sorted_slot == nullptr || block_expert == nullptr)
+        return cudaErrorInvalidValue;
+    dim3 grid(max_blocks, (ocols + PD_KQT_BN - 1u) / PD_KQT_BN);
+    cudaStream_t st = (cudaStream_t)stream;
+    if (mu) {
+        pd_pdl_go(pd_kquant_moe_down_tile_kernel<true>, grid, 256u, 0u, st,
+            (const uint8_t*)down_data, (const uint8_t*)down_scales,
+            (const unsigned int*)sorted_row, (const unsigned int*)sorted_slot,
+            (const unsigned int*)block_expert, (const float*)topk_w,
+            (const int8_t*)fq, (const float*)fs, (const float*)fsums, (float*)part,
+            ff, embd, o0, ocols, n_active, ddt);
+    } else {
+        pd_pdl_go(pd_kquant_moe_down_tile_kernel<false>, grid, 256u, 0u, st,
+            (const uint8_t*)down_data, (const uint8_t*)down_scales,
+            (const unsigned int*)sorted_row, (const unsigned int*)sorted_slot,
+            (const unsigned int*)block_expert, (const float*)topk_w,
+            (const int8_t*)fq, (const float*)fs, (const float*)fsums, (float*)part,
+            ff, embd, o0, ocols, n_active, ddt);
+    }
+    return pd_launch_status();
+}
+
+// slot 592: the register-tiled pair. Takes a `pd_moe_align_bm(bm = 16)` CSR
+// (BM is the tile, so the group size is the kernel's, not the caller's) and
+// writes the token-batched kernel's PAIR-major output, so the quantize and
+// the down half after it are unchanged.
+PD_EXPORT
+int pd_kquant_moe_gate_up_tile(const void* gate_data, const void* gate_scales,
+                               const void* up_data, const void* up_scales,
+                               const void* sorted_row, const void* sorted_slot,
+                               const void* block_expert, const void* xq,
+                               const void* xs, const void* xsums, void* out,
+                               uint32_t in_dim, uint32_t ff, uint32_t n_active,
+                               uint32_t max_blocks, uint32_t gdt, uint32_t udt,
+                               void* stream) {
+    if (ff == 0 || n_active == 0 || max_blocks == 0) return 0;
+    if ((in_dim % PD_KQT_BK) != 0) return cudaErrorInvalidValue;
+    if (!(pd_kq_valid(gdt) || pd_kq_valid_iq(gdt)) || !(pd_kq_valid(udt) || pd_kq_valid_iq(udt)))
+        return cudaErrorInvalidValue;
+    const bool mu = pd_kq_has_mu(gdt) || pd_kq_has_mu(udt);
+    if (mu && xsums == nullptr) return cudaErrorInvalidValue;
+    if (sorted_row == nullptr || sorted_slot == nullptr || block_expert == nullptr)
+        return cudaErrorInvalidValue;
+    dim3 grid(max_blocks, (ff + PD_KQT_BN - 1u) / PD_KQT_BN);
+    cudaStream_t st = (cudaStream_t)stream;
+    if (mu) {
+        pd_pdl_go(pd_kquant_moe_gate_up_tile_kernel<true>, grid, 256u, 0u, st,
+            (const uint8_t*)gate_data, (const uint8_t*)gate_scales,
+            (const uint8_t*)up_data, (const uint8_t*)up_scales,
+            (const unsigned int*)sorted_row, (const unsigned int*)sorted_slot,
+            (const unsigned int*)block_expert, (const int8_t*)xq, (const float*)xs,
+            (const float*)xsums, (float*)out, in_dim, ff, n_active, gdt, udt);
+    } else {
+        pd_pdl_go(pd_kquant_moe_gate_up_tile_kernel<false>, grid, 256u, 0u, st,
+            (const uint8_t*)gate_data, (const uint8_t*)gate_scales,
+            (const uint8_t*)up_data, (const uint8_t*)up_scales,
+            (const unsigned int*)sorted_row, (const unsigned int*)sorted_slot,
+            (const unsigned int*)block_expert, (const int8_t*)xq, (const float*)xs,
+            (const float*)xsums, (float*)out, in_dim, ff, n_active, gdt, udt);
+    }
+    return pd_launch_status();
+}
+
+// ---- expert-GROUPED down + slot fold (the prefill class, slots 589/590) ----
+// The column-tiled kernel above still unpacks every routed pair's expert row
+// per output column: a 2114-row wave walk is 2114 x 2560 x 400 window unpacks
+// a layer, and down owned 42% of it. Here a block owns (expert group, column
+// tile) off the same moe_align CSR the grouped gate_up reads: the group's
+// activation rows are staged ONCE into shared, and each column's weight row is
+// unpacked ONCE and walked against all of them. Unpack falls by the rows per
+// group, the fq re-reads by the columns per block.
+//
+// A grouped block holds pairs of DIFFERENT tokens, so it cannot fold the slots
+// itself - it writes one partial per (pair, column) and `pd_moe_part_fold_at`
+// sums them in ascending slot order, which is the fold order the ungrouped
+// kernel used inside its block. Per (pair, column) the dot keeps the plain
+// kernel's lane->window mapping (32 lanes striding 512) and its 32-lane tree,
+// so every number here is bit-identical to slot 495's.
+//
+// `o0`/`ocols` are a COLUMN CHUNK: the partials plane is [pairs, ocols], so
+// the caller walks the output in chunks instead of sizing a [pairs, embd]
+// plane (419 MB at a 4096-row wave; 42 MB at ocols = 256).
+template <uint32_t T, uint32_t CPW>
+__global__ void __launch_bounds__(256, 4) pd_kquant_moe_down_grp_kernel(
+    const uint8_t* __restrict__ dd, const uint8_t* __restrict__ dsc,
+    const unsigned int* __restrict__ sorted_row,
+    const unsigned int* __restrict__ sorted_slot,
+    const unsigned int* __restrict__ block_expert, const float* __restrict__ topk_w,
+    const int8_t* __restrict__ fq, const float* __restrict__ fs,
+    const float* __restrict__ fsums, float* __restrict__ part, uint32_t ff,
+    uint32_t embd, uint32_t o0, uint32_t ocols, uint32_t n_active, uint32_t ddt) {
+    PD_PDL_ARM();
+    const uint32_t blk = blockIdx.x;
+    const uint32_t e = block_expert[blk];
+    if (e == PD_MOE_PAD) return;
+    const uint32_t tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u;
+    const uint32_t nsb = ff >> 5;
+    // dynamic shared: the group's fq rows, their per-32 scales, the row list
+    extern __shared__ char pd_kdg_sh[];
+    int8_t* sx = reinterpret_cast<int8_t*>(pd_kdg_sh);            // [T][ff]
+    float* sxs = reinterpret_cast<float*>(sx + (size_t)T * ff);   // [T][ff/32]
+    unsigned int* srow = reinterpret_cast<unsigned int*>(sxs + (size_t)T * nsb);
+    unsigned int* sslt = srow + T;
+    if (tid < T) {
+        srow[tid] = sorted_row[(size_t)blk * T + tid];
+        sslt[tid] = sorted_slot[(size_t)blk * T + tid];
+    }
+    __syncthreads();
+    for (uint32_t i = 0; i < T; ++i) {
+        const unsigned int b = srow[i];
+        if (b == PD_MOE_PAD) continue;
+        const size_t pair = (size_t)b * n_active + sslt[i];
+        for (uint32_t j = tid * 4u; j < ff; j += blockDim.x * 4u)
+            *reinterpret_cast<int*>(&sx[i * ff + j]) =
+                *reinterpret_cast<const int*>(fq + pair * ff + j);
+        for (uint32_t j = tid; j < nsb; j += blockDim.x)
+            sxs[i * nsb + j] = fs[pair * nsb + j];
+    }
+    __syncthreads();
+
+    const uint32_t ddb = pd_kq_datab(ddt), dscb = pd_kq_scb(ddt);
+    const bool mu = pd_kq_has_mu(ddt);
+    // One column at a time per warp, and the row loop is NOT unrolled: with
+    // the group's rows unrolled (or held as a register tile of columns) the
+    // kernel compiled to 128 registers, which is 2 blocks an SM and 33% of
+    // warps - and ncu then put it at 39% of L1 throughput with DRAM at 3.5%,
+    // i.e. waiting on its own operand traffic with nothing to hide it. The
+    // 4-column register tile was measured too: 22.6 ms a layer against this
+    // shape's 13.4.
+    for (uint32_t cw = 0; cw < CPW; ++cw) {
+        const uint32_t c = blockIdx.y * (8u * CPW) + cw * 8u + warp;
+        if (c >= ocols) break;
+        const uint32_t o = o0 + c;
+        if (o >= embd) break;
+        const uint8_t* row = dd + ((size_t)e * embd + o) * pd_kq_row_datab(ddt, ff);
+        const uint8_t* rrec = dsc + ((size_t)e * embd + o) * pd_kq_row_scb(ddt, ff);
+        float acc[T];
+        #pragma unroll
+        for (uint32_t i = 0; i < T; ++i) acc[i] = 0.0f;
+        // the plain kernel's walk: lane owns window `lane`, stride 32 windows
+        for (uint32_t base = lane * 16u; base < ff; base += 32u * 16u) {
+            const uint32_t sb = base >> 8, w = (base >> 4) & 15u;
+            int wq[4];
+            float f, g;
+            pd_kq_win_unpack(ddt, row + (size_t)sb * ddb, rrec + (size_t)sb * dscb, w, wq, &f, &g);
+            for (uint32_t i = 0; i < T; ++i) {
+                if (srow[i] == PD_MOE_PAD) continue;
+                const int4 xv = *reinterpret_cast<const int4*>(&sx[i * ff + base]);
+                int si = __dp4a(wq[0], xv.x, 0);
+                si = __dp4a(wq[1], xv.y, si);
+                si = __dp4a(wq[2], xv.z, si);
+                si = __dp4a(wq[3], xv.w, si);
+                const float x_s = sxs[i * nsb + (base >> 5)];
+                acc[i] += f * (x_s * (float)si);
+                if (mu) {
+                    const size_t pair = (size_t)srow[i] * n_active + sslt[i];
+                    acc[i] += g * (x_s * fsums[pair * (ff >> 4) + (base >> 4)]);
+                }
+            }
+        }
+        for (uint32_t i = 0; i < T; ++i) {
+            float v = acc[i];
+            for (uint32_t s2 = 16; s2 > 0; s2 >>= 1) v += __shfl_down_sync(0xffffffffu, v, s2);
+            if (lane == 0 && srow[i] != PD_MOE_PAD) {
+                const size_t pair = (size_t)srow[i] * n_active + sslt[i];
+                part[pair * ocols + c] = topk_w[pair] * v;
+            }
+        }
+    }
+}
+
+// Fold a column chunk's per-(token, slot) partials into `out` in ASCENDING
+// slot order - the same order the ungrouped down kernel summed inside its
+// block. One writer per (token, column).
+__global__ void pd_moe_part_fold_at_kernel(const float* __restrict__ part,
+                                           float* __restrict__ out, uint32_t embd,
+                                           uint32_t o0, uint32_t ocols,
+                                           uint32_t n_active) {
+    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= ocols) return;
+    const uint32_t b = blockIdx.y;
+    float v = 0.0f;
+    for (uint32_t s = 0; s < n_active; ++s)
+        v += part[((size_t)b * n_active + s) * ocols + c];
+    out[(size_t)b * embd + o0 + c] = v;
+}
+
+// slot 589: grouped down over one column chunk. `group` is 8 or 16 (the CSR's
+// bm); `ocols` is the chunk width, and `part` must hold rows*n_active*ocols
+// floats. PAD lanes write nothing - the fold reads only real pairs because
+// every (token, slot) of the walk is present exactly once in the CSR.
+PD_EXPORT
+int pd_kquant_moe_down_grp(const void* down_data, const void* down_scales,
+                           const void* sorted_row, const void* sorted_slot,
+                           const void* block_expert, const void* topk_w,
+                           const void* fq, const void* fs, const void* fsums,
+                           void* part, uint32_t ff, uint32_t embd, uint32_t o0,
+                           uint32_t ocols, uint32_t n_active, uint32_t max_blocks,
+                           uint32_t group, uint32_t ddt, void* stream) {
+    if (embd == 0 || n_active == 0 || max_blocks == 0 || ocols == 0) return 0;
+    if ((ff & 31u) != 0 || n_active > 16u) return cudaErrorInvalidValue;
+    if ((ff & 255u) != 0 && ddt != PD_KQ_IQ4NL_ID) return cudaErrorInvalidValue;
+    if (!pd_kq_valid(ddt) && !pd_kq_valid_iq(ddt)) return cudaErrorInvalidValue;
+    if (pd_kq_has_mu(ddt) && fsums == nullptr) return cudaErrorInvalidValue;
+    if (sorted_row == nullptr || sorted_slot == nullptr || block_expert == nullptr)
+        return cudaErrorInvalidValue;
+    constexpr uint32_t CPW = 2u;   // 8 warps x 2 columns = 16 a block
+    cudaStream_t st = (cudaStream_t)stream;
+#define PD_KQ_DGRP_GO(TV)                                                      \
+    do {                                                                       \
+        const uint32_t smem = (uint32_t)((size_t)(TV) * ff                      \
+            + (size_t)(TV) * (ff >> 5) * sizeof(float) + 2u * (TV) * sizeof(unsigned int)); \
+        if (smem > 48u * 1024u) return cudaErrorInvalidValue;                   \
+        dim3 grid(max_blocks, (ocols + 8u * CPW - 1u) / (8u * CPW));            \
+        pd_pdl_go(pd_kquant_moe_down_grp_kernel<TV, CPW>, grid, 256u, smem, st,  \
+            (const uint8_t*)down_data, (const uint8_t*)down_scales,             \
+            (const unsigned int*)sorted_row, (const unsigned int*)sorted_slot,  \
+            (const unsigned int*)block_expert, (const float*)topk_w,            \
+            (const int8_t*)fq, (const float*)fs, (const float*)fsums,           \
+            (float*)part, ff, embd, o0, ocols, n_active, ddt);                  \
+    } while (0)
+    switch (group) {
+        case 8u: PD_KQ_DGRP_GO(8u); break;
+        case 16u: PD_KQ_DGRP_GO(16u); break;
+        case 32u: PD_KQ_DGRP_GO(32u); break;
+        default: return cudaErrorInvalidValue;
+    }
+#undef PD_KQ_DGRP_GO
+    return pd_launch_status();
+}
+
+// slot 590: the fold that turns slot 589's chunk of partials into `out`.
+PD_EXPORT
+int pd_moe_part_fold_at(const void* part, void* out, uint32_t embd, uint32_t o0,
+                        uint32_t ocols, uint32_t n_active, uint32_t rows,
+                        void* stream) {
+    if (rows == 0 || ocols == 0) return 0;
+    dim3 grid((ocols + 255u) / 256u, rows);
+    pd_moe_part_fold_at_kernel<<<grid, 256u, 0, (cudaStream_t)stream>>>(
+        (const float*)part, (float*)out, embd, o0, ocols, n_active);
     return pd_launch_status();
 }
 

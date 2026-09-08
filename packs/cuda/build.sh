@@ -38,15 +38,18 @@ done
 
 arch_arg="${1:-}"
 arches=(${arch_arg//,/ })
-# 103 (Blackwell Ultra), 110 and 121 (DGX Spark GB10) are built as PLAIN
-# targets, no 'a' feature variant. The fatbin carries no PTX, so a die absent
-# from this list cannot load the pack at all -- which is how 12.1 was
-# unsupported. They are safe to add only because the accelerated families now
-# gate on an exact cc match (see exports.cuh): a 10.3 or 12.1 device gets the
-# portable paths instead of tcgen05/block-scale bodies that its target
+# 103 (Blackwell Ultra) and 110 are built as PLAIN targets, no 'a' feature
+# variant. The fatbin carries no PTX, so a die absent from this list cannot
+# load the pack at all -- which is how 12.1 was unsupported. They are safe to
+# add only because the accelerated families gate on an exact cc match
+# (pd_dev_bs_sass in abi.cuh, the table resolution in exports.cuh): a 10.3
+# device gets the portable paths instead of tcgen05 bodies that its target
 # compiled away. Adding an 'a' variant for them needs the device feature
-# macros widened first -- PD_TC5_OK is `__CUDA_ARCH__ == 1000`, PD_BS_OK is
-# `>= 1200 && SM120_ALL` -- or they silently no-op.
+# macros widened first -- PD_TC5_OK is `__CUDA_ARCH__ == 1000` -- or they
+# silently no-op. 121 (DGX Spark GB10) got exactly that treatment on
+# 2026-09-07: PD_BS_OK accepts __CUDA_ARCH_FEAT_SM121_ALL, so 121 builds its
+# 'a' twin beside the plain image (like 120) and -DPD_BS_SM121=1 tells the
+# host election that the 12.1 bodies are real.
 [ ${#arches[@]} -eq 0 ] && arches=(80 86 89 90 100 103 110 120 121)
 
 supported="$(nvcc --list-gpu-arch | sed 's/compute_//')"
@@ -62,6 +65,14 @@ for a in "${arches[@]}"; do
             # the 'a' feature target carries the block-scale (mxf8f6f4) MMA
             gencode+=("-gencode=arch=compute_120a,code=sm_120a")
             bs_host=1
+        fi
+        if [ "$a" = "121" ]; then
+            # GB10's feature target: same block-scale MMA family as 120a
+            # (PD_BS_OK accepts its macro); PD_BS_SM121 lets pd_dev_bs_sass
+            # elect those bodies on a 12.1 die
+            gencode+=("-gencode=arch=compute_121a,code=sm_121a")
+            bs_host=1
+            defines+=("-DPD_BS_SM121=1")
         fi
         # sm_100 (B200): the f8w8 family rides plain e4m3 mma + sw ue8m0 fold
         # (no 'a' target needed); PD_BS_HOST makes the launchers real and

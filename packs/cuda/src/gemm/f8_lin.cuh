@@ -983,6 +983,14 @@ static size_t pd_lin_ktz_cap = 0;
 // of the gated decode shapes has empty splits). Deletes the combine
 // launch and the partial-plane traffic. Single-wave grids only (every
 // split of a tile must be resident for the flag chain to advance).
+// PD_KT3_PROBE (bench-only, default 0 = the shipped kernel): phase-stripped
+// twins for the GB10 tile question (bench/f8lin_gb10_bench.cu, 2026-09-08):
+// 1 = loads + ring, no mma; 2 = mma on stale smem, no TMA; 3 = no epilogue
+// stores; 4 = no TMA and no stores (the tensor pipe alone). Never set by the
+// pack build.
+#ifndef PD_KT3_PROBE
+#define PD_KT3_PROBE 0
+#endif
 template <bool O16 = false, bool KS = false, bool KF = false, bool RW = false,
           bool SPLIT = false>
 __global__ void __launch_bounds__(288, 1) pd_f8_gemm_lin_kt3(
@@ -1098,7 +1106,11 @@ __global__ void __launch_bounds__(288, 1) pd_f8_gemm_lin_kt3(
                 else              asm volatile("bar.sync 3, 288;");
             }
             const uint32_t m = (uint32_t)__cvta_generic_to_shared(mb) + b * 8u;
+#if PD_KT3_PROBE == 2 || PD_KT3_PROBE == 4
+            if (false) {
+#else
             if (tid == 256u) {
+#endif
                 asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;"
                              ::"r"(m), "r"(BOX + PAIR16));
                 const uint32_t wd = (uint32_t)__cvta_generic_to_shared(wdat + b * BOX);
@@ -1194,11 +1206,19 @@ __global__ void __launch_bounds__(288, 1) pd_f8_gemm_lin_kt3(
                 uint32_t am[4][2][4], bm[4][4];
                 if (RW) {
                     pd_kt4a_ldh(wp, yp, h, lane, i0, c0w, am, bm);
+#if PD_KT3_PROBE == 1
+                    acc[0][0] += __uint_as_float(am[0][0][0] & 1u) + __uint_as_float(bm[0][0] & 1u);
+#else
                     pd_kt3_mma(acc, am, bm, sa_row, sbj[h]);
+#endif
                 } else {
                     uint32_t sa[4];
                     pd_kt3_ldh(wp, yp, h, lane, i0, c0w, am, bm, sa);
+#if PD_KT3_PROBE == 1
+                    acc[0][0] += __uint_as_float(am[0][0][0] & 1u) + __uint_as_float(bm[0][0] & 1u) + __uint_as_float(sa[0] & 1u);
+#else
                     pd_kt3_mma(acc, am, bm, sa, sbj[h]);
+#endif
                 }
             }
         }
@@ -1332,6 +1352,62 @@ __global__ void __launch_bounds__(288, 1) pd_f8_gemm_lin_kt3(
         if (row_base >= ncut) { ysp = y2; sp_dim = out_dim - ncut; sp_base = ncut; }
         else sp_dim = ncut;
     }
+#if PD_KT3_PROBE == 3 || PD_KT3_PROBE == 4
+    // keep the mainloop alive without the landing
+    if (acc[0][0] == 1.2345e30f && acc[15][3] == 2.3456e30f) ysp[tid] = acc[7][2];
+    return;
+#endif
+#if PD_KT3_PROBE != 5
+    // Coalesced landing, staged through the idle ring (GB10 2026-09-08, the
+    // f4t4 lesson on the fp8 tile): the fragment stores below are 32-byte
+    // segments (a lane holds rows r0/r0+8 of two batch columns), and with one
+    // CTA per SM the epilogue is EXPOSED after every mainloop - the probe
+    // twins priced it at ~240 us of the in_qkv launch's 1031 (mma alone 272,
+    // loads+mma 793). Same values, same per-element O16 conversion - only
+    // the store shape changes: each warp parks its fragment block as
+    // [batch col][out row] f32 (132-float pitch: conflict-free fragment
+    // writes), then the eight consumer warps stream the tile out as 512-byte
+    // (f32) / 256-byte (bf16) row runs. Full-row tiles only; a row tail
+    // (out_dim not a 128-multiple in the last tile) keeps the scalar loop.
+    // The producer warp has returned and the last stage's smem reads are
+    // behind the final phase wait, so the ring is free once the consumers
+    // meet at barrier 5.
+    {
+        const bool full_rows = (row_base + 128u <= out_dim);
+        float* otile = (float*)pd_lin_sh3;   // 128 x 132 f32 = 67.6 KB of the 99 KB ring
+        asm volatile("bar.sync 5, 256;");
+        if (full_rows) {
+            #pragma unroll
+            for (uint32_t j = 0; j < 4u; ++j) {
+                const uint32_t cl = c0w + j * 8u + 2u * tq;
+                #pragma unroll
+                for (uint32_t s = 0; s < 4u; ++s) {
+                    const uint32_t rl = i0 + s * 16u + g;
+                    otile[cl * 132u + rl] = acc[s * 4u + j][0];
+                    otile[(cl + 1u) * 132u + rl] = acc[s * 4u + j][1];
+                    otile[cl * 132u + rl + 8u] = acc[s * 4u + j][2];
+                    otile[(cl + 1u) * 132u + rl + 8u] = acc[s * 4u + j][3];
+                }
+            }
+            asm volatile("bar.sync 5, 256;");
+            for (uint32_t it = warp; it < 128u; it += 8u) {
+                const uint32_t c = col_base + it;
+                if (c >= batch) continue;
+                const float4 v = *(const float4*)(otile + it * 132u + lane * 4u);
+                if (O16) {
+                    __nv_bfloat16* yh = (__nv_bfloat16*)y + (size_t)c * out_dim + row_base + lane * 4u;
+                    __nv_bfloat162 lo = __floats2bfloat162_rn(v.x, v.y);
+                    __nv_bfloat162 hi = __floats2bfloat162_rn(v.z, v.w);
+                    uint2 pk; pk.x = *(const uint32_t*)&lo; pk.y = *(const uint32_t*)&hi;
+                    *(uint2*)yh = pk;
+                } else {
+                    *(float4*)(ysp + (size_t)c * sp_dim + (row_base - sp_base) + lane * 4u) = v;
+                }
+            }
+            return;
+        }
+    }
+#endif
     #pragma unroll
     for (uint32_t j = 0; j < 4u; ++j) {
         const uint32_t c0 = col_base + c0w + j * 8u + 2u * tq;
@@ -3688,7 +3764,8 @@ int pd_f8_gemm_lin_kt(const void* wlin, const void* xq, const void* xs,
                 (float*)y, in_dim, out_dim, batch);
         return pd_launch_status();
     }
-    // kt3 (DEFAULT on for the sm_120 class; PADDOCK_LIN_KT3=0
+    // kt3 (DEFAULT on for sm_120 - cc 12.0 EXACTLY, its bodies are
+    // PD_BS_OK SASS and a 12.1 GB10 would launch stubs; PADDOCK_LIN_KT3=0
     // reverts): 3-deep ring stage-period cut - ysc staging moved out of smem
     // (consumers read x-scales from L2 directly), producer collapsed to one
     // warp. Bit-exact vs kt, never slower isolated (gate/up -2%, qkv -2%,
@@ -3698,10 +3775,8 @@ int pd_f8_gemm_lin_kt(const void* wlin, const void* xq, const void* xs,
     static const bool kt3 = [] {
         const char* e = pd_env("PADDOCK_LIN_KT3");
         if (e) return atoi(e) != 0;
-        int dev = 0, cma = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&cma, cudaDevAttrComputeCapabilityMajor, dev);
-        return cma == 12;
+        // exact cc 12.0 - the kt3 bodies are block-scale SASS (see pd_dev_bs_sass)
+        return pd_dev_bs_sass();
     }();
     if (kt3) {
         const uint32_t smem3 = 99864u;
@@ -3749,7 +3824,8 @@ int pd_f8_gemm_lin_kt(const void* wlin, const void* xq, const void* xs,
         // nz contiguous K-slices fill the die and cut the chain by nz;
         // partial f32 planes summed by the combine (decode-ks numeric
         // class, not bitwise vs single-chain - serve-gated).
-        // DEFAULT-ON for the sm_120 class: serve-measured on both families
+        // DEFAULT-ON for sm_120 (cc 12.0 exactly, same rule as kt3):
+        // serve-measured on both families
         // and up on every shape (wide-decode r~128 ticks are
         // chain-latency-bound; down nt=84 is dead-centre in the win
         // region), nothing regressed. PADDOCK_LIN_KTZ=0 reverts; other
@@ -3758,10 +3834,8 @@ int pd_f8_gemm_lin_kt(const void* wlin, const void* xq, const void* xs,
         static const bool ktz = [] {
             const char* e = pd_env("PADDOCK_LIN_KTZ");
             if (e) return atoi(e) != 0;
-            int dev = 0, cma = 0;
-            cudaGetDevice(&dev);
-            cudaDeviceGetAttribute(&cma, cudaDevAttrComputeCapabilityMajor, dev);
-            return cma == 12;
+            // exact cc 12.0 - the kt3 bodies are block-scale SASS (see pd_dev_bs_sass)
+            return pd_dev_bs_sass();
         }();
         if (ktz && batch <= 1024u) {
             static int sms = 0;
@@ -4073,10 +4147,8 @@ int pd_f8_gemm_lin_kt_split(const void* wlin, const void* xq, const void* xs,
     static const bool kt3 = [] {
         const char* e = pd_env("PADDOCK_LIN_KT3");
         if (e) return atoi(e) != 0;
-        int dev = 0, cma = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&cma, cudaDevAttrComputeCapabilityMajor, dev);
-        return cma == 12;
+        // exact cc 12.0 - the kt3 bodies are block-scale SASS (see pd_dev_bs_sass)
+        return pd_dev_bs_sass();
     }();
     if (!tma || !kt3) return -2;
     const uint32_t smem3 = 99864u;
@@ -4132,10 +4204,8 @@ static inline int pd_f8_gemm_lin_gu_launch(
     static const bool kt3 = [] {
         const char* e = pd_env("PADDOCK_LIN_KT3");
         if (e) return atoi(e) != 0;
-        int dev = 0, cma = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&cma, cudaDevAttrComputeCapabilityMajor, dev);
-        return cma == 12;
+        // exact cc 12.0 - the kt3 bodies are block-scale SASS (see pd_dev_bs_sass)
+        return pd_dev_bs_sass();
     }();
     if (!tma || !kt3) return -2;
     const uint32_t smem3 = 99864u;
@@ -4370,10 +4440,8 @@ static inline int pd_f8_gemm_lin_gu_r_launch(
     static const bool kt3 = [] {
         const char* e = pd_env("PADDOCK_LIN_KT3");
         if (e) return atoi(e) != 0;
-        int dev = 0, cma = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&cma, cudaDevAttrComputeCapabilityMajor, dev);
-        return cma == 12;
+        // exact cc 12.0 - the kt3 bodies are block-scale SASS (see pd_dev_bs_sass)
+        return pd_dev_bs_sass();
     }();
     if (!tma || !kt3) return -2;
     const uint32_t smem3r = 98328u;
@@ -4438,10 +4506,8 @@ int pd_f8_gemm_lin_kt_r(const void* wlin, const void* wse, const void* xq,
     static const bool kt3 = [] {
         const char* e = pd_env("PADDOCK_LIN_KT3");
         if (e) return atoi(e) != 0;
-        int dev = 0, cma = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&cma, cudaDevAttrComputeCapabilityMajor, dev);
-        return cma == 12;
+        // exact cc 12.0 - the kt3 bodies are block-scale SASS (see pd_dev_bs_sass)
+        return pd_dev_bs_sass();
     }();
     if (!tma || !kt3) return cudaErrorNotSupported;
     const uint32_t smem3r = 98328u;
@@ -4468,10 +4534,8 @@ int pd_f8_gemm_lin_kt_r(const void* wlin, const void* wse, const void* xq,
     static const bool ktz = [] {
         const char* e = pd_env("PADDOCK_LIN_KTZ");
         if (e) return atoi(e) != 0;
-        int dev = 0, cma = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&cma, cudaDevAttrComputeCapabilityMajor, dev);
-        return cma == 12;
+        // exact cc 12.0 - the kt3 bodies are block-scale SASS (see pd_dev_bs_sass)
+        return pd_dev_bs_sass();
     }();
     if (ktz && batch <= 1024u) {
         static int sms = 0;
@@ -4848,7 +4912,7 @@ __global__ void pd_f8lin_gemv_kernel(
         const unsigned char* __restrict__ boxes, const float* __restrict__ x,
         float* __restrict__ part, float* __restrict__ y,
         unsigned int* __restrict__ ticket, uint32_t in_dim, uint32_t out_dim,
-        uint32_t kpc) {
+        uint32_t kpc, uint32_t xwin) {
 #if PD_LIN_DEV_OK
     const uint32_t nk = in_dim >> 7;
     const uint32_t bt = blockIdx.x, z = blockIdx.y, nz = gridDim.y;
@@ -4865,8 +4929,8 @@ __global__ void pd_f8lin_gemv_kernel(
     const uint32_t c_n = (THREADS == 2 * BM) ? 4u : 8u;
     const uint32_t rb = slice * BM + r;
     float acc = 0.0f;
-    for (uint32_t w0 = k0; w0 < k1; w0 += PD_LINV_XWIN) {
-        const uint32_t w1 = min(k1, w0 + PD_LINV_XWIN);
+    for (uint32_t w0 = k0; w0 < k1; w0 += xwin) {
+        const uint32_t w1 = min(k1, w0 + xwin);
         __syncthreads();
         for (uint32_t i = tid; i < (w1 - w0) * 32u; i += THREADS)
             *reinterpret_cast<float4*>(xs + i * 4u) =
@@ -4922,7 +4986,7 @@ __global__ void pd_f8lin_gemv_kernel(
     }
 #else
     (void)boxes; (void)x; (void)part; (void)y; (void)ticket;
-    (void)in_dim; (void)out_dim; (void)kpc;
+    (void)in_dim; (void)out_dim; (void)kpc; (void)xwin;
 #endif
 }
 
@@ -4965,20 +5029,40 @@ int pd_f8lin_gemv(const void* wlin, const void* x, void* part, void* y,
     // overlaps nothing at any of the three geometries. That is a structural
     // property of one fused call replacing two independent ones, not a
     // tuning parameter.
+    //
+    // The three rules above were ranked on 188 SMs, where 544 gate|up CTAs
+    // are 2.9 per SM in ONE wave. On 48 SMs (GB10, 2026-09-07) the same
+    // launch is 11 CTAs per SM against a 9-per-SM smem ceiling (24 KB of x
+    // window each) - a 1.26-wave tail - and the down plane's nz=2 is 160
+    // CTAs, 3.3 per SM: both ran at 42-43% of that die's roof while the
+    // lin<32> arm on the same token ran at 84%. Two dev switches so the next
+    // die can be MEASURED instead of argued: PADDOCK_LINV_NZ pins the split
+    // (1..16), PADDOCK_LINV_XWIN the x window in boxes (1..48; smaller =
+    // more resident CTAs). Unset = the rule as shipped.
+    static int env_nz = -1, env_xwin = -1;
+    if (env_nz < 0) {
+        const char* e = pd_env("PADDOCK_LINV_NZ");
+        env_nz = e ? atoi(e) : 0;
+        const char* w = pd_env("PADDOCK_LINV_XWIN");
+        env_xwin = w ? atoi(w) : 0;
+    }
     uint32_t nz = 1;
     if (ticket) {
         const uint32_t want = (2u * (uint32_t)nsm + ctas - 1u) / ctas;
         nz = want < 1u ? 1u : (want > 16u ? 16u : want);
+        if (env_nz > 0) nz = env_nz > 16 ? 16u : (uint32_t)env_nz;
         if (nz > nk) nz = nk;
     }
     const uint32_t kpc = (nk + nz - 1u) / nz;
     // every z plane must own a non-empty K range or the ticket never fills
     const uint32_t nz_eff = (nk + kpc - 1u) / kpc;
     dim3 grid(ctas, nz_eff);
-    const uint32_t win = kpc < PD_LINV_XWIN ? kpc : PD_LINV_XWIN;
+    uint32_t xwin = PD_LINV_XWIN;
+    if (env_xwin > 0 && env_xwin <= (int)PD_LINV_XWIN) xwin = (uint32_t)env_xwin;
+    const uint32_t win = kpc < xwin ? kpc : xwin;
     const uint32_t shm = win * 128u * (uint32_t)sizeof(float);
     pd_f8lin_gemv_kernel<128, 64><<<grid, 128, shm, (cudaStream_t)stream>>>(
         (const unsigned char*)wlin, (const float*)x, (float*)part, (float*)y,
-        (unsigned int*)ticket, in_dim, out_dim, kpc);
+        (unsigned int*)ticket, in_dim, out_dim, kpc, xwin);
     return pd_launch_status();
 }

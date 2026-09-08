@@ -18,7 +18,11 @@
 // s8 mmq path. Build with -DPD_BS_HOST=1 IFF the gencode list includes
 // compute_120a (the host launcher cannot see __CUDA_ARCH__; a silent empty
 // launch would violate the no-silent-failure rule).
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200) && defined(__CUDA_ARCH_FEAT_SM120_ALL)
+// sm_120a OR sm_121a (GB10 / DGX Spark): both feature targets carry the
+// block-scale MMA; the plain 12.x passes and the 120f family pass do not
+// define either macro and get the stubs. Host half: pd_dev_bs_sass (abi.cuh).
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200) && \
+    (defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL))
 #define PD_BS_OK 1
 #else
 #define PD_BS_OK 0

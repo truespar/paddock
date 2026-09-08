@@ -87,6 +87,84 @@ fn n_qtiles(runs: &[Run]) -> usize {
 /// directly and a deviation localizes to one op of one layer instead of to
 /// "the logits". Readback is capture-illegal, so this is a triage path only -
 /// nothing reads the env var on the serving walk.
+/// Per-pass wall clock for a PREFILL walk (`PADDOCK_Q4X_PHASE_MS`). Syncs
+/// between passes, so what it reports is a SERIALIZED attribution - it exists
+/// to say which pass owns a prefill's wall, not to price a pipelined one. It
+/// never arms on a decode walk: a sync inside graph capture is illegal.
+struct PhaseMs {
+    on: bool,
+    t: std::time::Instant,
+    acc: Vec<(&'static str, f64, u32)>,
+}
+
+thread_local! {
+    /// The armed walk's timer, so a pass nested below `device_walk` can lap
+    /// into the same map without threading a &mut through every signature.
+    static PHASE_MS: std::cell::RefCell<Option<PhaseMs>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Lap the armed walk timer, if any (inert when `PADDOCK_Q4X_PHASE_MS` is not
+/// set or the walk is a decode - see `PhaseMs::arm`).
+fn pm_lap(e: &GpuExecutor, tag: &'static str) {
+    PHASE_MS.with(|p| {
+        if let Some(pm) = p.borrow_mut().as_mut() {
+            pm.lap(e, tag);
+        }
+    });
+}
+
+impl PhaseMs {
+    fn arm(phase: Phase) -> Self {
+        Self {
+            // decode walks only with graph capture off: a sync inside stream
+            // capture is illegal, so `PADDOCK_Q38FN_NO_GRAPH=1` is what makes
+            // a decode tick measurable here (its absolute numbers carry the
+            // eager-launch cost the graph exists to remove - read the SHARES).
+            on: (matches!(phase, Phase::Prefill | Phase::PrefillRuns) || !capture_wanted())
+                && std::env::var_os("PADDOCK_Q4X_PHASE_MS").is_some(),
+            t: std::time::Instant::now(),
+            acc: Vec::new(),
+        }
+    }
+
+    fn lap(&mut self, e: &GpuExecutor, tag: &'static str) {
+        if !self.on {
+            return;
+        }
+        let _ = e.synchronize();
+        let ms = self.t.elapsed().as_secs_f64() * 1e3;
+        match self.acc.iter_mut().find(|(k, _, _)| *k == tag) {
+            Some(slot) => {
+                slot.1 += ms;
+                slot.2 += 1;
+            }
+            None => self.acc.push((tag, ms, 1)),
+        }
+        self.t = std::time::Instant::now();
+    }
+
+    fn report(&self, n: usize) {
+        self.report_as(n, "walk");
+    }
+
+    fn report_as(&self, n: usize, what: &str) {
+        if !self.on || self.acc.is_empty() {
+            return;
+        }
+        let tot: f64 = self.acc.iter().map(|(_, ms, _)| ms).sum();
+        let mut rows = self.acc.clone();
+        rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+        eprintln!("[q4x-phase] {what} n={n} total {tot:.2} ms");
+        for (tag, ms, cnt) in rows {
+            eprintln!(
+                "[q4x-phase]   {tag:10} {ms:8.2} ms  ({:5.1}%)  {cnt:4} calls  {:6.3} ms/call",
+                100.0 * ms / tot,
+                ms / cnt as f64
+            );
+        }
+    }
+}
+
 struct Dump(Option<std::path::PathBuf>);
 
 impl Dump {
@@ -260,6 +338,13 @@ pub struct Qwen4ExpGpu {
     exec: Arc<GpuExecutor>,
     cfg: Qwen4ExpConfig,
     /// where the host-side PLE n-gram gather reads its rows
+    /// Resident WEIGHT bytes, stamped once at load by `settled_mem_used()`
+    /// before anything pool-sized allocates - the number `will-it-fit` prices
+    /// this model with. It excludes what this family deliberately keeps OFF
+    /// the device: the n-gram table (51B of the parameter count, read from the
+    /// GGUF mmap) and any host-mapped experts, which is why the honest figure
+    /// is far under the download size.
+    weights_bytes: Option<u64>,
     st: PleSource,
     layers: Vec<Qwen4ExpLayer>,
     embed: Embed,
@@ -410,6 +495,16 @@ struct Scratch {
     d_ssums: CudaSlice<f32>,
     d_fq: CudaSlice<i8>,
     d_fs: CudaSlice<f32>,
+    /// expert-grouped prefill MoE (slot 586): the moe_align CSR over the
+    /// walk's routed pairs. Sized for the SMALLEST group (8) because that is
+    /// the one that pads the most blocks; a wider group needs fewer.
+    d_msrow: CudaSlice<u32>,
+    d_msslot: CudaSlice<u32>,
+    d_mbexp: CudaSlice<u32>,
+    /// per-(pair, column) partials for the grouped down (slot 589), one COLUMN
+    /// CHUNK wide - a full [pairs, hidden] plane would be 419 MB at a 4096-row
+    /// wave, and the fold consumes a chunk at a time anyway
+    d_dpart: CudaSlice<f32>,
     /// device-sampling scratch (slots 4-wide each): the packed per-row plan,
     /// the truncation params, and the sampled ids. Caller-owned and
     /// address-stable like everything else the decode graph can see.
@@ -772,6 +867,12 @@ impl Qwen4ExpGpu {
         };
         // only the GGUF lane seats k-quant planes (safetensors is bf16 / NVFP4)
         let kq_lanes = matches!(st, PleSource::Gguf { .. });
+        // The PUBLISHED resident-weight line, stamped exactly here: every
+        // plane is uploaded, and the scratch below is the first pool-sized
+        // claim. The moe slot cache the runner seats afterwards is a CACHE
+        // sized from leftover headroom, not weights, and is correctly outside
+        // this number.
+        let weights_bytes = exec.settled_mem_used();
         let sc = Scratch::new(exec, &cfg, max_tokens, slots, kq_lanes)?;
         // the widest activation any dense plane reads is the 4-stream state
         let stage = DenseStage {
@@ -799,6 +900,20 @@ impl Qwen4ExpGpu {
             } else {
                 1
             })?,
+            // K-split partials (slot 588) for the narrow-out Q8 planes, sized
+            // by the rung's own caps: batch <= SK_MAX_BATCH rows of
+            // out <= SK_MAX_OUT, SK_MAX_SPLIT chunks each. 4 MB at the caps,
+            // and the counters are the same plane one word per (row, out).
+            sk_part: exec.alloc(if kq_lanes {
+                super::SK_MAX_BATCH * super::SK_MAX_OUT * super::SK_MAX_SPLIT
+            } else {
+                1
+            })?,
+            sk_cnt: exec.alloc_u32(if kq_lanes {
+                super::SK_MAX_BATCH * super::SK_MAX_OUT
+            } else {
+                1
+            })?,
             // the widest activation any dense plane reads is the 4-stream state
             x16: exec.alloc_f16(max_tokens * cfg.hc_width())?,
             xb16: exec.stream_alloc_bf16(max_tokens * cfg.hc_width())?,
@@ -811,6 +926,7 @@ impl Qwen4ExpGpu {
         Ok(Self {
             exec: exec.clone(),
             cfg,
+            weights_bytes,
             st,
             layers,
             embed,
@@ -1593,6 +1709,15 @@ impl Qwen4ExpGpu {
         self.decode_graph.is_some()
     }
 
+    /// Resident weight bytes measured at load - see the `weights_bytes` field.
+    /// `Generator::weights_mem_bytes` forwards to this, which is what
+    /// `/api/stats` publishes and the catalog shape survey measures a
+    /// shape from; without it the picker prices this family by FILE size and
+    /// refuses a card that serves it (76 GB of download against ~60 resident).
+    pub fn weights_mem_bytes(&self) -> Option<u64> {
+        self.weights_bytes
+    }
+
     /// The dense weight class this model actually loaded - for benchmarks and
     /// the PPL gate, so the class is never implicit in a number.
     pub fn dense_class(&self) -> &'static str {
@@ -1796,6 +1921,8 @@ impl Qwen4ExpGpu {
             usize::MAX
         };
         let dump = Dump::arm();
+        let mut pm = PhaseMs::arm(phase);
+        PHASE_MS.with(|p| *p.borrow_mut() = pm.on.then(|| PhaseMs::arm(phase)));
 
         // ---- embed -> the 4-stream hyper-connection state -----------------
         match embed {
@@ -1807,6 +1934,7 @@ impl Qwen4ExpGpu {
                 e.copy_region(&sc.d_x, t * h, &mut sc.d_h, t * hw + s * h, h)?;
             }
         }
+        pm.lap(e, "embed");
         dump.put(e, usize::MAX, "h_embed", &sc.d_h, n * hw)?;
 
         // Carries whether the previous combine already left this mix's
@@ -1829,6 +1957,7 @@ impl Qwen4ExpGpu {
                     cur_slots,
                     cur_runs,
                 )?;
+                pm.lap(e, "ple");
                 debug_assert!(
                     !pre_normed,
                     "a PLE layer must never be handed a pre-normed state"
@@ -1841,6 +1970,7 @@ impl Qwen4ExpGpu {
             }
 
             let attn_inj = hc_mix_pass(e, c, &layer.attn_hc, sc, stage, n, pre_normed)?;
+            pm.lap(e, "hc_attn");
             dump.put(e, li, "hc_bi_attn", &sc.d_bi, n * h)?;
             dump.put(e, li, "hc_m_attn", &sc.d_m, n * c.hc_lowrank)?;
             dump.put(e, li, "hc_inj_attn", &sc.d_inj, n * hc)?;
@@ -1869,6 +1999,7 @@ impl Qwen4ExpGpu {
                         cur_runs,
                         fork_ok,
                     )?;
+                    pm.lap(e, "gdn");
                     if dump.on() {
                         let (hv, vdim) = (c.gdn_v_heads, c.gdn_v_heads * c.gdn_v_dim);
                         dump.put(e, li, "gdn_qkv", &sc.d_qkv, n * c.gdn_qkv_rows())?;
@@ -1901,6 +2032,7 @@ impl Qwen4ExpGpu {
                         cur_runs,
                         fork_ok,
                     )?;
+                    pm.lap(e, "attn");
                 }
             }
             dump.put(e, li, "mix_out", &sc.d_mix, n * h)?;
@@ -1916,9 +2048,11 @@ impl Qwen4ExpGpu {
                 eps,
                 stage,
             )?;
+            pm.lap(e, "combine");
             dump.put(e, li, "h_mid", &sc.d_h, n * hw)?;
 
             let mlp_inj = hc_mix_pass(e, c, &layer.mlp_hc, sc, stage, n, mlp_pre)?;
+            pm.lap(e, "hc_mlp");
             dump.put(e, li, "hc_bi_mlp", &sc.d_bi, n * h)?;
             if dump.on() {
                 dump.put(e, li, "mlp_bi", &sc.d_bi, n * h)?;
@@ -1953,8 +2087,10 @@ impl Qwen4ExpGpu {
                 fork_ok,
                 matches!(phase, Phase::Decode | Phase::DecodeBatch),
             )?;
+            pm.lap(e, "moe");
             dump.put(e, li, "moe_out", &sc.d_mix, n * h)?;
             pre_normed = combine(e, sc, mlp_inj, next_norm, n, hc, h, eps, stage)?;
+            pm.lap(e, "combine");
             dump.put(e, li, "h_out", &sc.d_h, n * hw)?;
         }
 
@@ -2004,6 +2140,7 @@ impl Qwen4ExpGpu {
             final_mix.up.matmul(e, &sc.d_m, &mut sc.d_gate, n, stage)?;
             e.q4x_hc_mix(&sc.d_xn, &sc.d_gate, &mut sc.d_bi, None, n, hc, h)?;
         }
+        pm.lap(e, "final_mix");
         if matches!(phase, Phase::DecodeBatch) {
             // every row is a live sequence's next-token distribution
             lm_head.matmul(e, &sc.d_bi, &mut sc.d_out, n, stage)?;
@@ -2020,7 +2157,13 @@ impl Qwen4ExpGpu {
             dump.put(e, usize::MAX, "fin", &sc.d_fin, h)?;
             lm_head.matmul(e, &sc.d_fin, &mut sc.d_out, 1, stage)?;
         }
+        pm.lap(e, "lm_head");
         dump.put(e, usize::MAX, "logits", &sc.d_out, c.vocab)?;
+        let nested = PHASE_MS.with(|p| p.borrow_mut().take());
+        pm.report(n);
+        if let Some(np) = nested {
+            np.report_as(n, "moe-split");
+        }
         Ok(())
     }
 }
@@ -2225,6 +2368,7 @@ fn hc_mix_pass(
         e.matvec_f32_raw(&wi.buf, hc * h, hc, &sc.d_xn, &mut sc.d_inj, n)?;
         Inj::Separate
     };
+    pm_lap(e, "hc-down");
     if !silu_done {
         e.q4x_scale_silu(&mut sc.d_m, n * lr, 1.0 / hc as f32)?;
     }
@@ -2256,6 +2400,7 @@ fn hc_mix_pass(
             e.q4x_hc_mix(&sc.d_xn, &sc.d_gate, &mut sc.d_bi, None, n, hc, h)?;
         }
     }
+    pm_lap(e, "hc-up");
     Ok(inj)
 }
 
@@ -2768,6 +2913,7 @@ fn gdn_pass(
         w.qkv.matmul(e, &sc.d_bi, &mut sc.d_qkv, n, stage)?;
     }
     let mut split_done = false;
+    pm_lap(e, "gdn-proj");
     match phase {
         Phase::Prefill => {
             e.causal_conv1d_silu(
@@ -2915,6 +3061,7 @@ fn gdn_pass(
             )?;
         }
     }
+    pm_lap(e, "gdn-conv");
     // Join before the recurrence: it is the first consumer of both branches.
     if forked {
         e.side_join()?;
@@ -3015,21 +3162,44 @@ fn gdn_pass(
         // n == 1 case of that. Same kernel either way, taken at this slot's
         // region of the [slots, heads, D, D] state - at slot 0 that offset is
         // zero, so the single-sequence lane's numerics do not move.
-        e.gated_delta_recurrent_at(
-            &sc.d_dq,
-            &sc.d_dk,
-            &sc.d_dv,
-            &sc.d_g,
-            &sc.d_beta,
-            state,
-            slot * hv * kd * kd,
-            &mut sc.d_dattn,
-            n,
-            hv,
-            kd,
-        )?;
+        // The PRE-NORMED, P-split walk (slot 596) where the pack has it: the
+        // shipped walk holds a whole state column per thread (255 registers,
+        // 2 blocks an SM, 12.57% occupancy on ncu) and runs two shared trees
+        // a token. Prefill widths only - the decode tick is n == 1, where the
+        // split has nothing to spread and the legacy order is kept.
+        if n > 1 && e.has_gated_delta_recurrent_pn() && super::gdn_pn_enabled() {
+            e.gated_delta_recurrent_pn_at(
+                &sc.d_dq,
+                &sc.d_dk,
+                &sc.d_dv,
+                &sc.d_g,
+                &sc.d_beta,
+                state,
+                slot * hv * kd * kd,
+                &mut sc.d_dattn,
+                &mut sc.d_dnrn,
+                n,
+                hv,
+                kd,
+            )?;
+        } else {
+            e.gated_delta_recurrent_at(
+                &sc.d_dq,
+                &sc.d_dk,
+                &sc.d_dv,
+                &sc.d_g,
+                &sc.d_beta,
+                state,
+                slot * hv * kd * kd,
+                &mut sc.d_dattn,
+                n,
+                hv,
+                kd,
+            )?;
+        }
     }
     if !gn_done {
+        pm_lap(e, "gdn-recur");
         e.q4x_gdn_gated_norm(
             &sc.d_dattn,
             &sc.d_zg,
@@ -3041,7 +3211,9 @@ fn gdn_pass(
             c.eps,
         )?;
     }
+    pm_lap(e, "gdn-norm");
     w.out.matmul(e, &sc.d_core, &mut sc.d_mix, n, stage)?;
+    pm_lap(e, "gdn-out");
     Ok(())
 }
 
@@ -3438,6 +3610,19 @@ fn attn_pass(
 /// `d_mix` = the top-k-weighted routed output `[n, hidden]`, exactly what
 /// the NVFP4 arm leaves.
 #[allow(clippy::too_many_arguments)]
+/// Column chunk the grouped down (slot 589) walks the output in. The partials
+/// plane is [pairs, chunk]: 42 MB at a 4096-row wave against the 419 MB a
+/// full-width plane would take, and the chunking costs only a re-stage of
+/// activations the block loads anyway.
+const MOE_DOWN_CHUNK: usize = 256;
+
+/// Blocks a `pd_moe_align_bm(bm)` layout needs for `rows` routed pairs over
+/// `n_expert` experts: every expert rounds its own count up to a whole block,
+/// so the worst case is one partial block per expert on top of the rows.
+fn grp_align_blocks(rows: usize, n_expert: usize, bm: usize) -> usize {
+    (rows + n_expert * (bm - 1)).div_ceil(bm)
+}
+
 fn kq_moe_routed(
     e: &GpuExecutor,
     c: &Qwen4ExpConfig,
@@ -3484,33 +3669,187 @@ fn kq_moe_routed(
     if ng {
         e.q8_sums_strided(&sc.d_xq, &mut sc.d_ssums, h, n)?;
     }
-    e.kquant_moe_gate_up(
-        g,
-        u,
-        idx,
-        &sc.d_xq,
-        &sc.d_xs,
-        ng.then_some(&sc.d_ssums),
-        &mut sc.d_act,
-        k,
-        n,
-    )?;
+    pm_lap(e, "x-quant");
+    // GROUPED gate+up (slot 586) whenever a routing has rows to share. The
+    // pair kernel unpacks a weight window per ROUTED ROW, and a prefill routes
+    // rows/n_expert of them to each expert - 3.9 at a 200-token prompt, so it
+    // unpacked every expert 3.9 times over and MoE owned 57-62% of the walk
+    // (ncu: SM 52% of peak, DRAM 23% - unpack-bound, not bandwidth-bound).
+    // The grouped form pays the unpack once per (expert group, out row) and
+    // is bit-identical to the pair kernel, so this needs no class gate: at
+    // rows <= n_expert (every decode width here) the group holds one row and
+    // the two kernels do exactly the same work, so the pair kernel keeps the
+    // narrow band where its grid is the simpler one.
+    let grp = (cache.is_none()
+        && rows > c.n_expert
+        && super::moe_grp_enabled()
+        && e.has_kquant_moe_grp()
+        && e.has_moe_align_bm())
+    .then(|| GpuExecutor::kq_moe_group_for(rows, c.n_expert));
+    match grp {
+        Some(bm) => {
+            let blocks = grp_align_blocks(rows, c.n_expert, bm);
+            e.moe_align_bm(
+                idx,
+                &mut sc.d_msrow,
+                &mut sc.d_msslot,
+                &mut sc.d_mbexp,
+                n,
+                k,
+                c.n_expert,
+                bm,
+                blocks,
+            )?;
+            // REGISTER-TILED pair (slot 592) when the CSR group is its own
+            // tile height and K divides its slice: it stages both operands per
+            // BK and reads the group's activations once per column TILE, where
+            // the grouped pair kernel reads them once per column - 47 GB a
+            // layer at a 2114-row wave, which is what that kernel waits on.
+            let tiled = bm == GpuExecutor::KQ_MOE_TILE_BM
+                && h.is_multiple_of(128)
+                && super::moe_tile_enabled()
+                && e.has_kquant_moe_gate_up_tile();
+            if tiled {
+                e.kquant_moe_gate_up_tile(
+                    g,
+                    u,
+                    &sc.d_msrow,
+                    &sc.d_msslot,
+                    &sc.d_mbexp,
+                    &sc.d_xq,
+                    &sc.d_xs,
+                    ng.then_some(&sc.d_ssums),
+                    &mut sc.d_act,
+                    k,
+                    n,
+                    blocks,
+                )?;
+            } else {
+                e.kquant_moe_gate_up_grp(
+                    g,
+                    u,
+                    &sc.d_msrow,
+                    &sc.d_msslot,
+                    &sc.d_mbexp,
+                    &sc.d_xq,
+                    &sc.d_xs,
+                    ng.then_some(&sc.d_ssums),
+                    &mut sc.d_act,
+                    k,
+                    n,
+                    blocks,
+                    bm,
+                )?;
+            }
+        }
+        None => e.kquant_moe_gate_up(
+            g,
+            u,
+            idx,
+            &sc.d_xq,
+            &sc.d_xs,
+            ng.then_some(&sc.d_ssums),
+            &mut sc.d_act,
+            k,
+            n,
+        )?,
+    }
+    pm_lap(e, "gate_up");
     e.quantize_q8(&sc.d_act, &mut sc.d_fq, &mut sc.d_fs, rows * ff)?;
     let nd = needs(d.ty);
     if nd {
         e.q8_sums_strided(&sc.d_fq, &mut sc.d_ssums, ff, rows)?;
     }
-    e.kquant_moe_down(
-        d,
-        idx,
-        &sc.d_topw,
-        &sc.d_fq,
-        &sc.d_fs,
-        nd.then_some(&sc.d_ssums),
-        &mut sc.d_mix,
-        k,
-        n,
-    )?;
+    pm_lap(e, "act-quant");
+    // Column-tiled down (slot 587) on the same prefill shapes the grouped
+    // gate+up takes: the plain kernel's block computes one output float and
+    // spends its life on dependent weight loads (ncu: SM 32%, DRAM 21%, and
+    // 1.25 windows per lane to hide them with). Bit-identical, so the choice
+    // is only about keeping the die full - which is why it is the prefill
+    // widths that take it.
+    if let (Some(bm), true) = (grp, e.has_kquant_moe_down_grp()) {
+        // Expert-grouped down over the CSR the gate_up half already built:
+        // the ungrouped kernels unpack a weight row per (routed pair, column),
+        // which is 42% of a wave walk (17.2 ms a layer at 2114 rows). One
+        // column chunk at a time, each chunk's partials folded in slot order
+        // before the next - a grouped block holds different tokens, so the
+        // slot sum cannot happen inside it.
+        let blocks = grp_align_blocks(rows, c.n_expert, bm);
+        let mut o0 = 0;
+        while o0 < h {
+            let ocols = (h - o0).min(MOE_DOWN_CHUNK);
+            if bm == GpuExecutor::KQ_MOE_TILE_BM
+                && ff.is_multiple_of(128)
+                && super::moe_tile_enabled()
+                && e.has_kquant_moe_down_tile()
+            {
+                e.kquant_moe_down_tile(
+                    d,
+                    &sc.d_msrow,
+                    &sc.d_msslot,
+                    &sc.d_mbexp,
+                    &sc.d_topw,
+                    &sc.d_fq,
+                    &sc.d_fs,
+                    nd.then_some(&sc.d_ssums),
+                    &mut sc.d_dpart,
+                    o0,
+                    ocols,
+                    k,
+                    n,
+                    blocks,
+                )?;
+                e.moe_part_fold_at(&sc.d_dpart, &mut sc.d_mix, h, o0, ocols, k, n)?;
+                o0 += ocols;
+                continue;
+            }
+            e.kquant_moe_down_grp(
+                d,
+                &sc.d_msrow,
+                &sc.d_msslot,
+                &sc.d_mbexp,
+                &sc.d_topw,
+                &sc.d_fq,
+                &sc.d_fs,
+                nd.then_some(&sc.d_ssums),
+                &mut sc.d_dpart,
+                o0,
+                ocols,
+                k,
+                n,
+                blocks,
+                bm,
+            )?;
+            e.moe_part_fold_at(&sc.d_dpart, &mut sc.d_mix, h, o0, ocols, k, n)?;
+            o0 += ocols;
+        }
+    } else if (grp.is_some() || n >= 2) && e.has_kquant_moe_down_cols() {
+        e.kquant_moe_down_cols(
+            d,
+            idx,
+            &sc.d_topw,
+            &sc.d_fq,
+            &sc.d_fs,
+            nd.then_some(&sc.d_ssums),
+            &mut sc.d_mix,
+            k,
+            n,
+            4,
+        )?;
+    } else {
+        e.kquant_moe_down(
+            d,
+            idx,
+            &sc.d_topw,
+            &sc.d_fq,
+            &sc.d_fs,
+            nd.then_some(&sc.d_ssums),
+            &mut sc.d_mix,
+            k,
+            n,
+        )?;
+    }
+    pm_lap(e, "down");
     Ok(())
 }
 
@@ -4041,6 +4380,29 @@ impl Scratch {
             } else {
                 1
             })?,
+            // moe_align CSR: max_blocks = ceil((rows + n_expert*(bm-1))/bm)
+            // at bm = 8 (the widest block count of the three group sizes),
+            // and the sorted arrays carry bm entries per block.
+            d_msrow: e.alloc_u32(if kq_lanes {
+                grp_align_blocks(t * c.n_active, c.n_expert, 8) * 8
+            } else {
+                1
+            })?,
+            d_msslot: e.alloc_u32(if kq_lanes {
+                grp_align_blocks(t * c.n_active, c.n_expert, 8) * 8
+            } else {
+                1
+            })?,
+            d_mbexp: e.alloc_u32(if kq_lanes {
+                grp_align_blocks(t * c.n_active, c.n_expert, 8)
+            } else {
+                1
+            })?,
+            d_dpart: e.alloc(if kq_lanes {
+                t * c.n_active * MOE_DOWN_CHUNK
+            } else {
+                1
+            })?,
             d_topw: e.alloc(t * c.n_active)?,
             d_act: e.alloc(t * c.n_active * c.moe_ff)?,
             d_par: e.alloc_u32(t.max(1) * 4)?,
@@ -4094,6 +4456,12 @@ fn q4x_gen_err(e: GpuModelError) -> crate::generator::GenError {
 use crate::generator::{RowSample, SampledStep};
 
 impl crate::generator::Generator for Qwen4ExpGpu {
+    /// The resident-weight line `/api/stats` publishes and the catalog's
+    /// shape generator measures from (see `weights_mem_bytes` above).
+    fn weights_mem_bytes(&self) -> Option<u64> {
+        Self::weights_mem_bytes(self)
+    }
+
     fn reset(&mut self) {
         // trait returns unit; a state-clear failure here would surface on the
         // next forward as a driver error rather than being swallowed silently

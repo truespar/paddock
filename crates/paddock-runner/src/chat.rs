@@ -977,6 +977,7 @@ pub(crate) fn build_mm_chunks(
     prompt_ids: &[u32],
     pad_id: u32,
     media: Vec<MmChunk>,
+    task: Option<&crate::chat_template::TaskTag>,
 ) -> Result<MmPrompt, String> {
     let n_media = media.len();
     let mut media = media.into_iter();
@@ -996,12 +997,40 @@ pub(crate) fn build_mm_chunks(
         }
     }
     if n_pads != n_media {
+        // The one case with a known cause gets a message that says what to
+        // change: granite-vision's template rebuilds a task-tagged turn as
+        // IBM's canned prompt around ONE image slot, so a multi-page document
+        // (one image per page) sent with `<tables_json>` and friends renders
+        // one slot for N pages. The tasks are single-image by design - IBM's
+        // own document pipeline drives the model one page per request - and
+        // that is the answer here too, not a silent drop of N-1 pages.
+        if let Some(t) = task
+            && n_pads < n_media
+        {
+            return Err(format!(
+                "{} is a one-image task on this model: its prompt renders one image                  slot and this request carries {n_media} images (a multi-page document                  is one image per page) - send one page per request",
+                t.tag
+            ));
+        }
         return Err(format!(
             "template rendered {n_pads} media slot(s) for {n_media} media item(s)"
         ));
     }
     chunks.push(MmChunk::Text(text));
     Ok(MmPrompt { chunks, text_ids })
+}
+
+/// The task tag whose canned instruction the rendered prompt carries, if any.
+/// The template already swapped the tag for the instruction by the time we
+/// look, so the instruction being present is what proves a tag fired - the
+/// user's own text is not consulted, which keeps this true for every API
+/// surface without each of them parsing content parts.
+pub(crate) fn fired_task_tag<'a>(
+    prompt: &str,
+    tags: &'a [crate::chat_template::TaskTag],
+) -> Option<&'a crate::chat_template::TaskTag> {
+    tags.iter()
+        .find(|t| !t.prompt.is_empty() && prompt.contains(&t.prompt))
 }
 
 /// Parse the OpenAI logit_bias map ({"token_id": -100..100}) into sampler
@@ -1600,13 +1629,14 @@ fn prepare(
             .image_pad_id
             .ok_or("model has no <|image_pad|> token")?;
         let media = images.into_iter().map(RequestImage::into_chunk).collect();
-        let mm = build_mm_chunks(&prompt_ids, pad, media)?;
+        let task = fired_task_tag(&prompt, &model.task_tags);
+        let mm = build_mm_chunks(&prompt_ids, pad, media, task)?;
         (Some(mm.chunks), mm.text_ids)
     } else if !audio.is_empty() {
         let pad = model
             .audio_pad_id
             .ok_or("model has no <|audio_pad|> token")?;
-        let mm = build_mm_chunks(&prompt_ids, pad, audio)?;
+        let mm = build_mm_chunks(&prompt_ids, pad, audio, None)?;
         (Some(mm.chunks), mm.text_ids)
     } else {
         (None, prompt_ids.clone())
@@ -3528,7 +3558,7 @@ mod tests {
             w: 1,
             h: 1,
         };
-        let mm = build_mm_chunks(&[10, 11, 99, 12], 99, vec![img]).expect("chunks");
+        let mm = build_mm_chunks(&[10, 11, 99, 12], 99, vec![img], None).expect("chunks");
         assert_eq!(mm.chunks.len(), 3);
         assert!(matches!(&mm.chunks[0], MmChunk::Text(t) if t == &vec![10, 11]));
         assert!(matches!(&mm.chunks[1], MmChunk::Image { w: 1, h: 1, .. }));
@@ -3547,7 +3577,8 @@ mod tests {
             w: 1,
             h: 1,
         };
-        let mm = build_mm_chunks(&[10, 99, 11, 99, 12], 99, vec![px(), px()]).expect("chunks");
+        let mm =
+            build_mm_chunks(&[10, 99, 11, 99, 12], 99, vec![px(), px()], None).expect("chunks");
         assert_eq!(
             mm.text_ids,
             vec![10, 11, 12],
@@ -3574,7 +3605,7 @@ mod tests {
     /// filtering something out of an ordinary request.
     #[test]
     fn a_prompt_without_images_keeps_every_token() {
-        let mm = build_mm_chunks(&[10, 11, 12], 99, vec![]).expect("chunks");
+        let mm = build_mm_chunks(&[10, 11, 12], 99, vec![], None).expect("chunks");
         assert_eq!(mm.text_ids, vec![10, 11, 12]);
         assert_eq!(mm.chunks.len(), 1);
     }
@@ -3587,8 +3618,33 @@ mod tests {
             h: 1,
         };
         // no pad token in the prompt for the one image
-        let err = build_mm_chunks(&[10, 11], 99, vec![img]).unwrap_err();
+        let err = build_mm_chunks(&[10, 11], 99, vec![img], None).unwrap_err();
         assert!(err.contains("1 media item(s)"), "{err}");
+    }
+
+    #[test]
+    fn one_image_task_with_several_images_names_the_tag() {
+        let px = || MmChunk::Image {
+            rgb: vec![0; 3],
+            w: 1,
+            h: 1,
+        };
+        let tag = crate::chat_template::TaskTag {
+            tag: "<tables_json>".into(),
+            prompt: "Identify and extract the table schema".into(),
+        };
+        // one slot rendered (granite's tag path), four pages sent
+        let err = build_mm_chunks(&[10, 99, 11], 99, vec![px(), px(), px(), px()], Some(&tag))
+            .unwrap_err();
+        assert!(
+            err.starts_with("<tables_json> is a one-image task"),
+            "{err}"
+        );
+        assert!(err.contains("4 images"), "{err}");
+        // the fired tag is read off the RENDERED prompt, not the user's text
+        let tags = [tag];
+        assert!(fired_task_tag("...Identify and extract the table schema...", &tags).is_some());
+        assert!(fired_task_tag("what is in this picture", &tags).is_none());
     }
 
     // ── audio content parts  ─────────────────────────────────────
@@ -3631,7 +3687,7 @@ mod tests {
             samples: vec![0.0; 160],
             mel: None,
         };
-        let mm = build_mm_chunks(&[10, 99, 11], 99, vec![clip]).expect("chunks");
+        let mm = build_mm_chunks(&[10, 99, 11], 99, vec![clip], None).expect("chunks");
         assert_eq!(mm.text_ids, vec![10, 11]);
         assert!(matches!(&mm.chunks[1], MmChunk::Audio { samples, .. } if samples.len() == 160));
     }

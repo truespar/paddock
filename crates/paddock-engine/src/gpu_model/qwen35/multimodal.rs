@@ -1041,7 +1041,7 @@ impl GpuQwen35 {
                         )?;
                     }
                 }
-                Ffn::Nvf4Dense { gate, up, down } => {
+                Ffn::Nvf4Dense { gu, down } => {
                     // off the f32 xn (write_xn=true; int8 staging unused) -
                     // the chain takes the W4A4 arm above the row band
                     prefill_add_norm_quant(
@@ -1061,8 +1061,7 @@ impl GpuQwen35 {
                     )?;
                     nvf4_ffn(
                         &exec,
-                        gate,
-                        up,
+                        gu,
                         down,
                         &sc.d_xn,
                         &mut sc.d_pxq,
@@ -1070,6 +1069,9 @@ impl GpuQwen35 {
                         &mut sc.d_nv4part,
                         &mut sc.d_ffn_gate,
                         &mut sc.d_ffn_up,
+                        &mut sc.d_ffn_gu,
+                        &mut sc.d_swq_q,
+                        &mut sc.d_swq_s,
                         &mut sc.d_proj,
                         ff,
                         r,
