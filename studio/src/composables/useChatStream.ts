@@ -43,6 +43,7 @@ import {
   replyReserve,
   serverCompactThreshold,
   serverCompactionValid,
+  summaryBlock,
   trimIndex,
   windowRemaining,
 } from '@/lib/tokens'
@@ -712,7 +713,10 @@ function buildBody(
   // and a cloud relay identically.
   if (tools.length && maxToolCalls != null) body.max_tool_calls = maxToolCalls
   // The compaction summary rides in `instructions` (the single system message),
-  // standing in for the older messages the window squeezed out.
+  // standing in for the older messages the window squeezed out. Its wording
+  // comes from `summaryBlock` because the reply budget charges that same
+  // string (see the promptTokensFrom call in run()) - the text the prompt
+  // carries and the text the budget pays for must not be two strings.
   // Client temporal context, date-granular on PURPOSE (SOTA parity: ChatGPT,
   // Claude, and Open WebUI all date their system prompts). Never clock time:
   // this block heads every request, so a minute-stamp would re-tokenize the
@@ -730,9 +734,7 @@ function buildBody(
     // lives ('' while no graph is ready). The static how-to-use text arrives
     // separately, as the graph MCP server's own instructions.
     useGraphsStore().groundingFor(conv.id),
-    plan.summary
-      ? `Summary of the earlier part of this conversation (older messages were compacted):\n${plan.summary}`
-      : '',
+    plan.summary ? summaryBlock(plan.summary) : '',
   ]
     .filter(Boolean)
     .join('\n\n')
@@ -1322,9 +1324,16 @@ export function useChatStream() {
     // Resolve "model maximum" once, here: the window minus the planned prompt.
     // Both the wire and the run record use this number - the run record must
     // show what actually rode (same rule as the maxTokens note below).
+    //
+    // `plan.summary` rides too: buildBody puts it in `instructions`, so the
+    // prompt this cap is estimated against must include that known text too.
     const replyCap =
       settings.maxTokens ??
-      windowRemaining(window, promptTokensFrom(conv, plan.from), models.outCapFor(modelId))
+      windowRemaining(
+        window,
+        promptTokensFrom(conv, plan.from, plan.summary),
+        models.outCapFor(modelId),
+      )
     const controller = new AbortController()
     beginStream(conv.id, controller)
     const started = performance.now()

@@ -78,9 +78,21 @@ function windowSlack(maxCtx: number): number {
 }
 
 /** Rough size of what a send will carry, for windowRemaining. Same estimator
- *  the trimmer uses, so the two agree. */
-export function promptTokensFrom(conv: Conversation, from: number): number {
+ *  the trimmer uses, so the two agree.
+ *
+ *  `summary` is the compaction summary this send will INJECT - a
+ *  `ContextPlan`'s own, never the stored one, because a summary held in
+ *  reserve is not in the prompt and costs nothing. It is charged with its
+ *  wrapper (`summaryBlock`, the one owner of that wording), once, and the
+ *  messages it stands in for are already excluded by `from`.
+ *
+ *  Date/graph/tool content remains outside this estimate. Charging this
+ *  known block reduces the omitted input; it does not provide exact tokenizer
+ *  accounting or prove that a provider would otherwise reject the request. */
+export function promptTokensFrom(conv: Conversation, from: number, summary?: string): number {
   let t = conv.systemPrompt ? estimateTokens(conv.systemPrompt) + PER_MESSAGE_OVERHEAD : 0
+  // Keep the existing estimator's conservative per-block overhead.
+  if (summary) t += estimateTokens(summaryBlock(summary)) + PER_MESSAGE_OVERHEAD
   const msgs = thread(conv)
   for (let i = Math.max(0, from); i < msgs.length; i++) t += messageTokens(msgs[i])
   return t
@@ -166,6 +178,14 @@ export function summaryValid(conv: Conversation): boolean {
     conv.summaryCount &&
     thread(conv)[conv.summaryCount - 1]?.id === conv.summaryLastId
   )
+}
+
+/** The summary exactly as it rides in the prompt: the send path puts this
+ *  string in `instructions` and `promptTokensFrom` charges this string, so
+ *  ONE owner of the wording. Two owners is how the budget came to ignore text
+ *  the request had been carrying all along. */
+export function summaryBlock(summary: string): string {
+  return `Summary of the earlier part of this conversation (older messages were compacted):\n${summary}`
 }
 
 /** What the next prompt should contain: raw messages from `from` on, preceded
