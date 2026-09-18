@@ -68,11 +68,19 @@ export async function maybeCompact(
   const lastId = covered[covered.length - 1]?.id
   if (!lastId) return
 
+  // The model this compaction IS FOR, fixed before anything is built from it.
+  // `conv.model` is mutable and reachable for as long as the request is out -
+  // the header dropdown goes through lib/select-model.ts `selectStudioModel`
+  // into the chat store's `edit` - and it decides three things that have to
+  // agree: which lane's history the transcript carries (see renderTranscript),
+  // which dialect the thinking knob is spelled in, and which runner answers.
+  const model = conv.model
+
   // Roll the existing summary forward: it covers a prefix of `covered`, so the
   // model folds it in rather than re-reading those messages.
   const prior = summaryValid(conv) ? (conv.summaryCount as number) : 0
   const priorBlock = prior > 0 ? `Summary of the conversation so far:\n${conv.summary}\n\n` : ''
-  const transcript = renderTranscript(covered.slice(prior), conv.model)
+  const transcript = renderTranscript(covered.slice(prior), model)
   if (!transcript && !priorBlock) return
 
   // The chunk must itself fit the window with room for the summary; oversize
@@ -86,7 +94,7 @@ export async function maybeCompact(
     // rides in `instructions`, the transcript in `input`). A summary is one-shot,
     // so we don't stream it.
     const req: Record<string, unknown> = {
-      model: conv.model,
+      model,
       instructions: INSTRUCTIONS,
       input: body,
       temperature: 0,
@@ -95,13 +103,13 @@ export async function maybeCompact(
     }
     // Summaries are mechanical: no thinking budget. effort is a Harmony knob;
     // enable_thinking is Qwen's - the same split the model uses elsewhere.
-    if (isHarmony(conv.model)) req.reasoning = { effort: 'low' }
+    if (isHarmony(model)) req.reasoning = { effort: 'low' }
     else req.chat_template_kwargs = { enable_thinking: false }
 
     // Same manager relay the main chat uses - keyed by the runner serving
     // this conversation's model.
-    const endpoint = useModelsStore().responsesUrl(conv.model)
-    if (!endpoint) throw new Error(`no running model serves ${conv.model}`)
+    const endpoint = useModelsStore().responsesUrl(model)
+    if (!endpoint) throw new Error(`no running model serves ${model}`)
     const res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -122,10 +130,17 @@ export async function maybeCompact(
     // The thread may have grown while we summarized (that's fine - coverage is
     // anchored by id), but if the covered prefix itself changed, discard.
     if (activeMessages(conv)[count - 1]?.id !== lastId) return
+    // Same for the model: the selection moved while this was out, so what came
+    // back is the OLD model's summary of the OLD model's own history. Keeping
+    // it would put one model's context under another's name - a compare lane's
+    // answers are filtered per model, so it is the wrong text as well as the
+    // wrong label, and `summaryModel` is what the thread divider shows. Drop
+    // it; the next finished turn compacts for whatever is selected then.
+    if (conv.model !== model) return
     conv.summary = summary
     conv.summaryCount = count
     conv.summaryLastId = lastId
-    conv.summaryModel = conv.model
+    conv.summaryModel = model
     persist(conv)
   } catch (e) {
     console.warn('compaction failed (will retry after a later turn)', e)
