@@ -16,6 +16,11 @@ import { useModelsStore } from '@/stores/models'
 
 const SUMMARY_MAX_TOKENS = 640
 
+/** Proposed upper wait for background compaction; not a latency guarantee.
+ *  Keep the slot retryable when a request stalls. Five minutes needs maintainer
+ *  review against slow/loaded models; browser timer suspension can delay it. */
+const COMPACTION_TIMEOUT_MS = 5 * 60_000
+
 const INSTRUCTIONS =
   'Summarize the conversation transcript below into a compact brief for continuing ' +
   'the same conversation later. Keep: what the user is trying to do, decisions and ' +
@@ -81,6 +86,8 @@ export async function maybeCompact(
   const body = (priorBlock + transcript).slice(-capChars)
 
   inflight.add(conv.id)
+  const abort = new AbortController()
+  let deadline: ReturnType<typeof setTimeout> | undefined
   try {
     // Non-streaming Responses call - same API the main chat uses (system prompt
     // rides in `instructions`, the transcript in `input`). A summary is one-shot,
@@ -102,13 +109,28 @@ export async function maybeCompact(
     // this conversation's model.
     const endpoint = useModelsStore().responsesUrl(conv.model)
     if (!endpoint) throw new Error(`no running model serves ${conv.model}`)
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(req),
+
+    // One deadline covers headers and body consumption. AbortSignal cancels
+    // both in Fetch; racing each await also ends our wait when a transport does
+    // not cooperate. Losing promises have handlers but never mutate the chat.
+    const expired = new Promise<never>((_, reject) => {
+      deadline = setTimeout(() => {
+        reject(new Error(`compaction timed out after ${COMPACTION_TIMEOUT_MS}ms`))
+        abort.abort()
+      }, COMPACTION_TIMEOUT_MS)
     })
+
+    const res = await Promise.race([
+      fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(req),
+        signal: abort.signal,
+      }),
+      expired,
+    ])
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    const out = (await res.json()) as {
+    const out = (await Promise.race([res.json(), expired])) as {
       output?: { type: string; content?: { type: string; text?: string }[] }[]
     }
     const summary = out.output
@@ -128,8 +150,17 @@ export async function maybeCompact(
     conv.summaryModel = conv.model
     persist(conv)
   } catch (e) {
+    // Cancel whatever is still open. On a timeout the deadline already did it;
+    // this covers the rest - an HTTP error whose body we never read, a parse
+    // that failed partway through - so a failed attempt leaves no request
+    // running against a slot it no longer holds.
+    abort.abort()
     console.warn('compaction failed (will retry after a later turn)', e)
   } finally {
+    // Every outcome, success included: a timer left armed is a five-minute
+    // reference to a finished attempt. Undefined when we never got as far as
+    // a request (no endpoint), which clearTimeout takes.
+    clearTimeout(deadline)
     inflight.delete(conv.id)
   }
 }
