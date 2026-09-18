@@ -16,6 +16,12 @@ import { useModelsStore } from '@/stores/models'
 
 const SUMMARY_MAX_TOKENS = 640
 
+/** Window held back from the transcript beyond the summary itself: the
+ *  instructions, the chat template, and the slack the ~4-chars/token estimate
+ *  needs. Named because the floor it implies - a window has to beat
+ *  SUMMARY_MAX_TOKENS + this before ANY transcript fits - is reportable. */
+const REQUEST_HEADROOM = 2048
+
 const INSTRUCTIONS =
   'Summarize the conversation transcript below into a compact brief for continuing ' +
   'the same conversation later. Keep: what the user is trying to do, decisions and ' +
@@ -77,7 +83,21 @@ export async function maybeCompact(
 
   // The chunk must itself fit the window with room for the summary; oversize
   // (possible when many turns arrive between compactions) keeps the newest end.
-  const capChars = Math.max(0, (maxCtx - SUMMARY_MAX_TOKENS - 2048) * 4)
+  const capChars = (maxCtx - SUMMARY_MAX_TOKENS - REQUEST_HEADROOM) * 4
+  // A window under the floor has no room for one line of transcript, and the
+  // clamp this used to carry (`Math.max(0, ...)`) made that the WORST case
+  // rather than a refused one: `slice(-0)` keeps the whole string, so the
+  // budget nothing fits into was sent everything. compactionTarget only needs
+  // `maxCtx - maxReply - 1024 > 0`, so it does ask on windows this small.
+  // Say so and leave: the messages and any existing summary stand, nothing is
+  // marked in flight, and a later turn on a bigger window compacts normally.
+  if (capChars <= 0) {
+    console.warn(
+      `compaction skipped: a ${maxCtx}-token window has no room for a summary request ` +
+        `(needs more than ${SUMMARY_MAX_TOKENS + REQUEST_HEADROOM})`,
+    )
+    return
+  }
   const body = (priorBlock + transcript).slice(-capChars)
 
   inflight.add(conv.id)
