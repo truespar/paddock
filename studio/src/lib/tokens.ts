@@ -56,11 +56,24 @@ export function replyReserve(cap: number | null): number {
  *  (tool schemas, which no client-side estimate can see), so input + output
  * crossed the window and the send died on a 400. Taking
  *  the smaller of the two makes the estimator's error harmless: 384k of output
- *  on a 1M window cannot overflow whatever the prompt turns out to be. */
+ *  on a 1M window cannot overflow whatever the prompt turns out to be.
+ *
+ *  Both halves are CEILINGS, so there is no floor under them. A floor under a
+ *  ceiling is an override: `Math.max(512, ...)` out here asked a provider
+ *  publishing 128 for 512 - the exact 400 the clamp above exists to prevent -
+ *  and on a window the prompt had already filled it invented 512 tokens of
+ *  room that do not exist. 0 is therefore a real answer and means what it
+ *  says: this request has no reply to ask for, and the caller owes the user an
+ *  error rather than a number. */
 export function windowRemaining(maxCtx: number, promptTokens: number, outCap?: number): number {
-  const byModel = outCap && outCap > 0 ? outCap : Infinity
-  if (!maxCtx) return Math.min(REPLY_RESERVE, byModel)
-  return Math.max(512, Math.min(maxCtx - promptTokens - windowSlack(maxCtx), byModel))
+  // A cap only counts when it is a finite positive number of tokens; anything
+  // else (absent, 0, negative, NaN, Infinity) is "this provider publishes none".
+  const byModel = outCap !== undefined && Number.isFinite(outCap) && outCap > 0 ? outCap : Infinity
+  // Window not known yet: the documented fallback - the default headroom, and
+  // still never more than the provider will emit.
+  if (!maxCtx) return Math.floor(Math.min(REPLY_RESERVE, byModel))
+  const byWindow = maxCtx - promptTokens - windowSlack(maxCtx)
+  return Math.max(0, Math.floor(Math.min(byWindow, byModel)))
 }
 
 /** Slack between "everything the window has left" and what we actually ask

@@ -1325,6 +1325,23 @@ export function useChatStream() {
     const replyCap =
       settings.maxTokens ??
       windowRemaining(window, promptTokensFrom(conv, plan.from), models.outCapFor(modelId))
+    // A nonpositive allowance must not reach buildBody: it omits those caps,
+    // which would ask for the provider default instead of refusing the turn.
+    // Keep recoverable continuation state intact when no request is started.
+    if (replyCap <= 0) {
+      assistant.error =
+        `No room left for a reply in the ${window}-token context window used for ` +
+        `${fleetLabel(modelId)}. Shorten the conversation, start a new chat, or load the model ` +
+        `with a larger context.`
+      assistant.streaming = false
+      chat.persistNow(conv)
+      return
+    }
+    if (append) {
+      assistant.incomplete = undefined
+      assistant.stopped = false
+      assistant.error = undefined
+    }
     const controller = new AbortController()
     beginStream(conv.id, controller)
     const started = performance.now()
@@ -2216,8 +2233,6 @@ export function useChatStream() {
     if (!live) return
     if (live.incomplete !== 'length') return
     live.streaming = true
-    live.incomplete = undefined
-    live.stopped = false
     await run(conv, live, true)
   }
 
