@@ -60,6 +60,29 @@ use crate::gpu_model::qwen35::vision::host_f32;
 /// transcription lands inside the first step and never reallocates.
 const ROWS_STEP: usize = 512;
 
+/// The most encoder frames one pass takes (~4.4 min at 50 fps): a clip that
+/// fits runs in one pass exactly as it always did, and a longer one runs in
+/// SEGMENTS whose encoded range never exceeds this - so the planes stop
+/// growing here, where they used to grow to the longest clip ever served
+/// (~12 GB for a clip filling a 32k context) and keep it.
+///
+/// Segmenting is exact, not an approximation, by construction. Attention is
+/// blockwise and never crosses a 200-frame block; the only thing that does
+/// is the centered k15 conv, 7 frames a layer. A frame computed with the
+/// wrong neighbours at a segment's edge therefore spreads by at most one
+/// block per layer (7 frames across the edge, then the next layer's
+/// attention over that whole block), so after 16 layers the error is 16
+/// blocks deep. Each segment is encoded with SEGMENT_HALO frames of real
+/// context on both sides (18 blocks) and keeps only its middle.
+const SEGMENT_CAP: usize = SEGMENT_KEEP + 2 * SEGMENT_HALO;
+/// Frames a segment keeps. Kept ranges start on multiples of 600 frames -
+/// whole attention blocks AND whole 15-frame projector windows.
+const SEGMENT_KEEP: usize = 10 * 600;
+/// Context each side of a kept range: 18 blocks, covering the 16-block error
+/// depth, and a multiple of both the block (200) and the window (15) so the
+/// encoded range starts on a block and the kept rows on a window.
+const SEGMENT_HALO: usize = 6 * 600;
+
 /// One conformer block. Names follow the GGUF, which follows llama.cpp's
 /// converter: `ffn_*` is the first macaron half and `ffn_*_1` the second,
 /// `ln1` is the attention pre-norm and `ln2` the block's post-norm,
@@ -182,6 +205,10 @@ struct Scratch {
     /// zero rows, copied over the window padding (planes are reused across
     /// encodes, so the pad has to be written, not merely never touched)
     zero: CudaSlice<f32>,
+    /// the same for the f16 capture planes, once a segment's kept rows move
+    zero16: CudaSlice<f16>,
+    /// one segment's projector output, copied into the clip's span
+    seg_out: CudaSlice<f32>,
     /// the LayerNorm'd query template repeated per window - constant for a
     /// given block count, so it is built on grow and only copied per encode
     qtpl: CudaSlice<f32>,
@@ -207,6 +234,7 @@ impl Scratch {
         win: usize,
         queries: usize,
         n_cat: usize,
+        out_dim: usize,
         qnorm: &[f32],
     ) -> Result<Self, GpuModelError> {
         let pad_cap = cap.div_ceil(win) * win;
@@ -234,6 +262,8 @@ impl Scratch {
                 .map(|_| exec.alloc_f16(pad_cap * embd))
                 .collect::<Result<_, _>>()?,
             zero: exec.alloc(win * embd)?,
+            zero16: exec.alloc_f16(win * embd)?,
+            seg_out: exec.alloc(q_cap * out_dim)?,
             qtpl: exec.to_device(&tpl)?,
             qz: exec.alloc(q_cap * embd)?,
             pq: exec.alloc(q_cap * embd)?,
@@ -244,8 +274,10 @@ impl Scratch {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn bytes(
-        &self,
+        cap: usize,
+        n_cat: usize,
         embd: usize,
         ffn: usize,
         conv_inner: usize,
@@ -253,8 +285,9 @@ impl Scratch {
         in_dim: usize,
         win: usize,
         queries: usize,
+        out_dim: usize,
     ) -> usize {
-        let (cap, pad_cap) = (self.cap, self.cap.div_ceil(win) * win);
+        let pad_cap = cap.div_ceil(win) * win;
         let q_cap = pad_cap / win * queries;
         let f32s = cap * in_dim
             + pad_cap * embd
@@ -265,8 +298,10 @@ impl Scratch {
             + cap * ctc_dim
             + win * embd
             + q_cap * embd * 5
+            + q_cap * out_dim
             + pad_cap * embd * 2;
-        let f16s = cap * ffn + cap * embd + cap * ctc_dim + pad_cap * embd * (1 + self.cat16.len());
+        let f16s =
+            cap * ffn + cap * embd + cap * ctc_dim + win * embd + pad_cap * embd * (1 + n_cat);
         f32s * 4 + f16s * 2
     }
 }
@@ -612,6 +647,17 @@ impl SpeechTower {
         let conv_pw1_out = blocks[0].conv_pw1_w.dims[1];
         let conv_inner = conv_pw1_out / 2;
 
+        // Segments are exact only while the halo covers the error depth: one
+        // attention block per conformer layer (see SEGMENT_CAP). A tower
+        // deeper, or with wider blocks, than this one would need a wider
+        // halo - refuse it rather than transcribe long clips inexactly.
+        if blocks.len() * ctx > SEGMENT_HALO || !SEGMENT_HALO.is_multiple_of(ctx) {
+            return Err(GpuModelError::Unsupported(format!(
+                "granite-speech: {} layers of {ctx}-frame attention blocks outrun the \
+                 {SEGMENT_HALO}-frame segment halo that keeps long clips exact",
+                blocks.len()
+            )));
+        }
         let sc = Scratch::new(
             &exec,
             ROWS_STEP,
@@ -623,6 +669,7 @@ impl SpeechTower {
             win,
             queries,
             cat_layers.len(),
+            out_dim,
             &qnorm,
         )?;
         let me = Self {
@@ -663,28 +710,40 @@ impl SpeechTower {
             ctc_dim,
             cat_layers = ?me.cat_layers,
             weights_mib = me.weight_bytes / (1 << 20),
-            scratch_mib = me.sc.bytes(embd, ffn, conv_inner, ctc_dim, in_dim, win, queries)
-                / (1 << 20),
+            scratch_mib = me.scratch_bytes(me.sc.cap) / (1 << 20),
             "granite-speech conformer tower resident at f16 (f32 accumulate)"
         );
         Ok(me)
     }
 
     /// Resident bytes: weights plus the scratch planes allocated so far. The
-    /// scratch grows with the longest clip served, so this rises once and
-    /// settles - it is read for the ledger after load, when it is just the
-    /// initial [`ROWS_STEP`] step.
+    /// scratch grows with the longest clip served, up to [`SEGMENT_CAP`]
+    /// frames, so this rises once and settles - it is read for the ledger
+    /// after load, when it is just the initial [`ROWS_STEP`] step.
     pub fn resident_bytes(&self) -> usize {
-        self.weight_bytes
-            + self.sc.bytes(
-                self.embd,
-                self.ffn,
-                self.conv_inner,
-                self.ctc_dim,
-                mel::INPUT_DIM,
-                self.win,
-                self.queries,
-            )
+        self.weight_bytes + self.scratch_bytes(self.sc.cap)
+    }
+
+    /// What the scratch may still grow by: the plan reserves it, since the
+    /// growth is on demand and bounded at [`SEGMENT_CAP`] frames.
+    pub fn scratch_growth_bytes(&self) -> usize {
+        self.scratch_bytes(SEGMENT_CAP)
+            .saturating_sub(self.scratch_bytes(self.sc.cap))
+    }
+
+    fn scratch_bytes(&self, cap: usize) -> usize {
+        Scratch::bytes(
+            cap,
+            self.cat_layers.len(),
+            self.embd,
+            self.ffn,
+            self.conv_inner,
+            self.ctc_dim,
+            mel::INPUT_DIM,
+            self.win,
+            self.queries,
+            self.out_dim,
+        )
     }
 
     /// Audio tokens this tower emits for a clip of `frames` encoder frames.
@@ -700,10 +759,28 @@ impl SpeechTower {
     }
 
     fn grow(&mut self, rows: usize) -> Result<(), GpuModelError> {
+        debug_assert!(rows <= SEGMENT_CAP, "a pass never exceeds SEGMENT_CAP");
         if rows <= self.sc.cap {
             return Ok(());
         }
-        let cap = rows.div_ceil(ROWS_STEP) * ROWS_STEP;
+        let cap = (rows.div_ceil(ROWS_STEP) * ROWS_STEP).min(SEGMENT_CAP.max(rows));
+        // release the old planes first: building the new set while the old
+        // was still held made every growth cost both at once
+        self.sc = Scratch::new(
+            &self.exec,
+            1,
+            self.embd,
+            self.ffn,
+            self.conv_inner,
+            self.ctc_dim,
+            mel::INPUT_DIM,
+            self.win,
+            self.queries,
+            self.cat_layers.len(),
+            self.out_dim,
+            &self.qnorm[..self.queries * self.embd],
+        )?;
+        self.exec.trim_mem_pool();
         self.sc = Scratch::new(
             &self.exec,
             cap,
@@ -715,6 +792,7 @@ impl SpeechTower {
             self.win,
             self.queries,
             self.cat_layers.len(),
+            self.out_dim,
             &self.qnorm,
         )?;
         Ok(())
@@ -739,17 +817,82 @@ impl SpeechTower {
                 feats.data.len()
             )));
         }
-        self.grow(t)?;
+        let exec = self.exec.clone();
+        let n_tokens = self.tokens_for_frames(t);
+        // the one allocation per encode: the span outlives the call
+        let mut embd_out = exec.alloc(n_tokens * self.out_dim)?;
+        let od = self.out_dim;
+        if t <= SEGMENT_CAP {
+            self.grow(t)?;
+            let nq = self.encode_range(feats, 0, t, 0, t)?;
+            exec.copy_region(&self.sc.seg_out, 0, &mut embd_out, 0, nq * od)?;
+        } else {
+            // overlapped segments (see SEGMENT_CAP): encode [x0, x1), keep
+            // [k0, k1), land its tokens at the clip's token offset for k0
+            self.grow(SEGMENT_CAP)?;
+            let mut k0 = 0usize;
+            while k0 < t {
+                let k1 = (k0 + SEGMENT_KEEP).min(t);
+                let (x0, x1) = (k0.saturating_sub(SEGMENT_HALO), (k1 + SEGMENT_HALO).min(t));
+                let nq = self.encode_range(feats, x0, x1, k0, k1)?;
+                let at = k0 / self.win * self.queries;
+                exec.copy_region(&self.sc.seg_out, 0, &mut embd_out, at * od, nq * od)?;
+                k0 = k1;
+            }
+        }
+        let nq = n_tokens;
+
+        // Debug tap for the encoder oracle gate: appends one
+        // [n_tokens, out_dim] f32 block per encode.
+        if let Ok(path) = paddock_models::dev_var!("PADDOCK_GS_DUMP_EMBD") {
+            let host = exec.to_host_len(&embd_out, nq * self.out_dim)?;
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|e| crate::gpu::GpuError::Driver(format!("embd dump {path}: {e}")))?;
+            let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+            f.write_all(&bytes)
+                .map_err(|e| crate::gpu::GpuError::Driver(format!("embd dump {path}: {e}")))?;
+            tracing::info!(
+                n_tokens = nq,
+                path,
+                "dumped granite-speech tower embeddings"
+            );
+        }
+
+        Ok(AudioOutput {
+            embd: embd_out,
+            n_tokens: nq,
+        })
+    }
+
+    /// Input projection, the 16 conformer blocks and the Q-Former projector
+    /// over encoder frames `[x0, x1)`, keeping `[k0, k1)`: the kept frames'
+    /// tokens land in `sc.seg_out`, and their count is returned. A single
+    /// pass is `x0 == k0 == 0, x1 == k1 == t` and runs exactly as the tower
+    /// always did.
+    fn encode_range(
+        &mut self,
+        feats: &MelFeatures,
+        x0: usize,
+        x1: usize,
+        k0: usize,
+        k1: usize,
+    ) -> Result<usize, GpuModelError> {
         let exec = self.exec.clone();
         let sc = &mut self.sc;
         let (e, ffn, ci) = (self.embd, self.ffn, self.conv_inner);
         let eps = self.eps;
+        let t = x1 - x0;
         let padded = t.div_ceil(self.win) * self.win;
-        let nb = padded / self.win;
-        let nq = nb * self.queries;
 
         // ---- input projection: [t, 160] -> [t, embd] ----
-        exec.upload_f32(&feats.data, &mut sc.md)?;
+        exec.upload_f32(
+            &feats.data[x0 * mel::INPUT_DIM..x1 * mel::INPUT_DIM],
+            &mut sc.md,
+        )?;
         exec.convert_f32_f16(&sc.md, &mut sc.s16, t * mel::INPUT_DIM)?;
         exec.matvec_batch_f16(&self.inp_w, &sc.s16, &mut sc.x, t)?;
         exec.bias_add(&mut sc.x, &self.inp_b, t, e)?;
@@ -885,6 +1028,29 @@ impl SpeechTower {
             }
         }
 
+        // ---- the kept frames, moved to the front for the projector ----
+        // A segment keeps the middle of what it encoded; its first kept frame
+        // is a whole number of 15-frame windows in (see SEGMENT_HALO), so the
+        // projector runs unchanged over the kept rows once they sit at row 0.
+        let (off, kf) = (k0 - x0, k1 - k0);
+        let padded_k = kf.div_ceil(self.win) * self.win;
+        if off != 0 || kf != t {
+            exec.copy_region(&sc.x, off * e, &mut sc.n, 0, kf * e)?;
+            exec.copy_region(&sc.n, 0, &mut sc.x, 0, kf * e)?;
+            if padded_k > kf {
+                exec.copy_region(&sc.zero, 0, &mut sc.x, kf * e, (padded_k - kf) * e)?;
+            }
+            for plane in sc.cat16.iter_mut() {
+                exec.copy_region(plane, off * e, &mut sc.s16, 0, kf * e)?;
+                exec.copy_region(&sc.s16, 0, plane, 0, kf * e)?;
+                if padded_k > kf {
+                    exec.copy_region(&sc.zero16, 0, plane, kf * e, (padded_k - kf) * e)?;
+                }
+            }
+        }
+        let padded = padded_k;
+        let nb = padded / self.win;
+        let nq = nb * self.queries;
         // ---- Q-Former projector ----
         exec.convert_f32_f16(&sc.x, &mut sc.enc16, padded * e)?;
         exec.copy_region(&sc.qtpl, 0, &mut sc.qz, 0, nq * e)?;
@@ -993,35 +1159,9 @@ impl SpeechTower {
             )?;
         }
 
-        // the one allocation per encode: the span outlives the call
-        let mut embd_out = exec.alloc(nq * self.out_dim)?;
-        exec.matvec_batch_f16(&self.proj_w, &sc.s16, &mut embd_out, nq)?;
-        exec.bias_add(&mut embd_out, &self.proj_b, nq, self.out_dim)?;
-
-        // Debug tap for the encoder oracle gate: appends one
-        // [n_tokens, out_dim] f32 block per encode.
-        if let Ok(path) = paddock_models::dev_var!("PADDOCK_GS_DUMP_EMBD") {
-            let host = exec.to_host_len(&embd_out, nq * self.out_dim)?;
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .map_err(|e| crate::gpu::GpuError::Driver(format!("embd dump {path}: {e}")))?;
-            let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
-            f.write_all(&bytes)
-                .map_err(|e| crate::gpu::GpuError::Driver(format!("embd dump {path}: {e}")))?;
-            tracing::info!(
-                n_tokens = nq,
-                path,
-                "dumped granite-speech tower embeddings"
-            );
-        }
-
-        Ok(AudioOutput {
-            embd: embd_out,
-            n_tokens: nq,
-        })
+        exec.matvec_batch_f16(&self.proj_w, &sc.s16, &mut sc.seg_out, nq)?;
+        exec.bias_add(&mut sc.seg_out, &self.proj_b, nq, self.out_dim)?;
+        Ok(nq)
     }
 }
 

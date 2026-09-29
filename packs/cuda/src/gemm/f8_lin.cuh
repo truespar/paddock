@@ -3290,10 +3290,18 @@ __global__ void __launch_bounds__(320, 1) pd_f8_gemm_lin_ktp(
 // exact sequence), so outputs are bit-identical per row. 320 threads: the
 // 8 consumer warps carry 128 acc regs/thread (256x128 tile / 256 lanes),
 // so the producer shrinks to 2 warps to keep the 204-reg budget. smem:
-// 2 stages x 2 boxes + 2 x 16 KB Y + one 512 B ysc = 100864 B (the
-// per-block budget is 102400 minus CUDA's 1 KB reserve, so the double
-// ysc did not fit; consumers register-load their Y scales at stage entry
-// and free ysc via named barrier 3, keeping the pipeline depth intact).
+// 2 stages x 2 boxes + 2 x 16 KB Y + one 512 B ysc + the 2 mbarriers =
+// 100880 B (the per-block budget is 102400 minus CUDA's 1 KB reserve, so the
+// double ysc did not fit; consumers register-load their Y scales at stage
+// entry and free ysc via named barrier 3, keeping the pipeline depth intact).
+// ALL of it dynamic: the mbarriers were a static array, and in the sm_120a/
+// 121a images - the only ones where this body exists (PD_F8W8_TMA_OK) - one
+// 1 KB-aligned extern buffer anywhere in the pack aligns every kernel's static
+// section to 1 KB, so their 16 bytes cost 1,024 and every launch asked
+// 101,888 B of a 101,376 B cap: refused on every RTX 50xx and GB10.
+#define PD_LIN_KT2_SMEM 100880u
+static_assert(PD_LIN_KT2_SMEM <= 101376u,
+              "kt2's tile must fit the 99 KB opt-in cap of sm_120/121");
 template <bool O16 = false>
 __global__ void __launch_bounds__(320, 1) pd_f8_gemm_lin_kt2(
     const unsigned char* __restrict__ wlin, const __grid_constant__ PdTmap ymap,
@@ -3306,7 +3314,9 @@ __global__ void __launch_bounds__(320, 1) pd_f8_gemm_lin_kt2(
     unsigned char* wdat = pd_lin2_sh;                // 2 stages x 2 boxes
     unsigned char* ydat = pd_lin2_sh + 67584u;       // 2 stages x 16 KB
     unsigned char* ysc = pd_lin2_sh + 100352u;       // one 512 B buffer
-    __shared__ __align__(8) unsigned long long mb2[2];
+    // the 2 stage mbarriers, 8-byte aligned in the dynamic tail
+    unsigned long long* mb2 =
+        reinterpret_cast<unsigned long long*>(pd_lin2_sh + PD_LIN_KT2_SMEM - 16u);
 
     const uint32_t tid = threadIdx.x;
     const uint32_t n_kb = in_dim >> 5;
@@ -3728,16 +3738,14 @@ int pd_f8_gemm_lin_kt(const void* wlin, const void* xq, const void* xs,
             return pd_launch_status();
         }
     }
-    if (kt2 && (out_dim & 255u) == 0u) {
-        const uint32_t smem2 = 100864u;
-        static bool alin2 = false;
-        if (!alin2) {
-            cudaFuncSetAttribute((const void*)pd_f8_gemm_lin_kt2<true>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem2);
-            cudaFuncSetAttribute((const void*)pd_f8_gemm_lin_kt2<false>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem2);
-            alin2 = true;
-        }
+    // elected by fit: pd_smem_fits counts the image's static bytes and leaves
+    // no failed call behind - a die it does not fit falls through to the kt
+    // tiles below instead of refusing the GEMM
+    static const bool kt2_fits = kt2
+        && pd_smem_fits((const void*)pd_f8_gemm_lin_kt2<true>, PD_LIN_KT2_SMEM)
+        && pd_smem_fits((const void*)pd_f8_gemm_lin_kt2<false>, PD_LIN_KT2_SMEM);
+    if (kt2_fits && (out_dim & 255u) == 0u) {
+        const uint32_t smem2 = PD_LIN_KT2_SMEM;
         const uint32_t nt2 = (out_dim >> 8) * (bp >> 7);
         if (o16)
             pd_f8_gemm_lin_kt2<true><<<nt2, 320, smem2, (cudaStream_t)stream>>>(

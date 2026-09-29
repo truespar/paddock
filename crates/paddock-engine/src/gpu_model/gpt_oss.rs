@@ -977,6 +977,11 @@ impl GpuGptOss {
 
     /// Measured device bytes this model holds (weights + KV caches) - see
     /// `GpuExecutor::process_mem_used`.
+    /// Return the pool's freed memory to the driver (`Generator::release_idle_memory`).
+    pub(crate) fn trim_idle(&self) {
+        self.exec.trim_mem_pool();
+    }
+
     pub fn device_mem_used(&self) -> Option<u64> {
         self.exec.process_mem_used()
     }

@@ -743,6 +743,55 @@ impl GpuExecutor {
         }
     }
 
+    /// Device bytes the stream-ordered pool peaks at while `f` runs, above
+    /// what it held when `f` began - a PROFILE RUN. Work that allocates on
+    /// demand (a vision tower's activations, an audio encoder's scratch) is
+    /// priced into a plan by running its widest case once at load and reading
+    /// the pool's high-water mark, the way vLLM sizes its KV cache, instead of
+    /// by arithmetic that drifts from the code it describes.
+    pub fn pool_peak_during<T>(
+        &self,
+        f: impl FnOnce() -> Result<T, GpuError>,
+    ) -> Result<(T, u64), GpuError> {
+        use cudarc::driver::sys::CUmemPool_attribute as A;
+        let pool = unsafe {
+            let dev =
+                cudarc::driver::result::device::get(self.ctx.ordinal() as i32).map_err(drv)?;
+            cudarc::driver::result::device::get_mem_pool(dev).map_err(drv)?
+        };
+        let read = |a: A| -> Result<u64, GpuError> {
+            let mut v: u64 = 0;
+            // SAFETY: our device's pool; the out-param is the attribute's
+            // documented cuuint64_t.
+            unsafe {
+                cudarc::driver::result::mem_pool::get_attribute(
+                    pool,
+                    a,
+                    std::ptr::from_mut(&mut v).cast(),
+                )
+                .map_err(drv)?;
+            }
+            Ok(v)
+        };
+        self.stream.synchronize().map_err(drv)?;
+        let base = read(A::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)?;
+        // writing 0 resets the high-water mark to the current use
+        let mut zero: u64 = 0;
+        // SAFETY: as above; USED_MEM_HIGH accepts only 0, meaning "reset".
+        unsafe {
+            cudarc::driver::result::mem_pool::set_attribute(
+                pool,
+                A::CU_MEMPOOL_ATTR_USED_MEM_HIGH,
+                std::ptr::from_mut(&mut zero).cast(),
+            )
+            .map_err(drv)?;
+        }
+        let out = f()?;
+        self.stream.synchronize().map_err(drv)?;
+        let high = read(A::CU_MEMPOOL_ATTR_USED_MEM_HIGH)?;
+        Ok((out, high.saturating_sub(base)))
+    }
+
     pub fn pool_reserved_bytes(&self) -> Option<u64> {
         let mut reserved: u64 = 0;
         // SAFETY: same contract as `process_mem_used` - our device's pool, and

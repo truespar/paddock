@@ -2863,15 +2863,21 @@ impl GpuQwen35 {
             vision: None,
             last_reused: Vec::new(),
             chunked: Vec::new(),
-            image_cache: Vec::new(),
-            image_cache_clock: 0,
-            image_cache_reused: 0,
+            // budgeted for the requested chunk until enable_batch elects one
+            pictures: crate::gpu_model::picture_store::PictureStore::new(
+                (2 * super::chunk_tick_rows() * embd * std::mem::size_of::<f32>()) as u64,
+            ),
             pipe: None,
         })
     }
 
     /// Measured device bytes this model holds (weights + KV/state pools) -
     /// see `GpuExecutor::process_mem_used`.
+    /// Return the pool's freed memory to the driver (`Generator::release_idle_memory`).
+    pub(crate) fn trim_idle(&self) {
+        self.exec.trim_mem_pool();
+    }
+
     pub fn device_mem_used(&self) -> Option<u64> {
         self.exec.process_mem_used()
     }

@@ -229,6 +229,8 @@ thread_local! {
     pub(super) static LOCAL_ATTENTION_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     pub(super) static PADDED_ATTENTION_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     pub(super) static GATHER_ATTENTION_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    pub(super) static VALUE_PITCH_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    pub(super) static DIRECT_RUNS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 impl Workspace {
     fn partition_units(capacity: usize, slots: usize, mlx: bool) -> usize {
@@ -344,6 +346,50 @@ impl Workspace {
         x: &Buffer,
         out: &Buffer,
     ) {
+        self.encode_inner(cmd, w, cache, plan, x, Some(out));
+    }
+
+    /// Populate exactly the same persistent state without evaluating dead
+    /// queries or attention outputs. Only the terminal MLX layer may use this,
+    /// and only when no caller (including a draft head) consumes its hidden rows.
+    pub(super) fn encode_cache(
+        &self,
+        cmd: &Commands<'_>,
+        w: &Weights,
+        cache: &Cache,
+        plan: &Plan,
+        x: &Buffer,
+        bad: &Buffer,
+    ) {
+        assert!(affine::is_affine(w.q.ty));
+        self.encode_inner(cmd, w, cache, plan, x, None);
+        let n = plan.meta.len() / 4;
+        cmd.dispatch(
+            "q4b_cache_finite",
+            &[
+                &cache.keys,
+                &cache.values,
+                &self.raw,
+                &cache.pooled,
+                &self.meta,
+                &self.pages,
+                bad,
+            ],
+            &self.p(n),
+            [(n * KV).div_ceil(256), 1, 1],
+            256,
+        );
+    }
+
+    fn encode_inner(
+        &self,
+        cmd: &Commands<'_>,
+        w: &Weights,
+        cache: &Cache,
+        plan: &Plan,
+        x: &Buffer,
+        out: Option<&Buffer>,
+    ) {
         let n = plan.meta.len() / 4;
         let mlx = affine::is_affine(w.q.ty);
         let mut p = self.p(n);
@@ -352,11 +398,19 @@ impl Workspace {
             // its own split count on GPU; neighbours cannot change rounding.
             p[4] = SPLITS as u32;
         }
-        for (w, y) in [(&w.q, &self.qg), (&w.k, &self.k), (&w.v, &self.v)] {
-            project(cmd, w, x, y, n);
+        for (needed, w, y) in [
+            (out.is_some(), &w.q, &self.qg),
+            (true, &w.k, &self.k),
+            (true, &w.v, &self.v),
+        ] {
+            if needed {
+                project(cmd, w, x, y, n);
+            }
         }
         if let Some(index_k) = &w.index_k {
-            project(cmd, &w.index_q, x, &self.index_query, n);
+            if out.is_some() {
+                project(cmd, &w.index_q, x, &self.index_query, n);
+            }
             project(cmd, index_k, x, &self.raw, n);
         } else {
             // The checkpoint fuses Q/K index rows. Splitting its compressed
@@ -371,10 +425,19 @@ impl Workspace {
                 256,
             );
         }
-        for (x, w, y, width, heads, stride) in [
-            (&self.qg, &w.q_norm, &self.query, 256, 24, 512),
-            (&self.k, &w.k_norm, &self.k, 256, 2, 256),
+        for (needed, x, w, y, width, heads, stride) in [
             (
+                out.is_some(),
+                &self.qg,
+                &w.q_norm,
+                &self.query,
+                256,
+                24,
+                512,
+            ),
+            (true, &self.k, &w.k_norm, &self.k, 256, 2, 256),
+            (
+                out.is_some(),
                 &self.index_query,
                 &w.index_q_norm,
                 &self.index_query,
@@ -383,6 +446,9 @@ impl Workspace {
                 128,
             ),
         ] {
+            if !needed {
+                continue;
+            }
             cmd.dispatch(
                 if mlx {
                     "q4b_norm_rope"
@@ -429,6 +495,7 @@ impl Workspace {
             [(n * 128).div_ceil(256), 1, 1],
             256,
         );
+        let Some(out) = out else { return };
         if plan.blocks > 512 {
             cmd.dispatch(
                 "q4s_score",
@@ -493,8 +560,23 @@ impl Workspace {
         let gather_attention = padded_attention;
         #[cfg(test)]
         let gather_attention = gather_attention && GATHER_ATTENTION_FOR_TEST.with(|v| v.get());
+        let value_pitch = gather_attention;
+        #[cfg(test)]
+        let value_pitch = value_pitch && VALUE_PITCH_FOR_TEST.with(|v| v.get());
+        #[cfg(test)]
+        let direct = value_pitch && DIRECT_RUNS_FOR_TEST.with(|v| v.get());
+        #[cfg(not(test))]
+        let direct = value_pitch;
+        // The measured opportunity is dense prompt attention. Do not add
+        // the run election to singleton decode or wholly sparse long tails.
+        // A mixed call still checks physical contiguity separately per row.
+        let direct = direct && n > 8 && plan.meta.chunks_exact(4).any(|m| m[1] < 2048);
         cmd.dispatch(
-            if gather_attention {
+            if direct {
+                "q4b_attention_direct_runs"
+            } else if value_pitch {
+                "q4b_attention_local_vpad1"
+            } else if gather_attention {
                 "q4b_attention_local_gather"
             } else if padded_attention {
                 "q4b_attention_local_pad"

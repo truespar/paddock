@@ -127,10 +127,18 @@ pub(super) fn images_of(chunks: &[MmChunk]) -> Vec<(&[u8], usize, usize)> {
 /// the chunk list (the runner injects it before any image), missing halves
 /// fall to `default`. Scanned in full before any image math so it can never
 /// apply to only a suffix.
+///
+/// Both halves are held to the ceiling this model publishes (the one
+/// `vision_budget_impl` reports). The client's numbers used to be taken as
+/// given: a `max_pixels` of a few hundred megapixels grew the tower's
+/// workspace to match and kept it, bounded only by the prompt fitting
+/// max_ctx - memory any caller could ask for. Above the ceiling a request
+/// gets the ceiling, the same answer `detail: high` gets.
 pub(super) fn budget_of(
     chunks: &[MmChunk],
     default: PixelBudget,
 ) -> Result<PixelBudget, GpuModelError> {
+    let ceiling = (SPOTTING_MAX_PIXELS as usize).max(default.max_pixels);
     let mut budget = default;
     for c in chunks {
         if let MmChunk::VisionPixels {
@@ -139,10 +147,10 @@ pub(super) fn budget_of(
         } = c
         {
             if let Some(m) = min_pixels {
-                budget.min_pixels = *m as usize;
+                budget.min_pixels = (*m as usize).min(ceiling);
             }
             if let Some(m) = max_pixels {
-                budget.max_pixels = *m as usize;
+                budget.max_pixels = (*m as usize).min(ceiling);
             }
         }
     }
@@ -595,5 +603,34 @@ impl GpuPaddleOcrVl {
         bs.mrope_delta[slot] = plan.pos.next as i64 - plan.n_rows as i64;
         let logits = self.head_row(last_len - 1)?;
         Ok((logits, plan.n_rows))
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::{PixelBudget, SPOTTING_MAX_PIXELS, budget_of};
+    use crate::service::MmChunk;
+
+    fn directive(min: Option<u64>, max: Option<u64>) -> Vec<MmChunk> {
+        vec![MmChunk::VisionPixels {
+            min_pixels: min,
+            max_pixels: max,
+        }]
+    }
+
+    /// A client's pixel budget is held to the model's published ceiling -
+    /// it used to be taken as given, and the tower's workspace grew to match.
+    #[test]
+    fn a_directive_cannot_raise_the_budget_past_the_published_ceiling() {
+        let default = PixelBudget::DEFAULT;
+        let ceiling = (SPOTTING_MAX_PIXELS as usize).max(default.max_pixels);
+        let b = budget_of(&directive(None, Some(400_000_000)), default).expect("budget");
+        assert_eq!(b.max_pixels, ceiling);
+        let b =
+            budget_of(&directive(Some(300_000_000), Some(400_000_000)), default).expect("budget");
+        assert_eq!((b.min_pixels, b.max_pixels), (ceiling, ceiling));
+        // and a directive inside the ceiling is honoured as asked
+        let b = budget_of(&directive(Some(100_000), Some(800_000)), default).expect("budget");
+        assert_eq!((b.min_pixels, b.max_pixels), (100_000, 800_000));
     }
 }

@@ -55,6 +55,17 @@ pub trait Generator: Send {
         None
     }
 
+    /// Hand the device memory the finished requests freed back to the
+    /// driver. The scheduler calls it once each time it runs out of work.
+    ///
+    /// The stream-ordered pool returns freed memory only at a synchronize,
+    /// and an idle server does not synchronize, so what the last requests
+    /// freed stayed reserved until the next one arrived - measured +2.4 GB of
+    /// NVML on granite after a request of twelve max-grid strips, all of it
+    /// already freed. On a unified-memory box that is memory nothing else on
+    /// the machine can have.
+    fn release_idle_memory(&mut self) {}
+
     /// One batched decode step: `tokens[i]` at `positions[i]` drives KV slot i.
     /// Returns [rows, vocab] logits (row i = slot i's next-token logits). Only
     /// valid after `enable_batch` returned > 1.
@@ -1469,6 +1480,10 @@ impl Generator for crate::gpu_model::qwen35::GpuQwen35 {
     fn device_mem_used(&self) -> Option<u64> {
         crate::gpu_model::qwen35::GpuQwen35::device_mem_used(self)
     }
+
+    fn release_idle_memory(&mut self) {
+        crate::gpu_model::qwen35::GpuQwen35::trim_idle(self);
+    }
     fn enable_batch(&mut self, max_batch: usize) -> Result<usize, GenError> {
         // to_gen_err so a Config reject stays typed (fatal at startup, never
         // width-halved into a config the user didn't ask for)
@@ -1789,55 +1804,28 @@ impl Generator for crate::gpu_model::qwen35::GpuQwen35 {
         &mut self,
         items: Vec<(usize, Vec<crate::service::MmChunk>)>,
     ) -> Vec<(usize, Result<(Vec<f32>, usize), GenError>)> {
-        // One cache-aware batched tower pass over every pending request's
-        // images, then one batched prefill pass over every request's rows -
-        // the full vi8 fix (encode batching alone left a serial-prefill
-        // TTFT plateau)
-        let refs: Vec<&[crate::service::MmChunk]> =
-            items.iter().map(|(_, c)| c.as_slice()).collect();
+        // Batched prefill over every pending request's rows - the full vi8 fix
+        // (encode batching alone left a serial-prefill TTFT plateau) - with
+        // each prefill group's pictures encoded in one batched tower call as
+        // its pass comes up. A failure is systemic (alloc/driver): report it
+        // on every pending slot rather than half-serving the wave.
+        let ks: Vec<usize> = items.iter().map(|(k, _)| *k).collect();
+        let n = items.len();
         let t0 = std::time::Instant::now();
-        match self.encode_images_for_requests(&refs) {
-            Ok(per_req) => {
-                if paddock_models::dev_var_os!("PADDOCK_ROUTE_WITNESS").is_some() {
-                    eprintln!(
-                        "pd route: mm encode {} reqs in {:.1}ms",
-                        refs.len(),
-                        t0.elapsed().as_secs_f64() * 1e3
-                    );
-                }
-                let t1 = std::time::Instant::now();
-                let ks: Vec<usize> = items.iter().map(|(k, _)| *k).collect();
-                let reqs: Vec<_> = items
-                    .into_iter()
-                    .zip(per_req)
-                    .map(|((k, chunks), images)| (k, chunks, images))
-                    .collect();
-                let n = reqs.len();
-                let res = self.forward_prefill_batch_mm(reqs);
-                if paddock_models::dev_var_os!("PADDOCK_ROUTE_WITNESS").is_some() {
-                    eprintln!(
-                        "pd route: mm prefill {} reqs in {:.1}ms",
-                        n,
-                        t1.elapsed().as_secs_f64() * 1e3
-                    );
-                }
-                match res {
-                    Ok(res) => ks.into_iter().zip(res).map(|(k, lr)| (k, Ok(lr))).collect(),
-                    Err(e) => {
-                        let msg = e.to_string();
-                        ks.into_iter()
-                            .map(|k| (k, Err(GenError::Backend(msg.clone()))))
-                            .collect()
-                    }
-                }
-            }
-            // a batched-encode failure is systemic (alloc/driver): report it
-            // on every pending slot rather than half-serving the wave
+        let res = self.forward_prefill_mm_wave(items);
+        if paddock_models::dev_var_os!("PADDOCK_ROUTE_WITNESS").is_some() {
+            eprintln!(
+                "pd route: mm encode + prefill {} reqs in {:.1}ms",
+                n,
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        match res {
+            Ok(res) => ks.into_iter().zip(res).map(|(k, lr)| (k, Ok(lr))).collect(),
             Err(e) => {
                 let msg = e.to_string();
-                items
-                    .into_iter()
-                    .map(|(k, _)| (k, Err(GenError::Backend(msg.clone()))))
+                ks.into_iter()
+                    .map(|k| (k, Err(GenError::Backend(msg.clone()))))
                     .collect()
             }
         }
@@ -1861,6 +1849,10 @@ impl Generator for crate::gpu_model::gpt_oss::GpuGptOss {
     }
     fn device_mem_used(&self) -> Option<u64> {
         crate::gpu_model::gpt_oss::GpuGptOss::device_mem_used(self)
+    }
+
+    fn release_idle_memory(&mut self) {
+        crate::gpu_model::gpt_oss::GpuGptOss::trim_idle(self);
     }
 
     fn weights_mem_bytes(&self) -> Option<u64> {

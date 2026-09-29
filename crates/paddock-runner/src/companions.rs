@@ -210,6 +210,21 @@ fn is_gguf(p: &Path) -> bool {
 /// Check the configured companions against the weights, then fill the unset
 /// ones from the weights' own folder - the layout catalog pulls produce.
 pub(crate) fn resolve(cfg: &mut Config, weights: &Path) -> Result<(), String> {
+    // `vision = false` / `--no-mmproj`: the tower is switched OFF. Leaving the
+    // mmproj line out used to be the only off switch, and discovery below
+    // loaded the tower beside the weights anyway - the manager's Vision switch
+    // wrote exactly such a file, and the endpoint kept serving images, holding
+    // memory its admission never counted. Naming a tower as well is a
+    // contradiction; refusing it beats guessing which one was meant.
+    if cfg.vision == Some(false)
+        && let Some(p) = &cfg.mmproj
+    {
+        return Err(format!(
+            "`vision = false` switches the vision tower off, but `mmproj` names one ({}) - \
+             remove one of the two",
+            p.display()
+        ));
+    }
     // A checkpoint DIRECTORY (safetensors-primary lane) carries everything
     // inside itself; scanning its PARENT would treat unrelated sibling
     // models' companions as this model's.
@@ -271,8 +286,15 @@ pub(crate) fn resolve(cfg: &mut Config, weights: &Path) -> Result<(), String> {
             "mmproj",
         )
     {
-        tracing::info!(mmproj = %p.display(), "companion mmproj discovered beside the weights");
-        cfg.mmproj = Some(p);
+        if cfg.vision == Some(false) {
+            tracing::info!(
+                mmproj = %p.display(),
+                "vision is off (vision = false): the tower beside the weights is not loaded"
+            );
+        } else {
+            tracing::info!(mmproj = %p.display(), "companion mmproj discovered beside the weights");
+            cfg.mmproj = Some(p);
+        }
     }
     if cfg.mtp.is_none()
         && let Some(p) = pick(
@@ -426,5 +448,59 @@ mod tests {
         assert!(e.contains("mmproj = other/mmproj-BF16.gguf"), "{e}");
         assert!(e.contains("4096") && e.contains("5120"), "{e}");
         assert!(check_named(p, "projector", "mmproj", Verdict::Unknown).is_ok());
+    }
+
+    /// A model folder with its tower beside the weights - the layout every
+    /// catalog pull produces. Empty files: an unreadable header counts as
+    /// "unknown", which discovery still takes, so this drives the real scan.
+    fn folder_with_tower(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("pd-vision-off-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let weights = dir.join("Model-Q8_0.gguf");
+        let tower = dir.join("mmproj-BF16.gguf");
+        std::fs::write(&weights, b"").expect("weights");
+        std::fs::write(&tower, b"").expect("tower");
+        (dir, weights, tower)
+    }
+
+    /// The Vision switch's contract: off means the tower beside the weights is
+    /// NOT loaded. Before the key existed, "off" was a missing mmproj line and
+    /// this scan put the tower straight back.
+    #[test]
+    fn vision_off_leaves_the_tower_beside_the_weights_unloaded() {
+        let (dir, weights, tower) = folder_with_tower("off");
+        let mut on = crate::config::Config::default();
+        resolve(&mut on, &weights).expect("resolve");
+        assert_eq!(
+            on.mmproj.as_deref(),
+            Some(tower.as_path()),
+            "discovery as before"
+        );
+
+        let mut off = crate::config::Config {
+            vision: Some(false),
+            ..Default::default()
+        };
+        resolve(&mut off, &weights).expect("resolve");
+        assert_eq!(
+            off.mmproj, None,
+            "vision = false must keep the tower unloaded"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Off plus a named tower is a contradiction, refused with both named.
+    #[test]
+    fn vision_off_with_a_named_tower_is_refused() {
+        let (dir, weights, tower) = folder_with_tower("both");
+        let mut cfg = crate::config::Config {
+            vision: Some(false),
+            mmproj: Some(tower.clone()),
+            ..Default::default()
+        };
+        let e = resolve(&mut cfg, &weights).unwrap_err();
+        assert!(e.contains("vision = false") && e.contains("mmproj"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -200,6 +200,19 @@ impl GpuPaddleOcrVl {
         }
         self.weights_bytes += vm.weight_bytes() as u64;
         self.vision = Some(vm);
+        // the tower's workspace, once, for the widest pass serving can form:
+        // TOWER_PASS_ROWS, or one maximum-size picture (four patch rows per
+        // token at the published ceiling) alone - in the ledger before any
+        // plan reads its grant, never grown after
+        let max_picture = self
+            .vision_budget_impl()
+            .map_or(0, |b| 4 * b.max_tokens as usize);
+        let rows = super::vision::TOWER_PASS_ROWS.max(max_picture);
+        self.vision
+            .as_mut()
+            .expect("attached above")
+            .size_workspace(rows)
+            .map_err(GpuModelError::from)?;
         Ok(())
     }
 

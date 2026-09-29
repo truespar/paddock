@@ -69,6 +69,9 @@ pub struct ServingModel {
     pub reasoning: crate::reasoning::ReasoningCaps,
     /// an mmproj was loaded - image content parts are accepted
     pub supports_vision: bool,
+    /// the operator switched the tower off (`vision = false` / `--no-mmproj`),
+    /// so an image request is refused naming the switch, not a missing file
+    pub vision_off: bool,
     /// an AUDIO mmproj was loaded - /v1/audio/transcriptions serves
     pub supports_audio: bool,
     /// which host frontend this model's audio goes through. Only meaningful
@@ -1812,6 +1815,7 @@ pub(crate) fn load_with_residency(
     )?;
 
     Ok(ServingModel {
+        vision_off: false,
         id,
         spec: SpecReport {
             heads: arch_has_infile_heads(&arch)
@@ -2063,6 +2067,7 @@ fn load_hf_dir(
     )?;
 
     Ok(ServingModel {
+        vision_off: false,
         id,
         spec: SpecReport {
             heads: false,

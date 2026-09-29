@@ -126,7 +126,7 @@ pub(crate) fn audio_key(samples: &[f32]) -> u64 {
 /// Sized for a handful of ordinary pictures or a couple of max-grid ones; an
 /// image bigger than the whole cap is served without being cached rather than
 /// evicting everything for one entry.
-fn img_cache_cap() -> usize {
+pub(super) fn img_cache_cap() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         paddock_models::dev_var!("PADDOCK_IMG_CACHE_MB")

@@ -349,6 +349,13 @@ impl VisionModel {
         resize_target_px(w, h, self.max_pixels(), self.max_edge())
     }
 
+    /// Soft tokens a `w`x`h` picture encodes to - what `encode` will report,
+    /// from the resize target alone (patch grid, then the 3x3 pool).
+    pub fn tokens_for(&self, w: usize, h: usize) -> usize {
+        let (tw, th) = self.resize_target(w, h);
+        (tw / self.patch / N_MERGE) * (th / self.patch / N_MERGE)
+    }
+
     /// Full preprocessing: bilinear resize to the smart target, then im2row
     /// patches with the graph's ×2-1 scaling folded in. Returns (patches
     /// [n_patches, 3·patch²], grid_w, grid_h).

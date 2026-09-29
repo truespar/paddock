@@ -92,6 +92,13 @@ pub struct Config {
     pub max_batch: usize,
     /// Vision tower GGUF (mmproj) for multimodal models; enables image input.
     pub mmproj: Option<PathBuf>,
+    /// `false` switches the vision tower OFF (`--no-mmproj`, llama.cpp's flag).
+    /// Leaving `mmproj` out is not enough on its own: companion discovery
+    /// loads a tower it finds beside the weights, so an endpoint written
+    /// without the line still served images. Unset (or `true`) keeps
+    /// discovery; `false` alongside an `mmproj` line is refused as a
+    /// contradiction.
+    pub vision: Option<bool>,
     /// MTP drafter GGUF (separate-model speculative drafter, e.g. gemma4's
     /// mtp-*.gguf); enables serving spec rounds with model drafts.
     pub mtp: Option<PathBuf>,
@@ -356,6 +363,7 @@ impl Default for Config {
             // (max_num_seqs=256).
             max_batch: 32,
             mmproj: None,
+            vision: None,
             mtp: None,
             text_encoder: None,
             vae: None,

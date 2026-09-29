@@ -1,5 +1,17 @@
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static CACHE_ONLY_TAIL_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    pub(super) static PLE_LOOKAHEAD_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static ADAPTIVE_PLE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+fn trace_work() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_METAL_WORK_TRACE").is_some())
+}
+
 impl FlashNext {
     pub(super) fn execute(
         &mut self,
@@ -33,6 +45,9 @@ impl FlashNext {
                 "invalid Flash Next execution/output rows".into(),
             ));
         }
+        // Opt-in prefill diagnostics only. Never log token IDs, prompt text,
+        // weights or activations; no per-decode logging or extra GPU barrier.
+        let trace_started = (n > self.slots.len() && trace_work()).then(std::time::Instant::now);
         let lengths = self.slots.iter().map(|s| s.length).collect::<Vec<_>>();
         let positions = rows.iter().map(|r| (r.0, r.2 as usize)).collect::<Vec<_>>();
         // All three plans are immutable control data, built once per batch,
@@ -76,9 +91,11 @@ impl FlashNext {
         }
         // Fenced compressed-row reads precede GPU mutation. Failed I/O is
         // not a cache miss or a reason to consume stale staging bytes.
+        let planned = trace_started.map(|t| t.elapsed());
         #[cfg(test)]
         let ple_started = std::time::Instant::now();
         self.ple_table.stage(&pp, &self.scratch.ple)?;
+        let staged = trace_started.map(|t| t.elapsed());
         #[cfg(test)]
         if n > 8 && std::env::var_os("PADDOCK_FLASH_NEXT_PLE_TIMING").is_some() {
             eprintln!(
@@ -197,6 +214,16 @@ impl FlashNext {
             trace!(li, "hc_low", &s.hc.low, 320);
             trace!(li, "hc_gate", &s.hc.gate, WIDE);
             trace!(li, "hc_mix", &s.hc.mixed, WIDTH);
+            // execute's only consumers are the requested logits and carried
+            // caches; no draft head consumes s.h. Do not select/compact rows
+            // for mixed calls: their original projection contracts stay intact.
+            let cache_only = self.is_mlx() && outputs.is_empty() && li + 1 == self.layers.len();
+            #[cfg(test)]
+            let cache_only = cache_only && CACHE_ONLY_TAIL_FOR_TEST.with(|v| v.get());
+            if cache_only && let Mixer::Qsa(w, cache) = &layer.mixer {
+                s.qsa.encode_cache(&cmd, w, cache, &qp, &s.hc.mixed, &s.bad);
+                continue;
+            }
             match &layer.mixer {
                 Mixer::Delta(w, cache) => s.dn.encode(&cmd, w, cache, &dp, &s.hc.mixed, &s.delta),
                 Mixer::Qsa(w, cache) => {
@@ -211,9 +238,16 @@ impl FlashNext {
                 }
             }
             trace!(li, "mixer", &s.delta, WIDTH);
-            layer.hc.combine(&cmd, &s.h, &s.delta, &s.hc, n);
+            let normalized = layer
+                .ffn
+                .prepare_after_mixer(&cmd, &s.h, &s.delta, &s.hc, n);
+            if !normalized {
+                layer.hc.combine(&cmd, &s.h, &s.delta, &s.hc, n);
+            }
             trace!(li, "attention_out", &s.h, WIDE);
-            layer.ffn.encode_ffn(&cmd, &s.h, &s.hc, &s.moe, n)?;
+            layer
+                .ffn
+                .encode_ffn(&cmd, &s.h, &s.hc, &s.moe, n, normalized)?;
             trace!(li, "ffn_out", &s.h, WIDE);
             // Scratch flags are overwritten by the next layer; accumulate
             // them now, rather than inspecting only layer 47 on the host.
@@ -260,7 +294,43 @@ impl FlashNext {
                 256,
             );
         }
-        self.last_gpu_seconds = cmd.finish()?;
+        let submitted = trace_started.map(|t| t.elapsed());
+        // Only measured slow storage justifies competing with the GPU for
+        // memory bandwidth. The read-ahead does not change admission, token
+        // history, arithmetic or the live staging buffer.
+        let lookahead =
+            matches!(&self.ple_table, ple::Table::Paged(table) if table.should_prefetch());
+        #[cfg(test)]
+        let lookahead = (lookahead && ADAPTIVE_PLE_FOR_TEST.with(|v| v.get()))
+            || PLE_LOOKAHEAD_FOR_TEST.with(|v| v.get());
+        if lookahead && let ple::Table::Paged(table) = &mut self.ple_table {
+            self.last_gpu_seconds = cmd.finish_with_host_work(|gpu_done| {
+                let mut ids = Vec::new();
+                for pending in &self.pending {
+                    let start = next[pending.slot];
+                    if start <= pending.offset || start >= pending.tokens.len() {
+                        continue;
+                    }
+                    let count = (start - pending.offset)
+                        .min(pending.tokens.len() - start)
+                        .min(super::super::ple_paged::LOOKAHEAD_ROWS - ids.len() / 16);
+                    if count == 0 {
+                        break;
+                    }
+                    match super::super::ple_paged::prompt_lookahead(&pending.tokens, start, count) {
+                        Ok(rows) => ids.extend(rows),
+                        Err(_) => return, // demand staging retains authoritative validation
+                    }
+                }
+                // Speculative I/O failure never fails a completed request or
+                // admits partial bytes. A needed row is read/validated again
+                // by stage(), which propagates its actual error to the caller.
+                let _ = table.prefetch(&ids, gpu_done);
+            })?;
+        } else {
+            self.last_gpu_seconds = cmd.finish()?;
+        }
+        let finished = trace_started.map(|t| t.elapsed());
         let status = unsafe { s.bad.read_u32(1)[0] };
         if status != 0 {
             return Err(MetalError::Device(format!(
@@ -272,6 +342,24 @@ impl FlashNext {
             slot.length = len;
         }
         self.poisoned = false;
+        if let (Some(started), Some(planned), Some(staged), Some(submitted), Some(finished)) =
+            (trace_started, planned, staged, submitted, finished)
+        {
+            tracing::info!(
+                rows = n,
+                output_rows = outputs.len(),
+                min_position = rows.iter().map(|r| r.2).min().unwrap_or(0),
+                max_position = rows.iter().map(|r| r.2).max().unwrap_or(0),
+                spans = ?projection_rows,
+                planning_ms = planned.as_secs_f64() * 1000.,
+                ple_ms = (staged - planned).as_secs_f64() * 1000.,
+                encode_ms = (submitted - staged).as_secs_f64() * 1000.,
+                submit_wait_ms = (finished - submitted).as_secs_f64() * 1000.,
+                gpu_ms = self.last_gpu_seconds * 1000.,
+                readout_ms = (started.elapsed() - finished).as_secs_f64() * 1000.,
+                "Flash Next prefill execution"
+            );
+        }
         Ok(logits)
     }
 }

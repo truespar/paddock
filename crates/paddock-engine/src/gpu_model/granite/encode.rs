@@ -172,10 +172,17 @@ pub(crate) struct WaveEncode {
     tiles: Vec<Vec<f32>>,
     /// Tiles the finished stack will hold, from `plans` alone.
     total_tiles: usize,
-    /// Projected rows accumulated so far, one buffer per DeepStack stream. Sized
-    /// for the whole stack up front: the same volume the unbudgeted encode
-    /// allocates, just written a group at a time.
-    acc: Vec<CudaSlice<f32>>,
+    /// Projected rows accumulated so far, per unique picture, one buffer per
+    /// DeepStack stream - allocated when the picture's first tile is encoded
+    /// and packed into its features (then freed) the moment its last tile is.
+    ///
+    /// It used to be one set sized for the WHOLE wave up front, and packing
+    /// then made a newline copy and a packed copy of all of it at once: ~12
+    /// GiB at the peak for 32 max-grid pictures, allocated before the first
+    /// tile encoded. Per picture, the transient is one picture's worth.
+    acc: Vec<Option<Vec<CudaSlice<f32>>>>,
+    /// Per unique picture, its packed features once all its tiles are in.
+    packed: Vec<Option<Arc<MediaFeatures>>>,
     /// Tiles encoded so far.
     cursor: usize,
 }
@@ -222,6 +229,48 @@ fn fail_all(slots: Vec<usize>, e: impl std::fmt::Display) -> Vec<(usize, MmAdmit
 }
 
 impl GpuGranite {
+    /// The plan's charges for image and audio input, which allocate on
+    /// demand and so were never in it.
+    ///
+    /// The tower pass is MEASURED: one budget group of blank max-grid tiles
+    /// through the tower, its pool high-water read at load (a profile run -
+    /// eight Q-Former stacks deep, arithmetic would drift from the code). On
+    /// top of it one picture's accumulation, newline copy and packed features
+    /// (a picture packs the moment its last tile encodes), and the image
+    /// cache's own byte cap.
+    pub(crate) fn vision_reserves(&self) -> Result<Vec<crate::kv_plan::Reserve>, GpuError> {
+        // the speech tower's scratch grows on demand with the longest clip,
+        // and stops at its segment cap - the room left to grow is reserved
+        let mut out = Vec::new();
+        if let Some(a) = self.audio.as_ref() {
+            out.push(crate::kv_plan::Reserve::new(
+                "audio encoder growth",
+                a.scratch_growth_bytes() as u64,
+            ));
+        }
+        let Some(v) = self.vision.as_ref() else {
+            return Ok(out);
+        };
+        let b = v.budget();
+        let edge = b.max_edge.map_or(3840, |e| e as usize);
+        let short = (b.max_pixels as usize / edge).max(1);
+        let blank = vec![0u8; short * edge * 3];
+        let (_, tiles, _) = v.tile_stack(&[(&blank, short, edge)])?;
+        let group = tile_budget().clamp(1, tiles.len().max(1));
+        let (_, tower) = self.exec.pool_peak_during(|| v.encode(&tiles[..group]))?;
+        let per_tile = (v.tokens_per_tile() * v.proj_width() * std::mem::size_of::<f32>()) as u64;
+        let picture = 3 * tiles.len() as u64 * per_tile * v.n_streams() as u64;
+        out.push(crate::kv_plan::Reserve::new(
+            "vision tower pass",
+            tower + picture,
+        ));
+        out.push(crate::kv_plan::Reserve::new(
+            "image cache",
+            super::deepstack::img_cache_cap() as u64,
+        ));
+        Ok(out)
+    }
+
     /// Register an admission wave and spend the first budget group on it.
     ///
     /// Returns one verdict per slot: `Queued` when the wave finished inside this
@@ -360,11 +409,8 @@ impl GpuGranite {
             total_tiles += plan.n_tiles();
             plans.push(plan);
         }
-        let stack_rows = total_tiles * v.tokens_per_tile() * v.proj_width();
-        let n_streams = if total_tiles == 0 { 0 } else { v.n_streams() };
-        let acc = (0..n_streams)
-            .map(|_| self.exec.alloc(stack_rows))
-            .collect::<Result<Vec<_>, _>>()?;
+        let acc = (0..uniq.len()).map(|_| None).collect();
+        let packed = (0..uniq.len()).map(|_| None).collect();
 
         Ok(WaveEncode {
             items,
@@ -380,6 +426,7 @@ impl GpuGranite {
             tiles: Vec::new(),
             total_tiles,
             acc,
+            packed,
             cursor: 0,
         })
     }
@@ -417,10 +464,50 @@ impl GpuGranite {
         }
         let streams = v.encode(&wave.tiles[wave.cursor..end])?.streams;
         let per_row = v.tokens_per_tile() * v.proj_width();
-        let off = wave.cursor * per_row;
-        let n = (end - wave.cursor) * per_row;
-        for (dst, src) in wave.acc.iter_mut().zip(&streams) {
-            self.exec.copy_region(src, 0, dst, off, n)?;
+        let verify = paddock_models::dev_var_os!("PADDOCK_VISION_VERIFY").is_some();
+        // scatter the group's rows into each picture it touches, and pack every
+        // picture whose last tile this group encoded
+        for j in 0..wave.plans.len() {
+            let (b0, b1) = (wave.bases[j], wave.bases[j] + wave.plans[j].n_tiles());
+            let (t0, t1) = (b0.max(wave.cursor), b1.min(end));
+            if t0 >= t1 {
+                continue;
+            }
+            if wave.acc[j].is_none() {
+                let rows = (b1 - b0) * per_row;
+                wave.acc[j] = Some(
+                    (0..streams.len())
+                        .map(|_| self.exec.alloc(rows))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
+            let acc = wave.acc[j].as_mut().expect("allocated above");
+            for (dst, src) in acc.iter_mut().zip(&streams) {
+                self.exec.copy_region(
+                    src,
+                    (t0 - wave.cursor) * per_row,
+                    dst,
+                    (t0 - b0) * per_row,
+                    (t1 - t0) * per_row,
+                )?;
+            }
+            if t1 == b1 {
+                let rows = (b1 - b0) * v.tokens_per_tile();
+                let feats = v
+                    .pack_wave(acc, rows, std::slice::from_ref(&wave.plans[j]), &[0])?
+                    .pop()
+                    .expect("one plan, one picture");
+                wave.packed[j] = Some(Arc::new(feats));
+                if !verify {
+                    wave.acc[j] = None;
+                }
+            }
+        }
+        // the host tiles are spent once encoded (verify re-encodes them all)
+        if !verify {
+            for t in &mut wave.tiles[wave.cursor..end] {
+                *t = Vec::new();
+            }
         }
         wave.cursor = end;
         Ok(())
@@ -446,10 +533,27 @@ impl GpuGranite {
                 return;
             }
         };
-        for (i, (a, b)) in wave.acc.iter().zip(&whole).enumerate() {
-            let (ha, hb) = match (self.exec.to_host(a), self.exec.to_host(b)) {
-                (Ok(x), Ok(y)) => (x, y),
-                _ => return,
+        // the per-picture accumulations laid end to end, as the whole-stack
+        // encode lays them
+        let per_tile = v.tokens_per_tile() * v.proj_width();
+        let mut joined: Vec<Vec<f32>> = vec![Vec::new(); whole.len()];
+        for acc in wave.acc.iter().flatten() {
+            for (s, buf) in acc.iter().enumerate() {
+                match self.exec.to_host(buf) {
+                    Ok(h) => joined[s].extend(h),
+                    Err(_) => return,
+                }
+            }
+        }
+        debug_assert!(
+            joined
+                .iter()
+                .all(|j| j.len() == wave.total_tiles * per_tile)
+        );
+        for (i, (ha, b)) in joined.into_iter().zip(&whole).enumerate() {
+            let hb = match self.exec.to_host(b) {
+                Ok(y) => y,
+                Err(_) => return,
             };
             let per_row = v.proj_width();
             let (mut worst, mut at) = (0f32, 0usize);
@@ -474,17 +578,15 @@ impl GpuGranite {
         if paddock_models::dev_var_os!("PADDOCK_VISION_VERIFY").is_some() {
             self.wave_verify(&wave);
         }
-        let packed = match self.vision.as_ref() {
-            None => Err(GpuError::Driver("granite: no mmproj attached".into())),
-            Some(_) if wave.total_tiles == 0 => Ok(Vec::new()),
-            Some(v) => {
-                let rows = wave.total_tiles * v.tokens_per_tile();
-                v.pack_wave(&wave.acc, rows, &wave.plans, &wave.bases)
+        // every picture was packed as its last tile encoded
+        let encoded: Vec<Arc<MediaFeatures>> = match wave.packed.iter().cloned().collect() {
+            Some(p) => p,
+            None => {
+                return fail_all(
+                    wave.slots(),
+                    GpuError::Driver("granite: a wave finished with a picture unpacked".into()),
+                );
             }
-        };
-        let encoded: Vec<Arc<MediaFeatures>> = match packed {
-            Ok(p) => p.into_iter().map(Arc::new).collect(),
-            Err(e) => return fail_all(wave.slots(), e),
         };
         for (j, &u) in wave.uniq.iter().enumerate() {
             let i = wave.todo[u];

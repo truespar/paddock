@@ -308,10 +308,20 @@ fn gguf_bounded_walks_match_the_whole_walk() {
 
 /// R4b: inside the window (every row sees <= 2051 tokens) QSA selects every
 /// block, so the sparse path IS dense attention - walked by other kernels
-/// (the SIMT gather against the tiled prefill / decode kernels), so the
-/// answer must hold (argmax, greedy chain) with the logits within those
-/// kernels' own distance. Past the window the two are different models by
-/// design; that distance is printed, not bounded.
+/// (the SIMT gather against the tensor-core prefill / decode kernels). The
+/// gate is the first attention layer, where both paths read the same
+/// inputs: a wrong selection (a block dropped or doubled) moves its output
+/// O(1e-1), the kernels' own distance is ~1e-5 (v4 prefill) to ~5e-3 (the
+/// f16-accumulating WMMA tile). Downstream nothing is bounded: on this
+/// prompt (one sentence cycled to 1500 tokens) ANY perturbation there -
+/// sparse vs dense, or two dense prefill kernels - saturates to a 20-60%
+/// hidden-state spread by the middle layers (measured per attention layer,
+/// 2026-09-28: the two dense kernels differ from each other exactly as much
+/// as either differs from sparse), and the final argmax is a near tie
+/// (`<|im_end|>` vs " A", 0.1-0.35 logits on the dense paths), so the
+/// logits, argmax and greedy chain are printed, not asserted - end-to-end
+/// quality is the llama.cpp parity legs'. Past the window the two are
+/// different models by design; that distance is printed too.
 #[test]
 fn gguf_qsa_sparse_matches_dense_inside_the_window() {
     if !common::heavy() {
@@ -405,23 +415,16 @@ fn gguf_qsa_sparse_matches_dense_inside_the_window() {
         argmax(&ls),
         argmax(&ld)
     );
-    // the sparse kernel sits 4.5e-8 from f64 (op gate); the dense kernels'
-    // half-precision P.V puts them ~5e-3 from it - a wrong selection inside
+    // the sparse kernel sits 4.5e-8 from f64 (op gate); the dense kernels
+    // ~1e-5 (v4) to ~5e-3 (the WMMA tile's f16 O) - a wrong selection inside
     // the window (dropping or duplicating tokens) moves this O(1e-1)
     assert!(
         r3 < 1e-2,
         "the first attention layer's output moved: rel {r3}"
     );
-    assert_eq!(
-        argmax(&ls),
-        argmax(&ld),
-        "the sparse path moved the argmax inside the window"
-    );
-    assert_eq!(ts[0], td[0]);
-    assert!(
-        r < 3e-1,
-        "sparse vs dense logits inside the window: rel {r}"
-    );
+    // the logits, argmax and chain are printed above, not asserted: past
+    // layer 3 the two walks see different inputs and this prompt amplifies
+    // any difference (see the doc)
     // past it: QSA (Auto) against pinned dense - different models; recorded
     let q: Vec<u32> = base.iter().copied().cycle().take(3000).collect();
     m.set_qsa_mode(QsaMode::Dense);

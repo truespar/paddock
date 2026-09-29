@@ -602,6 +602,22 @@ fn part_detail(part: &serde_json::Value) -> Result<ImageDetail, String> {
     }
 }
 
+/// The refusal for image input on an endpoint serving no tower, shared by
+/// every API surface: it names the switch when vision was turned off, and the
+/// missing companion file otherwise - pointing an operator who switched it
+/// off at the mmproj line would send them to a config the runner refuses.
+pub(crate) fn no_vision(model: &crate::serving::ServingModel) -> String {
+    if model.vision_off {
+        "this endpoint has vision switched off (`vision = false` in its config) - turn \
+         Vision on for it to accept image input"
+            .into()
+    } else {
+        "this model is not serving vision (a vision-capable model needs its `mmproj` \
+         companion file set in the config to accept image input)"
+            .into()
+    }
+}
+
 /// Find image content parts, in render order. The detection condition
 /// MIRRORS the qwen chat template's (`'image' in item or 'image_url' in item
 /// or item.type == 'image'`) so the count always matches the `<|image_pad|>`
@@ -1454,11 +1470,7 @@ fn prepare(
     // <|image_pad|> slots after tokenization
     let image_refs = find_images(&req.messages)?;
     if !image_refs.is_empty() && !model.supports_vision {
-        return Err(
-            "this model is not serving vision (a vision-capable model needs its `mmproj` \
-             companion file set in the config to accept image input)"
-                .into(),
-        );
+        return Err(no_vision(model));
     }
     // The inverse gate: a document parser given no document free-runs
     // transcription-vocabulary noise to the token cap. Runs after

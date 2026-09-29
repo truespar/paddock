@@ -17,6 +17,9 @@ thread_local! {
     pub(super) static BASELINE_EXPERT_TAIL_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static EXPERT_LOADER_FOR_TEST: std::cell::Cell<u8> = const { std::cell::Cell::new(2) };
     pub(super) static FUSED_GATE_UP_FOR_TEST: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    pub(super) static DIRECT_EXPERT_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    pub(super) static EXPERT_ROWS64_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static VECTOR_GATE_UP_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
 pub(super) struct Weights {
@@ -118,6 +121,17 @@ impl Weights {
 
     /// Caller must validate the whole batch before any stateful layer encodes
     /// and check invalid routing after completion before publishing results.
+    pub(super) fn prepare_after_mixer(
+        &self,
+        cmd: &Commands<'_>,
+        h: &Buffer,
+        delta: &Buffer,
+        hc: &residual::Workspace,
+        rows: usize,
+    ) -> bool {
+        self.hc.normalize_after(cmd, h, delta, hc, rows)
+    }
+
     pub(super) fn encode_ffn(
         &self,
         cmd: &Commands<'_>,
@@ -125,10 +139,15 @@ impl Weights {
         hc: &residual::Workspace,
         s: &Workspace,
         rows: usize,
+        normalized: bool,
     ) -> Result<()> {
         s.validate(h, rows, true)?;
         s.validate(&hc.mixed, rows, false)?;
-        self.hc.encode(cmd, h, hc, rows);
+        if normalized {
+            self.hc.encode_normalized(cmd, hc, rows);
+        } else {
+            self.hc.encode(cmd, h, hc, rows);
+        }
         self.encode(cmd, &hc.mixed, s, rows)?;
         self.hc.combine(cmd, h, &s.output, hc, rows);
         Ok(())
@@ -239,6 +258,26 @@ impl Weights {
         }
         let matrix = matrix_mask.iter().any(|&v| v != 0);
         let vectors = (0..rows).any(|r| matrix_mask[r / 32] & (1 << (r % 32)) == 0);
+        #[cfg(test)]
+        let vector_gate_up = VECTOR_GATE_UP_FOR_TEST.with(|v| v.get());
+        #[cfg(not(test))]
+        let vector_gate_up = true;
+        // Only true singleton contracts may use the fused vector activation.
+        // Small physical prefill batches can have a matrix/split-K contract;
+        // neither their projections nor mixed decode/prefill may change here.
+        let vector_gate_up = vector_gate_up
+            && cmd.tensor_accelerated()
+            && cmd.independent_rows()
+            && !matrix
+            && rows <= 8
+            && [&self.gate, &self.up, &self.shared_gate, &self.shared_up]
+                .iter()
+                .enumerate()
+                .all(|(i, w)| {
+                    w.ty == affine::A4G32
+                        && w.k == WIDTH
+                        && w.n == if i < 2 { EXPERTS * FF } else { FF }
+                });
         if matrix {
             cmd.dispatch(
                 "moe_align",
@@ -287,40 +326,105 @@ impl Weights {
                 #[cfg(not(test))]
                 let loader = 2;
                 let input_rows = if per_entry { entries } else { rows };
-                let packed = cmd.projection_workspace().filter(|workspace| {
-                    tail && loader == 2 && workspace.len() >= input_rows.div_ceil(32) * 32 * w.k * 2
-                });
-                if let Some(packed) = packed {
+                // Sorting is elected only for full-width down projections.
+                // The 1024-row fixture win did not carry over to real agent
+                // prompts. Keep gate/up and narrower batches unchanged.
+                // Reuse the existing projection arena; router
+                // logits are dead after q4b_route and hold the 512 offsets.
+                // Mixed decoding rows retain the vector arithmetic below.
+                let direct = tail && loader == 2 && per_entry && rows == affine::MAX_ROWS;
+                #[cfg(test)]
+                let direct = direct && DIRECT_EXPERT_FOR_TEST.with(|v| v.get());
+                let direct = cmd
+                    .projection_workspace()
+                    .filter(|workspace| direct && workspace.len() >= entries * w.k * 2);
+                if let Some(sorted) = direct {
+                    // Diagnostic only: exact, but the short-agent confirmation
+                    // regressed. Production retains the qualified 32-row route.
+                    #[cfg(not(test))]
+                    let wide = false;
+                    #[cfg(test)]
+                    let wide = EXPERT_ROWS64_FOR_TEST.with(|v| v.get());
+                    // Gate/up have finished using the 32-row schedule. Reuse
+                    // its buffer for the down tiles; no extra live allocation.
+                    if wide {
+                        cmd.dispatch(
+                            "q4a_expert_plan64",
+                            &[&s.counts, &s.logits, &s.tiles],
+                            &[512],
+                            [1, 1, 1],
+                            512,
+                        );
+                    } else {
+                        cmd.dispatch(
+                            "q4a_expert_offsets",
+                            &[&s.counts, &s.logits],
+                            &[512],
+                            [1, 1, 1],
+                            512,
+                        );
+                    }
                     cmd.dispatch(
-                        "q4a_input",
-                        &[x, packed],
-                        &[w.k as u32, n as u32, input_rows as u32, 0, 0, 0, 0],
-                        [(input_rows.div_ceil(32) * 32 * w.k).div_ceil(256), 1, 1],
-                        256,
+                        if wide {
+                            "q4a_expert_pack64"
+                        } else {
+                            "q4a_expert_pack"
+                        },
+                        &[x, &s.lists, &s.counts, &s.tiles, &s.logits, sorted],
+                        &p,
+                        [w.k.div_ceil(512), Workspace::tiles(rows), 1],
+                        128,
+                    );
+                    cmd.dispatch(
+                        if wide {
+                            "q4a_expert_mm_direct64"
+                        } else {
+                            "q4a_expert_mm_direct"
+                        },
+                        &[
+                            &w.buffer, sorted, &s.lists, &s.counts, &s.tiles, &s.logits, y,
+                        ],
+                        &p,
+                        [n.div_ceil(64), Workspace::tiles(rows), 1],
+                        128,
+                    );
+                } else {
+                    let packed = cmd.projection_workspace().filter(|workspace| {
+                        tail && loader == 2
+                            && workspace.len() >= input_rows.div_ceil(32) * 32 * w.k * 2
+                    });
+                    if let Some(packed) = packed {
+                        cmd.dispatch(
+                            "q4a_input",
+                            &[x, packed],
+                            &[w.k as u32, n as u32, input_rows as u32, 0, 0, 0, 0],
+                            [(input_rows.div_ceil(32) * 32 * w.k).div_ceil(256), 1, 1],
+                            256,
+                        );
+                    }
+                    cmd.dispatch(
+                        if packed.is_some() {
+                            "q4a_expert_mm_group32_packed"
+                        } else if tail && loader > 0 {
+                            "q4a_expert_mm_group32_pad"
+                        } else if tail {
+                            "q4a_expert_mm_tail"
+                        } else {
+                            "q4a_expert_mm_wide"
+                        },
+                        &[
+                            &w.buffer,
+                            packed.unwrap_or(x),
+                            &s.lists,
+                            &s.counts,
+                            &s.tiles,
+                            y,
+                        ],
+                        &p,
+                        [n.div_ceil(64), Workspace::tiles(rows), 1],
+                        128,
                     );
                 }
-                cmd.dispatch(
-                    if packed.is_some() {
-                        "q4a_expert_mm_group32_packed"
-                    } else if tail && loader > 0 {
-                        "q4a_expert_mm_group32_pad"
-                    } else if tail {
-                        "q4a_expert_mm_tail"
-                    } else {
-                        "q4a_expert_mm_wide"
-                    },
-                    &[
-                        &w.buffer,
-                        packed.unwrap_or(x),
-                        &s.lists,
-                        &s.counts,
-                        &s.tiles,
-                        y,
-                    ],
-                    &p,
-                    [n.div_ceil(64), Workspace::tiles(rows), 1],
-                    128,
-                );
                 if vectors {
                     cmd.dispatch(
                         "q4a_expert_vector_masked",
@@ -344,7 +448,24 @@ impl Weights {
                 && cmd.tensor_accelerated()
                 && workspace.len() >= rows.next_multiple_of(32) * self.gate.k * 2
         });
-        if let Some(packed) = packed {
+        if vector_gate_up {
+            cmd.dispatch(
+                "q4a_expert_gate_up_vector",
+                &[
+                    &self.gate.buffer,
+                    &self.up.buffer,
+                    &self.shared_gate.buffer,
+                    &self.shared_up.buffer,
+                    x,
+                    &s.ids,
+                    &s.act,
+                    &s.shared_gate,
+                ],
+                &[WIDTH as u32, FF as u32, rows as u32, EXPERTS as u32],
+                [FF.div_ceil(8), rows * (ACTIVE + 1), 1],
+                64,
+            );
+        } else if let Some(packed) = packed {
             let mut p = [0u32; 5 + affine::MAX_ROWS.div_ceil(32)];
             p[..5].copy_from_slice(&[self.gate.k as u32, FF as u32, entries as u32, 0, 512]);
             p[5..].copy_from_slice(&matrix_mask);
@@ -436,15 +557,17 @@ impl Weights {
             );
         }
         project_experts(&self.down, &s.act, &s.down, true);
-        affine::project(cmd, &self.shared_gate, x, &s.shared_gate, rows);
-        affine::project(cmd, &self.shared_up, x, &s.shared_up, rows);
-        cmd.dispatch(
-            "mlx_swiglu",
-            &[&s.shared_gate, &s.shared_up],
-            &[(rows * FF) as u32],
-            [(rows * FF).div_ceil(256), 1, 1],
-            256,
-        );
+        if !vector_gate_up {
+            affine::project(cmd, &self.shared_gate, x, &s.shared_gate, rows);
+            affine::project(cmd, &self.shared_up, x, &s.shared_up, rows);
+            cmd.dispatch(
+                "mlx_swiglu",
+                &[&s.shared_gate, &s.shared_up],
+                &[(rows * FF) as u32],
+                [(rows * FF).div_ceil(256), 1, 1],
+                256,
+            );
+        }
         affine::project(
             cmd,
             &self.shared_down,

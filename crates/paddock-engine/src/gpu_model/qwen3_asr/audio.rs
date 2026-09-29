@@ -120,11 +120,20 @@ pub struct AudioOutput {
     pub n_tokens: usize,
 }
 
-/// Rows the token-domain planes start out sized for - a 30 s clip is 391
-/// tokens, so a stock serve never regrows. Growth rounds up to a multiple of
-/// this so a long-form prompt costs a handful of reallocations, not one per
-/// clip length.
-const ROWS_STEP: usize = 512;
+/// Token rows one encoder SEGMENT covers (~5.3 min of audio): the clip runs
+/// through the conv stem, the 24 layers and the projector a segment at a
+/// time, so every token-domain plane is sized for this once, at load.
+///
+/// Those planes used to grow to the longest clip seen and stay there, the
+/// whole clip in one pass, bounded only by the prompt fitting max_ctx - and
+/// each growth built the new planes while the old were still held. Segments
+/// are exact, not an approximation: they are a whole number of conv groups
+/// (20 x 16 chunks), so no conv group straddles one, and a multiple of the
+/// 104-token attention window, so no window does - attention never crosses a
+/// window and every other op is per row. A clip that fits one segment runs
+/// exactly the passes it always did.
+const SEGMENT_TOKENS: usize = 20 * CONV_GROUP * 13;
+const _: () = assert!(SEGMENT_TOKENS.is_multiple_of(WINDOW_TOKENS));
 
 /// Encode witness (`PADDOCK_TICK_STATS=1`): the admission tower is ~24% of
 /// the c32 ASR wall and sits outside every tick bucket, so the tick table
@@ -228,6 +237,8 @@ pub(crate) struct TowerScratch {
     at: CudaSlice<f32>,
     up: CudaSlice<f32>,
     m: CudaSlice<f32>,
+    /// one segment's projector output, copied into the clip's span
+    seg_out: CudaSlice<f32>,
 }
 
 /// Host-side stopwatch around one launch. The tower's cost is the LAUNCH
@@ -253,6 +264,7 @@ impl TowerScratch {
         ch: usize,
         embd: usize,
         ffn: usize,
+        out_dim: usize,
         pos_table: &[f32],
     ) -> Result<Self, GpuModelError> {
         let g = CONV_GROUP;
@@ -283,39 +295,19 @@ impl TowerScratch {
             at: exec.alloc(0)?,
             up: exec.alloc(0)?,
             m: exec.alloc(0)?,
+            seg_out: exec.alloc(SEGMENT_TOKENS * out_dim)?,
         };
         let mut me = me;
         me.grow(
             exec,
-            ROWS_STEP,
-            ROWS_STEP.div_ceil(W[3]),
+            SEGMENT_TOKENS,
+            SEGMENT_TOKENS / W[3],
             embd,
             ffn,
             ch,
             pos_table,
         )?;
         Ok(me)
-    }
-
-    /// Make room for `rows` token rows / `chunks` conv chunks. A no-op in the
-    /// steady state - the initial size covers every clip up to ~39 s.
-    #[allow(clippy::too_many_arguments)]
-    fn ensure(
-        &mut self,
-        exec: &GpuExecutor,
-        rows: usize,
-        chunks: usize,
-        embd: usize,
-        ffn: usize,
-        ch: usize,
-        pos_table: &[f32],
-    ) -> Result<(), GpuModelError> {
-        if rows <= self.rows_cap && chunks <= self.chunks_cap {
-            return Ok(());
-        }
-        let rows = rows.max(self.rows_cap).next_multiple_of(ROWS_STEP);
-        let chunks = chunks.max(self.chunks_cap).max(rows.div_ceil(W[3]));
-        self.grow(exec, rows, chunks, embd, ffn, ch, pos_table)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -377,7 +369,8 @@ impl TowerScratch {
             + self.v.len()
             + self.at.len()
             + self.up.len()
-            + self.m.len())
+            + self.m.len()
+            + self.seg_out.len())
             + 2 * self.s16.len()
             + 4 * (self.idx2.len() + self.idx3.len())
     }
@@ -394,9 +387,6 @@ pub struct AudioTower {
     eps: f32,
     /// LLM embedding width the projector emits (2048).
     pub out_dim: usize,
-    /// sinusoidal position table, host [1500, embd] - only rows 0..13 are
-    /// ever read (positions reset per chunk).
-    pos: Vec<f32>,
     conv1_w: HalfTensor,
     conv1_b: CudaSlice<f32>,
     conv2_w: HalfTensor,
@@ -526,7 +516,7 @@ impl AudioTower {
             });
         }
 
-        let sc = TowerScratch::new(&exec, ch, embd, ffn, &pos)?;
+        let sc = TowerScratch::new(&exec, ch, embd, ffn, out_dim, &pos)?;
         let me = Self {
             exec,
             embd,
@@ -536,7 +526,6 @@ impl AudioTower {
             ch,
             eps,
             out_dim,
-            pos,
             conv1_w,
             conv1_b: vec1("a.conv2d.1.bias")?,
             conv2_w,
@@ -729,7 +718,7 @@ impl AudioTower {
             )));
         }
 
-        let sc = TowerScratch::new(&exec, ch, embd, ffn, &pos)?;
+        let sc = TowerScratch::new(&exec, ch, embd, ffn, cfg.a_out_dim, &pos)?;
         let me = Self {
             exec,
             embd,
@@ -740,7 +729,6 @@ impl AudioTower {
             // nn.LayerNorm default - the HF audio_config carries no eps
             eps: 1e-5,
             out_dim: cfg.a_out_dim,
-            pos,
             conv1_w,
             conv1_b: vecf("model.audio_tower.conv2d1.bias", ch)?,
             conv2_w,
@@ -826,27 +814,89 @@ impl AudioTower {
     ///    before it is read, so back-to-back encodes cannot see each other.
     pub fn encode(&mut self, mel: &MelFeatures) -> Result<AudioOutput, GpuModelError> {
         let exec = self.exec.clone();
-        let (e, ch) = (self.embd, self.ch);
         let n_frames = mel.n_frames;
         assert!(n_frames > 0);
         let chunks = n_frames.div_ceil(CHUNK_FRAMES);
         let n_tokens = audio_token_count(n_frames);
-        self.sc
-            .ensure(&exec, n_tokens.max(1), chunks, e, self.ffn, ch, &self.pos)?;
-
-        // ---- conv stem, in groups of up to CONV_GROUP chunks ----
-        // The group is the clip's, but every plane and index table below is
-        // the resident CAPACITY one and a short group reads a prefix of it.
-        let g = CONV_GROUP.min(chunks);
-
         let wit = witness::on();
         let t_enter = std::time::Instant::now();
-        let mut im2col_ns = 0u64;
-        let mut gemm_ns = 0u64;
+        let (mut im2col_ns, mut gemm_ns) = (0u64, 0u64);
+        // the one allocation left per encode: the span outlives the call (the
+        // slot's registry holds it until its prefill rows are consumed)
+        let mut d_out = exec.alloc(n_tokens * self.out_dim)?;
+        // one SEGMENT at a time (see SEGMENT_TOKENS): its valid tokens are a
+        // prefix of its chunks' rows - only the clip's last chunk is short
+        let seg_chunks = SEGMENT_TOKENS / W[3];
+        let mut c0 = 0usize;
+        while c0 < chunks {
+            let sc_chunks = seg_chunks.min(chunks - c0);
+            let t0 = c0 * W[3];
+            let rows = (sc_chunks * W[3]).min(n_tokens - t0);
+            self.encode_segment(mel, c0, sc_chunks, rows, wit, &mut im2col_ns, &mut gemm_ns)?;
+            exec.copy_region(
+                &self.sc.seg_out,
+                0,
+                &mut d_out,
+                t0 * self.out_dim,
+                rows * self.out_dim,
+            )?;
+            c0 += sc_chunks;
+        }
+
+        // Debug tap: dump the projector output for oracle comparison against
+        // the upstream transformers encoder (our ASR oracle tool).
+        // Appends one [n_tokens, 2048] f32 block per encode call.
+        if let Ok(path) = paddock_models::dev_var!("PADDOCK_ASR_DUMP_EMBD") {
+            let host = exec.to_host_len(&d_out, n_tokens * self.out_dim)?;
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|e| crate::gpu::GpuError::Driver(format!("embd dump {path}: {e}")))?;
+            let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+            f.write_all(&bytes)
+                .map_err(|e| crate::gpu::GpuError::Driver(format!("embd dump {path}: {e}")))?;
+            tracing::info!(n_tokens, path, "dumped audio tower embeddings");
+        }
+
+        if wit {
+            witness::record(
+                n_tokens,
+                im2col_ns,
+                gemm_ns,
+                t_enter.elapsed().as_nanos() as u64,
+            );
+        }
+        Ok(AudioOutput {
+            embd: d_out,
+            n_tokens,
+        })
+    }
+
+    /// Conv stem, 24 encoder layers and projector over chunks
+    /// `[c0, c0 + sc_chunks)` - `rows` valid tokens - into `sc.seg_out`.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_segment(
+        &mut self,
+        mel: &MelFeatures,
+        c0: usize,
+        sc_chunks: usize,
+        rows: usize,
+        wit: bool,
+        im2col_ns: &mut u64,
+        gemm_ns: &mut u64,
+    ) -> Result<(), GpuModelError> {
+        let exec = self.exec.clone();
+        let (e, ch) = (self.embd, self.ch);
+        // ---- conv stem, in groups of up to CONV_GROUP chunks ----
+        // Every plane and index table below is the resident CAPACITY one and
+        // a short group reads a prefix of it.
+        let g = CONV_GROUP.min(sc_chunks);
         let sc = &mut self.sc;
         let mut done = 0usize;
-        while done < chunks {
-            let gc = g.min(chunks - done);
+        while done < sc_chunks {
+            let gc = g.min(sc_chunks - done);
             let (r1, r2, r3) = (gc * H[1] * W[1], gc * H[2] * W[2], gc * H[3] * W[3]);
             // stage 1 im2col on host straight from the mel frames. `data` is
             // chunk-aligned and carries the upstream pad content past
@@ -862,7 +912,7 @@ impl AudioTower {
                             for kx in 0..3usize {
                                 let (hi, wi) = (2 * h1 + ky, 2 * w1 + kx);
                                 let v = if hi >= 1 && hi <= H[0] && wi >= 1 && wi <= W[0] {
-                                    let frame = (done + c) * CHUNK_FRAMES + wi - 1;
+                                    let frame = (c0 + done + c) * CHUNK_FRAMES + wi - 1;
                                     debug_assert!(frame < mel_frames, "mel not chunk-aligned");
                                     mel.data[frame * N_MEL + (hi - 1)]
                                 } else {
@@ -875,11 +925,11 @@ impl AudioTower {
                 }
             }
             if wit {
-                im2col_ns += t_im.elapsed().as_nanos() as u64;
+                *im2col_ns += t_im.elapsed().as_nanos() as u64;
             }
             exec.upload_f32(&sc.h1[..r1 * 9], &mut sc.h1d)?;
             exec.convert_f32_f16(&sc.h1d, &mut sc.s16, r1 * 9)?;
-            timed(&mut gemm_ns, wit, || {
+            timed(gemm_ns, wit, || {
                 exec.matvec_batch_f16(&self.conv1_w, &sc.s16, &mut sc.a1, r1)
             })?;
             exec.bias_add(&mut sc.a1, &self.conv1_b, r1, ch)?;
@@ -887,7 +937,7 @@ impl AudioTower {
 
             exec.gather_rows_avg(&sc.a1, &sc.idx2, &mut sc.g2, r2 * 9, 1, ch)?;
             exec.convert_f32_f16(&sc.g2, &mut sc.s16, r2 * 9 * ch)?;
-            timed(&mut gemm_ns, wit, || {
+            timed(gemm_ns, wit, || {
                 exec.matvec_batch_f16(&self.conv2_w, &sc.s16, &mut sc.a2, r2)
             })?;
             exec.bias_add(&mut sc.a2, &self.conv2_b, r2, ch)?;
@@ -895,7 +945,7 @@ impl AudioTower {
 
             exec.gather_rows_avg(&sc.a2, &sc.idx3, &mut sc.g3, r3 * 9, 1, ch)?;
             exec.convert_f32_f16(&sc.g3, &mut sc.s16, r3 * 9 * ch)?;
-            timed(&mut gemm_ns, wit, || {
+            timed(gemm_ns, wit, || {
                 exec.matvec_batch_f16(&self.conv3_w, &sc.s16, &mut sc.a3, r3)
             })?;
             exec.bias_add(&mut sc.a3, &self.conv3_b, r3, ch)?;
@@ -904,35 +954,33 @@ impl AudioTower {
             // conv_out reads conv3's (w3, h3)-ordered rows as [gc*13, 16*ch]
             let tr = gc * W[3];
             exec.convert_f32_f16(&sc.a3, &mut sc.s16, tr * H[3] * ch)?;
-            // token rows for this group land at their global offset
-            timed(&mut gemm_ns, wit, || {
+            // token rows for this group land at their offset in the segment
+            timed(gemm_ns, wit, || {
                 exec.matvec_batch_f16(&self.conv_out_w, &sc.s16, &mut sc.gtok, tr)
             })?;
             exec.copy_region(&sc.gtok, 0, &mut sc.tok, done * W[3] * e, tr * e)?;
             done += gc;
         }
 
-        // ---- sinusoidal positions, reset 0..12 per chunk; valid token rows
-        // are the prefix (last chunk short => its tokens are 0..leave_tokens,
-        // and full*13 ≡ 0 mod 13, so j % 13 is the within-chunk index). The
-        // plane itself is resident and prebuilt - see TowerScratch::grow. ----
-        exec.copy_region(&sc.tok, 0, &mut sc.x, 0, n_tokens * e)?;
-        exec.add(&mut sc.x, &sc.pos, n_tokens * e)?;
+        // ---- sinusoidal positions, reset 0..12 per chunk; a segment starts on
+        // a chunk boundary, so j % 13 is the within-chunk index here too (the
+        // plane is resident and prebuilt - see TowerScratch::grow) ----
+        exec.copy_region(&sc.tok, 0, &mut sc.x, 0, rows * e)?;
+        exec.add(&mut sc.x, &sc.pos, rows * e)?;
 
-        // ---- 24 encoder layers over the full token stream ----
-        let rows = n_tokens;
+        // ---- 24 encoder layers over the segment's token stream ----
         let ffn = self.ffn;
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         for blk in &self.blocks {
             exec.layernorm(&sc.x, &blk.ln1_w, &blk.ln1_b, &mut sc.n, rows, e, self.eps)?;
             exec.convert_f32_f16(&sc.n, &mut sc.s16, rows * e)?;
-            timed(&mut gemm_ns, wit, || {
+            timed(gemm_ns, wit, || {
                 exec.matvec_batch_f16(&blk.wq, &sc.s16, &mut sc.q, rows)
             })?;
-            timed(&mut gemm_ns, wit, || {
+            timed(gemm_ns, wit, || {
                 exec.matvec_batch_f16(&blk.wk, &sc.s16, &mut sc.k, rows)
             })?;
-            timed(&mut gemm_ns, wit, || {
+            timed(gemm_ns, wit, || {
                 exec.matvec_batch_f16(&blk.wv, &sc.s16, &mut sc.v, rows)
             })?;
             exec.bias_add(&mut sc.q, &blk.bq, rows, e)?;
@@ -955,7 +1003,7 @@ impl AudioTower {
                 off += n_w;
             }
             exec.convert_f32_f16(&sc.at, &mut sc.s16, rows * e)?;
-            timed(&mut gemm_ns, wit, || {
+            timed(gemm_ns, wit, || {
                 exec.matvec_batch_f16(&blk.wo, &sc.s16, &mut sc.n, rows)
             })?;
             exec.bias_add(&mut sc.n, &blk.bo, rows, e)?;
@@ -963,13 +1011,13 @@ impl AudioTower {
 
             exec.layernorm(&sc.x, &blk.ln2_w, &blk.ln2_b, &mut sc.n, rows, e, self.eps)?;
             exec.convert_f32_f16(&sc.n, &mut sc.s16, rows * e)?;
-            timed(&mut gemm_ns, wit, || {
+            timed(gemm_ns, wit, || {
                 exec.matvec_batch_f16(&blk.up_w, &sc.s16, &mut sc.up, rows)
             })?;
             exec.bias_add(&mut sc.up, &blk.up_b, rows, ffn)?;
             exec.gelu_erf(&mut sc.up, rows * ffn)?;
             exec.convert_f32_f16(&sc.up, &mut sc.s16, rows * ffn)?;
-            timed(&mut gemm_ns, wit, || {
+            timed(gemm_ns, wit, || {
                 exec.matvec_batch_f16(&blk.down_w, &sc.s16, &mut sc.n, rows)
             })?;
             exec.bias_add(&mut sc.n, &blk.down_b, rows, e)?;
@@ -987,49 +1035,17 @@ impl AudioTower {
             self.eps,
         )?;
         exec.convert_f32_f16(&sc.n, &mut sc.s16, rows * e)?;
-        timed(&mut gemm_ns, wit, || {
+        timed(gemm_ns, wit, || {
             exec.matvec_batch_f16(&self.mm1_w, &sc.s16, &mut sc.m, rows)
         })?;
         exec.bias_add(&mut sc.m, &self.mm1_b, rows, e)?;
         exec.gelu_erf(&mut sc.m, rows * e)?;
-        // the one allocation left per encode: the span outlives the call (the
-        // slot's registry holds it until its prefill rows are consumed).
-        let mut d_out = exec.alloc(rows * self.out_dim)?;
         exec.convert_f32_f16(&sc.m, &mut sc.s16, rows * e)?;
-        timed(&mut gemm_ns, wit, || {
-            exec.matvec_batch_f16(&self.mm2_w, &sc.s16, &mut d_out, rows)
+        timed(gemm_ns, wit, || {
+            exec.matvec_batch_f16(&self.mm2_w, &sc.s16, &mut sc.seg_out, rows)
         })?;
-        exec.bias_add(&mut d_out, &self.mm2_b, rows, self.out_dim)?;
-
-        // Debug tap: dump the projector output for oracle comparison against
-        // the upstream transformers encoder (our ASR oracle tool).
-        // Appends one [n_tokens, 2048] f32 block per encode call.
-        if let Ok(path) = paddock_models::dev_var!("PADDOCK_ASR_DUMP_EMBD") {
-            let host = exec.to_host_len(&d_out, n_tokens * self.out_dim)?;
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .map_err(|e| crate::gpu::GpuError::Driver(format!("embd dump {path}: {e}")))?;
-            let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
-            f.write_all(&bytes)
-                .map_err(|e| crate::gpu::GpuError::Driver(format!("embd dump {path}: {e}")))?;
-            tracing::info!(n_tokens, path, "dumped audio tower embeddings");
-        }
-
-        if wit {
-            witness::record(
-                rows,
-                im2col_ns,
-                gemm_ns,
-                t_enter.elapsed().as_nanos() as u64,
-            );
-        }
-        Ok(AudioOutput {
-            embd: d_out,
-            n_tokens,
-        })
+        exec.bias_add(&mut sc.seg_out, &self.mm2_b, rows, self.out_dim)?;
+        Ok(())
     }
 }
 

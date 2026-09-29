@@ -311,7 +311,9 @@ Q4S_ATTENTION(q4b_attention_compact,bfloat,true,true,true)
 // remain F32. The same 32-token tiles, split boundaries and joins are retained.
 // Load: 0 = old 64-bit vectors; 1 = wider-only test comparator;
 // 2 = 128-bit vectors with SIMD-shared physical addresses for K and V.
-template<uint Pad,uint Load=0>
+// K keeps an aligned vector pitch; V's independent pitch spreads its scalar
+// transposed writes without changing logical tensors, contractions or joins.
+template<uint Pad,uint Load=0,uint VPad=Pad,uint Direct=0>
 inline void q4b_attention_local_impl(device float* q,device const bfloat* kc,
  device const bfloat* vc,device const uint4* meta,device const uint* pages,
  device const uint* selected,device const uint* counts,
@@ -325,7 +327,7 @@ inline void q4b_attention_local_impl(device float* q,device const bfloat* kc,
     uint span=((length+splits*32-1)/(splits*32))*32,first=split*span,last=min(first+span,length);
     auto tq=tensor(q+ulong(row)*6144+kh*3072,extents<int,256,12>(),array<int,2>{1,256});
     auto tk=tensor(kv,extents<int,256,32>(),array<int,2>{1,256+Pad});
-    auto tv=tensor(kv,extents<int,32,256>(),array<int,2>{1,32+Pad});
+    auto tv=tensor(kv,extents<int,32,256>(),array<int,2>{1,32+VPad});
     auto tp=tensor(prob,extents<int,32,16>(),array<int,2>{1,32});
     auto ts=tensor(scores,extents<int,32,16>(),array<int,2>{1,32});
     constexpr auto qkd=matmul2d_descriptor(16,32,256,false,true);
@@ -344,7 +346,13 @@ inline void q4b_attention_local_impl(device float* q,device const bfloat* kc,
             uint token=q4s_token(selected,row,base+tid%32,blocks);
             physical_lane=pages[meta[row].x*p[0]+token/16]*16+token%16;
         }
-        if(Load!=0) {
+        // Every SIMD resolves the same 32 addresses, so this election is
+        // uniform across all four participating SIMD groups. Partial runs,
+        // sparse gaps and permuted pages retain the original gather path.
+        uint physical_first=simd_shuffle(physical_lane,0);
+        bool contiguous=Direct!=0 && base+32<=last && simd_all(physical_lane==physical_first+tid%32);
+        bool direct=contiguous && (Direct&1)!=0;
+        if(!direct && Load!=0) {
             for(uint i=tid*8;i<8192;i+=1024) {
                 uint physical=Load==2 ? simd_shuffle(physical_lane,i/256) : 0;
                 uint4 v=0;
@@ -357,7 +365,7 @@ inline void q4b_attention_local_impl(device float* q,device const bfloat* kc,
                 }
                 *reinterpret_cast<threadgroup uint4*>(kv+i/256*(256+Pad)+i%256)=v;
             }
-        } else {
+        } else if(!direct) {
             for(uint i=tid*4;i<8192;i+=512) {
                 uint t=base+i/256; bfloat4 v=0;
                 if(t<last) {
@@ -368,8 +376,16 @@ inline void q4b_attention_local_impl(device float* q,device const bfloat* kc,
                 *reinterpret_cast<threadgroup bfloat4*>(kv+i/256*(256+Pad)+i%256)=v;
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        auto dot=qk.get_destination_cooperative_tensor<decltype(tq),decltype(tk),float>();qk.run(tq,tk,dot);dot.store(ts);
+        if(!direct)threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto dot=qk.get_destination_cooperative_tensor<decltype(tq),decltype(tk),float>();
+        if(direct) {
+            // MPP input tensor element types must be unqualified. The cast
+            // does not authorize stores: keys/values are read-only operands.
+            auto keys=tensor(const_cast<device bfloat*>(kc)+ulong(physical_first)*512+kh*256,extents<int,256,32>(),array<int,2>{1,512});
+            qk.run(tq,keys,dot);
+        } else qk.run(tq,tk,dot);
+        dot.store(ts);
+        direct=contiguous && (Direct&2)!=0;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         uint h=tid/8,lane=tid%8;float hi=maxima[h];
         for(uint j=lane;j<32;j+=8)if(base+j<last && h<12)hi=max(hi,scores[h*32+j]*0.0625f);
@@ -378,7 +394,7 @@ inline void q4b_attention_local_impl(device float* q,device const bfloat* kc,
         for(uint j=lane;j<32;j+=8){float v=h<12 && base+j<last ? exp(scores[h*32+j]*0.0625f-hi) : 0;prob[h*32+j]=v;sum+=v;}
         sum+=simd_shuffle_xor(sum,1);sum+=simd_shuffle_xor(sum,2);sum+=simd_shuffle_xor(sum,4);
         if(lane==0){maxima[h]=hi;denom[h]=denom[h]*old+sum;correction[h]=old;}
-        if(Load!=0) {
+        if(!direct && Load!=0) {
             for(uint i=tid*8;i<8192;i+=1024) {
                 uint physical=Load==2 ? simd_shuffle(physical_lane,i/256) : 0;
                 uint4 bits=0;
@@ -391,11 +407,11 @@ inline void q4b_attention_local_impl(device float* q,device const bfloat* kc,
                 }
                 bfloat4 lo=as_type<bfloat4>(bits.xy),hi=as_type<bfloat4>(bits.zw);
                 for(uint j=0;j<4;++j) {
-                    kv[(i%256+j)*(32+Pad)+i/256]=lo[j];
-                    kv[(i%256+4+j)*(32+Pad)+i/256]=hi[j];
+                    kv[(i%256+j)*(32+VPad)+i/256]=lo[j];
+                    kv[(i%256+4+j)*(32+VPad)+i/256]=hi[j];
                 }
             }
-        } else {
+        } else if(!direct) {
             for(uint i=tid*4;i<8192;i+=512) {
                 uint t=base+i/256; bfloat4 v=0;
                 if(t<last) {
@@ -403,13 +419,28 @@ inline void q4b_attention_local_impl(device float* q,device const bfloat* kc,
                     uint physical=pages[meta[row].x*p[0]+token/16]*16+token%16;
                     v=*reinterpret_cast<device const bfloat4*>(vc+ulong(physical)*512+kh*256+i%256);
                 }
-                for(uint j=0;j<4;++j)kv[(i%256+j)*(32+Pad)+i/256]=v[j];
+                for(uint j=0;j<4;++j)kv[(i%256+j)*(32+VPad)+i/256]=v[j];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        auto product=pv.get_destination_cooperative_tensor<decltype(tp),decltype(tv),float>();pv.run(tp,tv,product);
-        uint i=0;for(auto it=product.begin();it!=product.end();++it,++i)if(it.is_valid_element()) {
-            auto ij=it.get_multidimensional_index();acc[i]=acc[i]*correction[ij[1]]+*it;
+        if(direct) {
+            // Keep V's contiguous dimension as the tensor's inner axis and
+            // change the contraction's transpose flag instead of constructing
+            // a non-unit-inner-stride view. M/N and the accumulator layout
+            // stay fixed; the same 32 terms and online-softmax order remain.
+            auto values=tensor(const_cast<device bfloat*>(vc)+ulong(physical_first)*512+kh*256,extents<int,256,32>(),array<int,2>{1,512});
+            constexpr auto dd=matmul2d_descriptor(16,256,32,false,false);
+            matmul2d<dd,execution_simdgroups<4>> dop;
+            auto product=dop.get_destination_cooperative_tensor<decltype(tp),decltype(values),float>();
+            dop.run(tp,values,product);
+            uint i=0;for(auto it=product.begin();it!=product.end();++it,++i)if(it.is_valid_element()) {
+                auto ij=it.get_multidimensional_index();acc[i]=acc[i]*correction[ij[1]]+*it;
+            }
+        } else {
+            auto product=pv.get_destination_cooperative_tensor<decltype(tp),decltype(tv),float>();pv.run(tp,tv,product);
+            uint i=0;for(auto it=product.begin();it!=product.end();++it,++i)if(it.is_valid_element()) {
+                auto ij=it.get_multidimensional_index();acc[i]=acc[i]*correction[ij[1]]+*it;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -420,18 +451,24 @@ inline void q4b_attention_local_impl(device float* q,device const bfloat* kc,
     if(tid<12){ulong dst=q4s_part_base<true>(row,kh*12+tid,split,meta,p);
         parts[dst+256]=maxima[tid];parts[dst+257]=counts[row]<=512 ? denom[tid] : NAN;}
 }
-#define Q4B_ATTENTION_LOCAL(Name,Pad,Load) \
+#define Q4B_ATTENTION_LOCAL(Name,Pad,Load,VPad,Direct) \
 kernel void Name(device float* q [[buffer(0)]],device const bfloat* kc [[buffer(1)]], \
  device const bfloat* vc [[buffer(2)]],device const uint4* meta [[buffer(3)]],device const uint* pages [[buffer(4)]], \
  device const uint* selected [[buffer(5)]],device const uint* counts [[buffer(6)]],device float* scratch [[buffer(7)]], \
  device float* parts [[buffer(8)]],constant uint* p [[buffer(9)]],uint3 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) { \
-    alignas(16) threadgroup bfloat kv[256*(32+Pad)]; \
+    alignas(16) threadgroup bfloat kv[32*(256+Pad)>256*(32+VPad) ? 32*(256+Pad) : 256*(32+VPad)]; \
     threadgroup float scores[512],prob[512],maxima[16],denom[16],correction[16]; \
-    q4b_attention_local_impl<Pad,Load>(q,kc,vc,meta,pages,selected,counts,parts,p,g,tid,kv,scores,prob,maxima,denom,correction); }
-Q4B_ATTENTION_LOCAL(q4b_attention_local,0,0)
-Q4B_ATTENTION_LOCAL(q4b_attention_local_pad,8,0)
-Q4B_ATTENTION_LOCAL(q4b_attention_local_wide,8,1)
-Q4B_ATTENTION_LOCAL(q4b_attention_local_gather,8,2)
+    q4b_attention_local_impl<Pad,Load,VPad,Direct>(q,kc,vc,meta,pages,selected,counts,parts,p,g,tid,kv,scores,prob,maxima,denom,correction); }
+Q4B_ATTENTION_LOCAL(q4b_attention_local,0,0,0,false)
+Q4B_ATTENTION_LOCAL(q4b_attention_local_pad,8,0,8,false)
+Q4B_ATTENTION_LOCAL(q4b_attention_local_wide,8,1,8,false)
+Q4B_ATTENTION_LOCAL(q4b_attention_local_gather,8,2,8,false)
+Q4B_ATTENTION_LOCAL(q4b_attention_local_vpad1,8,2,1,false)
+Q4B_ATTENTION_LOCAL(q4b_attention_direct_runs,8,2,1,3)
+#ifdef PADDOCK_KERNEL_DIAGNOSTICS
+Q4B_ATTENTION_LOCAL(q4b_attention_direct_keys,8,2,1,1)
+Q4B_ATTENTION_LOCAL(q4b_attention_direct_values,8,2,1,2)
+#endif
 #undef Q4B_ATTENTION_LOCAL
 
 kernel void q4b_join_gate_compact(device const float* parts [[buffer(0)]],device const float* qg [[buffer(1)]],

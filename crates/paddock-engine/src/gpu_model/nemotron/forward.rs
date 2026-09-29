@@ -1677,6 +1677,10 @@ impl GpuNemotron {
 }
 
 impl Generator for GpuNemotron {
+    fn release_idle_memory(&mut self) {
+        self.exec.trim_mem_pool();
+    }
+
     fn tier_pump(&mut self) {
         self.tier_pump_impl();
     }

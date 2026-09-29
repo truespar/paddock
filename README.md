@@ -72,7 +72,9 @@ pack. We hope contributors will help close those gaps.
 ## Supported quants
 
 So far we support native FP8 and NVFP4, MXFP4, plus the Q8_0 and
-Q4_K_XL/Q4_K_L/Q4_K_M quantizations. Weights load from both GGUF and safetensors.
+Q4_K_XL/Q4_K_L/Q4_K_M quantizations, the 3-bit UD-Q3_K_XL and UD-IQ3_XXS, and
+Bonsai's ternary PTQ1_0. On Apple Silicon the MLX affine and ternary packages
+load as well. Weights load from both GGUF and safetensors.
 
 ## Available GPUs for contributors - Free
 
@@ -98,12 +100,24 @@ Every model below runs on the engine today. Sizes are the checkpoint's own, and
 
 - **Qwen** - 3.5 9B, 3.6 27B, 3.6 35B-A3B, 3.8 27B, and 3.8 Flash Next
 - **Gemma 4** - 31B and 26B-A4B
+- **DiffusionGemma** - 26B-A4B, which writes a whole block of text per step
 - **GPT-OSS** - 20B and 120B
+- **Bonsai 2** - 27B, in ternary weights
 - **Granite** - 4.1 8B/30B, 4.2 8B/30B, and 4.1 Vision 4B
 - **Laguna 2.1** - XS (33B-A3B) and S (118B-A8B)
 - **MiniCPM5** - 2B
 - **Muse Glimmer** - 30B
 - **Nemotron 3.5 Lightning** - 30B-A3B
+
+**Images**
+
+- **Qwen-Image 2.1** - pictures from a text prompt, and edits of a picture you
+  give it (non-commercial licence)
+
+**Decisions**
+
+- **Laya** - answers fixed questions about a text (yes or no, pick one, a
+  score) with a calibrated probability each; it powers the Studio's Reads page
 
 **Documents and OCR**
 
@@ -138,12 +152,15 @@ host RAM and optionally to disk, MoE expert streaming from RAM for models larger
 than VRAM, and will-it-fit estimation (please note this is not accurate and we plan to fix this)
 that reports honestly instead of failing at load.
 
-**APIs.** OpenAI chat completions, completions, the Responses API, embeddings
-and audio transcriptions; Anthropic messages and token counting; plus a
-Model Context Protocol surface. The runner publishes its own `/openapi.json`.
+**APIs.** OpenAI chat completions, completions, the Responses API, embeddings,
+image generations and edits, and audio transcriptions, live over the Realtime
+WebSocket too; Anthropic messages and token counting; plus reranking, forced
+alignment, the `/v1/systemone` decision call and a Model Context Protocol
+surface. The runner publishes its own `/openapi.json`.
 
-**Beyond text.** Vision models, speech transcription, reranking, and document
-extraction from PDF and Office files.
+**Beyond text.** Vision models, image generation and editing, speech
+transcription, reranking, calibrated decisions, and document extraction from
+PDF and Office files.
 
 **Studio.** A built-in web UI for downloading and managing models, running them,
 comparing them side by side, and serving them.
@@ -159,9 +176,9 @@ endpoint, same prompt, same view.
 Paddock is young and under active development.
 
 - **Backends:** CUDA and Metal. The CUDA release kernel pack carries SASS for
-  sm_86, sm_89, sm_100 and sm_120; the build script can target more. The Metal
-  backend (`crates/paddock-metal`, shaders in `packs/metal`) runs on Apple
-  Silicon. There is no Vulkan or ROCm backend.
+  sm_86, sm_89, sm_100 and sm_120 on x64 and sm_121 on the DGX Spark; the build
+  script can target more. The Metal backend (`crates/paddock-metal`, shaders in
+  `packs/metal`) runs on Apple Silicon. There is no Vulkan or ROCm backend.
 - **Platforms:** Windows and Linux on x64, Linux arm64 on the NVIDIA DGX Spark,
   and macOS on Apple Silicon with a native Swift app. Release downloads are
   available for all three platforms; macOS support is pre-release, as described above.

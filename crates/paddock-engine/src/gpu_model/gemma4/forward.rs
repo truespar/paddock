@@ -146,7 +146,7 @@ pub(crate) fn pf_rows_floor() -> usize {
 
 /// SWA append+attend sub-span rows. The WindowRing only has to absorb one
 /// sub-span of appends (plus the window behind it) before older blocks may
-/// alias - shrinking the ring from (PF_ROWS+window) to (span+IMG_SPAN_MAX
+/// alias - shrinking the ring from (PF_ROWS+window) to (span+picture overshoot
 /// +window): 193 -> 115 blocks, 2.36 -> 1.41 GB/slot at window 1024. GEMMs
 /// still run whole PF_ROWS chunks; only the SWA append/attend ladder steps.
 ///
@@ -188,11 +188,6 @@ pub(crate) fn swa_span_pin() -> Option<usize> {
 pub(crate) fn swa_span_initial() -> usize {
     swa_span_pin().unwrap_or(SWA_SPAN_DEFAULT)
 }
-/// Sub-span overshoot allowance: a multimodal sub-span may extend past
-/// SWA_SPAN rather than cut inside a NON-CAUSAL image span (rows attend
-/// forward to their image's end - splitting one would read keys not yet
-/// appended). Encoder emits <= 280 soft tokens per image.
-pub(crate) const IMG_SPAN_MAX: usize = 288;
 
 pub(crate) fn swa_spans(span: usize, runs: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
@@ -3230,10 +3225,11 @@ impl GpuGemma4 {
                         attn_join = Some(sx.record_event()?);
                     }
                 }
-                // global layers: scalar tiled prefill at HD=512 (the WMMA
-                // tile's static smem doesn't fit 512; the scalar tile does,
-                // barely - see pd_attn_prefill), per slot-run; paged twin
-                // over the budget-pool table in pool mode.
+                // global layers, per slot-run: the paged WMMA f16 tile (NC 16
+                // at HD=512) over the budget-pool table in pool mode; off the
+                // pool, the dense scalar tiled prefill, whose HD=512 tile
+                // fits the 99 KB opt-in window with 384 B to spare only
+                // because none of it is static shared (see pd_apf_smem).
                 // the armed run table is spans-based; globals
                 // iterate runs, so the collapsed pf6g launch only engages
                 // when the two coincide (no swa-ladder splits - always true

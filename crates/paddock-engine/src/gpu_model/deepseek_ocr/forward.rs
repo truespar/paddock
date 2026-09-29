@@ -401,6 +401,17 @@ fn gen_err(e: GpuModelError) -> crate::generator::GenError {
 /// reference and the no-paged-kv fallback. Chunked prefill / mixed ticks /
 /// device sampling / spec are listed perf rungs, not prerequisites.
 impl crate::generator::Generator for GpuDeepseekOcr {
+    /// The live mempool counter every family publishes as its device ledger
+    /// (`/api/stats` `model_mem`): without it the manager had nothing to
+    /// reconcile this model's NVML figure against.
+    fn device_mem_used(&self) -> Option<u64> {
+        self.exec.process_mem_used()
+    }
+
+    fn release_idle_memory(&mut self) {
+        self.exec.trim_mem_pool();
+    }
+
     fn reset(&mut self) {
         self.reset();
         if let Some(bs) = self.batch.as_mut() {

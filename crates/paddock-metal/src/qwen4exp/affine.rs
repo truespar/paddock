@@ -17,6 +17,308 @@ thread_local! {
     pub(super) static PLAIN_DENSE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static PLAIN_SPLIT_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static PADDED_TILES_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    pub(super) static TILE_REUSE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    pub(super) static STAGED_ROUTER_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    pub(super) static SHARED_INPUT_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static JOINED_INPUT_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    pub(super) static JOINED_SLAB_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static JOINED_ROW_GROUP_FOR_TEST: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    pub(super) static PACKED_WIDE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Valid only within an explicit group of projections of the same immutable
+/// input. The arena's prefix contains BF16 rows; slab weights and staged
+/// split-K partials live strictly after it. A fallback that can overwrite the
+/// prefix invalidates this record. No buffer-address cache survives a call.
+#[derive(Default)]
+struct InputReuse {
+    enabled: bool,
+    staged: std::cell::Cell<Option<[u32; 3]>>,
+}
+
+impl InputReuse {
+    fn stage(&self, cmd: &Commands<'_>, x: &Buffer, scratch: &Buffer, p: &[u32]) {
+        let key = [p[0], p[2], p[6]]; // K, physical rows, source-row offset
+        if self.enabled && self.staged.replace(Some(key)) == Some(key) {
+            return;
+        }
+        cmd.dispatch(
+            "q4a_input",
+            &[x, scratch],
+            p,
+            [
+                (p[2] as usize)
+                    .next_multiple_of(32)
+                    .saturating_mul(p[0] as usize)
+                    .div_ceil(256),
+                1,
+                1,
+            ],
+            256,
+        );
+    }
+}
+
+/// Share preparation, never arithmetic: every weight still elects its own
+/// coalesced spans, split-K count, quantization format and original kernel.
+pub(super) fn project_group(
+    cmd: &Commands<'_>,
+    weights: &[(&Weight, &Buffer)],
+    x: &Buffer,
+    rows: usize,
+) {
+    #[cfg(test)]
+    let enabled = SHARED_INPUT_FOR_TEST.with(|v| v.get());
+    #[cfg(not(test))]
+    let enabled = false; // exact, but no repeatable full-model performance win yet
+    let input = InputReuse {
+        enabled,
+        ..Default::default()
+    };
+    let joined = project_input_pair(cmd, weights, x, rows);
+    for &(w, y) in &weights[if joined { 2 } else { 0 }..] {
+        project_reusing(cmd, w, x, y, rows, &input);
+    }
+}
+
+/// Join QKV/Z launch grids, not their arithmetic. Keep the two packed weight
+/// planes and output strides; a workgroup still owns exactly one original
+/// output tile. Singleton recurrent gates deliberately remain vector kernels.
+fn project_input_pair(
+    cmd: &Commands<'_>,
+    weights: &[(&Weight, &Buffer)],
+    x: &Buffer,
+    rows: usize,
+) -> bool {
+    #[cfg(test)]
+    let enabled = JOINED_INPUT_FOR_TEST.with(|v| v.get())
+        && !SEPARATE_SPANS_FOR_TEST.with(|v| v.get())
+        && !INLINE_INPUT_FOR_TEST.with(|v| v.get())
+        && !PLAIN_DENSE_FOR_TEST.with(|v| v.get());
+    #[cfg(not(test))]
+    let enabled = true;
+    #[cfg(test)]
+    let slab_enabled = JOINED_SLAB_FOR_TEST.with(|v| v.get());
+    #[cfg(not(test))]
+    let slab_enabled = false; // isolated win did not translate into a c=4 win
+    if !enabled || rows < 64 || (!slab_enabled && rows >= 1536) {
+        return false;
+    }
+    let Some(&(a, ay)) = weights.first() else {
+        return false;
+    };
+    let Some(&(b, by)) = weights.get(1) else {
+        return false;
+    };
+    let Some(scratch) = cmd.projection_workspace() else {
+        return false;
+    };
+    if !cmd.tensor_accelerated()
+        || cmd.independent_rows()
+        || !padded_tiles()
+        || !tile_reuse()
+        || (a.ty, b.ty, a.k, b.k, a.n, b.n) != (A4G32, A4G32, 2560, 2560, 10240, 6144)
+        || scratch.len() < 32 * a.k * 2
+        || (cmd.projection_rows().is_none() && rows > MAX_LOGICAL_ROWS)
+    {
+        return false;
+    }
+    let default = [(0, rows, rows)];
+    let spans = cmd.projection_rows().unwrap_or(&default);
+    let plan = |w: &Weight| coalesced_spans(w.k, w.n, w.ty, Some(scratch.len()), spans);
+    // Split-K can differ for the two N dimensions. Never coalesce by the
+    // concatenated width, or perturb either projection's original row groups.
+    if !plan(a).eq(plan(b)) {
+        return false;
+    }
+    assert!(x.len() >= rows * a.k * 4 && ay.len() >= rows * a.n * 4 && by.len() >= rows * b.n * 4);
+    for (start, count, logical) in plan(a) {
+        if count < 64
+            || [a, b]
+                .iter()
+                .any(|w| contraction(w.k, w.n, w.ty, logical) != (2, 1))
+        {
+            project_span_reusing(
+                cmd,
+                a,
+                x,
+                ay,
+                (count, start, logical),
+                &InputReuse::default(),
+            );
+            project_span_reusing(
+                cmd,
+                b,
+                x,
+                by,
+                (count, start, logical),
+                &InputReuse::default(),
+            );
+            continue;
+        }
+        #[cfg(test)]
+        let slab = slab_enabled
+            && slab_shape(a.k, a.n, count)
+            && (scratch.len() / (a.k * 2)).saturating_sub(256) >= 32;
+        #[cfg(not(test))]
+        let slab = false;
+        let capacity =
+            ((scratch.len() / (a.k * 2)).saturating_sub(if slab { 256 } else { 0 }) / 32) * 32;
+        for offset in (0..count).step_by(capacity) {
+            let len = capacity.min(count - offset);
+            let mut p = [0u32; 17];
+            #[cfg(test)]
+            {
+                p[16] = JOINED_ROW_GROUP_FOR_TEST.with(|v| v.get());
+            }
+            #[cfg(not(test))]
+            {
+                p[16] = 0;
+            }
+            if p[16] == 0 {
+                p[16] = if slab { 8 } else { 1 };
+            }
+            assert!([1, 4, 8, 16].contains(&p[16]));
+            p[..7].copy_from_slice(&[
+                a.k as u32,
+                a.n as u32,
+                len as u32,
+                4,
+                32,
+                1,
+                (start + offset) as u32,
+            ]);
+            p.copy_within(..7, 7);
+            p[8] = b.n as u32;
+            InputReuse::default().stage(cmd, x, scratch, &p);
+            if slab {
+                let input_bytes = len.next_multiple_of(32) * a.k * 2;
+                // Every slab and the QKV/Z boundary align to full 64-column
+                // tiles, so no tensor tile changes its shape or K reduction.
+                let columns = (scratch.len() - input_bytes) / (a.k * 2) / 64 * 64;
+                for first in (0..a.n + b.n).step_by(columns) {
+                    let width = columns.min(a.n + b.n - first);
+                    p[14] = first as u32;
+                    p[15] = width as u32;
+                    cmd.dispatch_at(
+                        "q4a_weight_pair_slab",
+                        &[&a.buffer, &b.buffer, scratch],
+                        &[0, 0, input_bytes],
+                        &p,
+                        [(width * a.k / 32).div_ceil(256), 1, 1],
+                        256,
+                    );
+                    cmd.dispatch_at(
+                        "q4a_mm4_pair_slab",
+                        &[scratch, scratch, ay, by],
+                        &[input_bytes, 0, 0, 0],
+                        &p,
+                        [width.div_ceil(64), len.div_ceil(64), 1],
+                        128,
+                    );
+                }
+            } else {
+                let wide = len >= 512;
+                cmd.dispatch(
+                    if wide {
+                        "q4a_mm4_pair_wide"
+                    } else {
+                        "q4a_mm4_pair"
+                    },
+                    &[&a.buffer, &b.buffer, scratch, ay, by],
+                    &p,
+                    [
+                        (a.n + b.n).div_ceil(if wide { 64 } else { 32 }),
+                        len.div_ceil(32),
+                        1,
+                    ],
+                    128,
+                );
+            }
+        }
+    }
+    true
+}
+
+fn tile_reuse() -> bool {
+    #[cfg(test)]
+    return TILE_REUSE_FOR_TEST.with(|v| v.get());
+    #[cfg(not(test))]
+    true
+}
+
+/// Reuse only measured single-part M5 affine-4 shapes. Split-K and decode
+/// keep their existing arithmetic. Small matrices retain on-chip unpacking.
+fn slab_shape(k: usize, n: usize, rows: usize) -> bool {
+    matches!((k, n), (2560, 6144 | 10240 | 12288)) && rows >= 1536
+        || (k, n) == (320, 10240) && rows >= 512
+        || (k, n) == (2560, 640) && rows >= 1024
+}
+
+// Reserve at least 256 weight columns alongside the padded input, then bound
+// both physical row slices and column slabs by the actual arena. No global
+// weight expansion, extra allocation, or change to logical contraction.
+#[cfg(test)]
+pub(super) fn project_slab(
+    cmd: &Commands<'_>,
+    w: &Buffer,
+    x: &Buffer,
+    scratch: &Buffer,
+    y: &Buffer,
+    p: &[u32; 7],
+) -> bool {
+    project_slab_reusing(cmd, w, x, scratch, y, p, &InputReuse::default())
+}
+
+fn project_slab_reusing(
+    cmd: &Commands<'_>,
+    w: &Buffer,
+    x: &Buffer,
+    scratch: &Buffer,
+    y: &Buffer,
+    p: &[u32; 7],
+    input: &InputReuse,
+) -> bool {
+    let (k, n, rows) = (p[0] as usize, p[1] as usize, p[2] as usize);
+    assert!(k.is_multiple_of(64) && k > 0 && n > 0 && rows > 0);
+    assert_eq!((p[3], p[4], p[5]), (4, 32, 1));
+    let minimum_columns = 256.min(n.next_multiple_of(32));
+    let capacity = (scratch.len() / (k * 2)).saturating_sub(minimum_columns) / 32 * 32;
+    if capacity < 32 {
+        return false;
+    }
+    for offset in (0..rows).step_by(capacity) {
+        let count = capacity.min(rows - offset);
+        let input_bytes = count.next_multiple_of(32) * k * 2;
+        let columns = ((scratch.len() - input_bytes) / (k * 2) / 32) * 32;
+        let mut q = [0u32; 9];
+        q[..7].copy_from_slice(p);
+        q[2] = count as u32;
+        q[6] += offset as u32;
+        input.stage(cmd, x, scratch, &q);
+        for first in (0..n).step_by(columns) {
+            let width = columns.min((n - first).next_multiple_of(32));
+            q[7] = first as u32;
+            q[8] = width as u32;
+            cmd.dispatch_at(
+                "q4a_weight_slab",
+                &[w, scratch],
+                &[0, input_bytes],
+                &q,
+                [(width * k / 32).div_ceil(256), 1, 1],
+                256,
+            );
+            cmd.dispatch_at(
+                "q4a_mm4_slab",
+                &[scratch, scratch, y],
+                &[input_bytes, 0, 0],
+                &q,
+                [width.div_ceil(64), count.div_ceil(64), 1],
+                128,
+            );
+        }
+    }
+    true
 }
 
 // Padding changes only the on-chip weight pitch, not the logical tensor,
@@ -32,7 +334,7 @@ fn padded_tiles() -> bool {
 // with single-part dense and routed-expert input staging. Wide dense
 // projections slice physical rows to fit, retaining their logical contraction;
 // top-10 expert-down K=640 needs 6400 values per model row. These uses never
-// overlap. No weight expansion or post-load GPU allocation.
+// overlap. No persistent expanded weights or post-load GPU allocation.
 // Physical dispatch capacity is independent from a prompt's immutable
 // arithmetic shape. Wider shared passes must not re-elect split-K or masks.
 pub(super) const MAX_LOGICAL_ROWS: usize = 1024;
@@ -152,13 +454,24 @@ pub(super) fn load(
 /// HC injection / recurrent gates use a row-invariant vector contraction,
 /// as required by the upstream model's explicit singleton projection.
 pub(super) fn project(cmd: &Commands<'_>, w: &Weight, x: &Buffer, y: &Buffer, rows: usize) {
+    project_reusing(cmd, w, x, y, rows, &InputReuse::default());
+}
+
+fn project_reusing(
+    cmd: &Commands<'_>,
+    w: &Weight,
+    x: &Buffer,
+    y: &Buffer,
+    rows: usize,
+    input: &InputReuse,
+) {
     if !cmd.independent_rows()
         && let Some(spans) = cmd.projection_rows()
     {
         #[cfg(test)]
         if SEPARATE_SPANS_FOR_TEST.with(|v| v.get()) {
             for &(start, count, logical) in spans {
-                project_span(cmd, w, x, y, count, start, logical);
+                project_span_reusing(cmd, w, x, y, (count, start, logical), input);
             }
             return;
         }
@@ -172,13 +485,13 @@ pub(super) fn project(cmd: &Commands<'_>, w: &Weight, x: &Buffer, y: &Buffer, ro
         ) {
             assert!(start == end && count > 0 && start + count <= rows);
             assert!(count <= MAX_ROWS && logical_count <= MAX_LOGICAL_ROWS);
-            project_span(cmd, w, x, y, count, start, logical_count);
+            project_span_reusing(cmd, w, x, y, (count, start, logical_count), input);
             end += count;
         }
         assert_eq!(end, rows);
         return;
     }
-    project_span(cmd, w, x, y, rows, 0, rows);
+    project_span_reusing(cmd, w, x, y, (rows, 0, rows), input);
 }
 
 /// Dense projections are row-local. Adjacent physical slices may share a
@@ -231,6 +544,7 @@ fn coalesced_spans(
     })
 }
 
+#[cfg(test)]
 pub(super) fn project_span(
     cmd: &Commands<'_>,
     w: &Weight,
@@ -240,6 +554,25 @@ pub(super) fn project_span(
     start: usize,
     logical_rows: usize,
 ) {
+    project_span_reusing(
+        cmd,
+        w,
+        x,
+        y,
+        (rows, start, logical_rows),
+        &InputReuse::default(),
+    );
+}
+
+fn project_span_reusing(
+    cmd: &Commands<'_>,
+    w: &Weight,
+    x: &Buffer,
+    y: &Buffer,
+    span: (usize, usize, usize),
+    input: &InputReuse,
+) {
+    let (rows, start, logical_rows) = span;
     let (bits, group) = format(w.ty);
     assert!(rows > 0 && x.len() >= (start + rows) * w.k * 4 && y.len() >= (start + rows) * w.n * 4);
     let (kind, parts) = contraction(
@@ -254,6 +587,9 @@ pub(super) fn project_span(
     );
     let tile = kind == 2;
     let wide = kind == 1;
+    let packed_wide = cmd.tensor_accelerated();
+    #[cfg(test)]
+    let packed_wide = packed_wide && PACKED_WIDE_FOR_TEST.with(|v| v.get());
     // Test-binary-only arithmetic bisect. No runner setting or production
     // branch: isolate compiler specialization from the prefill graph.
     #[cfg(test)]
@@ -298,7 +634,12 @@ pub(super) fn project_span(
         && w.n >= 8
         && w.n <= 512
         && w.n.is_multiple_of(8);
-    let staged_split = tile && parts > 1 && bits == 4 && rows >= 64 && cmd.tensor_accelerated();
+    #[cfg(test)]
+    let staged_router = STAGED_ROUTER_FOR_TEST.with(|v| v.get());
+    #[cfg(not(test))]
+    let staged_router = true;
+    let staged_split =
+        tile && parts > 1 && (bits == 4 || staged_router) && rows >= 64 && cmd.tensor_accelerated();
     #[cfg(test)]
     let staged_split = staged_split && !PLAIN_SPLIT_FOR_TEST.with(|v| v.get());
     if staged_split && let Some(scratch) = cmd.projection_workspace() {
@@ -321,15 +662,17 @@ pub(super) fn project_span(
                     parts as u32,
                     (start + offset) as u32,
                 ];
-                cmd.dispatch(
-                    "q4a_input",
-                    &[x, scratch],
-                    &p,
-                    [(padded * w.k).div_ceil(256), 1, 1],
-                    256,
-                );
+                input.stage(cmd, x, scratch, &p);
                 let span = w.k / parts;
-                let kernel = if padded_tiles() && span.is_multiple_of(128) {
+                let kernel = if bits == 8 {
+                    assert!(span.is_multiple_of(64));
+                    match (span.is_multiple_of(128), padded_tiles()) {
+                        (true, true) => "q4a_mm8_split_device128_pad8",
+                        (false, true) => "q4a_mm8_split_device64_pad8",
+                        (true, false) => "q4a_mm8_split_device128",
+                        (false, false) => "q4a_mm8_split_device64",
+                    }
+                } else if padded_tiles() && span.is_multiple_of(128) {
                     "q4a_mm4_split_device128_pad8"
                 } else if padded_tiles() && span.is_multiple_of(64) {
                     "q4a_mm4_split_device64_pad8"
@@ -377,10 +720,24 @@ pub(super) fn project_span(
         && let Some(scratch) = cmd.projection_workspace()
         && scratch.len() / (w.k * 2) >= 32
     {
+        if bits == 4
+            && tile_reuse()
+            && slab_shape(w.k, w.n, rows)
+            && project_slab_reusing(
+                cmd,
+                &w.buffer,
+                x,
+                scratch,
+                y,
+                &[w.k as u32, w.n as u32, rows as u32, 4, 32, 1, start as u32],
+                input,
+            )
+        {
+            return;
+        }
         let capacity = (scratch.len() / (w.k * 2) / 32) * 32;
         for offset in (0..rows).step_by(capacity) {
             let count = capacity.min(rows - offset);
-            let padded = count.next_multiple_of(32);
             let p = [
                 w.k as u32,
                 w.n as u32,
@@ -390,19 +747,20 @@ pub(super) fn project_span(
                 1,
                 (start + offset) as u32,
             ];
-            cmd.dispatch(
-                "q4a_input",
-                &[x, scratch],
-                &p,
-                [(padded * w.k).div_ceil(256), 1, 1],
-                256,
-            );
+            input.stage(cmd, x, scratch, &p);
             #[cfg(test)]
             let grouped = !PLAIN_DENSE_FOR_TEST.with(|v| v.get());
             #[cfg(not(test))]
             let grouped = true;
+            let wide = bits == 4
+                && grouped
+                && padded_tiles()
+                && tile_reuse()
+                && count >= 512
+                && matches!((w.k, w.n), (2560, 6144 | 10240 | 12288) | (6144, 2560));
             cmd.dispatch(
                 match (bits, w.k.is_multiple_of(128), grouped) {
+                    (4, true, true) if wide => "q4a_mm4_device128_wide",
                     (4, true, true) if padded_tiles() => "q4a_mm4_device128_pad8",
                     (4, false, true) if padded_tiles() => "q4a_mm4_device64_pad8",
                     (4, true, true) => "q4a_mm4_device128_group32",
@@ -415,12 +773,17 @@ pub(super) fn project_span(
                 },
                 &[&w.buffer, scratch, y],
                 &p,
-                [w.n.div_ceil(32), count.div_ceil(32), 1],
+                [
+                    w.n.div_ceil(if wide { 64 } else { 32 }),
+                    count.div_ceil(32),
+                    1,
+                ],
                 128,
             );
         }
         return;
     }
+    input.staged.set(None);
     if tile
         && parts > 1
         && let Some(scratch) = cmd.projection_workspace()
@@ -461,7 +824,11 @@ pub(super) fn project_span(
         } else if tile {
             "q4a_mm"
         } else if wide {
-            "q4a_wide"
+            match (packed_wide, bits) {
+                (true, 4) => "q4a_wide4_packed",
+                (true, 8) => "q4a_wide8_packed",
+                _ => "q4a_wide",
+            }
         } else if narrow {
             "q4a_mv4_narrow"
         } else if half_group {

@@ -736,7 +736,7 @@ pub async fn run(
             } else {
                 None
             };
-            let m = serving::load_with_residency(
+            let mut m = serving::load_with_residency(
                 id,
                 path,
                 &cfg.device,
@@ -752,6 +752,7 @@ pub async fn run(
                 cfg.max_image_tokens,
                 resident_options,
             )?;
+            m.vision_off = cfg.vision == Some(false);
             tracing::info!(model = %m.id, "model ready");
             spec_policy_off = spec_off;
             serving = Some(m);

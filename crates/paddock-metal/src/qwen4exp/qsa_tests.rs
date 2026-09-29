@@ -133,6 +133,73 @@ fn compact_mlx_attention_matches_legacy_partitions_exactly() {
 }
 
 #[test]
+fn cache_only_finite_checks_written_paged_rows_and_completed_index_blocks() {
+    let d = MetalDevice::new(Some(32 << 20)).unwrap();
+    let meta = upload_u(&d, &[1, 3, 0, 2, 1, 4, 0, 2, 0, 16, 2, 3]);
+    let pages = upload_u(&d, &[2, 1, 3, 0]);
+    let bad = upload_u(&d, &[0]);
+    let p = [2, 8, 3, 2, 4];
+    for case in 0..7 {
+        let mut keys = vec![half::bf16::ONE; 4 * 16 * 512];
+        let mut values = keys.clone();
+        let mut raw = vec![1.; 3 * 128];
+        let mut pooled = vec![1.; 2 * 8 * 128];
+        match case {
+            1 => keys[(3 * 16 + 3) * 512 + 511] = half::bf16::NAN,
+            2 => values[16 * 512] = half::bf16::INFINITY,
+            3 => raw[128 + 127] = f32::NEG_INFINITY,
+            4 => pooled[8 * 128] = f32::NAN,
+            // Neither an untouched page nor an incomplete index block is read.
+            5 => {
+                keys[0] = half::bf16::NAN;
+                pooled[9 * 128] = f32::NAN;
+            }
+            6 => unsafe { bad.write_u32(&[4]) },
+            _ => (),
+        }
+        if case != 6 {
+            unsafe { bad.write_u32(&[0]) };
+        }
+        let keys = d
+            .upload(
+                &keys
+                    .iter()
+                    .flat_map(|v| v.to_bits().to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let values = d
+            .upload(
+                &values
+                    .iter()
+                    .flat_map(|v| v.to_bits().to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let raw = upload(&d, &raw);
+        let pooled = upload(&d, &pooled);
+        let cmd = d.begin().unwrap();
+        cmd.dispatch(
+            "q4b_cache_finite",
+            &[&keys, &values, &raw, &pooled, &meta, &pages, &bad],
+            &p,
+            [6, 1, 1],
+            256,
+        );
+        cmd.finish().unwrap();
+        assert_eq!(
+            unsafe { bad.read_u32(1) }[0],
+            match case {
+                1..=4 => 8,
+                6 => 4,
+                _ => 0,
+            },
+            "case={case}"
+        );
+    }
+}
+
+#[test]
 #[ignore = "isolated GPU timing for exact Flash Next attention staging routes"]
 fn mlx_attention_staging_cost() {
     attention_staging_contracts(true);
@@ -140,16 +207,27 @@ fn mlx_attention_staging_cost() {
 
 #[test]
 fn local_mlx_attention_preserves_partials_and_guards() {
-    attention_local_contracts(false);
+    attention_local_contracts(false, false);
 }
 
 #[test]
 #[ignore = "isolated on-chip attention timing; not a serving benchmark"]
 fn mlx_attention_local_cost() {
-    attention_local_contracts(true);
+    attention_local_contracts(true, false);
 }
 
-fn attention_local_contracts(benchmark: bool) {
+#[test]
+fn direct_mlx_attention_preserves_partials_and_guards() {
+    attention_local_contracts(false, true);
+}
+
+#[test]
+#[ignore = "exact contiguous-run attention GPU costs; not a serving benchmark"]
+fn mlx_attention_direct_runs_cost() {
+    attention_local_contracts(true, true);
+}
+
+fn attention_local_contracts(benchmark: bool, direct: bool) {
     let d = MetalDevice::new(Some(768 << 20)).unwrap();
     let capacity = 2048usize;
     let slots = 64usize;
@@ -177,6 +255,10 @@ fn attention_local_contracts(benchmark: bool) {
             // Every slot has a different permutation: wrong-slot reads must
             // not pass simply because all tables point to identical pages.
             .map(|i| {
+                if direct && (i / pages_per_slot).is_multiple_of(2) {
+                    return ((i % pages_per_slot + i / pages_per_slot * 32) % pages_per_slot)
+                        as u32;
+                }
                 ((pages_per_slot - 1 - i % pages_per_slot + i / pages_per_slot * 37)
                     % pages_per_slot) as u32
             })
@@ -258,14 +340,24 @@ fn attention_local_contracts(benchmark: bool) {
                     capacity as u32,
                 ];
                 let mut reference: Option<(Vec<u32>, Vec<u32>)> = None;
-                let kernels = [
-                    "q4b_attention_compact",
-                    "q4b_attention_local",
-                    "q4b_attention_local_pad",
-                    "q4b_attention_local_wide",
-                    "q4b_attention_local_gather",
-                ];
-                let mut times = kernels.map(|_| Vec::new());
+                let kernels: &[&str] = if direct {
+                    &[
+                        "q4b_attention_local_vpad1",
+                        "q4b_attention_direct_values",
+                        "q4b_attention_direct_keys",
+                        "q4b_attention_direct_runs",
+                    ]
+                } else {
+                    &[
+                        "q4b_attention_compact",
+                        "q4b_attention_local",
+                        "q4b_attention_local_pad",
+                        "q4b_attention_local_wide",
+                        "q4b_attention_local_gather",
+                        "q4b_attention_local_vpad1",
+                    ]
+                };
+                let mut times = vec![Vec::new(); kernels.len()];
                 let routes = kernels.len();
                 for round in 0..if benchmark { 7 } else { 1 } {
                     for route in (0..routes).map(|r| (r + round) % routes) {
@@ -333,6 +425,32 @@ fn attention_local_contracts(benchmark: bool) {
                             }
                         }
                         if let Some((expected, partials)) = &reference {
+                            if actual != *expected || active != *partials {
+                                let counts = (0..258)
+                                    .map(|offset| {
+                                        active
+                                            .iter()
+                                            .zip(partials)
+                                            .enumerate()
+                                            .filter(|(i, (a, b))| i % 258 == offset && a != b)
+                                            .count()
+                                    })
+                                    .collect::<Vec<_>>();
+                                eprintln!(
+                                    "DIRECT_DIFFERENCES kernel={} output={} maxima={} denominator={} partial_values={} max_error={}",
+                                    kernels[route],
+                                    actual.iter().zip(expected).filter(|(a, b)| a != b).count(),
+                                    counts[256],
+                                    counts[257],
+                                    counts[..256].iter().sum::<usize>(),
+                                    active
+                                        .iter()
+                                        .zip(partials)
+                                        .map(|(&a, &b)| (f32::from_bits(a) - f32::from_bits(b))
+                                            .abs())
+                                        .fold(0f32, f32::max)
+                                );
+                            }
                             assert!(
                                 actual == *expected,
                                 "output n={n} position={position} ragged={ragged} route={route}"
@@ -357,7 +475,7 @@ fn attention_local_contracts(benchmark: bool) {
                     eprintln!(
                         "FLASH_LOCAL_COST {}",
                         serde_json::json!({"rows":n,"position":position,"ragged":ragged,"bf16_query":bf_query,
-                    "mask":mask,"gpu_seconds":times,"partials_exact":true})
+                    "mask":mask,"kernels":kernels,"gpu_seconds":times,"partials_exact":true})
                     );
                 }
             }

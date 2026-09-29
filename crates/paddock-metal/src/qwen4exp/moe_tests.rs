@@ -149,7 +149,7 @@ fn complete_hc_routed_shared_ffn_matches_mps_across_schedules() {
                 h.extend([9876.5; 17]);
                 let h = upload(&d, &h);
                 let cmd = d.begin().unwrap();
-                w.encode_ffn(&cmd, &h, &hc, &s, n).unwrap();
+                w.encode_ffn(&cmd, &h, &hc, &s, n, false).unwrap();
                 cmd.submit().unwrap().wait().unwrap();
                 assert_eq!(unsafe { s.invalid.read_u32(n) }, vec![0; n]);
                 let actual_ids = unsafe { s.ids.read_u32(n * 10) };
@@ -242,7 +242,7 @@ fn complete_hc_routed_shared_ffn_matches_mps_across_schedules() {
         let prior = unsafe { s.output.read_u32(128 * WIDTH) };
         let cmd = d.begin().unwrap();
         for n in [0, 2, 129, usize::MAX] {
-            assert!(w.encode_ffn(&cmd, &h, &hc, &s, n).is_err());
+            assert!(w.encode_ffn(&cmd, &h, &hc, &s, n, false).is_err());
         }
         cmd.submit().unwrap().wait().unwrap();
         assert_eq!(
@@ -253,7 +253,7 @@ fn complete_hc_routed_shared_ffn_matches_mps_across_schedules() {
         let small_hc = residual::Workspace::new(&d, 1).unwrap();
         let two = upload(&d, &hidden[..2 * residual::WIDE]);
         let cmd = d.begin().unwrap();
-        assert!(w.encode_ffn(&cmd, &two, &small_hc, &s, 2).is_err());
+        assert!(w.encode_ffn(&cmd, &two, &small_hc, &s, 2, false).is_err());
         cmd.submit().unwrap().wait().unwrap();
         assert_eq!(
             unsafe { two.read_f32(0, 2 * residual::WIDE) },

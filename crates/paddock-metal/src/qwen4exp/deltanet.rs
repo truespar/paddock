@@ -434,14 +434,17 @@ impl Workspace {
             0,
             EPS.to_bits(),
         ];
-        for (w, y) in [
-            (&w.qkv, &self.qkv),
-            (&w.z, &self.z),
-            (&w.alpha, &self.alpha),
-            (&w.beta, &self.beta),
-        ] {
-            affine::project(cmd, w, x, y, n);
-        }
+        affine::project_group(
+            cmd,
+            &[
+                (&w.qkv, &self.qkv),
+                (&w.z, &self.z),
+                (&w.alpha, &self.alpha),
+                (&w.beta, &self.beta),
+            ],
+            x,
+            n,
+        );
         cmd.dispatch(
             "mlx_dn_conv",
             &[

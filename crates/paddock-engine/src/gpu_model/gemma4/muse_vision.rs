@@ -343,6 +343,13 @@ impl VisionModel {
         (tw * self.merge, th * self.merge)
     }
 
+    /// Soft tokens a `w`x`h` picture encodes to - what `encode` will report,
+    /// from the grid alone.
+    pub fn tokens_for(&self, w: usize, h: usize) -> usize {
+        let (gw, gh) = self.grid_for(w, h);
+        (gw / self.merge) * (gh / self.merge)
+    }
+
     /// Window layout in the permuted token order: the run length of each
     /// 32×32 patch tile, windows walked row-major. A block-diagonal mask over
     /// contiguous runs is exactly a batch of independent attentions, which is

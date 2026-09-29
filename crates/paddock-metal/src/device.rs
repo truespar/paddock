@@ -771,9 +771,14 @@ impl MetalDevice {
             "q4a_mv4_fast",
             "q4a_mv4_narrow",
             "q4a_mv4_fast2",
+            "q4a_expert_gate_up_vector",
+            "q4a_hc_down_vector",
+            "q4a_hc_up_mix_vector",
             "q4a_mv8",
             "q4a_mv8_fast",
             "q4a_wide",
+            "q4a_wide4_packed",
+            "q4a_wide8_packed",
             "q4a_mm",
             "q4a_mm4_packed",
             "q4a_input",
@@ -784,6 +789,15 @@ impl MetalDevice {
             "q4a_mm4_device64_group32",
             "q4a_mm4_device128_pad8",
             "q4a_mm4_device64_pad8",
+            "q4a_mm4_device128_wide",
+            "q4a_mm4_pair",
+            "q4a_mm4_pair_wide",
+            #[cfg(test)]
+            "q4a_weight_pair_slab",
+            #[cfg(test)]
+            "q4a_mm4_pair_slab",
+            "q4a_weight_slab",
+            "q4a_mm4_slab",
             #[cfg(test)]
             "q4a_mm4_device128_pad16",
             #[cfg(test)]
@@ -799,6 +813,10 @@ impl MetalDevice {
             "q4a_mm4_split_device128_pad8",
             "q4a_mm4_split_device64_pad8",
             "q4a_mm4_split_device32_pad8",
+            "q4a_mm8_split_device128",
+            "q4a_mm8_split_device64",
+            "q4a_mm8_split_device128_pad8",
+            "q4a_mm8_split_device64_pad8",
             "q4a_mm_join",
             "q4b_margin",
             "q4a_expert_mv",
@@ -817,6 +835,40 @@ impl MetalDevice {
             "q4a_expert_mm_group32_pad",
             "q4a_expert_mm_group32_packed",
             #[cfg(test)]
+            "q4a_expert_mm_k128_n32",
+            #[cfg(test)]
+            "q4a_expert_mm_k128_n64",
+            #[cfg(test)]
+            "q4a_expert_mm_load4",
+            #[cfg(test)]
+            "q4a_expert_mm_load8",
+            #[cfg(test)]
+            "q4a_expert_mm_sg1",
+            #[cfg(test)]
+            "q4a_expert_mm_sg2",
+            #[cfg(test)]
+            "q4a_expert_mm_pad4",
+            #[cfg(test)]
+            "q4a_expert_mm_pad16",
+            #[cfg(test)]
+            "q4a_expert_mm_register",
+            "q4b_hc_combine_norm",
+            #[cfg(test)]
+            "q4a_expert_mm_masked",
+            #[cfg(test)]
+            "q4a_expert_tiles64",
+            #[cfg(test)]
+            "q4a_expert_mm_rows64",
+            "q4a_expert_offsets",
+            #[cfg(test)]
+            "q4a_expert_plan64",
+            "q4a_expert_pack",
+            #[cfg(test)]
+            "q4a_expert_pack64",
+            "q4a_expert_mm_direct",
+            #[cfg(test)]
+            "q4a_expert_mm_direct64",
+            #[cfg(test)]
             "q4a_expert_gate_up_packed",
             #[cfg(test)]
             "q4a_expert_gate_up_dispatch",
@@ -829,6 +881,7 @@ impl MetalDevice {
             "q4b_norm_rope",
             "q4b_index_split",
             "q4b_store",
+            "q4b_cache_finite",
             "q4b_pool",
             "q4b_attention",
             "q4b_attention_contract",
@@ -838,6 +891,12 @@ impl MetalDevice {
             #[cfg(test)]
             "q4b_attention_local_wide",
             "q4b_attention_local_gather",
+            "q4b_attention_local_vpad1",
+            "q4b_attention_direct_runs",
+            #[cfg(test)]
+            "q4b_attention_direct_keys",
+            #[cfg(test)]
+            "q4b_attention_direct_values",
             "q4b_join_gate_compact",
             "q4a_ple_staged",
             "q4b_join_gate",
@@ -1645,8 +1704,11 @@ impl Commands<'_> {
                 || name.starts_with("ptq1_swar_")
                 || name.starts_with("ptq1_unroll_")
                 || name.starts_with("bonsai_add_")
-                || (name.starts_with("q4a_expert") && name != "q4a_expert_order")
-            {
+                || (name.starts_with("q4a_expert")
+                    && !matches!(
+                        name,
+                        "q4a_expert_order" | "q4a_expert_offsets" | "q4a_expert_plan64"
+                    )) {
                 format!("{name}[k={},n={},m={}]", params[0], params[1], params[2])
             } else if name.starts_with("mlx_affine_prefill")
                 || name.starts_with("mlx_affine_tile")
@@ -1711,11 +1773,33 @@ impl Commands<'_> {
         }
     }
     pub fn finish(self) -> Result<f64> {
+        self.finish_with_host_work(|_| ())
+    }
+
+    /// Submit before bounded, CPU-only work, then take the same completion,
+    /// error, telemetry and profiling path as finish. The closure must not
+    /// access any buffer referenced by this command. No detached work remains.
+    pub(crate) fn finish_with_host_work(self, work: impl FnOnce(&dyn Fn() -> bool)) -> Result<f64> {
         if let Some(enc) = &self.enc {
             enc.endEncoding();
         }
         self.cmd.commit();
-        self.cmd.waitUntilCompleted();
+        {
+            struct Fence<'a>(&'a ProtocolObject<dyn MTLCommandBuffer>);
+            impl Drop for Fence<'_> {
+                fn drop(&mut self) {
+                    self.0.waitUntilCompleted();
+                }
+            }
+            // Even a host-side panic must not unwind past in-flight resources.
+            let _fence = Fence(&self.cmd);
+            work(&|| {
+                matches!(
+                    self.cmd.status(),
+                    MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+                )
+            });
+        }
         crate::telemetry::completed(&self.cmd);
         if let Some(e) = self.cmd.error() {
             self.device.healthy.store(false, Ordering::Relaxed);
@@ -1760,6 +1844,28 @@ impl Commands<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_host_work_fences_gpu_writes_even_on_unwind() {
+        let d = MetalDevice::new(Some(16 << 20)).unwrap();
+        let out = d.alloc(4096).unwrap();
+        for panic_host in [false, true] {
+            unsafe { out.write_u32(&vec![u32::MAX; 1024]) };
+            let called = std::cell::Cell::new(false);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let cmd = d.begin().unwrap();
+                cmd.dispatch("dg_zero", &[&out], &[1024], [4, 1, 1], 256);
+                cmd.finish_with_host_work(|_| {
+                    called.set(true);
+                    assert!(!panic_host, "injected bounded host work failure");
+                })
+                .unwrap();
+            }));
+            assert_eq!(result.is_err(), panic_host);
+            assert!(called.get());
+            assert_eq!(unsafe { out.read_u32(1024) }, vec![0; 1024]);
+        }
+    }
 
     #[test]
     fn telemetry_async_completion_records_once_even_after_repeated_wait_and_drop() {

@@ -85,6 +85,44 @@ static inline bool pd_env_on(const char* name) {
     return v != nullptr && v[0] != '\0' && !(v[0] == '0' && v[1] == '\0');
 }
 
+// Host: can `fn` launch with `dyn` bytes of dynamic shared memory on this
+// device? The opt-in cap bounds STATIC + dynamic, and a kernel's static
+// arrays (its own and its inlined helpers') are invisible at the call site,
+// so a guard on `dyn` alone admits a launch the driver refuses: pf7rp's
+// 100,608 dynamic + 1,024 static bytes against GB10's 101,376 failed every
+// hd256 fp8 prefill with cudaErrorInvalidValue (the attribute set had failed
+// unchecked). Raises the kernel's dynamic limit when it fits; false = take
+// the next arm. It never leaves a failed call of its own behind: a refused
+// query or attribute set stays in the thread's last-error slot, and the next
+// pd_launch_status (cudaGetLastError) reports it against whatever launch
+// comes after - an arm that launched fine - so it consumes what it caused.
+// Static here is what the IMAGE carries, not what the source declares: in
+// the sm_120a/121a images every kernel's static section is aligned to 1 KB
+// (a sibling's `extern __shared__ __align__(1024)` buffer sets it for the
+// whole translation unit), so a 64-byte array reports 1,024 there.
+// Lives in abi.cuh so every segment's launcher can guard with it.
+static inline bool pd_smem_fits(const void* fn, uint32_t dyn) {
+    int dev = 0, cap = 0;
+    cudaFuncAttributes a;
+    if (cudaGetDevice(&dev) != cudaSuccess
+        || cudaDeviceGetAttribute(&cap, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev)
+               != cudaSuccess
+        || cudaFuncGetAttributes(&a, fn) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    if (a.sharedSizeBytes + (size_t)dyn > (size_t)cap) return false;
+    if (cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)dyn)
+        != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+// (No PD_BS_HOST guard: the launch guards call this on every build, and a
+// single-arch pack - which defines no PD_BS_HOST - failed to compile with it
+// hidden. It needs nothing but the CUDA runtime.)
+
 // Host half of PD_BS_OK: does the RUNNING device have the block-scale
 // (sm_120a feature-target) kernel bodies in this pack? The device gate is
 // `__CUDA_ARCH__ >= 1200 && __CUDA_ARCH_FEAT_SM120_ALL`, which only the

@@ -330,9 +330,10 @@ function togglePill(f: AfField, c: string): void {
 // are booleans (off = absent - identical semantics, the defaults are false).
 // The form is a lens over the file text: entering the tab parses it, leaving
 // or saving serializes back.
-// 'bool3' is pills that serialize as a real TOML boolean, for the one config
-// field whose absence is a THIRD state rather than false (`metrics_auth`: unset
-// = key required off-box only). A plain 'switch' cannot say "explicitly false",
+// 'bool3' is pills that serialize as a real TOML boolean, for the config
+// fields whose absence is a THIRD state rather than false (`metrics_auth`: unset
+// = key required off-box only; `vision`: unset = load a tower found beside the
+// weights, false = none at all). A plain 'switch' cannot say "explicitly false",
 // and plain 'pills' would write the string "true", which the runner's
 // Option<bool> refuses at startup.
 type AfKind = 'text' | 'num' | 'switch' | 'bool3' | 'pills' | 'list' | 'json' | 'file' | 'gpu'
@@ -365,6 +366,7 @@ const AF_CARDS: { hd: string; fields: AfField[] }[] = [
       // the user can hand-edit should not have a field they cannot see.
       { key: 'catalog', kind: 'json', hint: 'which catalog model the weights are · {"model": "qwen3.5-9b", "artifact": "q8", "drafter": "drafter2"}' },
       { key: 'mmproj', kind: 'file', src: 'mmproj', hint: 'image encoder GGUF - enables image input' },
+      { key: 'vision', kind: 'bool3', choices: ['true', 'false'], hint: 'false = image input off, even with a tower beside the weights (refused beside mmproj) · unset = load a tower found there' },
       { key: 'mtp', kind: 'file', src: 'mtp', hint: 'drafter GGUF for speculative decode (models without in-file MTP)' },
       // The image lane's two companions (config.rs `text_encoder` / `vae`).
       // The encoder is a GGUF, so the gguf picker suits it; the VAE is a

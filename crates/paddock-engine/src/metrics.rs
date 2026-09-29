@@ -155,9 +155,11 @@ pub struct EngineMetrics {
     /// pass while a tier is armed. All zero when untiered - `armed` is what
     /// separates "no tier" from "a tier that has answered nothing yet".
     pub tier: TierGauges,
-    /// Measured device bytes the loaded model holds (weights + KV/state pools),
-    /// sampled once by the engine thread after the batch pools are allocated.
-    /// 0 = not sampled (CPU backend, or before the engine finished setup).
+    /// Measured device bytes the loaded model holds in its mempool (weights,
+    /// KV/state pools, scratch), sampled by the engine thread after the batch
+    /// pools are allocated, again once warm, and live while serving (at most
+    /// once a second). 0 = not sampled (CPU backend, or before the engine
+    /// finished setup).
     pub model_mem_bytes: AtomicU64,
     /// Memory breakdown: device bytes held by weights
     /// (all serving classes) and by the KV cache, where the family reports

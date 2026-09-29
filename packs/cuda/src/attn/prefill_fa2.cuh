@@ -318,6 +318,8 @@ __global__ void __launch_bounds__(NT, 256u / NT) pd_attn_prefill_fa_kernel(
 // G=6 (qwen3.6-27B 24q/4kv/hd256) takes MR=48 - the only 16-multiple that
 // divides by 6; before this instantiation the shape fell to the per-q-head
 // WMMA tile (f16) / the SCALAR paged walk (fp8, the elected kv8 class).
+// G=12 (Qwen3.8-Flash-Next 24q/2kv/hd256) takes MR=48 too: 4 tokens x 12
+// heads a CTA, the o_acc budget G=6 already runs at.
 // KVT arm: e4m3 pools ride the v3c PIPE class - cp.async lands raw byte
 // tiles in sh_raw, a post-wait smem->smem widened-cvt expand fills the same
 // padded-row half layout f16 staging writes (staging bit-equal to an f16
@@ -335,8 +337,8 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_f16_v4_kernel(
     float scale, const uint32_t* __restrict__ run_offs,
     const unsigned int* __restrict__ win_pos) {
 #if PD_FA_OK
-    constexpr uint32_t MR =
-        G == 6u ? 48u : (G == 9u ? 144u : (HD >= 512u ? 32u : 64u));  // mma rows
+    constexpr uint32_t MR = (G == 6u || G == 12u)
+        ? 48u : (G == 9u ? 144u : (HD >= 512u ? 32u : 64u));  // mma rows
     static_assert(MR % G == 0u && MR % 16u == 0u, "MR must fit G and mma frags");
     constexpr uint32_t TQ = MR / G;                    // tokens per CTA
     constexpr uint32_t row_e = HD + 8u;                // +8-half pad

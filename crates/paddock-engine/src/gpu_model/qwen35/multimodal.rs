@@ -5,13 +5,10 @@ use crate::gpu::GpuError;
 use crate::gpu_model::gpt_oss::GpuModelError;
 use paddock_models::mapped::MappedGguf;
 
-/// The identity of one picture: its raw bytes plus its dimensions.
-///
-/// One definition, because three places have to agree on it - the serial
-/// tower cache, the batched tower cache, the prefix radix's
-/// image-row keys. If the tower cache and the KV cache could disagree about
-/// whether two pictures are the same picture, a request could hit one and miss
-/// the other, which is the shape of "the blue-image slot answered red".
+/// The prefix radix's identity of one picture (its image-row keys): its raw
+/// bytes plus its dimensions. The picture store keys on a 256-bit digest of
+/// the same inputs (`pictures::picture_key`), so the two can only disagree on
+/// a 64-bit collision here - and the radix needs rows, not bytes, to hold.
 pub(super) fn image_content_hash(rgb: &[u8], w: usize, h: usize) -> u64 {
     hash_bytes(rgb) ^ (w as u64).wrapping_mul(31) ^ (h as u64).wrapping_mul(131)
 }
@@ -21,7 +18,30 @@ impl GpuQwen35 {
     pub fn attach_vision(&mut self, mmproj: &MappedGguf) -> Result<(), GpuModelError> {
         let vm = crate::gpu_model::qwen35::vision::VisionModel::load(self.exec.clone(), mmproj)?;
         self.vision = Some(vm);
+        if self.batch.is_some() {
+            self.cap_picture_at_pass();
+        }
         Ok(())
+    }
+
+    /// One picture must fit one planned prefill pass (see
+    /// `VisionModel::cap_image_tokens`), and the picture store holds what the
+    /// plan reserved for that pass (`picture_budget_bytes`); run wherever
+    /// either side of the pair - the tower or the elected chunk - arrives
+    /// second.
+    pub(super) fn cap_picture_at_pass(&mut self) {
+        let pass = self.prefill_chunk_rows;
+        let budget = self.picture_budget_bytes(pass);
+        self.pictures.set_budget(budget);
+        if let Some(v) = self.vision.as_mut()
+            && let Some((was, now)) = v.cap_image_tokens(pass)
+        {
+            tracing::info!(
+                "qwen35 vision: one picture is capped at {now} tokens, the planned prefill pass \
+                 (the checkpoint allows {was}) - its rows prefill together, and a longer \
+                 picture would grow the serving scratch past the plan"
+            );
+        }
     }
 
     pub fn has_vision(&self) -> bool {
@@ -37,258 +57,34 @@ impl GpuQwen35 {
     /// Vision-tower outputs a re-sent image would recompute, served from the
     /// cache instead (test/telemetry hook).
     pub fn image_cache_reuses(&self) -> u64 {
-        self.image_cache_reused
+        self.pictures.reused
     }
 
-    /// Preprocess + encode `rgb` through the vision tower, or serve the
-    /// projected embeddings from the image cache when the exact bytes were
-    /// encoded before. Returns an OWNED VisionOutput either way (a cache hit
-    /// copies device-to-device - trivial next to the tower forward it skips).
-    fn encode_image_cached(
-        &mut self,
-        rgb: &[u8],
-        w: usize,
-        h: usize,
-    ) -> Result<crate::gpu_model::qwen35::vision::VisionOutput, GpuModelError> {
-        use crate::gpu_model::qwen35::vision::VisionOutput;
-        let hash = image_content_hash(rgb, w, h);
-        self.image_cache_clock += 1;
-        let clock = self.image_cache_clock;
-        if let Some(i) = self
-            .image_cache
-            .iter()
-            .position(|e| e.hash == hash && e.w == w && e.h == h && e.rgb == rgb)
-        {
-            self.image_cache[i].last_used = clock;
-            self.image_cache_reused += 1;
-            let (nx, ny) = (self.image_cache[i].nx, self.image_cache[i].ny);
-            let n = self.image_cache[i].embd.len();
-            let mut buf = self.exec.alloc(n)?;
-            self.exec
-                .copy_region(&self.image_cache[i].embd, 0, &mut buf, 0, n)?;
-            return Ok(VisionOutput {
-                embd: buf,
-                nx,
-                ny,
-                deepstack: Vec::new(),
-            });
-        }
-
-        let out = {
-            let vm = self.vision.as_ref().ok_or_else(|| {
-                GpuModelError::Unsupported(
-                    "qwen35 was loaded without an mmproj - configure `mmproj` to enable image \
-                     input"
-                        .into(),
-                )
-            })?;
-            let (img, tw, th) = vm.preprocess_rgb(rgb, w, h);
-            vm.encode(&img, tw, th)?
-        };
-
-        // cache a copy (LRU eviction when full)
-        let mut store = self.exec.alloc(out.embd.len())?;
-        self.exec
-            .copy_region(&out.embd, 0, &mut store, 0, out.embd.len())?;
-        if self.image_cache.len() >= IMAGE_CACHE_ENTRIES
-            && let Some(i) = self
-                .image_cache
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, e)| e.last_used)
-                .map(|(i, _)| i)
-        {
-            self.image_cache.swap_remove(i);
-        }
-        self.image_cache.push(ImageCacheEntry {
-            hash,
-            w,
-            h,
-            rgb: rgb.to_vec(),
-            embd: store,
-            nx: out.nx,
-            ny: out.ny,
-            last_used: clock,
-        });
-        Ok(out)
+    /// Bytes the picture store holds, and its budget (test/telemetry hook).
+    pub fn picture_store_bytes(&self) -> (u64, u64) {
+        (self.pictures.bytes(), self.pictures.budget())
     }
 
-    /// Encode every image in the chunk list (in order) through the vision tower,
-    /// each cache-served when its exact bytes were seen before. Returns OWNED
-    /// VisionOutputs so the borrow ends before prefill takes `&mut self`.
+    /// Borrow every picture in the chunk list (in order), encoded or served
+    /// from the picture store. The serial lane's whole-prompt prefill takes
+    /// them all at once; the batched lanes ask per pass instead.
     pub(super) fn encode_all_images(
         &mut self,
         chunks: &[crate::service::MmChunk],
-    ) -> Result<Vec<crate::gpu_model::qwen35::vision::VisionOutput>, GpuModelError> {
-        use crate::service::MmChunk;
-        let mut out = Vec::new();
-        for c in chunks {
-            if let MmChunk::Image { rgb, w, h } = c {
-                out.push(self.encode_image_cached(rgb, *w, *h)?);
-            }
-        }
-        if out.is_empty() {
+    ) -> Result<Vec<super::pictures::Picture>, GpuModelError> {
+        let want: Vec<(&[u8], usize, usize)> = chunks
+            .iter()
+            .filter_map(|c| match c {
+                crate::service::MmChunk::Image { rgb, w, h } => Some((rgb.as_slice(), *w, *h)),
+                _ => None,
+            })
+            .collect();
+        if want.is_empty() {
             return Err(GpuModelError::Unsupported(
                 "multimodal prompt has no image".into(),
             ));
         }
-        Ok(out)
-    }
-
-    /// Cache-aware BATCHED encode across multiple pending multimodal requests
-    /// - the fix for the concurrent-image TTFT staircase. Cache hits copy out exactly as the
-    ///   serial path did; misses are preprocessed, grouped by canvas size, and
-    ///   each group runs one `encode_batch` tower pass (row-capped) instead of
-    ///   one tower pass per request. Returns per-request VisionOutputs in chunk
-    ///   order - bit-identical to per-request `encode_all_images`.
-    pub(crate) fn encode_images_for_requests(
-        &mut self,
-        reqs: &[&[crate::service::MmChunk]],
-    ) -> Result<Vec<Vec<crate::gpu_model::qwen35::vision::VisionOutput>>, GpuModelError> {
-        use crate::gpu_model::qwen35::vision::VisionOutput;
-        use crate::service::MmChunk;
-        // rows per batched tower pass (scratch ~ rows × vit_ffn f32 ≈ 17 KB/row)
-        const MAX_BATCH_ROWS: usize = 8192;
-
-        struct Miss {
-            ri: usize,
-            ii: usize,
-            rgb: Vec<u8>,
-            w: usize,
-            h: usize,
-            hash: u64,
-            img: Vec<f32>,
-            tw: usize,
-            th: usize,
-        }
-
-        if self.vision.is_none() {
-            return Err(GpuModelError::Unsupported(
-                "qwen35 was loaded without an mmproj - configure `mmproj` to enable image input"
-                    .into(),
-            ));
-        }
-        let mut out: Vec<Vec<Option<VisionOutput>>> = Vec::with_capacity(reqs.len());
-        let mut misses: Vec<Miss> = Vec::new();
-        for (ri, chunks) in reqs.iter().enumerate() {
-            let mut row: Vec<Option<VisionOutput>> = Vec::new();
-            for c in chunks.iter() {
-                let MmChunk::Image { rgb, w, h } = c else {
-                    continue;
-                };
-                let hash = image_content_hash(rgb, *w, *h);
-                self.image_cache_clock += 1;
-                let clock = self.image_cache_clock;
-                if let Some(i) = self
-                    .image_cache
-                    .iter()
-                    .position(|e| e.hash == hash && e.w == *w && e.h == *h && e.rgb == *rgb)
-                {
-                    self.image_cache[i].last_used = clock;
-                    self.image_cache_reused += 1;
-                    let (nx, ny) = (self.image_cache[i].nx, self.image_cache[i].ny);
-                    let nlen = self.image_cache[i].embd.len();
-                    let mut buf = self.exec.alloc(nlen)?;
-                    self.exec
-                        .copy_region(&self.image_cache[i].embd, 0, &mut buf, 0, nlen)?;
-                    row.push(Some(VisionOutput {
-                        embd: buf,
-                        nx,
-                        ny,
-                        deepstack: Vec::new(),
-                    }));
-                } else {
-                    let (img, tw, th) = {
-                        let vm = self.vision.as_ref().expect("checked above");
-                        vm.preprocess_rgb(rgb, *w, *h)
-                    };
-                    misses.push(Miss {
-                        ri,
-                        ii: row.len(),
-                        rgb: rgb.clone(),
-                        w: *w,
-                        h: *h,
-                        hash,
-                        img,
-                        tw,
-                        th,
-                    });
-                    row.push(None);
-                }
-            }
-            if row.is_empty() {
-                return Err(GpuModelError::Unsupported(
-                    "multimodal prompt has no image".into(),
-                ));
-            }
-            out.push(row);
-        }
-
-        // group misses by canvas size (stable within a size), encode each
-        // group in row-capped slices through one tower pass per slice
-        let mut order: Vec<usize> = (0..misses.len()).collect();
-        order.sort_by_key(|&i| (misses[i].tw, misses[i].th, i));
-        let mut gi = 0;
-        while gi < order.len() {
-            let (tw, th) = (misses[order[gi]].tw, misses[order[gi]].th);
-            let (encoded, gj) = {
-                let vm = self.vision.as_ref().expect("checked above");
-                let (pw, ph) = vm.patch_grid(tw, th);
-                let max_imgs = (MAX_BATCH_ROWS / (pw * ph)).max(1);
-                let mut gj = gi;
-                while gj < order.len()
-                    && misses[order[gj]].tw == tw
-                    && misses[order[gj]].th == th
-                    && gj - gi < max_imgs
-                {
-                    gj += 1;
-                }
-                let batch: Vec<(&[f32], usize, usize)> = order[gi..gj]
-                    .iter()
-                    .map(|&i| (misses[i].img.as_slice(), tw, th))
-                    .collect();
-                (vm.encode_batch(&batch)?, gj)
-            };
-            for (vo, &mi) in encoded.into_iter().zip(&order[gi..gj]) {
-                let m = &mut misses[mi];
-                // cache a copy (LRU eviction), exactly like the serial path
-                let mut store = self.exec.alloc(vo.embd.len())?;
-                self.exec
-                    .copy_region(&vo.embd, 0, &mut store, 0, vo.embd.len())?;
-                if self.image_cache.len() >= IMAGE_CACHE_ENTRIES
-                    && let Some(i) = self
-                        .image_cache
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, e)| e.last_used)
-                        .map(|(i, _)| i)
-                {
-                    self.image_cache.swap_remove(i);
-                }
-                self.image_cache_clock += 1;
-                self.image_cache.push(ImageCacheEntry {
-                    hash: m.hash,
-                    w: m.w,
-                    h: m.h,
-                    rgb: std::mem::take(&mut m.rgb),
-                    embd: store,
-                    nx: vo.nx,
-                    ny: vo.ny,
-                    last_used: self.image_cache_clock,
-                });
-                out[m.ri][m.ii] = Some(vo);
-            }
-            gi = gj;
-        }
-
-        Ok(out
-            .into_iter()
-            .map(|row| {
-                row.into_iter()
-                    .map(|o| o.expect("all images encoded"))
-                    .collect()
-            })
-            .collect())
+        self.encode_pictures(&want)
     }
 
     /// Exclusive multimodal prefill from interleaved text/image chunks: resets
@@ -308,8 +104,8 @@ impl GpuQwen35 {
                     .into(),
             ));
         }
-        // owned VisionOutputs (cache-served or freshly encoded), so the borrow
-        // ends before reset/prefill take &mut self
+        // borrowed pictures (store-served or freshly encoded), held apart from
+        // `self` so reset/prefill can take &mut self
         let images = self.encode_all_images(chunks)?;
 
         self.reset();
@@ -344,7 +140,7 @@ impl GpuQwen35 {
     pub fn prefill_multimodal(
         &mut self,
         chunks: &[crate::service::MmChunk],
-        images: &[crate::gpu_model::qwen35::vision::VisionOutput],
+        images: &[super::pictures::Picture],
     ) -> Result<Vec<f32>, GpuModelError> {
         // token ids (image spans are `0` placeholders, overwritten by the vision
         // embeddings below), the mRoPE grid, and the equal-t image visibility
@@ -1217,7 +1013,17 @@ impl GpuQwen35 {
             },
             crate::service::MmChunk::Text(after.to_vec()),
         ];
-        let last = self.prefill_multimodal(&chunks, std::slice::from_ref(image))?;
+        // a parity tool's own tower output: one copy into a picture, off the
+        // serving path
+        let mut embd = self.exec.alloc(image.embd.len())?;
+        self.exec
+            .copy_region(&image.embd, 0, &mut embd, 0, image.embd.len())?;
+        let picture = std::sync::Arc::new(super::pictures::PictureEmbd {
+            embd,
+            nx: image.nx,
+            ny: image.ny,
+        });
+        let last = self.prefill_multimodal(&chunks, std::slice::from_ref(&picture))?;
         let exec = self.exec.clone();
         let mut out = Vec::with_capacity(max_new);
         out.push(argmax(&last));

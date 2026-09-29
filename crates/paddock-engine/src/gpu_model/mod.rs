@@ -12,6 +12,7 @@ pub mod laguna;
 pub mod laya;
 pub mod nemotron;
 pub mod paddleocr_vl;
+pub mod picture_store;
 pub mod pillow;
 pub mod prefix_cache;
 pub mod qwen3;

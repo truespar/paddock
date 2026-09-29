@@ -300,6 +300,47 @@ fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_steady_drift_warns_once_then_on_change_then_clears() {
+        let mut w = super::DriftWarnings::default();
+        let gib = 1i64 << 30;
+        assert_eq!(w.note(7, 0, false), None, "healthy: nothing to say");
+        assert_eq!(
+            w.note(7, 20 * gib, true),
+            Some(true),
+            "leaving tolerance warns"
+        );
+        assert_eq!(
+            w.note(7, 20 * gib, true),
+            None,
+            "the same drift again: silent"
+        );
+        assert_eq!(
+            w.note(7, 20 * gib + gib / 2, true),
+            None,
+            "under a GiB of movement: silent"
+        );
+        assert_eq!(
+            w.note(7, 21 * gib + 1, true),
+            Some(true),
+            "a GiB of movement warns again"
+        );
+        assert_eq!(
+            w.note(7, gib / 4, false),
+            Some(false),
+            "back in tolerance: one all-clear"
+        );
+        assert_eq!(w.note(7, gib / 4, false), None, "and only one");
+        w.note(9, 20 * gib, true);
+        w.retain(&std::collections::HashSet::from([7]));
+        assert_eq!(
+            w.note(9, 20 * gib, true),
+            Some(true),
+            "a runner that went away is forgotten"
+        );
+    }
+
     use super::*;
 
     #[cfg(target_os = "macos")]
@@ -442,10 +483,11 @@ pub fn start_reconciler(
 ) -> watch::Receiver<Arc<Option<Reconciliation>>> {
     let (tx, rx) = watch::channel(Arc::new(None));
     tokio::spawn(async move {
+        let mut warned = DriftWarnings::default();
         loop {
             let snap = gpu.latest();
             if snap.available {
-                let recon = reconcile(&snap, &supervisor).await;
+                let recon = reconcile(&snap, &supervisor, &mut warned).await;
                 if tx.send(Arc::new(Some(recon))).is_err() {
                     return;
                 }
@@ -456,9 +498,53 @@ pub fn start_reconciler(
     rx
 }
 
+/// What the drift warning last said per runner PID, so a runner outside
+/// tolerance is reported when it leaves it, when the drift moves, and as a
+/// periodic reminder - not every sample. Warned every two seconds, one
+/// healthy runner's constant drift was 43,200 identical lines a day, which
+/// buried whatever else the log had to say and read as an alarm nobody could
+/// act on.
+#[derive(Default)]
+struct DriftWarnings(std::collections::HashMap<u32, (i64, std::time::Instant)>);
+
+/// A drift change worth another line, and the reminder interval for one that
+/// holds still.
+const DRIFT_REWARN_DELTA: i64 = 1 << 30;
+const DRIFT_REWARN_EVERY: Duration = Duration::from_secs(600);
+
+impl DriftWarnings {
+    /// Whether `pid`'s drift, flagged or not this sample, deserves a line:
+    /// Some(true) warn, Some(false) the all-clear, None nothing new.
+    fn note(&mut self, pid: u32, drift: i64, flagged: bool) -> Option<bool> {
+        match (flagged, self.0.get(&pid).copied()) {
+            (false, None) => None,
+            (false, Some(_)) => {
+                self.0.remove(&pid);
+                Some(false)
+            }
+            (true, Some((last, at)))
+                if (drift - last).abs() < DRIFT_REWARN_DELTA
+                    && at.elapsed() < DRIFT_REWARN_EVERY =>
+            {
+                None
+            }
+            (true, _) => {
+                self.0.insert(pid, (drift, std::time::Instant::now()));
+                Some(true)
+            }
+        }
+    }
+
+    /// Forget runners that are gone.
+    fn retain(&mut self, live: &std::collections::HashSet<u32>) {
+        self.0.retain(|pid, _| live.contains(pid));
+    }
+}
+
 async fn reconcile(
     snap: &GpuSnapshot,
     supervisor: &crate::supervisor::Supervisor,
+    warned: &mut DriftWarnings,
 ) -> Reconciliation {
     use futures::{StreamExt, stream};
     // NVML per-PID, summed across devices (a runner is single-GPU today, but
@@ -480,6 +566,7 @@ async fn reconcile(
     }
 
     let mut runners = Vec::new();
+    let mut live_pids = std::collections::HashSet::new();
     let mut paddock_mem = 0u64;
     let mut anomaly = false;
     let mut samples = stream::iter(supervisor.list().await)
@@ -522,15 +609,24 @@ async fn reconcile(
             _ => None,
         };
         let flagged = drift.is_some_and(|d| !(DRIFT_LOW..=DRIFT_HIGH).contains(&d));
-        if flagged {
-            tracing::warn!(
+        live_pids.insert(view.pid);
+        match warned.note(view.pid, drift.unwrap_or(0), flagged) {
+            Some(true) => tracing::warn!(
                 port = view.port,
                 pid = view.pid,
                 nvml = nvml_mem.unwrap_or(0),
                 ledger = self_mem.unwrap_or(0),
                 drift = drift.unwrap_or(0),
-                "VRAM reconciliation drift outside tolerance (leak/fragmentation?)"
-            );
+                "VRAM reconciliation drift outside tolerance (leak/fragmentation?) - \
+                 repeated only if it moves by 1 GiB or in 10 minutes"
+            ),
+            Some(false) => tracing::info!(
+                port = view.port,
+                pid = view.pid,
+                drift = drift.unwrap_or(0),
+                "VRAM reconciliation drift back within tolerance"
+            ),
+            None => {}
         }
         anomaly |= flagged;
         paddock_mem += nvml_mem.unwrap_or(0);
@@ -555,6 +651,7 @@ async fn reconcile(
     // WDDM blind spot - report absence, not zeros.
     let attribution = !snap.gpus.iter().any(|g| g.metal.is_some())
         && (runners.is_empty() || runners.iter().any(|r| r.nvml_mem.is_some()));
+    warned.retain(&live_pids);
     // ledger sum vs the card: > total means WDDM is paging VRAM to system RAM
     let committed: u64 = runners.iter().filter_map(|r| r.self_mem).sum();
     let overcommit = (device_total > 0 && committed > device_total).then(|| {

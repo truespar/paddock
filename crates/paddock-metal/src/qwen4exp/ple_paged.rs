@@ -12,6 +12,8 @@ use paddock_models::safetensors::TensorFileReader;
 const RECORD: usize = 104; // u32 identity + 80 code + 10 scale + 10 bias bytes
 const CACHE_ROWS: usize = 65536;
 const IO_WORKERS: usize = 8;
+const PREFETCH_BATCH: usize = 256; // 16 tokens, all readers joined before checking GPU completion
+pub(super) const LOOKAHEAD_ROWS: usize = 1024;
 #[cfg(test)]
 thread_local! {
     static SERIAL_IO_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -27,6 +29,8 @@ pub(super) struct PagedTable {
     // Direct-mapped and bounded: exact ID tags, no unbounded hash map growth or
     // float expansion. A collision only causes another positional read.
     cache: Vec<[u8; RECORD]>,
+    lookahead: bool,
+    prefetch_cost: std::time::Duration,
     pub(super) staging: Weight,
 }
 
@@ -50,6 +54,8 @@ impl PagedTable {
         Ok(Self {
             planes,
             cache: vec![[255; RECORD]; CACHE_ROWS],
+            lookahead: false,
+            prefetch_cost: std::time::Duration::ZERO,
             staging: Weight {
                 buffer: d.alloc(Self::bytes(rows) as usize)?,
                 ty: affine::A4G32,
@@ -63,6 +69,8 @@ impl PagedTable {
     /// fenced integer token history; a new slot has the GPU reset's EOS history.
     /// No GPU submission occurs on a partial/failed file read.
     pub(super) fn stage(&mut self, plan: &ple::Plan, history: &Buffer) -> Result<()> {
+        self.lookahead = false;
+        let prefetched = std::mem::take(&mut self.prefetch_cost);
         let history = unsafe { history.read_u32(history.len() / 4) };
         let ids = hash_rows(&plan.tokens, &plan.meta, &history)?;
         if ids.len() > self.staging.n {
@@ -76,26 +84,109 @@ impl PagedTable {
                 ids.len() * RECORD,
             )
         };
-        let read = |id: u32, record: &mut [u8; RECORD]| {
-            let shard = id as usize / mlx::SHARD_ROWS;
-            let row = id as usize % mlx::SHARD_ROWS;
-            let Some(planes) = self.planes.get(shard) else {
-                return Err(MetalError::Model("PLE row outside checkpoint".into()));
-            };
-            for (plane, stride, range) in [(0, 80, 4..84), (1, 10, 84..94), (2, 10, 94..104)] {
-                planes[plane]
-                    .read_at(row * stride, &mut record[range])
-                    .map_err(|e| MetalError::Model(format!("PLE row read failed: {e}")))?;
-            }
-            record[..4].copy_from_slice(&id.to_le_bytes());
-            Ok(())
-        };
+        let read = |id, record: &mut [u8; RECORD]| read_record(&self.planes, id, record);
+        let started = std::time::Instant::now();
         #[cfg(test)]
-        if SERIAL_IO_FOR_TEST.with(|v| v.get()) {
-            return stage_serial(&ids, &mut self.cache, dst, &read);
-        }
-        stage_rows(&ids, &mut self.cache, dst, &read)
+        let serial = SERIAL_IO_FOR_TEST.with(|v| v.get());
+        #[cfg(not(test))]
+        let serial = false;
+        let result = if serial {
+            stage_serial(&ids, &mut self.cache, dst, &read)
+        } else {
+            stage_rows(&ids, &mut self.cache, dst, &read)
+        };
+        self.lookahead =
+            result.is_ok() && worth_prefetching(ids.len() / 16, started.elapsed(), prefetched);
+        result
     }
+
+    pub(super) fn should_prefetch(&self) -> bool {
+        self.lookahead
+    }
+
+    /// Called after submission: only descriptors and the CPU compressed-row
+    /// cache are accessed, never staging or GPU history. Work is bounded and
+    /// completes before the model owner returns; cancellation cannot strand
+    /// futures or publish results into a reused slot. Identity is the immutable
+    /// checkpoint row ID, independently validated by the normal GPU gather.
+    pub(super) fn prefetch(&mut self, ids: &[u32], gpu_done: &dyn Fn() -> bool) -> Result<()> {
+        self.prefetch_cost = std::time::Duration::ZERO;
+        if ids.len() > LOOKAHEAD_ROWS * 16 {
+            return Err(MetalError::Model("PLE lookahead capacity exceeded".into()));
+        }
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let result = prefetch_rows(ids, &mut self.cache, gpu_done, &|id, record| {
+            read_record(&self.planes, id, record)
+        });
+        if result.is_ok() {
+            self.prefetch_cost = started.elapsed();
+        }
+        result
+    }
+}
+
+// A cheap demand stage can be the result of useful read-ahead, not evidence
+// that storage has become cheap. Consume the immediately preceding prefetch
+// cost once; no permanent warm/cold flag survives workload or pressure changes.
+fn worth_prefetching(
+    rows: usize,
+    demand: std::time::Duration,
+    prefetched: std::time::Duration,
+) -> bool {
+    rows >= 128 && demand.max(prefetched) >= std::time::Duration::from_millis(8)
+}
+
+fn prefetch_rows(
+    ids: &[u32],
+    cache: &mut [[u8; RECORD]],
+    gpu_done: &dyn Fn() -> bool,
+    read: &(impl Fn(u32, &mut [u8; RECORD]) -> Result<()> + Sync),
+) -> Result<()> {
+    // Check completion between bounded batches, not after all future rows.
+    // At most this one batch can extend past GPU completion; no detached I/O
+    // remains. A single filesystem read has no hard wall-time bound.
+    let mut records = [0u8; PREFETCH_BATCH * RECORD];
+    for batch in ids.chunks(PREFETCH_BATCH) {
+        if gpu_done() {
+            break;
+        }
+        stage_rows(batch, cache, &mut records[..batch.len() * RECORD], read)?;
+    }
+    Ok(())
+}
+
+fn read_record(planes: &[[TensorFileReader; 3]], id: u32, record: &mut [u8; RECORD]) -> Result<()> {
+    let shard = id as usize / mlx::SHARD_ROWS;
+    let row = id as usize % mlx::SHARD_ROWS;
+    let Some(planes) = planes.get(shard) else {
+        return Err(MetalError::Model("PLE row outside checkpoint".into()));
+    };
+    for (plane, stride, range) in [(0, 80, 4..84), (1, 10, 84..94), (2, 10, 94..104)] {
+        planes[plane]
+            .read_at(row * stride, &mut record[range])
+            .map_err(|e| MetalError::Model(format!("PLE row read failed: {e}")))?;
+    }
+    record[..4].copy_from_slice(&id.to_le_bytes());
+    Ok(())
+}
+
+/// Only known prompt tokens may be looked up ahead. Never predict decode
+/// tokens or inspect GPU history while a command is running.
+pub(super) fn prompt_lookahead(tokens: &[u32], start: usize, count: usize) -> Result<Vec<u32>> {
+    if count > LOOKAHEAD_ROWS || start > tokens.len() || count > tokens.len() - start {
+        return Err(MetalError::Model("invalid PLE lookahead span".into()));
+    }
+    let history = [
+        start.checked_sub(1).map_or(248044, |i| tokens[i]),
+        start.checked_sub(2).map_or(248044, |i| tokens[i]),
+    ];
+    let meta = (0..count)
+        .flat_map(|i| [0, (start + i) as u32, 0, count as u32])
+        .collect::<Vec<_>>();
+    hash_rows(&tokens[start..start + count], &meta, &history)
 }
 
 fn bucket(id: u32) -> usize {
@@ -303,6 +394,124 @@ mod tests {
         }
         record[..4].copy_from_slice(&id.to_le_bytes());
         Ok(())
+    }
+
+    #[test]
+    fn lookahead_policy_tracks_cost_without_disabling_its_own_success() {
+        use std::time::Duration as D;
+        assert!(!worth_prefetching(127, D::from_secs(1), D::from_secs(1)));
+        assert!(!worth_prefetching(128, D::from_micros(7999), D::ZERO));
+        assert!(worth_prefetching(128, D::from_millis(8), D::ZERO));
+        assert!(worth_prefetching(1024, D::ZERO, D::from_millis(8)));
+        assert!(!worth_prefetching(
+            1024,
+            D::from_millis(1),
+            D::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn read_ahead_stops_at_completion_and_demand_fills_the_remainder() {
+        let ids = (0..1024).collect::<Vec<_>>();
+        let mut cache = vec![[255u8; RECORD]; CACHE_ROWS];
+        let calls = AtomicUsize::new(0);
+        let read = |id, record: &mut [u8; RECORD]| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            fake_record(id, record)
+        };
+        prefetch_rows(&ids, &mut cache, &|| true, &read).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        prefetch_rows(
+            &ids,
+            &mut cache,
+            &|| calls.load(Ordering::Relaxed) >= PREFETCH_BATCH,
+            &read,
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), PREFETCH_BATCH);
+        let mut out = vec![0; ids.len() * RECORD];
+        stage_rows(&ids, &mut cache, &mut out, &read).unwrap();
+        for (&id, actual) in ids.iter().zip(out.chunks_exact(RECORD)) {
+            let mut expected = [0; RECORD];
+            fake_record(id, &mut expected).unwrap();
+            assert_eq!(actual, expected);
+        }
+        // A failed optional batch cannot label partial bytes as valid. Earlier
+        // complete batches remain useful and all scoped workers have joined.
+        cache.fill([255; RECORD]);
+        assert!(
+            prefetch_rows(&ids, &mut cache, &|| false, &|id, record| {
+                if id == PREFETCH_BATCH as u32 + 39 {
+                    return Err(MetalError::Model("injected read-ahead failure".into()));
+                }
+                fake_record(id, record)
+            })
+            .is_err()
+        );
+        for id in 0..PREFETCH_BATCH as u32 {
+            assert_eq!(tag(&cache[bucket(id)]), id);
+        }
+        for &id in &ids[PREFETCH_BATCH..] {
+            assert_ne!(tag(&cache[bucket(id)]), id);
+        }
+    }
+
+    #[test]
+    fn prompt_lookahead_preserves_eos_history_and_partial_spans() {
+        let mut tokens = (0..1100).map(|i| 1000 + i as u32 * 17).collect::<Vec<_>>();
+        for i in [0, 1, 15, 511, 1023] {
+            tokens[i] = 248044;
+        }
+        let meta = (0..tokens.len())
+            .flat_map(|i| [0, i as u32, 0, tokens.len() as u32])
+            .collect::<Vec<_>>();
+        let all = hash_rows(&tokens, &meta, &[248044, 248044]).unwrap();
+        for start in [0, 1, 2, 3, 14, 15, 16, 17, 510, 511, 512, 513, 1024, 1100] {
+            for count in [0, 1, 13, 127, LOOKAHEAD_ROWS] {
+                let count = count.min(tokens.len() - start);
+                assert_eq!(
+                    prompt_lookahead(&tokens, start, count).unwrap(),
+                    all[start * 16..(start + count) * 16]
+                );
+            }
+        }
+        assert!(prompt_lookahead(&tokens, usize::MAX, 1).is_err());
+        assert!(prompt_lookahead(&tokens, tokens.len(), 1).is_err());
+        assert!(prompt_lookahead(&tokens, 0, LOOKAHEAD_ROWS + 1).is_err());
+    }
+
+    #[test]
+    #[ignore = "local checkpoint descriptors; verify compressed read-ahead never touches GPU staging"]
+    fn paged_ple_lookahead_exact_bytes_and_staging_isolation() {
+        let source = mlx::Source::open(std::path::Path::new(
+            &std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap(),
+        ))
+        .unwrap();
+        let d = MetalDevice::new(Some(16 << 20)).unwrap();
+        let mut table = PagedTable::new(&d, &source, 512).unwrap();
+        let tokens = (0..512).map(|i| 1000 + i).collect::<Vec<_>>();
+        let rows = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| (0, i, t))
+            .collect::<Vec<_>>();
+        let plan = ple::Plan::new(&rows, &[0], 512, 1024).unwrap();
+        let history = upload(&d, &[248044, 248044]);
+        let allocated = d.allocated_bytes();
+        let count = table.staging.buffer.len() / 4;
+        unsafe { table.staging.buffer.write_u32(&vec![0xdeadbeef; count]) };
+        let ids = prompt_lookahead(&tokens, 0, tokens.len()).unwrap();
+        table.prefetch(&ids, &|| false).unwrap();
+        assert_eq!(
+            unsafe { table.staging.buffer.read_u32(count) },
+            vec![0xdeadbeef; count]
+        );
+        table.stage(&plan, &history).unwrap();
+        let warmed = unsafe { table.staging.buffer.read_u32(count) };
+        table.cache.fill([255; RECORD]);
+        table.stage(&plan, &history).unwrap();
+        assert_eq!(warmed, unsafe { table.staging.buffer.read_u32(count) });
+        assert_eq!(allocated, d.allocated_bytes());
     }
 
     #[test]

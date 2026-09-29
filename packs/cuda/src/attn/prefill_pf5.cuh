@@ -2307,7 +2307,7 @@ static int pd_attn_prefill_f16_paged_impl(
     if (head_dim != 256u && head_dim != 64u && head_dim != 512u && head_dim != 128u)
         return cudaErrorInvalidValue;
     // fp8 caches: the v3w (hd512 8:1) and v3s (hd256 2:1) tiles convert at
-    // staging, the v4 qwen35 arm (hd256, G in {4,6,8}) expands raw e4m3
+    // staging, the v4 hd256 arm (qwen35 G in {4,6,8}, Flash-Next G=12) expands raw e4m3
     // tiles in-kernel, the v4 granite/laguna/muse/paddleocr arm (hd128, G in
     // {4,6,8,9,16}) does the same, and the v4 gpt-oss arm (hd64, G=8)
     // too; every other f16-fragment tile requires half in memory
@@ -2316,7 +2316,7 @@ static int pd_attn_prefill_f16_paged_impl(
         && !(head_dim == 256u && n_heads == 2u * n_kv_heads && (n_kv_heads & 3u) == 0u)
         && !(head_dim == 256u
              && (n_heads == 4u * n_kv_heads || n_heads == 6u * n_kv_heads
-                 || n_heads == 8u * n_kv_heads))
+                 || n_heads == 8u * n_kv_heads || n_heads == 12u * n_kv_heads))
         && !(head_dim == 128u
              && (n_heads == 4u * n_kv_heads || n_heads == 6u * n_kv_heads
                  || n_heads == 8u * n_kv_heads || n_heads == 9u * n_kv_heads
@@ -2814,9 +2814,12 @@ static int pd_attn_prefill_f16_paged_impl(
     // exact smem attrs - a shared latch is the deltanet/core.cuh x2_optin trap.
     if (head_dim == 256u
         && (n_heads == 4u * n_kv_heads || n_heads == 6u * n_kv_heads
-            || n_heads == 8u * n_kv_heads)) {
+            || n_heads == 8u * n_kv_heads || n_heads == 12u * n_kv_heads)) {
         const bool f8v4 = kv_dtype == PD_KV_FP8_E4M3;
         const uint32_t g_ = n_heads / n_kv_heads;
+        // pf7 / pf7rp are instantiated for qwen35's groups only; G=12
+        // (Flash-Next, 24q/2kv) takes the v4 arm below for both dtypes
+        const bool g468 = g_ == 4u || g_ == 6u || g_ == 8u;
         // pf7: fa2-class register-resident tile, the fp8 election above the
         // v4 PIPE arm (attention front - see the kernel's comment
         // for the class rationale and proto ladder). Kill: PADDOCK_NO_PF7
@@ -2827,7 +2830,7 @@ static int pd_attn_prefill_f16_paged_impl(
         // bytes in the same mma order; word-compare gated in the proto),
         // -5..-21% across the ladder legs. Kill: PADDOCK_NO_PF7RP -> pf7.
         static const bool no_rp = pd_env("PADDOCK_NO_PF7RP") != nullptr;
-        if (f8v4 && !no_pf7 && !no_rp && !no_v4s) {
+        if (f8v4 && g468 && !no_pf7 && !no_rp && !no_v4s) {
             // Q and pane 64 x 264 halves, raw K/V 64 x 256 B (the per-row
             // positions ride the pane - see the kernel)
             constexpr uint32_t RPSM = 2u * 64u * 264u * 2u + 2u * 64u * 256u;
@@ -2857,7 +2860,7 @@ static int pd_attn_prefill_f16_paged_impl(
                 return pd_launch_status();
             }
         }
-        if (f8v4 && !no_pf7 && !no_v4s) {
+        if (f8v4 && g468 && !no_pf7 && !no_v4s) {
             constexpr uint32_t P7SM = 64u * 264u * 2u + 3u * 64u * 272u + 256u;
             static int p7cap = -1;
             if (p7cap < 0) {
@@ -2903,8 +2906,8 @@ static int pd_attn_prefill_f16_paged_impl(
         }
         if (!no_v4s) {
         constexpr uint32_t V4TK = 16u;
-        const uint32_t v4mr = g_ == 6u ? 48u : 64u;
-        const uint32_t v4tq = v4mr / g_;  // 16 rows/CTA at G=4, 8 at G=6/G=8
+        const uint32_t v4mr = (g_ == 6u || g_ == 12u) ? 48u : 64u;
+        const uint32_t v4tq = v4mr / g_;  // 16 rows/CTA at G=4, 8 at G=6/G=8, 4 at G=12
         const uint32_t rowe = 256u + 8u, ts4 = V4TK + 8u;
         // f8 arms add the raw e4m3 stage region (2 bufs x K,V x TK x 256B)
         auto v4q_smem = [&](uint32_t mr, uint32_t tq, bool f8) {
@@ -2948,9 +2951,26 @@ static int pd_attn_prefill_f16_paged_impl(
                     (const void*)pd_attn_prefill_f16_v4_kernel<256u, 8u, V4TK, __nv_fp8_e4m3>,
                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                     (int)v4q_smem(64u, 8u, true));
+                cudaFuncSetAttribute(
+                    (const void*)pd_attn_prefill_f16_v4_kernel<256u, 12u, V4TK>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    (int)v4q_smem(48u, 4u, false));
+                cudaFuncSetAttribute(
+                    (const void*)pd_attn_prefill_f16_v4_kernel<256u, 12u, V4TK, __nv_fp8_e4m3>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    (int)v4q_smem(48u, 4u, true));
                 a4q = true;
             }
             dim3 g4q(n_kv_heads, (batch + v4tq - 1u) / v4tq);
+            // batched-runs arm (a registered run table, grid.z over runs):
+            // Flash-Next's multi-slot walks - prefill waves, mixed ticks,
+            // verify rounds - in one launch, each CTA re-aimed at its run
+            const uint32_t* r4q = nullptr;
+            if (pd_pf_runs_offs != nullptr) {
+                g4q = dim3(n_kv_heads,
+                           (pd_pf_runs_maxn + v4tq - 1u) / v4tq, pd_pf_runs_n);
+                r4q = (const uint32_t*)pd_pf_runs_offs;
+            }
 #define PD_PFV4Q_LAUNCH(GV, KVT_)                                              \
     pd_attn_prefill_f16_v4_kernel<256u, GV, V4TK, KVT_>                        \
         <<<g4q, 256, smem, (cudaStream_t)stream>>>(                            \
@@ -2958,14 +2978,16 @@ static int pd_attn_prefill_f16_paged_impl(
             (const float*)sinks, (float*)out, (const unsigned int*)positions,  \
             (const uint32_t*)block_tables, blocks_per_slot,                    \
             (const unsigned int*)slots, n_heads, kv_dim, swa_window, batch,    \
-            scale, nullptr, wp)
+            scale, r4q, wp)
             if (f8v4) {
                 if (g_ == 4u) PD_PFV4Q_LAUNCH(4u, __nv_fp8_e4m3);
                 else if (g_ == 6u) PD_PFV4Q_LAUNCH(6u, __nv_fp8_e4m3);
+                else if (g_ == 12u) PD_PFV4Q_LAUNCH(12u, __nv_fp8_e4m3);
                 else PD_PFV4Q_LAUNCH(8u, __nv_fp8_e4m3);
             } else {
                 if (g_ == 4u) PD_PFV4Q_LAUNCH(4u, __half);
                 else if (g_ == 6u) PD_PFV4Q_LAUNCH(6u, __half);
+                else if (g_ == 12u) PD_PFV4Q_LAUNCH(12u, __half);
                 else PD_PFV4Q_LAUNCH(8u, __half);
             }
 #undef PD_PFV4Q_LAUNCH
@@ -3451,17 +3473,18 @@ static int pd_attn_prefill_f16_paged_impl(
         // v3c: the probed tile optimum of this class (TK=64/NR=64, K+V
         // co-staged; measured -35% at the churn shape). Default
         // for the geometry; PADDOCK_NO_PF_V3C reverts to v3s.
-        static const bool v3c = pd_env("PADDOCK_NO_PF_V3C") == nullptr;
-        if (v3c) {
-            static bool a3c = false;
-            if (!a3c) {
-                cudaFuncSetAttribute((const void*)pd_attn_prefill_f16_v3c_kernel<__half>,
-                                     cudaFuncAttributeMaxDynamicSharedMemorySize, PD_AF3C_SMEM);
-                // fp8 carries the Phase-75 raw cp.async stage region
-                cudaFuncSetAttribute((const void*)pd_attn_prefill_f16_v3c_kernel<__nv_fp8_e4m3>,
-                                     cudaFuncAttributeMaxDynamicSharedMemorySize, PD_AF3C_SMEM_P8);
-                a3c = true;
-            }
+        // Elected by fit, once per instantiation: pd_smem_fits counts the
+        // image's static bytes and leaves no failed call behind (the fp8
+        // arm runs 512 B under the cap - see PD_AF3C_BOUNDS); v3s where it
+        // would not fit.
+        static const bool v3c_on = pd_env("PADDOCK_NO_PF_V3C") == nullptr;
+        static const bool v3c16 = v3c_on
+            && pd_smem_fits((const void*)pd_attn_prefill_f16_v3c_kernel<__half>, PD_AF3C_SMEM);
+        // fp8 carries the Phase-75 raw cp.async stage region
+        static const bool v3c8 = v3c_on
+            && pd_smem_fits((const void*)pd_attn_prefill_f16_v3c_kernel<__nv_fp8_e4m3>,
+                            PD_AF3C_SMEM_P8);
+        if (kv_dtype == PD_KV_FP8_E4M3 ? v3c8 : v3c16) {
             dim3 gc(n_kv_heads, (batch + PD_AF3C_NR - 1u) / PD_AF3C_NR);
             if (kv_dtype == PD_KV_FP8_E4M3)
                 pd_attn_prefill_f16_v3c_kernel<__nv_fp8_e4m3><<<gc, 256, PD_AF3C_SMEM_P8, (cudaStream_t)stream>>>(
@@ -3501,6 +3524,10 @@ static int pd_attn_prefill_f16_paged_impl(
         return pd_launch_status();
     }
     static const bool v3p = pd_env("PADDOCK_ATTN_PF_V3") != nullptr;
+    // No arm from here down reads a run table: under a registered one they
+    // would attend every row to the first run's slot. Refuse, so the caller
+    // takes its own multi-run fallback rather than another run's keys.
+    if (pd_pf_runs_offs != nullptr) return cudaErrorNotSupported;
     if (v3p && head_dim == 256u && n_heads == 8u * n_kv_heads && batch > 0) {
         static bool a3p = false;
         if (!a3p) {
@@ -3634,15 +3661,12 @@ static int pd_attn_prefill_f16_paged2_impl(
     }
     if (head_dim == 256u && n_heads == 2u * n_kv_heads && (n_kv_heads & 3u) == 0u
         && kv_dtype == PD_KV_FP8_E4M3) {
-        static const bool v3c16 = pd_env("PADDOCK_NO_PF_V3C") == nullptr;
+        // elected by fit, as the f32-plane entry above
+        static const bool v3c16 = pd_env("PADDOCK_NO_PF_V3C") == nullptr
+            && pd_smem_fits(
+                (const void*)pd_attn_prefill_f16_v3c_kernel<__nv_fp8_e4m3, __half, __half>,
+                PD_AF3C_SMEM_P8);
         if (v3c16) {
-            static bool a3c16 = false;
-            if (!a3c16) {
-                cudaFuncSetAttribute(
-                    (const void*)pd_attn_prefill_f16_v3c_kernel<__nv_fp8_e4m3, __half, __half>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize, PD_AF3C_SMEM_P8);
-                a3c16 = true;
-            }
             dim3 gc(n_kv_heads, (batch + PD_AF3C_NR - 1u) / PD_AF3C_NR);
             pd_attn_prefill_f16_v3c_kernel<__nv_fp8_e4m3, __half, __half>
                 <<<gc, 256, PD_AF3C_SMEM_P8, (cudaStream_t)stream>>>(

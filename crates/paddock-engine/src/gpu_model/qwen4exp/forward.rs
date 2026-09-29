@@ -762,6 +762,9 @@ struct Scratch {
     d_run_off: CudaSlice<u32>,
     d_run_len: CudaSlice<u32>,
     d_run_slot: CudaSlice<u32>,
+    /// the same runs as a prefix table, [runs + 1] row offsets: the run table
+    /// the tensor-core prefill's batched-runs arm reads (`pf_runs_register`)
+    d_run_offs: CudaSlice<u32>,
     /// per-q-tile (row0, slot) for the batched prefill attention - the
     /// single-slot twin reads `slots[0]` for every row, so a wave needs the
     /// per-tile entry
@@ -2528,6 +2531,13 @@ impl Qwen4ExpGpu {
         self.exec.upload_u32(&roff, &mut self.sc.d_run_off)?;
         self.exec.upload_u32(&rlen, &mut self.sc.d_run_len)?;
         self.exec.upload_u32(&rslot, &mut self.sc.d_run_slot)?;
+        // the runs are contiguous in walk rows, so the prefix table is each
+        // run's first row and the last run's end
+        if let Some(last) = seq.last() {
+            let mut offs = roff.clone();
+            offs.push((last.off + last.len) as u32);
+            self.exec.upload_u32(&offs, &mut self.sc.d_run_offs)?;
+        }
         for li in 0..self.cfg.n_layer {
             if let Some(ple) = self.layers[li].ple.as_ref() {
                 match ple.table.as_ref() {
@@ -5502,6 +5512,27 @@ fn attn_pass(
     };
     if sparse {
         // the QSA output is in d_attn, where the dense kernels would put it
+    } else if matches!(phase, Phase::PrefillRuns) && stage.row_exact {
+        // A decode-exact verify walk: every row is a decode tick's row - one
+        // query at its own position against its slot's keys, its K/V
+        // appended above - so the decode attention's own dispatch covers
+        // them, and each row's output is the one the tick computes (the
+        // dense planes are row-exact the same way). Rows of one slot repeat
+        // its slot; the decode kernels take every row independently.
+        attn_core(
+            e,
+            c,
+            sc,
+            kc,
+            vc,
+            max_ctx,
+            tab,
+            bps,
+            n,
+            Phase::DecodeBatch,
+            &[],
+            scale,
+        )?;
     } else if matches!(phase, Phase::PrefillRuns) && lead > 0 {
         // A mixed walk: the decode rows lead, one per slot at its own
         // position, so the decode attention's dispatch (the class a decode
@@ -5633,6 +5664,48 @@ fn attn_core(
             // run silently attends to the first run's cache. Measured before the
             // fix: run 0 exact, runs 1 and 2 off by 0.66-0.79 logits with the
             // grouped MoE lane off, i.e. not a numeric-class artefact.
+            // Every run in ONE tensor-core launch: the paged dispatcher's hd256
+            // v4 arm at G=12 (pack >= 0.25; older bodies send G=12 to a tile
+            // that ignores a run table) behind the walk's run table, grid.z
+            // over runs, each CTA re-aimed at its run - K/V staged once per
+            // (kv head, 4-token tile) for all 12 q heads, HMMA for S and PV, O
+            // in f32. The single-slot walk takes the same arm, so a prompt
+            // attends through the same arithmetic in a wave, a chunked span or
+            // alone (bench/attn_prefill_runs_q4x_gb10_bench.cu: a 3 x 1300-row
+            // wave 27.0 -> 2.5 ms a layer, 2 x 512 mixed spans 13.6 -> 1.2).
+            // The registration is process state in the pack: armed for this
+            // one call, disarmed whatever it returned.
+            Phase::PrefillRuns
+                if hd == 256
+                    && super::attn_pf16_enabled()
+                    && e.pack_version() >= [0, 25, 0]
+                    && e.kernels_pf_runs_available()
+                    && e.has_attn_prefill_f16_paged() =>
+            {
+                let maxn = runs.iter().map(|r| r.len).max().unwrap_or(0);
+                e.pf_runs_register(Some((&sc.d_run_offs, runs.len() as u32, maxn as u32)))?;
+                let walked = e.attn_prefill_f16_paged(
+                    &sc.d_qn,
+                    kc,
+                    vc,
+                    &sc.d_sinks,
+                    &mut sc.d_attn,
+                    &sc.d_pos,
+                    &sc.d_slots,
+                    tab,
+                    bps,
+                    nh,
+                    nkv,
+                    hd,
+                    kv_dim,
+                    0,
+                    n,
+                    scale,
+                    KV(),
+                );
+                e.pf_runs_register(None)?;
+                walked?
+            }
             Phase::PrefillRuns => {
                 // the tile table is staged once per walk (`stage_inputs_runs`);
                 // a tile that spills past its run's end is masked row by row
@@ -5661,19 +5734,21 @@ fn attn_core(
                     KV(),
                 )?
             }
-            // The f16 tensor-core prefill (P6i, `pd_attn_prefill_f16`) for a
-            // 256-wide head on the fp16 pool: S = QK^T and O += VP on f16 WMMA
-            // fragments loaded straight from the cache, 32 queries a block, 64
-            // keys a tile. The tiled f32 walk below stages every K/V tile per
-            // (q head, 16-query tile) block - 12 q heads re-reading each kv
-            // head's bytes - and dots 16 keys over 32 lanes.
-            // bench/attn_prefill_q4x_gb10_bench.cu (24q / 2kv, 1024 rows): 4.83
-            // -> 0.65 ms a layer. A numerics CLASS change (f16 O accumulate,
-            // max |d| 1e-3 on the bench's outputs), judged by the golden;
+            // The tensor-core prefill for a 256-wide head: the paged
+            // dispatcher's v4 arm at G=12 on pack >= 0.25 (f16 or e4m3 pool,
+            // K/V staged once per kv head for all 12 q heads, O in f32 - the
+            // multi-run walks take the same arm, see above), P6i's WMMA tile on
+            // an older body (f16 only: S and O on f16 fragments loaded straight
+            // from the cache). The tiled f32 walk below stages every K/V tile
+            // per (q head, 16-query tile) block - 12 q heads re-reading each kv
+            // head's bytes - and dots 16 keys over 32 lanes: 2048 fresh rows
+            // 21.7 ms a layer against v4's 1.9 and the WMMA tile's 2.2
+            // (bench/attn_prefill_runs_q4x_gb10_bench.cu). A numerics CLASS
+            // change against it (f16 Q/K/V inputs), judged by the golden;
             // `PADDOCK_Q38FN_ATTN_PF16=0` is the A/B.
             Phase::Prefill
                 if hd == 256
-                    && KV() == KvDtype::Fp16
+                    && (KV() == KvDtype::Fp16 || e.pack_version() >= [0, 25, 0])
                     && super::attn_pf16_enabled()
                     && e.has_attn_prefill_f16_paged() =>
             {
@@ -7360,6 +7435,7 @@ impl Scratch {
             d_run_off: e.alloc_u32(slots.max(1))?,
             d_run_len: e.alloc_u32(slots.max(1))?,
             d_run_slot: e.alloc_u32(slots.max(1))?,
+            d_run_offs: e.alloc_u32(slots.max(1) + 1)?,
             d_tile_row0: e.alloc_u32(t / PD_APF_TQ + slots.max(1) + 1)?,
             d_tile_slot: e.alloc_u32(t / PD_APF_TQ + slots.max(1) + 1)?,
             d_pkey: e.alloc(t * hw)?,
@@ -7407,10 +7483,21 @@ fn q4x_gen_err(e: GpuModelError) -> crate::generator::GenError {
 use crate::generator::{RowSample, SampledStep};
 
 impl crate::generator::Generator for Qwen4ExpGpu {
+    fn release_idle_memory(&mut self) {
+        self.exec.trim_mem_pool();
+    }
+
     /// The resident-weight line `/api/stats` publishes and the catalog's
     /// shape generator measures from (see `weights_mem_bytes` above).
     fn weights_mem_bytes(&self) -> Option<u64> {
         Self::weights_mem_bytes(self)
+    }
+
+    /// The live mempool counter every family publishes as its device ledger
+    /// (`/api/stats` `model_mem`): without it the manager had nothing to
+    /// reconcile this lane's NVML figure against.
+    fn device_mem_used(&self) -> Option<u64> {
+        self.exec.process_mem_used()
     }
 
     fn reply_pin(&mut self, slot: usize) {

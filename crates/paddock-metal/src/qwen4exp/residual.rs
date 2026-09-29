@@ -12,6 +12,12 @@ pub(super) const WIDTH: usize = 2560;
 pub(super) const WIDE: usize = WIDTH * 4;
 const LOW: usize = 320;
 pub(super) const EPS: f32 = 1e-6;
+#[cfg(test)]
+thread_local! {
+    pub(super) static HC_VECTOR_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    pub(super) static HC_UP_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    pub(super) static HC_COMBINE_NORM_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
 
 pub(super) fn load_weight(
     d: &MetalDevice,
@@ -163,8 +169,73 @@ impl HyperConnection {
     pub(super) fn encode(&self, cmd: &Commands<'_>, h: &Buffer, s: &Workspace, rows: usize) {
         assert!(rows > 0 && rows <= s.rows && h.len() >= rows * WIDE * 4);
         norm(cmd, h, &self.norm, &s.norm, rows);
+        self.encode_normalized(cmd, s, rows);
+    }
+
+    /// Consume the previous block's injection before this HC overwrites it.
+    /// No deferred residual state escapes the call: both H and norm are written.
+    pub(super) fn normalize_after(
+        &self,
+        cmd: &Commands<'_>,
+        h: &Buffer,
+        delta: &Buffer,
+        s: &Workspace,
+        rows: usize,
+    ) -> bool {
+        #[cfg(test)]
+        let enabled = HC_COMBINE_NORM_FOR_TEST.with(|v| v.get());
+        #[cfg(not(test))]
+        let enabled = true;
+        if !enabled || !cmd.tensor_accelerated() || self.norm.ty != mlx::FOLDED_NORM {
+            return false;
+        }
+        assert!(
+            rows > 0
+                && rows <= s.rows
+                && h.len() >= rows * WIDE * 4
+                && delta.len() >= rows * WIDTH * 4
+        );
+        cmd.dispatch(
+            "q4b_hc_combine_norm",
+            &[h, delta, &s.inject, &self.norm.buffer, &s.norm],
+            &[WIDTH as u32, 4, EPS.to_bits()],
+            [4, rows, 1],
+            256,
+        );
+        true
+    }
+
+    pub(super) fn encode_normalized(&self, cmd: &Commands<'_>, s: &Workspace, rows: usize) {
+        assert!(rows > 0 && rows <= s.rows);
         let mlx = affine::is_affine(self.down.ty);
-        if rows > 8 && !mlx {
+        #[cfg(test)]
+        let fused = HC_VECTOR_FOR_TEST.with(|v| v.get());
+        #[cfg(not(test))]
+        let fused = true;
+        let fused = fused
+            && cmd.tensor_accelerated()
+            && cmd.independent_rows()
+            && rows <= 8
+            && (self.down.ty, self.down.k, self.down.n) == (affine::A4G32, WIDE, LOW)
+            && self
+                .inject
+                .as_ref()
+                .is_some_and(|w| (w.ty, w.k, w.n) == (affine::A4G32, WIDE, 4));
+        if fused {
+            cmd.dispatch(
+                "q4a_hc_down_vector",
+                &[
+                    &self.down.buffer,
+                    &self.inject.as_ref().expect("checked injection").buffer,
+                    &s.norm,
+                    &s.low,
+                    &s.inject,
+                ],
+                &[rows as u32],
+                [42, rows, 1],
+                64,
+            );
+        } else if rows > 8 && !mlx {
             // N=320 gives only 10..40 prefill tiles at our serving sizes.
             // Split the long reduction to occupy the GPU. The 32 partial
             // planes fit exactly in the existing gate buffer (320*32=WIDE),
@@ -189,26 +260,47 @@ impl HyperConnection {
         } else {
             project(cmd, &self.down, &s.norm, &s.low, rows);
         }
-        cmd.dispatch(
-            if mlx {
-                "q4b_scale_silu"
-            } else {
-                "q4x_scale_silu"
-            },
-            &[&s.low],
-            &[(rows * LOW) as u32],
-            [(rows * LOW).div_ceil(256), 1, 1],
-            256,
-        );
-        project(cmd, &self.up, &s.low, &s.gate, rows);
-        cmd.dispatch(
-            if mlx { "q4b_hc_mix" } else { "q4x_hc_mix" },
-            &[&s.norm, &s.gate, &s.mixed],
-            &[WIDTH as u32, rows as u32],
-            [(rows * WIDTH).div_ceil(256), 1, 1],
-            256,
-        );
-        if let Some(w) = &self.inject {
+        if !fused {
+            cmd.dispatch(
+                if mlx {
+                    "q4b_scale_silu"
+                } else {
+                    "q4x_scale_silu"
+                },
+                &[&s.low],
+                &[(rows * LOW) as u32],
+                [(rows * LOW).div_ceil(256), 1, 1],
+                256,
+            );
+        }
+        #[cfg(test)]
+        let fused_up = HC_UP_FOR_TEST.with(|v| v.get());
+        #[cfg(not(test))]
+        let fused_up = true;
+        let fused_up = fused_up
+            && cmd.tensor_accelerated()
+            && cmd.independent_rows()
+            && rows <= 8
+            && (self.up.ty, self.up.k, self.up.n) == (affine::A4G32, LOW, WIDE);
+        if fused_up {
+            cmd.dispatch(
+                "q4a_hc_up_mix_vector",
+                &[&self.up.buffer, &s.low, &s.norm, &s.gate, &s.mixed],
+                &[rows as u32],
+                [WIDTH / 4, rows, 1],
+                128,
+            );
+        } else {
+            project(cmd, &self.up, &s.low, &s.gate, rows);
+            cmd.dispatch(
+                if mlx { "q4b_hc_mix" } else { "q4x_hc_mix" },
+                &[&s.norm, &s.gate, &s.mixed],
+                &[WIDTH as u32, rows as u32],
+                [(rows * WIDTH).div_ceil(256), 1, 1],
+                256,
+            );
+        }
+        if !fused && let Some(w) = &self.inject {
             if mlx {
                 project(cmd, w, &s.norm, &s.inject, rows);
                 cmd.dispatch(

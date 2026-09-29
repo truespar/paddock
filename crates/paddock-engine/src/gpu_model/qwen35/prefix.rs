@@ -486,28 +486,13 @@ impl GpuQwen35 {
     /// llama-position. Returns the last row's logits and the total row count
     /// (the engine's KV position for this slot).
     ///
-    /// Prefix-cached like the text path - see
-    /// [`Self::forward_prefill_slot_mm_encoded`].
-    pub fn forward_prefill_slot_mm(
-        &mut self,
-        slot: usize,
-        chunks: &[crate::service::MmChunk],
-    ) -> Result<(Vec<f32>, usize), GpuModelError> {
-        if self.vision.is_none() {
-            return Err(GpuModelError::Unsupported(
-                "qwen35 was loaded without an mmproj - configure `mmproj` to enable image input"
-                    .into(),
-            ));
-        }
-        // owned VisionOutputs (cache-served or freshly encoded), so the borrow
-        // ends before the &mut self prefill work below
-        let images = self.encode_all_images(chunks)?;
-        self.forward_prefill_slot_mm_encoded(slot, chunks, images)
-    }
-
-    /// The slot mm prefill with the vision outputs already encoded - the seam
-    /// the batched multi-request encode feeds (one tower pass for the whole
-    /// admission wave, then per-slot prefills consume their outputs here).
+    /// PICTURES ARE ENCODED PER PASS. The layout needs only each picture's
+    /// grid, which the resize target gives without the tower, so a picture is
+    /// encoded (or borrowed from the picture store) when the pass that splices
+    /// it comes up and released when that pass ends. A prompt's pictures are
+    /// never all resident at once - a document of page images used to hold
+    /// every page's embeddings, twice, through its whole first prefill - and a
+    /// resumed prompt never encodes the pictures its adopted pages cover.
     ///
     /// PREFIX CACHED, keyed on content rather than on row
     /// tokens: `build_mm_layout` gives every image row the same `0` placeholder
@@ -529,17 +514,16 @@ impl GpuQwen35 {
     /// attention bound pointing at the span's last row, so a cut landing inside
     /// a picture has gemma4v's non-causal hazard; `cut_outside_image_spans`
     /// makes such a cut - and therefore such a resume - unreachable.
-    pub fn forward_prefill_slot_mm_encoded(
+    pub fn forward_prefill_slot_mm(
         &mut self,
         slot: usize,
         chunks: &[crate::service::MmChunk],
-        images: Vec<crate::gpu_model::qwen35::vision::VisionOutput>,
     ) -> Result<(Vec<f32>, usize), GpuModelError> {
         assert!(self.batch.is_some(), "enable_batch first");
         assert!(slot < self.batch.as_ref().expect("batch").max_batch);
         // token ids (image spans are `0` placeholders), the mRoPE grid, and the
         // equal-t image visibility bound - one ordered walk, any number of images
-        let grids: Vec<(usize, usize)> = images.iter().map(|v| (v.nx, v.ny)).collect();
+        let grids = self.picture_grids(chunks)?;
         let lay = build_mm_layout(chunks, &grids)?;
         let t_len = lay.t_len;
         assert!(t_len > 0);
@@ -552,6 +536,13 @@ impl GpuQwen35 {
         let keys = mm_radix_keys(&lay, &mm_image_hashes(chunks));
         let img_spans: Vec<(usize, usize)> =
             lay.splices.iter().map(|&(off, n)| (off, off + n)).collect();
+        let sources: Vec<(&[u8], usize, usize)> = chunks
+            .iter()
+            .filter_map(|c| match c {
+                crate::service::MmChunk::Image { rgb, w, h } => Some((rgb.as_slice(), *w, *h)),
+                _ => None,
+            })
+            .collect();
 
         // Same admission shape as the text path: match + restore, then grow the
         // table to cover the whole prompt. `start` is a block-aligned row count
@@ -570,17 +561,39 @@ impl GpuQwen35 {
             self.ensure_slot_blocks(slot, t_len - 1)?;
         }
 
-        // Prefill [start, t_len) in spans that end at the checkpoint cuts, so
+        // Prefill [start, t_len) in passes that end at the checkpoint cuts, so
         // the DeltaNet state can be snapshotted at each boundary before the
-        // following rows advance it - the paged text tail's shape exactly.
+        // following rows advance it - the paged text tail's shape exactly -
+        // and at most one planned prefill chunk apart, so no pass outgrows
+        // the serving scratch (`mm_pass_ends`).
         let cuts = self.mm_ckpt_cuts(t_len, start, &img_spans);
+        let passes = crate::gpu_model::prefix_cache::mm_pass_ends(
+            start,
+            t_len,
+            &cuts,
+            &img_spans,
+            self.prefill_chunk_rows,
+        );
         let mut pos = start;
-        for c in cuts {
-            self.mm_prefill_span(slot, &lay, &images, pos, c)?;
-            self.mm_prefix_publish(slot, &keys, c, true)?;
-            pos = c;
+        let mut logits = Vec::new();
+        for (end, checkpoint) in passes {
+            // exactly the pictures this pass splices (the cut rule keeps each
+            // one whole inside a single pass), released when it ends
+            let need: Vec<usize> = (0..img_spans.len())
+                .filter(|&k| img_spans[k].0 >= pos && img_spans[k].1 <= end)
+                .collect();
+            let got =
+                self.encode_pictures(&need.iter().map(|&k| sources[k]).collect::<Vec<_>>())?;
+            let mut pictures: Vec<Option<super::pictures::Picture>> = vec![None; img_spans.len()];
+            for (k, p) in need.into_iter().zip(got) {
+                pictures[k] = Some(p);
+            }
+            logits = self.mm_prefill_span(slot, &lay, &pictures, pos, end)?;
+            if checkpoint {
+                self.mm_prefix_publish(slot, &keys, end, true)?;
+            }
+            pos = end;
         }
-        let logits = self.mm_prefill_span(slot, &lay, &images, pos, t_len)?;
         // cache every full page of this prompt (idempotent for those inserted
         // at a cut above) so a longer continuation resumes past the last one
         self.mm_prefix_publish(slot, &keys, t_len / BLOCK_TOKENS * BLOCK_TOKENS, false)?;
@@ -716,7 +729,7 @@ impl GpuQwen35 {
         &mut self,
         slot: usize,
         lay: &MmLayout,
-        images: &[crate::gpu_model::qwen35::vision::VisionOutput],
+        images: &[Option<super::pictures::Picture>],
         a: usize,
         b: usize,
     ) -> Result<Vec<f32>, GpuModelError> {
@@ -824,7 +837,10 @@ impl GpuQwen35 {
                 "image rows [{off}, {}) straddle the prefill span [{a}, {b})",
                 off + n
             );
-            exec.copy_region(&images[k].embd, 0, &mut sc.d_x, (off - a) * embd, n * embd)?;
+            let picture = images[k]
+                .as_ref()
+                .expect("a pass's pictures are encoded before it runs");
+            exec.copy_region(&picture.embd, 0, &mut sc.d_x, (off - a) * embd, n * embd)?;
         }
 
         for (li, layer) in layers.iter().enumerate() {

@@ -15,6 +15,7 @@ impl FlashNext {
     ) -> Result<Self> {
         Self::memory(context, batch)?;
         let source = mlx::Source::open(path)?;
+        let markers = prompt::Markers::load(path);
         let (device, chunk, cache_bytes, scratch_bytes, prefix_entries, paged) = Self::mlx_device(
             context,
             batch,
@@ -111,6 +112,7 @@ impl FlashNext {
             prefill_rows = chunk,
             batch,
             prefix_entries,
+            message_prefix_plan = markers.is_some(),
             ple_storage = if paged {
                 "file-backed compressed rows"
             } else {
@@ -132,6 +134,7 @@ impl FlashNext {
             slots: (0..batch).map(|_| Slot::default()).collect(),
             pool: KvPool::with_blocks((pages * batch) as u32),
             prefix,
+            markers,
             pending: VecDeque::new(),
             context,
             chunk: chunk.min(MLX_CHUNK),

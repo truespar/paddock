@@ -728,7 +728,7 @@ fn flash_next_mlx_prefix_natural_generations_and_arrivals() {
             assert_eq!(
                 m.take_prefill_reused(slot),
                 if warm {
-                    prefix::cuts(prompt.len(), m.chunk)[1]
+                    m.prompt_plan(prompt).cuts()[1]
                 } else {
                     0
                 }
@@ -1445,22 +1445,261 @@ fn flash_next_mlx_projection_padding_execution_cost() {
     prefill_optimization_execution_cost(PrefillOptimization::ProjectionPadding, true);
 }
 
+#[test]
+#[ignore = "full checkpoint and memory watchdog; weight reuse exact full logits and rotated costs"]
+fn flash_next_mlx_projection_reuse_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::ProjectionReuse, false);
+}
+
+#[test]
+#[ignore = "full checkpoint and memory watchdog; long weight reuse exact full logits and rotated costs"]
+fn flash_next_mlx_projection_reuse_long_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::ProjectionReuse, true);
+}
+
+#[test]
+#[ignore = "full checkpoint and memory watchdog; attention value pitch exact full logits and costs"]
+fn flash_next_mlx_attention_value_pitch_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::AttentionValuePitch, false);
+}
+
+#[test]
+#[ignore = "full checkpoint and memory watchdog; long attention value pitch full logits and costs"]
+fn flash_next_mlx_attention_value_pitch_long_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::AttentionValuePitch, true);
+}
+
 #[derive(Clone, Copy, Debug)]
 enum PrefillOptimization {
     Staging,
     AttentionGather,
     ProjectionPadding,
+    ProjectionReuse,
+    AttentionValuePitch,
+    DirectExpert,
+    ExpertRows64,
+    RouterSplit,
+    CacheOnlyTail,
+    SharedInput,
+    JoinedInput,
+    VectorGateUp,
+    DecodeFusion,
+    CombineNorm,
+    DirectAttention,
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; direct contiguous attention exact vocabularies and rotated costs"]
+fn flash_next_mlx_direct_attention_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::DirectAttention, false);
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; fused residual/normalization exact vocabularies and rotated costs"]
+fn flash_next_mlx_combine_norm_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::CombineNorm, false);
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; singleton expert fusion exact vocabularies and rotated costs"]
+fn flash_next_mlx_vector_gate_up_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::VectorGateUp, false);
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; decode fusion exact vocabularies and rotated costs"]
+fn flash_next_mlx_decode_fusion_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::DecodeFusion, false);
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; cache-only terminal layer exact vocabularies and rotated costs"]
+fn flash_next_mlx_cache_only_tail_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::CacheOnlyTail, false);
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; long cache-only terminal layer exact vocabularies and rotated costs"]
+fn flash_next_mlx_cache_only_tail_long_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::CacheOnlyTail, true);
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; shared DeltaNet preparation exact vocabularies and rotated costs"]
+fn flash_next_mlx_shared_input_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::SharedInput, false);
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; long shared DeltaNet preparation exact vocabularies and rotated costs"]
+fn flash_next_mlx_shared_input_long_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::SharedInput, true);
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; joined DeltaNet projection grids with exact vocabularies and rotated costs"]
+fn flash_next_mlx_joined_input_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::JoinedInput, false);
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; long joined projection grids with exact vocabularies and rotated costs"]
+fn flash_next_mlx_joined_input_long_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::JoinedInput, true);
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; bounded PLE read-ahead under the real mixed prefill scheduler"]
+fn flash_next_mlx_lookahead_execution_cost() {
+    lookahead_execution_cost(false);
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; long bounded PLE read-ahead under the real mixed prefill scheduler"]
+fn flash_next_mlx_lookahead_long_execution_cost() {
+    lookahead_execution_cost(true);
+}
+
+fn lookahead_execution_cost(long: bool) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            forward::PLE_LOOKAHEAD_FOR_TEST.with(|v| v.set(false));
+            forward::ADAPTIVE_PLE_FOR_TEST.with(|v| v.set(true));
+        }
+    }
+    let _reset = Reset;
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+    let budget = std::env::var("PADDOCK_FLASH_NEXT_TEST_BUDGET_BYTES")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let prompt_tokens = if long { 8705 } else { 2561 };
+    let mut m = FlashNext::load(
+        Path::new(&path),
+        if long { 12288 } else { 4096 },
+        4,
+        Some(budget),
+    )
+    .unwrap();
+    let allocated = m.device.allocated_bytes();
+    for slots in [1, 4] {
+        let mut reference = None;
+        for round in 0..if long { 3 } else { 4 } {
+            for route in (0..2).map(|i| (i + round) % 2) {
+                forward::ADAPTIVE_PLE_FOR_TEST.with(|v| v.set(route == 1));
+                m.reset();
+                m.prefix.clear(&mut m.pool);
+                for slot in 0..slots {
+                    m.prefill_begin(
+                        slot,
+                        (0..prompt_tokens)
+                            .map(|p| 1000 + p + slot as u32 * 17)
+                            .collect(),
+                    )
+                    .unwrap();
+                }
+                let started = std::time::Instant::now();
+                let mut gpu = 0.;
+                let mut done = 0;
+                let mut logits = vec![Vec::new(); slots];
+                while done < slots {
+                    let (_, complete) = m.forward_mixed(&[], m.capacity).unwrap();
+                    gpu += m.last_gpu_seconds;
+                    for (slot, out, _) in complete {
+                        logits[slot].extend(out.into_iter().map(f32::to_bits));
+                        done += 1;
+                    }
+                }
+                let prefill_wall = started.elapsed().as_secs_f64();
+                let prefill_gpu = gpu;
+                for position in prompt_tokens..prompt_tokens + 16 {
+                    let rows = (0..slots)
+                        .map(|s| (s, 23 + s as u32, position))
+                        .collect::<Vec<_>>();
+                    let out = m.execute(&rows, &(0..slots).collect::<Vec<_>>()).unwrap();
+                    for (s, row) in out.chunks_exact(VOCAB).enumerate() {
+                        logits[s].extend(row.iter().map(|v| v.to_bits()));
+                    }
+                }
+                if let Some(expected) = &reference {
+                    assert!(
+                        &logits == expected,
+                        "lookahead changes vocabulary c={slots} round={round} route={route}"
+                    );
+                } else {
+                    reference = Some(logits);
+                }
+                assert_eq!(allocated, m.device.allocated_bytes());
+                eprintln!(
+                    "FLASH_LOOKAHEAD {}",
+                    serde_json::json!({"slots":slots,"round":round,"route":route,"prompt_tokens":prompt_tokens,"adaptive":true,
+                    "prefill_wall_seconds":prefill_wall,"prefill_gpu_seconds":prefill_gpu,"full_logits_exact":true,"allocated":allocated})
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "full checkpoint and memory watchdog; staged affine-8 router full logits and costs"]
+fn flash_next_mlx_router_split_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::RouterSplit, false);
+}
+
+#[test]
+#[ignore = "full checkpoint and memory watchdog; long staged affine-8 router full logits and costs"]
+fn flash_next_mlx_router_split_long_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::RouterSplit, true);
+}
+
+#[test]
+#[ignore = "full checkpoint and memory watchdog; 64-row expert exact full logits and costs"]
+fn flash_next_mlx_expert_rows64_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::ExpertRows64, false);
+}
+
+#[test]
+#[ignore = "full checkpoint and memory watchdog; long 64-row expert exact full logits and costs"]
+fn flash_next_mlx_expert_rows64_long_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::ExpertRows64, true);
+}
+
+#[test]
+#[ignore = "full checkpoint and memory watchdog; sorted expert input exact full logits and costs"]
+fn flash_next_mlx_direct_expert_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::DirectExpert, false);
+}
+
+#[test]
+#[ignore = "full checkpoint and memory watchdog; long sorted expert input exact full logits and costs"]
+fn flash_next_mlx_direct_expert_long_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::DirectExpert, true);
 }
 
 fn prefill_optimization_execution_cost(comparison: PrefillOptimization, long: bool) {
-    use super::super::{affine, qsa};
+    use super::super::{affine, moe, qsa};
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
             affine::PLAIN_SPLIT_FOR_TEST.with(|v| v.set(false));
             qsa::PADDED_ATTENTION_FOR_TEST.with(|v| v.set(true));
             qsa::GATHER_ATTENTION_FOR_TEST.with(|v| v.set(true));
+            qsa::VALUE_PITCH_FOR_TEST.with(|v| v.set(true));
+            qsa::DIRECT_RUNS_FOR_TEST.with(|v| v.set(true));
             affine::PADDED_TILES_FOR_TEST.with(|v| v.set(true));
+            affine::TILE_REUSE_FOR_TEST.with(|v| v.set(true));
+            moe::DIRECT_EXPERT_FOR_TEST.with(|v| v.set(true));
+            moe::EXPERT_ROWS64_FOR_TEST.with(|v| v.set(false));
+            super::super::residual::HC_COMBINE_NORM_FOR_TEST.with(|v| v.set(true));
+            affine::STAGED_ROUTER_FOR_TEST.with(|v| v.set(true));
+            forward::CACHE_ONLY_TAIL_FOR_TEST.with(|v| v.set(true));
+            affine::SHARED_INPUT_FOR_TEST.with(|v| v.set(false));
+            affine::JOINED_INPUT_FOR_TEST.with(|v| v.set(true));
+            affine::JOINED_SLAB_FOR_TEST.with(|v| v.set(false));
+            moe::VECTOR_GATE_UP_FOR_TEST.with(|v| v.set(true));
+            super::super::residual::HC_VECTOR_FOR_TEST.with(|v| v.set(true));
+            super::super::residual::HC_UP_FOR_TEST.with(|v| v.set(true));
         }
     }
     let _reset = Reset;
@@ -1477,15 +1716,74 @@ fn prefill_optimization_execution_cost(comparison: PrefillOptimization, long: bo
         let mut reference = None;
         let gather = matches!(comparison, PrefillOptimization::AttentionGather);
         let projection = matches!(comparison, PrefillOptimization::ProjectionPadding);
-        let routes = if gather || projection { 2 } else { 3 };
-        for round in 0..3 {
+        let reuse = matches!(comparison, PrefillOptimization::ProjectionReuse);
+        let pitch = matches!(comparison, PrefillOptimization::AttentionValuePitch);
+        let wide = matches!(comparison, PrefillOptimization::ExpertRows64);
+        let router = matches!(comparison, PrefillOptimization::RouterSplit);
+        let cache_only = matches!(comparison, PrefillOptimization::CacheOnlyTail);
+        let shared = matches!(comparison, PrefillOptimization::SharedInput);
+        let joined = matches!(comparison, PrefillOptimization::JoinedInput);
+        let fusion = matches!(comparison, PrefillOptimization::DecodeFusion);
+        let combine_norm = matches!(comparison, PrefillOptimization::CombineNorm);
+        let direct_attention = matches!(comparison, PrefillOptimization::DirectAttention);
+        let vector = fusion || matches!(comparison, PrefillOptimization::VectorGateUp);
+        let direct = direct_attention
+            || combine_norm
+            || vector
+            || joined
+            || shared
+            || cache_only
+            || router
+            || wide
+            || matches!(comparison, PrefillOptimization::DirectExpert);
+        let routes = if gather || projection || reuse || pitch || direct {
+            2
+        } else {
+            3
+        };
+        for round in 0..if joined && !long { 9 } else { 3 } {
             for index in 0..routes {
                 let route = (index + round) % routes;
-                affine::PLAIN_SPLIT_FOR_TEST.with(|v| v.set(!gather && !projection && route == 0));
-                affine::PADDED_TILES_FOR_TEST.with(|v| v.set(projection && route == 1));
-                qsa::PADDED_ATTENTION_FOR_TEST.with(|v| v.set(gather || projection || route == 2));
-                qsa::GATHER_ATTENTION_FOR_TEST
-                    .with(|v| v.set(projection || (gather && route == 1)));
+                qsa::DIRECT_RUNS_FOR_TEST.with(|v| v.set(direct_attention && route == 1));
+                super::super::residual::HC_COMBINE_NORM_FOR_TEST
+                    .with(|v| v.set(combine_norm && route == 1));
+                forward::CACHE_ONLY_TAIL_FOR_TEST.with(|v| v.set(!cache_only || route == 1));
+                affine::SHARED_INPUT_FOR_TEST.with(|v| v.set(shared && route == 1));
+                affine::JOINED_INPUT_FOR_TEST.with(|v| {
+                    v.set(direct_attention || combine_norm || vector || (joined && route == 1))
+                });
+                moe::VECTOR_GATE_UP_FOR_TEST.with(|v| v.set(!vector || route == 1));
+                super::super::residual::HC_VECTOR_FOR_TEST.with(|v| v.set(!fusion || route == 1));
+                super::super::residual::HC_UP_FOR_TEST.with(|v| v.set(!fusion || route == 1));
+                affine::STAGED_ROUTER_FOR_TEST.with(|v| v.set(!router || route == 1));
+                moe::EXPERT_ROWS64_FOR_TEST.with(|v| v.set(wide && route == 1));
+                moe::DIRECT_EXPERT_FOR_TEST.with(|v| {
+                    v.set(
+                        direct_attention
+                            || combine_norm
+                            || vector
+                            || joined
+                            || shared
+                            || cache_only
+                            || router
+                            || wide
+                            || (direct && route == 1),
+                    )
+                });
+                qsa::VALUE_PITCH_FOR_TEST.with(|v| v.set(direct || (pitch && route == 1)));
+                affine::TILE_REUSE_FOR_TEST
+                    .with(|v| v.set(direct || pitch || (reuse && route == 1)));
+                affine::PLAIN_SPLIT_FOR_TEST.with(|v| {
+                    v.set(!direct && !gather && !projection && !reuse && !pitch && route == 0)
+                });
+                affine::PADDED_TILES_FOR_TEST
+                    .with(|v| v.set(direct || pitch || reuse || (projection && route == 1)));
+                qsa::PADDED_ATTENTION_FOR_TEST.with(|v| {
+                    v.set(direct || gather || projection || reuse || pitch || route == 2)
+                });
+                qsa::GATHER_ATTENTION_FOR_TEST.with(|v| {
+                    v.set(direct || pitch || reuse || projection || (gather && route == 1))
+                });
                 m.reset();
                 m.prefix.clear(&mut m.pool);
                 let started = std::time::Instant::now();
@@ -1505,7 +1803,11 @@ fn prefill_optimization_execution_cost(comparison: PrefillOptimization, long: bo
                                 .map(move |p| (s, 1000 + p as u32 + s as u32 * 17, p as u32))
                         })
                         .collect::<Vec<_>>();
-                    let outputs = (0..slots).map(|s| (s + 1) * count - 1).collect::<Vec<_>>();
+                    let outputs = if cache_only && offset < full_tokens {
+                        Vec::new()
+                    } else {
+                        (0..slots).map(|s| (s + 1) * count - 1).collect::<Vec<_>>()
+                    };
                     logits.extend(
                         m.execute_contracts(&rows, &outputs, Some(&vec![logical; slots]))
                             .unwrap()
@@ -1542,6 +1844,7 @@ fn prefill_optimization_execution_cost(comparison: PrefillOptimization, long: bo
                     "round":round,"route":route,"prefill_gpu_seconds":prefill_gpu,
                     "gather_comparison":gather,"prompt_tokens":full_tokens+512,
                     "comparison":format!("{comparison:?}"),
+                    "warmup":joined && !long && round < 2,
                     "gpu_seconds":gpu,"wall_seconds":started.elapsed().as_secs_f64(),
                     "full_logits_exact":true,"allocated":allocated})
                 );
@@ -1581,6 +1884,125 @@ fn flash_next_mlx_prefill_stage_attribution() {
             );
             m.execute_contracts(&rows, &[], Some(&vec![logical; slots]))
                 .unwrap();
+        }
+        // Mirror the small, unequal message-boundary tails visible in the
+        // SDK trace. Their logical contracts must not be replaced by the
+        // aggregate physical row count when attributing projection cost.
+        let tail_lengths = [14, 9, 14, 12];
+        let rows = (0..slots)
+            .flat_map(|s| {
+                (2560..2560 + tail_lengths[s])
+                    .map(move |p| (s, 1000 + p as u32 + s as u32 * 17, p as u32))
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "FLASH_STAGE slots={slots} phase=message_tail rows={} logical={:?}",
+            rows.len(),
+            &tail_lengths[..slots]
+        );
+        m.execute_contracts(&rows, &[], Some(&tail_lengths[..slots]))
+            .unwrap();
+        let outputs = (0..slots).collect::<Vec<_>>();
+        for step in 0..4 {
+            let rows = (0..slots)
+                .map(|s| (s, 100 + s as u32 * 17 + step, m.slots[s].length as u32))
+                .collect::<Vec<_>>();
+            eprintln!("FLASH_STAGE slots={slots} phase=decode step={step} rows={slots}");
+            let logits = m.execute(&rows, &outputs).unwrap();
+            assert_eq!(logits.len(), slots * VOCAB);
+            assert!(logits.iter().all(|x| x.is_finite()));
+        }
+    }
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; unequal message-tail contractions, full vocabulary bits and rotated GPU costs"]
+fn flash_next_mlx_packed_message_tail_execution_cost() {
+    use super::super::affine;
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            affine::PACKED_WIDE_FOR_TEST.with(|v| v.set(true));
+        }
+    }
+    let _reset = Reset;
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+    let budget = std::env::var("PADDOCK_FLASH_NEXT_TEST_BUDGET_BYTES")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut m = FlashNext::load(Path::new(&path), 4096, 4, Some(budget)).unwrap();
+    let allocated = m.device.allocated_bytes();
+    for slots in [1, 4] {
+        let mut expected = None;
+        for round in 0..3 {
+            for index in 0..2 {
+                let packed = (index + round) % 2 == 1;
+                affine::PACKED_WIDE_FOR_TEST.with(|v| v.set(packed));
+                m.reset();
+                m.prefix.clear(&mut m.pool);
+                let step = if slots == 1 { 1024 } else { 512 };
+                for offset in (0..2048).step_by(step) {
+                    let rows = (0..slots)
+                        .flat_map(|s| {
+                            (offset..offset + step)
+                                .map(move |p| (s, 1000 + p as u32 + s as u32 * 17, p as u32))
+                        })
+                        .collect::<Vec<_>>();
+                    m.execute_contracts(&rows, &[], Some(&vec![1024; slots]))
+                        .unwrap();
+                }
+                let lengths = [12, 9, 14, 12];
+                let rows = (0..slots)
+                    .flat_map(|s| {
+                        (2048..2048 + lengths[s])
+                            .map(move |p| (s, 1000 + p as u32 + s as u32 * 17, p as u32))
+                    })
+                    .collect::<Vec<_>>();
+                let mut end = 0;
+                let outputs = lengths[..slots]
+                    .iter()
+                    .map(|n| {
+                        end += n;
+                        end - 1
+                    })
+                    .collect::<Vec<_>>();
+                let began = std::time::Instant::now();
+                let mut logits = m
+                    .execute_contracts(&rows, &outputs, Some(&lengths[..slots]))
+                    .unwrap()
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>();
+                let tail_gpu = m.last_gpu_seconds;
+                let tail_wall = began.elapsed().as_secs_f64();
+                for step in 0..8 {
+                    let rows = (0..slots)
+                        .map(|s| (s, 100 + s as u32 * 17 + step, m.slots[s].length as u32))
+                        .collect::<Vec<_>>();
+                    logits.extend(
+                        m.execute(&rows, &(0..slots).collect::<Vec<_>>())
+                            .unwrap()
+                            .into_iter()
+                            .map(f32::to_bits),
+                    );
+                }
+                if let Some(expected) = &expected {
+                    assert!(
+                        &logits == expected,
+                        "packed tail changed vocabulary: slots={slots} round={round} packed={packed}"
+                    );
+                } else {
+                    expected = Some(logits);
+                }
+                assert_eq!(m.device.allocated_bytes(), allocated);
+                eprintln!(
+                    "FLASH_PACKED_TAIL {}",
+                    serde_json::json!({"slots":slots,"round":round,
+                    "packed":packed,"tail_gpu_seconds":tail_gpu,"tail_wall_seconds":tail_wall,
+                    "rows":rows.len(),"logical_rows":&lengths[..slots],"full_logits_exact":true,"allocated":allocated})
+                );
+            }
         }
     }
 }
@@ -1793,6 +2215,218 @@ fn flash_next_mlx_canonical_prefill_diagnostic() {
 }
 
 #[test]
+#[ignore = "full checkpoint and watchdog; message-prefix full vocabularies, natural follow-ups and mixed arrivals"]
+fn flash_next_mlx_message_prefix_generations() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            forward::CACHE_ONLY_TAIL_FOR_TEST.with(|v| v.set(true));
+            super::super::affine::SHARED_INPUT_FOR_TEST.with(|v| v.set(false));
+            super::super::affine::JOINED_INPUT_FOR_TEST.with(|v| v.set(true));
+            super::super::affine::JOINED_SLAB_FOR_TEST.with(|v| v.set(false));
+            forward::PLE_LOOKAHEAD_FOR_TEST.with(|v| v.set(false));
+            forward::ADAPTIVE_PLE_FOR_TEST.with(|v| v.set(true));
+            super::super::moe::VECTOR_GATE_UP_FOR_TEST.with(|v| v.set(true));
+            super::super::residual::HC_VECTOR_FOR_TEST.with(|v| v.set(true));
+            super::super::residual::HC_UP_FOR_TEST.with(|v| v.set(true));
+            super::super::affine::PACKED_WIDE_FOR_TEST.with(|v| v.set(true));
+            super::super::residual::HC_COMBINE_NORM_FOR_TEST.with(|v| v.set(true));
+            super::super::qsa::DIRECT_RUNS_FOR_TEST.with(|v| v.set(true));
+        }
+    }
+    let _reset = Reset;
+    // Independent old full-tail cold execution remains the oracle. Both new
+    // cold and restored/mixed execution must preserve every vocabulary bit.
+    forward::CACHE_ONLY_TAIL_FOR_TEST.with(|v| v.set(false));
+    super::super::affine::SHARED_INPUT_FOR_TEST.with(|v| v.set(false));
+    super::super::affine::JOINED_INPUT_FOR_TEST.with(|v| v.set(false));
+    super::super::affine::JOINED_SLAB_FOR_TEST.with(|v| v.set(false));
+    forward::PLE_LOOKAHEAD_FOR_TEST.with(|v| v.set(false));
+    forward::ADAPTIVE_PLE_FOR_TEST.with(|v| v.set(false));
+    super::super::moe::VECTOR_GATE_UP_FOR_TEST.with(|v| v.set(false));
+    super::super::residual::HC_VECTOR_FOR_TEST.with(|v| v.set(false));
+    super::super::residual::HC_UP_FOR_TEST.with(|v| v.set(false));
+    super::super::affine::PACKED_WIDE_FOR_TEST.with(|v| v.set(false));
+    super::super::residual::HC_COMBINE_NORM_FOR_TEST.with(|v| v.set(false));
+    super::super::qsa::DIRECT_RUNS_FOR_TEST.with(|v| v.set(false));
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+    let fixtures: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(std::env::var("PADDOCK_FLASH_NEXT_PREFIX_FIXTURES").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let budget = std::env::var("PADDOCK_FLASH_NEXT_TEST_BUDGET_BYTES")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let tokenizer = paddock_tokenizer::GgufTokenizer::from_hf_dir(Path::new(&path)).unwrap();
+    let mut m = FlashNext::load(Path::new(&path), 4096, 4, Some(budget)).unwrap();
+    assert!(
+        m.markers.is_some(),
+        "the real tokenizer must elect the message plan"
+    );
+    let allocated = m.device.allocated_bytes();
+    let argmax = |logits: &[f32]| {
+        logits
+            .iter()
+            .enumerate()
+            .max_by(|(ai, a), (bi, b)| a.total_cmp(b).then_with(|| bi.cmp(ai)))
+            .unwrap()
+            .0 as u32
+    };
+    let generate = |m: &mut FlashNext, mut logits: Vec<f32>| {
+        let mut tokens = Vec::new();
+        let mut vocabularies = Vec::new();
+        for _ in 0..64 {
+            let t = argmax(&logits);
+            tokens.push(t);
+            vocabularies.push(logits);
+            if [248044, 248046].contains(&t) {
+                return (tokens, vocabularies);
+            }
+            logits = m.forward(t).unwrap();
+        }
+        panic!("natural EOS required, not a truncated parity test");
+    };
+    let mut sources = Vec::new();
+    let mut targets = Vec::new();
+    let mut expected = Vec::new();
+    for fixture in fixtures["prompts"].as_array().unwrap() {
+        let source = fixture["token_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect::<Vec<_>>();
+        m.reset();
+        m.prefix.clear(&mut m.pool);
+        let first = m.prefill(0, &source).unwrap();
+        let (reply, _) = generate(&mut m, first);
+        let mut target = source.clone();
+        target.extend(reply);
+        target.extend(tokenizer.encode("\n<|im_start|>user\nRepeat your previous answer, with no extra words.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n").unwrap());
+        m.reset();
+        m.prefix.clear(&mut m.pool);
+        let prefix = std::mem::take(&mut m.prefix);
+        let first = m.prefill(0, &target).unwrap();
+        expected.push(generate(&mut m, first));
+        m.prefix = prefix;
+        sources.push(source);
+        targets.push(target);
+    }
+    assert_eq!(sources.len(), 4);
+    forward::CACHE_ONLY_TAIL_FOR_TEST.with(|v| v.set(true));
+    for (experimental, warm) in [
+        (0, false),
+        (0, true),
+        (1, false),
+        (1, true),
+        (2, false),
+        (2, true),
+        (3, false),
+        (3, true),
+        (4, false),
+        (4, true),
+        (5, false),
+        (5, true),
+        (6, false),
+        (6, true),
+    ] {
+        super::super::affine::SHARED_INPUT_FOR_TEST.with(|v| v.set(experimental == 1));
+        forward::PLE_LOOKAHEAD_FOR_TEST.with(|v| v.set(experimental == 1));
+        forward::ADAPTIVE_PLE_FOR_TEST.with(|v| v.set(experimental >= 2));
+        super::super::affine::JOINED_INPUT_FOR_TEST.with(|v| v.set(experimental >= 2));
+        super::super::affine::JOINED_SLAB_FOR_TEST.with(|v| v.set(experimental == 3));
+        super::super::moe::VECTOR_GATE_UP_FOR_TEST.with(|v| v.set(experimental >= 4));
+        super::super::residual::HC_VECTOR_FOR_TEST.with(|v| v.set(experimental >= 4));
+        super::super::residual::HC_UP_FOR_TEST.with(|v| v.set(experimental >= 4));
+        super::super::affine::PACKED_WIDE_FOR_TEST.with(|v| v.set(experimental >= 5));
+        super::super::residual::HC_COMBINE_NORM_FOR_TEST.with(|v| v.set(experimental == 6));
+        super::super::qsa::DIRECT_RUNS_FOR_TEST.with(|v| v.set(experimental == 6));
+        m.reset();
+        m.prefix.clear(&mut m.pool);
+        if warm {
+            for (slot, source) in sources.iter().enumerate() {
+                m.prefill(slot, source).unwrap();
+            }
+        }
+        m.reset();
+        let mut actual = vec![Vec::new(); 4];
+        let mut ready = [false; 4];
+        for (slot, target) in targets.iter().enumerate().take(3) {
+            m.prefill_begin(slot, target.clone()).unwrap();
+            let reused = m.take_prefill_reused(slot);
+            if warm {
+                assert!(reused >= m.prompt_plan(&sources[slot]).cuts()[0] && reused > 0);
+            } else {
+                assert_eq!(reused, 0);
+            }
+            eprintln!("FLASH_MESSAGE_START warm={warm} slot={slot} reused={reused}");
+        }
+        for tick in 0..1024 {
+            if tick == 2 {
+                m.prefill_begin(3, targets[3].clone()).unwrap();
+                assert_eq!(m.take_prefill_reused(3) > 0, warm);
+                assert!(m.prefill_abort(3));
+                m.prefill_begin(3, targets[3].clone()).unwrap();
+            }
+            let decodes = (0..4)
+                .filter_map(|slot| {
+                    let &token = actual[slot].last()?;
+                    (ready[slot] && ![248044, 248046].contains(&token)).then_some((
+                        slot,
+                        token,
+                        m.slots[slot].length as u32,
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let (logits, complete) = m
+                .forward_mixed(&decodes, [2048, 511, 33, 13][tick % 4])
+                .unwrap();
+            for (i, &(slot, _, _)) in decodes.iter().enumerate() {
+                let row = &logits[i * VOCAB..(i + 1) * VOCAB];
+                assert!(
+                    row.iter()
+                        .map(|v| v.to_bits())
+                        .eq(expected[slot].1[actual[slot].len()]
+                            .iter()
+                            .map(|v| v.to_bits())),
+                    "follow-up decode vocabulary differs warm={warm} slot={slot}"
+                );
+                actual[slot].push(argmax(row));
+            }
+            for (slot, logits, _) in complete {
+                assert!(
+                    logits
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .eq(expected[slot].1[0].iter().map(|v| v.to_bits())),
+                    "follow-up prefill vocabulary differs warm={warm} slot={slot}"
+                );
+                actual[slot].push(argmax(&logits));
+                ready[slot] = true;
+            }
+            assert_eq!(allocated, m.device.allocated_bytes());
+            assert!(actual.iter().all(|v| v.len() <= 64));
+            if actual
+                .iter()
+                .all(|v| v.last().is_some_and(|t| [248044, 248046].contains(t)))
+            {
+                break;
+            }
+        }
+        for (got, reference) in actual.iter().zip(&expected) {
+            assert_eq!(*got, reference.0);
+        }
+        eprintln!(
+            "FLASH_MESSAGE_GENERATIONS experimental={experimental} warm={warm} exact=4/4 full_vocabularies=true natural_eos=true arrivals=true cancel=true"
+        );
+    }
+    m.reset();
+    m.prefix.clear(&mut m.pool);
+    assert_eq!(m.pool.free_blocks(), m.pool.capacity() as usize);
+}
+
+#[test]
 #[ignore = "112 GB wide-prefix generation gate; elected model, fixtures and watchdog required"]
 fn flash_next_mlx_prefix_wide_serial_generations() {
     let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
@@ -1855,7 +2489,7 @@ fn flash_next_mlx_prefix_wide_serial_generations() {
         m.reset();
         let warm = m.prefill(0, &prompt).unwrap();
         let reused = m.take_prefill_reused(0);
-        assert_eq!(reused, prefix::cuts(prompt.len(), m.chunk)[1]);
+        assert_eq!(reused, m.prompt_plan(&prompt).cuts()[1]);
         assert_eq!(warm, cold, "wide restore changed full-vocabulary logits");
         assert_eq!(
             generate(&mut m, warm),

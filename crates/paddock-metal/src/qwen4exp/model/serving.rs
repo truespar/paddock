@@ -184,16 +184,12 @@ impl Generator for FlashNext {
                     // logical boundary discards most of a grant while a
                     // neighbouring prompt could have used the spare rows.
                     let mut remaining = if mlx {
-                        logical_chunk(p.tokens.len(), p.offset, self.chunk).1
+                        self.slots[p.slot].plan.at(p.offset).1
                     } else {
                         p.tokens.len() - p.offset
                     };
                     if self.prefix.enabled() {
-                        remaining = remaining.min(prefix::rows_until_cut(
-                            p.tokens.len(),
-                            p.offset,
-                            self.chunk,
-                        ));
+                        remaining = remaining.min(self.slots[p.slot].plan.until_cut(p.offset));
                     }
                     (remaining, p.tokens.len())
                 })
@@ -208,7 +204,7 @@ impl Generator for FlashNext {
         };
         for (p, &n) in self.pending.iter().zip(&advances) {
             if mlx && n > 0 {
-                contracts.push(logical_chunk(p.tokens.len(), p.offset, self.chunk).0);
+                contracts.push(self.slots[p.slot].plan.at(p.offset).0);
             }
             for i in p.offset..p.offset + n {
                 rows.push((p.slot, p.tokens[i], i as u32));
@@ -238,7 +234,7 @@ impl Generator for FlashNext {
                 self.prefix.enabled()
                     && p.offset > 0
                     && p.offset < p.tokens.len()
-                    && prefix::cuts(p.tokens.len(), self.chunk).contains(&p.offset)
+                    && self.slots[p.slot].plan.cuts().contains(&p.offset)
             })
             .map(|p| (p.slot, p.tokens.clone()))
             .collect::<Vec<_>>();
@@ -260,6 +256,7 @@ impl Generator for FlashNext {
 
 /// (Arithmetic shape, rows before the next boundary). Prompt-only serial
 /// execution and arbitrary bounded mixed grants must use the same graph.
+#[cfg(test)]
 pub(super) fn logical_chunk(tokens: usize, offset: usize, chunk: usize) -> (usize, usize) {
     assert!(tokens > 0 && offset < tokens);
     let body = tokens - 1;

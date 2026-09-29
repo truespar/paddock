@@ -274,6 +274,7 @@ pub const OWNED_CONFIG_KEYS: &[&str] = &[
     "model",
     "catalog",
     "mmproj",
+    "vision",
     "text_encoder",
     "vae",
     "mtp",
@@ -1746,8 +1747,12 @@ impl Supervisor {
             pull: false,
             fp8_native: get_str("fp8_native").is_some(),
             // the config file speaks for itself: a file with mmproj serves
-            // vision, one without stays text-only
-            vision: None,
+            // vision, and one that says `vision = false` stays off through any
+            // re-render (None would let the render resolve the tower again)
+            vision: v
+                .get("vision")
+                .and_then(toml::Value::as_bool)
+                .filter(|on| !on),
             host: get_str("host")
                 .map(|host| host.parse().map_err(|_| "invalid endpoint bind address"))
                 .transpose()?,
@@ -1800,7 +1805,8 @@ impl Supervisor {
                 .get("model")
                 .and_then(toml::Value::as_str)
                 .map(String::from),
-            vision: v.get("mmproj").is_some() || embedded_vision,
+            vision: (v.get("mmproj").is_some() || embedded_vision)
+                && v.get("vision").and_then(toml::Value::as_bool) != Some(false),
             fp8_native: spec.fp8_native,
             model: spec.model,
             artifact: spec.artifact,
@@ -2860,6 +2866,12 @@ impl Supervisor {
         }
         if let Some(mm) = mmproj {
             t.insert("mmproj".into(), mm.display().to_string().into());
+        } else if spec.vision == Some(false) {
+            // Off has to be SAID. The runner loads a tower it finds beside the
+            // weights when the file names none, so a file that only left the
+            // mmproj line out went on serving images with the switch off - and
+            // holding memory the admission never counted.
+            t.insert("vision".into(), false.into());
         }
         // an image lane's two pieces beside its DiT (`model`); absent on every
         // other kind of model, and absent-in-render means removed
@@ -4203,6 +4215,42 @@ mod tests {
         );
         assert_eq!(sup.read_config_file(port).unwrap().0, valid);
         assert!(!sup.is_serving(port).await);
+    }
+
+    /// Vision OFF has to reach the file as `vision = false`: the runner loads
+    /// a tower it finds beside the weights whenever the file names none, so
+    /// leaving the mmproj line out served images with the switch off. The
+    /// projection and the file-derived spec must both read the off back, and
+    /// a re-render from that spec must not resolve the tower again.
+    #[tokio::test]
+    async fn vision_off_is_written_read_back_and_survives_a_re_render() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = installed_model_supervisor(dir.path(), "qwen3.5-9b", None);
+        let spec = |vision| SpawnSpec {
+            model: "qwen3.5-9b".into(),
+            artifact: Some("q8".into()),
+            vision,
+            ..Default::default()
+        };
+        let on = sup.preview_config(spec(None)).await.unwrap();
+        let v: toml::Value = toml::from_str(&on).unwrap();
+        assert!(v.get("mmproj").is_some(), "{on}");
+        assert!(v.get("vision").is_none(), "{on}");
+
+        let off = sup.preview_config(spec(Some(false))).await.unwrap();
+        let v: toml::Value = toml::from_str(&off).unwrap();
+        assert!(v.get("mmproj").is_none(), "{off}");
+        assert_eq!(v["vision"].as_bool(), Some(false), "{off}");
+
+        assert!(sup.project_config_text(&on).unwrap().vision);
+        assert!(!sup.project_config_text(&off).unwrap().vision);
+        let from_file = sup.spec_from_config_text(&off).unwrap();
+        assert_eq!(from_file.vision, Some(false));
+        assert_eq!(sup.spec_from_config_text(&on).unwrap().vision, None);
+        let again = sup.preview_config(from_file).await.unwrap();
+        let v: toml::Value = toml::from_str(&again).unwrap();
+        assert!(v.get("mmproj").is_none(), "{again}");
+        assert_eq!(v["vision"].as_bool(), Some(false), "{again}");
     }
 
     #[tokio::test]

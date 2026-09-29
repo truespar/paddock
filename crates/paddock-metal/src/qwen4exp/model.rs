@@ -13,6 +13,7 @@ use std::{collections::VecDeque, path::Path};
 mod forward;
 mod mlx_load;
 mod prefix;
+mod prompt;
 mod serving;
 #[cfg(test)]
 mod tests;
@@ -49,6 +50,7 @@ struct Slot {
     table: BlockTable,
     length: usize,
     reused: usize,
+    plan: prompt::Plan,
 }
 struct Pending {
     slot: usize,
@@ -72,6 +74,7 @@ pub struct FlashNext {
     slots: Vec<Slot>,
     pool: KvPool,
     prefix: prefix::PrefixCache,
+    markers: Option<prompt::Markers>,
     pending: VecDeque<Pending>,
     context: usize,
     chunk: usize,
@@ -164,6 +167,7 @@ impl FlashNext {
             slots: (0..batch).map(|_| Slot::default()).collect(),
             pool: KvPool::with_blocks((pages * batch) as u32),
             prefix: prefix::PrefixCache::default(),
+            markers: None,
             pending: VecDeque::new(),
             context,
             chunk: CHUNK,
@@ -225,6 +229,7 @@ impl FlashNext {
             s.table.clear(&mut self.pool);
             s.length = 0;
             s.reused = 0;
+            s.plan = prompt::Plan::default();
         }
     }
     fn prepare(&mut self, slot: usize, tokens: &[u32]) -> Result<usize> {
@@ -240,6 +245,7 @@ impl FlashNext {
             ));
         }
         self.release(slot);
+        self.slots[slot].plan = self.prompt_plan(tokens);
         let reused = self.restore_prefix(slot, tokens)?;
         self.slots[slot].reused = reused;
         Ok(reused)
@@ -251,13 +257,13 @@ impl FlashNext {
         // final prompt token. Preserve that boundary even for short prompts.
         while pos < tokens.len() {
             let (logical, mut n) = if self.is_mlx() {
-                serving::logical_chunk(tokens.len(), pos, self.chunk)
+                self.slots[slot].plan.at(pos)
             } else {
                 let n = self.chunk.min(tokens.len() - pos);
                 (n, n)
             };
             if self.prefix.enabled() {
-                n = n.min(prefix::rows_until_cut(tokens.len(), pos, self.chunk));
+                n = n.min(self.slots[slot].plan.until_cut(pos));
             }
             let rows = tokens[pos..pos + n]
                 .iter()

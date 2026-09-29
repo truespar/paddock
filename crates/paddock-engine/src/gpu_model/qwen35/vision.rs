@@ -65,6 +65,11 @@ struct Merger {
 }
 
 /// The encoded image: merged-grid embeddings ready for LLM injection.
+/// Patch rows one batched tower pass takes before it splits (a picture
+/// larger than this runs alone, at its own size): ~80 KB of activations per
+/// row on the 27B's tower, so ~0.65 GB at this width.
+pub(crate) const TOWER_PASS_ROWS: usize = 8192;
+
 pub struct VisionOutput {
     /// [n_tokens, llm_embd] device-resident image embeddings.
     pub embd: CudaSlice<f32>,
@@ -751,6 +756,46 @@ impl VisionModel {
         (w / self.patch, h / self.patch)
     }
 
+    /// The merged token grid `(nx, ny)` a `w`x`h` picture encodes to - what
+    /// `encode` will report, known from the resize target alone, so a prompt's
+    /// layout can be built before any of its pictures is encoded.
+    pub fn merged_grid(&self, w: usize, h: usize) -> (usize, usize) {
+        let (tw, th) = smart_resize_target(w, h, self.patch, self.budget);
+        let (pw, ph) = self.patch_grid(tw, th);
+        (pw / 2, ph / 2)
+    }
+
+    /// Device bytes one `encode_batch` pass over `rows` patch rows allocates,
+    /// by the same arithmetic the pass allocates with: the patch upload,
+    /// positions and position embeddings, the seven `embd`-wide activation
+    /// planes, the FFN plane and the f16 staging plane, then the merger's two
+    /// planes and the per-picture outputs it hands back (plus DeepStack's
+    /// streams where the tower has taps). The plan reserves this for the
+    /// largest pass the tower can be asked for, since the pass allocates on
+    /// demand and hands everything back when it ends.
+    pub fn pass_bytes(&self, rows: usize) -> u64 {
+        let e = self.embd;
+        let ffn = self.blocks[0].up_w.dims[1];
+        let k_in = self.patch_w0.dims[0];
+        let (mid, out) = (self.mm0.dims[1], self.mm2.dims[1]);
+        let n4 = rows / 4;
+        let stage = (rows * ffn.max(e).max(k_in)).max(n4 * self.mm0.dims[0].max(mid));
+        let f32s = rows * (k_in + e + 7 * e + ffn) + n4 * (mid + 2 * out);
+        let taps = self.deepstack.len();
+        let deepstack = if taps == 0 {
+            0
+        } else {
+            let widest = self
+                .deepstack
+                .iter()
+                .map(|(_, m)| m.fc1.dims[1])
+                .max()
+                .unwrap_or(0);
+            taps * n4 * out + n4 * (widest + out)
+        };
+        (4 * (f32s + deepstack) + 4 * 4 * rows + 2 * stage) as u64
+    }
+
     /// Full llama.cpp-b9895 `dyn_size` preprocessing for an arbitrary-size RGB
     /// image: smart-resize target, aspect-preserving bilinear with black
     /// letterbox (PAD_CEIL), then mean/std normalization. Returns the planar
@@ -770,6 +815,26 @@ impl VisionModel {
             max_tokens: (self.budget.max_pixels as u64 / per_token) as u32,
             min_tokens: (self.budget.min_pixels as u64 / per_token) as u32,
         }
+    }
+
+    /// Cap one picture at `tokens` merged tokens by lowering the pixel budget
+    /// smart-resize serves at (and so the budget every API surface reports).
+    /// Returns `(was, now)` in tokens when it lowered it.
+    ///
+    /// The batched lane prefills a picture's rows in ONE pass - they attend to
+    /// the picture's last row - so a picture longer than the planned prefill
+    /// pass would regrow the serving scratch past the plan. Qwen's spec allows
+    /// 16384 tokens (16.8 MP); the 27B's planned 8192-row pass still takes
+    /// twice llama.cpp's 4096 cap, and a `detail: auto` picture is 4096.
+    pub fn cap_image_tokens(&mut self, tokens: usize) -> Option<(usize, usize)> {
+        let per_token = (self.patch * 2) * (self.patch * 2);
+        let was = self.budget.max_pixels / per_token;
+        if tokens >= was {
+            return None;
+        }
+        self.budget.max_pixels = tokens * per_token;
+        self.budget.min_pixels = self.budget.min_pixels.min(self.budget.max_pixels);
+        Some((was, tokens))
     }
 
     pub fn preprocess_rgb(&self, rgb: &[u8], w: usize, h: usize) -> (Vec<f32>, usize, usize) {

@@ -666,6 +666,17 @@ fn gen_err(e: GpuModelError) -> crate::generator::GenError {
 ///   the parity reference. The deepseek-ocr Generator arm, minus spec (no
 ///   drafter exists for this family - no spec legs ever).
 impl crate::generator::Generator for GpuPaddleOcrVl {
+    /// The live mempool counter every family publishes as its device ledger
+    /// (`/api/stats` `model_mem`): without it the manager had nothing to
+    /// reconcile this model's NVML figure against.
+    fn device_mem_used(&self) -> Option<u64> {
+        self.exec.process_mem_used()
+    }
+
+    fn release_idle_memory(&mut self) {
+        self.exec.trim_mem_pool();
+    }
+
     fn reset(&mut self) {
         self.reset_decode();
         if let Some(bs) = self.batch.as_mut() {

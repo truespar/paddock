@@ -2450,6 +2450,14 @@ __global__ void pd_attn_decode_v7_kernel(
         __syncthreads();
     }
     __syncthreads();
+    // FIN at one split, the v8 family's contract: o / l straight into the
+    // combined batch-major rows (with -inf sinks that IS the combine's math,
+    // bit-identical) and no m/l. The engine's wide decode passes n_splits ==
+    // 1 with no combine pass behind it, and the launcher elects this arm by
+    // fit wherever v8ks's smem does not fit (every 99 KB die) - so every arm
+    // it can elect has to finalize, or the rows land unnormalized and in the
+    // partial layout.
+    const bool fin = n_splits == 1u;
     if (warp < NW_V) {
         const uint32_t n_base_w = warp * SLICE;
         #pragma unroll
@@ -2458,16 +2466,22 @@ __global__ void pd_attn_decode_v7_kernel(
             for (uint32_t half = 0; half < 2u; ++half) {
                 const uint32_t rr = (lane >> 2) + half * 8u;
                 if (rr >= G) continue;
-                const size_t pidx =
-                    ((size_t)(kvh * G + rr) * gridDim.y + b) * n_splits + sp;
-                float* dst = out_o + pidx * HD + n_base_w + sub * 8u
+                const size_t row = fin
+                    ? (size_t)b * n_heads + kvh * G + rr
+                    : ((size_t)(kvh * G + rr) * gridDim.y + b) * n_splits + sp;
+                float* dst = out_o + row * HD + n_base_w + sub * 8u
                            + 2u * (lane & 3u);
-                dst[0] = o_acc[sub][half * 2u];
-                dst[1] = o_acc[sub][half * 2u + 1u];
+                if (fin) {
+                    dst[0] = o_acc[sub][half * 2u] / s_l[rr];
+                    dst[1] = o_acc[sub][half * 2u + 1u] / s_l[rr];
+                } else {
+                    dst[0] = o_acc[sub][half * 2u];
+                    dst[1] = o_acc[sub][half * 2u + 1u];
+                }
             }
         }
     }
-    if (d < G) {
+    if (!fin && d < G) {
         const size_t pidx = ((size_t)(kvh * G + d) * gridDim.y + b) * n_splits + sp;
         out_ml[pidx * 2 + 0] = s_m[d];
         out_ml[pidx * 2 + 1] = s_l[d];
@@ -2738,6 +2752,14 @@ __global__ void pd_attn_decode_v7ks_kernel(
         __syncthreads();
     }
     __syncthreads();
+    // FIN at one split, the v8 family's contract: o / l straight into the
+    // combined batch-major rows (with -inf sinks that IS the combine's math,
+    // bit-identical) and no m/l. The engine's wide decode passes n_splits ==
+    // 1 with no combine pass behind it, and the launcher elects this arm by
+    // fit wherever v8ks's smem does not fit (every 99 KB die) - so every arm
+    // it can elect has to finalize, or the rows land unnormalized and in the
+    // partial layout.
+    const bool fin = n_splits == 1u;
     if (warp < NW_V) {
         const uint32_t n_base_w = warp * SLICE;
         #pragma unroll
@@ -2746,16 +2768,22 @@ __global__ void pd_attn_decode_v7ks_kernel(
             for (uint32_t half = 0; half < 2u; ++half) {
                 const uint32_t rr = (lane >> 2) + half * 8u;
                 if (rr >= G) continue;
-                const size_t pidx =
-                    ((size_t)(kvh * G + rr) * gridDim.y + b) * n_splits + sp;
-                float* dst = out_o + pidx * HD + n_base_w + sub * 8u
+                const size_t row = fin
+                    ? (size_t)b * n_heads + kvh * G + rr
+                    : ((size_t)(kvh * G + rr) * gridDim.y + b) * n_splits + sp;
+                float* dst = out_o + row * HD + n_base_w + sub * 8u
                            + 2u * (lane & 3u);
-                dst[0] = o_acc[sub][half * 2u];
-                dst[1] = o_acc[sub][half * 2u + 1u];
+                if (fin) {
+                    dst[0] = o_acc[sub][half * 2u] / s_l[rr];
+                    dst[1] = o_acc[sub][half * 2u + 1u] / s_l[rr];
+                } else {
+                    dst[0] = o_acc[sub][half * 2u];
+                    dst[1] = o_acc[sub][half * 2u + 1u];
+                }
             }
         }
     }
-    if (d < G) {
+    if (!fin && d < G) {
         const size_t pidx = ((size_t)(kvh * G + d) * gridDim.y + b) * n_splits + sp;
         out_ml[pidx * 2 + 0] = s_m[d];
         out_ml[pidx * 2 + 1] = s_l[d];

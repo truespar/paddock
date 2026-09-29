@@ -33,7 +33,7 @@
 use std::io::IsTerminal;
 use std::path::Path;
 
-/// Rotate at startup when the existing log is already this big.
+/// Rotate when the log reaches this size - at startup, and while running.
 ///
 /// Size, not per-run: the RUNNER logs rotate per serving generation because a
 /// port gets reused by a different model and mixing their lifetimes is
@@ -44,7 +44,84 @@ use std::path::Path;
 ///
 /// Two files, never more. A log directory that grows without limit is the
 /// thing being fixed; a numbered series just fixes it more slowly.
+///
+/// "Months of normal operation" assumed the log is only written by normal
+/// operation. A manager that stays up for weeks, or a condition it reports
+/// every sample, grows it past the cap between starts - so the file copy
+/// rotates as it writes, not only when the process begins.
 const ROTATE_AT: u64 = 8 * 1024 * 1024;
+
+/// The file copy's writer: appends, and once a write takes the file past
+/// `rotate_at` moves it aside by the same two-file rule as `rotate_if_large`.
+/// A rename that fails (a live tail on Windows) leaves it appending to the
+/// same file, and the next attempt waits for another eighth of the cap
+/// rather than retrying on every line.
+struct RotatingFile {
+    path: std::path::PathBuf,
+    file: Option<std::fs::File>,
+    len: u64,
+    next_check: u64,
+    rotate_at: u64,
+}
+
+impl RotatingFile {
+    fn open(path: &Path, rotate_at: u64) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        Ok(Self {
+            path: path.to_path_buf(),
+            file: Some(file),
+            len,
+            next_check: rotate_at,
+            rotate_at,
+        })
+    }
+
+    fn rotate(&mut self) {
+        self.file = None; // closed, so the rename is allowed everywhere it can be
+        rotate_if_large_at(&self.path, self.rotate_at);
+        self.file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .ok();
+        self.len = self
+            .file
+            .as_ref()
+            .and_then(|f| f.metadata().ok())
+            .map_or(0, |m| m.len());
+        // rotated: the cap again; the rename failed: a little more of the same file
+        self.next_check = if self.len < self.rotate_at {
+            self.rotate_at
+        } else {
+            self.len + self.rotate_at / 8
+        };
+    }
+}
+
+impl std::io::Write for RotatingFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.len >= self.next_check {
+            self.rotate();
+        }
+        match self.file.as_mut() {
+            Some(f) => {
+                let n = f.write(buf)?;
+                self.len += n as u64;
+                Ok(n)
+            }
+            // the file could not be reopened: the terminal copy still has it
+            None => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.as_mut().map_or(Ok(()), std::io::Write::flush)
+    }
+}
 
 /// Install the process-wide subscriber.
 ///
@@ -64,11 +141,7 @@ pub fn init(tee: Option<&Path>) {
             let _ = std::fs::create_dir_all(dir);
         }
         rotate_if_large(path);
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
+        match RotatingFile::open(path, ROTATE_AT) {
             Ok(f) => Some(
                 tracing_subscriber::fmt::layer()
                     .with_ansi(false)
@@ -110,10 +183,14 @@ pub fn init(tee: Option<&Path>) {
 /// start, so every error here is swallowed deliberately - same call the runner's
 /// per-generation rotation already makes.
 fn rotate_if_large(path: &Path) {
+    rotate_if_large_at(path, ROTATE_AT);
+}
+
+fn rotate_if_large_at(path: &Path, rotate_at: u64) {
     let Ok(meta) = std::fs::metadata(path) else {
         return; // no file yet: nothing to rotate
     };
-    if meta.len() < ROTATE_AT {
+    if meta.len() < rotate_at {
         return;
     }
     let prev = path.with_extension("prev.log");
@@ -124,6 +201,32 @@ fn rotate_if_large(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_running_log_rotates_at_the_cap_and_keeps_two_files() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("pd-log-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("m.log");
+        let mut w = RotatingFile::open(&path, 1000).expect("open");
+        let line = [b'a'; 100];
+        for _ in 0..25 {
+            w.write_all(&line).expect("write");
+        }
+        let cur = std::fs::metadata(&path).expect("current").len();
+        let prev = std::fs::metadata(path.with_extension("prev.log"))
+            .expect("the full file moved aside")
+            .len();
+        assert!(cur < 1000, "the live file restarted below the cap ({cur})");
+        assert!(
+            prev >= 1000,
+            "the file moved aside is the one that hit the cap ({prev})"
+        );
+        let files = std::fs::read_dir(&dir).expect("ls").count();
+        assert_eq!(files, 2, "two files, never more");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_small_log_is_left_alone() {

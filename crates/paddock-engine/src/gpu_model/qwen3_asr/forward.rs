@@ -639,6 +639,17 @@ impl GpuQwen3Asr {
 }
 
 impl Generator for GpuQwen3Asr {
+    /// The live mempool counter every family publishes as its device ledger
+    /// (`/api/stats` `model_mem`): without it the manager had nothing to
+    /// reconcile this model's NVML figure against.
+    fn device_mem_used(&self) -> Option<u64> {
+        self.exec.process_mem_used()
+    }
+
+    fn release_idle_memory(&mut self) {
+        self.exec.trim_mem_pool();
+    }
+
     fn reset(&mut self) {
         if let Some(ds) = self.decode.as_mut() {
             ds.pos = 0;

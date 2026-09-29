@@ -123,6 +123,67 @@ pub fn cut_outside_image_spans(mut cut: usize, img_spans: &[(usize, usize)]) -> 
     cut
 }
 
+/// Where a multimodal prefill of rows `[start, t_len)` ends each pass, and
+/// whether that end is one of the `ckpt` cuts (snapshot + publish there).
+///
+/// Text prompts reach the engine in scheduler chunks; a prompt carrying a
+/// picture used to be prefilled from its start to its first checkpoint cut in
+/// ONE pass, and the checkpoint cuts sit at the prompt's last page
+/// boundaries - so the pass was the whole prompt. The shared prefill scratch
+/// is planned for `pass` rows, and every longer pass regrew it to the prompt's
+/// length and kept it: measured on qwen3.8-27B, an 18K-row picture prompt
+/// took the scratch from 6.4 to 13.4 GB for the rest of the runner's life, and
+/// the regrowth briefly held both. So passes end at most `pass` rows apart as
+/// well as at the checkpoint cuts.
+///
+/// A pass may never end strictly inside a picture - its rows attend to the
+/// picture's last row, which must be in the same pass - so an end that lands
+/// inside one walks back to the picture's start (not to a page boundary: this
+/// is a pass cut, not a checkpoint, and a page-aligned walk could land before
+/// the pass even began). A picture longer than `pass` cannot be split at all
+/// and runs as its own pass; the serving lane caps one picture's tokens at the
+/// planned pass so that stays unreachable, but the rule is total without it.
+///
+/// `ckpt` must hold cuts outside every picture (`cut_outside_image_spans`),
+/// and `start` must not lie inside one (it is 0 or a checkpoint position).
+pub fn mm_pass_ends(
+    start: usize,
+    t_len: usize,
+    ckpt: &[usize],
+    img_spans: &[(usize, usize)],
+    pass: usize,
+) -> Vec<(usize, bool)> {
+    let pass = pass.max(1);
+    let mut out = Vec::new();
+    let mut a = start;
+    while a < t_len {
+        let next_ckpt = ckpt.iter().copied().filter(|&c| c > a && c < t_len).min();
+        let hard = next_ckpt.unwrap_or(t_len);
+        let end = if hard - a <= pass {
+            hard
+        } else {
+            let mut t = a + pass;
+            for &(s, e) in img_spans.iter().rev() {
+                if t > s && t < e {
+                    t = s;
+                }
+            }
+            if t > a {
+                t
+            } else {
+                // a picture starts at `a` and outruns one pass: it goes whole
+                img_spans
+                    .iter()
+                    .find(|&&(s, e)| s <= a && a < e)
+                    .map_or(hard, |&(_, e)| e.min(hard))
+            }
+        };
+        out.push((end, next_ckpt == Some(end)));
+        a = end;
+    }
+    out
+}
+
 #[cfg(test)]
 mod span_tests {
     use super::{BLOCK_TOKENS, cut_outside_image_spans as cut_outside};
@@ -246,6 +307,130 @@ mod margin_tests {
     fn a_tiny_pool_gets_no_margin() {
         for cap in 0..4 {
             assert_eq!(evict_ahead_margin(2048, cap), 0, "capacity {cap}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod pass_tests {
+    use super::mm_pass_ends;
+
+    /// Walk the plan and check the invariants every caller relies on: passes
+    /// tile [start, t_len) in order, none is longer than `pass` unless it is
+    /// exactly one oversized picture, none ends inside a picture, and every
+    /// checkpoint cut is a pass end flagged as such.
+    fn check(start: usize, t_len: usize, ckpt: &[usize], spans: &[(usize, usize)], pass: usize) {
+        let plan = mm_pass_ends(start, t_len, ckpt, spans, pass);
+        let mut a = start;
+        for &(end, is_ckpt) in &plan {
+            assert!(end > a, "pass [{a}, {end}) is empty or backwards");
+            let oversized_picture = spans.iter().any(|&(s, e)| s == a && e == end);
+            assert!(
+                end - a <= pass || oversized_picture,
+                "pass [{a}, {end}) is {} rows over a {pass}-row plan",
+                end - a
+            );
+            for &(s, e) in spans {
+                assert!(
+                    !(end > s && end < e),
+                    "pass end {end} inside picture [{s}, {e})"
+                );
+            }
+            assert_eq!(is_ckpt, ckpt.contains(&end), "ckpt flag wrong at {end}");
+            a = end;
+        }
+        assert_eq!(a, t_len, "the plan stops short of the prompt");
+        for &c in ckpt {
+            if c > start && c < t_len {
+                assert!(plan.iter().any(|&(e, k)| e == c && k), "ckpt cut {c} lost");
+            }
+        }
+    }
+
+    /// The measured case: ~14K text rows then a 4096-row picture then the
+    /// question. One pass used to cover everything up to the checkpoint cuts.
+    #[test]
+    fn a_long_document_with_a_picture_runs_in_planned_passes() {
+        let spans = [(14_000usize, 18_096usize)];
+        let ckpt = [18_192usize, 18_208];
+        check(0, 18_243, &ckpt, &spans, 8192);
+        let plan = mm_pass_ends(0, 18_243, &ckpt, &spans, 8192);
+        assert!(plan.iter().all(|&(e, _)| e <= 18_243));
+        assert!(plan.len() >= 3, "{plan:?}");
+    }
+
+    /// An end landing inside a picture walks back to the picture's start, and
+    /// the picture then rides whole in the next pass.
+    #[test]
+    fn a_pass_end_inside_a_picture_moves_to_its_start() {
+        let spans = [(6000usize, 10_096usize)];
+        let plan = mm_pass_ends(0, 12_000, &[], &spans, 8192);
+        assert_eq!(plan[0], (6000, false));
+        assert_eq!(plan[1], (12_000, false));
+        check(0, 12_000, &[], &spans, 8192);
+    }
+
+    /// Pictures back to back: stepping out of one must not strand the end in
+    /// the one before it.
+    #[test]
+    fn adjacent_pictures_split_between_them() {
+        let spans = [
+            (100usize, 4196usize),
+            (4196usize, 8292usize),
+            (8292usize, 12_388usize),
+        ];
+        check(0, 12_500, &[], &spans, 8192);
+        check(0, 12_500, &[], &spans, 4096);
+    }
+
+    /// A picture longer than a pass cannot be split; it runs alone and the
+    /// text around it still chunks.
+    #[test]
+    fn an_oversized_picture_runs_as_its_own_pass() {
+        let spans = [(3000usize, 19_384usize)];
+        let plan = mm_pass_ends(0, 30_000, &[], &spans, 8192);
+        assert_eq!(plan[0], (3000, false));
+        assert_eq!(plan[1], (19_384, false));
+        check(0, 30_000, &[], &spans, 8192);
+    }
+
+    /// A resumed prompt starts at its checkpoint and a short tail is one pass;
+    /// a text-only or short prompt is exactly the old cut walk.
+    #[test]
+    fn short_tails_and_short_prompts_are_unchanged() {
+        assert_eq!(
+            mm_pass_ends(4096, 4200, &[], &[(0, 4000)], 8192),
+            vec![(4200, false)]
+        );
+        assert_eq!(
+            mm_pass_ends(0, 5000, &[4960, 4976], &[(16, 4112)], 8192),
+            vec![(4960, true), (4976, true), (5000, false)]
+        );
+        check(0, 5000, &[4960, 4976], &[(16, 4112)], 8192);
+    }
+
+    /// Exhaustive sweep over small shapes so an off-by-one at any boundary
+    /// shows up here rather than as a wrong answer.
+    #[test]
+    fn invariants_hold_across_a_sweep() {
+        for pass in [7usize, 16, 33] {
+            for t_len in [1usize, 15, 64, 97] {
+                for s in (0..t_len).step_by(9) {
+                    for len in [1usize, 5, 20, 40] {
+                        let e = (s + len).min(t_len);
+                        if e <= s {
+                            continue;
+                        }
+                        let spans = [(s, e)];
+                        let ckpt: Vec<usize> = [t_len / 2, t_len.saturating_sub(3)]
+                            .into_iter()
+                            .map(|c| super::cut_outside_image_spans(c, &spans))
+                            .filter(|&c| c > 0 && c < t_len && (c <= s || c >= e))
+                            .collect();
+                        check(0, t_len, &ckpt, &spans, pass);
+                    }
+                }
+            }
         }
     }
 }

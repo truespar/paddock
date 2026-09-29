@@ -490,8 +490,12 @@ fn attn_prefill_matches_decode_batch() {
     };
     for dt in KV_DTYPES {
         // (16, 4, 256) is the real qwen35-9B full-attn shape; (16, 8, 128) covers
-        // the HD=128 instantiation
-        for (n_heads, n_kv_heads, head_dim) in [(16usize, 4usize, 256usize), (16, 8, 128)] {
+        // the HD=128 instantiation; (16, 2, 512) is gemma4's global layer, the
+        // one whose tile sits 384 B under the 99 KB opt-in cap - it was refused
+        // on sm_121a while its window floors were static shared (pd_apf_smem)
+        for (n_heads, n_kv_heads, head_dim) in
+            [(16usize, 4usize, 256usize), (16, 8, 128), (16, 2, 512)]
+        {
             let kv_dim = n_kv_heads * head_dim;
             let scale = 1.0 / (head_dim as f32).sqrt();
             let max_ctx = 512usize;
@@ -1303,6 +1307,243 @@ fn attn_partial_batch_paged_bitwise_matches_dense_body() {
     }
 }
 
+/// gemma4's two decode geometries through the paged FlashDecoding entry - the
+/// hd512 G8 global layer and the hd256 G2 sliding one, both KV classes -
+/// against the plain f32 decode walk over the same bytes (identity block
+/// table, so the pool overlays the dense cache).
+///
+/// Nothing ran these shapes through this entry, and two things were wrong
+/// there on GB10. The hd512 f16 arm the launcher elected (v8ks) needs more
+/// shared memory than a 99 KB die has, so every call was refused; and its
+/// unchecked attribute set failed the first launch of the arm that ran
+/// instead. Now the arm is elected by fit - and since the one that fits
+/// (v7ks) did not finalize, the one-split contract gemma4's wide decode
+/// relies on (`fin1_ok`: o / l straight into the combined rows, no combine
+/// pass) is checked here too, on the geometries that claim it.
+#[test]
+fn gemma4_paged_decode_matches_the_f32_walk() {
+    let Some(exec) = common::gpu() else {
+        return;
+    };
+    if !exec.has_attn_partial_batch_paged() {
+        eprintln!("pack has no paged FlashDecoding partial - skipping");
+        return;
+    }
+    // the in-kernel finalize is the TMA walks' (cc >= 9), as fin1_ok says
+    let fin_dies = exec.compute_capability().0 >= 9;
+    let max_ctx = 2048usize;
+    let bps = max_ctx / 16;
+    let batch = 16usize;
+    // rows spread over the context: short, mid, past the 1024 window, full
+    let positions: Vec<u32> = (0..batch as u32).map(|b| (37 + 131 * b) % 2048).collect();
+    let d_pos = exec.stream.clone_htod(&positions).expect("pos");
+    let bt_host: Vec<u32> = (0..(batch * bps) as u32).collect();
+    let d_bt = exec.stream.clone_htod(&bt_host).expect("bt");
+    for dt in KV_DTYPES {
+        for (n_heads, n_kv_heads, head_dim, window) in [
+            (16usize, 2usize, 512usize, 0usize),
+            (16, 8, 256, 1024),
+            (16, 8, 256, 0),
+        ] {
+            let kv_dim = n_kv_heads * head_dim;
+            let qdim = n_heads * head_dim;
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let q = det(batch * qdim, 7);
+            let d_q = exec.to_device(&q).expect("q");
+            // the tensor-core arms stage Q at the cache's width (f16, or e4m3
+            // on the fp8 arms); the reference walks the same rounded Q
+            let d_q_ref = exec.to_device(&kv_round(&q, dt)).expect("q ref");
+            let d_k = kv_dev_u8(&exec, &det(batch * max_ctx * kv_dim, 107), dt);
+            let d_v = kv_dev_u8(&exec, &det(batch * max_ctx * kv_dim, 207), dt);
+            let d_sinks = exec
+                .to_device(&vec![f32::NEG_INFINITY; n_heads])
+                .expect("sinks");
+            let mut d_ref = exec.alloc(batch * qdim).expect("ref");
+            exec.attn_decode_batch(
+                &d_q_ref, &d_k, &d_v, &d_sinks, &mut d_ref, &d_pos, None, n_heads, n_kv_heads,
+                head_dim, max_ctx, kv_dim, window, batch, scale, dt,
+            )
+            .expect("f32 walk");
+            let reference = exec.to_host(&d_ref).expect("dtoh ref");
+            let peak = reference.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            // one split is checked where the engine relies on it (fin1_ok's
+            // geometries, which finalize); the fp8 hd512 arm finalizes there
+            // too, but nothing passes it one split, so it is not pinned here
+            let fin_geometry = fin_dies && (head_dim == 256 || dt == KvDtype::Fp16);
+            for n_splits in [1usize, 3] {
+                if n_splits == 1 && !fin_geometry {
+                    continue;
+                }
+                let fin = n_splits == 1;
+                let mut d_o = exec
+                    .to_device(&vec![f32::NAN; n_heads * batch * n_splits * head_dim])
+                    .expect("o");
+                let mut d_ml = exec
+                    .to_device(&vec![f32::NAN; n_heads * batch * n_splits * 2])
+                    .expect("ml");
+                exec.attn_partial_batch_paged(
+                    &d_q, &d_k, &d_v, &mut d_o, &mut d_ml, &d_pos, None, &d_bt, bps, n_heads,
+                    n_kv_heads, head_dim, kv_dim, window, n_splits, batch, scale, dt,
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "{dt:?} hd{head_dim} G{} splits {n_splits}: {e:?}",
+                        n_heads / n_kv_heads
+                    )
+                });
+                let got = if fin {
+                    exec.to_host(&d_o).expect("dtoh fin")
+                } else {
+                    let mut d_out = exec.alloc(batch * qdim).expect("out");
+                    exec.attn_combine_batch(
+                        &d_o, &d_ml, &d_sinks, &mut d_out, n_heads, head_dim, n_splits, batch,
+                    )
+                    .expect("combine");
+                    exec.to_host(&d_out).expect("dtoh out")
+                };
+                let got = &got[..batch * qdim];
+                let maxd =
+                    reference
+                        .iter()
+                        .zip(got)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(
+                            0.0f32,
+                            |m, d| if d.is_nan() { f32::INFINITY } else { m.max(d) },
+                        );
+                let rel = maxd / peak.max(1e-6);
+                eprintln!(
+                    "{dt:?} hd{head_dim} G{} window {window} splits {n_splits}{}: max_abs {maxd:.2e} \
+                     (rel {rel:.2e} of peak {peak:.3})",
+                    n_heads / n_kv_heads,
+                    if fin { " FIN" } else { "" }
+                );
+                // class gates, against a wrong row being O(peak) (an
+                // unnormalized FIN, the partial layout read as final, an
+                // unwritten row - NaN - fails outright). f16: the tensor-core
+                // walks stage Q/K/V/P at f16, 1.7-1.9e-4 of peak on GB10.
+                // fp8: P is rounded to e4m3 before PV (the class the
+                // v9q test measures against its own exact walk), 2.1-2.4e-2
+                // of peak here (3.3-3.9e-3 abs) whatever the Q rounding.
+                let tol = if dt == KvDtype::Fp16 { 2e-3 } else { 5e-2 };
+                assert!(
+                    rel < tol,
+                    "{dt:?} hd{head_dim} window {window} splits {n_splits}: rel {rel:.3e} past the class gate {tol:e}"
+                );
+            }
+        }
+    }
+}
+
+/// gemma4's sliding-window prefill geometry (16 q / 8 kv heads of 256: G2,
+/// n_kv % 4 == 0) through the two paged entries its forward uses - f32 q/out
+/// planes, and the a16 attention streams' f16 ones - against the f32 tiled
+/// walk over the same bytes. With an fp8 cache that geometry is v3c's, the
+/// default SWA prefill under KV8, and nothing tested it: its launch sat
+/// EXACTLY on the 99 KB opt-in cap in the sm_121a image (512 B of static
+/// window bounds, padded to 1 KB there). The bounds live in the dynamic tail
+/// now and the launchers elect it by fit. An f16 cache takes the WMMA tile
+/// on the f32 entry; the a16 entry's arm here is fp8-only.
+#[test]
+fn gemma4_swa_prefill_matches_the_f32_walk() {
+    let Some(exec) = common::gpu() else {
+        return;
+    };
+    let (n_heads, n_kv_heads, head_dim) = (16usize, 8usize, 256usize);
+    let kv_dim = n_kv_heads * head_dim;
+    let qdim = n_heads * head_dim;
+    let max_ctx = 2048usize;
+    let bps = max_ctx / 16;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    // a 300-row chunk resumed at 1500: past the 1024 window, several key
+    // tiles, and a ragged last row block
+    let (base, rows) = (1500usize, 300usize);
+    let positions: Vec<u32> = (base..base + rows).map(|p| p as u32).collect();
+    let d_pos = exec.stream.clone_htod(&positions).expect("pos");
+    let d_slots = exec.stream.clone_htod(&vec![0u32; rows]).expect("slots");
+    let bt: Vec<u32> = (0..bps as u32).collect();
+    let d_bt = exec.stream.clone_htod(&bt).expect("bt");
+    let d_sinks = exec
+        .to_device(&vec![f32::NEG_INFINITY; n_heads])
+        .expect("sinks");
+    // the tensor-core arms take Q at f16 (scale is a power of two here, so
+    // rounding before or after it is the same); the walk reads the same Q
+    let q = f16_round(&det(rows * qdim, 31));
+    let d_q = exec.to_device(&q).expect("q");
+    let d_q16 = f16_plane(&exec, &q);
+    for dt in KV_DTYPES {
+        let d_k = kv_dev_u8(&exec, &det(max_ctx * kv_dim, 131), dt);
+        let d_v = kv_dev_u8(&exec, &det(max_ctx * kv_dim, 231), dt);
+        for window in [1024usize, 0] {
+            let mut d_ref = exec.alloc(rows * qdim).expect("ref");
+            exec.attn_prefill(
+                &d_q, &d_k, &d_v, &d_sinks, &mut d_ref, &d_pos, &d_slots, n_heads, n_kv_heads,
+                head_dim, max_ctx, kv_dim, window, rows, scale, dt,
+            )
+            .expect("f32 walk");
+            let reference = exec.to_host(&d_ref).expect("dtoh ref");
+            let peak = reference.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            let judge = |got: &[f32], what: &str, tol: f32| {
+                let maxd =
+                    reference
+                        .iter()
+                        .zip(got)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(
+                            0.0f32,
+                            |m, d| if d.is_nan() { f32::INFINITY } else { m.max(d) },
+                        );
+                let rel = maxd / peak.max(1e-6);
+                eprintln!(
+                    "{dt:?} window {window} {what}: max_abs {maxd:.2e} (rel {rel:.2e} of peak {peak:.3})"
+                );
+                assert!(
+                    rel < tol,
+                    "{dt:?} window {window} {what}: rel {rel:.3e} past the class gate {tol:e}"
+                );
+            };
+            let mut d_out = exec.to_device(&vec![f32::NAN; rows * qdim]).expect("out");
+            exec.attn_prefill_f16_rows_paged(
+                &d_q, &d_k, &d_v, &d_sinks, &mut d_out, &d_pos, None, &d_slots, &d_bt, bps,
+                n_heads, n_kv_heads, head_dim, kv_dim, window, 0, rows, scale, dt,
+            )
+            .unwrap_or_else(|e| panic!("{dt:?} window {window} f32 planes: {e:?}"));
+            // K/V staged at f16 (exact from either cache), f32 scores, the
+            // tile's online-max regrouping: 2.2-2.3e-4 of peak on GB10. A
+            // wrong window or a mislaid row is O(peak).
+            judge(&exec.to_host(&d_out).expect("dtoh"), "f32 planes", 2e-3);
+            if dt == KvDtype::Fp8E4m3 {
+                let mut d_out16 = f16_plane(&exec, &vec![f32::NAN; rows * qdim]);
+                exec.attn_prefill_f16_rows_paged_a16(
+                    &d_q16,
+                    &d_k,
+                    &d_v,
+                    &d_sinks,
+                    &mut d_out16,
+                    &d_pos,
+                    None,
+                    &d_slots,
+                    &d_bt,
+                    bps,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    kv_dim,
+                    window,
+                    0,
+                    rows,
+                    scale,
+                    dt,
+                )
+                .unwrap_or_else(|e| panic!("{dt:?} window {window} a16 planes: {e:?}"));
+                // plus the f16 rounding of the stored output: 4.1-4.8e-4
+                let got = f16_unplane(&exec.to_host(&d_out16).expect("dtoh a16"), rows * qdim);
+                judge(&got, "a16 planes", 2e-3);
+            }
+        }
+    }
+}
+
 /// The v9q fp8 decode arm (fp8 KV, hd128, G4, batch >= 2 - granite) against
 /// a reference of its class: Q*scale cast to e4m3, f32 scores, online softmax
 /// over 32-key supertiles aligned to 16-token blocks from the split's first
@@ -1528,8 +1769,9 @@ fn cpu_attn_p8(
 /// (pd_attn_prefill). Single-slot (all rows share slot 0). With a contiguous
 /// identity block table the pool overlays the dense cache, so paged must be
 /// BITWISE == dense - proving the paged prefill addressing. Covers the qwen35
-/// full-attn shape (hd 256) and the hd 128 instantiation, T multiple/non-
-/// multiple of the query tile, and a sliding window. Only runs on a P4b pack.
+/// full-attn shape (hd 256), the hd 128 instantiation and gemma4's global
+/// layer (hd 512, the near-cap tile), T multiple/non-multiple of the query
+/// tile, and a sliding window. Only runs on a P4b pack.
 #[test]
 fn attn_prefill_paged_bitwise_matches_dense() {
     let Some(exec) = common::gpu() else {
@@ -1540,7 +1782,9 @@ fn attn_prefill_paged_bitwise_matches_dense() {
         return;
     }
     for dt in KV_DTYPES {
-        for (n_heads, n_kv_heads, head_dim) in [(16usize, 4usize, 256usize), (16, 8, 128)] {
+        for (n_heads, n_kv_heads, head_dim) in
+            [(16usize, 4usize, 256usize), (16, 8, 128), (16, 2, 512)]
+        {
             let kv_dim = n_kv_heads * head_dim;
             let scale = 1.0 / (head_dim as f32).sqrt();
             let max_ctx = 512usize;
@@ -1918,6 +2162,37 @@ fn kv_dev_u8(exec: &GpuExecutor, data: &[f32], dt: KvDtype) -> CudaSlice<u8> {
         KvDtype::Fp16 => f16_dev_u8(exec, data),
         KvDtype::Fp8E4m3 => e4m3_dev_u8(exec, data),
     }
+}
+
+/// An f16 plane in the f32-typed scratch the a16 entries take: two halves
+/// per f32 word, element i in the low half of word i/2 when i is even.
+fn f16_plane(exec: &GpuExecutor, data: &[f32]) -> CudaSlice<f32> {
+    let words: Vec<f32> = data
+        .chunks(2)
+        .map(|c| {
+            let lo = u32::from(f16::from_f32(c[0]).to_bits());
+            let hi = c
+                .get(1)
+                .map_or(0, |x| u32::from(f16::from_f32(*x).to_bits()));
+            f32::from_bits(lo | (hi << 16))
+        })
+        .collect();
+    exec.to_device(&words).expect("f16 plane")
+}
+
+/// The inverse of [`f16_plane`] on a plane read back to the host.
+fn f16_unplane(words: &[f32], n: usize) -> Vec<f32> {
+    words
+        .iter()
+        .flat_map(|w| {
+            let b = w.to_bits();
+            [
+                f16::from_bits(b as u16).to_f32(),
+                f16::from_bits((b >> 16) as u16).to_f32(),
+            ]
+        })
+        .take(n)
+        .collect()
 }
 
 /// Round an f32 slice through whichever width the cache holds - the reference

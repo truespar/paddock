@@ -606,6 +606,9 @@ impl GpuGranite {
         // own arithmetic was already budget-correct - this is the same solve,
         // moved somewhere a new family cannot forget to do it, and it reports the
         // pool's TOKEN CAPACITY rather than leaving max_ctx to imply it.
+        // image input's on-demand costs, profiled before the grant is read so
+        // the profile run's own transient is back with the driver by then
+        let vision_reserves = self.vision_reserves()?;
         let grant = self
             .exec
             .vram_headroom()
@@ -652,6 +655,7 @@ impl GpuGranite {
                         crate::kv_tier::ram_transport::device_staging_bytes(),
                     ));
                 }
+                r.extend(vision_reserves);
                 r
             },
             ..Default::default()

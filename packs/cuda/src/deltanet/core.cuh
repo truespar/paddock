@@ -180,7 +180,15 @@ static const PackInfo PD_INFO = {
     // moe/nvf4_expert.cuh) the NVFP4 gate+up GEMV with a fused swiglu - the
     // first nvf4 expert consumer here that has a gate matrix at all.
     // New segment src/qwen4exp.cuh. Pure appends.
-    { 0, 24, 0 },
+    // 0.25.0: the paged dispatcher's hd256 v4 arm takes G=12 (Flash-Next,
+    // 24q/2kv) for f16 and e4m3 pools, and wires its batched-runs arm (a
+    // registered run table, grid.z over runs) - the engine gates Flash-Next's
+    // multi-run walks on >= 0.25 (an older body's G=12 f16 launch lands on
+    // the WMMA tile, which ignores a run table and attends slot 0). The
+    // arms that cannot read a run table now refuse a registered one
+    // (cudaErrorNotSupported) instead of attending the first run's slot. No
+    // slot change.
+    { 0, 25, 0 },
 };
 
 // ---------------------------------------------------------------------------

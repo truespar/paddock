@@ -2889,8 +2889,10 @@ impl GpuGemma4 {
         // will not otherwise fit, and rebuilds this ring to match.
         let swa_span = super::forward::swa_span_initial();
         let paging = if paged {
+            // no tower yet: a picture no longer than a sub-span needs no
+            // allowance, and `enable_batch` re-sizes once the tower is known
             Some(super::batch::build_swa_paging(
-                &exec, max_ctx, swa_window, 1, swa_span,
+                &exec, max_ctx, swa_window, 1, swa_span, 0,
             )?)
         } else {
             None
@@ -3039,15 +3041,17 @@ impl GpuGemma4 {
             max_ctx,
             pf_rows,
             swa_span,
+            swa_overshoot: 0,
             pos: 0,
             n_slots: 1,
             paging,
             kv_dtype_pref: None,
             prefix: None,
             vision: None,
-            img_cache: Vec::new(),
-            img_cache_clock: 0,
-            img_cache_reused: 0,
+            // budgeted for the load-time pass until enable_batch elects one
+            pictures: crate::gpu_model::picture_store::PictureStore::new(
+                (2 * pf_rows * n_embd * std::mem::size_of::<f32>()) as u64,
+            ),
             img_beg_id,
             img_end_id,
             batch_logits: None,

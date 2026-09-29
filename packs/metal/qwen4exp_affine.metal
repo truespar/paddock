@@ -1,6 +1,7 @@
 // Original compressed-affine kernels. U32 codes, then BF16 scales, then
 // BF16 biases; offsets use 64-bit arithmetic (PLE is larger than 4 GiB).
 // This file does not alter the dense-Qwen affine/group64 implementation.
+inline float mlx_sigmoid_bf(float x);
 kernel void q4a_small(device const bfloat* x [[buffer(0)]],device float* y [[buffer(1)]],
     constant uint* p [[buffer(2)]],uint i [[thread_position_in_grid]]) {
     if(i<p[0]) {float v=float(x[i]);y[i]=p[1]==1 ? -exp(v) : p[1]==2 ? 1.0f+v : v;}
@@ -26,9 +27,9 @@ kernel void q4a_gather(device const uchar* w [[buffer(0)]],device const uint* id
 
 // Four outputs share a SIMD's activation loads. BF16 bias subtotals are
 // observable in MLX's singleton affine contraction; retain that boundary.
-template<uint bits,uint group,uint step,uint Outputs=4>
+template<uint bits,uint group,uint step,uint Outputs=4,uint Post=0>
 inline void q4a_vector_step(device const uchar* w,device const float* x,device float* y,
-    uint K,uint totalN,uint N,uint col,uint lane,ulong expert) {
+    uint K,uint totalN,uint N,uint col,uint lane,ulong expert,threadgroup float* tile=nullptr) {
     #pragma clang fp reassociate(off)
     #pragma clang fp contract(off)
     if(col>=N)return; // uniform within a SIMD; no workgroup barriers here
@@ -88,7 +89,13 @@ inline void q4a_vector_step(device const uchar* w,device const float* x,device f
     }
     for(uint c=0;c<Outputs;++c) {
         float sum=simd_sum(sums[c]);
-        if(lane==0 && col+c<N)y[col+c]=mlx_bf(sum);
+        if(lane==0 && col+c<N) {
+            float value=mlx_bf(sum);
+            if(Post==1) {value=mlx_bf(value*0.25f);value=mlx_bf(value*mlx_sigmoid_bf(value));}
+            if(Post==2)value=mlx_bf(2.0f*mlx_sigmoid_bf(mlx_bf(value*0.25f)));
+            y[col+c]=value;
+            if(Post==3)tile[c]=value;
+        }
     }
 }
 template<uint bits,uint group>
@@ -116,6 +123,46 @@ kernel void q4a_wide(device const uchar* w [[buffer(0)]],device const float* x [
     }
     sum=kquant_sum<8>(sum);if(lane==0)y[ulong(g.y)*p[1]+n]=mlx_bf(sum);
 }
+// Keep the small-prompt eight-lane contraction, but specialize the packed
+// format and hoist its group scale/bias. The generic entry above stays an
+// independent oracle: no BF16 weight staging or singleton bias sums here.
+template<uint Bits,uint Group>
+inline void q4a_wide_packed(device const uchar* w,device const float* x,device float* y,
+    constant uint* p,uint2 g,uint tid) {
+    #pragma clang fp reassociate(off)
+    constexpr uint Pack=32/Bits,Mask=(1u<<Bits)-1;
+    uint K=p[0],N=p[1],n=g.x*8+tid/8,lane=tid%8;
+    if(n>=N)return;
+    x+=ulong(p[6]+g.y)*K;y+=ulong(p[6]+g.y)*N;
+    device const uint* codes=reinterpret_cast<device const uint*>(w);
+    device const bfloat* scales=reinterpret_cast<device const bfloat*>(w+ulong(K)*N*Bits/8);
+    float sum=0;
+    for(uint base=lane*Group;base<K;base+=8*Group) {
+        ulong first=ulong(n)*K+base;
+        float scale=float(scales[first/Group]),bias=float(scales[ulong(K)*N/Group+first/Group]);
+        #pragma unroll
+        for(uint j=0;j<Group;j+=8) {
+            float sub=0;
+            #pragma unroll
+            for(uint t=0;t<8;++t) {
+                uint code=(codes[(first+j+t)/Pack]>>(((j+t)%Pack)*Bits))&Mask;
+                float value=float(code)*scale+bias;
+                sub+=x[base+j+t]*value;
+            }
+            sum+=sub;
+        }
+    }
+    sum=kquant_sum<8>(sum);if(lane==0)y[n]=mlx_bf(sum);
+}
+#define Q4A_WIDE_PACKED(Name,Bits,Group) \
+kernel void Name(device const uchar* w [[buffer(0)]],device const float* x [[buffer(1)]], \
+    device float* y [[buffer(2)]],constant uint* p [[buffer(3)]], \
+    uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) { \
+    q4a_wide_packed<Bits,Group>(w,x,y,p,g,tid); \
+}
+Q4A_WIDE_PACKED(q4a_wide4_packed,4,32)
+Q4A_WIDE_PACKED(q4a_wide8_packed,8,64)
+#undef Q4A_WIDE_PACKED
 kernel void q4a_mv(device const uchar* w [[buffer(0)]],device const float* x [[buffer(1)]],
     device float* y [[buffer(2)]],constant uint* p [[buffer(3)]],
     uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
@@ -158,12 +205,97 @@ kernel void q4a_mv4_fast2(device const uchar* w [[buffer(0)]],device const float
     q4a_vector_step<4,32,16>(w,x+ulong(g.y)*p[0],y+ulong(g.y)*p[1],
         p[0],p[1],p[1],g.x*8+tid/32*4,tid%32,0);
 }
+// Join launches, not reductions: HC down retains its 16-wide lane walk,
+// and each of the four injection outputs retains its 8-wide lane walk.
+// The post-ops have the same explicit BF16 boundaries as their old kernels.
+kernel void q4a_hc_down_vector(device const uchar* down [[buffer(0)]],device const uchar* inject [[buffer(1)]],
+    device const float* x [[buffer(2)]],device float* low [[buffer(3)]],device float* gain [[buffer(4)]],
+    constant uint* p [[buffer(5)]],uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
+    x+=ulong(g.y)*10240;
+    if(g.x<40)q4a_vector_step<4,32,16,4,1>(down,x,low+ulong(g.y)*320,10240,320,320,g.x*8+tid/32*4,tid%32,0);
+    else q4a_vector_step<4,32,8,1,2>(inject,x,gain+ulong(g.y)*4,10240,4,4,(g.x-40)*2+tid/32,tid%32,0);
+}
+// Four SIMDs own the same four coordinates in the four residual streams.
+// Preserve each up projection, then fold its rounded gate in stream order.
+// Keep the full gate plane for traces; the consumer reads the on-chip copy.
+kernel void q4a_hc_up_mix_vector(device const uchar* w [[buffer(0)]],device const float* low [[buffer(1)]],
+    device const float* norm [[buffer(2)]],device float* gate [[buffer(3)]],device float* mixed [[buffer(4)]],
+    constant uint* p [[buffer(5)]],uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
+    #pragma clang fp reassociate(off)
+    #pragma clang fp contract(off)
+    threadgroup float tile[16];uint sg=tid/32;
+    q4a_vector_step<4,32,8,4,3>(w,low+ulong(g.y)*320,gate+ulong(g.y)*10240,
+        320,10240,10240,sg*2560+g.x*4,tid%32,0,tile+sg*4);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(tid<4) {
+        uint d=g.x*4+tid;float sum=0;
+        for(uint s=0;s<4;++s)sum=mlx_bf(sum+mlx_bf(norm[ulong(g.y)*10240+s*2560+d]*mlx_sigmoid_bf(tile[s*4+tid])));
+        mixed[ulong(g.y)*2560+d]=mlx_bf(sum*0.25f);
+    }
+}
 kernel void q4a_expert_mv(device const uchar* w [[buffer(0)]],device const float* x [[buffer(1)]],
     device const uint* ids [[buffer(2)]],device float* y [[buffer(3)]],constant uint* p [[buffer(4)]],
     uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
     uint expert=ids[g.y];if(expert>=p[4])return;
     q4a_vector<4,32>(w,x+ulong(p[3] ? g.y : g.y/10)*p[0],y+ulong(g.y)*p[1],
         p[0],p[1]*p[4],p[1],g.x*16+tid/32*4,tid%32,expert);
+}
+
+// Singleton affine contracts, including the BF16 bias subtotals, are the
+// same as q4a_vector_step<4,32,16>. Share activation loads across gate/up
+// and consume their rounded results immediately. Each group owns one routed
+// or shared expert; routing order and the later weighted fold are unchanged.
+kernel void q4a_expert_gate_up_vector(device const uchar* gw [[buffer(0)]],device const uchar* uw [[buffer(1)]],
+    device const uchar* sgw [[buffer(2)]],device const uchar* suw [[buffer(3)]],
+    device const float* x [[buffer(4)]],device const uint* ids [[buffer(5)]],
+    device float* act [[buffer(6)]],device float* shared_act [[buffer(7)]],constant uint* p [[buffer(8)]],
+    uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],
+    uint2 nt [[threads_per_threadgroup]]) {
+    #pragma clang fp reassociate(off)
+    #pragma clang fp contract(off)
+    uint K=p[0],N=p[1],E=p[3],row=g.y/11,slot=g.y%11,lane=tid%32;
+    uint col=g.x*(nt.x/32*4)+tid/32*4;
+    if(col>=N || row>=p[2])return;
+    bool shared=slot==10;uint expert=shared ? 0 : ids[row*10+slot];
+    if(!shared && expert>=E)return;
+    device const uchar* weights[2]={shared ? sgw : gw,shared ? suw : uw};
+    ulong totalN=shared ? N : ulong(N)*E;
+    device const bfloat* scales[2]={reinterpret_cast<device const bfloat*>(weights[0]+ulong(K)*totalN/2),
+                                  reinterpret_cast<device const bfloat*>(weights[1]+ulong(K)*totalN/2)};
+    float sums[2][4]={{0,0,0,0},{0,0,0,0}};
+    x+=ulong(row)*K;
+    for(uint k=lane*16;k<K;k+=512) {
+        float a[16];float bias_sum=0;
+        #pragma unroll
+        for(uint j=0;j<16;j+=4) {
+            float4 av=*reinterpret_cast<device const float4*>(x+k+j);
+            a[j]=av.x;a[j+1]=av.y;a[j+2]=av.z;a[j+3]=av.w;
+            bias_sum+=mlx_bf(mlx_bf(mlx_bf(a[j]+a[j+1])+a[j+2])+a[j+3]);
+            a[j+1]*=0.0625f;a[j+2]*=0.00390625f;a[j+3]*=0.000244140625f;
+        }
+        #pragma unroll
+        for(uint plane=0;plane<2;++plane) {
+            #pragma unroll
+            for(uint c=0;c<4;++c) {
+                if(col+c>=N)continue;
+                ulong first=(ulong(expert)*N+col+c)*K+k;float dot=0;
+                #pragma unroll
+                for(uint j=0;j<16;j+=4) {
+                    uint codes=reinterpret_cast<device const ushort*>(weights[plane])[(first+j)/4];
+                    float sub=float(codes&15)*a[j];
+                    sub+=float(codes&0x00f0)*a[j+1];sub+=float(codes&0x0f00)*a[j+2];sub+=float(codes&0xf000)*a[j+3];
+                    dot+=sub;
+                }
+                float term=fma(dot,float(scales[plane][first/32]),bias_sum*float(scales[plane][ulong(K)*totalN/32+first/32]));
+                sums[plane][c]+=term;
+            }
+        }
+    }
+    device float* out=shared ? shared_act+ulong(row)*N : act+ulong(row*10+slot)*N;
+    for(uint c=0;c<4;++c) {
+        float gate=mlx_bf(simd_sum(sums[0][c])),up=mlx_bf(simd_sum(sums[1][c]));
+        if(lane==0 && col+c<N)out[col+c]=mlx_bf(mlx_bf(gate*mlx_sigmoid_bf(gate))*up);
+    }
 }
 
 // Stable, bounded GPU permutation only. The original routing IDs and their
@@ -322,7 +454,20 @@ inline void q4a_unpack_group32(uint4 words,float scale,float bias,threadgroup bf
         *reinterpret_cast<threadgroup bfloat4*>(dst+word*8+4)=bfloat4(fma(hi,float4(scale),float4(bias)));
     }
 }
-template<uint BM,uint BN,uint BK,bool GroupLoad=false,uint Pad=0,bool PackedInput=false>
+inline void q4a_unpack_group32_masked(uint4 words,float scale,float bias,threadgroup bfloat* dst) {
+    float4 scales=float4(scale,scale*0.0625f,scale,scale*0.0625f);
+    #pragma unroll
+    for(uint word=0;word<4;++word) {
+        uchar4 bytes=as_type<uchar4>(words[word]);
+        #pragma unroll
+        for(uint j=0;j<2;++j) {
+            uint a=bytes[j*2],b=bytes[j*2+1];
+            float4 codes=float4(a&15,a&240,b&15,b&240);
+            *reinterpret_cast<threadgroup bfloat4*>(dst+word*8+j*4)=bfloat4(fma(codes,scales,float4(bias)));
+        }
+    }
+}
+template<uint BM,uint BN,uint BK,bool GroupLoad=false,uint Pad=0,bool PackedInput=false,uint LoadValues=32,uint Threads=128,bool Masked=false>
 inline void q4a_expert_matrix(device const uchar* w,device const float* x,
     device const uint* lists,device const uint* counts,device const uint* tiles,
     device float* y,constant uint* p,uint2 g,uint tid,threadgroup bfloat* a,threadgroup bfloat* b) {
@@ -333,12 +478,12 @@ inline void q4a_expert_matrix(device const uchar* w,device const float* x,
     auto at=tensor(a,extents<int,BK,BM>(),array<int,2>{1,BK+Pad});
     auto bt=tensor(b,extents<int,BK,BN>(),array<int,2>{1,BK+Pad});
     constexpr auto desc=matmul2d_descriptor(BM,BN,BK,false,true,false,matmul2d_descriptor::mode::multiply_accumulate);
-    matmul2d<desc,execution_simdgroups<4>> op;
+    matmul2d<desc,execution_simdgroups<Threads/32>> op;
     auto acc=op.template get_destination_cooperative_tensor<decltype(at),decltype(bt),float>();
     for(uint i=0;i<acc.get_capacity();++i)acc[i]=0;
     for(uint base=0;base<p[0];base+=BK) {
         if(BK==32) {
-            for(uint i=tid;i<1024;i+=128) {
+            for(uint i=tid;i<1024;i+=Threads) {
                 uint r=i/32,k=base+i%32,col=g.x*BN+r;
                 uint entry=r<count ? lists[expert*p[2]+first+r] : p[2];
                 a[i]=bfloat(entry<p[2] ? x[ulong(p[3] ? entry : entry/10)*p[0]+k] : 0);
@@ -347,7 +492,7 @@ inline void q4a_expert_matrix(device const uchar* w,device const float* x,
         } else {
             // Four-value packed staging: each code word and scale/bias
             // pair is loaded once, then reused for four matrix operands.
-            for(uint i=tid*4;i<BM*BK;i+=512) {
+            for(uint i=tid*4;i<BM*BK;i+=Threads*4) {
                 uint r=i/BK,k=base+i%BK;
                 uint entry=r<count ? lists[expert*p[2]+first+r] : p[2];
                 ulong offset=ulong(p[3] ? entry : entry/10)*p[0]+k;
@@ -363,18 +508,32 @@ inline void q4a_expert_matrix(device const uchar* w,device const float* x,
                 // eight different groups. One packed 16-byte load and one
                 // scale/bias pair produce the same 32 BF16 tensor operands.
                 // No change to tensor shape, K order or the output boundary.
-                for(uint i=tid*32;i<BN*BK;i+=128*32) {
+                for(uint i=tid*LoadValues;i<BN*BK;i+=Threads*LoadValues) {
                     uint col=g.x*BN+i/BK,k=base+i%BK;
                     ulong at=(ulong(expert)*p[1]+col)*p[0]+k;
                     uint4 words=0;float scale=0,bias=0;
                     if(col<p[1]) {
-                        words=*reinterpret_cast<device const uint4*>(w+at/2);
+                        if(LoadValues==32)words=*reinterpret_cast<device const uint4*>(w+at/2);
+                        else if(LoadValues==8)words.x=*reinterpret_cast<device const uint*>(w+at/2);
+                        else words.x=*reinterpret_cast<device const ushort*>(w+at/2);
                         device const bfloat* scales=reinterpret_cast<device const bfloat*>(w+ulong(p[0])*p[1]*512/2);
                         scale=float(scales[at/32]);bias=float(scales[ulong(p[0])*p[1]*512/32+at/32]);
                     }
-                    q4a_unpack_group32(words,scale,bias,b+(i/BK)*(BK+Pad)+i%BK);
+                    auto dst=b+(i/BK)*(BK+Pad)+i%BK;
+                    if(LoadValues==32) {
+                        if(Masked)q4a_unpack_group32_masked(words,scale,bias,dst);
+                        else q4a_unpack_group32(words,scale,bias,dst);
+                    }
+                    else {
+                        float4 lo=float4(words.x&15,(words.x>>4)&15,(words.x>>8)&15,(words.x>>12)&15);
+                        *reinterpret_cast<threadgroup bfloat4*>(dst)=bfloat4(fma(lo,float4(scale),float4(bias)));
+                        if(LoadValues==8) {
+                            float4 hi=float4((words.x>>16)&15,(words.x>>20)&15,(words.x>>24)&15,words.x>>28);
+                            *reinterpret_cast<threadgroup bfloat4*>(dst+4)=bfloat4(fma(hi,float4(scale),float4(bias)));
+                        }
+                    }
                 }
-            } else for(uint i=tid*4;i<BN*BK;i+=512) {
+            } else for(uint i=tid*4;i<BN*BK;i+=Threads*4) {
                 uint col=g.x*BN+i/BK,k=base+i%BK;float4 v=0;
                 if(col<p[1]) {
                     ulong at=(ulong(expert)*p[1]+col)*p[0]+k;
@@ -484,6 +643,295 @@ kernel void q4a_expert_mm_group32_packed(device const uchar* w [[buffer(0)]],dev
 }
 
 #ifdef PADDOCK_KERNEL_DIAGNOSTICS
+// Expert-major 64-row schedule for gate/up weight-reuse diagnostics.
+kernel void q4a_expert_tiles64(device const uint* counts [[buffer(0)]],device uint* tiles [[buffer(1)]],
+    constant uint* p [[buffer(2)]],uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup uint sums[16],offsets[16];
+    uint num=(counts[tid]+63)/64,off=simd_prefix_exclusive_sum(num),sum=simd_sum(num);
+    if(lane==0)sums[sg]=sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(sg==0) {
+        uint v=lane<16 ? sums[lane] : 0,prefix=simd_prefix_exclusive_sum(v);
+        uint total=simd_sum(v);
+        if(lane<16)offsets[lane]=prefix;
+        if(lane==0)tiles[0]=total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint j=0;j<num;++j){uint out=offsets[sg]+off+j;tiles[1+2*out]=tid;tiles[2+2*out]=j*64;}
+}
+kernel void q4a_expert_mm_rows64(device const uchar* w [[buffer(0)]],device const float* x [[buffer(1)]],
+    device const uint* lists [[buffer(2)]],device const uint* counts [[buffer(3)]],device const uint* tiles [[buffer(4)]],
+    device float* y [[buffer(5)]],constant uint* p [[buffer(6)]],uint2 g [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    if(g.y>=tiles[0])return;
+    uint expert=tiles[1+2*g.y],first=tiles[2+2*g.y];
+    if(expert>=512 || first>=counts[expert])return;
+    threadgroup bfloat a[64*72],b[64*72];
+    if(counts[expert]-first<=8)q4a_expert_matrix<8,64,64,true,8,true>(w,x,lists,counts,tiles,y,p,g,tid,a,b);
+    else if(counts[expert]-first<=16)q4a_expert_matrix<16,64,64,true,8,true>(w,x,lists,counts,tiles,y,p,g,tid,a,b);
+    else if(counts[expert]-first<=32)q4a_expert_matrix<32,64,64,true,8,true>(w,x,lists,counts,tiles,y,p,g,tid,a,b);
+    else q4a_expert_matrix<64,64,64,true,8,true>(w,x,lists,counts,tiles,y,p,g,tid,a,b);
+}
+
+// Register-resident operand experiment: unpack directly into MPP fragments,
+// avoiding shared-memory staging and its two barriers per K step.
+inline void q4a_expert_register(device const uchar* w,device const bfloat* x,
+    device const uint* lists,device const uint* counts,device const uint* tiles,
+    device float* y,constant uint* p,uint2 g,uint sg) {
+    uint expert=tiles[1+2*g.y],first=tiles[2+2*g.y]+(sg/2)*16;
+    if(first>=counts[expert])return;
+    uint count=min(16u,counts[expert]-first),column=g.x*64+(sg%2)*32;
+    constexpr auto desc=matmul2d_descriptor(16,32,32,false,true,false,matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc,execution_simdgroup> op;
+    auto a=op.template get_left_input_cooperative_tensor<bfloat,bfloat,float>();
+    auto b=op.template get_right_input_cooperative_tensor<bfloat,bfloat,float>();
+    auto acc=op.template get_destination_cooperative_tensor<decltype(a),decltype(b),float>();
+    for(uint i=0;i<acc.get_capacity();++i)acc[i]=0;
+    device const bfloat* scales=reinterpret_cast<device const bfloat*>(w+ulong(p[0])*p[1]*512/2);
+    device const bfloat* biases=scales+ulong(p[0])*p[1]*512/32;
+    for(uint base=0;base<p[0];base+=32) {
+        for(auto it=a.begin();it!=a.end();++it)if(it.is_valid_element()) {
+            auto ij=it.get_multidimensional_index();
+            uint entry=ij[1]<count ? lists[expert*p[2]+first+ij[1]] : p[2];
+            *it=entry<p[2] ? x[ulong(p[3] ? entry : entry/10)*p[0]+base+ij[0]] : bfloat(0);
+        }
+        for(auto it=b.begin();it!=b.end();++it)if(it.is_valid_element()) {
+            auto ij=it.get_multidimensional_index();uint col=column+ij[1];
+            bfloat value=0;
+            if(col<p[1]) {
+                ulong pos=(ulong(expert)*p[1]+col)*p[0]+base+ij[0];
+                uint code=(reinterpret_cast<device const uint*>(w)[pos/8]>>((pos%8)*4))&15;
+                value=bfloat(fma(float(code),float(scales[pos/32]),float(biases[pos/32])));
+            }
+            *it=value;
+        }
+        op.run(a,b,acc);
+    }
+    for(auto it=acc.begin();it!=acc.end();++it)if(it.is_valid_element()) {
+        auto ij=it.get_multidimensional_index();uint col=column+ij[0];
+        if(ij[1]<count && col<p[1]) {
+            uint entry=lists[expert*p[2]+first+ij[1]],row=entry/10;
+            if((p[5+row/32]>>(row%32))&1)y[ulong(entry)*p[1]+col]=mlx_bf(*it);
+        }
+    }
+}
+kernel void q4a_expert_mm_register(device const uchar* w [[buffer(0)]],device const bfloat* x [[buffer(1)]],
+    device const uint* lists [[buffer(2)]],device const uint* counts [[buffer(3)]],device const uint* tiles [[buffer(4)]],
+    device float* y [[buffer(5)]],constant uint* p [[buffer(6)]],uint2 g [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+    if(g.y>=tiles[0])return;
+    uint expert=tiles[1+2*g.y],first=tiles[2+2*g.y];
+    if(expert>=512 || first>=counts[expert])return;
+    q4a_expert_register(w,x,lists,counts,tiles,y,p,g,sg);
+}
+
+// Fewer participating SIMD groups give each group a larger output tile.
+#define Q4A_EXPERT_GROUPS(Name,T,P,Masked) \
+kernel void Name(device const uchar* w [[buffer(0)]],device const float* x [[buffer(1)]], \
+    device const uint* lists [[buffer(2)]],device const uint* counts [[buffer(3)]],device const uint* tiles [[buffer(4)]], \
+    device float* y [[buffer(5)]],constant uint* p [[buffer(6)]],uint2 g [[threadgroup_position_in_grid]], \
+    uint tid [[thread_index_in_threadgroup]]) { \
+    if(g.y>=tiles[0])return; \
+    uint expert=tiles[1+2*g.y],first=tiles[2+2*g.y]; \
+    if(expert>=512 || first>=counts[expert])return; \
+    threadgroup bfloat a[32*(64+P)],b[64*(64+P)]; \
+    if(counts[expert]-first<=8)q4a_expert_matrix<8,64,64,true,P,true,32,T,Masked>(w,x,lists,counts,tiles,y,p,g,tid,a,b); \
+    else if(counts[expert]-first<=16)q4a_expert_matrix<16,64,64,true,P,true,32,T,Masked>(w,x,lists,counts,tiles,y,p,g,tid,a,b); \
+    else q4a_expert_matrix<32,64,64,true,P,true,32,T,Masked>(w,x,lists,counts,tiles,y,p,g,tid,a,b); \
+}
+Q4A_EXPERT_GROUPS(q4a_expert_mm_sg1,32,8,false)
+Q4A_EXPERT_GROUPS(q4a_expert_mm_sg2,64,8,false)
+Q4A_EXPERT_GROUPS(q4a_expert_mm_pad4,128,4,false)
+Q4A_EXPERT_GROUPS(q4a_expert_mm_pad16,128,16,false)
+Q4A_EXPERT_GROUPS(q4a_expert_mm_masked,128,8,true)
+#undef Q4A_EXPERT_GROUPS
+
+// Vary only the cooperative B-loader's ownership; matrix shape/order stay fixed.
+#define Q4A_EXPERT_LOAD(Name,L) \
+kernel void Name(device const uchar* w [[buffer(0)]],device const float* x [[buffer(1)]], \
+    device const uint* lists [[buffer(2)]],device const uint* counts [[buffer(3)]],device const uint* tiles [[buffer(4)]], \
+    device float* y [[buffer(5)]],constant uint* p [[buffer(6)]],uint2 g [[threadgroup_position_in_grid]], \
+    uint tid [[thread_index_in_threadgroup]]) { \
+    if(g.y>=tiles[0])return; \
+    uint expert=tiles[1+2*g.y],first=tiles[2+2*g.y]; \
+    if(expert>=512 || first>=counts[expert])return; \
+    threadgroup bfloat a[32*72],b[64*72]; \
+    if(counts[expert]-first<=8)q4a_expert_matrix<8,64,64,true,8,true,L>(w,x,lists,counts,tiles,y,p,g,tid,a,b); \
+    else if(counts[expert]-first<=16)q4a_expert_matrix<16,64,64,true,8,true,L>(w,x,lists,counts,tiles,y,p,g,tid,a,b); \
+    else q4a_expert_matrix<32,64,64,true,8,true,L>(w,x,lists,counts,tiles,y,p,g,tid,a,b); \
+}
+Q4A_EXPERT_LOAD(q4a_expert_mm_load4,4)
+Q4A_EXPERT_LOAD(q4a_expert_mm_load8,8)
+#undef Q4A_EXPERT_LOAD
+
+// Candidate only: widen K to amortize staging barriers. Keep routing, row
+// masks and BF16 boundaries; exact arithmetic still requires qualification.
+#define Q4A_EXPERT_K128(Name,BN) \
+kernel void Name(device const uchar* w [[buffer(0)]],device const float* x [[buffer(1)]], \
+    device const uint* lists [[buffer(2)]],device const uint* counts [[buffer(3)]],device const uint* tiles [[buffer(4)]], \
+    device float* y [[buffer(5)]],constant uint* p [[buffer(6)]],uint2 g [[threadgroup_position_in_grid]], \
+    uint tid [[thread_index_in_threadgroup]]) { \
+    if(g.y>=tiles[0])return; \
+    uint expert=tiles[1+2*g.y],first=tiles[2+2*g.y]; \
+    if(expert>=512 || first>=counts[expert])return; \
+    threadgroup bfloat a[32*136],b[BN*136]; \
+    if(counts[expert]-first<=8)q4a_expert_matrix<8,BN,128,true,8,true>(w,x,lists,counts,tiles,y,p,g,tid,a,b); \
+    else if(counts[expert]-first<=16)q4a_expert_matrix<16,BN,128,true,8,true>(w,x,lists,counts,tiles,y,p,g,tid,a,b); \
+    else q4a_expert_matrix<32,BN,128,true,8,true>(w,x,lists,counts,tiles,y,p,g,tid,a,b); \
+}
+Q4A_EXPERT_K128(q4a_expert_mm_k128_n32,32)
+Q4A_EXPERT_K128(q4a_expert_mm_k128_n64,64)
+#undef Q4A_EXPERT_K128
+#endif
+
+// Compact sorted inputs let TensorOps read A directly from device memory.
+// Only B is staged per output tile. Offsets are an exclusive scan of the
+// actual counts (no padded expert rows and no CPU routing synchronization).
+kernel void q4a_expert_offsets(device const uint* counts [[buffer(0)]],device uint* offsets [[buffer(1)]],
+    constant uint* p [[buffer(2)]],uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup uint sums[16],prefixes[16];
+    uint count=counts[tid],prefix=simd_prefix_exclusive_sum(count);
+    uint sum=simd_sum(count);
+    if(lane==0)sums[sg]=sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(sg==0) {
+        uint v=lane<16 ? sums[lane] : 0;
+        uint off=simd_prefix_exclusive_sum(v);
+        if(lane<16)prefixes[lane]=off;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    offsets[tid]=prefixes[sg]+prefix;
+}
+#ifdef PADDOCK_KERNEL_DIAGNOSTICS
+// Rejected serving candidate: retained only for exact cost diagnostics.
+// Build compact input offsets and a 64-row schedule together. Only the down
+// projection uses this schedule; gate/up keep their existing 32-row tiles.
+kernel void q4a_expert_plan64(device const uint* counts [[buffer(0)]],device uint* offsets [[buffer(1)]],
+    device uint* tiles [[buffer(2)]],constant uint* p [[buffer(3)]],uint tid [[thread_index_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup uint2 sums[16],prefixes[16];
+    // A 33..48-row remainder is cheaper as 32 + 8/16 than a padded 64.
+    // Use 64 only when it replaces two full 32-row matrix operations.
+    uint count=counts[tid],full=count/64,tail=count%64;
+    uint num=full+(tail>48 ? 1 : (tail+31)/32);
+    uint2 prefix=uint2(simd_prefix_exclusive_sum(count),simd_prefix_exclusive_sum(num));
+    uint2 sum=uint2(simd_sum(count),simd_sum(num));
+    if(lane==0)sums[sg]=sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(sg==0) {
+        uint2 v=lane<16 ? sums[lane] : uint2(0);
+        uint2 off=uint2(simd_prefix_exclusive_sum(v.x),simd_prefix_exclusive_sum(v.y));
+        uint total=simd_sum(v.y);
+        if(lane<16)prefixes[lane]=off;
+        if(lane==0)tiles[0]=total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    prefix+=prefixes[sg];offsets[tid]=prefix.x;
+    for(uint j=0;j<num;++j) {
+        uint out=prefix.y+j;tiles[1+2*out]=tid;
+        tiles[2+2*out]=j<full ? j*64 : full*64+(j-full)*32;
+    }
+}
+#endif
+kernel void q4a_expert_pack(device const float* x [[buffer(0)]],device const uint* lists [[buffer(1)]],
+    device const uint* counts [[buffer(2)]],device const uint* tiles [[buffer(3)]],
+    device const uint* offsets [[buffer(4)]],device bfloat* sorted [[buffer(5)]],
+    constant uint* p [[buffer(6)]],uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
+    if(g.y>=tiles[0])return;
+    uint expert=tiles[1+2*g.y],first=tiles[2+2*g.y],k=g.x*512+tid*4;
+    if(expert>=512 || first>=counts[expert] || k>=p[0])return;
+    uint count=min(32u,counts[expert]-first);
+    for(uint r=0;r<count;++r) {
+        uint entry=lists[expert*p[2]+first+r];
+        if(entry>=p[2])continue;
+        ulong src=ulong(p[3] ? entry : entry/10)*p[0]+k;
+        ulong dst=ulong(offsets[expert]+first+r)*p[0]+k;
+        *reinterpret_cast<device bfloat4*>(sorted+dst)=bfloat4(*reinterpret_cast<device const float4*>(x+src));
+    }
+}
+#ifdef PADDOCK_KERNEL_DIAGNOSTICS
+kernel void q4a_expert_pack64(device const float* x [[buffer(0)]],device const uint* lists [[buffer(1)]],
+    device const uint* counts [[buffer(2)]],device const uint* tiles [[buffer(3)]],
+    device const uint* offsets [[buffer(4)]],device bfloat* sorted [[buffer(5)]],
+    constant uint* p [[buffer(6)]],uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
+    if(g.y>=tiles[0])return;
+    uint expert=tiles[1+2*g.y],first=tiles[2+2*g.y],k=g.x*512+tid*4;
+    if(expert>=512 || first>=counts[expert] || k>=p[0])return;
+    uint remain=counts[expert]-first,count=min(remain<=48 ? 32u : 64u,remain);
+    for(uint r=0;r<count;++r) {
+        uint entry=lists[expert*p[2]+first+r];
+        if(entry>=p[2])continue;
+        ulong src=ulong(p[3] ? entry : entry/10)*p[0]+k;
+        ulong dst=ulong(offsets[expert]+first+r)*p[0]+k;
+        *reinterpret_cast<device bfloat4*>(sorted+dst)=bfloat4(*reinterpret_cast<device const float4*>(x+src));
+    }
+}
+#endif
+template<uint BM>
+inline void q4a_expert_direct(device const uchar* w,device bfloat* x,
+    device const uint* lists,device const uint* counts,device const uint* tiles,
+    device const uint* offsets,device float* y,constant uint* p,uint2 g,uint tid,threadgroup bfloat* b) {
+    uint expert=tiles[1+2*g.y],first=tiles[2+2*g.y],count=min(BM,counts[expert]-first);
+    auto at=tensor(x+ulong(offsets[expert])*p[0],extents<int,dynamic_extent,dynamic_extent>(p[0],counts[expert]),array<int,2>{1,int(p[0])});
+    auto bt=tensor(b,extents<int,64,64>(),array<int,2>{1,72});
+    constexpr auto desc=matmul2d_descriptor(BM,64,64,false,true,false,matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc,execution_simdgroups<4>> op;
+    auto acc=op.template get_destination_cooperative_tensor<decltype(at),decltype(bt),float>();
+    for(uint i=0;i<acc.get_capacity();++i)acc[i]=0;
+    for(uint base=0;base<p[0];base+=64) {
+        for(uint i=tid*32;i<64*64;i+=128*32) {
+            uint col=g.x*64+i/64,k=base+i%64;
+            ulong pos=(ulong(expert)*p[1]+col)*p[0]+k;
+            uint4 words=0;float scale=0,bias=0;
+            if(col<p[1]) {
+                words=*reinterpret_cast<device const uint4*>(w+pos/2);
+                device const bfloat* scales=reinterpret_cast<device const bfloat*>(w+ulong(p[0])*p[1]*512/2);
+                scale=float(scales[pos/32]);bias=float(scales[ulong(p[0])*p[1]*512/32+pos/32]);
+            }
+            q4a_unpack_group32(words,scale,bias,b+(i/64)*72+i%64);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto input=at.slice<64,BM>(base,first);op.run(input,bt,acc);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for(auto it=acc.begin();it!=acc.end();++it) {
+        auto ij=it.get_multidimensional_index();uint col=g.x*64+ij[0];
+        if(it.is_valid_element() && ij[1]<count && col<p[1]) {
+            uint entry=lists[expert*p[2]+first+ij[1]],row=entry/10;
+            if((p[5+row/32]>>(row%32))&1)y[ulong(entry)*p[1]+col]=mlx_bf(*it);
+        }
+    }
+}
+kernel void q4a_expert_mm_direct(device const uchar* w [[buffer(0)]],device bfloat* x [[buffer(1)]],
+    device const uint* lists [[buffer(2)]],device const uint* counts [[buffer(3)]],device const uint* tiles [[buffer(4)]],
+    device const uint* offsets [[buffer(5)]],device float* y [[buffer(6)]],constant uint* p [[buffer(7)]],
+    uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
+    if(g.y>=tiles[0])return;
+    uint expert=tiles[1+2*g.y],first=tiles[2+2*g.y];
+    if(expert>=512 || first>=counts[expert])return;
+    threadgroup bfloat b[64*72];
+    if(counts[expert]-first<=8)q4a_expert_direct<8>(w,x,lists,counts,tiles,offsets,y,p,g,tid,b);
+    else if(counts[expert]-first<=16)q4a_expert_direct<16>(w,x,lists,counts,tiles,offsets,y,p,g,tid,b);
+    else q4a_expert_direct<32>(w,x,lists,counts,tiles,offsets,y,p,g,tid,b);
+}
+
+#ifdef PADDOCK_KERNEL_DIAGNOSTICS
+kernel void q4a_expert_mm_direct64(device const uchar* w [[buffer(0)]],device bfloat* x [[buffer(1)]],
+    device const uint* lists [[buffer(2)]],device const uint* counts [[buffer(3)]],device const uint* tiles [[buffer(4)]],
+    device const uint* offsets [[buffer(5)]],device float* y [[buffer(6)]],constant uint* p [[buffer(7)]],
+    uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
+    if(g.y>=tiles[0])return;
+    uint expert=tiles[1+2*g.y],first=tiles[2+2*g.y];
+    if(expert>=512 || first>=counts[expert])return;
+    threadgroup bfloat b[64*72];
+    if(counts[expert]-first<=8)q4a_expert_direct<8>(w,x,lists,counts,tiles,offsets,y,p,g,tid,b);
+    else if(counts[expert]-first<=16)q4a_expert_direct<16>(w,x,lists,counts,tiles,offsets,y,p,g,tid,b);
+    else if(counts[expert]-first<=48)q4a_expert_direct<32>(w,x,lists,counts,tiles,offsets,y,p,g,tid,b);
+    else q4a_expert_direct<64>(w,x,lists,counts,tiles,offsets,y,p,g,tid,b);
+}
+
 // Defined in the shared MLX operations section of the same Metal library.
 inline float mlx_sigmoid_bf(float v);
 // Original paired contraction: gate/up retain separate compressed weight
@@ -696,22 +1144,23 @@ kernel void q4a_input(device const float* x [[buffer(0)]],device bfloat* out [[b
     uint padded=(p[2]+31)/32*32;
     if(i<padded*p[0])out[i]=bfloat(i<p[2]*p[0] ? x[ulong(p[6])*p[0]+i] : 0);
 }
-template<uint Bits,uint BK,bool GroupLoad=false,uint Pad=0>
+template<uint Bits,uint BK,bool GroupLoad=false,uint Pad=0,uint BN=32>
 inline void q4a_dense_device(device const uchar* w,device bfloat* x,device float* y,
     constant uint* p,uint2 g,uint tid,threadgroup bfloat* b) {
     uint K=p[0],N=p[1],M=p[2];
     auto at=tensor(x,dextents<int,2>(K,(M+31)/32*32),array<int,2>{1,int(K)});
-    auto bt=tensor(b,extents<int,BK,32>(),array<int,2>{1,BK+Pad});
-    constexpr auto desc=matmul2d_descriptor(32,32,BK,false,true,false,matmul2d_descriptor::mode::multiply_accumulate);
+    auto bt=tensor(b,extents<int,BK,BN>(),array<int,2>{1,BK+Pad});
+    constexpr auto desc=matmul2d_descriptor(32,BN,BK,false,true,false,matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc,execution_simdgroups<4>> op;
     auto acc=op.template get_destination_cooperative_tensor<decltype(at),decltype(bt),float>();
     for(uint i=0;i<acc.get_capacity();++i)acc[i]=0;
+    uint first=g.y*32;
     device const bfloat* scales=reinterpret_cast<device const bfloat*>(w+ulong(K)*N*Bits/8);
     device const bfloat* biases=scales+ulong(K)*N/(Bits==4 ? 32 : 64);
     for(uint base=0;base<K;base+=BK) {
         if(GroupLoad) {
-            for(uint i=tid*32;i<32*BK;i+=128*32) {
-                uint col=g.x*32+i/BK,k=base+i%BK;
+            for(uint i=tid*32;i<BN*BK;i+=128*32) {
+                uint col=g.x*BN+i/BK,k=base+i%BK;
                 ulong index=ulong(col)*K+k;
                 uint4 words=0;float scale=0,bias=0;
                 if(col<N) {
@@ -720,8 +1169,8 @@ inline void q4a_dense_device(device const uchar* w,device bfloat* x,device float
                 }
                 q4a_unpack_group32(words,scale,bias,b+i/BK*(BK+Pad)+i%BK);
             }
-        } else for(uint i=tid*4;i<32*BK;i+=512) {
-            uint col=g.x*32+i/BK,k=base+i%BK;float4 values=0;
+        } else for(uint i=tid*4;i<BN*BK;i+=512) {
+            uint col=g.x*BN+i/BK,k=base+i%BK;float4 values=0;
             if(col<N) {
                 ulong index=ulong(col)*K+k;float4 codes;
                 if(Bits==4) {
@@ -737,12 +1186,12 @@ inline void q4a_dense_device(device const uchar* w,device bfloat* x,device float
             *reinterpret_cast<threadgroup bfloat4*>(b+i/BK*(BK+Pad)+i%BK)=bfloat4(values);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        auto input=at.slice<BK,32>(base,g.y*32);op.run(input,bt,acc);
+        auto input=at.slice<BK,32>(base,first);op.run(input,bt,acc);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     y+=ulong(p[6])*N;
     for(auto it=acc.begin();it!=acc.end();++it) {
-        auto ij=it.get_multidimensional_index();uint col=g.x*32+ij[0],row=g.y*32+ij[1];
+        auto ij=it.get_multidimensional_index();uint col=g.x*BN+ij[0],row=first+ij[1];
         if(it.is_valid_element() && col<N && row<M)y[ulong(row)*N+col]=mlx_bf(*it);
     }
 }
@@ -762,10 +1211,117 @@ Q4A_DENSE_DEVICE(q4a_mm4_device128_pad16,4,128,true,16)
 Q4A_DENSE_DEVICE(q4a_mm4_device64_pad16,4,64,true,16)
 #undef Q4A_DENSE_DEVICE
 
+kernel void q4a_mm4_device128_wide(device const uchar* w [[buffer(0)]],device bfloat* x [[buffer(1)]],device float* y [[buffer(2)]],
+    constant uint* p [[buffer(3)]],uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup bfloat b[64*136];q4a_dense_device<4,128,true,8,64>(w,x,y,p,g,tid,b);
+}
+
+// A uniform workgroup selects one original packed plane. The matrix shape,
+// BF16 operands and K loop are exactly those of the separate dense kernels.
+inline uint2 q4a_pair_grid(uint2 g,uint columns,uint rows,uint group) {
+    if(group==1)return g;
+    uint linear=g.y*columns+g.x,first=(linear/(columns*group))*group;
+    uint height=min(group,rows-first),offset=linear%(columns*group);
+    return uint2(offset/height,first+offset%height);
+}
+#define Q4A_PAIR(Name,BN) \
+kernel void Name(device const uchar* w0 [[buffer(0)]],device const uchar* w1 [[buffer(1)]], \
+    device bfloat* x [[buffer(2)]],device float* y0 [[buffer(3)]],device float* y1 [[buffer(4)]], \
+    constant uint* p [[buffer(5)]],uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) { \
+    threadgroup bfloat b[BN*136];g=q4a_pair_grid(g,(p[1]+p[8])/BN,(p[2]+31)/32,p[16]); \
+    uint cut=p[1]/BN;bool second=g.x>=cut; \
+    if(second)g.x-=cut; \
+    q4a_dense_device<4,128,true,8,BN>(second?w1:w0,x,second?y1:y0,second?p+7:p,g,tid,b); }
+Q4A_PAIR(q4a_mm4_pair,32)
+Q4A_PAIR(q4a_mm4_pair_wide,64)
+#undef Q4A_PAIR
+
+#ifdef PADDOCK_KERNEL_DIAGNOSTICS
+// Isolated slab gains have not translated into a c=4 whole-model win.
+// Keep this experiment out of the production pipeline set.
+kernel void q4a_weight_pair_slab(device const uchar* w0 [[buffer(0)]],device const uchar* w1 [[buffer(1)]],
+    device bfloat* out [[buffer(2)]],constant uint* p [[buffer(3)]],uint i [[thread_position_in_grid]]) {
+    uint K=p[0];if(i>=p[15]*(K/32))return;
+    uint col=p[14]+i/(K/32),k=i%(K/32)*32;bool second=col>=p[1];
+    uint N=second?p[8]:p[1];if(second)col-=p[1];
+    device const uchar* w=second?w1:w0;
+    ulong at=ulong(col)*K+k;
+    uint4 words=*reinterpret_cast<device const uint4*>(w+at/2);
+    device const bfloat* scales=reinterpret_cast<device const bfloat*>(w+ulong(K)*N/2);
+    float scale=float(scales[at/32]),bias=float(scales[ulong(K)*N/32+at/32]);
+    #pragma unroll
+    for(uint word=0;word<4;++word) {
+        uint codes=words[word];
+        float4 lo=float4(codes&15,(codes>>4)&15,(codes>>8)&15,(codes>>12)&15);
+        float4 hi=float4((codes>>16)&15,(codes>>20)&15,(codes>>24)&15,codes>>28);
+        *reinterpret_cast<device bfloat4*>(out+ulong(i)*32+word*8)=bfloat4(fma(lo,float4(scale),float4(bias)));
+        *reinterpret_cast<device bfloat4*>(out+ulong(i)*32+word*8+4)=bfloat4(fma(hi,float4(scale),float4(bias)));
+    }
+}
+kernel void q4a_mm4_pair_slab(device bfloat* w [[buffer(0)]],device bfloat* x [[buffer(1)]],
+    device float* y0 [[buffer(2)]],device float* y1 [[buffer(3)]],constant uint* p [[buffer(4)]],
+    uint2 g [[threadgroup_position_in_grid]]) {
+    uint K=p[0],M=p[2];g=q4a_pair_grid(g,p[15]/64,(M+63)/64,p[16]);
+    uint first=p[14]+g.x*64;bool second=first>=p[1];
+    uint N=second?p[8]:p[1];if(second)first-=p[1];
+    device float* y=(second?y1:y0)+ulong(p[6])*N;
+    auto at=tensor(x,dextents<int,2>(K,(M+31)/32*32),array<int,2>{1,int(K)}).slice(0,g.y*64);
+    auto bt=tensor(w,dextents<int,2>(K,p[15]),array<int,2>{1,int(K)}).slice(0,g.x*64);
+    constexpr auto desc=matmul2d_descriptor(64,64,dynamic_length_v<int>,false,true,false);
+    matmul2d<desc,execution_simdgroups<4>> op;
+    auto acc=op.template get_destination_cooperative_tensor<decltype(at),decltype(bt),float>();
+    op.run(at,bt,acc);
+    for(auto it=acc.begin();it!=acc.end();++it) {
+        auto ij=it.get_multidimensional_index();uint col=first+ij[0],row=g.y*64+ij[1];
+        if(it.is_valid_element() && col<N && g.x*64+ij[0]<p[15] && row<M)y[ulong(row)*N+col]=mlx_bf(*it);
+    }
+}
+#endif
+
+// Decode a bounded output-column slab once for all physical prompt rows.
+// The temporary remains in the model's reusable projection arena; packed
+// checkpoint weights are unchanged. Pad columns for guarded tensor slices.
+kernel void q4a_weight_slab(device const uchar* w [[buffer(0)]],device bfloat* out [[buffer(1)]],
+    constant uint* p [[buffer(2)]],uint i [[thread_position_in_grid]]) {
+    uint K=p[0],N=p[1];
+    if(i>=p[8]*(K/32))return;
+    uint col=p[7]+i/(K/32),k=i%(K/32)*32;
+    ulong at=ulong(col)*K+k;
+    uint4 words=0;float scale=0,bias=0;
+    if(col<N) {
+        words=*reinterpret_cast<device const uint4*>(w+at/2);
+        device const bfloat* scales=reinterpret_cast<device const bfloat*>(w+ulong(K)*N/2);
+        scale=float(scales[at/32]);bias=float(scales[ulong(K)*N/32+at/32]);
+    }
+    #pragma unroll
+    for(uint word=0;word<4;++word) {
+        uint codes=words[word];
+        float4 lo=float4(codes&15,(codes>>4)&15,(codes>>8)&15,(codes>>12)&15);
+        float4 hi=float4((codes>>16)&15,(codes>>20)&15,(codes>>24)&15,codes>>28);
+        *reinterpret_cast<device bfloat4*>(out+ulong(i)*32+word*8)=bfloat4(fma(lo,float4(scale),float4(bias)));
+        *reinterpret_cast<device bfloat4*>(out+ulong(i)*32+word*8+4)=bfloat4(fma(hi,float4(scale),float4(bias)));
+    }
+}
+kernel void q4a_mm4_slab(device bfloat* w [[buffer(0)]],device bfloat* x [[buffer(1)]],device float* y [[buffer(2)]],
+    constant uint* p [[buffer(3)]],uint2 g [[threadgroup_position_in_grid]]) {
+    uint K=p[0],N=p[1],M=p[2];
+    auto at=tensor(x,dextents<int,2>(K,(M+31)/32*32),array<int,2>{1,int(K)}).slice(0,g.y*64);
+    auto bt=tensor(w,dextents<int,2>(K,p[8]),array<int,2>{1,int(K)}).slice(0,g.x*64);
+    constexpr auto desc=matmul2d_descriptor(64,64,dynamic_length_v<int>,false,true,false);
+    matmul2d<desc,execution_simdgroups<4>> op;
+    auto acc=op.template get_destination_cooperative_tensor<decltype(at),decltype(bt),float>();
+    op.run(at,bt,acc);
+    y+=ulong(p[6])*N;
+    for(auto it=acc.begin();it!=acc.end();++it) {
+        auto ij=it.get_multidimensional_index();uint col=p[7]+g.x*64+ij[0],row=g.y*64+ij[1];
+        if(it.is_valid_element() && col<N && col<p[7]+p[8] && row<M)y[ulong(row)*N+col]=mlx_bf(*it);
+    }
+}
+
 // The same affine group loader for split-K, without changing the immutable
 // partition boundaries or the BF16 partial/join contract. Input staging and
 // partials occupy disjoint regions of one bounded model-owned workspace.
-template<uint BK,uint Pad=0>
+template<uint BK,uint Pad=0,uint Bits=4>
 inline void q4a_split_device(device const uchar* w,device bfloat* x,device bfloat* partial,
     constant uint* p,uint3 g,uint tid,threadgroup bfloat* b) {
     #pragma clang fp reassociate(off)
@@ -777,10 +1333,10 @@ inline void q4a_split_device(device const uchar* w,device bfloat* x,device bfloa
     matmul2d<desc,execution_simdgroups<4>> op;
     auto acc=op.template get_destination_cooperative_tensor<decltype(at),decltype(bt),float>();
     for(uint i=0;i<acc.get_capacity();++i)acc[i]=0;
-    device const bfloat* scales=reinterpret_cast<device const bfloat*>(w+ulong(K)*N/2);
-    device const bfloat* biases=scales+ulong(K)*N/32;
+    device const bfloat* scales=reinterpret_cast<device const bfloat*>(w+ulong(K)*N*Bits/8);
+    device const bfloat* biases=scales+ulong(K)*N/(Bits==4 ? 32 : 64);
     for(uint base=g.z*span;base<(g.z+1)*span;base+=BK) {
-        for(uint i=tid*32;i<32*BK;i+=128*32) {
+        if(Bits==4)for(uint i=tid*32;i<32*BK;i+=128*32) {
             uint col=g.x*32+i/BK,k=base+i%BK;
             ulong index=ulong(col)*K+k;
             uint4 words=0;float scale=0,bias=0;
@@ -789,6 +1345,15 @@ inline void q4a_split_device(device const uchar* w,device bfloat* x,device bfloa
                 scale=float(scales[index/32]);bias=float(biases[index/32]);
             }
             q4a_unpack_group32(words,scale,bias,b+i/BK*(BK+Pad)+i%BK);
+        } else for(uint i=tid*4;i<32*BK;i+=512) {
+            uint col=g.x*32+i/BK,k=base+i%BK;float4 values=0;
+            if(col<N) {
+                ulong index=ulong(col)*K+k;
+                uint code=reinterpret_cast<device const uint*>(w)[index/4];
+                float4 codes=float4(code&255,(code>>8)&255,(code>>16)&255,code>>24);
+                values=fma(codes,float4(float(scales[index/64])),float4(float(biases[index/64])));
+            }
+            *reinterpret_cast<threadgroup bfloat4*>(b+i/BK*(BK+Pad)+i%BK)=bfloat4(values);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         auto input=at.slice<BK,32>(base,g.y*32);op.run(input,bt,acc);
@@ -811,6 +1376,16 @@ Q4A_SPLIT_DEVICE(q4a_mm4_split_device128_pad8,128,8)
 Q4A_SPLIT_DEVICE(q4a_mm4_split_device64_pad8,64,8)
 Q4A_SPLIT_DEVICE(q4a_mm4_split_device32_pad8,32,8)
 #undef Q4A_SPLIT_DEVICE
+
+#define Q4A_SPLIT8_DEVICE(Name,BK,Pad) \
+kernel void Name(device const uchar* w [[buffer(0)]],device bfloat* x [[buffer(1)]],device bfloat* partial [[buffer(2)]], \
+    constant uint* p [[buffer(3)]],uint3 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) { \
+    threadgroup bfloat b[32*(BK+Pad)];q4a_split_device<BK,Pad,8>(w,x,partial,p,g,tid,b); }
+Q4A_SPLIT8_DEVICE(q4a_mm8_split_device128,128,0)
+Q4A_SPLIT8_DEVICE(q4a_mm8_split_device64,64,0)
+Q4A_SPLIT8_DEVICE(q4a_mm8_split_device128_pad8,128,8)
+Q4A_SPLIT8_DEVICE(q4a_mm8_split_device64_pad8,64,8)
+#undef Q4A_SPLIT8_DEVICE
 
 // Original parallel split-K: one workgroup owns one immutable partition.
 // The join below preserves the sequential path's BF16 partials and reduction

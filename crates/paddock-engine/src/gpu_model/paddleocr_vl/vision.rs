@@ -143,6 +143,11 @@ struct TowerWs {
     host_pos: Vec<u32>,
 }
 
+/// Patch rows one batched tower pass takes before a group stops taking
+/// pictures (a picture larger than this runs alone): ~56 KB of workspace per
+/// row, so ~0.9 GB - two maximum-size pictures, or three default pages.
+pub(crate) const TOWER_PASS_ROWS: usize = 16384;
+
 /// Distinct geometries worth caching pos-embd planes for. Documents pages
 /// cluster on a handful of shapes; past this the whole cache resets (simple
 /// and honest - no LRU bookkeeping for a table this small).
@@ -171,6 +176,9 @@ impl TowerWs {
 
     fn grow_f32(buf: &mut CudaSlice<f32>, exec: &GpuExecutor, need: usize) -> Result<(), GpuError> {
         if buf.len() < need {
+            // release the old buffer first: assigning straight over it built
+            // the new one while the old was still held (old + new at the peak)
+            *buf = exec.alloc(1)?;
             *buf = exec.alloc(need)?;
         }
         Ok(())
@@ -178,6 +186,9 @@ impl TowerWs {
 
     fn grow_f16(buf: &mut CudaSlice<f16>, exec: &GpuExecutor, need: usize) -> Result<(), GpuError> {
         if buf.len() < need {
+            // release the old buffer first: assigning straight over it built
+            // the new one while the old was still held (old + new at the peak)
+            *buf = exec.alloc_f16(1)?;
             *buf = exec.alloc_f16(need)?;
         }
         Ok(())
@@ -185,6 +196,9 @@ impl TowerWs {
 
     fn grow_u32(buf: &mut CudaSlice<u32>, exec: &GpuExecutor, need: usize) -> Result<(), GpuError> {
         if buf.len() < need {
+            // release the old buffer first: assigning straight over it built
+            // the new one while the old was still held (old + new at the peak)
+            *buf = exec.alloc_u32(1)?;
             *buf = exec.alloc_u32(need)?;
         }
         Ok(())
@@ -457,6 +471,55 @@ impl VisionModel {
         out
     }
 
+    /// Size the tower's workspace for a `rows`-patch-row pass. Called at
+    /// attach for the widest pass serving can form (`TOWER_PASS_ROWS`, or one
+    /// maximum-size picture alone), which puts the workspace in the ledger
+    /// before the plan reads its grant; every pass after that fits it.
+    ///
+    /// It used to grow on demand to the largest group seen - up to eight
+    /// same-size pictures, ~3.7 GB at the published maximum - kept that for
+    /// the process's life, and held old and new together while growing.
+    pub fn size_workspace(&mut self, rows: usize) -> Result<(), GpuError> {
+        let exec = Arc::clone(&self.exec);
+        let e = self.embd;
+        let k2 = self.patch * self.patch;
+        let row_f = 3 * k2;
+        let ffn = self.blocks[0].up_w.dims[1];
+        let stage = (rows * ffn.max(e).max(self.patch_w.dims[0]))
+            .max((rows / 4) * self.mm1.dims[0].max(self.mm1.dims[1]));
+        let n4 = rows / 4;
+        let mid = self.mm1.dims[1];
+        let out_dim = self.mm2.dims[1];
+        TowerWs::grow_f16(&mut self.ws.s16, &exec, stage)?;
+        for (buf, need) in [
+            (&mut self.ws.x, rows * e),
+            (&mut self.ws.n, rows * e),
+            (&mut self.ws.q, rows * e),
+            (&mut self.ws.k, rows * e),
+            (&mut self.ws.v, rows * e),
+            (&mut self.ws.a, rows * e),
+            (&mut self.ws.up, rows * ffn),
+            (&mut self.ws.m, n4 * mid),
+            (&mut self.ws.out, n4 * out_dim),
+            (&mut self.ws.patches, rows * row_f),
+        ] {
+            TowerWs::grow_f32(buf, &exec, need)?;
+        }
+        TowerWs::grow_u32(&mut self.ws.pos, &exec, 4 * rows)?;
+        if self.ws.host_patches.len() < rows * row_f {
+            self.ws.host_patches.resize(rows * row_f, 0.0);
+        }
+        if self.ws.host_pos.len() < 4 * rows {
+            self.ws.host_pos.resize(4 * rows, 0);
+        }
+        Ok(())
+    }
+
+    /// Patch rows one picture of `w`x`h` (post-resize) occupies in a pass.
+    pub fn patch_rows(&self, w: usize, h: usize) -> usize {
+        (w / self.patch) * (h / self.patch)
+    }
+
     /// Encode one normalized planar image ([3][h][w] f32) - see
     /// [`super::preprocess::preprocess_rgb`]. `w`/`h` must be multiples of 28.
     pub fn encode(
@@ -503,37 +566,15 @@ impl VisionModel {
         let rows = b * n;
         let exec = Arc::clone(&self.exec);
 
-        // workspace residency for this geometry - grow-only, no-op steady state
+        // workspace residency for this geometry - sized once at attach for the
+        // widest pass (`size_workspace`), so this is a no-op in serving
+        self.size_workspace(rows)?;
         let k2 = patch * patch;
         let row_f = 3 * k2;
         let ffn = self.blocks[0].up_w.dims[1];
-        let stage = (rows * ffn.max(e).max(self.patch_w.dims[0]))
-            .max((rows / 4) * self.mm1.dims[0].max(self.mm1.dims[1]));
         let n4 = rows / 4;
         let mid = self.mm1.dims[1];
         let out_dim = self.mm2.dims[1];
-        TowerWs::grow_f16(&mut self.ws.s16, &exec, stage)?;
-        for (buf, need) in [
-            (&mut self.ws.x, rows * e),
-            (&mut self.ws.n, rows * e),
-            (&mut self.ws.q, rows * e),
-            (&mut self.ws.k, rows * e),
-            (&mut self.ws.v, rows * e),
-            (&mut self.ws.a, rows * e),
-            (&mut self.ws.up, rows * ffn),
-            (&mut self.ws.m, n4 * mid),
-            (&mut self.ws.out, n4 * out_dim),
-            (&mut self.ws.patches, rows * row_f),
-        ] {
-            TowerWs::grow_f32(buf, &exec, need)?;
-        }
-        TowerWs::grow_u32(&mut self.ws.pos, &exec, 4 * rows)?;
-        if self.ws.host_patches.len() < rows * row_f {
-            self.ws.host_patches.resize(rows * row_f, 0.0);
-        }
-        if self.ws.host_pos.len() < 4 * rows {
-            self.ws.host_pos.resize(4 * rows, 0);
-        }
 
         // host im2col in the merged 2×2-block order. Each yb block-row of one
         // image is one contiguous band of 2·pw patch rows, so bands fan out

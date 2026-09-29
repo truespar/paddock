@@ -12,6 +12,7 @@ hardened = ["paddock-models/hardened", "paddock-engine/hardened"]
 [dependencies]
 paddock-engine = { path = "../paddock-engine", default-features = false }
 paddock-models.workspace = true
+paddock-tokenizer.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 half.workspace = true
@@ -24,7 +25,6 @@ objc2-foundation = "0.3.2"
 objc2-metal = "0.3.2"
 
 [dev-dependencies]
-paddock-tokenizer.workspace = true
 paddock-kernels = { path = "../paddock-kernels" }
 
 [lints]

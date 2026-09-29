@@ -83,6 +83,22 @@ kernel void q4b_pool(device const float* raw [[buffer(0)]],device const float* r
     ulong dst=(ulong(m.x)*p[1]+m.y/4)*128;
     for(uint d=lane;d<128;d+=32)pooled[dst+d]=q4b_rope(values[d],values[d<32?d+32:d-32],d,m.y-3);
 }
+// Cache-only terminal execution has no attention/FFN output through which to
+// observe invalid values. Validate precisely the rows written, not stale or
+// unallocated pages. Keep errors sticky until the host poisons the model.
+kernel void q4b_cache_finite(device const bfloat* kc [[buffer(0)]],device const bfloat* vc [[buffer(1)]],
+    device const float* raw [[buffer(2)]],device const float* pooled [[buffer(3)]],
+    device const uint4* meta [[buffer(4)]],device const uint* pages [[buffer(5)]],
+    device atomic_uint* bad [[buffer(6)]],constant uint* p [[buffer(7)]],uint i [[thread_position_in_grid]]) {
+    if(i>=p[2]*512)return;uint row=i/512,d=i%512;uint4 m=meta[row];
+    ulong at=(ulong(pages[m.x*p[0]+m.y/16])*16+m.y%16)*512+d;
+    bool ok=isfinite(float(kc[at])) && isfinite(float(vc[at]));
+    if(d<128) {
+        ok=ok && isfinite(raw[ulong(row)*128+d]);
+        if(m.y%4==3)ok=ok && isfinite(pooled[(ulong(m.x)*p[1]+m.y/4)*128+d]);
+    }
+    if(!ok)atomic_fetch_or_explicit(bad,8u,memory_order_relaxed);
+}
 kernel void q4b_join_gate(device const float* parts [[buffer(0)]],device const float* qg [[buffer(1)]],
     device float* y [[buffer(2)]],constant uint* p [[buffer(3)]],uint rh [[threadgroup_position_in_grid]],uint lane [[thread_index_in_simdgroup]]) {
     #pragma clang fp reassociate(off)
@@ -199,6 +215,31 @@ kernel void q4b_hc_combine(device float* h [[buffer(0)]],device const float* del
 }
 kernel void q4b_injection(device float* x [[buffer(0)]],constant uint* p [[buffer(1)]],uint i [[thread_position_in_grid]]) {
     if(i<p[0])x[i]=mlx_bf(2.0f*mlx_sigmoid_bf(mlx_bf(x[i]*0.25f)));
+}
+// Combine attention's residual and normalize for the FFN in one traversal.
+// Keep both BF16 residual boundaries and the original eight-SIMD RMS sum.
+kernel void q4b_hc_combine_norm(device float* h [[buffer(0)]],device const float* delta [[buffer(1)]],
+    device const float* inject [[buffer(2)]],device const float* w [[buffer(3)]],
+    device float* y [[buffer(4)]],constant uint* p [[buffer(5)]],
+    uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
+    #pragma clang fp reassociate(off)
+    #pragma clang fp contract(off)
+    threadgroup float partial[8];
+    uint base=(g.y*4+g.x)*2560;float gain=inject[g.y*4+g.x],sq=0;
+    float values[10];
+    for(uint j=0;j<10;++j) {
+        uint d=tid+j*256;
+        float v=mlx_bf(h[base+d]+mlx_bf(delta[g.y*2560+d]*gain));
+        values[j]=v;h[base+d]=v;sq+=v*v;
+    }
+    sq=simd_sum(sq);if(tid%32==0)partial[tid/32]=sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sq=simd_sum(tid<8 ? partial[tid] : 0.0f);
+    if(tid==0)partial[0]=precise::rsqrt(precise::divide(sq,2560.0f)+as_type<float>(p[2]));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint j=0;j<10;++j) {
+        uint d=tid+j*256;y[base+d]=mlx_bf((values[j]*partial[0])*w[g.x*2560+d]);
+    }
 }
 kernel void q4a_ple_gather(device const uchar* w [[buffer(0)]],device const uint* ids [[buffer(1)]],
     device float* y [[buffer(2)]],constant uint* p [[buffer(3)]],uint i [[thread_position_in_grid]]) {

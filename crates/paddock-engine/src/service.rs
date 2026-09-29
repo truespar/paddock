@@ -1250,6 +1250,9 @@ impl Engine {
                 if let Some(b) = generator.kv_mem_bytes() {
                     metrics.kv_mem_bytes.store(b, Relaxed);
                 }
+                // the serving state as planned, before the warm-up runs anything
+                // (see `audit_warm_footprint`)
+                let planned_pool = generator.device_mem_used();
                 // Warm up so the first real request doesn't pay the cold-start
                 // cost - CUDA-graph capture (per-token decode graph, short-prefill
                 // graph), cuBLAS handle init, and the first large allocations - which
@@ -1258,10 +1261,19 @@ impl Engine {
                 // of it up front. llama.cpp warms up by default (its --no-warmup
                 // skips it); PADDOCK_NO_WARMUP skips ours. `_wrx` stays bound so the
                 // run completes (unbounded sends just buffer, then drop with it).
-                // (the batched diffusion loop warms below through its own
-                // loop - the single-stream state is not what it serves)
-                if paddock_models::dev_var_os!("PADDOCK_NO_WARMUP").is_none() && !(diffusion && batched)
-                {
+                // Only when the SERIAL loop is what serves. A batched serve warms
+                // below through the real scheduler, and the serial path is not
+                // what it runs (multimodal included, where the family takes
+                // images in slots) - but a serial request allocates that lane's
+                // own state, which lives on unused: qwen35 keeps a dense
+                // max_ctx KV plane per full-attention layer beside the batch
+                // pool (+12.6 GB at 160K x 2, +21.8 GB at 256K x 2 on
+                // qwen3.8-27B, measured 2026-09-28), outside the KV plan that
+                // had already sized the pool against the grant. On a
+                // unified-memory box that is the OS's headroom: a DGX Spark
+                // serving 256K x 2 sat at ~17 GB free and the kernel's OOM
+                // killer took the manager after about a day.
+                if paddock_models::dev_var_os!("PADDOCK_NO_WARMUP").is_none() && !batched {
                     let (wtx, _wrx) = tokio::sync::mpsc::unbounded_channel();
                     run_request(
                         generator.as_mut(),
@@ -1334,6 +1346,16 @@ impl Engine {
                         t0.elapsed().as_secs_f64() * 1e3
                     );
                 }
+                // the warm-up allocated what the first requests would have (the
+                // drafter's serving state, graph captures): publish the ledger
+                // as it now stands
+                refresh_model_mem(
+                    generator.as_ref(),
+                    &metrics,
+                    &mut None,
+                    MODEL_MEM_REFRESH,
+                );
+                audit_warm_footprint(generator.as_ref(), planned_pool);
                 // Build + enable_batch + warmup are all done - signal ready here, not
                 // right after build(), so the server starts listening only once warm.
                 // That moves the one-time cold-start cost into load time (a slightly
@@ -1363,9 +1385,18 @@ impl Engine {
                     let vocab = generator.vocab();
                     run_batched(generator.as_mut(), &rx, cap.max(1), vocab, &metrics, &ctl);
                 } else {
+                    let mut mem_seen = None;
                     loop {
                         match rx.recv_timeout(std::time::Duration::from_millis(250)) {
-                            Ok(req) => run_request(generator.as_mut(), req, &metrics),
+                            Ok(req) => {
+                                run_request(generator.as_mut(), req, &metrics);
+                                refresh_model_mem(
+                                    generator.as_ref(),
+                                    &metrics,
+                                    &mut mem_seen,
+                                    MODEL_MEM_REFRESH,
+                                );
+                            }
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                                 if ctl.stop_requested() {
                                     break;
@@ -2065,6 +2096,104 @@ fn run_batched_diffusion(
         }
         let occupied: Vec<bool> = slots.iter().map(Option::is_some).collect();
         generator.release_inactive_slots(&occupied);
+    }
+}
+
+/// Re-read the device ledger the runner publishes (`model_mem_bytes`) from the
+/// family's live pool counter - a driver attribute read, no sync - at most
+/// once per `every`. A reading taken once at setup went stale by everything
+/// allocated after it (the warm-up's drafter state, grow-on-demand scratch),
+/// and the manager's reconciler measured NVML against that stale figure:
+/// 2.6-21.8 GB of "drift" on a healthy runner, warned every two seconds for
+/// days.
+fn refresh_model_mem(
+    generator: &dyn Generator,
+    metrics: &EngineMetrics,
+    last: &mut Option<std::time::Instant>,
+    every: std::time::Duration,
+) {
+    if last.is_some_and(|t| t.elapsed() < every) {
+        return;
+    }
+    *last = Some(std::time::Instant::now());
+    if let Some(b) = generator.device_mem_used() {
+        metrics.model_mem_bytes.store(b, Relaxed);
+    }
+}
+
+/// How often a serving loop refreshes the published device ledger.
+const MODEL_MEM_REFRESH: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Warm-up growth past which the serve is holding state its KV plan never
+/// reserved. The warm-up legitimately allocates what the first requests
+/// would - a drafter's serving state, verify planes, graph pools: 2.28 GiB on
+/// qwen3.8-27B NVFP4 with DFlash2 at 256K x 2 (2026-09-28) - so the line
+/// that must be loud is the class above it, the serial lane's 12.6-21.8 GB.
+const WARM_GROWTH_WARN: u64 = 4 << 30;
+
+/// Startup's will-it-fit audit, once warm: the plan sized the pools against
+/// the grant before anything ran, so what the warm-up adds on top is memory
+/// no plan accounted for - said with its size, loudly past
+/// `WARM_GROWTH_WARN`. And, where the OS reports it, the system memory left
+/// once warm: on a unified-memory box (DGX Spark, Jetson) device memory IS
+/// system memory, and the default budget promises the OS a tenth of it
+/// (`GpuExecutor`'s 0.9 utilization) - under that, say so before a day of
+/// serving finds the OOM killer. The serial warm-up's own dense state was
+/// the case this exists for: 12.6-21.8 GB on qwen3.8-27B, invisible to the
+/// plan, and the Spark it ran on down to ~17 GB free (2026-09-28).
+fn audit_warm_footprint(generator: &dyn Generator, planned: Option<u64>) {
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    if let (Some(before), Some(now)) = (planned, generator.device_mem_used()) {
+        let grew = now.saturating_sub(before);
+        if grew > WARM_GROWTH_WARN {
+            tracing::warn!(
+                "warm-up allocated {:.2} GiB beyond the planned serving state ({:.2} -> {:.2} \
+                 GiB): memory the KV plan did not reserve, which on a unified-memory box comes \
+                 out of the OS's share",
+                gib(grew),
+                gib(before),
+                gib(now)
+            );
+        } else {
+            tracing::info!(
+                "warm-up allocated {:.2} GiB beyond the planned serving state",
+                gib(grew)
+            );
+        }
+    }
+    if let Some((total, avail)) = system_memory() {
+        if avail < total / 10 {
+            tracing::warn!(
+                "system memory once warm: {:.1} of {:.1} GiB free - under the tenth the OS is \
+                 budgeted. Lower max_ctx or max_batch before a long serve meets the OOM killer.",
+                gib(avail),
+                gib(total)
+            );
+        } else {
+            tracing::info!(
+                "system memory once warm: {:.1} of {:.1} GiB free",
+                gib(avail),
+                gib(total)
+            );
+        }
+    }
+}
+
+/// (MemTotal, MemAvailable) in bytes, where the OS reports them.
+fn system_memory() -> Option<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let field = |name: &str| -> Option<u64> {
+            let line = text.lines().find(|l| l.starts_with(name))?;
+            let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+            Some(kb * 1024)
+        };
+        Some((field("MemTotal:")?, field("MemAvailable:")?))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
     }
 }
 
@@ -3315,6 +3444,8 @@ fn run_batched(
     ctl: &ShutdownCtl,
 ) {
     let mut slots: Vec<Option<Slot>> = (0..max_batch).map(|_| None).collect();
+    // last refresh of the published device ledger (see `refresh_model_mem`)
+    let mut mem_seen: Option<std::time::Instant> = None;
     // Closed-loop speculation control (docs: crate::spec_policy). Under `auto`
     // this replaces the hand-tuned batch->K ladder with a goodput argmax that
     // re-decides every round; under the default `ladder` it hands the legacy
@@ -3555,6 +3686,9 @@ fn run_batched(
     // cannot starve behind a stream of text requests.
     let mm_slots = generator.supports_mm_slots();
     let mut mm_pending: Option<GenRequest> = None;
+    // true once the idle scheduler has handed its freed memory back; re-armed
+    // by any live request (see `Generator::release_idle_memory`)
+    let mut idle_released = true;
     // Reused per-tick occupancy mask for the paged free-on-completion hook.
     let mut occupied: Vec<bool> = Vec::with_capacity(max_batch);
     let pool_stats = paddock_models::dev_var_os!("PADDOCK_POOL_STATS").is_some();
@@ -3711,6 +3845,7 @@ fn run_batched(
         metrics
             .phase
             .store(if active > 0 { PHASE_DECODE } else { PHASE_IDLE }, Relaxed);
+        refresh_model_mem(generator, metrics, &mut mem_seen, MODEL_MEM_REFRESH);
         if let Some(free) = generator.pool_free_blocks() {
             let free = free as u32;
             // First idle tick sees free == capacity; latch it as the total.
@@ -3788,6 +3923,17 @@ fn run_batched(
         }
         // Nothing in flight: block for the next request (and exit when the last
         // sender is dropped). Otherwise keep the batch moving without blocking.
+        // Going idle is also when the pool hands back what the finished
+        // requests freed - once, not every 250 ms wake.
+        if active > 0 {
+            idle_released = false;
+        } else if !idle_released {
+            generator.release_idle_memory();
+            // and the ledger with it: it refreshes on busy passes only, so an
+            // idle server would keep publishing its last busy reading
+            refresh_model_mem(generator, metrics, &mut None, MODEL_MEM_REFRESH);
+            idle_released = true;
+        }
         if active == 0 {
             let received = loop {
                 match rx.recv_timeout(std::time::Duration::from_millis(250)) {

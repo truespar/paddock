@@ -750,10 +750,20 @@ impl GpuPaddleOcrVl {
             return;
         };
         let (w, h) = (fp.w, fp.h);
+        // rows, not just pictures, bound a pass: the workspace is sized once
+        // for TOWER_PASS_ROWS, and eight maximum-size pictures would be four
+        // times that
+        let rows = self
+            .vision
+            .as_ref()
+            .expect("vision attached")
+            .patch_rows(w, h);
 
         let mut members: Vec<(usize, usize, Prepped)> = Vec::new(); // (queue idx, k, prep)
         for (qi, e) in self.enc.iter_mut().enumerate() {
-            if members.len() + 1 >= ENC_GROUP_MAX {
+            if members.len() + 1 >= ENC_GROUP_MAX
+                || (members.len() + 2) * rows > super::vision::TOWER_PASS_ROWS
+            {
                 break;
             }
             if e.dead {

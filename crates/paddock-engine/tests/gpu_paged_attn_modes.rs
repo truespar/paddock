@@ -281,7 +281,10 @@ fn prefill_batch_paged_matches_dense() {
     let d_r0 = e.to_device_u32(&t_row0).unwrap();
     let d_ts = e.to_device_u32(&t_slot).unwrap();
     let d_bt = e.to_device_u32(&lay.table).unwrap();
-    for (nh, nkv, hd) in GEOMS {
+    // + gemma4's global layer: at hd 512 the scalar tile sits 384 B under the
+    // 99 KB opt-in cap, and it was refused on sm_121a while its window floors
+    // were static shared (pd_apf_smem)
+    for (nh, nkv, hd) in GEOMS.into_iter().chain([(16, 2, 512)]) {
         let kv_dim = nkv * hd;
         let scale = 1.0 / (hd as f32).sqrt();
         let d_q = e.to_device(&det(n * nh * hd, 11)).unwrap();
@@ -917,7 +920,9 @@ fn qsa_attn_paged_matches_dense() {
 /// at its 24 / 2 x 256 geometry they must be the same bits too (the paged
 /// f16 entry's pf5 / pf7 arms take other group sizes and fall to P6i's twin
 /// here). One slot's resumed chunk, every row the same slot as the
-/// single-slot entries require. The slot is backed only to its live keys
+/// single-slot entries require (from pack 0.25 the f16 entry at this group
+/// is the v4 arm, held to the f32 walk to the f16 class instead of a dense
+/// twin). The slot is backed only to its live keys
 /// (rows reaching 340): every row past them is NaN and every table entry
 /// past its pages names the poison block, so a kernel that reads a stale
 /// row into a product - P6i staged whole 64-key tiles and weighed the keys
@@ -973,8 +978,36 @@ fn single_slot_prefill_twins_match_dense() {
             &e.to_host(&p_out).unwrap(),
             &what,
         );
-        // P6i is the f16-pool arm (its dense entry refuses e4m3, as the paged one does)
-        if dtype == KvDtype::Fp16 {
+        let tiled = e.to_host(&d_out).unwrap();
+        // From pack 0.25 the paged tensor-core entry takes the v4 arm at
+        // G = 12 (f16 and e4m3; O in f32) - no dense twin: it is held to the
+        // f32 tiled walk above, to the f16 class, NaN past the live keys
+        if e.pack_version() >= [0, 25, 0] {
+            let mut p_out = fresh();
+            e.attn_prefill_f16_paged(
+                &d_q, &d_pk, &d_pv, &d_sinks, &mut p_out, &d_pos, &d_slot, &d_bt, lay.bps, nh, nkv,
+                hd, kv_dim, 0, n, scale, dtype,
+            )
+            .unwrap();
+            let v4 = e.to_host(&p_out).unwrap();
+            let what = format!("attn_prefill_f16_paged (v4 G12) {dtype:?}");
+            if let Some(i) = v4.iter().position(|v| !v.is_finite()) {
+                panic!(
+                    "{what}: output [{i}] = {} (a read past the live keys?)",
+                    v4[i]
+                );
+            }
+            let big = tiled.iter().fold(0f32, |m, x| m.max(x.abs()));
+            let dev = v4
+                .iter()
+                .zip(&tiled)
+                .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+            eprintln!("{what}: max |d| vs the f32 walk {dev:.3e} (max |ref| {big:.3e})");
+            assert!(dev <= 4e-3 * big.max(1.0), "{what}: {dev} off the f32 walk");
+        }
+        // P6i is the f16-pool arm (its dense entry refuses e4m3, as the paged
+        // one does); from 0.25 its paged twin is reached only at other groups
+        if dtype == KvDtype::Fp16 && e.pack_version() < [0, 25, 0] {
             let (mut d_out, mut p_out) = (fresh(), fresh());
             e.attn_prefill_f16(
                 &d_q,
@@ -1008,5 +1041,142 @@ fn single_slot_prefill_twins_match_dense() {
             );
         }
         eprintln!("single-slot prefill twins {dtype:?}: bit-identical");
+    }
+}
+
+/// The batched-runs launch of the tensor-core prefill at Flash-Next's
+/// geometry (24 / 2 x 256: the paged dispatcher's v4 arm at G = 12, from
+/// pack 0.25). Four runs over four slots - a resumed chunk, a fresh prompt, a
+/// verify-sized 4-row chunk and a slot's last rows - in ONE launch behind a
+/// registered run table must write every row exactly as a launch of that
+/// run alone does (`attn_prefill_f16_paged_at`, bit for bit), and stay
+/// inside the f16 class of the f32 SIMT walk it replaces
+/// (`attn_prefill_batch_paged`). Rows past each slot's live keys are NaN, so
+/// a run that attended another run's slot, or a row read past its keys,
+/// shows. f16 and e4m3 pools.
+#[test]
+fn prefill_runs_tensor_core_matches_single_runs() {
+    let Some(e) = exec_with_modes() else { return };
+    if e.pack_version() < [0, 25, 0]
+        || !e.kernels_pf_runs_available()
+        || !e.has_attn_prefill_f16_paged()
+    {
+        common::missing("a pack >= 0.25 with the batched-runs tensor-core prefill");
+        return;
+    }
+    let lay = attn_layout();
+    // (slot, first position, rows), contiguous in walk rows
+    let runs = [
+        (0usize, 300usize, 41usize),
+        (2, 0, 71),
+        (1, 14, 4),
+        (3, 500, 12),
+    ];
+    let (mut pos, mut slot, mut offs, mut t_row0, mut t_slot) =
+        (vec![], vec![], vec![0u32], vec![], vec![]);
+    for &(s, p0, n) in &runs {
+        let r0 = pos.len() as u32;
+        for i in 0..n {
+            pos.push((p0 + i) as u32);
+            slot.push(s as u32);
+        }
+        for t in 0..n.div_ceil(16) {
+            t_row0.push(r0 + 16 * t as u32);
+            t_slot.push(s as u32);
+        }
+        offs.push(pos.len() as u32);
+    }
+    let n = pos.len();
+    let maxn = runs.iter().map(|r| r.2).max().unwrap();
+    let d_pos = e.to_device_u32(&pos).unwrap();
+    let d_slot = e.to_device_u32(&slot).unwrap();
+    let d_offs = e.to_device_u32(&offs).unwrap();
+    let d_r0 = e.to_device_u32(&t_row0).unwrap();
+    let d_ts = e.to_device_u32(&t_slot).unwrap();
+    let d_bt = e.to_device_u32(&lay.table).unwrap();
+    let (nh, nkv, hd) = GEOMS[0];
+    let kv_dim = nkv * hd;
+    let scale = 1.0 / (hd as f32).sqrt();
+    let d_q = e.to_device(&det(n * nh * hd, 61)).unwrap();
+    let d_sinks = e.to_device(&det(nh, 62)).unwrap();
+    for dtype in DTYPES {
+        let [_, _, pk, pv] = kv_planes(&lay, kv_dim, dtype, 63);
+        let (d_pk, d_pv) = (e.to_device_u8(&pk).unwrap(), e.to_device_u8(&pv).unwrap());
+        let fresh = || e.to_device(&vec![f32::NAN; n * nh * hd]).unwrap();
+        let (mut a_out, mut b_out, mut c_out) = (fresh(), fresh(), fresh());
+        // one launch, every run
+        e.pf_runs_register(Some((&d_offs, runs.len() as u32, maxn as u32)))
+            .unwrap();
+        let walked = e.attn_prefill_f16_paged(
+            &d_q, &d_pk, &d_pv, &d_sinks, &mut a_out, &d_pos, &d_slot, &d_bt, lay.bps, nh, nkv, hd,
+            kv_dim, 0, n, scale, dtype,
+        );
+        e.pf_runs_register(None).unwrap();
+        walked.unwrap();
+        // each run alone, in place at its rows
+        for (i, r) in runs.iter().enumerate() {
+            e.attn_prefill_f16_paged_at(
+                &d_q,
+                &d_pk,
+                &d_pv,
+                &d_sinks,
+                &mut b_out,
+                &d_pos,
+                &d_slot,
+                offs[i] as usize,
+                &d_bt,
+                lay.bps,
+                nh,
+                nkv,
+                hd,
+                kv_dim,
+                0,
+                r.2,
+                scale,
+                dtype,
+            )
+            .unwrap();
+        }
+        let (a, b) = (e.to_host(&a_out).unwrap(), e.to_host(&b_out).unwrap());
+        let what = format!("prefill runs (v4 G12) {dtype:?}");
+        assert_same(&b, &a, &what);
+        // the f32 SIMT walk it replaces: the same values to the f16 class
+        e.attn_prefill_batch_paged(
+            &d_q,
+            &d_pk,
+            &d_pv,
+            &d_sinks,
+            &mut c_out,
+            &d_pos,
+            &d_slot,
+            &d_bt,
+            lay.bps,
+            &d_r0,
+            &d_ts,
+            t_row0.len(),
+            nh,
+            nkv,
+            hd,
+            kv_dim,
+            0,
+            n,
+            scale,
+            dtype,
+        )
+        .unwrap();
+        let c = e.to_host(&c_out).unwrap();
+        let big = c.iter().fold(0f32, |m, x| m.max(x.abs()));
+        let dev = a
+            .iter()
+            .zip(&c)
+            .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        eprintln!(
+            "{what}: {n} rows in one launch bit-identical to the runs alone; max |d| vs the f32 \
+             walk {dev:.3e} (max |ref| {big:.3e})"
+        );
+        assert!(
+            dev <= 4e-3 * big.max(1.0),
+            "{what}: {dev} off the f32 walk (max |ref| {big})"
+        );
     }
 }

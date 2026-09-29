@@ -225,7 +225,8 @@ pub(super) struct MmShareCtx {
     pub(super) mrope: Vec<u32>,
     pub(super) bound: Vec<u32>,
     pub(super) splices: Vec<(usize, usize)>,
-    pub(super) images: Vec<super::vision::VisionOutput>,
+    /// the request's pictures while its group's pass runs, empty otherwise
+    pub(super) images: Vec<super::pictures::Picture>,
     pub(super) final_mrope_pos: usize,
 }
 
@@ -265,7 +266,10 @@ impl GpuQwen35 {
             self.exec.trim_mem_pool();
             self.ensure_scratch(rows)?;
             match self.enable_batch_at(requested, chunk)? {
-                Ok(width) => return Ok(width),
+                Ok(width) => {
+                    self.cap_picture_at_pass();
+                    return Ok(width);
+                }
                 Err(refusal) if chunk > super::PREFILL_CHUNK_ROWS_MIN => {
                     tracing::warn!(
                         chunk_rows = chunk,
@@ -470,6 +474,19 @@ impl GpuQwen35 {
             0
         };
         let (ckpt_blocks, ckpt_retention) = ckpt_page_demand(max_batch, pages_per_ckpt);
+        // Image input's two on-demand costs, priced like the wave buffers.
+        // The widest tower pass: a picture at the per-picture cap (the elected
+        // chunk) runs alone at four patch rows per token, and smaller ones
+        // batch up to TOWER_PASS_ROWS - 2.6 GB on the 27B at an 8192-token
+        // cap. Then the picture store's byte budget (see `pictures`).
+        let (vision_tower, picture_store) = match self.vision.as_ref() {
+            Some(vm) => {
+                let picture_tokens = (vm.budget().max_tokens as usize).min(chunk);
+                let rows = super::vision::TOWER_PASS_ROWS.max(4 * picture_tokens);
+                (vm.pass_bytes(rows), self.picture_budget_bytes(chunk))
+            }
+            None => (0, 0),
+        };
         let demand = kv_plan::Demand {
             family: "qwen35",
             max_ctx: self.max_ctx,
@@ -487,6 +504,8 @@ impl GpuQwen35 {
                 kv_plan::Reserve::new("prefill wave buffers", wave_bufs),
                 kv_plan::Reserve::new("graph pools + headroom", graph_headroom),
                 kv_plan::Reserve::new("kv-tier staging", tier_staging),
+                kv_plan::Reserve::new("vision tower pass", vision_tower),
+                kv_plan::Reserve::new("picture store", picture_store),
             ],
             // Issue 2: when the budget cannot back --max-ctx ×
             // --max-batch, refuse loudly instead of silently under-sizing -
@@ -1392,21 +1411,22 @@ impl GpuQwen35 {
     /// `forward_prefill_batch`, threading the mm extras through
     /// `prefill_batch_pass`. `PADDOCK_NO_MM_BATCH_PREFILL` pins the serial
     /// per-slot path for A/B.
-    pub fn forward_prefill_batch_mm(
+    ///
+    /// Pictures are encoded per prefill GROUP, not for the whole wave up
+    /// front: a group's requests share one batched tower call, and their
+    /// pictures are released when the group's pass ends - the same bound the
+    /// per-slot path keeps per pass (see `pictures`).
+    pub fn forward_prefill_mm_wave(
         &mut self,
-        reqs: Vec<(
-            usize,
-            Vec<crate::service::MmChunk>,
-            Vec<super::vision::VisionOutput>,
-        )>,
+        reqs: Vec<(usize, Vec<crate::service::MmChunk>)>,
     ) -> Result<Vec<(Vec<f32>, usize)>, GpuModelError> {
         if paddock_models::dev_var_os!("PADDOCK_NO_MM_BATCH_PREFILL").is_some() || reqs.len() < 2 {
             if paddock_models::dev_var_os!("PADDOCK_ROUTE_WITNESS").is_some() {
                 eprintln!("pd route: mm prefill SERIAL n={}", reqs.len());
             }
             let mut out = Vec::with_capacity(reqs.len());
-            for (slot, chunks, images) in reqs {
-                out.push(self.forward_prefill_slot_mm_encoded(slot, &chunks, images)?);
+            for (slot, chunks) in reqs {
+                out.push(self.forward_prefill_slot_mm(slot, &chunks)?);
             }
             return Ok(out);
         }
@@ -1432,32 +1452,39 @@ impl GpuQwen35 {
             usize,
             usize,
             Vec<crate::service::MmChunk>,
-            Vec<super::vision::VisionOutput>,
+            Vec<(usize, usize)>,
         )> = Vec::with_capacity(reqs.len());
-        for (i, (slot, chunks, images)) in reqs.into_iter().enumerate() {
+        for (i, (slot, chunks)) in reqs.into_iter().enumerate() {
             if slot >= max_batch {
                 return Err(GpuModelError::BatchTooLarge {
                     got: slot + 1,
                     max: max_batch,
                 });
             }
-            if self.mm_prefix_would_resume(&chunks, &images)? {
-                out[i] = Some(self.forward_prefill_slot_mm_encoded(slot, &chunks, images)?);
+            let grids = self.picture_grids(&chunks)?;
+            // ...and the ones longer than one planned prefill chunk: a batched
+            // pass takes each prompt whole, so one of those would regrow the
+            // serving scratch to its length, where the serial path cuts it
+            // into planned passes (`mm_pass_ends`)
+            if self.mm_prefix_would_resume(&chunks, &grids)?
+                || mm_rows(&chunks, &grids) > self.prefill_chunk_rows
+            {
+                out[i] = Some(self.forward_prefill_slot_mm(slot, &chunks)?);
             } else {
-                cold.push((i, slot, chunks, images));
+                cold.push((i, slot, chunks, grids));
             }
         }
         if cold.len() == 1 {
             // a cohort of one is the serial path, and this one also gets to
             // publish its pages for the next turn
-            let (i, slot, chunks, images) = cold.pop().expect("len 1");
-            out[i] = Some(self.forward_prefill_slot_mm_encoded(slot, &chunks, images)?);
+            let (i, slot, chunks, _) = cold.pop().expect("len 1");
+            out[i] = Some(self.forward_prefill_slot_mm(slot, &chunks)?);
         } else if !cold.is_empty() {
             let mut orig: Vec<usize> = Vec::with_capacity(cold.len());
             let mut items: Vec<(usize, Vec<u32>)> = Vec::with_capacity(cold.len());
             let mut ctxs: Vec<MmShareCtx> = Vec::with_capacity(cold.len());
-            for (i, slot, chunks, images) in cold {
-                let grids: Vec<(usize, usize)> = images.iter().map(|v| (v.nx, v.ny)).collect();
+            let mut prompts: Vec<Vec<crate::service::MmChunk>> = Vec::with_capacity(cold.len());
+            for (i, slot, chunks, grids) in cold {
                 let MmLayout {
                     ids,
                     mrope,
@@ -1478,19 +1505,20 @@ impl GpuQwen35 {
                     mrope,
                     bound,
                     splices,
-                    images,
+                    images: Vec::new(),
                     final_mrope_pos,
                 });
+                prompts.push(chunks);
             }
-            let cap = batch_prefill_cap();
-            let mut lout: Vec<Vec<f32>> = vec![Vec::new(); items.len()];
+            // never past the planned pass either, or a group regrows it
+            let cap = batch_prefill_cap().min(self.prefill_chunk_rows);
+            let mut groups: Vec<Vec<usize>> = Vec::new();
             let mut group: Vec<usize> = Vec::new();
             let mut rows = 0usize;
-            for i in 0..items.len() {
-                let tl = items[i].1.len();
+            for (i, item) in items.iter().enumerate() {
+                let tl = item.1.len();
                 if rows + tl > cap && !group.is_empty() {
-                    self.prefill_batch_pass(&items, &group, &mut lout, Some(&ctxs))?;
-                    group.clear();
+                    groups.push(std::mem::take(&mut group));
                     rows = 0;
                 }
                 // an oversized single request just runs as its own pass (same
@@ -1499,7 +1527,32 @@ impl GpuQwen35 {
                 rows += tl;
             }
             if !group.is_empty() {
-                self.prefill_batch_pass(&items, &group, &mut lout, Some(&ctxs))?;
+                groups.push(group);
+            }
+            let mut lout: Vec<Vec<f32>> = vec![Vec::new(); items.len()];
+            for group in &groups {
+                // the group's pictures, one batched tower call across its
+                // requests, borrowed for this pass only
+                let want: Vec<(&[u8], usize, usize)> = group
+                    .iter()
+                    .flat_map(|&j| {
+                        prompts[j].iter().filter_map(|c| match c {
+                            crate::service::MmChunk::Image { rgb, w, h } => {
+                                Some((rgb.as_slice(), *w, *h))
+                            }
+                            _ => None,
+                        })
+                    })
+                    .collect();
+                let mut got = self.encode_pictures(&want)?.into_iter();
+                for &j in group {
+                    let n = ctxs[j].splices.len();
+                    ctxs[j].images = got.by_ref().take(n).collect();
+                }
+                self.prefill_batch_pass(&items, group, &mut lout, Some(&ctxs))?;
+                for &j in group {
+                    ctxs[j].images.clear();
+                }
             }
             for (j, l) in lout.into_iter().enumerate() {
                 out[orig[j]] = Some((l, items[j].1.len()));
@@ -1513,7 +1566,7 @@ impl GpuQwen35 {
 
     /// Would this multimodal prompt find a resumable checkpoint in the radix?
     ///
-    /// Asked before admission so `forward_prefill_batch_mm` can route it, and
+    /// Asked before admission so `forward_prefill_mm_wave` can route it, and
     /// deliberately answered with the same `match_full` the real resume uses
     /// rather than a cheaper approximation - a router that disagrees with the
     /// thing it routes to is worse than no router. `match_full` only reads and
@@ -1521,13 +1574,12 @@ impl GpuQwen35 {
     fn mm_prefix_would_resume(
         &mut self,
         chunks: &[crate::service::MmChunk],
-        images: &[super::vision::VisionOutput],
+        grids: &[(usize, usize)],
     ) -> Result<bool, GpuModelError> {
         if self.batch.as_ref().is_none_or(|b| b.paged_prefix.is_none()) {
             return Ok(false);
         }
-        let grids: Vec<(usize, usize)> = images.iter().map(|v| (v.nx, v.ny)).collect();
-        let lay = build_mm_layout(chunks, &grids)?;
+        let lay = build_mm_layout(chunks, grids)?;
         let keys = mm_radix_keys(&lay, &mm_image_hashes(chunks));
         let bs = self.batch.as_mut().expect("checked above");
         let m = bs
@@ -1624,7 +1676,7 @@ impl GpuQwen35 {
     /// `mm` (parallel to `items`) threads the multimodal extras
     /// through the same body: per-request 4-axis mrope, image visibility bounds
     /// (bound-driven segment attention), embedding splices after embed, and the
-    /// per-slot mrope delta - the batched twin of forward_prefill_slot_mm_encoded.
+    /// per-slot mrope delta - the batched twin of forward_prefill_slot_mm.
     /// persistent `prefill_batch_pass` buffers (see `PfPassBufs`).
     /// Grow-only with headroom; growth moves device addresses, so it drops
     /// every captured pass graph.
@@ -2718,7 +2770,7 @@ impl GpuQwen35 {
                                     // mm segment: bound-driven attention (image rows see
                                     // their whole equal-t block) - the exact solo-mm
                                     // prefill_attn call at base-0, bit-identical to
-                                    // forward_prefill_slot_mm_encoded's. The fast
+                                    // forward_prefill_slot_mm's. The fast
                                     // in-place paged arm assumes bound == row position,
                                     // so mm keeps the copy path (segments are short).
                                     let ctx = &m[oi];

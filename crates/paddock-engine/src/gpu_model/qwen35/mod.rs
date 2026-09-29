@@ -35,6 +35,7 @@ mod forward;
 mod load;
 mod multimodal;
 mod ops;
+pub mod pictures;
 mod prefix;
 mod rotation;
 mod spec;
@@ -1731,13 +1732,10 @@ pub struct GpuQwen35 {
     /// by a budgeted span per tick alongside the live decode rows, so an
     /// admission wave never freezes the streams for its whole prompt.
     chunked: Vec<ChunkedPrefill>,
-    /// Vision-tower output cache: a re-sent image (multi-turn vision chat
-    /// re-renders the same picture every turn) skips preprocess + tower.
-    /// Keyed by the raw request bytes; exact-bytes verified like the radix
-    /// cache's tokens, so a hash collision costs a miss, never a wrong reuse.
-    image_cache: Vec<ImageCacheEntry>,
-    image_cache_clock: u64,
-    image_cache_reused: u64,
+    /// Encoded pictures, the only owner of the tower's outputs, bounded in
+    /// bytes by the plan (see `pictures`): a re-sent image skips preprocess +
+    /// tower, and a prefill borrows a picture instead of copying it.
+    pictures: crate::gpu_model::picture_store::PictureStore<pictures::PictureEmbd>,
     /// In-flight pipelined pure-decode (see [`Self::decode_pipe_begin`]). Some
     /// only transiently, between a `decode_pipe_begin` and its matching drain
     /// inside one `run_batched` decode burst; the scheduler always drains before
@@ -1797,25 +1795,6 @@ struct UnifiedInflight {
     hold_seg: Vec<(CudaSlice<u32>, CudaSlice<u32>)>,
 }
 
-/// One cached vision-tower output (device-resident projected embeddings).
-struct ImageCacheEntry {
-    hash: u64,
-    w: usize,
-    h: usize,
-    rgb: Vec<u8>,
-    embd: CudaSlice<f32>,
-    nx: usize,
-    ny: usize,
-    last_used: u64,
-}
-
-/// Images held in the vision-tower output cache. Each entry is the projected
-/// embedding rows (~15-30 MB device) plus the raw bytes host-side for the
-/// exact-match verify. Sized so a multi-image request (e.g. a multi-page
-/// document sent as page images) keeps all of its images cached across turns
-/// rather than thrashing within a single prefill.
-const IMAGE_CACHE_ENTRIES: usize = 16;
-
 /// FNV-1a over the raw image bytes (+ dims folded in by the caller).
 fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
@@ -1844,6 +1823,19 @@ struct MmLayout {
     t_len: usize,
     /// the llama-position the first decoded token continues from.
     final_mrope_pos: usize,
+}
+
+/// Rows a multimodal prompt prefills - its text tokens plus each picture's
+/// merged grid, i.e. `build_mm_layout`'s `t_len` without building the layout.
+fn mm_rows(chunks: &[crate::service::MmChunk], grids: &[(usize, usize)]) -> usize {
+    let text: usize = chunks
+        .iter()
+        .map(|c| match c {
+            crate::service::MmChunk::Text(t) => t.len(),
+            _ => 0,
+        })
+        .sum();
+    text + grids.iter().map(|&(nx, ny)| nx * ny).sum::<usize>()
 }
 
 /// Walk the interleaved chunk list in order and lay out the fused prompt for an
@@ -3157,7 +3149,7 @@ mod mm_layout_tests {
     //! the oracle), so lifting the one-image cap provably does not perturb an
     //! existing one-image request; multi-image is checked against hand-computed
     //! expectations. No GPU/model needed - [`build_mm_layout`] is pure.
-    use super::{MmLayout, build_mm_layout};
+    use super::{MmLayout, build_mm_layout, mm_rows};
     use crate::service::MmChunk;
 
     fn img() -> MmChunk {
@@ -3272,6 +3264,23 @@ mod mm_layout_tests {
         assert_eq!(&w[7..10], &[5, 5, 5]);
         // bounds: text = own index; each image span = its last row index
         assert_eq!(l.bound, vec![0, 1, 5, 5, 5, 5, 6, 9, 9, 9, 10, 11]);
+    }
+
+    /// `mm_rows` is what routes a long picture prompt away from the batched
+    /// pass, so it has to agree with the layout that pass would build.
+    #[test]
+    fn mm_rows_is_the_layout_length() {
+        let chunks = vec![
+            MmChunk::Text(vec![1, 2]),
+            img(),
+            MmChunk::Text(vec![3]),
+            img(),
+            MmChunk::Text(vec![4, 5]),
+        ];
+        for grids in [[(2usize, 2usize), (1, 3)], [(64, 64), (32, 128)]] {
+            let l = build_mm_layout(&chunks, &grids).unwrap();
+            assert_eq!(mm_rows(&chunks, &grids), l.t_len);
+        }
     }
 
     #[test]

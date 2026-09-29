@@ -1,8 +1,8 @@
 //! Exact, process-local MLX prefix reuse. KV pages are immutable/refcounted;
 //! every non-KV carried state is copied together in one fenced blit submission.
-//! Retain a full-chunk fallback plus a page-aligned prompt-tail checkpoint.
-//! A tail is reusable only if ALL row-dependent contractions match the new
-//! prompt. Decode states are never substituted for prefill state.
+//! Retain a stable logical-boundary fallback plus a page-aligned prompt tail.
+//! ALL arithmetic intervals of the retained prefix must match the new prompt.
+//! Decode states are never substituted for prefill state.
 use super::*;
 
 fn trace() -> bool {
@@ -15,7 +15,7 @@ pub(super) struct Entry {
     history: Vec<u32>,
     table: BlockTable,
     touched: u64,
-    class: u16,
+    contract: Vec<(usize, u16)>,
 }
 
 #[derive(Default)]
@@ -65,7 +65,7 @@ impl PrefixCache {
                     history: Vec::new(),
                     table: BlockTable::default(),
                     touched: 0,
-                    class: 0,
+                    contract: Vec::new(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -86,6 +86,7 @@ impl PrefixCache {
             return false;
         };
         entry.history.clear();
+        entry.contract.clear();
         entry.table.clear(pool);
         true
     }
@@ -134,8 +135,8 @@ impl FlashNext {
                 compatible(
                     &e.history,
                     tokens,
-                    self.chunk,
-                    e.class,
+                    &self.slots[slot].plan,
+                    &e.contract,
                     &self.prefix.classes,
                 )
             })
@@ -157,13 +158,12 @@ impl FlashNext {
                 .max_by_key(|e| e.history.len());
             let (candidate_tokens, stored_class, requested_class) =
                 longest.map_or((0, 0, 0), |e| {
-                    let logical = super::serving::logical_chunk(
-                        tokens.len(),
-                        e.history.len() - 1,
-                        self.chunk,
+                    let logical = self.slots[slot].plan.at(e.history.len() - 1).0;
+                    (
+                        e.history.len(),
+                        e.contract.last().map_or(0, |v| v.1),
+                        self.prefix.classes[logical],
                     )
-                    .0;
-                    (e.history.len(), e.class, self.prefix.classes[logical])
                 });
             tracing::info!(
                 slot,
@@ -194,7 +194,7 @@ impl FlashNext {
 
     pub(super) fn capture_prefix(&mut self, slot: usize, tokens: &[u32]) -> Result<()> {
         let length = self.slots[slot].length;
-        let cuts = cuts(tokens.len(), self.chunk);
+        let cuts = self.slots[slot].plan.cuts();
         if self.prefix.entries.is_empty()
             || length == 0
             || length >= tokens.len()
@@ -203,13 +203,12 @@ impl FlashNext {
             return Ok(());
         }
         let history = &tokens[..length];
-        let logical = super::serving::logical_chunk(tokens.len(), length - 1, self.chunk).0;
-        let class = self.prefix.classes[logical];
+        let contract = self.slots[slot].plan.contract(length, &self.prefix.classes);
         if self
             .prefix
             .entries
             .iter()
-            .any(|e| e.history == history && e.class == class)
+            .any(|e| e.history == history && e.contract == contract)
         {
             return Ok(());
         }
@@ -231,6 +230,7 @@ impl FlashNext {
         // Invalidate before overwriting; publish state and page references only
         // after successful completion. No partially captured entry is visible.
         self.prefix.entries[index].history.clear();
+        self.prefix.entries[index].contract.clear();
         self.prefix.entries[index].table.clear(&mut self.pool);
         self.poisoned = true;
         self.copy_prefix_state(slot, index, length, false)?;
@@ -240,7 +240,7 @@ impl FlashNext {
             &mut self.pool,
         );
         entry.history.extend_from_slice(history);
-        entry.class = class;
+        entry.contract = contract;
         self.prefix.clock += 1;
         entry.touched = self.prefix.clock;
         self.poisoned = false;
@@ -314,15 +314,22 @@ fn transfer_state<'a>(
     device.copy_regions(&copies)
 }
 
-fn compatible(history: &[u32], tokens: &[u32], chunk: usize, class: u16, classes: &[u16]) -> bool {
+fn compatible(
+    history: &[u32],
+    tokens: &[u32],
+    plan: &prompt::Plan,
+    contract: &[(usize, u16)],
+    classes: &[u16],
+) -> bool {
     !history.is_empty()
         && history.len().is_multiple_of(BLOCK_TOKENS)
         && history.len() < tokens.len()
-        && class != 0
-        && classes[super::serving::logical_chunk(tokens.len(), history.len() - 1, chunk).0] == class
         && tokens.starts_with(history)
+        && !contract.is_empty()
+        && plan.contract(history.len(), classes) == contract
 }
 
+#[cfg(test)]
 pub(super) fn cuts(tokens: usize, chunk: usize) -> [usize; 2] {
     let last = tokens.saturating_sub(1) / chunk * chunk;
     // Leave 16..31 tokens for a rewritten assistant/tool header, rather than
@@ -338,6 +345,7 @@ pub(super) fn cuts(tokens: usize, chunk: usize) -> [usize; 2] {
     }
 }
 
+#[cfg(test)]
 pub(super) fn rows_until_cut(tokens: usize, offset: usize, chunk: usize) -> usize {
     cuts(tokens, chunk)
         .into_iter()
@@ -476,7 +484,7 @@ mod tests {
                 history: vec![1; 32],
                 table,
                 touched: 1,
-                class: 0,
+                contract: Vec::new(),
             }],
             clock: 1,
             classes: vec![],
@@ -505,7 +513,7 @@ mod tests {
                 history: vec![1; blocks * BLOCK_TOKENS],
                 table,
                 touched: blocks as u64,
-                class: 0,
+                contract: Vec::new(),
             });
         }
         let mut prefix = PrefixCache {
@@ -533,7 +541,13 @@ mod tests {
     fn prefix_matches_tokens_and_arithmetic_boundary_not_only_length() {
         let classes = super::super::super::mlx::arithmetic_classes();
         let compatible = |h: &[u32], tokens: &[u32], chunk: usize| {
-            super::compatible(h, tokens, chunk, classes[chunk], &classes)
+            super::compatible(
+                h,
+                tokens,
+                &prompt::Plan::grid(tokens.len(), chunk),
+                &[(h.len(), classes[chunk])],
+                &classes,
+            )
         };
         let h = vec![7; 1024];
         assert!(compatible(&h, &[7; 1040], 1024));
@@ -555,22 +569,22 @@ mod tests {
         assert!(super::compatible(
             &vec![7; 1680],
             &vec![7; 1800],
-            1024,
-            classes[675],
+            &prompt::Plan::grid(1800, 1024),
+            &prompt::Plan::grid(1700, 1024).contract(1680, &classes),
             &classes
         ));
         assert!(!super::compatible(
             &vec![7; 1680],
             &vec![7; 2020],
-            1024,
-            classes[675],
+            &prompt::Plan::grid(2020, 1024),
+            &prompt::Plan::grid(1700, 1024).contract(1680, &classes),
             &classes
         ));
         assert!(!super::compatible(
             &vec![7; 1680],
             &vec![7; 1800],
-            1024,
-            0,
+            &prompt::Plan::grid(1800, 1024),
+            &[],
             &classes
         ));
         for tokens in 1..=4096 {

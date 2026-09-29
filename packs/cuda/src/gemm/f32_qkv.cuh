@@ -4799,49 +4799,46 @@ int pd_attn_decode_batch_partial_paged(const void* q, const void* pool_k, const 
                     // 4-score/4-V split (K-split score x warp specialization) -
                     // bench glb 142.7 -> 95.5 us (-33%, 5.62 TB/s = the
                     // both-halves bound). Kill: PADDOCK_NO_V8KS -> v7ks.
-                    static int no_v8ks = -1;
-                    if (no_v8ks < 0) no_v8ks = pd_env("PADDOCK_NO_V8KS") ? 1 : 0;
-                    static int no_v7ks = -1;
-                    if (no_v7ks < 0) no_v7ks = pd_env("PADDOCK_NO_V7KS") ? 1 : 0;
-                    static bool ks_attr = false;
-                    if (!ks_attr) {
-                        cudaFuncSetAttribute(
-                            (const void*)pd_attn_decode_v7ks_kernel<512u, 8u>,
-                            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)v7_smem);
-                        ks_attr = true;
-                    }
-                    static bool ks8_attr = false;
-                    if (!ks8_attr) {
-                        cudaFuncSetAttribute(
-                            (const void*)pd_attn_decode_v8ks_kernel<512u, 8u>,
-                            cudaFuncAttributeMaxDynamicSharedMemorySize,
-                            (int)(5u * ((512u * 2u / 128u) * 2048u)
-                                  + 16u * (512u + 8u) * 2u + 2u * 16u * 24u * 2u + 1024u));
-                        ks8_attr = true;
-                    }
-                    if (!no_v8ks) {
+                    //
+                    // Elected BY FIT, once per process. v8ks's five 16 KB ring
+                    // stages and its q tile take 101,120 B dynamic plus 1,408 B
+                    // static (2,048 in the sm_121a image) - over the 101,376 B
+                    // opt-in cap of sm_86/89/120/121, so it serves only on the
+                    // 227 KB parts it was measured on. It used to be launched
+                    // on every cc >= 9 die: on GB10 every f16-KV hd512 decode
+                    // was refused (gemma4 under --kv-cache-dtype f16), and its
+                    // unchecked attribute set left an error that failed the
+                    // first launch of whichever arm ran instead (the kills
+                    // included). pd_smem_fits counts static, sets the limit
+                    // only when it fits and leaves no error behind. v7ks takes
+                    // 89,088 B on sm_121a, v7 84,992 - both fit every die.
+                    using KsFn = decltype(&pd_attn_decode_v7_kernel<512u, 8u>);
+                    static KsFn ks_fn = nullptr;
+                    static uint32_t ks_smem = 0;
+                    if (!ks_fn) {
                         const uint32_t v8s = 5u * ((512u * 2u / 128u) * 2048u)
                             + 16u * (512u + 8u) * 2u + 2u * 16u * 24u * 2u + 1024u;
-                        pd_pdl_go(pd_attn_decode_v8ks_kernel<512u, 8u>, v7grid, 256, v8s,
-                   (cudaStream_t)stream,
-                                *tk, *tv, (const float*)q, (float*)out_o, (float*)out_ml,
-                                (const unsigned int*)positions, (const unsigned int*)slots,
-                                (const uint32_t*)block_tables, blocks_per_slot,
-                                kv_dim, swa_window, n_splits, scale);
-                    } else if (!no_v7ks)
-                        pd_pdl_go(pd_attn_decode_v7ks_kernel<512u, 8u>, v7grid, 256, v7_smem,
-                   (cudaStream_t)stream,
-                                *tk, *tv, (const float*)q, (float*)out_o, (float*)out_ml,
-                                (const unsigned int*)positions, (const unsigned int*)slots,
-                                (const uint32_t*)block_tables, blocks_per_slot,
-                                kv_dim, swa_window, n_splits, scale);
-                    else
-                        pd_pdl_go(pd_attn_decode_v7_kernel<512u, 8u>, v7grid, 256, v7_smem,
-                   (cudaStream_t)stream,
-                                *tk, *tv, (const float*)q, (float*)out_o, (float*)out_ml,
-                                (const unsigned int*)positions, (const unsigned int*)slots,
-                                (const uint32_t*)block_tables, blocks_per_slot,
-                                kv_dim, swa_window, n_splits, scale);
+                        if (!pd_env("PADDOCK_NO_V8KS")
+                            && pd_smem_fits((const void*)pd_attn_decode_v8ks_kernel<512u, 8u>,
+                                            v8s)) {
+                            ks_fn = pd_attn_decode_v8ks_kernel<512u, 8u>;
+                            ks_smem = v8s;
+                        } else if (!pd_env("PADDOCK_NO_V7KS")
+                                   && pd_smem_fits(
+                                       (const void*)pd_attn_decode_v7ks_kernel<512u, 8u>,
+                                       v7_smem)) {
+                            ks_fn = pd_attn_decode_v7ks_kernel<512u, 8u>;
+                            ks_smem = v7_smem;
+                        } else {
+                            ks_fn = pd_attn_decode_v7_kernel<512u, 8u>;
+                            ks_smem = v7_smem;
+                        }
+                    }
+                    pd_pdl_go(ks_fn, v7grid, 256, ks_smem, (cudaStream_t)stream,
+                              *tk, *tv, (const float*)q, (float*)out_o, (float*)out_ml,
+                              (const unsigned int*)positions, (const unsigned int*)slots,
+                              (const uint32_t*)block_tables, blocks_per_slot,
+                              kv_dim, swa_window, n_splits, scale);
                 }
                 return pd_launch_status();
             }

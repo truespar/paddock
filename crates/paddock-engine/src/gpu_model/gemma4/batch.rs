@@ -611,8 +611,13 @@ pub(super) fn attn_fused16_arm(
         && kv_split_band(pmax) <= 6
 }
 
-/// route's own env kills so a killed route can never leave the output
-/// unnormalized. PADDOCK_NO_FIN1 kills the arm wholesale.
+/// Whether a one-split paged decode finalizes IN-KERNEL (o / l in the
+/// combined batch-major rows, no combine pass) at this geometry. The TMA
+/// tile walks do - v8/v8f8 at hd256 G2, and at hd512 G8 every arm the
+/// launcher can elect (v8ks where its smem fits, v7ks / v7 by fit or kill
+/// everywhere else, all three finalizing) - so this mirrors the kills that
+/// would route a geometry OFF those walks, and a killed route can never
+/// leave the output unnormalized. PADDOCK_NO_FIN1 kills the arm wholesale.
 pub(super) fn fin1_ok(
     exec: &GpuExecutor,
     hd: usize,
@@ -627,7 +632,6 @@ pub(super) fn fin1_ok(
             && paddock_models::dev_var_os!("PADDOCK_NO_ATTN_V5").is_none()
             && paddock_models::dev_var_os!("PADDOCK_NO_ATTN_V7").is_none()
             && paddock_models::dev_var_os!("PADDOCK_NO_ATTN_V8").is_none()
-            && paddock_models::dev_var_os!("PADDOCK_NO_V8KS").is_none()
             && paddock_models::dev_var_os!("PADDOCK_NO_V8F8").is_none()
     });
     if !envs_ok || exec.compute_capability().0 < 9 {
@@ -663,15 +667,17 @@ pub(crate) fn build_swa_paging(
     swa_window: usize,
     slots: usize,
     span: usize,
+    overshoot: usize,
 ) -> Result<SwaPaging, GpuError> {
     let bps = max_ctx.div_ceil(16);
-    // the ring absorbs one SWA sub-span (plus a multimodal image-span
-    // overshoot) before the window behind it, not a whole PF_ROWS chunk -
-    // prefill_layers appends+attends SWA in `span` steps (2048 default:
-    // 211 blocks at window 1024). `span` is whatever the caller elected and
-    // must be the same value the cutters use, or the ring aliases blocks
-    // the window still needs.
-    let ring = ((span + super::forward::IMG_SPAN_MAX + swa_window).div_ceil(16) + 1).min(bps);
+    // the ring absorbs one SWA sub-span before the window behind it, not a
+    // whole PF_ROWS chunk - prefill_layers appends+attends SWA in `span`
+    // steps (2048 default: 211 blocks at window 1024). `span` is whatever
+    // the caller elected and must be the same value the cutters use, or the
+    // ring aliases blocks the window still needs. `overshoot` is how far one
+    // picture longer than a sub-span runs past it (`picture_overshoot`): the
+    // cutter never splits a picture, so such a picture is a sub-span alone.
+    let ring = ((span + overshoot + swa_window).div_ceil(16) + 1).min(bps);
     let mut bt = vec![0u32; slots * bps];
     for s in 0..slots {
         for j in 0..bps {
@@ -804,6 +810,22 @@ impl GpuGemma4 {
         Ok(())
     }
 
+    /// Narrow (or widen, within the load's ceiling) the prefill pass to
+    /// `rows` - the step `enable_batch_impl`'s ladder takes, callable directly
+    /// so a gate can prefill one prompt at two pass widths and compare. Every
+    /// graph that baked the old scratch goes, as it does in `enable_batch`.
+    #[doc(hidden)]
+    pub fn set_prefill_pass_rows(&mut self, rows: usize) -> Result<usize, GpuError> {
+        let rows = rows.clamp(self.pass_floor(), super::forward::PF_ROWS);
+        self.decode_graphs.clear();
+        self.graph_seen.clear();
+        self.prefill_graphs.clear();
+        self.prefill_graph_seen.clear();
+        self.mtp_graphs.clear();
+        self.set_pf_rows(rows)?;
+        Ok(rows)
+    }
+
     /// return the capacity actually enabled. Existing cache contents drop -
     /// the engine only enables batching before admitting sequences.
     pub(crate) fn enable_batch_impl(&mut self, max_batch: usize) -> Result<usize, GpuError> {
@@ -856,9 +878,10 @@ impl GpuGemma4 {
         // per-slot price: at window 1024 the 2048 rung holds 3376 positions
         // to retain 1024, the 512 rung holds 1824. Dense (unpaged) mode
         // ignores it - the planes are full-context either way.
+        let max_picture = self.max_picture_rows();
         let per_slot_for = |span: usize| -> usize {
             let ring_pos = self.paging.as_ref().map(|_| {
-                ((span + super::forward::IMG_SPAN_MAX + self.hp.swa_window).div_ceil(16) + 1)
+                ((span + max_picture.saturating_sub(span) + self.hp.swa_window).div_ceil(16) + 1)
                     .min(bps)
                     * 16
             });
@@ -934,6 +957,9 @@ impl GpuGemma4 {
         // somewhere a new family cannot forget to do it. The SWA-span LADDER stays
         // here because which sub-span to prefill in is a gemma4 question; the
         // planner only answers "does that rung still seat the whole ask".
+        // image input's on-demand costs (profiled before any grant is read,
+        // so the profile run's own transient is back with the driver)
+        let vision_reserves = self.vision_reserves()?;
         let demand_for = |per_slot: usize, slots: usize| kv_plan::Demand {
             family: "gemma4",
             max_ctx,
@@ -977,6 +1003,7 @@ impl GpuGemma4 {
                         crate::kv_tier::ram_transport::device_staging_bytes(),
                     ));
                 }
+                r.extend(vision_reserves.iter().copied());
                 r
             },
             ..Default::default()
@@ -996,8 +1023,9 @@ impl GpuGemma4 {
         // again on a width change, and a rung we stepped down to for 32 slots
         // must not become the permanent ceiling for a later 1-slot server that
         // has room to spare.
-        let mut chunk = super::forward::pf_rows(self.max_ctx);
-        let chunk_floor = super::forward::pf_rows_floor();
+        // never below one whole picture: a picture's rows prefill together
+        let chunk_floor = self.pass_floor();
+        let mut chunk = super::forward::pf_rows(self.max_ctx).max(chunk_floor);
         let (plan, elected, elected_cost) = loop {
             self.set_pf_rows(chunk)?;
             self.exec
@@ -1080,13 +1108,18 @@ impl GpuGemma4 {
         }
         let slots = plan.slots;
 
+        // the picture store holds what the plan reserved for the elected pass
+        let budget = self.picture_budget_bytes(self.pf_rows);
+        self.pictures.set_budget(budget);
         if self.paging.is_some() {
+            self.swa_overshoot = self.picture_overshoot(self.swa_span);
             self.paging = Some(build_swa_paging(
                 &self.exec,
                 self.max_ctx,
                 self.hp.swa_window,
                 slots,
                 self.swa_span,
+                self.swa_overshoot,
             )?);
         }
         let pool_blocks = if pooled { Some(plan.pool_blocks) } else { None };
@@ -1120,6 +1153,7 @@ impl GpuGemma4 {
                         self.hp.swa_window,
                         1,
                         self.swa_span,
+                        self.swa_overshoot,
                     )?);
                 }
                 self.kv = alloc_kv(

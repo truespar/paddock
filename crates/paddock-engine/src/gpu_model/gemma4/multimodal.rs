@@ -63,6 +63,14 @@ impl VisionTower {
         }
     }
 
+    /// Soft tokens a `w`x`h` picture will encode to, without encoding it.
+    pub(crate) fn tokens_for(&self, w: usize, h: usize) -> usize {
+        match self {
+            VisionTower::Gemma4(v) => v.tokens_for(w, h),
+            VisionTower::Muse(v) => v.tokens_for(w, h),
+        }
+    }
+
     /// Preprocess + encode one RGB8 image -> (device rows, row count).
     /// Preprocessing is part of the tower, not of the caller: the two disagree
     /// on the resize filter (bilinear vs LANCZOS), on whether the image is
@@ -103,23 +111,6 @@ enum Row {
     Image(usize, usize),
 }
 
-/// One cached vision-tower output: projected soft-token rows device-side,
-/// raw RGB host-side for the exact-bytes verify (see the field note on
-/// [`GpuGemma4::img_cache`]).
-pub(crate) struct G4ImageCacheEntry {
-    pub hash: u64,
-    pub w: usize,
-    pub h: usize,
-    pub rgb: Vec<u8>,
-    pub embd: CudaSlice<f32>,
-    pub n_tokens: usize,
-    pub last_used: u64,
-}
-
-/// Images held in the tower-output cache - sized so a multi-image request
-/// (a document sent as page images) stays resident across turns.
-const G4_IMAGE_CACHE_ENTRIES: usize = 16;
-
 /// FNV-1a over the raw image bytes (dims folded in by the caller).
 fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
@@ -138,6 +129,27 @@ impl GpuGemma4 {
         self.attach_vision_with(map, None)
     }
 
+    /// Soft-token rows of the largest picture the attached tower emits.
+    pub(crate) fn max_picture_rows(&self) -> usize {
+        self.vision
+            .as_ref()
+            .map_or(0, |v| v.budget().max_tokens as usize)
+    }
+
+    /// How far one picture longer than an SWA sub-span `span` runs past it:
+    /// the ring's picture allowance. The sub-span cutter never splits a
+    /// picture, so anything longer than a span is a sub-span on its own -
+    /// 0 for gemma4's 280-token pictures, a whole extra span for muse's 4096.
+    pub(crate) fn picture_overshoot(&self, span: usize) -> usize {
+        self.max_picture_rows().saturating_sub(span)
+    }
+
+    /// The narrowest prefill pass: one serving tick, and never less than one
+    /// whole picture (its rows prefill together).
+    pub(crate) fn pass_floor(&self) -> usize {
+        super::forward::pf_rows_floor().max(self.max_picture_rows().next_multiple_of(128))
+    }
+
     /// `attach_vision` plus the endpoint's resolved options. `max_image_tokens`
     /// is the per-image soft-token ceiling from `servers/<port>.toml`; None
     /// keeps the checkpoint's published budget. Only the gemma4 tower reads
@@ -148,6 +160,8 @@ impl GpuGemma4 {
         map: &paddock_models::mapped::MappedGguf,
         max_image_tokens: Option<usize>,
     ) -> Result<(), GpuError> {
+        // one picture prefills in one pass, and no pass is wider than PF_ROWS
+        let max_image_tokens = max_image_tokens.map(|t| t.min(super::forward::PF_ROWS));
         // The tower is elected by the TEXT model's arch, not by the mmproj's
         // projector string: they must agree, and the text side is what already
         // decided every other constant.
@@ -187,89 +201,68 @@ impl GpuGemma4 {
         Ok(())
     }
 
-    /// Encode one image through the tower, or serve it from the output cache
-    /// (hash + exact-bytes verify). Hits return a dtod CLONE of the cached
-    /// rows (~3 MB - noise next to the tower run it saves) so the splice code
-    /// below never holds a cache borrow.
-    ///
-    /// Also returns the CONTENT hash, which is what the prefix radix keys this
-    /// picture's rows on - the same number the cache identifies it by, so
-    /// "the tower cache hit" and "the KV cache hit" can never disagree about
-    /// whether two pictures are the same picture.
-    fn encode_image_cached(
+    /// The prefix radix's identity of one picture (its image-row keys).
+    /// The picture store keys on a 256-bit digest of the same inputs
+    /// (`picture_store::picture_key`), so the two can only disagree on a
+    /// 64-bit collision here.
+    fn picture_hash(rgb: &[u8], w: usize, h: usize) -> u64 {
+        hash_bytes(rgb)
+            ^ (w as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ (h as u64).rotate_left(32)
+    }
+
+    /// Borrow the encoded picture, from the picture store when its bytes were
+    /// encoded before and through the tower otherwise. The store is the only
+    /// owner - a hit used to allocate and copy the rows, and a miss kept a
+    /// second copy for the cache, whose 16 entries were bounded by count (a
+    /// muse picture is 109 MB) and kept each picture's raw RGB for an exact
+    /// compare.
+    fn encode_picture(
         &mut self,
         rgb: &[u8],
         w: usize,
         h: usize,
-    ) -> Result<(EncodedImage, u64), GpuError> {
-        let hash = hash_bytes(rgb)
-            ^ (w as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
-            ^ (h as u64).rotate_left(32);
-        self.img_cache_clock += 1;
-        let clock = self.img_cache_clock;
-        if let Some(e) = self
-            .img_cache
-            .iter_mut()
-            .find(|e| e.hash == hash && e.w == w && e.h == h && e.rgb == rgb)
-        {
-            e.last_used = clock;
-            let n_tokens = e.n_tokens;
-            let mut embd = self
-                .exec
-                .stream
-                .alloc_zeros::<f32>(e.embd.len())
-                .map_err(|er| GpuError::Driver(er.to_string()))?;
-            self.exec
-                .stream
-                .memcpy_dtod(&e.embd, &mut embd)
-                .map_err(|er| GpuError::Driver(er.to_string()))?;
-            self.img_cache_reused += 1;
-            if paddock_models::dev_var_os!("PADDOCK_VISION_DEBUG").is_some() {
-                tracing::info!(
-                    "[img-cache] HIT ({}x{}, {} soft tokens; reused {} total)",
-                    w,
-                    h,
-                    n_tokens,
-                    self.img_cache_reused
-                );
-            }
-            return Ok((EncodedImage { embd, n_tokens }, hash));
+    ) -> Result<std::sync::Arc<EncodedImage>, GpuError> {
+        let key = crate::gpu_model::picture_store::picture_key(rgb, w, h);
+        if let Some(p) = self.pictures.get(&key) {
+            return Ok(p);
         }
         let vision = self
             .vision
             .as_ref()
             .ok_or_else(|| GpuError::Driver("no mmproj attached".into()))?;
         let out = vision.encode_rgb(rgb, w, h)?;
-        // cache a device copy (the fresh buffer goes to the caller)
-        let mut copy = self
+        let bytes = (out.embd.len() * std::mem::size_of::<f32>()) as u64;
+        Ok(self.pictures.insert(key, out, bytes))
+    }
+
+    /// The plan's charges for image input, which allocates on demand and so
+    /// was never in it: one tower pass at the largest picture the tower emits,
+    /// MEASURED by a profile run at load (a blank max-size picture through
+    /// the tower, its pool high-water read - ~0.2 GB on gemma4's 280-token
+    /// grid, ~2 GB on muse's 4096), and the picture store's byte budget at the
+    /// widest pass the ladder can elect.
+    pub(crate) fn vision_reserves(&self) -> Result<Vec<crate::kv_plan::Reserve>, GpuError> {
+        let Some(v) = self.vision.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let side = ((v.budget().max_pixels as f64).sqrt() as usize).max(1);
+        let blank = vec![0u8; side * side * 3];
+        let (_, tower) = self
             .exec
-            .stream
-            .alloc_zeros::<f32>(out.embd.len())
-            .map_err(|er| GpuError::Driver(er.to_string()))?;
-        self.exec
-            .stream
-            .memcpy_dtod(&out.embd, &mut copy)
-            .map_err(|er| GpuError::Driver(er.to_string()))?;
-        if self.img_cache.len() >= G4_IMAGE_CACHE_ENTRIES {
-            let lru = self
-                .img_cache
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, e)| e.last_used)
-                .map(|(i, _)| i)
-                .expect("non-empty");
-            self.img_cache.swap_remove(lru);
-        }
-        self.img_cache.push(G4ImageCacheEntry {
-            hash,
-            w,
-            h,
-            rgb: rgb.to_vec(),
-            embd: copy,
-            n_tokens: out.n_tokens,
-            last_used: clock,
-        });
-        Ok((out, hash))
+            .pool_peak_during(|| v.encode_rgb(&blank, side, side))?;
+        let widest = super::forward::pf_rows(self.max_ctx).max(self.pass_floor());
+        Ok(vec![
+            crate::kv_plan::Reserve::new("vision tower pass", tower),
+            crate::kv_plan::Reserve::new("picture store", self.picture_budget_bytes(widest)),
+        ])
+    }
+
+    /// What the picture store may hold: two prefill passes of picture rows -
+    /// the one in flight and one for reuse (a repeated conversation prefix is
+    /// the radix KV cache's job, not this one's).
+    pub(crate) fn picture_budget_bytes(&self, pass_rows: usize) -> u64 {
+        (2 * pass_rows * self.hp.n_embd * std::mem::size_of::<f32>()) as u64
     }
 
     /// Exclusive multimodal prefill: encode every image, splice
@@ -328,15 +321,23 @@ impl GpuGemma4 {
             self.img_end_id.expect("markers checked at vision attach"),
         );
 
-        // pass 1: resolve every image (tower or cache) - needs &mut self,
-        // so it runs before the row stream takes any other borrows
-        let mut encoded: Vec<EncodedImage> = Vec::new();
+        // pass 1: each picture's radix identity and soft-token count - from
+        // the resize alone, so the whole layout is known before any picture
+        // is encoded (each is encoded when the pass that splices it comes up)
+        let mut sources: Vec<(&[u8], usize, usize)> = Vec::new();
+        let mut n_tok: Vec<usize> = Vec::new();
         let mut hashes: Vec<u64> = Vec::new();
-        for ch in chunks {
-            if let MmChunk::Image { rgb, w, h } = ch {
-                let (out, hash) = self.encode_image_cached(rgb, *w, *h)?;
-                encoded.push(out);
-                hashes.push(hash);
+        {
+            let vision = self
+                .vision
+                .as_ref()
+                .ok_or_else(|| GpuError::Driver("no mmproj attached".into()))?;
+            for ch in chunks {
+                if let MmChunk::Image { rgb, w, h } = ch {
+                    sources.push((rgb, *w, *h));
+                    n_tok.push(vision.tokens_for(*w, *h));
+                    hashes.push(Self::picture_hash(rgb, *w, *h));
+                }
             }
         }
         // pass 2: the interleaved row stream, and the radix key vector beside
@@ -356,7 +357,7 @@ impl GpuGemma4 {
                     rows.push(Row::Token(beg));
                     keys.push(beg);
                     let first = rows.len();
-                    let n = encoded[img_k].n_tokens;
+                    let n = n_tok[img_k];
                     rows.extend((0..n).map(|r| Row::Image(img_k, r)));
                     keys.extend((0..n).map(|r| image_key_row(hashes[img_k], r)));
                     img_spans.push((first, first + n));
@@ -395,7 +396,7 @@ impl GpuGemma4 {
 
         // image spans (for the non-causal attention-bound override):
         // span_end[i] = the absolute position of image i's last soft token
-        let mut span_end = vec![0usize; encoded.len()];
+        let mut span_end = vec![0usize; n_tok.len()];
         for (pos, row) in rows.iter().enumerate() {
             if let Row::Image(i, _) = row {
                 span_end[*i] = pos;
@@ -426,9 +427,41 @@ impl GpuGemma4 {
         // resume: rows [0, start) are already in KV, so the tail starts there
         // and `base` stays ABSOLUTE - positions, rope and the non-causal
         // attention bounds are all indexed off the full prompt, not the tail.
+        // Passes end at most `pf_rows` apart and NEVER inside a picture: its
+        // rows attend to its last row, so a pass that ended mid-picture had
+        // its first rows reading KV rows the next pass had not written yet -
+        // whatever the slot held before (found with two different prior
+        // prompts: the straddling prefill's logits moved by up to 3.2). The
+        // pass floor keeps one whole picture inside a pass.
+        let passes = crate::gpu_model::prefix_cache::mm_pass_ends(
+            start,
+            rows.len(),
+            &[],
+            &img_spans,
+            self.pf_rows,
+        );
         let mut base = start;
         let mut last_len = 0usize;
-        for chunk in rows[start..].chunks(self.pf_rows) {
+        for (end, _) in passes {
+            // the pictures this pass splices (a pass never cuts one), encoded
+            // or borrowed from the store now and released when the pass ends -
+            // a prompt's pictures are never all held at once
+            let mut pictures: Vec<Option<std::sync::Arc<EncodedImage>>> = vec![None; n_tok.len()];
+            for (k, &(s0, e0)) in img_spans.iter().enumerate() {
+                if s0 >= base && e0 <= end {
+                    let (rgb, w, h) = sources[k];
+                    let p = self.encode_picture(rgb, w, h)?;
+                    if p.n_tokens != n_tok[k] {
+                        return Err(GpuError::Driver(format!(
+                            "a {w}x{h} picture encoded to {} soft tokens where its resize \
+                             planned {} - the layout would splice it wrong",
+                            p.n_tokens, n_tok[k]
+                        )));
+                    }
+                    pictures[k] = Some(p);
+                }
+            }
+            let chunk = &rows[base..end];
             let r = chunk.len();
             let positions: Vec<u32> = (0..r).map(|i| (base + i) as u32).collect();
             // attention bounds: image rows see through their whole span
@@ -482,7 +515,10 @@ impl GpuGemma4 {
             }
             for (i, row) in chunk.iter().enumerate() {
                 if let Row::Image(img, ir) = row {
-                    let src = &encoded[*img].embd;
+                    let src = &pictures[*img]
+                        .as_ref()
+                        .expect("a pass's pictures are encoded before it runs")
+                        .embd;
                     let sc = &mut self.scratch;
                     self.exec
                         .copy_region(src, ir * n_embd, &mut sc.pf_x, i * n_embd, n_embd)?;
@@ -504,29 +540,39 @@ impl GpuGemma4 {
                     r,
                 )?;
             }
-            // image-aware SWA sub-spans: cut every ~swa_span() rows, but never
-            // inside an image span - its rows attend NON-CAUSALLY to the
-            // span's end, so a mid-image cut would read keys not yet
-            // appended. Extension is bounded by the encoder's <=280 soft
-            // tokens (< IMG_SPAN_MAX, which the ring absorbs).
-            let spans = {
-                let mut spans: Vec<(usize, usize)> = Vec::new();
-                let mut o = 0usize;
-                while o < r {
-                    let mut end = (o + self.swa_span).min(r);
-                    while end < r {
-                        match (&chunk[end - 1], &chunk[end]) {
-                            (Row::Image(a, _), Row::Image(b, _)) if a == b => end += 1,
-                            _ => break,
-                        }
-                    }
-                    spans.push((o, end - o));
-                    o = end;
+            // image-aware SWA sub-spans: cut every `swa_span` rows, never inside
+            // a picture - an end that lands in one walks back to its start, so
+            // a sub-span is at most `swa_span` rows or one whole longer picture,
+            // which is exactly what the ring was sized for (`swa_overshoot`).
+            // Extending PAST the picture instead (the old cutter) grew a
+            // sub-span by up to a whole picture, and anything over a 288-row
+            // allowance - muse's 4096-token pictures, a raised gemma4 cap -
+            // wrapped the ring onto keys the window still needed.
+            let in_chunk: Vec<(usize, usize)> = img_spans
+                .iter()
+                .filter(|&&(s0, e0)| s0 >= base && e0 <= end)
+                .map(|&(s0, e0)| (s0 - base, e0 - base))
+                .collect();
+            let mut spans: Vec<(usize, usize)> = Vec::new();
+            let mut o = 0usize;
+            for (e, _) in
+                crate::gpu_model::prefix_cache::mm_pass_ends(0, r, &[], &in_chunk, self.swa_span)
+            {
+                if self.paging.is_some() && e - o > self.swa_span + self.swa_overshoot {
+                    return Err(GpuError::Driver(format!(
+                        "a {}-row picture outgrows the SWA ring's {} + {} rows (the tower \
+                         was attached after the ring was sized) - refusing rather than \
+                         wrap the ring onto keys the window still reads",
+                        e - o,
+                        self.swa_span,
+                        self.swa_overshoot
+                    )));
                 }
-                spans
-            };
+                spans.push((o, e - o));
+                o = e;
+            }
             self.prefill_layers(r, &[(0, r)], &spans, 0)?;
-            base += r;
+            base = end;
             last_len = r;
         }
         let logits = self.logits_from_pf_row(last_len - 1)?;

@@ -443,6 +443,10 @@ impl GpuLaguna {
 }
 
 impl Generator for GpuLaguna {
+    fn release_idle_memory(&mut self) {
+        self.exec.trim_mem_pool();
+    }
+
     fn reset(&mut self) {
         self.pipe_abort(); // a leftover pipe must never survive into a fresh serve
         if let Some(ds) = self.decode.as_mut() {

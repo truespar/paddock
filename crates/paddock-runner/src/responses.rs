@@ -376,11 +376,7 @@ fn prepare(
         );
     }
     if !image_refs.is_empty() && !model.supports_vision {
-        return Err(
-            "this model is not serving vision (a vision-capable model needs its `mmproj` \
-             companion file set in the config to accept image input)"
-                .into(),
-        );
+        return Err(crate::chat::no_vision(model));
     }
     // The inverse gate, same as chat completions: a document
     // parser with no document free-runs noise, so refuse text-only requests

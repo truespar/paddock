@@ -131,6 +131,10 @@ pub struct Cli {
     /// Vision tower GGUF (mmproj) enabling image input
     #[arg(long, value_name = "PATH")]
     pub mmproj: Option<PathBuf>,
+    /// Serve text only: no vision tower, not even one found beside the
+    /// weights (llama.cpp's flag; wins over --mmproj, as it does there)
+    #[arg(long = "no-mmproj")]
+    pub no_mmproj: bool,
     /// MTP drafter GGUF (speculative decoding; gemma4's mtp-*.gguf)
     #[arg(long, value_name = "PATH")]
     pub mtp: Option<PathBuf>,
@@ -468,6 +472,10 @@ pub fn resolve(cli: &Cli) -> Result<(Config, Banner), ConfigError> {
     }
     if let Some(mm) = &cli.mmproj {
         cfg.mmproj = Some(mm.clone());
+    }
+    if cli.no_mmproj {
+        cfg.vision = Some(false);
+        cfg.mmproj = None;
     }
     if let Some(mt) = &cli.mtp {
         cfg.mtp = Some(mt.clone());
@@ -876,6 +884,7 @@ pub fn run() -> std::process::ExitCode {
         }
     };
     paddock_admin::logging::init(cfg.log_file.as_deref());
+    prefer_oom_victim();
     // Now that there is somewhere to say it: the compat decisions made during
     // resolve. Never silent is the whole point of accepting these flags.
     for note in &banner.compat_notes {
@@ -1034,6 +1043,41 @@ pub fn print_startup_banner(cfg: &Config, banner: &Banner) {
     println!();
 }
 
+/// On Linux, be the kernel's first choice when memory runs out.
+///
+/// A runner's model lives in driver-allocated device memory, and on a
+/// unified-memory box (DGX Spark, Jetson) that IS system RAM - but it never
+/// shows in the runner's resident set, which is all the kernel's OOM
+/// scoring looks at. So when memory ran out, the kernel killed the biggest
+/// process it could see: a Spark serving Qwen3.8-27B at 256K x 2 lost its
+/// manager (`paddock`) after about a day, while the runner that held ~100
+/// GB was scored as a 0.5 GB process (2026-09-28). A runner is the process
+/// a supervisor restarts; the manager and the user's session are not.
+///
+/// Raising our own score needs no privilege. A value an administrator
+/// already set (a systemd unit's `OOMScoreAdjust`) is theirs to keep, so
+/// only the default 0 is raised.
+fn prefer_oom_victim() {
+    #[cfg(target_os = "linux")]
+    {
+        const PATH: &str = "/proc/self/oom_score_adj";
+        match std::fs::read_to_string(PATH) {
+            Ok(cur) if cur.trim() == "0" => {
+                if let Err(e) = std::fs::write(PATH, "1000") {
+                    tracing::debug!(%e, "could not raise oom_score_adj");
+                } else {
+                    tracing::info!(
+                        "oom_score_adj 1000: under memory pressure the kernel takes this runner, \
+                         not the process that supervises it"
+                    );
+                }
+            }
+            Ok(cur) => tracing::info!(value = cur.trim(), "oom_score_adj left as configured"),
+            Err(_) => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1076,6 +1120,24 @@ mod tests {
 
     /// A plain launch says nothing - the notes exist for flags the user passed,
     /// not as startup chatter everyone pays for.
+    /// llama.cpp's `--no-mmproj` switches the tower off even beside an
+    /// explicit `--mmproj`, and it has to reach discovery as `vision = false`
+    /// or a tower in the weights' folder loads anyway.
+    #[test]
+    fn no_mmproj_switches_vision_off_and_wins_over_mmproj() {
+        let cli = Cli::parse_from([
+            "paddock-runner",
+            "--model",
+            "x.gguf",
+            "--mmproj",
+            "t.gguf",
+            "--no-mmproj",
+        ]);
+        let (cfg, _) = resolve(&cli).expect("resolve");
+        assert_eq!(cfg.vision, Some(false));
+        assert_eq!(cfg.mmproj, None);
+    }
+
     #[test]
     fn a_launch_with_no_compat_flags_is_quiet() {
         let cli = Cli::parse_from(["paddock-runner", "--model", "x.gguf"]);

@@ -77,6 +77,9 @@ fn overlay(content: &str, rendered: &str, port: u16) -> Result<String, String> {
         "model",
         "catalog",
         "mmproj",
+        // Vision OFF is a key of its own: without it the runner loads the
+        // tower it finds beside the weights, switch or no switch
+        "vision",
         "mtp",
         "fp8_native",
         "text_encoder",
@@ -138,6 +141,22 @@ mod tests {
         );
         assert_eq!(value["forensics"]["auto"].as_str(), Some("images"));
         assert!(value.get("mmproj").is_none() && value.get("mtp").is_none());
+    }
+
+    /// The Vision switch round trip: off replaces the tower line with an
+    /// explicit `vision = false` (a missing line alone let discovery load the
+    /// tower anyway), and on again removes it.
+    #[test]
+    fn switching_vision_off_writes_it_and_on_again_removes_it() {
+        let on = "port=12345\nmodel='m.gguf'\nmmproj='mmproj-BF16.gguf'\n";
+        let off = overlay(on, "port=12345\nmodel='m.gguf'\nvision=false\n", 12345).unwrap();
+        let value = parse(&off, 12345).unwrap();
+        assert!(value.get("mmproj").is_none());
+        assert_eq!(value["vision"].as_bool(), Some(false));
+        let back = overlay(&off, on, 12345).unwrap();
+        let value = parse(&back, 12345).unwrap();
+        assert!(value.get("vision").is_none());
+        assert_eq!(value["mmproj"].as_str(), Some("mmproj-BF16.gguf"));
     }
 
     #[test]

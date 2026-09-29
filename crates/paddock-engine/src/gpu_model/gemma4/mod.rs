@@ -994,6 +994,10 @@ pub struct GpuGemma4 {
     /// `forward::SWA_SPAN_LADDER` when the widest rung would leave no room to
     /// batch; an operator pin (`PADDOCK_G4_SWA_SPAN`) freezes it.
     pub(crate) swa_span: usize,
+    /// Rows the ring holds past `swa_span` for one picture longer than a
+    /// sub-span (`picture_overshoot` when the ring was built): a picture is
+    /// never split, so such a picture is a sub-span on its own.
+    pub(crate) swa_overshoot: usize,
     pub(crate) pos: usize,
     /// KV slots allocated (1 until `enable_batch`)
     pub(crate) n_slots: usize,
@@ -1022,15 +1026,11 @@ pub struct GpuGemma4 {
     pub(crate) prefix: Option<prefix::Gemma4Prefix>,
     /// vision tower (attach_vision) + the <|image> / <image|> marker ids
     pub(crate) vision: Option<multimodal::VisionTower>,
-    /// Vision-tower output cache (the qwen35 ImageCache pattern): a re-sent
-    /// image (multi-turn vision chat re-renders the same picture every turn)
-    /// skips preprocess + tower. FNV over raw RGB + dims, exact-bytes
-    /// verified - a hash collision costs a miss, never a wrong reuse. LRU by
-    /// clock; entries hold the projected rows device-side (~3 MB at gemma4's
-    /// soft-token grid).
-    pub(crate) img_cache: Vec<multimodal::G4ImageCacheEntry>,
-    pub(crate) img_cache_clock: u64,
-    pub(crate) img_cache_reused: u64,
+    /// Encoded pictures, the only owner of the tower's outputs, bounded in
+    /// bytes by the plan (`picture_budget_bytes`): a re-sent image skips
+    /// preprocess + tower, and a prefill borrows a picture instead of copying
+    /// it. Pictures are encoded as the pass that splices them comes up.
+    pub(crate) pictures: crate::gpu_model::picture_store::PictureStore<multimodal::EncodedImage>,
     pub(crate) img_beg_id: Option<u32>,
     pub(crate) img_end_id: Option<u32>,
     /// [n_slots, n_vocab] device logits for the batched head
@@ -1199,6 +1199,10 @@ fn gen_err(e: crate::gpu::GpuError) -> GenError {
 }
 
 impl Generator for GpuGemma4 {
+    fn release_idle_memory(&mut self) {
+        self.exec.trim_mem_pool();
+    }
+
     fn reset(&mut self) {
         self.pos = 0;
     }

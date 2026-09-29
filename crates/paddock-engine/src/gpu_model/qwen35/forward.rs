@@ -1655,6 +1655,15 @@ impl GpuQwen35 {
             sb.graph_verify.clear();
             sb.graph_commit.clear();
         }
+        // Free the old scratch BEFORE building the new one. The assignment
+        // below used to build every new buffer while the old ones were still
+        // live, so a regrowth briefly held both (+6.0 GiB for an 8K-row
+        // regrowth on the 27B). The trim hands the freed pages back at once
+        // (release threshold 0), which also makes the measurement below this
+        // scratch's own size rather than whatever the pool happened to reuse.
+        if self.scratch.take().is_some() {
+            self.exec.trim_mem_pool();
+        }
         // Growth headroom: the unified tick's row count r = decode_rows +
         // prefill_share creeps by one as each admission joins decode, and a
         // bare cap = r turned every such tick into a multi-GB realloc + full

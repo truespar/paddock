@@ -23,6 +23,30 @@
 // KV slot) - the engine dispatch falls back to the decode kernel otherwise.
 #define PD_APF_TQ 16
 
+// keys per staged tile, sized so the f32 K/V/Q tiles fit the opt-in window
+__host__ __device__ constexpr uint32_t pd_apf_tk(uint32_t hd) { return hd == 128u ? 32u : 16u; }
+
+// Dynamic shared bytes of the scalar tiled family (the dense, paged and batch
+// kernels below share one layout): the f32 Q tile, the d-major K tile, the
+// key-major V tile, then the per-query key bounds and window floors.
+// NONE of it is static, on purpose. The sm_120a/121a images compile kernels
+// that declare `extern __shared__ __align__(1024)` buffers, and one such
+// declaration aligns EVERY kernel's static shared section in the translation
+// unit to 1 KB - a 64-byte static array costs 1024 B there (probed on GB10: a
+// kernel's section went 0x440 -> 0x800 once a sibling carried the alignment).
+// At HD=512 this layout is 100,992 B; with the window floors held static, as
+// they were, the sm_121a image asked for 101,952 B against the 101,376 B
+// opt-in cap of sm_86/89/120/121, and every dense HD=512 prefill (gemma4's
+// global layers off the pool) was refused with InvalidValue - while the plain
+// images, which pad to 128 B, launched.
+template<uint32_t HD>
+__host__ __device__ constexpr uint32_t pd_apf_smem() {
+    return (PD_APF_TQ * (HD + 4u) + HD * (pd_apf_tk(HD) + 1u) + pd_apf_tk(HD) * (HD + 4u)
+            + 2u * PD_APF_TQ) * 4u;
+}
+static_assert(pd_apf_smem<512u>() <= 101376u,
+              "the scalar prefill tile must fit the 99 KB opt-in cap of sm_86/89/120/121");
+
 // SLIDING-WINDOW FLOOR (2026-09-23, the win_pos lane). `positions[b]` is a
 // row's attention BOUND - the last key it may read - and every arm below
 // used to derive the window's first key from it too (`bound + 1 - swa`).
@@ -45,30 +69,6 @@ __device__ __forceinline__ uint32_t pd_pf_floor(uint32_t wpos, uint32_t swa) {
     return (swa > 0 && wpos + 1u > swa) ? wpos + 1u - swa : 0u;
 }
 
-// Host: can `fn` launch with `dyn` bytes of dynamic shared memory on this
-// device? The opt-in cap bounds STATIC + dynamic, and a kernel's static
-// arrays (its own and its inlined helpers') are invisible at the call site,
-// so a guard on `dyn` alone admits a launch the driver refuses: pf7rp's
-// 100,608 dynamic + 1,024 static bytes against GB10's 101,376 failed every
-// hd256 fp8 prefill with cudaErrorInvalidValue (the attribute set had failed
-// unchecked). Raises the kernel's dynamic limit when it fits; false = take
-// the next arm.
-static inline bool pd_smem_fits(const void* fn, uint32_t dyn) {
-    int dev = 0, cap = 0;
-    cudaFuncAttributes a;
-    if (cudaGetDevice(&dev) != cudaSuccess
-        || cudaDeviceGetAttribute(&cap, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev)
-               != cudaSuccess
-        || cudaFuncGetAttributes(&a, fn) != cudaSuccess)
-        return false;
-    if (a.sharedSizeBytes + (size_t)dyn > (size_t)cap) return false;
-    return cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)dyn)
-           == cudaSuccess;
-}
-// (No PD_BS_HOST guard: the pf7/pf7rp launch guards call this on every
-// build, and a single-arch pack - which defines no PD_BS_HOST - failed to
-// compile with it hidden. It needs nothing but the CUDA runtime.)
-
 template<typename KV, uint32_t HD>
 __global__ void __launch_bounds__(256) pd_attn_prefill_kernel(
     const float* __restrict__ q, const KV* __restrict__ kc,
@@ -80,7 +80,7 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_kernel(
     const unsigned int* __restrict__ win_pos) {
     // TK sized so the f32 K/V/Q tiles fit the opt-in shared window; DPL =
     // dims per lane (the slice of the output vector each lane accumulates)
-    constexpr uint32_t TK = HD == 128u ? 32u : 16u;
+    constexpr uint32_t TK = pd_apf_tk(HD);
     constexpr uint32_t DPL = HD / 32u;
     constexpr uint32_t QPAD = HD + 4u;  // 16B-aligned rows, conflict-free f4
     const uint32_t h = blockIdx.x;
@@ -95,7 +95,7 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_kernel(
     float* sh_k = sh_q + PD_APF_TQ * QPAD;              // [HD][TK+1] d-major
     float* sh_v = sh_k + HD * (TK + 1u);                // [TK][QPAD]
     uint32_t* sh_hi = (uint32_t*)(sh_v + TK * QPAD);    // [TQ]
-    __shared__ uint32_t sh_lo[PD_APF_TQ];               // window floors (+1)
+    uint32_t* sh_lo = sh_hi + PD_APF_TQ;                // [TQ] window floors (+1)
 
     // stage the 16 queries (dead rows -> 0) and per-query key bounds
     #pragma unroll
@@ -239,10 +239,7 @@ static int pd_attn_prefill_launch(const void* q, const void* kc, const void* vc,
                                   uint32_t n_kv_heads, uint32_t max_ctx, uint32_t kv_dim,
                                   uint32_t swa_window, uint32_t batch, float scale,
                                   cudaStream_t stream) {
-    constexpr uint32_t TK = HD == 128u ? 32u : 16u;
-    constexpr uint32_t QPAD = HD + 4u;
-    constexpr uint32_t SMEM =
-        (PD_APF_TQ * QPAD + HD * (TK + 1u) + TK * QPAD + PD_APF_TQ) * 4u;
+    constexpr uint32_t SMEM = pd_apf_smem<HD>();
     static cudaError_t attr = cudaFuncSetAttribute(
         (const void*)pd_attn_prefill_kernel<KV, HD>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM);
@@ -267,7 +264,8 @@ static int pd_attn_prefill_impl(const void* q, const void* kc, const void* vc,
                                 float scale, uint32_t kv_dtype, void* stream) {
     if (n_heads == 0 || batch == 0) return 0;
     // 512 = gemma4's global-layer geometry; its smem (TQ 16, TK 16) is
-    // 100,928 B - inside sm_120's 101,376 B opt-in cap with 448 B to spare
+    // 100,992 B, all dynamic - inside the 101,376 B opt-in cap with 384 B to
+    // spare only because none of it is static (see pd_apf_smem)
     if (head_dim != 128u && head_dim != 256u && head_dim != 512u)
         return cudaErrorInvalidValue;
     auto st = (cudaStream_t)stream;
@@ -335,7 +333,7 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_paged_kernel(
     uint32_t n_heads, uint32_t n_kv_heads, uint32_t kv_dim,
     uint32_t swa_window, uint32_t n_rows, float scale,
     const unsigned int* __restrict__ win_pos) {
-    constexpr uint32_t TK = HD == 128u ? 32u : 16u;
+    constexpr uint32_t TK = pd_apf_tk(HD);
     constexpr uint32_t DPL = HD / 32u;
     constexpr uint32_t QPAD = HD + 4u;  // 16B-aligned rows, conflict-free f4
     const uint32_t h = blockIdx.x;
@@ -350,7 +348,7 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_paged_kernel(
     float* sh_k = sh_q + PD_APF_TQ * QPAD;              // [HD][TK+1] d-major
     float* sh_v = sh_k + HD * (TK + 1u);                // [TK][QPAD]
     uint32_t* sh_hi = (uint32_t*)(sh_v + TK * QPAD);    // [TQ]
-    __shared__ uint32_t sh_lo[PD_APF_TQ];               // window floors (+1)
+    uint32_t* sh_lo = sh_hi + PD_APF_TQ;                // [TQ] window floors (+1)
 
     #pragma unroll
     for (uint32_t it = 0; it < PD_APF_TQ * HD / 256u; ++it) {
@@ -488,10 +486,7 @@ static int pd_attn_prefill_paged_launch(const void* q, const void* pool_k, const
                                         uint32_t n_kv_heads, uint32_t kv_dim, uint32_t swa_window,
                                         uint32_t batch, float scale, cudaStream_t stream,
                                         const void* win_pos = nullptr) {
-    constexpr uint32_t TK = HD == 128u ? 32u : 16u;
-    constexpr uint32_t QPAD = HD + 4u;
-    constexpr uint32_t SMEM =
-        (PD_APF_TQ * QPAD + HD * (TK + 1u) + TK * QPAD + PD_APF_TQ) * 4u;
+    constexpr uint32_t SMEM = pd_apf_smem<HD>();
     static cudaError_t attr = cudaFuncSetAttribute(
         (const void*)pd_attn_prefill_paged_kernel<KV, HD>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM);
@@ -581,7 +576,7 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_batch_kernel(
     uint32_t swa_window, uint32_t n_rows, float scale,
     const unsigned int* __restrict__ win_pos,
     const uint32_t* __restrict__ block_tables = nullptr, uint32_t bps = 0) {
-    constexpr uint32_t TK = HD == 128u ? 32u : 16u;
+    constexpr uint32_t TK = pd_apf_tk(HD);
     constexpr uint32_t DPL = HD / 32u;
     constexpr uint32_t QPAD = HD + 4u;
     const uint32_t h = blockIdx.x;
@@ -596,7 +591,7 @@ __global__ void __launch_bounds__(256) pd_attn_prefill_batch_kernel(
     float* sh_k = sh_q + PD_APF_TQ * QPAD;              // [HD][TK+1] d-major
     float* sh_v = sh_k + HD * (TK + 1u);                // [TK][QPAD]
     uint32_t* sh_hi = (uint32_t*)(sh_v + TK * QPAD);    // [TQ]
-    __shared__ uint32_t sh_lo[PD_APF_TQ];               // window floors (+1)
+    uint32_t* sh_lo = sh_hi + PD_APF_TQ;                // [TQ] window floors (+1)
 
     // stage the 16 queries; a row is live only if in range AND in this slot
     #pragma unroll
@@ -756,10 +751,7 @@ static int pd_attn_prefill_batch_launch(
         uint32_t n_kv_heads, uint32_t max_ctx, uint32_t kv_dim, uint32_t swa_window,
         uint32_t n_rows, float scale, cudaStream_t st,
         const void* block_tables = nullptr, uint32_t bps = 0) {
-    constexpr uint32_t TK = HD == 128u ? 32u : 16u;
-    constexpr uint32_t QPAD = HD + 4u;
-    constexpr uint32_t SMEM =
-        (PD_APF_TQ * QPAD + HD * (TK + 1u) + TK * QPAD + PD_APF_TQ) * 4u;
+    constexpr uint32_t SMEM = pd_apf_smem<HD>();
     static cudaError_t attr = cudaFuncSetAttribute(
         (const void*)pd_attn_prefill_batch_kernel<KV, HD, PAGED>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)SMEM);
@@ -2681,9 +2673,23 @@ pd_attn_prefill_f16_v3s_kernel(
 //     already falsified (v3w TK ladder, FA tile); local optimum again.
 #define PD_AF3C_TK 64u
 #define PD_AF3C_NR 64u
-#define PD_AF3C_SMEM (2u * PD_AF3C_TK * (256u + 8u) * 2u)
-// fp8 PIPE arm: + raw K+V tile staging bytes (2 pools x TK x 256B)
-#define PD_AF3C_SMEM_P8 (PD_AF3C_SMEM + 2u * PD_AF3C_TK * 256u)
+// the co-staged K and V f16 tiles, [TK][256 + 8] halves each
+#define PD_AF3C_TILES (2u * PD_AF3C_TK * (256u + 8u) * 2u)
+// fp8 PIPE arm: raw K+V tile staging bytes (2 pools x TK x 256B)
+#define PD_AF3C_RAW (2u * PD_AF3C_TK * 256u)
+// Per-row key bounds and window floors, u32 each, in the DYNAMIC tail - not
+// static. In the sm_120a/121a images one 1 KB-aligned extern buffer anywhere
+// in the pack aligns every kernel's static section to 1 KB, so these 512
+// bytes cost 1,024 there and the fp8 launch sat EXACTLY on the 101,376 B
+// opt-in cap (100,352 dynamic + 1,024): one more static byte, in this kernel
+// or an inlined helper, and gemma4's default SWA prefill under KV8 would be
+// refused. All dynamic it is 100,864 B, 512 B under the cap on every image.
+#define PD_AF3C_BOUNDS (2u * PD_AF3C_NR * 4u)
+// launch sizes: f16 KV (direct-store path) and the fp8 PIPE arm
+#define PD_AF3C_SMEM (PD_AF3C_TILES + PD_AF3C_BOUNDS)
+#define PD_AF3C_SMEM_P8 (PD_AF3C_TILES + PD_AF3C_RAW + PD_AF3C_BOUNDS)
+static_assert(PD_AF3C_SMEM_P8 <= 101376u,
+              "v3c's fp8 tile must fit the 99 KB opt-in cap of sm_86/89/120/121");
 // TQ/TO (attention streams): f16 q/out planes. The q path is
 // BIT-equal at serve's scale=1.0 - the kernel rounds q to f16 into its
 // mma fragments anyway ((float)h expand is exact, *1.0 is identity, and
@@ -2725,8 +2731,11 @@ pd_attn_prefill_f16_v3c_kernel(
     __half* sh_v = sh_k + (size_t)TK * DPD;                    // [TK][DPD]
     // PIPE only: next tile's raw fp8 bytes land here via cp.async
     unsigned char* sh_raw = reinterpret_cast<unsigned char*>(sh_v + (size_t)TK * DPD);
-    __shared__ uint32_t sh_hi[NR];
-    __shared__ uint32_t sh_lo[NR];     // window floors (+1), from wp
+    // bounds in the dynamic tail (see PD_AF3C_BOUNDS): past the raw stage on
+    // the PIPE arm, past the tiles otherwise
+    uint32_t* sh_hi = reinterpret_cast<uint32_t*>(
+        af3csh + PD_AF3C_TILES + (PIPE ? PD_AF3C_RAW : 0u));   // [NR]
+    uint32_t* sh_lo = sh_hi + NR;      // [NR] window floors (+1), from wp
 
     if (tid < NR) {
         const uint32_t b = blockIdx.y * NR + tid;
