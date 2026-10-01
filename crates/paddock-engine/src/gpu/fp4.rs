@@ -2679,6 +2679,10 @@ impl GpuExecutor {
     /// indexed, which is [`Self::nvf4_moe_down_bs`]'s direct B input, so the
     /// pair runs without an unsort between halves.
     #[allow(clippy::too_many_arguments)]
+    ///
+    /// `tok_off`: the sorted rows are local to tokens `[tok_off, ..)` of the
+    /// activation pair (a sub-wave of a wider walk, see
+    /// [`Self::moe_align_at`]); 0 for a whole wave.
     pub fn nvf4_moe_gu_swiglu_bs(
         &self,
         gate: &Nvf4MoePlane,
@@ -2690,6 +2694,7 @@ impl GpuExecutor {
         fq: &mut CudaSlice<u8>,
         fs: &mut CudaSlice<u8>,
         nb: usize,
+        tok_off: usize,
     ) -> Result<(), GpuError> {
         let f = self
             .kernels
@@ -2716,8 +2721,16 @@ impl GpuExecutor {
         let (u2, _a6) = up.scale2.device_ptr(&self.stream);
         let (rp, _a7) = sorted_row.device_ptr(&self.stream);
         let (bp, _a8) = block_expert.device_ptr(&self.stream);
+        // nvfp4 activations: in_dim/2 packed bytes and in_dim/16 scales a row
+        if tok_off * (gate.in_dim / 2) > xq.len() || tok_off * (gate.in_dim / 16) > xs.len() {
+            return Err(GpuError::Unsupported(
+                "nvf4_moe_gu_swiglu_bs: token offset past the activation pair".into(),
+            ));
+        }
         let (xqp, _a9) = xq.device_ptr(&self.stream);
+        let xqp = xqp + (tok_off * (gate.in_dim / 2)) as u64;
         let (xsp, _a10) = xs.device_ptr(&self.stream);
+        let xsp = xsp + (tok_off * (gate.in_dim / 16)) as u64;
         let (fqp, _a11) = fq.device_ptr_mut(&self.stream);
         let (fsp, _a12) = fs.device_ptr_mut(&self.stream);
         // SAFETY: ABI contract; shapes and sizes checked above
@@ -2813,6 +2826,43 @@ impl GpuExecutor {
         slot_off: usize,
         nb: usize,
     ) -> Result<(), GpuError> {
+        self.nvf4_moe_down_bs_at(
+            w,
+            sorted_row,
+            sorted_slot,
+            block_expert,
+            topk_w,
+            fq,
+            fs,
+            part,
+            kw,
+            np,
+            slot_off,
+            nb,
+            0,
+        )
+    }
+
+    /// [`Self::nvf4_moe_down_bs`] for a sub-wave whose sorted rows are local to
+    /// tokens `[tok_off, ..)` (see [`Self::moe_align_at`]): the routing
+    /// weights are read from that range, the partials land local.
+    #[allow(clippy::too_many_arguments)]
+    pub fn nvf4_moe_down_bs_at(
+        &self,
+        w: &Nvf4MoePlane,
+        sorted_row: &CudaSlice<u32>,
+        sorted_slot: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        topk_w: Option<&CudaSlice<f32>>,
+        fq: &CudaSlice<u8>,
+        fs: &CudaSlice<u8>,
+        part: &mut CudaSlice<f32>,
+        kw: usize,
+        np: usize,
+        slot_off: usize,
+        nb: usize,
+        tok_off: usize,
+    ) -> Result<(), GpuError> {
         let f = self
             .kernels
             .nvf4_moe_down_bs
@@ -2832,8 +2882,13 @@ impl GpuExecutor {
         let (bp, _g6) = block_expert.device_ptr(&self.stream);
         let wp = match topk_w {
             Some(w) => {
+                if tok_off * kw > w.len() {
+                    return Err(GpuError::Unsupported(
+                        "nvf4_moe_down_bs_at: token offset past the routing weights".into(),
+                    ));
+                }
                 let (p, _g) = w.device_ptr(&self.stream);
-                p as *const core::ffi::c_void
+                (p + (tok_off * kw * std::mem::size_of::<f32>()) as u64) as *const core::ffi::c_void
             }
             None => core::ptr::null(),
         };

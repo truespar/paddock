@@ -285,6 +285,7 @@ pub struct AppState {
     /// The loaded decision model (a Laya bundle), if one was configured -
     /// serves `POST /v1/systemone` only.
     pub laya: Option<crate::systemone::laya::LayaModel>,
+    pub tabular: Option<crate::tabular::TabularModel>,
     /// The loaded image-generation model (Qwen-Image), if one was configured
     /// - serves `/v1/images/*` only.
     pub image: Option<crate::serving::ImageModel>,
@@ -419,6 +420,7 @@ impl AppState {
             aligner: None,
             segmenter: None,
             laya: None,
+            tabular: None,
             image: None,
             max_ctx: 8192,
             vad_gate: false,
@@ -529,6 +531,19 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/images/generations", post(crate::images::generations))
         .route("/v1/images/edits", post(crate::images::edits))
         .route("/v1/systemone", post(crate::systemone::handle))
+        .route(
+            "/v1/tabular/predictions",
+            post(crate::tabular::handle)
+                .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
+        .route(
+            "/v1/tabular/contexts",
+            post(crate::tabular::fit).layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
+        .route(
+            "/v1/tabular/contexts/{context_id}",
+            axum::routing::delete(crate::tabular::release),
+        )
         .fallback(not_found)
         // Axum's default body limit is 2 MB, which is below what a single
         // legitimate request carries here: a data-URI image inflates 4/3 in
@@ -932,6 +947,7 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
         // Decision model id (Laya): POST /v1/systemone works iff this is set,
         // and it is the ONLY thing such a runner serves - the sixth role.
         "reader": state.laya.as_ref().map(|l| l.id.clone()),
+        "tabular": state.tabular.as_ref().map(|m| serde_json::json!({"model":m.id,"capabilities":m.capabilities()})),
         // The longest clip TRANSCRIPTION can take, same reason and same shape
         // as the alignment cap above. Null means no ceiling worth
         // publishing: whisper windows a clip into 30 s pieces, so length costs
@@ -1457,6 +1473,11 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
             ),
         );
     }
+    if let Some(m) = &state.tabular {
+        data.push(ModelObject::new(m.id.clone(),0,"paddock").with_listing_meta(
+            serde_json::json!({"input_modalities":["table"],"output_modalities":["prediction"],"modality":"table->prediction"}),
+            m.capabilities(),vec!["context".into(),"targets".into(),"query".into(),"categorical".into(),"preprocessing".into()],0));
+    }
     if let Some(im) = &state.image {
         // image generation only: text in, an image out - /v1/images/* and
         // nothing else. No context window; the listing says so with a 0.
@@ -1527,6 +1548,8 @@ pub(crate) fn is_generation_path(path: &str) -> bool {
             | "/v1/images/generations"
             | "/v1/images/edits"
             | "/v1/systemone"
+            | "/v1/tabular/predictions"
+            | "/v1/tabular/contexts"
     )
 }
 

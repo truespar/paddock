@@ -80,7 +80,8 @@ pub fn resolve_device(selector: &str) -> Result<usize, CudaError> {
         let hex: String = uuid
             .bytes
             .iter()
-            .map(|b| format!("{:02x}", *b as u8))
+            // c_char is i8 on x86 and u8 on aarch64: the byte, either way
+            .map(|b| format!("{:02x}", b.to_ne_bytes()[0]))
             .collect();
         if hex.starts_with(&want) {
             hits.push(ord);

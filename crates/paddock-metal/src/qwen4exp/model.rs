@@ -256,11 +256,19 @@ impl FlashNext {
         // The checkpoint's GPU reference uses decode arithmetic for the
         // final prompt token. Preserve that boundary even for short prompts.
         while pos < tokens.len() {
-            let (logical, mut n) = if self.is_mlx() {
-                self.slots[slot].plan.at(pos)
+            let mut n = if self.is_mlx() {
+                if self.groups_prompt_chunks() {
+                    let cap = if self.prefix.enabled() {
+                        self.capacity.min(self.slots[slot].plan.until_cut(pos))
+                    } else {
+                        self.capacity
+                    };
+                    self.slots[slot].plan.pass_rows(pos, cap)
+                } else {
+                    self.slots[slot].plan.at(pos).1
+                }
             } else {
-                let n = self.chunk.min(tokens.len() - pos);
-                (n, n)
+                self.chunk.min(tokens.len() - pos)
             };
             if self.prefix.enabled() {
                 n = n.min(self.slots[slot].plan.until_cut(pos));
@@ -275,8 +283,11 @@ impl FlashNext {
             } else {
                 Vec::new()
             };
-            logits =
-                self.execute_contracts(&rows, &outputs, self.is_mlx().then_some(&[logical]))?;
+            logits = if self.is_mlx() {
+                self.execute_planned(&rows, &outputs)?
+            } else {
+                self.execute(&rows, &outputs)?
+            };
             self.capture_prefix(slot, tokens)?;
             pos += n;
         }

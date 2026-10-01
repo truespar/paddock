@@ -95,7 +95,9 @@ struct EndpointModelWorkload: View {
         }
       }
     }
-    if !editor.isImageGeneration && !editor.capabilities.contains("decision") {
+    if !editor.isImageGeneration && !editor.capabilities.contains("decision")
+      && !editor.capabilities.contains("tabular")
+    {
       EndpointFormField("Workload") {
         LazyVGrid(
           columns: Array(repeating: GridItem(.flexible(minimum: 0), spacing: 6), count: 4),

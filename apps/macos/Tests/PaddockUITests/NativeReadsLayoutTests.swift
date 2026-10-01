@@ -29,7 +29,9 @@ struct NativeReadsLayoutTests {
         navigation.studio = .reads
         let footer = NSHostingController(
           rootView: StudioSidebarFooter(navigation: .constant(navigation)))
-        #expect(footer.sizeThatFits(in: NSSize(width: width, height: 130)).height <= 130)
+        // Tables adds one destination; reserve its row instead of squeezing
+        // the existing, accessible 32-point footer targets.
+        #expect(footer.sizeThatFits(in: NSSize(width: width, height: 168)).height <= 168)
       }
     }
   }

@@ -8,7 +8,7 @@
 // document one copy away for codegen tools.
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
-import { useFleetStore } from '@/stores/fleet'
+import { servedId, useFleetStore } from '@/stores/fleet'
 import { copyText } from '@/lib/clipboard'
 import { modelLabel } from '@/lib/model-name'
 import Icon from '@/components/Icon.vue'
@@ -67,12 +67,7 @@ const fleet = useFleetStore()
 const port = computed(() => Number(route.params.port))
 const row = computed(() => fleet.rows.find((r) => r.port === port.value))
 const title = computed(() => {
-  const served =
-    row.value?.model ??
-    row.value?.embedder ??
-    row.value?.asr ??
-    row.value?.aligner ??
-    row.value?.image
+  const served = row.value ? servedId(row.value) : undefined
   const t = row.value?.display ?? modelLabel(served)
   return t || served || `server ${port.value}`
 })

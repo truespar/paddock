@@ -26,7 +26,9 @@
 //! is the single-slot walk (captured, fork-enabled, the fastest prefill
 //! shape), and when that span finishes its prompt the cuts inside it are
 //! taken IN the walk (`walk_cuts`), exactly as `prefill_from` does: an idle
-//! server's lone prompt runs the walk it always did.
+//! server's lone prompt runs the walk it always did. That walk starts where
+//! an exact re-send can start it again (`walk_origin`): the resume point, or
+//! a checkpoint filed at the walk boundary it starts on.
 //!
 //! The row budget comes from the scheduler, which is also where the
 //! long-context tick pacer (crate::pacing) sizes it; `prefill_queue` and
@@ -34,6 +36,7 @@
 
 use super::{Phase, Qwen4ExpGpu, Run};
 use crate::gpu_model::gpt_oss::GpuModelError;
+use crate::gpu_model::prefix_cache::BLOCK_TOKENS;
 
 /// One prompt queued for chunked prefill.
 pub(super) struct ChunkedPrefill {
@@ -180,10 +183,14 @@ impl Qwen4ExpGpu {
 
     /// Where `slot`'s span may end this tick: at most `room` rows past its
     /// cursor, and never past its next checkpoint cut - unless `inwalk`, when
-    /// a span that FINISHES the prompt takes the cuts inside itself.
+    /// a span that FINISHES the prompt takes the cuts inside itself. Only
+    /// from a page boundary: the walk's start is where a re-send starts it
+    /// again (`walk_origin`), which takes a checkpoint there; a cursor that
+    /// budgeted ticks beside decode rows left mid-page stops at the cuts.
     fn span_end(&self, qi: usize, room: usize, inwalk: bool) -> (usize, bool) {
         let c = &self.chunked[qi];
         let len = c.tokens.len();
+        let inwalk = inwalk && c.cursor.is_multiple_of(BLOCK_TOKENS);
         // and never across an absolute multiple of walk_rows: the single-slot
         // walk splits there, so both walk a long prompt in the same pieces
         let bound = (c.cursor / self.walk_rows + 1) * self.walk_rows;
@@ -372,6 +379,8 @@ impl Qwen4ExpGpu {
             .expect("span of a queued prompt");
         let len = self.chunked[qi].tokens.len();
         let mut reserved: Vec<(usize, u32)> = Vec::new();
+        // span_end's test: a span took its cuts inside only from a page
+        let inwalk = inwalk && s.from.is_multiple_of(BLOCK_TOKENS);
         if inwalk
             && s.finishes
             && let Some(pc) = self.prefix.as_mut()
@@ -394,7 +403,12 @@ impl Qwen4ExpGpu {
             .collect();
         self.walk_ckpts = reserved.iter().map(|&(_, idx)| idx).collect();
         let ids = std::mem::take(&mut self.chunked[qi].tokens);
-        let walked = self.walk_span_dev(s.slot, &ids, s.from, s.to);
+        let walked = if reserved.is_empty() {
+            Ok(())
+        } else {
+            self.walk_origin(s.slot, &ids, s.from)
+        }
+        .and_then(|()| self.walk_span_dev(s.slot, &ids, s.from, s.to));
         self.chunked[qi].tokens = ids;
         self.walk_cuts.clear();
         let walked = walked.and_then(|()| self.commit_walk_cuts());
@@ -431,7 +445,7 @@ impl Qwen4ExpGpu {
                 self.pos[s.slot] = s.to;
                 if s.finishes {
                     self.prefix_publish(s.slot, &ids, s.to, false)?;
-                    self.attach_cuts(&ids, &w.reserved);
+                    self.attach_cuts(s.slot, &ids, &w.reserved);
                     self.reply_track_admit(s.slot);
                 } else if s.at_cut {
                     self.prefix_cut(s.slot, &ids, s.to)?;

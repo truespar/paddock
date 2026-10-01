@@ -43,6 +43,8 @@ pub use moe_cache::{
     ExpertCache, MOE_CACHE_NONE, MoeOffloadCfg, moe_cache_slots_pin, moe_offload, set_moe_offload,
 };
 mod kquant;
+mod kumo;
+pub use kumo::{KumoEpi, KumoFuse, KumoHeads, KumoIn};
 mod types;
 pub use kquant::q40_to_q8_blocks;
 mod mamba;

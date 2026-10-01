@@ -42,6 +42,10 @@ export interface FleetRow {
   asr?: string | null
   aligner?: string | null
   image?: string | null
+  /** decision model (Laya, /v1/systemone) and tabular predictor (Kumo,
+   *  /v1/tabular/*) serving ids - the sixth and seventh roles */
+  reader?: string | null
+  tabular?: string | null
   /** The catalog's human name ("Qwen 3.5 9B") + maker - what the UI shows;
    *  the technical id stays in `model` for tooltips. Absent for models this
    *  build's catalog doesn't know. */
@@ -296,6 +300,21 @@ const BASE_PORT = 11540
 
 /** The running fleet + desired state + deploy lifecycle - the Manager's
  *  Servers screen state. Polls while a subscriber asks it to. */
+/** The model a runner serves, whichever serving role it is in. A row carries
+ *  only its own role's key, so every role has to be listed - a chain that
+ *  stops early renders the rest nameless. */
+export function servedId(r: {
+  model?: string | null
+  embedder?: string | null
+  asr?: string | null
+  aligner?: string | null
+  image?: string | null
+  reader?: string | null
+  tabular?: string | null
+}): string | undefined {
+  return r.model ?? r.embedder ?? r.asr ?? r.aligner ?? r.image ?? r.reader ?? r.tabular ?? undefined
+}
+
 export const useFleetStore = defineStore('fleet', () => {
   // The manager's own version, to compare each runner against. Bound once here
   // rather than per call site so `staleRunners` stays a plain computed.

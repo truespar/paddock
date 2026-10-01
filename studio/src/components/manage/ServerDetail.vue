@@ -6,7 +6,7 @@
 import { copyText } from '@/lib/clipboard'
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { useFleetStore, type ResidencySnapshot } from '@/stores/fleet'
+import { servedId as servedOf, useFleetStore, type ResidencySnapshot } from '@/stores/fleet'
 import { useDownloadsStore, jobActive } from '@/stores/downloads'
 import { selectStudioModel } from '@/lib/select-model'
 import { gpuApi } from '@/lib/api'
@@ -39,18 +39,9 @@ const downloadHere = computed(() =>
 const stoppedHere = computed(() => fleet.stopped.find((c) => c.port === port.value))
 const boots = computed(() => fleet.bootPorts.has(port.value))
 
-/** What this page calls the model: catalog display first, id as fallback.
- *  A row carries exactly one of model/embedder/asr/aligner/image - all five
- *  are in the chain so a speech, aligner or image runner is never nameless
- *  here. */
-const servedId = computed(
-  () =>
-    row.value?.model ??
-    row.value?.embedder ??
-    row.value?.asr ??
-    row.value?.aligner ??
-    row.value?.image,
-)
+/** What this page calls the model: catalog display first, id as fallback -
+ *  whichever serving role the runner is in (the fleet store's `servedId`). */
+const servedId = computed(() => (row.value ? servedOf(row.value) : undefined))
 const title = computed(() => {
   const t = row.value?.display ?? modelLabel(servedId.value)
   return t || `server ${port.value}`
@@ -176,6 +167,11 @@ async function copyKey(): Promise<void> {
 }
 
 function openInStudio(): void {
+  // a table predictor has its own page: rows in, a column out, no turns
+  if (row.value?.tabular) {
+    void router.push({ name: 'tables', query: { port: String(port.value) } })
+    return
+  }
   // an image model takes turns in the chat surface like any other, so it
   // opens there too - selected, on a fresh draft
   const id = row.value?.model ?? row.value?.embedder ?? row.value?.image

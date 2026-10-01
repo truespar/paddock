@@ -37,7 +37,7 @@ where
         match Json::<T>::from_request(req, state).await {
             Ok(Json(v)) => Ok(OaiJson(v)),
             Err(rej) => Err((
-                StatusCode::BAD_REQUEST,
+                rejection_status(&rej),
                 Json(ErrorBody::new(
                     "invalid_request_error",
                     shape(&rejection_text(&rej)),
@@ -62,7 +62,7 @@ where
         match Json::<T>::from_request(req, state).await {
             Ok(Json(v)) => Ok(AnthJson(v)),
             Err(rej) => Err((
-                StatusCode::BAD_REQUEST,
+                rejection_status(&rej),
                 Json(json!({"type": "error", "error": {
                     "type": "invalid_request_error",
                     "message": shape(&rejection_text(&rej)),
@@ -70,6 +70,17 @@ where
             )
                 .into_response()),
         }
+    }
+}
+
+fn rejection_status(rej: &JsonRejection) -> StatusCode {
+    // Syntax/schema failures use the API's 400 envelope, but a transport
+    // size limit is still 413. In particular, table endpoints have a much
+    // smaller limit than image/chat payloads; never disguise it as bad JSON.
+    if rej.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else {
+        StatusCode::BAD_REQUEST
     }
 }
 

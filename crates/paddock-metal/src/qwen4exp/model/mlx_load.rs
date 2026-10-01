@@ -203,7 +203,9 @@ impl FlashNext {
                     // throughput preference may spend only its spare grant:
                     // never evict a snapshot, move resident PLE to disk or
                     // enlarge an implicit/explicit memory grant for wider rows.
-                    let wide = batch > 1 && chunk == MLX_CHUNK && device.tensor_accelerated();
+                    let wide = (batch > 1 || prompt::grouping())
+                        && chunk == MLX_CHUNK
+                        && device.tensor_accelerated();
                     #[cfg(test)]
                     let wide = wide && WIDE_BATCH_FOR_TEST.with(|v| v.get());
                     if wide {

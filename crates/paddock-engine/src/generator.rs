@@ -1277,6 +1277,17 @@ pub enum MmAdmit {
     /// Still encoding under the backend's encoder budget. The BACKEND owns this
     /// slot's chunks until a later `encode_step` reports it.
     Encoding,
+    /// The backend ran the whole prefill itself, a planned pass per
+    /// `encode_step`, and the scheduler's ticks ran between the passes - so
+    /// no live stream waited out the whole picture prompt. The slot's KV holds
+    /// `rows` rows (image rows included) and `logits` is its last row: the
+    /// scheduler finishes it exactly as it does a blocking multimodal prefill.
+    /// For a backend whose chunked queue cannot carry picture rows (a picture
+    /// that attends to its own last row cannot be split across a shared tick).
+    Prefilled {
+        logits: Vec<f32>,
+        rows: usize,
+    },
     Failed(GenError),
 }
 
@@ -1626,7 +1637,23 @@ impl Generator for crate::gpu_model::qwen35::GpuQwen35 {
         crate::gpu_model::qwen35::GpuQwen35::prefix_share_floor(self)
     }
     fn prefill_abort(&mut self, slot: usize) -> bool {
-        crate::gpu_model::qwen35::GpuQwen35::prefill_abort(self, slot)
+        // a queued chunked prompt, or a picture prompt the stepped lane holds
+        crate::gpu_model::qwen35::GpuQwen35::prefill_abort(self, slot) || self.mm_steps_abort(slot)
+    }
+    fn supports_chunked_multimodal(&self) -> bool {
+        self.mm_steps_supported()
+    }
+    fn prefill_begin_multimodal(
+        &mut self,
+        items: Vec<(usize, Vec<crate::service::MmChunk>)>,
+    ) -> Vec<(usize, MmAdmit)> {
+        self.mm_steps_begin(items)
+    }
+    fn encode_step(&mut self) -> Vec<(usize, MmAdmit)> {
+        self.mm_steps_run()
+    }
+    fn encoding_pending(&self) -> bool {
+        self.mm_steps_pending()
     }
     fn forward_mixed(
         &mut self,

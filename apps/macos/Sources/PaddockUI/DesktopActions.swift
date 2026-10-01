@@ -106,6 +106,25 @@ extension WorkspaceModel {
     default: break
     }
     if case .chat(let port) = request.action,
+      snapshot?.runners.contains(where: { $0.port == port && $0.tabular != nil }) == true
+    {
+      guard !tables.busy else {
+        desktopError = "Wait for the current prediction or cancel it before switching models."
+        return
+      }
+      desktopTransition = true
+      defer { desktopTransition = false }
+      await tables.refresh()
+      guard tables.predictors.contains(where: { $0.port == port }) else {
+        desktopError = "This table model is not ready. Check Settings > Instances."
+        return
+      }
+      tables.port = port
+      navigation.mode = .studio
+      navigation.studio = .tables
+      return
+    }
+    if case .chat(let port) = request.action,
       snapshot?.runners.contains(where: { $0.port == port && $0.reader != nil }) == true
     {
       // Decision endpoints have no chat model. Preserve both drafts, discover

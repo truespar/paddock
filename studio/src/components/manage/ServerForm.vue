@@ -1190,6 +1190,14 @@ const catalogLoaded = computed(() => reg.models.length > 0)
 const forensicsPossible = computed(
   () => catalogLoaded.value && (!catModel.value || !!visionArtifact.value),
 )
+// Document & image intelligence reads the files a CONVERSATION carries - an
+// image or a PDF in a turn - so it belongs to the models that chat. A table, a
+// decision, an embedding or a transcript has no attachment for it to read, and
+// the card told a Kumo endpoint its file metadata was "Always on". Same
+// catalog-loaded guard as above: a hand-typed path keeps the card.
+const takesAttachments = computed(
+  () => catalogLoaded.value && (!catModel.value || selectedCapabilities.value.includes('chat')),
+)
 // System tools need TOOL CALLING; a model whose capability doesn't include
 // it gets no web-search/MCP section (same rule as canSpeculate).
 const canTools = computed(
@@ -1214,8 +1222,9 @@ const canSpeculate = computed(
 const singlePass = computed(() =>
   selectedCapabilities.value.some(
     // a decision model reads each question in one pass at the checkpoint's
-    // own sequence length and packs its own passes, so neither knob exists
-    (c) => c === 'image-generation' || c === 'segmentation' || c === 'decision',
+    // own sequence length and packs its own passes, and a tabular predictor
+    // reads a whole table in one pass - neither knob exists for either
+    (c) => c === 'image-generation' || c === 'segmentation' || c === 'decision' || c === 'tabular',
   ),
 )
 const canOffload = computed(() => backend.value !== 'metal' || selectedWeights.value?.kv_offload_supported === true)
@@ -2530,7 +2539,7 @@ function start(): void {
              and file metadata (Sift). Endpoint-level defaults; every
              feature is also togglable per request over the API / in the chat
              composer. -->
-        <div class="sf__card">
+        <div v-if="takesAttachments" class="sf__card">
         <p class="sf__card-hd">Document &amp; image intelligence</p>
         <p class="sf__hint">What the runner finds in a file, beyond its content.</p>
         <!-- Cards rather than a bare switch, matching the Quality block: these

@@ -81,9 +81,11 @@ extension EndpointEditor {
   var isMLX: Bool {
     selectedArtifact?.format == "safetensors" && selectedArtifact?.runtime?.checkpointDir != false
       && !capabilities.contains("decision")
+      && !capabilities.contains("tabular")
   }
   var isSplash: Bool { selectedArtifact?.format == "splash-packed-q4" }
   var checkpointLabel: String {
+    if capabilities.contains("tabular") { return "F32 checkpoint" }
     if capabilities.contains("decision") { return "F16 checkpoint" }
     return isSplash
       ? "Splash packed Q4"

@@ -67,6 +67,10 @@ const CAP_META = [
   // Typed questions about a text in, a calibrated answer each out - the Reads
   // page's model. It neither chats nor generates, so the chip is all it does.
   { key: 'decision', icon: 'list-checks', label: 'Decisions' },
+  // Labelled rows in, the missing column predicted (a class or a number) -
+  // the Tables page's model. It takes tables, never text, so the chip is all
+  // it does.
+  { key: 'tabular', icon: 'table', label: 'Tables' },
   // Aerial photographs in, maps out (what the ground is, how tall the trees
   // are). It reads images but it is no vision chat - it answers with rasters,
   // so it gets its own chip rather than borrowing 'Vision'.
@@ -139,6 +143,8 @@ function sectionOf(m: CatalogModel): string {
   if (m.capability.includes('alignment')) return 'Speech to text'
   // Answers questions with probabilities, never with text of its own.
   if (m.capability.includes('decision')) return 'Decisions'
+  // Rows in, predictions out - no text surface at all.
+  if (m.capability.includes('tabular')) return 'Tables'
   // Chips in, rasters out - it has no text surface at all, so filing it under
   // 'Chat' would promise the one thing it refuses.
   if (m.capability.includes('segmentation')) return 'Maps from imagery'
@@ -325,7 +331,8 @@ function configure(m: CatalogModel): void {
                 <Tooltip :label="r.m.specs?.context_max ?? ''">
                   <span class="c-name__meta">
                     {{ r.m.specs?.params }}<template v-if="r.m.specs?.context">
-                      · {{ r.m.specs.context }} ctx</template>
+                      · {{ r.m.specs.context
+                      }}{{ r.m.capability.includes('tabular') ? '' : ' ctx' }}</template>
                   </span>
                 </Tooltip>
                 <span v-if="!r.m.installed" class="c-name__get">

@@ -6786,6 +6786,366 @@ revision = "2026-08-09"
     sha256 = "f575b6361ff69b52388967f69219f0cc7f9ae91f96482e5ad038261b2728799e"
     size = 16554
 
+# -- tabular predictors --------------------------------------------------------
+# Kumo Tabular (NVIDIA): a tabular foundation model. Labelled rows go in with
+# every request and the model reads them in context - no training, no tuning -
+# then predicts the target of new rows: a class with its probabilities, or a
+# number as 999 quantiles. Served on /v1/tabular/* (one-shot predictions, and
+# fitted contexts a later query replays), never as chat.
+#
+# Six checkpoints, one per endpoint: small / medium / large, each with a
+# classification and a regression head. Mirrored from HF nvidia/Kumo-Tabular
+# at v1.0.0 (bd7fa122b516), each original PyTorch archive SHA-verified and
+# re-saved as F32 safetensors unchanged - the runner never unpickles - with
+# the model card and the OpenMDW licence beside the weights.
+#
+# A single-pass model: nothing is cached between calls but the fitted
+# contexts a caller asks for. weight_bytes is the loader's own count
+# (GB10, 2026-09-30); workspace is the ceiling of a pass's planes at the
+# request limits (4096 labelled + 1024 query rows, 500 columns, 131072
+# cells) plus the 1 GiB fitted-context cap, for the larger of the two lanes:
+# Metal's 18-plane pass (medium/large 3.81 GiB, small 2.45 GiB). The fused
+# CUDA arena tops out at 2.80 / 1.95 GiB.
+
+[[model]]
+id = "kumo-tabular"
+vendor = "NVIDIA"
+display = "Kumo Tabular"
+family = "kumo"
+capability = ["tabular"]
+license = "openmdw-1.1"
+revision = "2026-09-30"
+
+  [model.specs]
+  published_at = "2026-09-29"
+  published_source = "https://huggingface.co/blog/nvidia/kumo-tabular"
+  params = "27M / 62M / 214M"
+  context = "4,096 labelled rows, 500 columns"
+  homepage = "https://huggingface.co/nvidia/Kumo-Tabular"
+  about = "Predicts a column of a table from the rows around it - give it labelled rows and it fills in the rest, a class with its probabilities or a number with its whole distribution. No training: the labelled rows ride along with every request, the same /v1/tabular/predictions call your code makes."
+  strengths = [
+    "Nothing to train or tune - tens of milliseconds for hundreds of rows",
+    "Numbers, categories and missing cells as they come, raw strings included",
+    "Regression answers carry 999 quantiles, not just a point estimate",
+  ]
+  tradeoffs = [
+    "Up to 4,096 labelled rows, 1,024 rows to predict and 500 columns a request",
+    "At most ten classes",
+    "One task per endpoint: classification and regression are separate checkpoints",
+  ]
+
+  [[model.artifact]]
+  id = "large-classification"
+  kind = "weights"
+  format = "safetensors"
+  label = "Large - classification (official F32)"
+  quant = "F32"
+  default = true
+  workspace = 4087631776
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  checkpoint_dir = true
+  # a single-pass predictor: no drafter, no tower, nothing rides along
+  companions = []
+  [model.artifact.runtime.backend_overrides.metal]
+  default_max_batch = 1
+  kv_cache_dtype = "auto"
+
+  [model.artifact.shape]
+  weight_bytes = 854674408
+  kind = "encoder"
+  vocab = 0
+  max_ctx = 4096
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = []
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-large-classification/model.safetensors"
+    dest = "kumo-tabular-large-classification/model.safetensors"
+    sha256 = "2e398863274d3b8088af5dd6dd5464dfc91a459c515f02872abf03709050386a"
+    size = 854738672
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-large-classification/config.json"
+    dest = "kumo-tabular-large-classification/config.json"
+    sha256 = "e4ceeefce2b02f0413676b1a6397919cb4285ed5164faf71f75c07ca922b447f"
+    size = 359
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-large-classification/LICENSE"
+    dest = "kumo-tabular-large-classification/LICENSE"
+    sha256 = "44b43ed7b8e0f987dc5e90fb6cb4b901eccf0b14dc9f17a9033951603851d37d"
+    size = 2693
+
+    # NVIDIA's own model card - the loud-attribution file
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-large-classification/README.md"
+    dest = "kumo-tabular-large-classification/README.md"
+    sha256 = "d57981ccfc614d107ec8eee7bd1ce2d572968d66024ccc8ed116d710b685bd32"
+    size = 1129
+
+  [[model.artifact]]
+  id = "large-regression"
+  kind = "weights"
+  format = "safetensors"
+  label = "Large - regression (official F32)"
+  quant = "F32"
+  default = false
+  workspace = 4087631776
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  checkpoint_dir = true
+  # a single-pass predictor: no drafter, no tower, nothing rides along
+  companions = []
+  [model.artifact.runtime.backend_overrides.metal]
+  default_max_batch = 1
+  kv_cache_dtype = "auto"
+
+  [model.artifact.shape]
+  weight_bytes = 862734172
+  kind = "encoder"
+  vocab = 0
+  max_ctx = 4096
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = []
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-large-regression/model.safetensors"
+    dest = "kumo-tabular-large-regression/model.safetensors"
+    sha256 = "ed84296ce00d436847baff6411835a436b61d0490124cf22c9b0943c86b7085e"
+    size = 862798444
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-large-regression/config.json"
+    dest = "kumo-tabular-large-regression/config.json"
+    sha256 = "da1bae1fcbf85ef5cbe780a7d3362f8b52dfebf36d6adceddf34dcdad612ba6d"
+    size = 355
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-large-regression/LICENSE"
+    dest = "kumo-tabular-large-regression/LICENSE"
+    sha256 = "44b43ed7b8e0f987dc5e90fb6cb4b901eccf0b14dc9f17a9033951603851d37d"
+    size = 2693
+
+    # NVIDIA's own model card - the loud-attribution file
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-large-regression/README.md"
+    dest = "kumo-tabular-large-regression/README.md"
+    sha256 = "d57981ccfc614d107ec8eee7bd1ce2d572968d66024ccc8ed116d710b685bd32"
+    size = 1129
+
+  [[model.artifact]]
+  id = "medium-classification"
+  kind = "weights"
+  format = "safetensors"
+  label = "Medium - classification (official F32)"
+  quant = "F32"
+  default = false
+  workspace = 4087631776
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  checkpoint_dir = true
+  # a single-pass predictor: no drafter, no tower, nothing rides along
+  companions = []
+  [model.artifact.runtime.backend_overrides.metal]
+  default_max_batch = 1
+  kv_cache_dtype = "auto"
+
+  [model.artifact.shape]
+  weight_bytes = 245942504
+  kind = "encoder"
+  vocab = 0
+  max_ctx = 4096
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = []
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-medium-classification/model.safetensors"
+    dest = "kumo-tabular-medium-classification/model.safetensors"
+    sha256 = "77359664b29c4f55876f3ecd73a7bc55a4d32a4fe2b2d4f61b873f81dd65301b"
+    size = 246006440
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-medium-classification/config.json"
+    dest = "kumo-tabular-medium-classification/config.json"
+    sha256 = "8285943be48d7c4942644ca3df9633eb0181655ebde7cb883deac6c1a92314d2"
+    size = 360
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-medium-classification/LICENSE"
+    dest = "kumo-tabular-medium-classification/LICENSE"
+    sha256 = "44b43ed7b8e0f987dc5e90fb6cb4b901eccf0b14dc9f17a9033951603851d37d"
+    size = 2693
+
+    # NVIDIA's own model card - the loud-attribution file
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-medium-classification/README.md"
+    dest = "kumo-tabular-medium-classification/README.md"
+    sha256 = "d57981ccfc614d107ec8eee7bd1ce2d572968d66024ccc8ed116d710b685bd32"
+    size = 1129
+
+  [[model.artifact]]
+  id = "medium-regression"
+  kind = "weights"
+  format = "safetensors"
+  label = "Medium - regression (official F32)"
+  quant = "F32"
+  default = false
+  workspace = 4087631776
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  checkpoint_dir = true
+  # a single-pass predictor: no drafter, no tower, nothing rides along
+  companions = []
+  [model.artifact.runtime.backend_overrides.metal]
+  default_max_batch = 1
+  kv_cache_dtype = "auto"
+
+  [model.artifact.shape]
+  weight_bytes = 249969756
+  kind = "encoder"
+  vocab = 0
+  max_ctx = 4096
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = []
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-medium-regression/model.safetensors"
+    dest = "kumo-tabular-medium-regression/model.safetensors"
+    sha256 = "ace4bdfa861bb308f708050d3017806d4f8ce2b900012bd37776253239ad6b09"
+    size = 250033716
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-medium-regression/config.json"
+    dest = "kumo-tabular-medium-regression/config.json"
+    sha256 = "ca1872bba41e96a41caee02ca823025000f3076c0ac09ce6536fb2ca97cb03fd"
+    size = 356
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-medium-regression/LICENSE"
+    dest = "kumo-tabular-medium-regression/LICENSE"
+    sha256 = "44b43ed7b8e0f987dc5e90fb6cb4b901eccf0b14dc9f17a9033951603851d37d"
+    size = 2693
+
+    # NVIDIA's own model card - the loud-attribution file
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-medium-regression/README.md"
+    dest = "kumo-tabular-medium-regression/README.md"
+    sha256 = "d57981ccfc614d107ec8eee7bd1ce2d572968d66024ccc8ed116d710b685bd32"
+    size = 1129
+
+  [[model.artifact]]
+  id = "small-classification"
+  kind = "weights"
+  format = "safetensors"
+  label = "Small - classification (official F32)"
+  quant = "F32"
+  default = false
+  workspace = 2631290784
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  checkpoint_dir = true
+  # a single-pass predictor: no drafter, no tower, nothing rides along
+  companions = []
+  [model.artifact.runtime.backend_overrides.metal]
+  default_max_batch = 1
+  kv_cache_dtype = "auto"
+
+  [model.artifact.shape]
+  weight_bytes = 109833512
+  kind = "encoder"
+  vocab = 0
+  max_ctx = 4096
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = []
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-small-classification/model.safetensors"
+    dest = "kumo-tabular-small-classification/model.safetensors"
+    sha256 = "fe55113ae955f991942fe92a595d1bea3dc58176081f8c2bcdd981733c417990"
+    size = 109871224
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-small-classification/config.json"
+    dest = "kumo-tabular-small-classification/config.json"
+    sha256 = "88d0cc0aff90ca7b4757ac17e86f1fa9b73513d42cbe190f64e6f91f750e5e47"
+    size = 359
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-small-classification/LICENSE"
+    dest = "kumo-tabular-small-classification/LICENSE"
+    sha256 = "44b43ed7b8e0f987dc5e90fb6cb4b901eccf0b14dc9f17a9033951603851d37d"
+    size = 2693
+
+    # NVIDIA's own model card - the loud-attribution file
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-small-classification/README.md"
+    dest = "kumo-tabular-small-classification/README.md"
+    sha256 = "d57981ccfc614d107ec8eee7bd1ce2d572968d66024ccc8ed116d710b685bd32"
+    size = 1129
+
+  [[model.artifact]]
+  id = "small-regression"
+  kind = "weights"
+  format = "safetensors"
+  label = "Small - regression (official F32)"
+  quant = "F32"
+  default = false
+  workspace = 2631290784
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  checkpoint_dir = true
+  # a single-pass predictor: no drafter, no tower, nothing rides along
+  companions = []
+  [model.artifact.runtime.backend_overrides.metal]
+  default_max_batch = 1
+  kv_cache_dtype = "auto"
+
+  [model.artifact.shape]
+  weight_bytes = 113865372
+  kind = "encoder"
+  vocab = 0
+  max_ctx = 4096
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = []
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-small-regression/model.safetensors"
+    dest = "kumo-tabular-small-regression/model.safetensors"
+    sha256 = "fd77cabc96866b6708231fa53e31da79a46a8902db219078fed2fcc75d5493aa"
+    size = 113903108
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-small-regression/config.json"
+    dest = "kumo-tabular-small-regression/config.json"
+    sha256 = "d904b4957b9703490e8dc5fcc885b2efd4bed71e8bbc5bbd7eb945b04cbb5d37"
+    size = 355
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-small-regression/LICENSE"
+    dest = "kumo-tabular-small-regression/LICENSE"
+    sha256 = "44b43ed7b8e0f987dc5e90fb6cb4b901eccf0b14dc9f17a9033951603851d37d"
+    size = 2693
+
+    # NVIDIA's own model card - the loud-attribution file
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/kumo-tabular-small-regression/README.md"
+    dest = "kumo-tabular-small-regression/README.md"
+    sha256 = "d57981ccfc614d107ec8eee7bd1ce2d572968d66024ccc8ed116d710b685bd32"
+    size = 1129
+
 # ── image generation ─────────────────────────────────────────────────────────
 #
 # Qwen-Image-2.1 (released 2026-09-20): the first image-generation model here,

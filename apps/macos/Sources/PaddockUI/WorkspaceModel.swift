@@ -49,6 +49,7 @@ public final class WorkspaceModel {
   let endpointLogs: EndpointLogsModel
   let studioLibrary = StudioLibraryModel()
   let reads: NativeReadsModel
+  let tables: NativeTablesModel
   let studioPreferences = StudioPreferencesModel()
   public var desktopRequest: DesktopRequest?
   public var desktopError: String?
@@ -57,7 +58,8 @@ public final class WorkspaceModel {
   @ObservationIgnored public var onSnapshot: ((ManagerSnapshot) -> Void)?
   @ObservationIgnored public var onStudioState: ((StudioState) -> Void)?
   public var studioNeedsQuitConfirmation: Bool {
-    reads.hasWork || connections.hasDraft || integrations.hasDraft || endpointEditor?.dirty == true
+    reads.hasWork || tables.hasWork || connections.hasDraft || integrations.hasDraft
+      || endpointEditor?.dirty == true
       || studioLibrary.hasWork || studioLibrary.instructions.hasWork || studioPreferences.hasWork
       || draft.hasContent || chatStorage?.busy == true
       || chatStorage?.uploading == true
@@ -81,6 +83,7 @@ public final class WorkspaceModel {
   ) {
     self.client = client
     reads = NativeReadsModel(client: client)
+    tables = NativeTablesModel(client: client)
     insights = InsightsModel(client: client)
     benchmarks = BenchmarksModel(client: client)
     dataStorage = DataStorageModel(client: client)
@@ -308,6 +311,7 @@ public final class WorkspaceModel {
   }
 
   public func shutdown() async {
+    tables.cancel()
     await speech.settle()
     await studioLibrary.settle()
     await studioPreferences.settle()
@@ -328,5 +332,13 @@ public final class WorkspaceModel {
     lastReceipt = nil
     commandError = nil
     await client.close()
+  }
+
+  public func saveTablesBeforeQuit() async -> Bool {
+    let saved = await tables.prepareForQuit()
+    if !saved {
+      desktopError = tables.history.error ?? "The table could not be saved. Paddock stayed open."
+    }
+    return saved
   }
 }

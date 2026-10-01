@@ -231,6 +231,21 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/runners/{port}/v1/embeddings", post(relay_embeddings))
         .route("/api/runners/{port}/v1/rerank", post(relay_rerank))
         .route("/api/runners/{port}/v1/systemone", post(relay_systemone))
+        // Tables (Kumo-Tabular): a one-shot or fitted-context prediction, a
+        // context fitted for reuse, and its release - JSON both ways; the
+        // release is a DELETE, so this relay carries the method.
+        .route(
+            "/api/runners/{port}/v1/tabular/predictions",
+            post(relay_tabular_predictions),
+        )
+        .route(
+            "/api/runners/{port}/v1/tabular/contexts",
+            post(relay_tabular_contexts),
+        )
+        .route(
+            "/api/runners/{port}/v1/tabular/contexts/{id}",
+            axum::routing::delete(relay_tabular_release),
+        )
         // Transcribe: an audio FILE goes up, so this relay carries the
         // caller's multipart content-type (boundary and all) rather than the
         // JSON every other relay assumes.
@@ -1699,6 +1714,48 @@ async fn relay_systemone(
     relay_v1(state, port, "v1/systemone", body).await
 }
 
+async fn relay_tabular_predictions(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(port): axum::extract::Path<u16>,
+    body: axum::body::Bytes,
+) -> Response {
+    relay_v1(state, port, "v1/tabular/predictions", body).await
+}
+
+async fn relay_tabular_contexts(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(port): axum::extract::Path<u16>,
+    body: axum::body::Bytes,
+) -> Response {
+    relay_v1(state, port, "v1/tabular/contexts", body).await
+}
+
+/// Release a fitted context. The id goes into the runner's URL, so only the
+/// characters a runner mints (`ctx_` + hex) pass - never a path segment of
+/// the caller's choosing.
+async fn relay_tabular_release(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((port, id)): axum::extract::Path<(u16, String)>,
+) -> Response {
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return relay_err(StatusCode::BAD_REQUEST, "not a tabular context id".into());
+    }
+    relay_method(
+        state,
+        port,
+        reqwest::Method::DELETE,
+        &format!("v1/tabular/contexts/{id}"),
+        "application/json",
+        axum::body::Bytes::new(),
+    )
+    .await
+}
+
 async fn relay_count_tokens(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(port): axum::extract::Path<u16>,
@@ -1792,6 +1849,17 @@ async fn relay_raw(
     content_type: &str,
     body: axum::body::Bytes,
 ) -> Response {
+    relay_method(state, port, reqwest::Method::POST, path, content_type, body).await
+}
+
+async fn relay_method(
+    state: Arc<AppState>,
+    port: u16,
+    method: reqwest::Method,
+    path: &str,
+    content_type: &str,
+    body: axum::body::Bytes,
+) -> Response {
     let key = state.supervisor.runner_key(port).await;
     // No total timeout: a long generation streams for minutes. Connect
     // timeout keeps a dead runner from hanging the Studio.
@@ -1803,7 +1871,7 @@ async fn relay_raw(
         Err(e) => return relay_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     let mut req = client
-        .post(format!("http://127.0.0.1:{port}/{path}"))
+        .request(method, format!("http://127.0.0.1:{port}/{path}"))
         .header(axum::http::header::CONTENT_TYPE, content_type)
         .body(body);
     if let Some(k) = key {

@@ -152,11 +152,33 @@ fn api_allowed(method: &Method, path: &str) -> bool {
         ["api", "usage", "history"] => *method == Method::GET,
         ["api", "reads"] => matches!(*method, Method::GET | Method::POST),
         ["api", "read-history"] => *method == Method::GET,
+        ["api", "table-history"] => *method == Method::GET,
+        ["api", "table-history", _] => {
+            matches!(*method, Method::GET | Method::PUT | Method::DELETE)
+        }
         ["api", "read-history", _] => matches!(*method, Method::GET | Method::PUT | Method::DELETE),
         ["api", "read-runs", _] => matches!(*method, Method::GET | Method::POST | Method::DELETE),
         ["api", "reads", _] => matches!(*method, Method::GET | Method::PUT | Method::DELETE),
         ["api", "runners", port, "v1", "systemone"] if port.parse::<u16>().is_ok() => {
             *method == Method::POST
+        }
+        [
+            "api",
+            "runners",
+            port,
+            "v1",
+            "tabular",
+            "predictions" | "contexts",
+        ] if port.parse::<u16>().is_ok_and(|p| p != 0) => *method == Method::POST,
+        ["api", "runners", port, "v1", "tabular", "contexts", id]
+            if port.parse::<u16>().is_ok_and(|p| p != 0)
+                && !id.is_empty()
+                && id.len() <= 64
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') =>
+        {
+            *method == Method::DELETE
         }
         ["api", "mcp", "artifacts" | "graph" | "tools"] => true,
         ["api", "connectors"] => *method == Method::GET,
@@ -586,6 +608,12 @@ mod tests {
             (Method::PUT, "/api/reads/set-1"),
             (Method::DELETE, "/api/reads/set-1"),
             (Method::POST, "/api/runners/12587/v1/systemone"),
+            (Method::POST, "/api/runners/12587/v1/tabular/predictions"),
+            (Method::POST, "/api/runners/12587/v1/tabular/contexts"),
+            (
+                Method::DELETE,
+                "/api/runners/12587/v1/tabular/contexts/ctx_1",
+            ),
         ] {
             assert!(api_allowed(&method, path));
             assert!(!authorized(
@@ -612,6 +640,13 @@ mod tests {
             (Method::GET, "/api/runners/12587/v1/systemone"),
             (Method::POST, "/api/runners/invalid/v1/systemone"),
             (Method::POST, "/api/runners/12587/stop"),
+            (Method::GET, "/api/runners/12587/v1/tabular/predictions"),
+            (Method::POST, "/api/runners/0/v1/tabular/predictions"),
+            (Method::POST, "/api/runners/12587/v1/tabular/contexts/ctx-1"),
+            (
+                Method::DELETE,
+                "/api/runners/12587/v1/tabular/contexts/../secret",
+            ),
         ] {
             assert!(!api_allowed(&method, path));
         }
@@ -672,6 +707,86 @@ mod tests {
         assert_eq!(settings["studio.pk_theme"], "dark");
         assert_eq!(settings["studio.pk_sidebar_width"], "0");
         assert!(settings.get("credentials").is_none());
+    }
+
+    #[tokio::test]
+    async fn table_history_uses_sqlite_revisions_through_the_native_guard() {
+        let state = Arc::new(paddock_manager::routes::AppState::for_tests());
+        let app = paddock_manager::routes::router(state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(policy()),
+                guard,
+            ))
+            .layer(axum::Extension(state));
+        let call = |method: Method, path: &str, body: String| {
+            app.clone().oneshot(
+                request(path)
+                    .method(method)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+        let key = "a47678d9564a8102e8467fd45a06b9e753a5450ed76f3af163a15eea89c9f3c0";
+        let mut doc = serde_json::json!({"version":1,"id":"shared","title":"Table","model":"kumo","createdAt":1,"updatedAt":2,
+            "draft":{"dataset":key,"fileName":"Example.csv","model":"kumo","port":11544,"estimators":8,"seed":0,"spec":null},
+            "datasets":{key:"size,city,label\n1,a,yes\n2,b,no\n3,c,\n"},"runs":[]});
+        assert_eq!(
+            call(Method::PUT, "/api/table-history/shared", doc.to_string())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let reply = call(
+            Method::PUT,
+            "/api/table-history/shared?revision=",
+            doc.to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(reply.into_body(), 8192).await.unwrap();
+        let row: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let path = format!(
+            "/api/table-history/shared?revision={}",
+            row["revision"].as_str().unwrap()
+        );
+        doc["title"] = serde_json::json!("Native edit");
+        assert_eq!(
+            call(Method::PUT, &path, doc.to_string())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(Method::PUT, &path, doc.to_string())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(Method::DELETE, &path, String::new())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        let reply = call(Method::GET, "/api/table-history/shared", String::new())
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(reply.into_body(), 8192).await.unwrap();
+        let snapshot: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(snapshot["doc"], doc.to_string());
+        assert_eq!(
+            call(Method::POST, "/api/table-history/shared", String::new())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
     }
 
     #[tokio::test]

@@ -998,6 +998,48 @@ impl GpuExecutor {
         })
     }
 
+    /// True when the pack decodes host-staged n-gram rows (slot 697).
+    pub fn has_q4x_ple_rows(&self) -> bool {
+        self.kernels.q4x_ple_rows.is_some()
+    }
+
+    /// Decode `rows` n-gram rows the host copied raw off the table's mapping
+    /// (`raw` `[rows, row_bytes]`, one per (token, head) in the ids' order)
+    /// into `out` `[rows, width]` f32 - slot 697. `fmt` is the pack's row
+    /// format code (qwen4exp.cuh); `scale` the table's tensor scale where the
+    /// format has one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn q4x_ple_rows(
+        &self,
+        raw: &CudaSlice<u8>,
+        out: &mut CudaSlice<f32>,
+        fmt: u32,
+        scale: f32,
+        rows: usize,
+        width: usize,
+        row_bytes: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .q4x_ple_rows
+            .ok_or(GpuError::MissingOp("q4x_ple_rows"))?;
+        let (rp, _g1) = raw.device_ptr(&self.stream);
+        let (op, _g2) = out.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slot 697)
+        check(unsafe {
+            f(
+                rp as *const _,
+                op as *mut _,
+                fmt,
+                scale,
+                rows as u32,
+                width as u32,
+                row_bytes as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     pub fn q4x_ple_gate(
         &self,
         kn: &CudaSlice<f32>,

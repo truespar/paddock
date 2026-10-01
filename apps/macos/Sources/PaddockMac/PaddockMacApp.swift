@@ -187,6 +187,12 @@ final class AppLifecycle: NSObject, NSApplicationDelegate {
     terminating = true
     workspace.quitting = true
     Task {
+      guard await workspace.saveTablesBeforeQuit() else {
+        terminating = false
+        workspace.quitting = false
+        sender.reply(toApplicationShouldTerminate: false)
+        return
+      }
       if stopModels, !(await workspace.stopForQuit(runners)) {
         terminating = false
         workspace.quitting = false

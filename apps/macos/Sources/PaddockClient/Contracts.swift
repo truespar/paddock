@@ -135,6 +135,7 @@ public struct RunnerInfo: Decodable, Identifiable, Sendable {
   public let aligner: String?
   public let image: String?
   public let reader: String?
+  public let tabular: String?
   public let display: String?
   public let endpoint: String
   public let version: String?
@@ -146,7 +147,13 @@ public struct RunnerInfo: Decodable, Identifiable, Sendable {
   // A replacement runner on the same port is a new identity.
   public var id: String { "\(port):\(pid)" }
   public var title: String {
-    display ?? model ?? embedder ?? asr ?? aligner ?? image ?? reader ?? "Runner \(port)"
+    display ?? model ?? embedder ?? asr ?? aligner ?? image ?? reader ?? tabular ?? "Runner \(port)"
+  }
+  public var studioActionTitle: String {
+    tabular != nil ? "Open Tables" : reader != nil ? "Open Reads" : "Open Studio"
+  }
+  public var studioActionSymbol: String {
+    tabular != nil ? "tablecells" : reader != nil ? "list.bullet.clipboard" : "bubble"
   }
 }
 

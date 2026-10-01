@@ -4,6 +4,20 @@
 //! history, not merely token equality or the last contraction class.
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static GROUPED_PROMPT_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(super) fn grouping() -> bool {
+    #[cfg(test)]
+    return GROUPED_PROMPT_FOR_TEST.with(|v| v.get());
+    #[cfg(not(test))]
+    // Exact in fixed work, but the repeated agent matrix did not improve.
+    // Retain the experiment without enlarging production c=1 scratch.
+    false
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct Markers {
     opener: u32,
@@ -131,6 +145,36 @@ impl Plan {
         self.cuts
     }
 
+    pub(super) fn execution_at(&self, offset: usize) -> (usize, usize) {
+        if self.ends.last().is_some_and(|&end| offset < end) {
+            self.at(offset)
+        } else {
+            (1, 1)
+        }
+    }
+
+    /// Bounded cold-prefill work only. Do not join short/vector tails, cross a
+    /// recurrent tile boundary after a partial chunk, or include the final
+    /// singleton prompt token. Callers bound `limit` by the next retained
+    /// prefix cut and the scheduler's grant before calling this method.
+    pub(super) fn pass_rows(&self, offset: usize, limit: usize) -> usize {
+        let (logical, remaining) = self.at(offset);
+        let mut count = remaining.min(limit);
+        if logical < 256 || remaining < 32 {
+            return count;
+        }
+        let mut part = remaining;
+        while count < limit && part.is_multiple_of(32) {
+            let (logical, remaining) = self.at(offset + count);
+            if logical < 256 || remaining < 32 {
+                break;
+            }
+            part = remaining;
+            count += remaining.min(limit - count);
+        }
+        count
+    }
+
     pub(super) fn until_cut(&self, offset: usize) -> usize {
         self.cuts
             .iter()
@@ -167,6 +211,10 @@ impl Plan {
 }
 
 impl FlashNext {
+    pub(super) fn groups_prompt_chunks(&self) -> bool {
+        grouping() && self.device.tensor_accelerated() && self.capacity > self.chunk
+    }
+
     pub(super) fn prompt_plan(&self, tokens: &[u32]) -> Plan {
         Plan::new(tokens, self.chunk, self.markers.as_ref())
     }
@@ -188,6 +236,44 @@ mod tests {
         tokens[670] = 99;
         tokens[1650..1653].copy_from_slice(&[99, 98, 97]);
         tokens
+    }
+
+    #[test]
+    fn grouped_pass_is_bounded_and_keeps_short_tail_and_prefix_cuts() {
+        let plan = Plan::grid(4096, 1024);
+        assert_eq!(plan.pass_rows(0, 2048), 2048);
+        assert_eq!(plan.pass_rows(2048, 2048), 2047);
+        assert_eq!(plan.pass_rows(4095, 2048), 1);
+        assert_eq!(plan.pass_rows(13, 2048), 1011);
+        assert_eq!(plan.pass_rows(32, 2048), 2048);
+        let plan = Plan::new(&conversation(), 1024, Some(&markers()));
+        assert_eq!(plan.pass_rows(0, 2048), 1648);
+        assert_eq!(plan.pass_rows(0, plan.until_cut(0)), 1648);
+        assert_eq!(plan.pass_rows(1648, 2048), 51);
+        assert_eq!(plan.execution_at(1700), (1, 1));
+        assert_eq!(Plan::default().execution_at(0), (1, 1));
+        for length in [1, 12, 255, 256, 257, 512, 1024, 1025, 2048, 4096, 8192] {
+            let plan = Plan::grid(length, 1024);
+            for offset in 0..length {
+                for cap in [0, 1, 13, 32, 33, 512, 1024, 2048] {
+                    let count = plan.pass_rows(offset, cap);
+                    assert!(count <= cap && count <= length - offset);
+                    assert!(count >= plan.at(offset).1.min(cap));
+                    if offset < length - 1 {
+                        assert!(offset + count < length, "final token must stay singleton");
+                    }
+                    let mut at = offset;
+                    while at < offset + count {
+                        let (_, remaining) = plan.at(at);
+                        let take = remaining.min(offset + count - at);
+                        if at + take < offset + count {
+                            assert!(take.is_multiple_of(32));
+                        }
+                        at += take;
+                    }
+                }
+            }
+        }
     }
 
     #[test]

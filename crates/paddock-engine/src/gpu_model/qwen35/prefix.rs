@@ -519,88 +519,14 @@ impl GpuQwen35 {
         slot: usize,
         chunks: &[crate::service::MmChunk],
     ) -> Result<(Vec<f32>, usize), GpuModelError> {
-        assert!(self.batch.is_some(), "enable_batch first");
-        assert!(slot < self.batch.as_ref().expect("batch").max_batch);
-        // token ids (image spans are `0` placeholders), the mRoPE grid, and the
-        // equal-t image visibility bound - one ordered walk, any number of images
-        let grids = self.picture_grids(chunks)?;
-        let lay = build_mm_layout(chunks, &grids)?;
-        let t_len = lay.t_len;
-        assert!(t_len > 0);
-        if t_len > self.max_ctx {
-            return Err(GpuModelError::BatchTooLarge {
-                got: t_len,
-                max: self.max_ctx,
-            });
-        }
-        let keys = mm_radix_keys(&lay, &mm_image_hashes(chunks));
-        let img_spans: Vec<(usize, usize)> =
-            lay.splices.iter().map(|&(off, n)| (off, off + n)).collect();
-        let sources: Vec<(&[u8], usize, usize)> = chunks
-            .iter()
-            .filter_map(|c| match c {
-                crate::service::MmChunk::Image { rgb, w, h } => Some((rgb.as_slice(), *w, *h)),
-                _ => None,
-            })
-            .collect();
-
-        // Same admission shape as the text path: match + restore, then grow the
-        // table to cover the whole prompt. `start` is a block-aligned row count
-        // already resident in KV (and whose DeltaNet state has been restored),
-        // 0 on a cold prompt.
-        //
-        // P5 budget pool: the slot's block table must back this prompt's KV
-        // before the paged appends/attention below read it. Without this the mm
-        // prefill wrote DENSE slot*max_ctx offsets into the pool store while
-        // decode read through the block table - correct only by the fresh-pool
-        // slot-0 coincidence, cross-slot KV corruption under any concurrency
-        // (found live: of two concurrent image requests, the blue-image slot
-        // answered "red").
-        let start = self.mm_prefix_resume(slot, &keys)?;
-        if self.batch.as_ref().expect("batch").pool.is_some() {
-            self.ensure_slot_blocks(slot, t_len - 1)?;
-        }
-
-        // Prefill [start, t_len) in passes that end at the checkpoint cuts, so
-        // the DeltaNet state can be snapshotted at each boundary before the
-        // following rows advance it - the paged text tail's shape exactly -
-        // and at most one planned prefill chunk apart, so no pass outgrows
-        // the serving scratch (`mm_pass_ends`).
-        let cuts = self.mm_ckpt_cuts(t_len, start, &img_spans);
-        let passes = crate::gpu_model::prefix_cache::mm_pass_ends(
-            start,
-            t_len,
-            &cuts,
-            &img_spans,
-            self.prefill_chunk_rows,
-        );
-        let mut pos = start;
-        let mut logits = Vec::new();
-        for (end, checkpoint) in passes {
-            // exactly the pictures this pass splices (the cut rule keeps each
-            // one whole inside a single pass), released when it ends
-            let need: Vec<usize> = (0..img_spans.len())
-                .filter(|&k| img_spans[k].0 >= pos && img_spans[k].1 <= end)
-                .collect();
-            let got =
-                self.encode_pictures(&need.iter().map(|&k| sources[k]).collect::<Vec<_>>())?;
-            let mut pictures: Vec<Option<super::pictures::Picture>> = vec![None; img_spans.len()];
-            for (k, p) in need.into_iter().zip(got) {
-                pictures[k] = Some(p);
+        // the stepped lane's units (`mm_steps`), run back to back: every pass
+        // at most one planned prefill chunk, pictures encoded as it comes up
+        let mut job = self.mm_slot_begin(slot, chunks, self.prefill_chunk_rows)?;
+        loop {
+            if let Some(done) = self.mm_slot_unit(&mut job, chunks)? {
+                return Ok(done);
             }
-            logits = self.mm_prefill_span(slot, &lay, &pictures, pos, end)?;
-            if checkpoint {
-                self.mm_prefix_publish(slot, &keys, end, true)?;
-            }
-            pos = end;
         }
-        // cache every full page of this prompt (idempotent for those inserted
-        // at a cut above) so a longer continuation resumes past the last one
-        self.mm_prefix_publish(slot, &keys, t_len / BLOCK_TOKENS * BLOCK_TOKENS, false)?;
-
-        self.batch.as_mut().expect("batch").mrope_delta[slot] =
-            lay.final_mrope_pos as i64 - t_len as i64;
-        Ok((logits, t_len))
     }
 
     /// Match `keys` against the paged radix and, if a resumable DeltaNet
@@ -611,7 +537,11 @@ impl GpuQwen35 {
     /// No MTP re-sync, unlike the text path's `prefix_resume_begin`: image
     /// prompts never warm the spec shadow at all (the placeholder ids would
     /// poison it - see the batch tick's note), so there is no cursor to rewind.
-    fn mm_prefix_resume(&mut self, slot: usize, keys: &[u32]) -> Result<usize, GpuModelError> {
+    pub(super) fn mm_prefix_resume(
+        &mut self,
+        slot: usize,
+        keys: &[u32],
+    ) -> Result<usize, GpuModelError> {
         let paged = self.batch.as_ref().expect("batch").paged_prefix.is_some();
         let mut start = 0usize;
         if paged {
@@ -670,7 +600,12 @@ impl GpuQwen35 {
     /// The checkpoint cuts for a multimodal prompt: [`ckpt_cuts`]'s two
     /// boundaries, each walked back out of any image span it lands inside, then
     /// filtered to the ones this prefill can actually reach.
-    fn mm_ckpt_cuts(&self, t_len: usize, start: usize, img_spans: &[(usize, usize)]) -> Vec<usize> {
+    pub(super) fn mm_ckpt_cuts(
+        &self,
+        t_len: usize,
+        start: usize,
+        img_spans: &[(usize, usize)],
+    ) -> Vec<usize> {
         if self.batch.as_ref().expect("batch").paged_prefix.is_none() {
             return Vec::new();
         }
@@ -687,7 +622,7 @@ impl GpuQwen35 {
     /// Publish `slot`'s full pages up to row `upto` into the radix, and (when
     /// `checkpoint`) snapshot the DeltaNet state there so the next turn can
     /// resume at it. A no-op below one page or outside pool mode.
-    fn mm_prefix_publish(
+    pub(super) fn mm_prefix_publish(
         &mut self,
         slot: usize,
         keys: &[u32],
@@ -725,7 +660,7 @@ impl GpuQwen35 {
     /// sit in an earlier span), so only the host slices move. Every image lies
     /// entirely inside one span - the cut rule guarantees no boundary falls
     /// inside a picture - so a span either splices a picture whole or not at all.
-    fn mm_prefill_span(
+    pub(super) fn mm_prefill_span(
         &mut self,
         slot: usize,
         lay: &MmLayout,

@@ -144,6 +144,26 @@ fn prompt_hash(tokens: &[u32]) -> u64 {
     h
 }
 
+/// Where the walk that took an in-walk checkpoint began: the prompt (its
+/// length and hash) and the checkpoint it resumed from - `None` for a cold
+/// walk - named by index AND attach generation, so a later re-send can tell
+/// that very checkpoint from a newer one filed at the same boundary.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WalkSrc {
+    t_len: usize,
+    hash: u64,
+    from: Option<Origin>,
+}
+
+/// A resume point: boundary, checkpoint index, the generation it was attached
+/// under.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Origin {
+    pos: usize,
+    idx: u32,
+    stamp: u64,
+}
+
 /// The slot's carried state, which a checkpoint snapshots and restores.
 pub(super) struct SlotState<'a> {
     pub(super) recur: &'a mut [Option<CudaSlice<f32>>],
@@ -162,11 +182,23 @@ pub(super) struct PrefixCache {
     max_descs: usize,
     last_reused: Vec<usize>,
     stats: bool,
-    /// per checkpoint index: the (length, hash) of the prompt that took the
-    /// checkpoint inside its own prefill walk - an exact re-send of that prompt
-    /// prefills cold (see `resume`). None for a checkpoint a walk boundary
-    /// took (cut walks, the reply checkpoint).
-    src: Vec<Option<(usize, u64)>>,
+    /// per checkpoint index: the walk that took the checkpoint inside itself,
+    /// which an exact re-send of that prompt repeats (see `resume`). None for
+    /// a checkpoint a walk boundary took (cut walks, the reply checkpoint).
+    src: Vec<Option<WalkSrc>>,
+    /// per checkpoint index: the generation of its current attachment. An
+    /// index is recycled when its checkpoint is stolen or dropped, so (index,
+    /// generation) is what names one checkpoint for as long as it lives.
+    gens: Vec<u64>,
+    next_gen: u64,
+    /// per slot: where its current walk began (`resume`'s verdict, or a
+    /// walk boundary `walk_starts` named), which the in-walk cuts it takes
+    /// record as their origin
+    walk_from: Vec<Option<Origin>>,
+    /// per slot: the latest point its state sits at that an exact re-send
+    /// can reach again - the resume point (None there = cold) or the last
+    /// walk-boundary checkpoint filed for it - and where that is
+    repeat_at: Vec<Option<(usize, Option<Origin>)>>,
 }
 
 impl PrefixCache {
@@ -215,7 +247,19 @@ impl PrefixCache {
             last_reused: vec![0; slots],
             stats: paddock_models::dev_var_os!("PADDOCK_PREFIX_STATS").is_some(),
             src: vec![None; n_ckpt as usize],
+            gens: vec![0; n_ckpt as usize],
+            next_gen: 0,
+            walk_from: vec![None; slots],
+            repeat_at: vec![None; slots],
         })
+    }
+
+    /// Stamp checkpoint `idx` with a fresh attach generation.
+    fn stamp(&mut self, idx: u32) {
+        self.next_gen += 1;
+        if let Some(g) = self.gens.get_mut(idx as usize) {
+            *g = self.next_gen;
+        }
     }
 
     /// How many leading tokens the last prefill of `slot` took from the cache
@@ -237,23 +281,78 @@ impl PrefixCache {
         st: SlotState<'_>,
     ) -> Result<usize, GpuModelError> {
         let t_len = tokens.len();
+        // cold unless a checkpoint below says otherwise
+        self.walk_from[slot] = None;
+        self.repeat_at[slot] = Some((0, None));
         let Some((radix, _)) = pages.radix_pool() else {
             return Ok(0);
         };
         let m = radix.match_full(tokens);
-        let Some((pos, idx)) = m.ckpt else {
+        if self.stats {
+            // the whole resident checkpoint set, so a shallow resume can be
+            // told apart from a divergent prompt (the match) and from a
+            // stolen checkpoint (the set)
+            let mut at: Vec<usize> = radix
+                .state_attachments()
+                .iter()
+                .map(|&(d, _, _)| d * BLOCK_TOKENS)
+                .collect();
+            at.sort_unstable();
+            tracing::info!(
+                "qwen4exp-match: slot {slot} t_len {t_len} matched {} tok, ckpt {:?}, resident {at:?}",
+                m.blocks.len() * BLOCK_TOKENS,
+                m.ckpt.map(|c| c.0)
+            );
+        }
+        let Some((mut pos, mut idx)) = m.ckpt else {
             return Ok(0);
         };
         // An exact re-send of the prompt that took this checkpoint inside its
-        // own walk prefills cold: resuming would replay rows the first run
-        // computed inside one walk through a shorter one, and the two agree
-        // only to the last ulp. Cold, the re-send is bit-identical to the
-        // first run (the in-walk checkpoint trade, chosen 2026-09-15).
-        if self.src.get(idx as usize).copied().flatten() == Some((t_len, prompt_hash(tokens))) {
-            if self.stats {
-                tracing::info!("qwen4exp-resume: t_len {t_len} is an exact re-send - cold");
+        // own walk repeats that walk: resuming at the in-walk cut would replay
+        // rows the first run computed inside one walk through a shorter one,
+        // and the two agree only to the last ulp (the in-walk checkpoint
+        // trade, chosen 2026-09-15: the re-send stays bit-identical to its
+        // first run). So it starts where the first run started - cold when
+        // that run was cold, and at the very checkpoint it resumed from when
+        // that one still stands (same boundary, same index, same attach
+        // generation, pages under it held by the path). Before 2026-09-30
+        // every exact re-send went cold, which on a long conversation is the
+        // whole context: a retried 177K-token turn re-prefilled 177K tokens
+        // (201 s) instead of its own 11.7K-token tail.
+        let src = self.src.get(idx as usize).copied().flatten();
+        if let Some(src) = src.filter(|s| s.t_len == t_len && s.hash == prompt_hash(tokens)) {
+            let again = src.from.filter(|o| {
+                o.pos >= MIN_RESUME
+                    && o.pos < t_len
+                    && m.blocks.len() * BLOCK_TOKENS >= o.pos
+                    && self.gens.get(o.idx as usize) == Some(&o.stamp)
+            });
+            match again.filter(|o| radix.resume_state_at(tokens, o.pos) == Some(o.idx)) {
+                Some(o) => {
+                    if self.stats {
+                        tracing::info!(
+                            "qwen4exp-resume: t_len {t_len} is an exact re-send - repeating its \
+                             first walk from {}",
+                            o.pos
+                        );
+                    }
+                    (pos, idx) = (o.pos, o.idx);
+                }
+                None => {
+                    if self.stats {
+                        tracing::info!(
+                            "qwen4exp-resume: t_len {t_len} is an exact re-send - cold (its first \
+                             walk {})",
+                            if src.from.is_some() {
+                                "resumed from a checkpoint that is gone"
+                            } else {
+                                "was cold"
+                            }
+                        );
+                    }
+                    return Ok(0);
+                }
             }
-            return Ok(0);
         }
         if pos < MIN_RESUME || pos >= t_len || m.blocks.len() * BLOCK_TOKENS < pos {
             if self.stats {
@@ -273,6 +372,13 @@ impl PrefixCache {
             .to_vec();
         self.state_copy(exec, slot, &ck, st, Dir::FromPages)?;
         self.last_reused[slot] = pos;
+        let origin = Origin {
+            pos,
+            idx,
+            stamp: self.gens.get(idx as usize).copied().unwrap_or(0),
+        };
+        self.walk_from[slot] = Some(origin);
+        self.repeat_at[slot] = Some((pos, Some(origin)));
         if self.stats {
             tracing::info!(
                 "qwen4exp-resume: slot {slot} t_len {t_len} matched {} tok, resumed at {pos} \
@@ -320,10 +426,52 @@ impl PrefixCache {
         if let Some(s) = self.src.get_mut(idx as usize) {
             *s = None;
         }
+        self.stamp(idx);
+        // the slot's state right now, filed at a walk boundary: a re-send
+        // that resumes here walks on from the very same state
+        if let Some(r) = self.repeat_at.get_mut(slot) {
+            *r = Some((
+                upto,
+                Some(Origin {
+                    pos: upto,
+                    idx,
+                    stamp: self.gens[idx as usize],
+                }),
+            ));
+        }
         if self.stats {
             tracing::info!("qwen4exp-ckpt: slot {slot} cut {upto} idx {idx}");
         }
         Ok(Some(idx))
+    }
+
+    /// `slot`'s next walk starts at `pos` and takes checkpoint cuts inside
+    /// itself: name where an exact re-send can start that walk again - the
+    /// slot's resume point, or the checkpoint its last walk boundary filed -
+    /// as the origin those cuts record. False when neither sits at `pos`: the
+    /// caller files one there and asks again, and if that fails too the
+    /// cuts record no origin and a re-send of the prompt goes cold, as when
+    /// an origin is gone.
+    ///
+    /// Why the walk's own start and not the prompt's: a long prompt walks in
+    /// pieces (`walk_rows`), and only the last carries the cuts. Named by the
+    /// resume point, a re-send repeated every piece - the whole prompt when it
+    /// had come in cold (a 30K-token re-send re-prefilled 30K tokens, 21.8 s).
+    /// Named by a checkpoint at the last piece's start - a boundary the walk
+    /// has anyway, so filing it costs a state copy, not a walk - it repeats
+    /// that piece alone. And a prompt whose earlier rows rode ticks beside
+    /// other slots' decode rows is only repeatable from a boundary after them.
+    pub(super) fn walk_starts(&mut self, slot: usize, pos: usize) -> bool {
+        match self.repeat_at.get(slot).copied().flatten() {
+            Some((at, origin)) if at == pos => {
+                self.walk_from[slot] = origin;
+                true
+            }
+            _ => {
+                self.walk_from[slot] = None;
+                false
+            }
+        }
     }
 
     /// The staging blobs as a prefill walk writes in-walk checkpoints.
@@ -381,12 +529,17 @@ impl PrefixCache {
     /// checkpointed) the index and its pages go back.
     pub(super) fn attach_reserved(
         &mut self,
+        slot: usize,
         tokens: &[u32],
         cut: usize,
         idx: u32,
         pages: &mut KvPages,
     ) -> bool {
-        let src = Some((tokens.len(), prompt_hash(tokens)));
+        let src = Some(WalkSrc {
+            t_len: tokens.len(),
+            hash: prompt_hash(tokens),
+            from: self.walk_from.get(slot).copied().flatten(),
+        });
         self.attach_staged(tokens, cut, idx, pages, src, "in-walk cut")
     }
 
@@ -410,7 +563,7 @@ impl PrefixCache {
         cut: usize,
         idx: u32,
         pages: &mut KvPages,
-        src: Option<(usize, u64)>,
+        src: Option<WalkSrc>,
         what: &str,
     ) -> bool {
         let Some((radix, pool)) = pages.radix_pool() else {
@@ -420,6 +573,7 @@ impl PrefixCache {
             if let Some(s) = self.src.get_mut(idx as usize) {
                 *s = src;
             }
+            self.stamp(idx);
             if self.stats {
                 tracing::info!("qwen4exp-ckpt: {what} {cut} idx {idx}");
             }

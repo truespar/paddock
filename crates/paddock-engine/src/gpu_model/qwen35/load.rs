@@ -2867,6 +2867,7 @@ impl GpuQwen35 {
             pictures: crate::gpu_model::picture_store::PictureStore::new(
                 (2 * super::chunk_tick_rows() * embd * std::mem::size_of::<f32>()) as u64,
             ),
+            mm_steps: std::collections::VecDeque::new(),
             pipe: None,
         })
     }

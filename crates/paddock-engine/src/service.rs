@@ -3126,18 +3126,22 @@ fn preempt_or_fail_mixed(
 }
 
 /// Settle a multimodal admission verdict that is not `Encoding` - the slot is
-/// either on the chunked queue now or its request is over.
+/// on the chunked queue now, prefilled by the backend's own stepped passes
+/// (finished here exactly as a blocking multimodal prefill is), or its request
+/// is over.
 ///
 /// A slot that died while the backend was encoding (client hung up, preempted)
 /// reports `Queued` with nothing queued behind it; `slots[k]` is already None
 /// then, and inserting it into `chunking` would wedge a slot that has no queue
 /// entry to finish it. So the insert is conditional on the slot still existing.
 fn admit_mm(
+    generator: &mut dyn Generator,
     slots: &mut [Option<Slot>],
     chunking: &mut std::collections::HashSet<usize>,
     st_adm: &mut u64,
     k: usize,
     res: crate::generator::MmAdmit,
+    metrics: &EngineMetrics,
 ) {
     use crate::generator::MmAdmit;
     match res {
@@ -3146,6 +3150,13 @@ fn admit_mm(
                 chunking.insert(k);
                 *st_adm += 1;
             }
+        }
+        MmAdmit::Prefilled { logits, rows } => {
+            // finish_prefill drops a report whose slot was already resolved
+            if slots[k].is_some() {
+                *st_adm += 1;
+            }
+            finish_prefill(generator, slots, k, logits, rows as u32, metrics);
         }
         // Reported by the backend only once it has stopped holding the slot,
         // so this branch is unreachable - but silently treating it as queued is
@@ -3476,7 +3487,20 @@ fn run_batched(
     // was to scrape paddock_spec_decode_draft_tokens_total and find a zero.
     // A serving envelope the operator explicitly asked for and did not get is
     // the definition of a silent failure, so it is a WARN on every serve.
-    if spec_supported && !generator.spec_capable() {
+    // EXPLICITLY: a `spec` setting, or a drafter file the runner was handed
+    // (it exports the default policy by name then, see the runner's spec
+    // resolution). The default policy alone is not a request - it used to put
+    // this WARN on every start of every model that has nothing to draft with
+    // (Flash-Next's NVFP4 export from the Studio, for one), which is noise
+    // that teaches operators to ignore the one time it matters.
+    let spec_explicit = std::env::var_os("PADDOCK_SPEC").is_some();
+    if spec_supported && !generator.spec_capable() && !spec_explicit {
+        tracing::info!(
+            "speculation is on by default but this serve has no drafter to run it - \
+             every token decodes at the no-spec rate"
+        );
+    }
+    if spec_supported && !generator.spec_capable() && spec_explicit {
         tracing::warn!(
             policy = %spec_policy,
             "speculation was requested (spec = {spec_policy}) but this serve CANNOT speculate: \
@@ -3817,9 +3841,8 @@ fn run_batched(
                 tick_wall,
                 [ph_admit, ph_prefill, ph_mixed, ph_spec, ph_decode],
             );
-            tracing::warn!(
-                ?early_exit_phase,
-                "tick-stall phases: admit {:.0} prefill {:.0} mixed {:.0} spec {:.0} decode {:.0} sample+emit {:.0} ms (unfinished branch includes its emit work)",
+            let phases = format!(
+                "admit {:.0} prefill {:.0} mixed {:.0} spec {:.0} decode {:.0} sample+emit {:.0} ms",
                 ms(phase[0]),
                 ms(phase[1]),
                 ms(phase[2]),
@@ -3827,12 +3850,35 @@ fn run_batched(
                 ms(phase[4]),
                 ms(phase[5]),
             );
-            tracing::warn!(
-                "tick-stall: {:.0} ms wall (live {active}, chunking {}, preempted {})",
-                tick_wall.as_secs_f64() * 1e3,
-                chunking.len(),
-                preempted.len()
-            );
+            let wall_ms = tick_wall.as_secs_f64() * 1e3;
+            // Who waited on this tick: live sequences not mid-way through a
+            // chunked prefill or a stepped multimodal one (so decoding, or
+            // taking a one-tick prefill) and the preempted ones queued for
+            // recompute. With none, every live sequence was spending its own
+            // planned prefill - a long prompt's chunk ticks run past the wall
+            // by design, one per second for the whole prompt (a 178K prompt on
+            // the 27B put ~120 WARNs in a customer log), so those go to debug
+            // and the WARN keeps meaning a client was held.
+            let waiting =
+                active.saturating_sub(chunking.len() + mm_encoding.len()) + preempted.len();
+            if waiting > 0 {
+                tracing::warn!(
+                    ?early_exit_phase,
+                    "tick-stall phases: {phases} (unfinished branch includes its emit work)"
+                );
+                tracing::warn!(
+                    "tick-stall: {wall_ms:.0} ms wall (live {active}, chunking {}, preempted {})",
+                    chunking.len(),
+                    preempted.len()
+                );
+            } else {
+                tracing::debug!(
+                    ?early_exit_phase,
+                    "tick-stall (prefill only, nobody waiting): {wall_ms:.0} ms wall (live \
+                     {active}, chunking {}): {phases}",
+                    chunking.len()
+                );
+            }
         }
         tick_t0 = std::time::Instant::now();
         ph_admit = std::time::Duration::ZERO;
@@ -4264,7 +4310,15 @@ fn run_batched(
                 let seg_t = std::time::Instant::now();
                 for (k, res) in generator.encode_step() {
                     mm_encoding.remove(&k);
-                    admit_mm(&mut slots, &mut chunking, &mut st_adm, k, res);
+                    admit_mm(
+                        generator,
+                        &mut slots,
+                        &mut chunking,
+                        &mut st_adm,
+                        k,
+                        res,
+                        metrics,
+                    );
                 }
                 if crate::tickseg::on() {
                     crate::tickseg::enc(seg_t.elapsed());
@@ -4295,7 +4349,15 @@ fn run_batched(
                             mm_encoding.insert(k);
                             continue;
                         }
-                        admit_mm(&mut slots, &mut chunking, &mut st_adm, k, res);
+                        admit_mm(
+                            generator,
+                            &mut slots,
+                            &mut chunking,
+                            &mut st_adm,
+                            k,
+                            res,
+                            metrics,
+                        );
                     }
                     if crate::tickseg::on() {
                         crate::tickseg::adm(seg_t.elapsed());

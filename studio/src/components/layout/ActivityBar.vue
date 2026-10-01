@@ -140,6 +140,17 @@ function active(name: string): boolean {
           <Icon name="list-checks" :size="20" />
         </button>
       </Tooltip>
+      <!-- a table model runs on this box's GPU like an encoder, so the entry
+           follows the same rule: offered wherever a model can be served -->
+      <Tooltip v-if="canRunHere" label="Tables" side="right">
+        <button
+          class="activity-bar__btn"
+          :class="{ 'activity-bar__btn--active': active('tables') }"
+          @click="go('tables')"
+        >
+          <Icon name="table" :size="20" />
+        </button>
+      </Tooltip>
       <Tooltip label="Prompts" side="right">
         <button
           class="activity-bar__btn"

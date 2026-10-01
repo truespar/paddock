@@ -20,6 +20,9 @@ thread_local! {
     pub(super) static DIRECT_EXPERT_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     pub(super) static EXPERT_ROWS64_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static VECTOR_GATE_UP_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    pub(super) static PAIRED_GATE_UP_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    pub(super) static PROMPT_GATE_UP_FOR_TEST: std::cell::Cell<u8> = const { std::cell::Cell::new(4) };
+    pub(super) static EXTENDED_ORDER_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
 pub(super) struct Weights {
@@ -294,7 +297,13 @@ impl Weights {
                 512,
             );
         }
-        let order = if !matrix && (64..=1280).contains(&entries) {
+        #[cfg(test)]
+        let extended_order = EXTENDED_ORDER_FOR_TEST.with(|v| v.get());
+        #[cfg(not(test))]
+        let extended_order = true;
+        let order = if !matrix
+            && ordered_vector_entries(entries, extended_order && cmd.tensor_accelerated())
+        {
             cmd.dispatch(
                 "q4a_expert_order",
                 &[&s.ids, &s.lists],
@@ -306,6 +315,43 @@ impl Weights {
         } else {
             None
         };
+        #[cfg(test)]
+        let prompt_choice = PROMPT_GATE_UP_FOR_TEST.with(|v| v.get());
+        #[cfg(not(test))]
+        let prompt_choice = 4;
+        // Unlike the shared expert, routed experts below the matrix threshold
+        // retain singleton arithmetic even in a prompt. Fuse only that work.
+        // Selection changes loading/scheduling, never a row's contraction.
+        let prompt_kernel = order
+            .filter(|_| {
+                cmd.tensor_accelerated()
+                    && !cmd.independent_rows()
+                    && !matrix
+                    && [&self.gate, &self.up]
+                        .iter()
+                        .all(|w| w.ty == affine::A4G32 && w.k == WIDTH && w.n == EXPERTS * FF)
+            })
+            .and_then(|order| {
+                let (name, columns, stripes) = match prompt_choice {
+                    0 => return None,
+                    1 => ("q4a_expert_gate_up_ordered", 4, 8),
+                    2 => ("q4a_expert_gate_up_ordered_pair2", 2, 4),
+                    3 => ("q4a_expert_gate_up_ordered_pair4", 4, 4),
+                    _ => {
+                        let columns = prompt_pair_columns(rows)?;
+                        (
+                            if columns == 2 {
+                                "q4a_expert_gate_up_ordered_pair2"
+                            } else {
+                                "q4a_expert_gate_up_ordered_pair4"
+                            },
+                            columns,
+                            4,
+                        )
+                    }
+                };
+                Some((order, name, columns, stripes))
+            });
         let project_experts = |w: &Weight, x: &Buffer, y: &Buffer, per_entry: bool| {
             if matrix {
                 let n = w.n / EXPERTS;
@@ -449,8 +495,20 @@ impl Weights {
                 && workspace.len() >= rows.next_multiple_of(32) * self.gate.k * 2
         });
         if vector_gate_up {
+            // The enclosing election proves M5, independent singleton rows,
+            // at most eight requests and the exact affine-4/group-32 shapes.
+            // Equal expert IDs share loads, never reductions or output slots.
+            #[cfg(test)]
+            let paired = PAIRED_GATE_UP_FOR_TEST.with(|v| v.get());
+            #[cfg(not(test))]
+            let paired = true;
+            let kernel = if paired {
+                "q4a_expert_gate_up_pair2"
+            } else {
+                "q4a_expert_gate_up_vector"
+            };
             cmd.dispatch(
-                "q4a_expert_gate_up_vector",
+                kernel,
                 &[
                     &self.gate.buffer,
                     &self.up.buffer,
@@ -462,7 +520,29 @@ impl Weights {
                     &s.shared_gate,
                 ],
                 &[WIDTH as u32, FF as u32, rows as u32, EXPERTS as u32],
-                [FF.div_ceil(8), rows * (ACTIVE + 1), 1],
+                [
+                    FF.div_ceil(if paired { 4 } else { 8 }),
+                    rows * (ACTIVE + 1),
+                    1,
+                ],
+                64,
+            );
+        } else if let Some((order, name, columns, stripes)) = prompt_kernel {
+            cmd.dispatch(
+                name,
+                &[
+                    &self.gate.buffer,
+                    &self.up.buffer,
+                    &self.shared_gate.buffer,
+                    &self.shared_up.buffer,
+                    x,
+                    &s.ids,
+                    &s.act,
+                    &s.shared_gate,
+                    order,
+                ],
+                &[WIDTH as u32, FF as u32, rows as u32, EXPERTS as u32],
+                [FF.div_ceil(2 * columns) * stripes, entries.div_ceil(8), 1],
                 64,
             );
         } else if let Some(packed) = packed {
@@ -678,6 +758,52 @@ impl Weights {
                 128,
             );
         }
+    }
+}
+
+// M5 full-model qualification: preserve the earlier route for very small
+// launches and for larger prompts whose existing pair route already reuses
+// weights. No data-dependent or expert-occupancy numerical dispatch.
+fn prompt_pair_columns(rows: usize) -> Option<usize> {
+    match rows {
+        7..=32 => Some(2),
+        33..=96 => Some(4),
+        _ => None,
+    }
+}
+
+// The existing sorting network has 2048 keys. Extending its election does
+// not enlarge scratch or change top-k/reduction order. Extended election is
+// M5-only; 129..=204 vector rows reuse the already allocated network.
+fn ordered_vector_entries(entries: usize, extended: bool) -> bool {
+    (64..=if extended { 2048 } else { 1280 }).contains(&entries)
+}
+
+#[test]
+fn vector_order_election_respects_network_bound() {
+    for entries in 0..=affine::MAX_ROWS * ACTIVE {
+        assert_eq!(
+            ordered_vector_entries(entries, false),
+            (64..=1280).contains(&entries)
+        );
+        assert_eq!(
+            ordered_vector_entries(entries, true),
+            (64..=2048).contains(&entries)
+        );
+    }
+}
+
+#[test]
+fn prompt_pair_election_is_bounded() {
+    for rows in 0..=affine::MAX_ROWS {
+        let expected = if (7..=32).contains(&rows) {
+            Some(2)
+        } else if (33..=96).contains(&rows) {
+            Some(4)
+        } else {
+            None
+        };
+        assert_eq!(prompt_pair_columns(rows), expected);
     }
 }
 

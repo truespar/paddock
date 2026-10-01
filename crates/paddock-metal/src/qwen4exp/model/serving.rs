@@ -184,7 +184,17 @@ impl Generator for FlashNext {
                     // logical boundary discards most of a grant while a
                     // neighbouring prompt could have used the spare rows.
                     let mut remaining = if mlx {
-                        self.slots[p.slot].plan.at(p.offset).1
+                        let plan = &self.slots[p.slot].plan;
+                        if decodes.is_empty() && self.groups_prompt_chunks() {
+                            let cap = if self.prefix.enabled() {
+                                self.capacity.min(plan.until_cut(p.offset))
+                            } else {
+                                self.capacity
+                            };
+                            plan.pass_rows(p.offset, cap)
+                        } else {
+                            plan.at(p.offset).1
+                        }
                     } else {
                         p.tokens.len() - p.offset
                     };
@@ -197,15 +207,7 @@ impl Generator for FlashNext {
             budget.min(self.prefill_tick_cap(decodes.len())),
             decodes.is_empty() && policy == 0,
         );
-        let mut contracts = if mlx {
-            vec![1; decodes.len()]
-        } else {
-            Vec::new()
-        };
         for (p, &n) in self.pending.iter().zip(&advances) {
-            if mlx && n > 0 {
-                contracts.push(self.slots[p.slot].plan.at(p.offset).0);
-            }
             for i in p.offset..p.offset + n {
                 rows.push((p.slot, p.tokens[i], i as u32));
             }
@@ -220,7 +222,7 @@ impl Generator for FlashNext {
             .chain(complete.iter().map(|r| r.1))
             .collect::<Vec<_>>();
         let logits = if mlx {
-            self.execute_contracts(&rows, &outputs, Some(&contracts))?
+            self.execute_planned(&rows, &outputs)?
         } else {
             self.execute(&rows, &outputs)?
         };

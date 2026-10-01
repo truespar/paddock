@@ -5,10 +5,15 @@ import PaddockClient
 enum ModelStartPurpose: String, CaseIterable, Identifiable {
   case all = "All models"
   case speech = "Speech to text"
+  case tables = "Tables"
   var id: Self { self }
 
   func matches(_ artifact: CatalogArtifact, model: CatalogModel) -> Bool {
-    self == .all || (artifact.runtime?.capability ?? model.capability).contains("transcription")
+    switch self {
+    case .all: true
+    case .speech: (artifact.runtime?.capability ?? model.capability).contains("transcription")
+    case .tables: (artifact.runtime?.capability ?? model.capability).contains("tabular")
+    }
   }
 
   func weights(_ model: CatalogModel, backend: String?) -> [CatalogArtifact] {

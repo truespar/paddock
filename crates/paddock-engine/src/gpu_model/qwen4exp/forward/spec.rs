@@ -29,11 +29,22 @@
 //! past it the state at the boundary is rebuilt from the same planes a
 //! rollback reads (`reply_snapshot_mid`).
 //!
-//! Rows are decode-exact (`verify_exact_on`): every row-count-sensitive op of
-//! the walk runs the decode tick's own reduction for that row, and the replay
+//! Rows are decode-exact on the GGUF lane (`verify_exact_on`): every
+//! row-count-sensitive op that lane runs - its `Kq` planes and attention -
+//! takes the decode tick's own reduction for that row, and the replay
 //! re-advances the recurrence through the tick's kernel too, so a spec stream
 //! is the greedy stream bit for bit rather than to the last ulp (a near-tie
 //! does not survive the last ulp - measured on real text, 2026-09-14).
+//!
+//! NOT on the safetensors MX/NVFP4 export: its bf16 hyper-connection planes,
+//! MXFP8 dense planes and W4A4 experts pick kernels by row count (the hc down
+//! is fused with its silu at one row and segmented above it, for one), and
+//! `row_exact` does not reach them. Measured 2026-09-30: no verify row's
+//! logits bit-identical to the tick's (0.014 off on the first row), so a
+//! greedy spec stream parts from plain decode at a near tie - different
+//! numerics of the same model, not a wrong answer. The target is
+//! batch-invariant decode-band kernels (one reduction order per row at every
+//! width); `verify_rows_carry_the_decode_logits` is the gate that says so.
 //!
 //! This is save-and-replay, not per-row state snapshots inside the recurrence
 //! kernel (qwen35's `gated_delta_recurrent_snap` shape): one state copy per

@@ -71,14 +71,28 @@ pub(crate) fn nvf4_mm(
         let key = (loc.file(), loc.line(), rows.next_power_of_two());
         let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
         if g.get_or_insert_with(Default::default).insert(key) {
-            tracing::warn!(
-                "[nvf4-mm-site] {}:{} rows={} out={} in={}",
-                loc.file(),
-                loc.line(),
-                rows,
-                w.out_dim,
-                w.in_dim,
-            );
+            // below the W4A4 floor this IS the elected class (a single row
+            // runs the scalar gemv the decode band shares); at or above it a
+            // caller here is one the census exists to find
+            if rows >= nvf4_w4a4_min_rows() {
+                tracing::warn!(
+                    "[nvf4-mm-site] {}:{} rows={} out={} in={}",
+                    loc.file(),
+                    loc.line(),
+                    rows,
+                    w.out_dim,
+                    w.in_dim,
+                );
+            } else {
+                tracing::debug!(
+                    "[nvf4-mm-site] {}:{} rows={} out={} in={} (below the W4A4 floor)",
+                    loc.file(),
+                    loc.line(),
+                    rows,
+                    w.out_dim,
+                    w.in_dim,
+                );
+            }
         }
     }
     if rows == 1 {
@@ -229,19 +243,33 @@ pub(crate) fn nvf4_ffn_staged(
         // first fires at rows=4 still reports when it later runs a 1k prefill
         let key = (loc.file(), loc.line(), w4a4, rows.next_power_of_two());
         let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        // WARN only for the software-dequant chain on a width the w4a4 arm
+        // should own - the one thing this census exists to find; the elected
+        // w4a4 arm, and a single row below its floor, are normal serving and
+        // used to put a WARN in every customer's log
         if g.get_or_insert_with(Default::default).insert(key) {
-            tracing::warn!(
-                "[nvf4-ffn-site] {}:{} arm={} rows={} ff={}",
-                loc.file(),
-                loc.line(),
-                if w4a4 {
-                    "w4a4"
-                } else {
-                    "W4A16-SOFTWARE-DEQUANT"
-                },
-                rows,
-                ff,
-            );
+            if w4a4 || rows < nvf4_w4a4_min_rows() {
+                tracing::debug!(
+                    "[nvf4-ffn-site] {}:{} arm={} rows={} ff={}",
+                    loc.file(),
+                    loc.line(),
+                    if w4a4 {
+                        "w4a4"
+                    } else {
+                        "W4A16 (below the W4A4 floor)"
+                    },
+                    rows,
+                    ff,
+                );
+            } else {
+                tracing::warn!(
+                    "[nvf4-ffn-site] {}:{} arm=W4A16-SOFTWARE-DEQUANT rows={} ff={}",
+                    loc.file(),
+                    loc.line(),
+                    rows,
+                    ff,
+                );
+            }
         }
     }
     if rows >= nvf4_w4a4_min_rows() && exec.has_nvf4_gemm_f4() {
@@ -314,15 +342,27 @@ pub(crate) fn nvf4_ffn_fused(
         };
         let key = (loc.file(), loc.line(), arm, rows.next_power_of_two());
         let mut g = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        // as the split plane's census: WARN only for the software-dequant arm
+        // on a width the w4a4 arm should own
         if g.get_or_insert_with(Default::default).insert(key) {
-            tracing::warn!(
-                "[nvf4-ffn-site] {}:{} arm={} rows={} ff={} (fused gate|up plane)",
-                loc.file(),
-                loc.line(),
-                ["W4A16-SOFTWARE-DEQUANT-il", "w4a4-il", "w4a4-SWQ"][arm as usize],
-                rows,
-                ff,
-            );
+            let name = ["W4A16-SOFTWARE-DEQUANT-il", "w4a4-il", "w4a4-SWQ"][arm as usize];
+            if arm == 0 && rows >= nvf4_w4a4_min_rows() {
+                tracing::warn!(
+                    "[nvf4-ffn-site] {}:{} arm={name} rows={} ff={} (fused gate|up plane)",
+                    loc.file(),
+                    loc.line(),
+                    rows,
+                    ff,
+                );
+            } else {
+                tracing::debug!(
+                    "[nvf4-ffn-site] {}:{} arm={name} rows={} ff={} (fused gate|up plane)",
+                    loc.file(),
+                    loc.line(),
+                    rows,
+                    ff,
+                );
+            }
         }
     }
     if swq {

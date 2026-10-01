@@ -160,11 +160,46 @@ impl GpuExecutor {
         n_expert: usize,
         max_blocks: usize,
     ) -> Result<(), GpuError> {
+        self.moe_align_at(
+            idx,
+            0,
+            sorted_row,
+            sorted_slot,
+            block_expert,
+            rows,
+            n_active,
+            n_expert,
+            max_blocks,
+        )
+    }
+
+    /// [`Self::moe_align`] over tokens `[tok_off, tok_off + rows)` of `idx`:
+    /// the sorted rows it writes are LOCAL to that range (0..rows), which is
+    /// what a sub-wave of a wider walk hands its GEMM pair.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_align_at(
+        &self,
+        idx: &CudaSlice<u32>,
+        tok_off: usize,
+        sorted_row: &mut CudaSlice<u32>,
+        sorted_slot: &mut CudaSlice<u32>,
+        block_expert: &mut CudaSlice<u32>,
+        rows: usize,
+        n_active: usize,
+        n_expert: usize,
+        max_blocks: usize,
+    ) -> Result<(), GpuError> {
         let f = self
             .kernels
             .moe_align
             .ok_or(GpuError::MissingOp("moe_align"))?;
+        if (tok_off + rows) * n_active > idx.len() {
+            return Err(GpuError::Unsupported(
+                "moe_align_at: token range past the routing plane".into(),
+            ));
+        }
         let (ip, _g1) = idx.device_ptr(&self.stream);
+        let ip = ip + (tok_off * n_active * std::mem::size_of::<u32>()) as u64;
         let (rp, _g2) = sorted_row.device_ptr_mut(&self.stream);
         let (sp, _g3) = sorted_slot.device_ptr_mut(&self.stream);
         let (bp, _g4) = block_expert.device_ptr_mut(&self.stream);
@@ -541,12 +576,34 @@ impl GpuExecutor {
         n_active: usize,
         rows: usize,
     ) -> Result<(), GpuError> {
+        self.moe_slot_combine_init_at(part, residual, 0, embd, n_active, rows)
+    }
+
+    /// [`Self::moe_slot_combine_init`] writing residual rows
+    /// `[row_off, row_off + rows)` from partials that are local to that range -
+    /// the fold of one sub-wave of a wider walk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_slot_combine_init_at(
+        &self,
+        part: &CudaSlice<f32>,
+        residual: &mut CudaSlice<f32>,
+        row_off: usize,
+        embd: usize,
+        n_active: usize,
+        rows: usize,
+    ) -> Result<(), GpuError> {
         let f = self
             .kernels
             .moe_slot_combine_init
             .ok_or(GpuError::MissingOp("moe_slot_combine_init"))?;
+        if (row_off + rows) * embd > residual.len() || rows * n_active * embd > part.len() {
+            return Err(GpuError::Unsupported(
+                "moe_slot_combine_init_at: rows past the residual or partial plane".into(),
+            ));
+        }
         let (pp, _g1) = part.device_ptr(&self.stream);
         let (rp, _g2) = residual.device_ptr_mut(&self.stream);
+        let rp = rp + (row_off * embd * std::mem::size_of::<f32>()) as u64;
         // SAFETY: ABI contract
         check(unsafe {
             f(

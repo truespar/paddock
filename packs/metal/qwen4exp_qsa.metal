@@ -471,6 +471,117 @@ Q4B_ATTENTION_LOCAL(q4b_attention_direct_values,8,2,1,2)
 #endif
 #undef Q4B_ATTENTION_LOCAL
 
+#ifdef PADDOCK_KERNEL_DIAGNOSTICS
+// Adjacent dense-prefill queries share KV tiles. Pack only query addresses;
+// their F32 values and four padded heads per position remain unchanged.
+kernel void q4b_attention_pair_pack(device const float* q [[buffer(0)]],device float* packed [[buffer(1)]],
+ constant uint* p [[buffer(2)]],uint i [[thread_position_in_grid]]) {
+    uint groups=(p[0]+1)/2;
+    if(i>=groups*16384)return;
+    uint group=i/16384,kh=(i/8192)%2,h=(i/256)%32,d=i%256;
+    uint row=group*2+h/16;
+    packed[i]=row<p[0] && h%16<12 ? q[ulong(row)*6144+kh*3072+(h%16)*256+d] : 0;
+}
+kernel void q4b_attention_pairs(device float* q [[buffer(0)]],device const bfloat* kc [[buffer(1)]],
+ device const bfloat* vc [[buffer(2)]],device const uint4* meta [[buffer(3)]],device const uint* pages [[buffer(4)]],
+ device const uint* selected [[buffer(5)]],device const uint* counts [[buffer(6)]],device float* packed [[buffer(7)]],
+ device float* parts [[buffer(8)]],constant uint* p [[buffer(9)]],uint3 g [[threadgroup_position_in_grid]],
+ uint tid [[thread_index_in_threadgroup]]) {
+    alignas(16) threadgroup bfloat kv[32*264];
+    threadgroup float scores[1024],prob[1024],maxima[32],denom[32],correction[32];
+    uint row=g.y*2,kh=g.x;
+    bool pair=row+1<p[2] && meta[row].x==meta[row+1].x && meta[row+1].y==meta[row].y+1
+        && meta[row+1].y<2048 && counts[row]<=512 && counts[row+1]<=512
+        && ((p[5+meta[row].x/32]>>(meta[row].x%32))&1)==0;
+    if(!pair) {
+        for(uint r=row;r<min(row+2,p[2]);++r) {
+            q4b_attention_local_impl<8,2,1,3>(q,kc,vc,meta,pages,selected,counts,parts,p,
+                uint3(kh,r,g.z),tid,kv,scores,prob,maxima,denom,correction);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        return;
+    }
+    if(g.z!=0)return;
+    uint first_length=meta[row].y+1,last=meta[row+1].y+1;
+    auto tq=tensor(packed+ulong(g.y)*16384+kh*8192,extents<int,256,32>(),array<int,2>{1,256});
+    auto tk=tensor(kv,extents<int,256,32>(),array<int,2>{1,264});
+    auto tv=tensor(kv,extents<int,32,256>(),array<int,2>{1,33});
+    auto tp=tensor(prob,extents<int,32,32>(),array<int,2>{1,32});
+    auto ts=tensor(scores,extents<int,32,32>(),array<int,2>{1,32});
+    constexpr auto qkd=matmul2d_descriptor(32,32,256,false,true);
+    constexpr auto pvd=matmul2d_descriptor(32,256,32,false,true);
+    matmul2d<qkd,execution_simdgroups<4>> qk;matmul2d<pvd,execution_simdgroups<4>> pv;
+    auto acc=pv.get_destination_cooperative_tensor<decltype(tp),decltype(tv),float>();
+    for(uint i=0;i<acc.get_capacity();++i)acc[i]=0;
+    if(tid<32){maxima[tid]=-INFINITY;denom[tid]=0;}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint base=0;base<last;base+=32) {
+        uint token=base+tid%32,physical=0;
+        if(token<last)physical=pages[meta[row].x*p[0]+token/16]*16+token%16;
+        uint first=simd_shuffle(physical,0);
+        bool direct=base+32<=last && simd_all(physical==first+tid%32);
+        if(!direct) {
+            for(uint i=tid*8;i<8192;i+=1024) {
+                uint address=simd_shuffle(physical,i/256);uint4 bits=0;
+                if(base+i/256<last)bits=*reinterpret_cast<device const uint4*>(kc+ulong(address)*512+kh*256+i%256);
+                *reinterpret_cast<threadgroup uint4*>(kv+i/256*264+i%256)=bits;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        auto dot=qk.get_destination_cooperative_tensor<decltype(tq),decltype(tk),float>();
+        if(direct) {
+            auto keys=tensor(const_cast<device bfloat*>(kc)+ulong(first)*512+kh*256,extents<int,256,32>(),array<int,2>{1,512});
+            qk.run(tq,keys,dot);
+        } else qk.run(tq,tk,dot);
+        dot.store(ts);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for(uint h=tid/8;h<32;h+=16) {
+            uint lane=tid%8,end=h<16 ? first_length : last;float hi=maxima[h];
+            for(uint j=lane;j<32;j+=8)if(base+j<end && h%16<12)hi=max(hi,scores[h*32+j]*0.0625f);
+            hi=max(hi,simd_shuffle_xor(hi,1));hi=max(hi,simd_shuffle_xor(hi,2));hi=max(hi,simd_shuffle_xor(hi,4));
+            float sum=0,old=isfinite(maxima[h]) ? exp(maxima[h]-hi) : 0;
+            for(uint j=lane;j<32;j+=8){float v=h%16<12 && base+j<end ? exp(scores[h*32+j]*0.0625f-hi) : 0;prob[h*32+j]=v;sum+=v;}
+            sum+=simd_shuffle_xor(sum,1);sum+=simd_shuffle_xor(sum,2);sum+=simd_shuffle_xor(sum,4);
+            if(lane==0){maxima[h]=hi;denom[h]=denom[h]*old+sum;correction[h]=old;}
+        }
+        if(!direct) {
+            for(uint i=tid*8;i<8192;i+=1024) {
+                uint address=simd_shuffle(physical,i/256);uint4 bits=0;
+                if(base+i/256<last)bits=*reinterpret_cast<device const uint4*>(vc+ulong(address)*512+kh*256+i%256);
+                bfloat4 lo=as_type<bfloat4>(bits.xy),hi=as_type<bfloat4>(bits.zw);
+                for(uint j=0;j<4;++j){kv[(i%256+j)*33+i/256]=lo[j];kv[(i%256+4+j)*33+i/256]=hi[j];}
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if(direct) {
+            auto values=tensor(const_cast<device bfloat*>(vc)+ulong(first)*512+kh*256,extents<int,256,32>(),array<int,2>{1,512});
+            constexpr auto desc=matmul2d_descriptor(32,256,32,false,false);
+            matmul2d<desc,execution_simdgroups<4>> op;
+            auto product=op.get_destination_cooperative_tensor<decltype(tp),decltype(values),float>();op.run(tp,values,product);
+            uint i=0;for(auto it=product.begin();it!=product.end();++it,++i)if(it.is_valid_element()) {
+                auto ij=it.get_multidimensional_index();
+                if(base<first_length || ij[1]>=16)acc[i]=acc[i]*correction[ij[1]]+*it;
+            }
+        } else {
+            auto product=pv.get_destination_cooperative_tensor<decltype(tp),decltype(tv),float>();pv.run(tp,tv,product);
+            uint i=0;for(auto it=product.begin();it!=product.end();++it,++i)if(it.is_valid_element()) {
+                auto ij=it.get_multidimensional_index();
+                if(base<first_length || ij[1]>=16)acc[i]=acc[i]*correction[ij[1]]+*it;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for(auto it=acc.begin();it!=acc.end();++it)if(it.is_valid_element()) {
+        auto ij=it.get_multidimensional_index();uint h=ij[1];
+        if(h%16<12)parts[q4s_part_base<true>(row+h/16,kh*12+h%16,0,meta,p)+ij[0]]=*it;
+    }
+    if(tid<32 && tid%16<12) {
+        ulong dst=q4s_part_base<true>(row+tid/16,kh*12+tid%16,0,meta,p);
+        parts[dst+256]=maxima[tid];parts[dst+257]=denom[tid];
+    }
+}
+#endif
+
 kernel void q4b_join_gate_compact(device const float* parts [[buffer(0)]],device const float* qg [[buffer(1)]],
     device float* y [[buffer(2)]],device const uint4* meta [[buffer(3)]],constant uint* p [[buffer(4)]],
     uint rh [[threadgroup_position_in_grid]],uint lane [[thread_index_in_simdgroup]]) {

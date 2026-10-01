@@ -162,14 +162,13 @@ struct EndpointsView: View {
     HStack(spacing: 8) {
       if row.runner?.status == "ok" {
         Button(
-          row.runner?.reader != nil ? "Open Reads" : "Open Studio",
-          systemImage: row.runner?.reader != nil ? "list.bullet.clipboard" : "bubble"
+          row.runner?.studioActionTitle ?? "Open Studio",
+          systemImage: row.runner?.studioActionSymbol ?? "bubble"
         ) { workspace.request(.chat(port: row.port)) }
         .buttonStyle(FlatButtonStyle(primary: true))
         .disabled(workspace.desktopNavigationBlocked || row.job?.isActive == true)
         .help(
-          row.runner?.reader != nil
-            ? "Read with this endpoint" : "Start a conversation with this endpoint"
+          row.runner?.studioActionTitle ?? "Open Studio"
         )
         .accessibilityIdentifier("endpoint-studio-\(row.port)")
       } else if row.runner == nil, row.job?.isActive != true {

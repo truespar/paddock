@@ -163,6 +163,54 @@ kernel void Name(device const uchar* w [[buffer(0)]],device const float* x [[buf
 Q4A_WIDE_PACKED(q4a_wide4_packed,4,32)
 Q4A_WIDE_PACKED(q4a_wide8_packed,8,64)
 #undef Q4A_WIDE_PACKED
+// Multiple rows reuse the same F32 affine value without sharing reductions.
+// Each row retains its eight-term subtotals, group walk and eight-lane sum.
+template<uint Bits,uint Group,uint Rows>
+inline void q4a_wide_rows(device const uchar* w,device const float* x,device float* y,
+    constant uint* p,uint2 g,uint tid) {
+    #pragma clang fp reassociate(off)
+    constexpr uint Pack=32/Bits,Mask=(1u<<Bits)-1;
+    uint K=p[0],N=p[1],n=g.x*8+tid/8,lane=tid%8,row=g.y*Rows;
+    if(n>=N)return;
+    x+=ulong(p[6]+row)*K;y+=ulong(p[6]+row)*N;
+    device const uint* codes=reinterpret_cast<device const uint*>(w);
+    device const bfloat* scales=reinterpret_cast<device const bfloat*>(w+ulong(K)*N*Bits/8);
+    float sums[Rows];for(uint r=0;r<Rows;++r)sums[r]=0;
+    for(uint base=lane*Group;base<K;base+=8*Group) {
+        ulong first=ulong(n)*K+base;
+        float scale=float(scales[first/Group]),bias=float(scales[ulong(K)*N/Group+first/Group]);
+        #pragma unroll
+        for(uint j=0;j<Group;j+=8) {
+            float sub[Rows];for(uint r=0;r<Rows;++r)sub[r]=0;
+            #pragma unroll
+            for(uint t=0;t<8;++t) {
+                uint code=(codes[(first+j+t)/Pack]>>(((j+t)%Pack)*Bits))&Mask;
+                float value=float(code)*scale+bias;
+                #pragma unroll
+                for(uint r=0;r<Rows;++r)sub[r]+=x[ulong(r)*K+base+j+t]*value;
+            }
+            #pragma unroll
+            for(uint r=0;r<Rows;++r)sums[r]+=sub[r];
+        }
+    }
+    #pragma unroll
+    for(uint r=0;r<Rows;++r) {
+        float sum=kquant_sum<8>(sums[r]);
+        if(lane==0 && row+r<p[2])y[ulong(r)*N+n]=mlx_bf(sum);
+    }
+}
+#define Q4A_WIDE_ROWS(Name,Bits,Group,Rows) \
+kernel void Name(device const uchar* w [[buffer(0)]],device const float* x [[buffer(1)]], \
+    device float* y [[buffer(2)]],constant uint* p [[buffer(3)]], \
+    uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) { \
+    if((g.y+1)*Rows<=p[2])q4a_wide_rows<Bits,Group,Rows>(w,x,y,p,g,tid); \
+    else for(uint r=g.y*Rows;r<p[2];++r)q4a_wide_packed<Bits,Group>(w,x,y,p,uint2(g.x,r),tid); \
+}
+Q4A_WIDE_ROWS(q4a_wide4_rows2,4,32,2)
+Q4A_WIDE_ROWS(q4a_wide4_rows4,4,32,4)
+Q4A_WIDE_ROWS(q4a_wide8_rows2,8,64,2)
+Q4A_WIDE_ROWS(q4a_wide8_rows4,8,64,4)
+#undef Q4A_WIDE_ROWS
 kernel void q4a_mv(device const uchar* w [[buffer(0)]],device const float* x [[buffer(1)]],
     device float* y [[buffer(2)]],constant uint* p [[buffer(3)]],
     uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
@@ -245,16 +293,15 @@ kernel void q4a_expert_mv(device const uchar* w [[buffer(0)]],device const float
 // same as q4a_vector_step<4,32,16>. Share activation loads across gate/up
 // and consume their rounded results immediately. Each group owns one routed
 // or shared expert; routing order and the later weighted fold are unchanged.
-kernel void q4a_expert_gate_up_vector(device const uchar* gw [[buffer(0)]],device const uchar* uw [[buffer(1)]],
-    device const uchar* sgw [[buffer(2)]],device const uchar* suw [[buffer(3)]],
-    device const float* x [[buffer(4)]],device const uint* ids [[buffer(5)]],
-    device float* act [[buffer(6)]],device float* shared_act [[buffer(7)]],constant uint* p [[buffer(8)]],
-    uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],
-    uint2 nt [[threads_per_threadgroup]]) {
+template<uint Columns>
+inline void q4a_expert_gate_up_body(device const uchar* gw,device const uchar* uw,
+    device const uchar* sgw,device const uchar* suw,device const float* x,
+    device const uint* ids,device float* act,device float* shared_act,constant uint* p,
+    uint2 g,uint tid,uint threads) {
     #pragma clang fp reassociate(off)
     #pragma clang fp contract(off)
     uint K=p[0],N=p[1],E=p[3],row=g.y/11,slot=g.y%11,lane=tid%32;
-    uint col=g.x*(nt.x/32*4)+tid/32*4;
+    uint col=g.x*(threads/32*Columns)+tid/32*Columns;
     if(col>=N || row>=p[2])return;
     bool shared=slot==10;uint expert=shared ? 0 : ids[row*10+slot];
     if(!shared && expert>=E)return;
@@ -262,7 +309,7 @@ kernel void q4a_expert_gate_up_vector(device const uchar* gw [[buffer(0)]],devic
     ulong totalN=shared ? N : ulong(N)*E;
     device const bfloat* scales[2]={reinterpret_cast<device const bfloat*>(weights[0]+ulong(K)*totalN/2),
                                   reinterpret_cast<device const bfloat*>(weights[1]+ulong(K)*totalN/2)};
-    float sums[2][4]={{0,0,0,0},{0,0,0,0}};
+    float sums[2][Columns]={};
     x+=ulong(row)*K;
     for(uint k=lane*16;k<K;k+=512) {
         float a[16];float bias_sum=0;
@@ -276,7 +323,7 @@ kernel void q4a_expert_gate_up_vector(device const uchar* gw [[buffer(0)]],devic
         #pragma unroll
         for(uint plane=0;plane<2;++plane) {
             #pragma unroll
-            for(uint c=0;c<4;++c) {
+            for(uint c=0;c<Columns;++c) {
                 if(col+c>=N)continue;
                 ulong first=(ulong(expert)*N+col+c)*K+k;float dot=0;
                 #pragma unroll
@@ -292,15 +339,195 @@ kernel void q4a_expert_gate_up_vector(device const uchar* gw [[buffer(0)]],devic
         }
     }
     device float* out=shared ? shared_act+ulong(row)*N : act+ulong(row*10+slot)*N;
-    for(uint c=0;c<4;++c) {
+    for(uint c=0;c<Columns;++c) {
         float gate=mlx_bf(simd_sum(sums[0][c])),up=mlx_bf(simd_sum(sums[1][c]));
         if(lane==0 && col+c<N)out[col+c]=mlx_bf(mlx_bf(gate*mlx_sigmoid_bf(gate))*up);
     }
 }
+kernel void q4a_expert_gate_up_vector(device const uchar* gw [[buffer(0)]],device const uchar* uw [[buffer(1)]],
+    device const uchar* sgw [[buffer(2)]],device const uchar* suw [[buffer(3)]],
+    device const float* x [[buffer(4)]],device const uint* ids [[buffer(5)]],
+    device float* act [[buffer(6)]],device float* shared_act [[buffer(7)]],constant uint* p [[buffer(8)]],
+    uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],
+    uint2 nt [[threads_per_threadgroup]]) {
+    q4a_expert_gate_up_body<4>(gw,uw,sgw,suw,x,ids,act,shared_act,p,g,tid,nt.x);
+}
+
+// Pair equal expert IDs without changing route order or any row's reduction.
+// The odd occurrence is written by its even predecessor. A SIMD scans at
+// most 80 IDs; shared-expert rows pair directly. No host route readback,
+// expanded weights or permutation/output workspace is required.
+template<uint Columns,bool Ordered=false>
+inline void q4a_expert_gate_up_pair_body(device const uchar* gw,device const uchar* uw,
+    device const uchar* sgw,device const uchar* suw,device const float* x,
+    device const uint* ids,device float* act,device float* shared_act,
+    constant uint* p,uint2 g,uint tid,uint threads,device const uint* order) {
+    #pragma clang fp reassociate(off)
+    #pragma clang fp contract(off)
+    uint ordered_partner=UINT_MAX;
+    if(Ordered) {
+        uint at=(g.y*4+g.x%4)*2;
+        if(at>=p[2]*10)return;
+        uint first=order[at],second=at+1<p[2]*10 ? order[at+1] : UINT_MAX;
+        g.x/=4;
+        bool valid_first=first<p[2]*10 && ids[first]<p[3];
+        bool valid_second=second<p[2]*10 && ids[second]<p[3];
+        if(!valid_first || !valid_second || ids[first]!=ids[second]) {
+            if(valid_first)q4a_expert_gate_up_body<Columns>(gw,uw,sgw,suw,x,ids,act,shared_act,p,
+                uint2(g.x,first/10*11+first%10),tid,threads);
+            if(valid_second)q4a_expert_gate_up_body<Columns>(gw,uw,sgw,suw,x,ids,act,shared_act,p,
+                uint2(g.x,second/10*11+second%10),tid,threads);
+            return;
+        }
+        g.y=first/10*11+first%10;
+        ordered_partner=second;
+    }
+    uint K=p[0],N=p[1],E=p[3],row=g.y/11,slot=g.y%11,lane=tid%32;
+    uint col=g.x*(threads/32*Columns)+tid/32*Columns;
+    if(col>=N || row>=p[2])return;
+    bool shared=slot==10;uint entry=row*10+slot,expert=shared ? 0 : ids[entry];
+    if(!shared && expert>=E)return;
+    uint partner=UINT_MAX,rank=0;
+    if(Ordered) {
+        partner=ordered_partner;
+    } else if(shared) {
+        if(row%2)return;
+        if(row+1<p[2])partner=row+1;
+        entry=row;
+    } else {
+        for(uint i=lane;i<p[2]*10;i+=32) {
+            bool same=ids[i]==expert;
+            rank+=same && i<entry;
+            if(same && i>entry)partner=min(partner,i);
+        }
+        rank=simd_sum(rank);partner=simd_min(partner);
+        if(rank%2)return;
+    }
+    bool paired=partner!=UINT_MAX;
+    if(!paired) {
+        q4a_expert_gate_up_body<Columns>(gw,uw,sgw,suw,x,ids,act,shared_act,p,g,tid,threads);
+        return;
+    }
+    uint other=paired ? (shared ? partner : partner/10) : row;
+    device const uchar* weights[2]={shared ? sgw : gw,shared ? suw : uw};
+    ulong totalN=shared ? N : ulong(N)*E;
+    device const bfloat* scales[2]={reinterpret_cast<device const bfloat*>(weights[0]+ulong(K)*totalN/2),
+                                  reinterpret_cast<device const bfloat*>(weights[1]+ulong(K)*totalN/2)};
+    float sums[2][2][Columns]={};
+    for(uint k=lane*16;k<K;k+=512) {
+        float a[2][16],bias_sum[2]={0,0};
+        #pragma unroll
+        for(uint r=0;r<2;++r) {
+            device const float* xr=x+ulong(r==0 ? row : other)*K+k;
+            #pragma unroll
+            for(uint j=0;j<16;j+=4) {
+                float4 av=*reinterpret_cast<device const float4*>(xr+j);
+                a[r][j]=av.x;a[r][j+1]=av.y;a[r][j+2]=av.z;a[r][j+3]=av.w;
+                bias_sum[r]+=mlx_bf(mlx_bf(mlx_bf(av.x+av.y)+av.z)+av.w);
+                a[r][j+1]*=0.0625f;a[r][j+2]*=0.00390625f;a[r][j+3]*=0.000244140625f;
+            }
+        }
+        #pragma unroll
+        for(uint plane=0;plane<2;++plane) {
+            #pragma unroll
+            for(uint c=0;c<Columns;++c) {
+                if(col+c>=N)continue;
+                ulong first=(ulong(expert)*N+col+c)*K+k;float dot[2]={0,0};
+                #pragma unroll
+                for(uint j=0;j<16;j+=4) {
+                    uint codes=reinterpret_cast<device const ushort*>(weights[plane])[(first+j)/4];
+                    float4 q=float4(codes&15,codes&0x00f0,codes&0x0f00,codes&0xf000);
+                    #pragma unroll
+                    for(uint r=0;r<2;++r) {
+                        float sub=q.x*a[r][j];sub+=q.y*a[r][j+1];sub+=q.z*a[r][j+2];sub+=q.w*a[r][j+3];
+                        dot[r]+=sub;
+                    }
+                }
+                float scale=float(scales[plane][first/32]),bias=float(scales[plane][ulong(K)*totalN/32+first/32]);
+                #pragma unroll
+                for(uint r=0;r<2;++r)sums[r][plane][c]+=fma(dot[r],scale,bias_sum[r]*bias);
+            }
+        }
+    }
+    #pragma unroll
+    for(uint r=0;r<2;++r) {
+        if(r==1 && !paired)continue;
+        device float* out=(shared ? shared_act : act)+ulong(r==0 ? entry : partner)*N;
+        for(uint c=0;c<Columns;++c) {
+            float gate=mlx_bf(simd_sum(sums[r][0][c])),up=mlx_bf(simd_sum(sums[r][1][c]));
+            if(lane==0 && col+c<N)out[col+c]=mlx_bf(mlx_bf(gate*mlx_sigmoid_bf(gate))*up);
+        }
+    }
+}
+#define Q4A_EXPERT_PAIR(Name,Columns) \
+kernel void Name(device const uchar* gw [[buffer(0)]],device const uchar* uw [[buffer(1)]], \
+    device const uchar* sgw [[buffer(2)]],device const uchar* suw [[buffer(3)]], \
+    device const float* x [[buffer(4)]],device const uint* ids [[buffer(5)]], \
+    device float* act [[buffer(6)]],device float* shared_act [[buffer(7)]],constant uint* p [[buffer(8)]], \
+    uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]], \
+    uint2 nt [[threads_per_threadgroup]]) { \
+    q4a_expert_gate_up_pair_body<Columns>(gw,uw,sgw,suw,x,ids,act,shared_act,p,g,tid,nt.x,ids); \
+}
+Q4A_EXPERT_PAIR(q4a_expert_gate_up_pair2,2)
+#ifdef PADDOCK_KERNEL_DIAGNOSTICS
+Q4A_EXPERT_PAIR(q4a_expert_gate_up_pair4,4)
+#endif
+#undef Q4A_EXPERT_PAIR
+
+// Prompt experts below the matrix threshold retain singleton contractions.
+// Fuse only their routed gate/up work: shared experts keep their logical
+// prompt projection. Use the existing sorted route list, never a host gather.
+#define Q4A_EXPERT_ORDERED_GU(Name,Columns,Paired) \
+kernel void Name(device const uchar* gw [[buffer(0)]],device const uchar* uw [[buffer(1)]], \
+    device const uchar* sgw [[buffer(2)]],device const uchar* suw [[buffer(3)]], \
+    device const float* x [[buffer(4)]],device const uint* ids [[buffer(5)]], \
+    device float* act [[buffer(6)]],device float* shared_act [[buffer(7)]], \
+    device const uint* order [[buffer(8)]],constant uint* p [[buffer(9)]], \
+    uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]], \
+    uint2 nt [[threads_per_threadgroup]]) { \
+    if(Paired)q4a_expert_gate_up_pair_body<Columns,true>(gw,uw,sgw,suw,x,ids,act,shared_act,p,g,tid,nt.x,order); \
+    else { \
+        uint at=g.y*8+g.x%8;if(at>=p[2]*10)return;uint entry=order[at];if(entry>=p[2]*10)return; \
+        q4a_expert_gate_up_body<Columns>(gw,uw,sgw,suw,x,ids,act,shared_act,p, \
+            uint2(g.x/8,entry/10*11+entry%10),tid,nt.x); \
+    } \
+}
+#ifdef PADDOCK_KERNEL_DIAGNOSTICS
+Q4A_EXPERT_ORDERED_GU(q4a_expert_gate_up_ordered,4,false)
+#endif
+Q4A_EXPERT_ORDERED_GU(q4a_expert_gate_up_ordered_pair2,2,true)
+Q4A_EXPERT_ORDERED_GU(q4a_expert_gate_up_ordered_pair4,4,true)
+#undef Q4A_EXPERT_ORDERED_GU
+
+#ifdef PADDOCK_KERNEL_DIAGNOSTICS
+// Reuse the activation walk across more output columns, and join routed and
+// shared down launches without joining their reductions. K=640 retains the
+// original eight-value lane walk (not the sixteen-value gate/up contract).
+#define Q4A_EXPERT_DOWN_VECTOR(Name,Outputs) \
+kernel void Name(device const uchar* w [[buffer(0)]],device const uchar* sw [[buffer(1)]], \
+    device const float* act [[buffer(2)]],device const float* shared_act [[buffer(3)]], \
+    device const uint* ids [[buffer(4)]],device float* y [[buffer(5)]], \
+    device float* shared_y [[buffer(6)]],constant uint* p [[buffer(7)]], \
+    uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]], \
+    uint2 nt [[threads_per_threadgroup]]) { \
+    uint K=p[0],N=p[1],row=g.y/11,slot=g.y%11; \
+    if(row>=p[2])return; \
+    bool shared=slot==10;uint expert=shared ? 0 : ids[row*10+slot]; \
+    if(!shared && expert>=p[3])return; \
+    uint entry=shared ? row : row*10+slot; \
+    q4a_vector_step<4,32,8,Outputs>(shared ? sw : w, \
+        (shared ? shared_act : act)+ulong(entry)*K,(shared ? shared_y : y)+ulong(entry)*N, \
+        K,shared ? N : N*p[3],N,g.x*(nt.x/32*Outputs)+tid/32*Outputs,tid%32,expert); \
+}
+Q4A_EXPERT_DOWN_VECTOR(q4a_expert_down_vector4,4)
+Q4A_EXPERT_DOWN_VECTOR(q4a_expert_down_vector8,8)
+Q4A_EXPERT_DOWN_VECTOR(q4a_expert_down_vector16,16)
+#undef Q4A_EXPERT_DOWN_VECTOR
+#endif
 
 // Stable, bounded GPU permutation only. The original routing IDs and their
 // accumulation order never change. Scratch reuses the GGUF alignment list.
-// 128 tokens * top10 fit in a 2048-key sorting network (8 KiB shared).
+// Up to 204 tokens * top10 fit in a 2048-key sorting network (8 KiB shared).
 kernel void q4a_expert_order(device const uint* ids [[buffer(0)]],device uint* order [[buffer(1)]],
     constant uint* p [[buffer(2)]],uint tid [[thread_index_in_threadgroup]]) {
     threadgroup uint keys[2048];

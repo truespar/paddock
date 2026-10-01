@@ -28,6 +28,41 @@ fn laya_metal_uses_original_bundle_and_encoder_memory_not_chat_kv() {
 }
 
 #[test]
+fn kumo_serves_every_checkpoint_on_both_backends_as_a_single_pass_table_model() {
+    for backend in ["cuda", "metal"] {
+        let reg = Registry::new("./models".into()).with_backend(backend);
+        let model = reg.catalog_of("kumo-tabular").unwrap();
+        assert_eq!(
+            crate::estimate::kind_for(&model.capability),
+            paddock_estimator::ModelKind::Encoder
+        );
+        assert_eq!(
+            model.default_weights_for_backend(backend, None).unwrap().id,
+            "large-classification"
+        );
+        for size in ["small", "medium", "large"] {
+            for task in ["classification", "regression"] {
+                let a = model.artifact(&format!("{size}-{task}")).unwrap();
+                assert!(a.runtime.supports_backend(backend));
+                assert_eq!(a.capabilities(model), ["tabular"]);
+                assert!(a.runtime.checkpoint_dir);
+                // the runner is handed the export directory, whose name is
+                // the served model id
+                assert!(
+                    a.entry_path(reg.models_dir())
+                        .unwrap()
+                        .ends_with(format!("kumo-tabular-{size}-{task}"))
+                );
+                assert!(a.files[0].dest.ends_with("model.safetensors"));
+                let shape = a.shape.as_ref().unwrap();
+                assert!(shape.kv_layers.is_empty() && shape.weight_bytes > 100 << 20);
+                assert!(a.workspace.unwrap() > 2 << 30);
+            }
+        }
+    }
+}
+
+#[test]
 fn diffusion_metal_catalog_exposes_vision_in_three_formats_without_cuda_drift() {
     let metal = Registry::new("./models".into()).with_backend("metal");
     let model = metal.catalog_of("diffusiongemma-26b-a4b").unwrap();

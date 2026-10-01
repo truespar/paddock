@@ -7,7 +7,7 @@
 import { copyText } from '@/lib/clipboard'
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { useFleetStore, type FleetRow } from '@/stores/fleet'
+import { servedId, useFleetStore, type FleetRow } from '@/stores/fleet'
 import { useDownloadsStore, jobActive, type DownloadJob } from '@/stores/downloads'
 import { useRegistryStore } from '@/stores/registry'
 import { fmtVram as gb, fmtBytes, fmtEtaShort, fmtRate } from '@/lib/format'
@@ -82,6 +82,16 @@ const entries = computed<Entry[]>(() => {
   }
   for (const c of fleet.stopped) put({ kind: 'stopped', port: c.port, c })
   return [...byPort.values()].sort((a, b) => a.port - b.port)
+})
+
+/** Display names two or more live rows share: one catalog model served from
+ *  several of its artifacts at once (Kumo's classification and regression
+ *  checkpoints, two quants of one chat model). Those rows add the artifact,
+ *  or the fleet shows the same name twice with nothing to tell them apart. */
+const sharedNames = computed(() => {
+  const seen = new Map<string, number>()
+  for (const r of fleet.rows) if (r.display) seen.set(r.display, (seen.get(r.display) ?? 0) + 1)
+  return new Set([...seen].filter(([, n]) => n > 1).map(([d]) => d))
 })
 
 /** Human status labels - Title case, and "Running" instead of API-speak "ok". */
@@ -481,14 +491,19 @@ async function stop(r: FleetRow): Promise<void> {
             <tr v-else-if="en.kind === 'live'" class="srow srow--click" @click="toDetail(en.port)">
               <td class="c-port">{{ en.port }}</td>
               <td class="c-model">
-                <Tooltip :label="en.r.model ?? en.r.embedder ?? en.r.asr ?? en.r.aligner ?? en.r.image ?? ''">
+                <Tooltip :label="servedId(en.r) ?? ''">
                   <span class="c-model__name">
                     <VendorLogo v-if="en.r.vendor" :vendor="en.r.vendor" :size="16" class="c-model__logo" />
-                    <span class="c-model__id">{{ en.r.display ?? en.r.model ?? en.r.embedder ?? en.r.asr ?? en.r.aligner ?? en.r.image ?? '-' }}</span>
+                    <span class="c-model__id">{{ en.r.display ?? servedId(en.r) ?? '-' }}</span>
                     <span v-if="speculationBadge(en.r.spec)" class="c-model__spec">{{ speculationBadge(en.r.spec) }}</span>
                   </span>
                 </Tooltip>
                 <span v-if="en.r.embedder && en.r.model" class="c-model__extra">+ {{ en.r.embedder }}</span>
+                <span
+                  v-else-if="en.r.display && sharedNames.has(en.r.display) && en.r.config?.artifact"
+                  class="c-model__extra"
+                  >{{ en.r.config.artifact }}</span
+                >
               </td>
               <td>
                 <span class="st" :class="`st--${statusTone(en.r)}`">

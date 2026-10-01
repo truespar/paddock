@@ -1,6 +1,10 @@
 //! Native Metal execution for Paddock. Model state stays on its engine thread;
 //! generation, encoder and Whisper contracts share the native serving boundary.
 #[cfg(target_os = "macos")]
+mod kumo;
+#[cfg(target_os = "macos")]
+pub use kumo::{Kumo, KumoOutput};
+#[cfg(target_os = "macos")]
 mod laya;
 #[cfg(target_os = "macos")]
 pub use laya::Laya;

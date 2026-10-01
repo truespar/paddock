@@ -410,6 +410,7 @@ fn project_for_ui(key: &str, value: &mut serde_json::Value) -> Result<(), String
                         "aligner",
                         "image",
                         "reader",
+                        "tabular",
                         "display",
                         "endpoint",
                         "version",

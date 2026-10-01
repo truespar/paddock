@@ -16,6 +16,7 @@
 
 mod common;
 
+use paddock_engine::generator::Generator;
 use paddock_engine::gpu_model::qwen4exp::Qwen4ExpGpu;
 
 /// "The capital of Sweden is" - the stamped positive control. Host reference
@@ -71,6 +72,7 @@ fn forward_matches_host_reference_top4() {
         return;
     }
 
+    let stamped = stamped_checkpoint(&dir);
     let mut m = Qwen4ExpGpu::load(&exec, &dir, 512).expect("load qwen4exp");
     for (name, ids, want) in [
         ("capital-of-sweden", PROMPT_A, TOP4_A),
@@ -80,15 +82,45 @@ fn forward_matches_host_reference_top4() {
         assert_eq!(logits.len(), m.config().vocab, "logit width");
         let got = top_k(&logits, 8);
         eprintln!(
-            "{name}: top-8 {:?}  (argmax logit {:.4})",
-            got, logits[got[0]]
+            "{name}: top-8 {:?}  (argmax logit {:.4}){}",
+            got,
+            logits[got[0]],
+            if stamped {
+                ""
+            } else {
+                "  [not the stamped checkpoint: argmax only]"
+            }
         );
-        assert_eq!(
-            &got[..4],
-            want,
-            "{name}: GPU top-4 differs from the host-exact reference"
-        );
+        if stamped {
+            assert_eq!(
+                &got[..4],
+                want,
+                "{name}: GPU top-4 differs from the host-exact reference"
+            );
+        } else {
+            assert_eq!(
+                got[0], want[0],
+                "{name}: argmax differs from the host-exact reference"
+            );
+        }
     }
+}
+
+/// Whether `dir` is the checkpoint the TOP4 constants were stamped on:
+/// NVIDIA's NVFP4 export, whose dense planes ship bf16. Another export of this
+/// model - the distilled MX one ships them MXFP8 - is different weights, and a
+/// near-tied tail need not keep another checkpoint's order (measured on it:
+/// " Stockholm" first, the same top-4 set, ranks 3 and 4 swapped). So there
+/// only the argmax, a fact about the model rather than the bytes, is held.
+fn stamped_checkpoint(dir: &std::path::Path) -> bool {
+    use paddock_models::safetensors::{ShardedSafetensors, StDtype};
+    ShardedSafetensors::open_dir(dir)
+        .ok()
+        .and_then(|st| {
+            st.bytes("model.language_model.layers.0.linear_attn.in_proj_qkv.weight")
+                .map(|(t, _)| t.dtype == StDtype::Bf16)
+        })
+        .unwrap_or(true)
 }
 
 /// Numeric bound against the reference's own final logits, when the dump made
@@ -617,5 +649,518 @@ fn prefill_wave_matches_serial_prefill() {
                 "slot {i} continues differently after a wave prefill"
             );
         }
+    }
+}
+
+/// Speculation must not change what greedy decode emits. The checkpoint's own
+/// MTP head drafts (`attach_mtp_in_file`), greedy verify rounds commit on slot
+/// 0, plain decode ticks run on slot 1 from the same prefill, and the two
+/// streams must be the same tokens. A verify row that is not decode-exact
+/// shows up here as a stream that parts at a near tie; the report names the
+/// round and both rows' top-2 margins, so a class flip reads apart from a
+/// wrong answer.
+#[test]
+fn spec_rounds_emit_the_decode_stream() {
+    let Some(dir) = common::model_dir("QWEN4EXP_DIR", &["Qwen3.8-Flash-Next-NVFP4"]) else {
+        return;
+    };
+    if !common::heavy() {
+        return;
+    }
+    let Some(exec) = common::gpu_arc() else {
+        return;
+    };
+    // the serving context, not a toy one: kernel and partition choices key
+    // on it, and a verify that is exact only at 1K is not exact
+    let ctx = std::env::var("QWEN4EXP_SPEC_CTX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32768);
+    let mut m = Qwen4ExpGpu::load_with_slots(&exec, &dir, ctx, 2).expect("load qwen4exp");
+    if !m.has_in_file_mtp() {
+        common::missing("this checkpoint ships no in-file MTP head");
+        return;
+    }
+    // a short chat-shaped prompt, the same ids on both slots
+    let p: Vec<u32> = PROMPT_B.iter().copied().cycle().take(96).collect();
+    let argmax = |v: &[f32]| top_k(v, 1)[0] as u32;
+    let margin = |v: &[f32]| {
+        let t = top_k(v, 2);
+        v[t[0]] - v[t[1]]
+    };
+    const N: usize = 160;
+    // plain greedy decode of `p` on slot 1: the prefill's logits and the stream
+    let plain_run = |m: &mut Qwen4ExpGpu| -> (Vec<f32>, Vec<u32>) {
+        let l = m.prefill_slot(1, &p).expect("prefill 1");
+        let mut pend = argmax(&l);
+        let mut out = vec![pend];
+        while out.len() < N {
+            let d = m.decode_step_batch(&[(1, pend)]).expect("decode");
+            pend = argmax(&d[0]);
+            out.push(pend);
+        }
+        (l, out)
+    };
+    // The drafter must be invisible to the trunk: the stream a serve without
+    // a head emits, before the head exists at all ...
+    let (ref_l, ref_stream) = plain_run(&mut m);
+    m.attach_mtp_in_file().expect("attach the in-file head");
+    // ... equals the one with the head attached but never fed (a serve whose
+    // policy is off, or wider than the speculating band) ...
+    m.spec_warm_hint(false);
+    m.spec_fuse_hint(false);
+    let (idle_l, idle_stream) = plain_run(&mut m);
+    m.spec_warm_hint(true);
+    m.spec_fuse_hint(true);
+    let parts = |a: &[u32], b: &[u32]| a.iter().zip(b).position(|(x, y)| x != y);
+    eprintln!(
+        "head attached, idle: prefill logits identical {}, stream first difference at {:?}",
+        idle_l == ref_l,
+        parts(&ref_stream, &idle_stream)
+    );
+    let l0 = m.prefill_slot(0, &p).expect("prefill 0");
+    let l1 = m.prefill_slot(1, &p).expect("prefill 1");
+    assert!(l0 == l1, "the two slots do not start bit-identical");
+    eprintln!(
+        "head attached, fed: prefill logits identical to the headless run {}",
+        l1 == ref_l
+    );
+    let depth = 3usize;
+    let (mut pend0, mut pend1) = (argmax(&l0), argmax(&l1));
+    let (mut spec, mut plain) = (vec![pend0], vec![pend1]);
+    let mut accepted = 0usize;
+    while spec.len() < N {
+        let pos0 = m.slot_position(0);
+        let draft = m
+            .spec_draft_batch(&[(0, pend0)], depth)
+            .expect("draft")
+            .map(|mut d| d.remove(0))
+            .unwrap_or_default();
+        let mut chunk = vec![pend0];
+        chunk.extend(draft.iter().copied().take(depth));
+        let picks = m
+            .forward_spec_batch(&[(0, pos0, chunk.clone())])
+            .expect("greedy round")
+            .expect("the greedy round declined");
+        let mut a = 0usize;
+        while a + 1 < chunk.len() && chunk[a + 1] == picks[a] {
+            a += 1;
+        }
+        accepted += a;
+        spec.extend_from_slice(&picks[..=a]);
+        pend0 = picks[a];
+    }
+    let mut decode_margins = Vec::new();
+    while plain.len() < spec.len() {
+        let l = m.decode_step_batch(&[(1, pend1)]).expect("decode");
+        decode_margins.push(margin(&l[0]));
+        pend1 = argmax(&l[0]);
+        plain.push(pend1);
+    }
+    let first_diff = spec.iter().zip(&plain).position(|(a, b)| a != b);
+    eprintln!(
+        "spec vs decode: {} tokens, {accepted} drafts accepted, first difference at {:?}{}",
+        spec.len(),
+        first_diff,
+        first_diff
+            .map(|i| format!(
+                " (decode's top-2 margin there {:.4})",
+                decode_margins
+                    .get(i.saturating_sub(1))
+                    .copied()
+                    .unwrap_or(f32::NAN)
+            ))
+            .unwrap_or_default()
+    );
+    let fed_diff = parts(&ref_stream, &plain);
+    eprintln!(
+        "head attached, fed: decode stream vs the headless run, first difference at {fed_diff:?}"
+    );
+    assert!(
+        accepted > 0,
+        "no draft was ever accepted: nothing speculated"
+    );
+    assert_eq!(
+        first_diff, None,
+        "speculation changed the greedy stream (verify rows are not decode-exact)"
+    );
+    assert!(
+        idle_l == ref_l && parts(&ref_stream, &idle_stream).is_none(),
+        "attaching the head changed the trunk's greedy stream"
+    );
+    assert_eq!(
+        fed_diff, None,
+        "feeding the head changed the trunk's greedy stream"
+    );
+}
+
+/// The serving shapes of a speculated reply, against plain decode of the same
+/// prompt: chunked prefill (`prefill_begin` + mixed ticks, the path a served
+/// prompt takes), then rounds of every width a serve verifies - the head's
+/// drafts cut to 0..=3 (a cold head verifies the pending token alone),
+/// n-gram-length chunks up to the 9-row ceiling (drafts taken from the plain
+/// stream, some spoiled so a round rejects mid-chunk), and plain decode ticks
+/// between rounds. Every round must emit exactly what plain decode emits.
+#[test]
+fn spec_rounds_in_serving_shapes_emit_the_decode_stream() {
+    let Some(dir) = common::model_dir("QWEN4EXP_DIR", &["Qwen3.8-Flash-Next-NVFP4"]) else {
+        return;
+    };
+    if !common::heavy() {
+        return;
+    }
+    let Some(exec) = common::gpu_arc() else {
+        return;
+    };
+    let mut m = Qwen4ExpGpu::load_with_slots(&exec, &dir, 32768, 2).expect("load qwen4exp");
+    if !m.has_in_file_mtp() {
+        common::missing("this checkpoint ships no in-file MTP head");
+        return;
+    }
+    m.attach_mtp_in_file().expect("attach the in-file head");
+    let argmax = |v: &[f32]| top_k(v, 1)[0] as u32;
+    let p: Vec<u32> = PROMPT_B.iter().copied().cycle().take(67).collect();
+    // the served prompt path: queued, then walked by mixed ticks
+    let chunked = |m: &mut Qwen4ExpGpu, slot: usize| -> Vec<f32> {
+        m.prefill_begin(slot, p.clone()).expect("prefill_begin");
+        loop {
+            let (_, fin) = m.forward_mixed(&[], 4096).expect("mixed tick");
+            if let Some((_, l, _)) = fin.into_iter().find(|f| f.0 == slot) {
+                return l;
+            }
+        }
+    };
+    const N: usize = 240;
+    let l1 = chunked(&mut m, 1);
+    let mut pend = argmax(&l1);
+    let mut plain = vec![pend];
+    while plain.len() < N + 16 {
+        let d = m.decode_step_batch(&[(1, pend)]).expect("decode");
+        pend = argmax(&d[0]);
+        plain.push(pend);
+    }
+    let l0 = chunked(&mut m, 0);
+    assert!(l0 == l1, "the two slots do not start bit-identical");
+    let mut pend0 = argmax(&l0);
+    let mut out = vec![pend0];
+    // (round, what it was) for every emitted token, to name the one that parts
+    let mut how: Vec<String> = vec!["prefill".into()];
+    let mut round = 0usize;
+    while out.len() < N {
+        round += 1;
+        let pos0 = m.slot_position(0);
+        let kind = round % 5;
+        if kind == 4 {
+            let d = m.decode_step_batch(&[(0, pend0)]).expect("decode");
+            pend0 = argmax(&d[0]);
+            out.push(pend0);
+            how.push(format!("round {round}: plain tick"));
+            continue;
+        }
+        let drafts: Vec<u32> = if kind == 0 || kind == 1 {
+            // the head's own drafts, cut to 0..=3
+            let want = round % 4;
+            m.spec_draft_batch(&[(0, pend0)], 3)
+                .expect("draft")
+                .map(|mut d| d.remove(0))
+                .unwrap_or_default()
+                .into_iter()
+                .take(want)
+                .collect()
+        } else {
+            // n-gram-length chunks from the plain stream; every third one
+            // spoiled at its last draft
+            let len = 1 + round % 8;
+            let at = out.len();
+            let mut d: Vec<u32> = plain[at..(at + len).min(plain.len())].to_vec();
+            if round.is_multiple_of(3)
+                && let Some(last) = d.last_mut()
+            {
+                *last = last.wrapping_add(1);
+            }
+            d
+        };
+        let mut chunk = vec![pend0];
+        chunk.extend(drafts);
+        let picks = m
+            .forward_spec_batch(&[(0, pos0, chunk.clone())])
+            .expect("greedy round")
+            .expect("the greedy round declined");
+        let mut a = 0usize;
+        while a + 1 < chunk.len() && chunk[a + 1] == picks[a] {
+            a += 1;
+        }
+        for _ in 0..=a {
+            how.push(format!("round {round}: {} rows, accepted {a}", chunk.len()));
+        }
+        out.extend_from_slice(&picks[..=a]);
+        pend0 = picks[a];
+    }
+    let first = out.iter().zip(&plain).position(|(x, y)| x != y);
+    eprintln!(
+        "serving-shaped spec vs decode: {} tokens over {round} rounds, first difference at {:?}{}",
+        out.len(),
+        first,
+        first.map(|i| format!(" ({})", how[i])).unwrap_or_default()
+    );
+    assert_eq!(first, None, "a serving-shaped round is not decode-exact");
+}
+
+/// Verify rows must carry the decode tick's LOGITS, not just its argmax: a
+/// greedy stream can survive a few hundred tokens of small deviations and
+/// then part at the first near tie a served prompt meets. The host-sampled
+/// round (`forward_spec_verify`) hands every verify row's logits back; each
+/// row whose context is the plain stream's is compared bit for bit with the
+/// plain decode's logits at that position.
+///
+/// Ignored because it fails on the safetensors MX export and the reason is
+/// known: the walk picks kernels by row count (the hyper-connection down runs
+/// fused with its silu at one row and segmented at two, the bf16 planes take
+/// the mrow twin above one row, and so on), so a verify row is a different
+/// reduction of the same math. Measured 2026-09-30 on the MXFP8/NVFP4 export:
+/// 0 of 119 rows bit-identical, the first row off by 0.014 in a logit, a
+/// greedy stream that parts from plain decode at the first near tie a served
+/// prompt meets. `row_exact` makes the GGUF lane's `Kq` planes and attention
+/// row-exact and nothing else. The target is batch-invariant decode-band
+/// kernels - one reduction order per row whatever the width - which is also
+/// what would make a batched decode row equal a solo one.
+#[test]
+#[ignore = "verify rows are not decode-exact on the MX/NVFP4 lane (see the doc)"]
+fn verify_rows_carry_the_decode_logits() {
+    let Some(dir) = common::model_dir("QWEN4EXP_DIR", &["Qwen3.8-Flash-Next-NVFP4"]) else {
+        return;
+    };
+    if !common::heavy() {
+        return;
+    }
+    let Some(exec) = common::gpu_arc() else {
+        return;
+    };
+    let mut m = Qwen4ExpGpu::load_with_slots(&exec, &dir, 32768, 2).expect("load qwen4exp");
+    if !m.has_in_file_mtp() {
+        common::missing("this checkpoint ships no in-file MTP head");
+        return;
+    }
+    m.attach_mtp_in_file().expect("attach the in-file head");
+    let vocab = m.config().vocab;
+    let argmax = |v: &[f32]| top_k(v, 1)[0] as u32;
+    let p: Vec<u32> = PROMPT_B.iter().copied().cycle().take(67).collect();
+    let chunked = |m: &mut Qwen4ExpGpu, slot: usize| -> Vec<f32> {
+        m.prefill_begin(slot, p.clone()).expect("prefill_begin");
+        loop {
+            let (_, fin) = m.forward_mixed(&[], 4096).expect("mixed tick");
+            if let Some((_, l, _)) = fin.into_iter().find(|f| f.0 == slot) {
+                return l;
+            }
+        }
+    };
+    const N: usize = 120;
+    // plain[i] = token i of the stream, logits[i] = the logits it was drawn
+    // from (0 = the prefill's)
+    let l1 = chunked(&mut m, 1);
+    let mut plain = vec![argmax(&l1)];
+    let mut logits = vec![l1];
+    while plain.len() < N + 8 {
+        let d = m
+            .decode_step_batch(&[(1, *plain.last().unwrap())])
+            .expect("decode")
+            .remove(0);
+        plain.push(argmax(&d));
+        logits.push(d);
+    }
+    let l0 = chunked(&mut m, 0);
+    assert!(l0 == logits[0], "the two slots do not start bit-identical");
+    let (mut rows, mut exact, mut worst) = (0usize, 0usize, 0f32);
+    let mut first_off: Option<(usize, usize, f32)> = None;
+    let mut done = 1usize; // tokens of the plain stream slot 0 has emitted
+    while done < N {
+        let pos0 = m.slot_position(0);
+        let pend = plain[done - 1];
+        let drafts = m
+            .spec_draft_batch(&[(0, pend)], 3)
+            .expect("draft")
+            .map(|mut d| d.remove(0))
+            .unwrap_or_default();
+        let mut chunk = vec![pend];
+        chunk.extend(drafts);
+        let lv = m
+            .forward_spec_verify(&[(0, pos0, chunk.clone())])
+            .expect("sampled round")
+            .expect("the sampled round declined");
+        // row r predicts the token after chunk[..=r]; its context is the
+        // plain stream's while every draft before it matched
+        let mut a = 0usize;
+        for r in 0..chunk.len() {
+            let row = &lv[r * vocab..(r + 1) * vocab];
+            let want = &logits[done + r];
+            let d = row
+                .iter()
+                .zip(want)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            rows += 1;
+            if row == &want[..] {
+                exact += 1;
+            } else if first_off.is_none() {
+                first_off = Some((done + r, r, d));
+            }
+            worst = worst.max(d);
+            if r + 1 < chunk.len() && chunk[r + 1] == plain[done + r] {
+                a += 1;
+            } else {
+                break;
+            }
+        }
+        m.spec_commit(&[(a + 1) as u32]).expect("commit");
+        done += a + 1;
+    }
+    eprintln!(
+        "verify rows vs decode logits: {exact} of {rows} rows bit-identical, worst |dlogit| \
+         {worst:.6}, first deviating row {first_off:?} (stream index, chunk row, max |d|)"
+    );
+    assert_eq!(
+        exact, rows,
+        "a verify row's logits are not the decode tick's"
+    );
+}
+
+/// An exact re-send repeats its first run's walk. A conversation's second
+/// turn resumed from its first turn's checkpoint; re-sent word for word (a
+/// retried request, a second agent with the same history) it must resume from
+/// that same checkpoint - not re-prefill the whole context cold - and still
+/// land on the first run's logits bit for bit. A prompt whose first run was
+/// cold is re-sent cold, as before.
+#[test]
+fn an_exact_resend_repeats_its_first_walk() {
+    let Some(dir) = common::model_dir("QWEN4EXP_DIR", &["Qwen3.8-Flash-Next-NVFP4"]) else {
+        return;
+    };
+    if !common::heavy() {
+        return;
+    }
+    let Some(exec) = common::gpu_arc() else {
+        return;
+    };
+    let mut m = Qwen4ExpGpu::load_with_slots(&exec, &dir, 4096, 2).expect("load qwen4exp");
+    let p1: Vec<u32> = PROMPT_B.iter().copied().cycle().take(600).collect();
+    let mut p2 = p1.clone();
+    p2.extend(PROMPT_A.iter().copied().cycle().take(300));
+    let l1 = m.prefill_slot(0, &p1).expect("turn 1");
+    assert_eq!(m.take_prefill_reused(0), 0, "turn 1 is cold");
+    let l2 = m.prefill_slot(0, &p2).expect("turn 2");
+    let r2 = m.take_prefill_reused(0);
+    assert!(r2 >= 576, "turn 2 did not resume from turn 1 (reused {r2})");
+    // the re-sends, on the other slot
+    let l2b = m.prefill_slot(1, &p2).expect("turn 2 re-sent");
+    let r2b = m.take_prefill_reused(1);
+    let l1b = m.prefill_slot(1, &p1).expect("turn 1 re-sent");
+    let r1b = m.take_prefill_reused(1);
+    eprintln!("re-send: turn 2 resumed at {r2}, its re-send at {r2b}; turn 1's re-send at {r1b}");
+    assert_eq!(r2b, r2, "the re-send did not repeat its first walk");
+    assert!(l2b == l2, "the re-send's logits are not its first run's");
+    assert_eq!(r1b, 0, "a re-send of a cold first run must be cold");
+    assert!(
+        l1b == l1,
+        "the cold re-send's logits are not its first run's"
+    );
+}
+
+/// A prompt longer than one walk (`walk_rows`, 4096) takes its checkpoints
+/// inside its LAST walk, and an exact re-send of it repeats that walk alone:
+/// it resumes at the walk's start - a checkpoint filed at that boundary for
+/// the purpose - rather than going cold, and still lands on its first run's
+/// logits bit for bit. Both prefill paths: the blocking wave
+/// (`prefill_slot`) and the served chunked path (`prefill_begin` +
+/// riderless mixed ticks).
+#[test]
+fn a_long_resend_repeats_only_its_last_walk() {
+    let Some(dir) = common::model_dir("QWEN4EXP_DIR", &["Qwen3.8-Flash-Next-NVFP4"]) else {
+        return;
+    };
+    if !common::heavy() {
+        return;
+    }
+    let Some(exec) = common::gpu_arc() else {
+        return;
+    };
+    let mut m = Qwen4ExpGpu::load_with_slots(&exec, &dir, 16384, 2).expect("load qwen4exp");
+    let n = 4096 + 700;
+    let pa: Vec<u32> = PROMPT_B.iter().copied().cycle().take(n).collect();
+    let l1 = m.prefill_slot(0, &pa).expect("cold");
+    assert_eq!(m.take_prefill_reused(0), 0, "the first run is cold");
+    let l1b = m.prefill_slot(1, &pa).expect("re-sent");
+    let r1b = m.take_prefill_reused(1);
+    // the served path, on a prompt of its own
+    let pb: Vec<u32> = PROMPT_A.iter().copied().cycle().take(n).collect();
+    let chunked = |m: &mut Qwen4ExpGpu, slot: usize| -> Vec<f32> {
+        m.prefill_begin(slot, pb.clone()).expect("prefill_begin");
+        loop {
+            let (_, fin) = m.forward_mixed(&[], 16384).expect("mixed tick");
+            if let Some((_, l, _)) = fin.into_iter().find(|f| f.0 == slot) {
+                return l;
+            }
+        }
+    };
+    let l2 = chunked(&mut m, 0);
+    assert_eq!(m.take_prefill_reused(0), 0, "the chunked first run is cold");
+    let l2b = chunked(&mut m, 1);
+    let r2b = m.take_prefill_reused(1);
+    eprintln!("long re-send: blocking resumed at {r1b}, chunked at {r2b}");
+    assert_eq!(
+        r1b, 4096,
+        "the blocking re-send did not resume at its last walk"
+    );
+    assert!(
+        l1b == l1,
+        "the blocking re-send's logits are not its first run's"
+    );
+    assert_eq!(
+        r2b, 4096,
+        "the chunked re-send did not resume at its last walk"
+    );
+    assert!(
+        l2b == l2,
+        "the chunked re-send's logits are not its first run's"
+    );
+}
+
+/// The PLE n-gram rows the host lane stages raw decode on the device (slot
+/// 697) to the bits the host decode gives them: a prompt walk (the threaded
+/// gather, 16 rows a token) and decode ticks (a token's 16 rows on the
+/// caller's thread), device decode against host decode, logits compared bit
+/// for bit.
+#[test]
+fn ple_rows_decode_on_the_device_as_on_the_host() {
+    let Some(dir) = common::model_dir("QWEN4EXP_DIR", &["Qwen3.8-Flash-Next-NVFP4"]) else {
+        return;
+    };
+    if !common::heavy() {
+        return;
+    }
+    let Some(exec) = common::gpu_arc() else {
+        return;
+    };
+    let mut m = Qwen4ExpGpu::load_with_slots(&exec, &dir, 4096, 1).expect("load qwen4exp");
+    if !m.set_ple_host_decode(false) {
+        common::missing("the n-gram table is device-resident here - no host lane to compare");
+        return;
+    }
+    let p: Vec<u32> = PROMPT_B.iter().copied().cycle().take(1500).collect();
+    let run = |m: &mut Qwen4ExpGpu, host: bool| -> Vec<Vec<f32>> {
+        m.set_ple_host_decode(host);
+        let mut out = vec![m.forward_prompt(&p).expect("prompt")];
+        for _ in 0..6 {
+            let t = top_k(out.last().expect("logits"), 1)[0] as u32;
+            out.push(m.decode_step(t).expect("decode"));
+        }
+        out
+    };
+    let dev = run(&mut m, false);
+    let host = run(&mut m, true);
+    for (i, (a, b)) in dev.iter().zip(&host).enumerate() {
+        assert!(
+            a == b,
+            "step {i}: the device decode's logits are not the host decode's"
+        );
     }
 }

@@ -33,6 +33,7 @@ mod batch;
 mod dflash;
 mod forward;
 mod load;
+mod mm_steps;
 mod multimodal;
 mod ops;
 pub mod pictures;
@@ -1736,6 +1737,10 @@ pub struct GpuQwen35 {
     /// bytes by the plan (see `pictures`): a re-sent image skips preprocess +
     /// tower, and a prefill borrows a picture instead of copying it.
     pictures: crate::gpu_model::picture_store::PictureStore<pictures::PictureEmbd>,
+    /// Picture prompts held by the stepped lane (`mm_steps`): each
+    /// `encode_step` runs one planned unit of the oldest, and the scheduler's
+    /// ticks run between them.
+    mm_steps: std::collections::VecDeque<mm_steps::MmStepJob>,
     /// In-flight pipelined pure-decode (see [`Self::decode_pipe_begin`]). Some
     /// only transiently, between a `decode_pipe_begin` and its matching drain
     /// inside one `run_batched` decode burst; the scheduler always drains before

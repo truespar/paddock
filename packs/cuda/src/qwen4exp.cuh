@@ -1182,3 +1182,113 @@ int pd_q4x_ple_gather(const void* table, const void* ids, void* out,
         width);
     return pd_launch_status();
 }
+
+// 697: decode n-gram rows the HOST gathered raw. On a unified-memory die the
+// table stays a file mapping (a device copy would hold it twice), and only a
+// part of it is page-cache resident beside a loaded model, so the host does
+// what only the host can: hint every page the walk needs at once and copy
+// each row's bytes as the table stores them into one compact plane. The
+// decode - the arithmetic - is here. The host used to widen every row to f32
+// itself (10.5M values and a 42 MB upload per 4096-row walk); the raw plane
+// is 5.9 MB for the NVFP4 table.
+//
+// A GPU gather straight off the mapping (ATS) was probed on GB10 and kept
+// off the lane: 11.6 ms for 65K warm rows, but a row whose page is not
+// mapped faults per page from the device - 17-20 s for 65K cold rows even
+// after the pages were hinted in, against 57 ms for the host's hint + copy
+// on 8 threads (bench/ple_rows_gb10_bench.cu, 2026-09-30).
+//
+// `raw` is [rows, row_bytes], one row per (token, head) in the ids' order;
+// `out` [rows, width] f32 - the layout the host gather produced. Every
+// format decodes exactly as the host twin did, so the bits are unchanged:
+// each value is an exact product (code x block scale) with at most one
+// rounding by the tensor scale, in the same order.
+//   fmt 0  e4m3 x scale                      (the FP8 table, row = width B)
+//   fmt 1  NVFP4: (e2m1 x e4m3 group-16) x scale; row = width/2 packed
+//          bytes (low nibble first) then width/16 group scales
+//   fmt 2  Q8_0  (blocks of 32: f16 d, 32 x i8)
+//   fmt 3  Q4_0  (f16 d, 16 bytes: low nibbles are elements 0..15)
+//   fmt 4  IQ4_NL (Q4_0's layout through the IQ4_NL codebook)
+//   fmt 5  f16   fmt 6  bf16   fmt 7  f32
+// s|ee|m: mag = ee == 0 ? 0.5*m : (1 + m/2) * 2^(ee-1) - exact, no table
+__device__ __forceinline__ float pd_q4x_ple_e2m1(uint32_t c) {
+    const uint32_t m = c & 1u, ee = (c >> 1) & 3u;
+    const float mag = 0.5f * (float)(ee == 0u ? m : ((2u + m) << (ee - 1u)));
+    return (c & 8u) ? -mag : mag;
+}
+
+// the IQ4_NL codebook (the format's own table; ggml-common.h, MIT)
+__device__ __constant__ int8_t PD_Q4X_IQ4NL[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+__device__ __forceinline__ float pd_q4x_ple_f16(const uint8_t* p) {
+    // bytewise: a row's f16 fields sit at any even offset of the staged plane
+    return __half2float(__ushort_as_half((unsigned short)(p[0] | (p[1] << 8))));
+}
+
+__global__ void pd_q4x_ple_rows_kernel(const uint8_t* __restrict__ raw,
+                                       float* __restrict__ out, uint32_t fmt,
+                                       float scale, uint32_t rows,
+                                       uint32_t width, uint32_t row_bytes) {
+    // one warp per row: 160 values is five per lane
+    const uint32_t r = blockIdx.x * (blockDim.x / 32u) + threadIdx.x / 32u;
+    if (r >= rows) return;
+    const uint8_t* row = raw + (size_t)r * row_bytes;
+    float* dst = out + (size_t)r * width;
+    for (uint32_t e = threadIdx.x % 32u; e < width; e += 32u) {
+        float v;
+        const uint32_t blk = e / 32u, j = e % 32u;
+        switch (fmt) {
+        case 0u:
+            v = __fmul_rn((float)reinterpret_cast<const __nv_fp8_e4m3&>(row[e]), scale);
+            break;
+        case 1u: {
+            const uint32_t b = row[e >> 1];
+            const uint32_t c = (e & 1u) ? (b >> 4) : (b & 15u);
+            const float g = (float)reinterpret_cast<const __nv_fp8_e4m3&>(row[width / 2u + e / 16u]);
+            v = __fmul_rn(__fmul_rn(pd_q4x_ple_e2m1(c), g), scale);
+            break;
+        }
+        case 2u: {
+            const uint8_t* b = row + blk * 34u;
+            v = __fmul_rn((float)(int8_t)b[2u + j], pd_q4x_ple_f16(b));
+            break;
+        }
+        case 3u:
+        case 4u: {
+            const uint8_t* b = row + blk * 18u;
+            const uint32_t q = b[2u + (j & 15u)];
+            const uint32_t c = j < 16u ? (q & 15u) : (q >> 4);
+            const float x = fmt == 3u ? (float)((int)c - 8) : (float)PD_Q4X_IQ4NL[c];
+            v = __fmul_rn(x, pd_q4x_ple_f16(b));
+            break;
+        }
+        case 5u:
+            v = pd_q4x_ple_f16(row + 2u * e);
+            break;
+        case 6u:
+            v = __uint_as_float((uint32_t)(row[2u * e] | (row[2u * e + 1u] << 8)) << 16);
+            break;
+        default: {
+            const uint8_t* p = row + 4u * e;
+            v = __uint_as_float((uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+                                ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24));
+            break;
+        }
+        }
+        dst[e] = v;
+    }
+}
+
+PD_EXPORT
+int pd_q4x_ple_rows(const void* raw, void* out, uint32_t fmt, float scale,
+                    uint32_t rows, uint32_t width, uint32_t row_bytes,
+                    void* stream) {
+    if (rows == 0 || width == 0) return 0;
+    if (fmt > 7u || row_bytes == 0) return (int)cudaErrorInvalidValue;
+    const uint32_t per = 8u;  // rows (warps) per block
+    pd_q4x_ple_rows_kernel<<<(rows + per - 1u) / per, 32u * per, 0,
+                             (cudaStream_t)stream>>>(
+        (const uint8_t*)raw, (float*)out, fmt, scale, rows, width, row_bytes);
+    return pd_launch_status();
+}

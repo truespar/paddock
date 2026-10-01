@@ -349,12 +349,57 @@ fn expert_prefill_variant_cases(measure: bool) {
 
 #[test]
 fn small_prompt_packed_wide_preserves_bits_and_offset_guards() {
+    small_prompt_wide_cases(false);
+}
+
+#[test]
+#[ignore = "exact shared-unpacking small-prompt costs; not a serving benchmark"]
+fn small_prompt_wide_rows_execution_cost() {
+    small_prompt_wide_cases(true);
+}
+
+#[test]
+fn wide_row_reuse_keeps_parallelism_and_covers_partial_groups() {
+    for (rows, columns, expected) in [
+        (1, 10240, 1),
+        (2, 10240, 2),
+        (3, 10240, 2),
+        (4, 10240, 4),
+        (4, 320, 1),
+        (4, 640, 2),
+        (9, 320, 2),
+        (9, 640, 4),
+        (12, 320, 2),
+        (21, 320, 4),
+        (49, 4, 1),
+    ] {
+        assert_eq!(affine::wide_row_group(rows, columns), expected);
+    }
+    for rows in 1..=2048_usize {
+        for columns in [4, 13, 320, 512, 640, 2560, 10240] {
+            let width = affine::wide_row_group(rows, columns);
+            assert!([1, 2, 4].contains(&width));
+            if width > 1 {
+                assert!((rows / width) * columns.div_ceil(8) >= 128);
+            }
+            let covered = (0..rows.div_ceil(width))
+                .flat_map(|group| group * width..((group + 1) * width).min(rows))
+                .collect::<Vec<_>>();
+            assert_eq!(covered, (0..rows).collect::<Vec<_>>());
+        }
+    }
+}
+
+fn small_prompt_wide_cases(measure: bool) {
     let d = MetalDevice::new(Some(128 << 20)).unwrap();
     for (k, n, ty) in [
         (2560, 640, affine::A4G32),
         (10240, 320, affine::A4G32),
         (320, 10240, affine::A4G32),
         (2560, 512, affine::A8G64),
+        (2560, 10240, affine::A4G32),
+        (6144, 2560, affine::A4G32),
+        (64, 4, affine::A4G32),
         (64, 13, affine::A4G32),
         (64, 13, affine::A8G64),
     ] {
@@ -373,9 +418,28 @@ fn small_prompt_packed_wide_preserves_bits_and_offset_guards() {
             }));
         }
         let w = d.upload(&raw).unwrap();
-        for (rows, start) in [(1, 0), (2, 3), (9, 14), (12, 37), (21, 14)] {
+        for (rows, start) in [
+            (1, 0),
+            (2, 3),
+            (3, 1),
+            (4, 3),
+            (5, 1),
+            (7, 3),
+            (8, 0),
+            (9, 14),
+            (11, 0),
+            (12, 37),
+            (13, 7),
+            (21, 14),
+            (49, 7),
+        ] {
+            if measure && (rows < 2 || n < 64) {
+                continue;
+            }
             let input = (0..(start + rows) * k)
                 .flat_map(|i| {
+                    // The model's small-prompt projection contract is BF16
+                    // activations stored in F32, not arbitrary F32 inputs.
                     half::bf16::from_f32((i % 137) as f32 / 97. - 0.7)
                         .to_f32()
                         .to_le_bytes()
@@ -385,51 +449,88 @@ fn small_prompt_packed_wide_preserves_bits_and_offset_guards() {
             let count = (start + rows) * n;
             let y = d.alloc((count + 32) * 4).unwrap();
             let mut expected = None;
-            for kernel in [
-                "q4a_wide",
-                if bits == 4 {
-                    "q4a_wide4_packed"
-                } else {
-                    "q4a_wide8_packed"
-                },
-            ] {
-                poison_output(&y, count);
-                let cmd = d.begin().unwrap();
-                cmd.dispatch(
-                    kernel,
-                    &[&w, &x, &y],
-                    &[
-                        k as u32,
-                        n as u32,
-                        rows as u32,
-                        bits as u32,
-                        group as u32,
-                        1,
-                        start as u32,
-                    ],
-                    [n.div_ceil(8), rows, 1],
-                    64,
-                );
-                cmd.finish().unwrap();
-                let got = unsafe { y.read_f32(0, count + 32) };
-                assert!(
-                    got[..start * n]
-                        .iter()
-                        .chain(&got[count..])
-                        .all(|x| x.is_nan())
-                );
-                let got = got[start * n..count]
-                    .iter()
-                    .map(|x| x.to_bits())
-                    .collect::<Vec<_>>();
-                if let Some(expected) = &expected {
-                    assert!(
-                        &got == expected,
-                        "K={k} N={n} bits={bits} rows={rows} start={start}"
+            let mut kernels = vec![
+                ("q4a_wide", 1),
+                (
+                    if bits == 4 {
+                        "q4a_wide4_packed"
+                    } else {
+                        "q4a_wide8_packed"
+                    },
+                    1,
+                ),
+                (
+                    if bits == 4 {
+                        "q4a_wide4_rows2"
+                    } else {
+                        "q4a_wide8_rows2"
+                    },
+                    2,
+                ),
+                (
+                    if bits == 4 {
+                        "q4a_wide4_rows4"
+                    } else {
+                        "q4a_wide8_rows4"
+                    },
+                    4,
+                ),
+            ];
+            if measure {
+                kernels.remove(0);
+            }
+            let mut times = vec![Vec::new(); kernels.len()];
+            for round in 0..if measure { 7 } else { 1 } {
+                for route in (0..kernels.len()).map(|r| (r + round) % kernels.len()) {
+                    let (kernel, width) = kernels[route];
+                    poison_output(&y, count);
+                    let cmd = d.begin().unwrap();
+                    cmd.dispatch(
+                        kernel,
+                        &[&w, &x, &y],
+                        &[
+                            k as u32,
+                            n as u32,
+                            rows as u32,
+                            bits as u32,
+                            group as u32,
+                            1,
+                            start as u32,
+                        ],
+                        [n.div_ceil(8), rows.div_ceil(width), 1],
+                        64,
                     );
-                } else {
-                    expected = Some(got);
+                    let elapsed = cmd.finish().unwrap();
+                    if round > 0 {
+                        times[route].push(elapsed);
+                    }
+                    let got = unsafe { y.read_f32(0, count + 32) };
+                    assert!(
+                        got[..start * n]
+                            .iter()
+                            .chain(&got[count..])
+                            .all(|x| x.is_nan())
+                    );
+                    let got = got[start * n..count]
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .collect::<Vec<_>>();
+                    if let Some(expected) = &expected {
+                        assert!(
+                            &got == expected,
+                            "kernel={kernel} K={k} N={n} bits={bits} rows={rows} start={start}"
+                        );
+                    } else {
+                        expected = Some(got);
+                    }
                 }
+            }
+            if measure {
+                eprintln!(
+                    "FLASH_WIDE_ROWS_COST {}",
+                    serde_json::json!({"k":k,"n":n,"bits":bits,
+                "rows":rows,"start":start,"kernels":kernels,"gpu_seconds":times,"exact":true})
+                );
             }
         }
     }
@@ -707,6 +808,21 @@ fn expert_gate_up_vector_execution_cost() {
 }
 
 fn expert_gate_up_vector_cases(measure: bool) {
+    expert_gate_up_cases(measure, false);
+}
+
+#[test]
+fn expert_gate_up_ordered_preserves_routes_and_guards() {
+    expert_gate_up_cases(false, true);
+}
+
+#[test]
+#[ignore = "checkpoint-backed routed prompt gate/up fusion; exact outputs and rotated component GPU costs"]
+fn expert_gate_up_ordered_execution_cost() {
+    expert_gate_up_cases(true, true);
+}
+
+fn expert_gate_up_cases(measure: bool, ordered: bool) {
     let d = MetalDevice::new(Some(4 << 30)).unwrap();
     let k = 2560;
     let n = 640;
@@ -755,8 +871,20 @@ fn expert_gate_up_vector_cases(measure: bool) {
             })
             .collect::<Vec<_>>()
     };
-    for rows in [1, 4, 8] {
-        for skewed in [false, true] {
+    let row_counts: &[usize] = if ordered {
+        if measure {
+            &[7, 14, 49, 96, 128]
+        } else {
+            &[7, 13, 49, 128]
+        }
+    } else if measure {
+        &[1, 4, 8]
+    } else {
+        &[1, 2, 3, 4, 7, 8]
+    };
+    for &rows in row_counts {
+        for routing in 0..if measure { 2 } else { 3 } {
+            let skewed = routing == 1;
             let x = d
                 .upload(
                     &(0..rows * k)
@@ -772,7 +900,9 @@ fn expert_gate_up_vector_cases(measure: bool) {
                 .upload(
                     &(0..rows * 10)
                         .flat_map(|i| {
-                            if skewed {
+                            if routing == 2 && i % 7 == 0 {
+                                u32::MAX
+                            } else if skewed {
                                 (experts - 1) as u32
                             } else {
                                 ((i * 43 + i / 10 * 13) % experts) as u32
@@ -784,15 +914,48 @@ fn expert_gate_up_vector_cases(measure: bool) {
                 .unwrap();
             let outputs = [rows * 10 * n, rows * 10 * n, rows * n, rows * n]
                 .map(|count| d.alloc((count + 32) * 4).unwrap());
-            let baseline = |cmd: &crate::device::Commands<'_>| {
-                for plane in 0..4 {
+            for (out, count) in
+                outputs
+                    .iter()
+                    .zip([rows * 10 * n, rows * 10 * n, rows * n, rows * n])
+            {
+                poison_output(out, count);
+            }
+            let order = d.alloc(rows * 10 * 4).unwrap();
+            if ordered {
+                let cmd = d.begin().unwrap();
+                cmd.dispatch(
+                    "q4a_expert_order",
+                    &[&ids, &order],
+                    &[(rows * 10) as u32],
+                    [1, 1, 1],
+                    256,
+                );
+                cmd.finish().unwrap();
+            }
+            let baseline = |cmd: &crate::device::Commands<'_>, shared_only: bool| {
+                for plane in if shared_only { 2 } else { 0 }..4 {
                     let w = &weights[plane];
                     if plane < 2 {
                         cmd.dispatch(
-                            "q4a_expert4_fast",
-                            &[&w.buffer, &x, &ids, &outputs[plane], &ids],
+                            if ordered {
+                                "q4a_expert4_fast_ordered"
+                            } else {
+                                "q4a_expert4_fast"
+                            },
+                            &[
+                                &w.buffer,
+                                &x,
+                                &ids,
+                                &outputs[plane],
+                                if ordered { &order } else { &ids },
+                            ],
                             &[k as u32, n as u32, (rows * 10) as u32, 0, experts as u32],
-                            [n.div_ceil(16), rows * 10, 1],
+                            if ordered {
+                                [n.div_ceil(16) * 8, (rows * 10).div_ceil(8), 1]
+                            } else {
+                                [n.div_ceil(16), rows * 10, 1]
+                            },
                             128,
                         );
                     } else {
@@ -806,6 +969,9 @@ fn expert_gate_up_vector_cases(measure: bool) {
                     }
                 }
                 for (gate, up, count) in [(0, 1, rows * 10 * n), (2, 3, rows * n)] {
+                    if shared_only && gate == 0 {
+                        continue;
+                    }
                     cmd.dispatch(
                         "mlx_swiglu",
                         &[&outputs[gate], &outputs[up]],
@@ -816,39 +982,72 @@ fn expert_gate_up_vector_cases(measure: bool) {
                 }
             };
             let cmd = d.begin().unwrap();
-            baseline(&cmd);
+            baseline(&cmd, false);
             cmd.finish().unwrap();
             let expected = [unsafe { outputs[0].read_u32(rows * 10 * n) }, unsafe {
                 outputs[2].read_u32(rows * n)
             }];
             let allocated = d.allocated_bytes();
-            let mut times: [Vec<f64>; 3] = Default::default();
+            let variants: &[(&str, usize, usize)] = if ordered {
+                &[
+                    ("baseline", 4, 128),
+                    ("q4a_expert_gate_up_ordered", 4, 64),
+                    ("q4a_expert_gate_up_ordered", 4, 128),
+                    ("q4a_expert_gate_up_ordered_pair2", 2, 64),
+                    ("q4a_expert_gate_up_ordered_pair4", 4, 64),
+                    ("q4a_expert_gate_up_ordered_pair4", 4, 128),
+                ]
+            } else {
+                &[
+                    ("baseline", 4, 128),
+                    ("q4a_expert_gate_up_vector", 4, 64),
+                    ("q4a_expert_gate_up_vector", 4, 128),
+                    ("q4a_expert_gate_up_pair2", 2, 64),
+                    ("q4a_expert_gate_up_pair4", 4, 64),
+                    ("q4a_expert_gate_up_pair4", 4, 128),
+                ]
+            };
+            let mut times = vec![Vec::new(); variants.len()];
             for round in 0..if measure { 9 } else { 1 } {
-                for index in 0..3 {
-                    let route = (index + round) % 3;
+                for index in 0..variants.len() {
+                    let route = (index + round) % variants.len();
                     for (out, count) in [(&outputs[0], rows * 10 * n), (&outputs[2], rows * n)] {
                         poison_output(out, count);
                     }
                     let cmd = d.begin().unwrap();
                     for _ in 0..if measure { 16 } else { 1 } {
                         if route == 0 {
-                            baseline(&cmd);
+                            baseline(&cmd, false);
                         } else {
-                            let threads = if route == 1 { 64 } else { 128 };
+                            let (name, columns, threads) = variants[route];
+                            let mut buffers = vec![
+                                &weights[0].buffer,
+                                &weights[1].buffer,
+                                &weights[2].buffer,
+                                &weights[3].buffer,
+                                &x,
+                                &ids,
+                                &outputs[0],
+                                &outputs[2],
+                            ];
+                            let stripes = if name.contains("pair") { 4 } else { 8 };
+                            if ordered {
+                                baseline(&cmd, true);
+                                buffers.push(&order);
+                            }
                             cmd.dispatch(
-                                "q4a_expert_gate_up_vector",
-                                &[
-                                    &weights[0].buffer,
-                                    &weights[1].buffer,
-                                    &weights[2].buffer,
-                                    &weights[3].buffer,
-                                    &x,
-                                    &ids,
-                                    &outputs[0],
-                                    &outputs[2],
-                                ],
+                                name,
+                                &buffers,
                                 &[k as u32, n as u32, rows as u32, experts as u32],
-                                [n.div_ceil(threads / 32 * 4), rows * 11, 1],
+                                if ordered {
+                                    [
+                                        n.div_ceil(threads / 32 * columns) * stripes,
+                                        (rows * 10).div_ceil(8) + 1,
+                                        1,
+                                    ]
+                                } else {
+                                    [n.div_ceil(threads / 32 * columns), rows * 11 + 1, 1]
+                                },
                                 threads,
                             );
                         }
@@ -858,7 +1057,7 @@ fn expert_gate_up_vector_cases(measure: bool) {
                         let got = unsafe { outputs[i * 2].read_u32(count + 32) };
                         assert!(
                             got[..count] == expected[i],
-                            "rows={rows} route={route} skewed={skewed}"
+                            "rows={rows} route={route} routing={routing}"
                         );
                         assert!(got[count..].iter().all(|&v| v == f32::NAN.to_bits()));
                     }
@@ -871,7 +1070,7 @@ fn expert_gate_up_vector_cases(measure: bool) {
             if measure {
                 eprintln!(
                     "FLASH_EXPERT_VECTOR {}",
-                    serde_json::json!({"rows":rows,"skewed":skewed,"gpu_seconds":times,"exact":true})
+                    serde_json::json!({"rows":rows,"skewed":skewed,"ordered":ordered,"variants":variants,"gpu_seconds":times,"exact":true})
                 );
             }
         }
@@ -881,6 +1080,185 @@ fn expert_gate_up_vector_cases(measure: bool) {
 #[test]
 fn joined_input_projection_preserves_tiles_spans_and_output_guards() {
     joined_input_cases(false);
+}
+
+#[test]
+fn expert_down_vector_preserves_outputs_invalid_routes_and_guards() {
+    expert_down_vector_cases(false);
+}
+
+#[test]
+#[ignore = "checkpoint-backed expert down costs, exact routed/shared outputs and guards; not a serving bar"]
+fn expert_down_vector_execution_cost() {
+    expert_down_vector_cases(true);
+}
+
+fn expert_down_vector_cases(measure: bool) {
+    let d = MetalDevice::new(Some(2 << 30)).unwrap();
+    for (k, n) in [(640_usize, 2560_usize), (64, 13)] {
+        if measure && n != 2560 {
+            continue;
+        }
+        let experts = if measure { 512 } else { 17 };
+        let weights = if measure {
+            let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+            let source = super::mlx::Source::open(Path::new(&path)).unwrap();
+            ["switch_mlp.down_proj", "shared_expert.down_proj"]
+                .into_iter()
+                .map(|suffix| {
+                    source
+                        .weight(&d, &format!("{}.layers.0.mlp.{suffix}", super::mlx::ROOT))
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        } else {
+            [experts, 1]
+                .into_iter()
+                .enumerate()
+                .map(|(plane, e)| {
+                    let size = k * n * e;
+                    let mut raw = (0..size / 2)
+                        .map(|i| (i * 31 + i / 127 + plane * 71) as u8)
+                        .collect::<Vec<_>>();
+                    for bias in [false, true] {
+                        raw.extend((0..size / 32).flat_map(|i| {
+                            half::bf16::from_f32(if bias {
+                                -0.04 + (i % 17) as f32 * 0.001
+                            } else {
+                                0.002 + (i % 31) as f32 * 0.00002
+                            })
+                            .to_le_bytes()
+                        }));
+                    }
+                    crate::weights::Weight {
+                        buffer: d.upload(&raw).unwrap(),
+                        k,
+                        n: n * e,
+                        ty: affine::A4G32,
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        for rows in [1, 4, 8] {
+            for routing in 0..if measure { 2 } else { 3 } {
+                let inputs = [rows * 10 * k, rows * k].map(|count| {
+                    d.upload(
+                        &(0..count)
+                            .flat_map(|i| {
+                                half::bf16::from_f32((i % 137) as f32 / 97. - 0.7)
+                                    .to_f32()
+                                    .to_le_bytes()
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap()
+                });
+                let ids = d
+                    .upload(
+                        &(0..rows * 10)
+                            .flat_map(|i| {
+                                let id = if routing == 2 && i % 7 == 0 {
+                                    u32::MAX
+                                } else if routing == 1 {
+                                    (experts - 1) as u32
+                                } else {
+                                    ((i * 43 + i / 10 * 13) % experts) as u32
+                                };
+                                id.to_le_bytes()
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+                let counts = [rows * 10 * n, rows * n];
+                let outputs = counts.map(|count| d.alloc((count + 32) * 4).unwrap());
+                let baseline = |cmd: &crate::device::Commands<'_>| {
+                    cmd.dispatch(
+                        "q4a_expert4",
+                        &[&weights[0].buffer, &inputs[0], &ids, &outputs[0], &ids],
+                        &[k as u32, n as u32, (rows * 10) as u32, 1, experts as u32],
+                        [n.div_ceil(16), rows * 10, 1],
+                        128,
+                    );
+                    cmd.dispatch(
+                        "q4a_mv4",
+                        &[&weights[1].buffer, &inputs[1], &outputs[1]],
+                        &[k as u32, n as u32, rows as u32, 4, 32, 1, 0],
+                        [n.div_ceil(16), rows, 1],
+                        128,
+                    );
+                };
+                for (out, count) in outputs.iter().zip(counts) {
+                    poison_output(out, count);
+                }
+                let cmd = d.begin().unwrap();
+                baseline(&cmd);
+                cmd.finish().unwrap();
+                let expected = [0, 1].map(|i| unsafe { outputs[i].read_u32(counts[i] + 32) });
+                let variants = [
+                    ("baseline", 4, 128),
+                    ("q4a_expert_down_vector4", 4, 64),
+                    ("q4a_expert_down_vector8", 8, 32),
+                    ("q4a_expert_down_vector8", 8, 64),
+                    ("q4a_expert_down_vector8", 8, 128),
+                    ("q4a_expert_down_vector16", 16, 64),
+                ];
+                let mut times = vec![Vec::new(); variants.len()];
+                let allocated = d.allocated_bytes();
+                for round in 0..if measure { 9 } else { 1 } {
+                    for route in (0..variants.len()).map(|i| (i + round) % variants.len()) {
+                        let (name, width, threads) = variants[route];
+                        for (out, count) in outputs.iter().zip(counts) {
+                            poison_output(out, count);
+                        }
+                        let cmd = d.begin().unwrap();
+                        for _ in 0..if measure { 16 } else { 1 } {
+                            if route == 0 {
+                                baseline(&cmd);
+                            } else {
+                                cmd.dispatch(
+                                    name,
+                                    &[
+                                        &weights[0].buffer,
+                                        &weights[1].buffer,
+                                        &inputs[0],
+                                        &inputs[1],
+                                        &ids,
+                                        &outputs[0],
+                                        &outputs[1],
+                                    ],
+                                    &[k as u32, n as u32, rows as u32, experts as u32],
+                                    [n.div_ceil(threads / 32 * width), rows * 11 + 1, 1],
+                                    threads,
+                                );
+                            }
+                        }
+                        let gpu = cmd.finish().unwrap();
+                        for i in 0..2 {
+                            assert!(
+                                unsafe { outputs[i].read_u32(counts[i] + 32) } == expected[i],
+                                "K={k} N={n} rows={rows} route={route} routing={routing} plane={i}"
+                            );
+                            assert!(
+                                expected[i][counts[i]..]
+                                    .iter()
+                                    .all(|&v| v == f32::NAN.to_bits())
+                            );
+                        }
+                        if round > 0 {
+                            times[route].push(gpu / 16.);
+                        }
+                    }
+                }
+                assert_eq!(d.allocated_bytes(), allocated);
+                if measure {
+                    eprintln!(
+                        "FLASH_DOWN_VECTOR {}",
+                        serde_json::json!({"rows":rows,"routing":routing,"variants":variants,"gpu_seconds":times,"exact":true})
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -2990,7 +3368,7 @@ fn flash_next_affine_matches_mlx_gpu() {
 #[test]
 fn flash_next_mlx_expert_order_is_stable_bounded_permutation() {
     let d = MetalDevice::new(Some(8 << 20)).unwrap();
-    for entries in [1, 10, 40, 64, 90, 330, 1280] {
+    for entries in [1, 10, 40, 64, 90, 330, 1280, 1290, 1600, 1920, 2040, 2048] {
         for invalid in [false, true] {
             let ids = (0..entries)
                 .map(|i| {
@@ -3023,6 +3401,129 @@ fn flash_next_mlx_expert_order_is_stable_bounded_permutation() {
             expected.resize(entries as usize, u32::MAX);
             assert_eq!(&actual[..entries as usize], expected);
             assert!(actual[entries as usize..].iter().all(|&v| v == 0xA5A5A5A5));
+        }
+    }
+}
+
+#[test]
+fn extended_expert_order_preserves_bits_routes_and_guards() {
+    let d = MetalDevice::new(Some(512 << 20)).unwrap();
+    // Full 512-expert address layout, with fewer independent output columns.
+    // Full-model tests additionally check the actual 640/2560-wide weights.
+    let n: usize = 16;
+    for k in [640usize, 2560] {
+        let size = k * n * 512;
+        let mut raw = (0..size / 2)
+            .map(|i| (i * 37 + i / 131) as u8)
+            .collect::<Vec<_>>();
+        for bias in [false, true] {
+            raw.extend((0..size / 32).flat_map(|i| {
+                half::bf16::from_f32(if bias {
+                    -0.04 + (i % 17) as f32 * 0.001
+                } else {
+                    0.002 + (i % 31) as f32 * 0.00002
+                })
+                .to_le_bytes()
+            }));
+        }
+        let w = d.upload(&raw).unwrap();
+        for rows in [129usize, 160, 192, 204] {
+            let entries = rows * 10;
+            let count = entries * n;
+            let x = d
+                .upload(
+                    &(0..entries * k)
+                        .flat_map(|i| {
+                            half::bf16::from_f32((i % 137) as f32 / 97. - 0.7)
+                                .to_f32()
+                                .to_le_bytes()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            for routing in 0..3 {
+                let ids = (0..entries)
+                    .map(|i| match routing {
+                        1 => 511,
+                        2 if i % 7 == 0 => u32::MAX,
+                        _ => ((i * 73 + i / 10 * 17) % 512) as u32,
+                    })
+                    .collect::<Vec<_>>();
+                let input = d
+                    .upload(&ids.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())
+                    .unwrap();
+                let order = d.upload(&vec![0xA5; (entries + 32) * 4]).unwrap();
+                let y = d.alloc((count + 32) * 4).unwrap();
+                let allocated = d.allocated_bytes();
+                let cmd = d.begin().unwrap();
+                cmd.dispatch(
+                    "q4a_expert_order",
+                    &[&input, &order],
+                    &[entries as u32],
+                    [1, 1, 1],
+                    256,
+                );
+                cmd.finish().unwrap();
+                assert!(
+                    unsafe { order.read_u32(entries + 32) }[entries..]
+                        .iter()
+                        .all(|&v| v == 0xA5A5A5A5)
+                );
+                for per_entry in [false, true] {
+                    let mut expected = None;
+                    for route in 0..3 {
+                        poison_output(&y, count);
+                        let cmd = d.begin().unwrap();
+                        let name = match (k, route) {
+                            (2560, 0) => "q4a_expert4_fast",
+                            (2560, 1) => "q4a_expert4_fast_ordered",
+                            (2560, _) => "q4a_expert4_fast_pair",
+                            (_, 0) => "q4a_expert4",
+                            (_, 1) => "q4a_expert4_ordered",
+                            _ => "q4a_expert4_pair",
+                        };
+                        cmd.dispatch(
+                            name,
+                            &[&w, &x, &input, &y, &order],
+                            &[
+                                k as u32,
+                                n as u32,
+                                entries as u32,
+                                u32::from(per_entry),
+                                512,
+                            ],
+                            match route {
+                                0 => [n / 16, entries, 1],
+                                1 => [n / 16 * 8, entries.div_ceil(8), 1],
+                                _ => [n / 16 * 4, entries.div_ceil(8), 1],
+                            },
+                            128,
+                        );
+                        cmd.finish().unwrap();
+                        let actual = unsafe { y.read_u32(count + 32) };
+                        assert!(actual[count..].iter().all(|&v| v == f32::NAN.to_bits()));
+                        for (i, &id) in ids.iter().enumerate() {
+                            assert!(actual[i * n..(i + 1) * n].iter().all(|&v| {
+                                if id >= 512 {
+                                    v == f32::NAN.to_bits()
+                                } else {
+                                    f32::from_bits(v).is_finite()
+                                }
+                            }));
+                        }
+                        if let Some(expected) = &expected {
+                            assert!(
+                                &actual == expected,
+                                "k={k} rows={rows} routing={routing} per_entry={per_entry} route={route}"
+                            );
+                        } else {
+                            expected = Some(actual);
+                        }
+                    }
+                }
+                assert_eq!(d.allocated_bytes(), allocated);
+                assert_eq!(unsafe { input.read_u32(entries) }, ids);
+            }
         }
     }
 }

@@ -407,6 +407,18 @@ impl PagedRadix {
         true
     }
 
+    /// The checkpoint at exactly boundary `pos` of `tokens`, if one is
+    /// attached there, marked used - for a resume that must start at that
+    /// boundary rather than at the deepest checkpoint a match offers (an
+    /// exact re-send repeating its first run's walk).
+    pub fn resume_state_at(&mut self, tokens: &[u32], pos: usize) -> Option<u32> {
+        let node = self.node_at(tokens, pos)?;
+        let idx = self.nodes[node as usize].state_blk?;
+        let t = self.tick();
+        self.nodes[node as usize].ckpt_used = t;
+        Some(idx)
+    }
+
     /// The cached node ending exactly at block boundary `pos` of `tokens`.
     /// Unlike a match, which keeps a token back for the prefill to run and
     /// so never reaches the node at `tokens.len()`, this walks all the way.
@@ -559,6 +571,7 @@ impl PagedRadix {
                 self.st_refused += 1;
                 return None;
             }
+            self.log_steal(victim, "checkpoint alloc", pool);
             let idx = self.nodes[victim]
                 .state_blk
                 .take()
@@ -567,6 +580,30 @@ impl PagedRadix {
             self.state_free.push(idx);
             self.st_steals += 1;
         }
+    }
+
+    /// Debug witness for a checkpoint steal: which boundary lost its state,
+    /// how stale it was, and why. Depth is a parent walk, so it is only
+    /// computed when someone is listening.
+    fn log_steal(&self, victim: usize, why: &str, pool: &KvPool) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let mut depth = 0usize;
+        let mut node = victim as u32;
+        while node != 0 {
+            depth += 1;
+            node = self.nodes[node as usize].parent;
+        }
+        tracing::debug!(
+            "ckpt steal ({why}): boundary {} tok, idle {} ticks, recurred {}, free idx {}, \
+             free pages {}",
+            depth * BLOCK_TOKENS,
+            self.clock.saturating_sub(self.nodes[victim].ckpt_used),
+            self.nodes[victim].recurred,
+            self.state_free.len(),
+            pool.free_blocks()
+        );
     }
 
     /// The checkpoint to give up first: never-recurred first under
@@ -664,6 +701,7 @@ impl PagedRadix {
                 continue;
             }
             if let Some(v) = self.state_victim_any(spare) {
+                self.log_steal(v, "live context needs pages", pool);
                 let idx = self.nodes[v].state_blk.take().expect("victim holds one");
                 self.drop_state_pages(idx, pool);
                 self.state_free.push(idx);
@@ -673,6 +711,10 @@ impl PagedRadix {
             if self.evict_lru_sparing(spare, pool).is_none() {
                 return false;
             }
+            tracing::debug!(
+                "make_room: LRU KV leaf evicted for a live context (free pages {}, want {want})",
+                pool.free_blocks()
+            );
         }
     }
 

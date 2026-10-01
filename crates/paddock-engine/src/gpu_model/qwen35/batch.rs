@@ -1433,12 +1433,6 @@ impl GpuQwen35 {
         if paddock_models::dev_var_os!("PADDOCK_ROUTE_WITNESS").is_some() {
             eprintln!("pd route: mm prefill BATCHED n={}", reqs.len());
         }
-        let max_batch = self
-            .batch
-            .as_ref()
-            .ok_or(GpuModelError::BatchDisabled)?
-            .max_batch;
-
         // Peel the RESUMABLE requests onto the serial path first.
         // The batched pass below is fresh-only - the same v1 scope its text
         // twin documents - so putting a request with a cached prefix through it
@@ -1446,116 +1440,38 @@ impl GpuQwen35 {
         // exactly the reuse the content-keyed cache exists to provide. A
         // document conversation is a cache hit by construction, so this is the
         // common case, not the corner. What is left is genuinely cold and
-        // batches as before.
+        // batches as before. The same goes for a prompt longer than one planned
+        // prefill chunk: a batched pass takes each prompt whole, so one of those
+        // would regrow the serving scratch to its length, where the serial path
+        // cuts it into planned passes (`mm_pass_ends`). Routing, grouping and
+        // the per-group pass are the stepped lane's (`mm_steps`), run here in
+        // one call.
         let mut out: Vec<Option<(Vec<f32>, usize)>> = (0..reqs.len()).map(|_| None).collect();
-        let mut cold: Vec<(
-            usize,
-            usize,
-            Vec<crate::service::MmChunk>,
-            Vec<(usize, usize)>,
-        )> = Vec::with_capacity(reqs.len());
+        let mut cold: Vec<(Vec<crate::service::MmChunk>, usize, Vec<(usize, usize)>)> =
+            Vec::with_capacity(reqs.len());
+        let mut orig: Vec<usize> = Vec::with_capacity(reqs.len());
         for (i, (slot, chunks)) in reqs.into_iter().enumerate() {
-            if slot >= max_batch {
-                return Err(GpuModelError::BatchTooLarge {
-                    got: slot + 1,
-                    max: max_batch,
-                });
-            }
-            let grids = self.picture_grids(&chunks)?;
-            // ...and the ones longer than one planned prefill chunk: a batched
-            // pass takes each prompt whole, so one of those would regrow the
-            // serving scratch to its length, where the serial path cuts it
-            // into planned passes (`mm_pass_ends`)
-            if self.mm_prefix_would_resume(&chunks, &grids)?
-                || mm_rows(&chunks, &grids) > self.prefill_chunk_rows
-            {
-                out[i] = Some(self.forward_prefill_slot_mm(slot, &chunks)?);
-            } else {
-                cold.push((i, slot, chunks, grids));
+            match self.mm_route(slot, &chunks, self.prefill_chunk_rows)? {
+                None => out[i] = Some(self.forward_prefill_slot_mm(slot, &chunks)?),
+                Some(grids) => {
+                    orig.push(i);
+                    cold.push((chunks, slot, grids));
+                }
             }
         }
         if cold.len() == 1 {
             // a cohort of one is the serial path, and this one also gets to
             // publish its pages for the next turn
-            let (i, slot, chunks, _) = cold.pop().expect("len 1");
-            out[i] = Some(self.forward_prefill_slot_mm(slot, &chunks)?);
+            let (chunks, slot, _) = cold.pop().expect("len 1");
+            out[orig[0]] = Some(self.forward_prefill_slot_mm(slot, &chunks)?);
         } else if !cold.is_empty() {
-            let mut orig: Vec<usize> = Vec::with_capacity(cold.len());
-            let mut items: Vec<(usize, Vec<u32>)> = Vec::with_capacity(cold.len());
-            let mut ctxs: Vec<MmShareCtx> = Vec::with_capacity(cold.len());
-            let mut prompts: Vec<Vec<crate::service::MmChunk>> = Vec::with_capacity(cold.len());
-            for (i, slot, chunks, grids) in cold {
-                let MmLayout {
-                    ids,
-                    mrope,
-                    bound,
-                    splices,
-                    t_len,
-                    final_mrope_pos,
-                } = build_mm_layout(&chunks, &grids)?;
-                if t_len == 0 || t_len > self.max_ctx {
-                    return Err(GpuModelError::BatchTooLarge {
-                        got: t_len,
-                        max: self.max_ctx,
-                    });
-                }
-                orig.push(i);
-                items.push((slot, ids));
-                ctxs.push(MmShareCtx {
-                    mrope,
-                    bound,
-                    splices,
-                    images: Vec::new(),
-                    final_mrope_pos,
-                });
-                prompts.push(chunks);
-            }
             // never past the planned pass either, or a group regrows it
             let cap = batch_prefill_cap().min(self.prefill_chunk_rows);
-            let mut groups: Vec<Vec<usize>> = Vec::new();
-            let mut group: Vec<usize> = Vec::new();
-            let mut rows = 0usize;
-            for (i, item) in items.iter().enumerate() {
-                let tl = item.1.len();
-                if rows + tl > cap && !group.is_empty() {
-                    groups.push(std::mem::take(&mut group));
-                    rows = 0;
+            let (mut job, prompts) = self.mm_group_plan(cold, cap)?;
+            while !job.groups.is_empty() {
+                for (j, logits) in self.mm_group_unit(&mut job, &prompts)? {
+                    out[orig[j]] = Some((logits, job.items[j].1.len()));
                 }
-                // an oversized single request just runs as its own pass (same
-                // kernels as the solo path; no serial special case needed)
-                group.push(i);
-                rows += tl;
-            }
-            if !group.is_empty() {
-                groups.push(group);
-            }
-            let mut lout: Vec<Vec<f32>> = vec![Vec::new(); items.len()];
-            for group in &groups {
-                // the group's pictures, one batched tower call across its
-                // requests, borrowed for this pass only
-                let want: Vec<(&[u8], usize, usize)> = group
-                    .iter()
-                    .flat_map(|&j| {
-                        prompts[j].iter().filter_map(|c| match c {
-                            crate::service::MmChunk::Image { rgb, w, h } => {
-                                Some((rgb.as_slice(), *w, *h))
-                            }
-                            _ => None,
-                        })
-                    })
-                    .collect();
-                let mut got = self.encode_pictures(&want)?.into_iter();
-                for &j in group {
-                    let n = ctxs[j].splices.len();
-                    ctxs[j].images = got.by_ref().take(n).collect();
-                }
-                self.prefill_batch_pass(&items, group, &mut lout, Some(&ctxs))?;
-                for &j in group {
-                    ctxs[j].images.clear();
-                }
-            }
-            for (j, l) in lout.into_iter().enumerate() {
-                out[orig[j]] = Some((l, items[j].1.len()));
             }
         }
         Ok(out
@@ -1571,7 +1487,7 @@ impl GpuQwen35 {
     /// rather than a cheaper approximation - a router that disagrees with the
     /// thing it routes to is worse than no router. `match_full` only reads and
     /// touches LRU, so asking twice costs a tree walk.
-    fn mm_prefix_would_resume(
+    pub(super) fn mm_prefix_would_resume(
         &mut self,
         chunks: &[crate::service::MmChunk],
         grids: &[(usize, usize)],
@@ -1794,7 +1710,7 @@ impl GpuQwen35 {
         Ok(())
     }
 
-    fn prefill_batch_pass(
+    pub(super) fn prefill_batch_pass(
         &mut self,
         items: &[(usize, Vec<u32>)],
         group: &[usize],

@@ -7518,7 +7518,387 @@ pub struct KernelTableV1 {
     /// Slot 696: `pd_q4x_qsa_attn_mma_paged` - [`Self::q4x_qsa_attn_mma`]
     /// over the pool.
     pub q4x_qsa_attn_mma_paged: Option<Q4xQsaAttnPagedFn>,
+    /// Slot 697: `pd_q4x_ple_rows` - decode n-gram rows the host staged raw
+    /// off the table's mapping, `[rows, row_bytes]` -> `[rows, width]` f32.
+    pub q4x_ple_rows: Option<Q4xPleRowsFn>,
+    /// Slots 698-708: Kumo-Tabular at F32 (`kumo.cuh`). 698 `pd_kumo_gemm`:
+    /// `y = epi(x w^T + bias)` over batched problems, 3xTF32 with a
+    /// round-nearest accumulator per 32-deep k tile; epilogue 0 store,
+    /// 1 GELU, 2 accumulate into y, 3 split n at N/2 into y | y2.
+    pub kumo_gemm: Option<KumoGemmFn>,
+    /// Slot 699: `pd_kumo_norm` - RMSNorm (F32 epsilon) of gathered rows, or
+    /// of `a[row % period] + b[row]` with the sum kept in `res`.
+    pub kumo_norm: Option<KumoNormFn>,
+    /// Slot 700: `pd_kumo_heads` - per-head split-half rope (optional) and
+    /// weightless RMSNorm, eps 1e-6.
+    pub kumo_heads: Option<KumoHeadsFn>,
+    /// Slot 701: `pd_kumo_scale` - `q * log(max(klen, 1)) * head_scale`,
+    /// times `1 + tanh(gate)` when a gate plane is given.
+    pub kumo_scale: Option<KumoScaleFn>,
+    /// Slot 702: `pd_kumo_attention` - online softmax attention over fixed
+    /// 64-key chunks, Test-GQA head map per launch.
+    pub kumo_attention: Option<KumoAttentionFn>,
+    /// Slot 703: `pd_kumo_fourier` - the cell Fourier features `[C][R][192]`.
+    pub kumo_fourier: Option<KumoFourierFn>,
+    /// Slot 704: `pd_kumo_cell_weights` - each column's `[D][192]` projection.
+    pub kumo_cell_weights: Option<KumoCellWeightsFn>,
+    /// Slot 705: `pd_kumo_cell_bias` - group biases, missing-cell and context
+    /// label terms onto the projected cells.
+    pub kumo_cell_bias: Option<KumoCellBiasFn>,
+    /// Slot 706: `pd_kumo_rows` - pack (0) / unpack (1) the row axis.
+    pub kumo_rows: Option<KumoRowsFn>,
+    /// Slot 707: `pd_kumo_labels` - the ICL label embedding onto context rows.
+    pub kumo_labels: Option<KumoLabelsFn>,
+    /// Slot 708: `pd_kumo_copy` - strided / broadcast row copy.
+    pub kumo_copy: Option<KumoCopyFn>,
+    /// Slot 709: `pd_kumo_stats` - the RMSNorm statistic alone, `inv[row]`,
+    /// optionally after the residual add (kept in `res`).
+    pub kumo_stats: Option<KumoStatsFn>,
+    /// Slot 710: `pd_kumo_gemm_fused` - [`Self::kumo_gemm`] (batch 1) with the
+    /// RMSNorm applied to the staged A rows (optionally gathered) and the
+    /// per-head rope (from a [`Self::kumo_rope_table`] table) / norm / log
+    /// scaling on the output, bit-identical to the separate passes.
+    pub kumo_gemm_fused: Option<KumoGemmFusedFn>,
+    /// Slot 711: `pd_kumo_qgate` - the gated log query scaling in one pass,
+    /// in place, the gate MLP on the GEMM's exact sequence.
+    pub kumo_qgate: Option<KumoQgateFn>,
+    /// Slot 712: `pd_kumo_rows_stats` - [`Self::kumo_rows`] emitting the
+    /// statistic of every row it lands.
+    pub kumo_rows_stats: Option<KumoRowsStatsFn>,
+    /// Slot 713: `pd_kumo_rope_table` - the rope's (cos, sin) pairs for
+    /// positions `0..seq` of one inv_freq vector, the heads kernel's own
+    /// evaluation.
+    pub kumo_rope_table: Option<KumoRopeTableFn>,
+    /// Slot 714: `pd_kumo_fourier_m` - [`Self::kumo_fourier`] over an
+    /// ensemble's members in one pass (rows stacked member-major, `rpm` rows
+    /// a member; means and categorical flags per member).
+    pub kumo_fourier_m: Option<KumoFourierMFn>,
+    /// Slot 715: `pd_kumo_cell_weights_m` - [`Self::kumo_cell_weights`] per
+    /// (column, member).
+    pub kumo_cell_weights_m: Option<KumoCellWeightsMFn>,
+    /// Slot 716: `pd_kumo_cell_bias_m` - [`Self::kumo_cell_bias`] over stacked
+    /// members, labels per member.
+    pub kumo_cell_bias_m: Option<KumoCellBiasMFn>,
+    /// Slot 717: `pd_kumo_labels_m` - [`Self::kumo_labels`] per member block.
+    pub kumo_labels_m: Option<KumoLabelsMFn>,
 }
+
+/// `(a, b, res, inv, D, rows, period, stream)` - see
+/// [`KernelTableV1::kumo_stats`].
+pub type KumoStatsFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(x, w, bias, y, y2, K, N, M, mode, ainv, aw, alen, astride, hd, seq, rope,
+/// hs, klen, stream)` - see [`KernelTableV1::kumo_gemm_fused`].
+pub type KumoGemmFusedFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(q, g0w, g0b, g2w, g2b, head_scale, vecs, hd, H, klen, stream)` - see
+/// [`KernelTableV1::kumo_qgate`].
+pub type KumoQgateFn = unsafe extern "C" fn(
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(x, means, cat, num_freq, cat_freq, out, R, C, rpm, stream)` - see
+/// [`KernelTableV1::kumo_fourier_m`].
+pub type KumoFourierMFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(cat, nw, cw, out, C, D, E, stream)` - see
+/// [`KernelTableV1::kumo_cell_weights_m`].
+pub type KumoCellWeightsMFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(out, x, cat, nb, cb, missing, target, y, R, C, D, nc, cls, rpm, stream)` -
+/// see [`KernelTableV1::kumo_cell_bias_m`].
+pub type KumoCellBiasMFn = unsafe extern "C" fn(
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(x, y, target, D, nc, cls, rpm, E, stream)` - see
+/// [`KernelTableV1::kumo_labels_m`].
+pub type KumoLabelsMFn = unsafe extern "C" fn(
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(freq, table, half, seq, stream)` - see
+/// [`KernelTableV1::kumo_rope_table`].
+pub type KumoRopeTableFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(cells, cls, rows, inv, R, C, D, dir, stream)` - see
+/// [`KernelTableV1::kumo_rows_stats`].
+pub type KumoRowsStatsFn = unsafe extern "C" fn(
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(x, w, bias, y, y2, K, N, M, mode, batch, x_bs, w_bs, y_bs, stream)` -
+/// see [`KernelTableV1::kumo_gemm`].
+pub type KumoGemmFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u64,
+    u64,
+    u64,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(a, b, w, res, y, D, rows, len, stride, period, stream)` - see
+/// [`KernelTableV1::kumo_norm`].
+pub type KumoNormFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(x, freq, y, H, hd, seq, vecs, rope, stream)` - see
+/// [`KernelTableV1::kumo_heads`].
+pub type KumoHeadsFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(q, head_scale, gate, n, hd, H, klen, stream)` - see
+/// [`KernelTableV1::kumo_scale`].
+pub type KumoScaleFn = unsafe extern "C" fn(
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u64,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(q, k, v, out, H, hd, batch, qlen, klen, kvh, q_brows, qkvh, q0, qcount,
+/// stream)` - see [`KernelTableV1::kumo_attention`].
+pub type KumoAttentionFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(x, means, cat, num_freq, cat_freq, out, R, C, stream)` - see
+/// [`KernelTableV1::kumo_fourier`].
+pub type KumoFourierFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(cat, nw, cw, out, C, D, stream)` - see
+/// [`KernelTableV1::kumo_cell_weights`].
+pub type KumoCellWeightsFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(out, x, cat, nb, cb, missing, target, y, R, C, D, nc, cls, stream)` -
+/// see [`KernelTableV1::kumo_cell_bias`].
+pub type KumoCellBiasFn = unsafe extern "C" fn(
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(cells, cls, rows, R, C, D, dir, stream)` - see
+/// [`KernelTableV1::kumo_rows`].
+pub type KumoRowsFn = unsafe extern "C" fn(
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(x, y, target, D, nc, cls, stream)` - see
+/// [`KernelTableV1::kumo_labels`].
+pub type KumoLabelsFn = unsafe extern "C" fn(
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(src, dst, rows, width, src_stride, dst_stride, period, stream)` - see
+/// [`KernelTableV1::kumo_copy`].
+pub type KumoCopyFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u64,
+    u64,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(raw, out, fmt, scale, rows, width, row_bytes, stream)` - see
+/// [`KernelTableV1::q4x_ple_rows`]; `fmt` is the pack's row-format code.
+pub type Q4xPleRowsFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    f32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
 
 /// `(q, pool_k, pool_v, sinks, out, positions, slots, block_tables,
 /// blocks_per_slot, tile_row0, tile_slot, n_qtiles, n_heads, n_kv_heads,
@@ -8676,7 +9056,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 682;
+pub const KERNEL_TABLE_SLOTS: usize = 703;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,

@@ -12,7 +12,7 @@ mod common;
 use paddock_engine::gpu_model::qwen4exp::{MixerW, load_layer, load_ple_projections};
 use paddock_models::modelopt::nvfp4_view;
 use paddock_models::qwen4exp::{Qwen4ExpBlock, Qwen4ExpConfig};
-use paddock_models::safetensors::ShardedSafetensors;
+use paddock_models::safetensors::{ShardedSafetensors, StDtype};
 
 fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
@@ -21,6 +21,47 @@ fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
         .iter()
         .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
         .collect()
+}
+
+/// The exact f32 value of a checkpoint plane the engine widens on the host:
+/// bf16 as shipped, or MXFP8 - OCP e4m3 (bias 7, 0x7F/0xFF NaN, exponent 0
+/// subnormal) times its block's ue8m0 scale (2^(b-127), 0xFF NaN), one scale
+/// per 32 values. Written from the spec here rather than borrowed from the
+/// loader, so the gate is an oracle and not the loader checking itself.
+fn exact_f32(st: &ShardedSafetensors, name: &str) -> Vec<f32> {
+    let (t, bytes) = st.bytes(name).unwrap_or_else(|| panic!("{name}: missing"));
+    match t.dtype {
+        StDtype::Bf16 => bf16_to_f32(bytes),
+        StDtype::F8E4m3 => {
+            let (_, sb) = st
+                .bytes(&format!("{name}_scale"))
+                .unwrap_or_else(|| panic!("{name}_scale: missing"));
+            let e4m3 = |b: u8| -> f32 {
+                let (sign, exp, man) = (b >> 7, (b >> 3) & 0x0F, b & 0x07);
+                let mag = if exp == 0x0F && man == 7 {
+                    f32::NAN
+                } else if exp == 0 {
+                    man as f32 / 8.0 * 2f32.powi(-6)
+                } else {
+                    (1.0 + man as f32 / 8.0) * 2f32.powi(exp as i32 - 7)
+                };
+                if sign == 1 { -mag } else { mag }
+            };
+            let ue8m0 = |b: u8| {
+                if b == 0xFF {
+                    f32::NAN
+                } else {
+                    2f32.powi(b as i32 - 127)
+                }
+            };
+            bytes
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| e4m3(b) * ue8m0(sb[i / 32]))
+                .collect()
+        }
+        other => panic!("{name}: no exact widen for {other:?}"),
+    }
 }
 
 #[test]
@@ -40,16 +81,37 @@ fn qwen4exp_layer_planes_round_trip() {
         let layer = load_layer(&exec, &st, &c, li).expect("layer loads");
         let p = format!("model.language_model.layers.{li}");
 
-        // one representative bf16 plane per mixer kind: device bytes must be
-        // identical to the checkpoint's
+        // one representative dense plane per mixer kind: device bytes must be
+        // identical to the checkpoint's, in whichever class the file ships -
+        // bf16 (NVIDIA's export) or MXFP8, whose e4m3 payload and ue8m0
+        // `weight_scale` both upload unconverted (the distilled MX export)
         let (name, plane) = match &layer.mixer {
             MixerW::Gdn(g) => (format!("{p}.linear_attn.in_proj_qkv.weight"), &g.qkv),
             MixerW::Attn(a) => (format!("{p}.self_attn.q_proj.weight"), &a.q),
         };
         let (_, want) = st.bytes(&name).expect("checkpoint bytes");
-        let raw = plane.raw_bf16().expect("parity class is bf16-resident");
-        let got: Vec<u8> = exec.to_host_range_u8(raw, 0, want.len()).expect("dtoh");
-        assert!(got == want, "{name}: device bytes differ from checkpoint");
+        if let Some(raw) = plane.raw_bf16() {
+            let got: Vec<u8> = exec.to_host_range_u8(raw, 0, want.len()).expect("dtoh");
+            assert!(got == want, "{name}: device bytes differ from checkpoint");
+        } else if let Some((data, scale)) = plane.raw_mxf8() {
+            let got: Vec<u8> = exec.to_host_range_u8(data, 0, want.len()).expect("dtoh");
+            assert!(
+                got == want,
+                "{name}: device payload differs from checkpoint"
+            );
+            let scale_name = format!("{name}_scale");
+            let (_, want_s) = st.bytes(&scale_name).expect("checkpoint scale bytes");
+            let got_s: Vec<u8> = exec.to_host_range_u8(scale, 0, want_s.len()).expect("dtoh");
+            assert!(
+                got_s == want_s,
+                "{scale_name}: device bytes differ from checkpoint"
+            );
+        } else {
+            panic!(
+                "{name}: class {} holds a re-encoding - no byte oracle applies",
+                plane.class()
+            );
+        }
 
         // the LAUNCH FOLD is a byte concatenation and nothing more: the hc
         // plane's first `lowrank` rows must be the checkpoint's down plane and
@@ -90,24 +152,19 @@ fn qwen4exp_layer_planes_round_trip() {
 
         // the GDN a||b fold, same claim
         if let MixerW::Gdn(g) = &layer.mixer {
-            let (_, a_want) = st
-                .bytes(&format!("{p}.linear_attn.in_proj_a.weight"))
-                .expect("a bytes");
-            let (_, b_want) = st
-                .bytes(&format!("{p}.linear_attn.in_proj_b.weight"))
-                .expect("b bytes");
+            // exact in either class the file ships (bf16, or MXFP8 widened)
+            let a_want = exact_f32(&st, &format!("{p}.linear_attn.in_proj_a.weight"));
+            let b_want = exact_f32(&st, &format!("{p}.linear_attn.in_proj_b.weight"));
             let ab: Vec<f32> = exec.to_host(&g.ab.buf).expect("dtoh");
             let hv = c.gdn_v_heads * c.hidden;
             assert_eq!(ab.len(), 2 * hv, "a||b plane width");
-            assert_eq!(ab[..hv], bf16_to_f32(a_want)[..], "a half of the fold");
-            assert_eq!(ab[hv..], bf16_to_f32(b_want)[..], "b half of the fold");
+            assert_eq!(ab[..hv], a_want[..], "a half of the fold");
+            assert_eq!(ab[hv..], b_want[..], "b half of the fold");
         }
 
         // the router||shared-gate fold: last row is the shared expert's gate
         let router: Vec<f32> = exec.to_host(&layer.moe.router.buf).expect("dtoh");
-        let (_, sg_want) = st
-            .bytes(&format!("{p}.mlp.shared_expert_gate.weight"))
-            .expect("shared gate bytes");
+        let sg_want = exact_f32(&st, &format!("{p}.mlp.shared_expert_gate.weight"));
         assert_eq!(
             router.len(),
             (c.n_expert + 1) * c.hidden,
@@ -115,16 +172,14 @@ fn qwen4exp_layer_planes_round_trip() {
         );
         assert_eq!(
             router[c.n_expert * c.hidden..],
-            bf16_to_f32(sg_want)[..],
+            sg_want[..],
             "router plane's last row is not the shared-expert gate"
         );
 
         // hyper-connection norm: exact f32 widen
-        let (_, nb) = st
-            .bytes(&format!("{p}.attn_hyper_connection.hc_norm.weight"))
-            .unwrap();
+        let nb = exact_f32(&st, &format!("{p}.attn_hyper_connection.hc_norm.weight"));
         let got_n: Vec<f32> = exec.to_host(&layer.attn_hc.norm.buf).expect("dtoh");
-        assert_eq!(got_n, bf16_to_f32(nb), "{p} hc_norm widen not exact");
+        assert_eq!(got_n, nb, "{p} hc_norm widen not exact");
 
         // MoE gate plane: concatenated nibbles equal per-expert checkpoint
         // views at both ends of the expert range; scale2 array matches

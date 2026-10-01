@@ -14,6 +14,9 @@ use serde_json::{Value, json};
 
 use crate::routes::AppState;
 
+#[path = "api_table_history.rs"]
+mod table_history;
+
 fn err500(e: impl std::fmt::Display) -> Response {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -28,6 +31,7 @@ fn errx(status: StatusCode, kind: &str, msg: impl std::fmt::Display) -> Response
 
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
+        .merge(table_history::routes())
         .route("/api/conversations", get(list_conversations))
         .route(
             "/api/conversations/{id}",

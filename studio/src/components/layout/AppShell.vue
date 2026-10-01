@@ -151,7 +151,7 @@ router.beforeEach((to) => {
 // scrollable content area.
 // full-bleed pages: the chat, and Reads - both a history list beside a
 // workspace that scrolls on its own
-const isChat = computed(() => ['chat', 'chat-new', 'home', 'reads'].includes(String(route.name)))
+const isChat = computed(() => ['chat', 'chat-new', 'home', 'reads', 'tables'].includes(String(route.name)))
 </script>
 
 <template>

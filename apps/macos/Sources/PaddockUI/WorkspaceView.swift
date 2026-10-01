@@ -72,7 +72,9 @@ public struct WorkspaceView: View {
               width: Binding(get: { width }, set: { navigation.panelWidth = $0 }),
               range: WorkspacePanelMetrics.limits(navigation.mode).lowerBound...maximum,
               label: navigation.mode == .studio
-                ? (navigation.showsReadsHistory ? "Resize reads panel" : "Resize chats panel")
+                ? (navigation.showsReadsHistory
+                  ? "Resize reads panel"
+                  : navigation.studio == .tables ? "Resize tables panel" : "Resize chats panel")
                 : "Resize Settings panel"
             ).id(navigation.mode)
           }
@@ -192,6 +194,10 @@ public struct WorkspaceView: View {
       NativeReadsView(model: model.reads, showsHistorySidebar: navigation.showsSidebar) {
         navigation.showManager(.runners)
       }
+    case .tables:
+      NativeTablesView(model: model.tables) {
+        navigation.showModelLibrary(purpose: .tables)
+      }
     case .settings:
       StudioPreferencesView(model: model.studioPreferences, busy: model.chat.busy, chat: model.chat)
     }
@@ -287,6 +293,8 @@ public struct WorkspaceView: View {
       VStack(spacing: 0) {
         if navigation.showsReadsHistory {
           NativeReadsSidebar(model: model.reads)
+        } else if navigation.studio == .tables {
+          NativeTablesSidebar(model: model.tables)
         } else {
           StudioConversationSidebar(
             chat: model.chat, hasDraft: draft.hasContent, onNewChat: newChat,

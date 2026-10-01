@@ -24,6 +24,21 @@ thread_local! {
     pub(super) static JOINED_SLAB_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static JOINED_ROW_GROUP_FOR_TEST: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     pub(super) static PACKED_WIDE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    pub(super) static ROW_REUSE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Reuse unpacked weights without starving small projections of independent
+/// threadgroups. Physical rows select reuse, never the contraction arithmetic:
+/// the caller must first elect the wide contract from the logical prompt.
+pub(super) fn wide_row_group(rows: usize, columns: usize) -> usize {
+    let groups = columns.div_ceil(8);
+    if (rows / 4) * groups >= 128 {
+        4
+    } else if (rows / 2) * groups >= 128 {
+        2
+    } else {
+        1
+    }
 }
 
 /// Valid only within an explicit group of projections of the same immutable
@@ -590,6 +605,15 @@ fn project_span_reusing(
     let packed_wide = cmd.tensor_accelerated();
     #[cfg(test)]
     let packed_wide = packed_wide && PACKED_WIDE_FOR_TEST.with(|v| v.get());
+    #[cfg(test)]
+    let row_reuse = ROW_REUSE_FOR_TEST.with(|v| v.get());
+    #[cfg(not(test))]
+    let row_reuse = true;
+    let wide_rows = if wide && packed_wide && row_reuse {
+        wide_row_group(rows, w.n)
+    } else {
+        1
+    };
     // Test-binary-only arithmetic bisect. No runner setting or production
     // branch: isolate compiler specialization from the prefill graph.
     #[cfg(test)]
@@ -824,9 +848,13 @@ fn project_span_reusing(
         } else if tile {
             "q4a_mm"
         } else if wide {
-            match (packed_wide, bits) {
-                (true, 4) => "q4a_wide4_packed",
-                (true, 8) => "q4a_wide8_packed",
+            match (packed_wide, bits, wide_rows) {
+                (true, 4, 4) => "q4a_wide4_rows4",
+                (true, 8, 4) => "q4a_wide8_rows4",
+                (true, 4, 2) => "q4a_wide4_rows2",
+                (true, 8, 2) => "q4a_wide8_rows2",
+                (true, 4, _) => "q4a_wide4_packed",
+                (true, 8, _) => "q4a_wide8_packed",
                 _ => "q4a_wide",
             }
         } else if narrow {
@@ -865,7 +893,7 @@ fn project_span_reusing(
             } else {
                 16
             }),
-            rows.div_ceil(if tile { 32 } else { 1 }),
+            rows.div_ceil(if tile { 32 } else { wide_rows }),
             1,
         ],
         if wide || half_group { 64 } else { 128 },

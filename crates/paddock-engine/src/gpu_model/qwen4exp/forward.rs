@@ -37,14 +37,15 @@ use crate::gpu::{DeviceTensor, ExpertCache, GpuExecutor, KvDtype, QuantTensor};
 use crate::gpu_model::gpt_oss::GpuModelError;
 use crate::gpu_model::prefix_cache::BLOCK_TOKENS;
 use crate::gpu_model::st_load::bf16_bytes;
-use paddock_kernels::reference::qwen4exp as rq;
 use paddock_models::ggml_type::GgmlType;
 use paddock_models::mapped::{MapAccess, MappedGguf};
 use paddock_models::qwen4exp::{Qwen4ExpBlock, Qwen4ExpConfig};
-use paddock_models::safetensors::{ShardedSafetensors, StDtype};
+use paddock_models::safetensors::ShardedSafetensors;
 
 use super::load::{dense_head, hc_weights, load_layer, load_ple_projections, load_ple_table};
 use super::{DensePlane, DenseStage, Embed, ExpertSeats, HcW, KqSeat, MixerW, PleW, Qwen4ExpLayer};
+pub(super) use ple::ple_row_bytes;
+use ple::{ple_device_table, warm_ple_table};
 
 /// Attention KV element type. f16 is the narrowest class the pack's attention
 /// lanes take (there is no f32 KV kernel); the rival stores BF16, which carries
@@ -173,6 +174,12 @@ thread_local! {
     static PHASE_MS: std::cell::RefCell<Option<PhaseMs>> = const { std::cell::RefCell::new(None) };
 }
 
+/// `PADDOCK_Q4X_PHASE_MS`: the prefill phase profile, and the host lane's
+/// PLE staging line (forward/ple.rs).
+fn phase_ms_on() -> bool {
+    std::env::var_os("PADDOCK_Q4X_PHASE_MS").is_some()
+}
+
 /// Lap the armed walk timer, if any (inert when `PADDOCK_Q4X_PHASE_MS` is not
 /// set or the walk is a decode - see `PhaseMs::arm`).
 pub(crate) fn pm_lap(e: &GpuExecutor, tag: &'static str) {
@@ -191,7 +198,7 @@ impl PhaseMs {
             // a decode tick measurable here (its absolute numbers carry the
             // eager-launch cost the graph exists to remove - read the SHARES).
             on: (matches!(phase, Phase::Prefill | Phase::PrefillRuns) || !capture_wanted())
-                && std::env::var_os("PADDOCK_Q4X_PHASE_MS").is_some(),
+                && phase_ms_on(),
             t: std::time::Instant::now(),
             acc: Vec::new(),
         }
@@ -358,89 +365,6 @@ pub enum PleSource {
     },
 }
 
-/// Bytes one `width`-wide row occupies in the host row decoder's types.
-/// `None` for a type it does not decode.
-pub(super) fn ple_row_bytes(ty: GgmlType, width: usize) -> Option<usize> {
-    let blocks32 = |bytes: usize| width.is_multiple_of(32).then_some(width / 32 * bytes);
-    match ty {
-        GgmlType::F32 => Some(width * 4),
-        GgmlType::F16 | GgmlType::Bf16 => Some(width * 2),
-        GgmlType::Q8_0 => blocks32(34),
-        GgmlType::Q4_0 | GgmlType::Iq4Nl => blocks32(18),
-        _ => None,
-    }
-}
-
-/// The IQ4_NL codebook (ggml-common.h, MIT).
-const KVALUES_IQ4NL: [i8; 16] = [
-    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
-];
-
-/// Decode one table row (`row.len() == ple_row_bytes(ty, out.len())`).
-fn ple_row_dequant(ty: GgmlType, row: &[u8], out: &mut [f32]) {
-    match ty {
-        GgmlType::F32 => {
-            for (o, c) in out.iter_mut().zip(row.as_chunks::<4>().0) {
-                *o = f32::from_le_bytes(*c);
-            }
-        }
-        GgmlType::F16 => {
-            for (o, c) in out.iter_mut().zip(row.as_chunks::<2>().0) {
-                *o = half::f16::from_le_bytes(*c).to_f32();
-            }
-        }
-        GgmlType::Bf16 => {
-            for (o, c) in out.iter_mut().zip(row.as_chunks::<2>().0) {
-                *o = f32::from_bits((u16::from_le_bytes(*c) as u32) << 16);
-            }
-        }
-        GgmlType::Q8_0 => {
-            for (blk, o) in row
-                .as_chunks::<34>()
-                .0
-                .iter()
-                .zip(out.as_chunks_mut::<32>().0.iter_mut())
-            {
-                let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
-                for j in 0..32 {
-                    o[j] = (blk[2 + j] as i8) as f32 * d;
-                }
-            }
-        }
-        GgmlType::Q4_0 => {
-            for (blk, o) in row
-                .as_chunks::<18>()
-                .0
-                .iter()
-                .zip(out.as_chunks_mut::<32>().0.iter_mut())
-            {
-                let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
-                for j in 0..16 {
-                    let q = blk[2 + j];
-                    o[j] = ((q & 0xf) as i32 - 8) as f32 * d;
-                    o[j + 16] = ((q >> 4) as i32 - 8) as f32 * d;
-                }
-            }
-        }
-        GgmlType::Iq4Nl => {
-            for (blk, o) in row
-                .as_chunks::<18>()
-                .0
-                .iter()
-                .zip(out.as_chunks_mut::<32>().0.iter_mut())
-            {
-                let d = half::f16::from_le_bytes([blk[0], blk[1]]).to_f32();
-                for j in 0..16 {
-                    let q = blk[2 + j];
-                    o[j] = KVALUES_IQ4NL[(q & 0xf) as usize] as f32 * d;
-                    o[j + 16] = KVALUES_IQ4NL[(q >> 4) as usize] as f32 * d;
-                }
-            }
-        }
-        _ => unreachable!("ple_row_bytes gated the type"),
-    }
-}
-
 pub struct Qwen4ExpGpu {
     exec: Arc<GpuExecutor>,
     cfg: Qwen4ExpConfig,
@@ -453,6 +377,15 @@ pub struct Qwen4ExpGpu {
     /// is far under the download size.
     weights_bytes: Option<u64>,
     st: PleSource,
+    /// per layer: the host lane's view of its PLE table (None on the device
+    /// lane, and on layers without a table)
+    ple_host: Vec<Option<ple::PleHostTable>>,
+    /// the host lane's raw rows as staged, and their device plane (slot 697)
+    ple_stage: Vec<u8>,
+    ple_raw: CudaSlice<u8>,
+    /// decode the staged rows on the host (`set_ple_host_decode`, a gate
+    /// instrument; slot 697 serves)
+    ple_host_decode: bool,
     layers: Vec<Qwen4ExpLayer>,
     embed: Embed,
     lm_head: DensePlane,
@@ -717,13 +650,12 @@ struct Scratch {
     /// n * (k+1) * hidden floats, so a 128-token prefill overran it 4x and
     /// took the serve down with CUDA_ERROR_ILLEGAL_ADDRESS.
     ///
-    /// BOUNDED, not full-width: at max_tokens 4096 a full-width plane is 461
-    /// MB out of the same headroom the KV pool sizes from, for an arm that
-    /// only engages on prefill. Sized to `NVF4_BS_MAX_ROWS` tokens instead,
-    /// and the dispatch checks this length before electing - so a wave wider
-    /// than the plane keeps the GEMV, correctly and quietly, instead of
-    /// scribbling. Proper token-chunking (nemotron's shape) would lift that
-    /// ceiling; it needs token offsets on four shared wrappers.
+    /// Sized to a whole walk (up to `NVF4_BS_MAX_ROWS`), 461 MB at 4096 rows
+    /// out of the headroom the KV pool sizes from: the pair then reads every
+    /// expert once per walk. A walk wider than the plane runs the pair in
+    /// token sub-waves of its width (the `_at` twins of the four wrappers read
+    /// one token range and land its partials here), and the dispatch reads the
+    /// wave width off this length.
     d_nvf4_part: CudaSlice<f32>,
     d_srow32: CudaSlice<u32>,
     d_sslot32: CudaSlice<u32>,
@@ -1122,7 +1054,7 @@ impl Qwen4ExpGpu {
         exec: &Arc<GpuExecutor>,
         cfg: Qwen4ExpConfig,
         st: PleSource,
-        layers: Vec<Qwen4ExpLayer>,
+        mut layers: Vec<Qwen4ExpLayer>,
         embed: Embed,
         lm_head: DensePlane,
         final_mix: HcW,
@@ -1187,6 +1119,34 @@ impl Qwen4ExpGpu {
         let weights_bytes = exec.settled_mem_used();
         let walk_rows = max_tokens.min(super::walk_rows());
         let mut sc = Scratch::new(exec, &cfg, walk_rows, max_tokens, slots, kq_lanes)?;
+        // the host lane's view of each PLE table it reads (see forward/ple.rs),
+        // and the staging plane of one walk's raw rows
+        let mut ple_host: Vec<Option<ple::PleHostTable>> = (0..cfg.n_layer).map(|_| None).collect();
+        for (li, layer) in layers.iter_mut().enumerate() {
+            let Some(p) = layer.ple.as_mut().filter(|p| p.table.is_none()) else {
+                continue;
+            };
+            let host = match &st {
+                PleSource::St(s) => ple::PleHostTable::of_st(s, &cfg, li)?,
+                PleSource::Gguf {
+                    map,
+                    name,
+                    ty,
+                    row_bytes,
+                } => {
+                    let (_, b) = map
+                        .tensor_bytes(name)
+                        .map_err(|e| GpuModelError::Unsupported(format!("{name}: {e}")))?;
+                    let width = cfg.ple_embed / cfg.ple_heads();
+                    ple::PleHostTable::of_gguf(name, *ty, *row_bytes, b.len() / row_bytes, width)?
+                }
+            };
+            // the bound the n-gram hash checks every row id against
+            p.table_rows = host.rows();
+            ple_host[li] = Some(host);
+        }
+        let raw_row = ple_host.iter().flatten().map(|h| h.row_bytes()).max();
+        let ple_raw = exec.alloc_u8((raw_row.unwrap_or(0) * walk_rows * cfg.ple_heads()).max(1))?;
         // the rebuild planes' norm prefixes: each mix's (1+w) weight, once
         if !sc.d_hcaux.is_empty() {
             let hw = cfg.hc_width();
@@ -1301,6 +1261,10 @@ impl Qwen4ExpGpu {
             cfg,
             weights_bytes,
             st,
+            ple_host,
+            ple_stage: Vec::new(),
+            ple_raw,
+            ple_host_decode: false,
             layers,
             embed,
             lm_head,
@@ -1479,28 +1443,7 @@ impl Qwen4ExpGpu {
         self.exec.upload_u32(&pos, &mut self.sc.d_pos)?;
         self.exec.upload_u32(&mrope, &mut self.sc.d_mrope)?;
         self.exec.upload_u32(&slots, &mut self.sc.d_slots)?;
-        for li in 0..self.cfg.n_layer {
-            if let Some(ple) = self.layers[li].ple.as_ref() {
-                match ple.table.as_ref() {
-                    Some(tab) => {
-                        let ids = ple_row_ids(&self.cfg, ple, &self.stream[slot], 2 + from, n)?;
-                        stage_ple_device(&self.exec, &self.cfg, ple, tab, &ids, &mut self.sc)?;
-                    }
-                    None => {
-                        let emb = gather_ple_rows(
-                            &self.st,
-                            &self.cfg,
-                            ple,
-                            li,
-                            &self.stream[slot],
-                            2 + from,
-                            n,
-                        )?;
-                        self.exec.upload_f32(&emb, &mut self.sc.d_emb)?;
-                    }
-                }
-            }
-        }
+        self.stage_ple(&[(slot, 2 + from, n)])?;
         self.cur_slots = vec![slot; n];
         self.walk_row0 = from;
         self.walk_qsa = self.qsa_for(to - 1);
@@ -1538,13 +1481,32 @@ impl Qwen4ExpGpu {
         Ok(())
     }
 
-    /// Attach the in-walk checkpoints a walk of `ids` wrote (`reserved`: cut,
-    /// checkpoint index - their staging blobs already committed into the
-    /// checkpoints' pages); a miss gives the index and its pages back.
-    fn attach_cuts(&mut self, ids: &[u32], reserved: &[(usize, u32)]) {
+    /// The walk about to start at `a` in `slot` takes checkpoint cuts inside
+    /// itself: name where an exact re-send can start it again
+    /// (`PrefixCache::walk_starts`), filing a checkpoint at `a` when the walk
+    /// before ended on a piece boundary rather than at the resume point or a
+    /// cut. The slot's state must be the state after `a`.
+    fn walk_origin(&mut self, slot: usize, ids: &[u32], a: usize) -> Result<(), GpuModelError> {
+        let Some(pc) = self.prefix.as_mut() else {
+            return Ok(());
+        };
+        if !pc.walk_starts(slot, a) {
+            self.prefix_cut(slot, ids, a)?;
+            if let Some(pc) = self.prefix.as_mut() {
+                pc.walk_starts(slot, a);
+            }
+        }
+        Ok(())
+    }
+
+    /// Attach the in-walk checkpoints a walk of `ids` in `slot` wrote
+    /// (`reserved`: cut, checkpoint index - their staging blobs already
+    /// committed into the checkpoints' pages); a miss gives the index and its
+    /// pages back.
+    fn attach_cuts(&mut self, slot: usize, ids: &[u32], reserved: &[(usize, u32)]) {
         if let Some(pc) = self.prefix.as_mut() {
             for &(c, idx) in reserved {
-                pc.attach_reserved(ids, c, idx, &mut self.pages);
+                pc.attach_reserved(slot, ids, c, idx, &mut self.pages);
             }
         }
     }
@@ -1757,10 +1719,11 @@ impl Qwen4ExpGpu {
     /// of it, so a resumed walk meets exactly the boundaries the cold walk
     /// did. Each walk seeds the MTP head with its own rows. `cuts` are the
     /// in-walk checkpoints (absolute position, reserved pool index): each
-    /// rides the walk it falls strictly inside; one landing ON a boundary is
-    /// the state that walk ends in - filed by a snapshot publish there, and
-    /// its reservation given back (removed from `cuts`). The last walk's
-    /// final-row logits are returned.
+    /// rides the walk it falls strictly inside, and that walk starts from a
+    /// state an exact re-send can start it from again (`walk_origin`); one
+    /// landing ON a boundary is the state that walk ends in - filed by a
+    /// snapshot publish there, and its reservation given back (removed from
+    /// `cuts`). The last walk's final-row logits are returned.
     fn walk_bounded(
         &mut self,
         slot: usize,
@@ -1778,6 +1741,9 @@ impl Qwen4ExpGpu {
                 .filter(|&&(c, _)| c > a && c < b)
                 .copied()
                 .collect();
+            if !inside.is_empty() {
+                self.walk_origin(slot, ids, a)?;
+            }
             self.walk_cuts = inside
                 .iter()
                 .enumerate()
@@ -1868,7 +1834,7 @@ impl Qwen4ExpGpu {
             };
             self.pos[slot] = n;
             self.prefix_publish(slot, ids, n, false)?;
-            self.attach_cuts(ids, &reserved);
+            self.attach_cuts(slot, ids, &reserved);
             self.reply_track_admit(slot);
             return Ok(logits);
         }
@@ -2257,7 +2223,6 @@ impl Qwen4ExpGpu {
 
     /// Stage one token per row, each against its own slot and position.
     fn stage_inputs_rows(&mut self, rows: &[(usize, u32)]) -> Result<(), GpuModelError> {
-        let n = rows.len();
         let reach: Vec<(usize, usize)> = rows.iter().map(|&(s, _)| (s, self.pos[s] + 1)).collect();
         self.back_rows(reach)?;
         let ids: Vec<u32> = rows.iter().map(|&(_, t)| t).collect();
@@ -2270,43 +2235,11 @@ impl Qwen4ExpGpu {
         self.exec.upload_u32(&pos, &mut self.sc.d_pos)?;
         self.exec.upload_u32(&mrope, &mut self.sc.d_mrope)?;
         self.exec.upload_u32(&slots, &mut self.sc.d_slots)?;
-        for li in 0..self.cfg.n_layer {
-            if let Some(ple) = self.layers[li].ple.as_ref() {
-                // each row hashes its own stream at its own position
-                match ple.table.as_ref() {
-                    Some(tab) => {
-                        let heads = self.cfg.ple_heads();
-                        let mut ids = Vec::with_capacity(n * heads);
-                        for &(sl, _) in rows {
-                            ids.extend_from_slice(&ple_row_ids(
-                                &self.cfg,
-                                ple,
-                                &self.stream[sl],
-                                self.pos[sl] + 2,
-                                1,
-                            )?);
-                        }
-                        stage_ple_device(&self.exec, &self.cfg, ple, tab, &ids, &mut self.sc)?;
-                    }
-                    None => {
-                        let mut emb = Vec::with_capacity(n * self.cfg.ple_embed);
-                        for &(sl, _) in rows {
-                            let one = gather_ple_rows(
-                                &self.st,
-                                &self.cfg,
-                                ple,
-                                li,
-                                &self.stream[sl],
-                                self.pos[sl] + 2,
-                                1,
-                            )?;
-                            emb.extend_from_slice(&one);
-                        }
-                        self.exec.upload_f32(&emb, &mut self.sc.d_emb)?;
-                    }
-                }
-            }
-        }
+        let ple_runs: Vec<(usize, usize, usize)> = rows
+            .iter()
+            .map(|&(sl, _)| (sl, self.pos[sl] + 2, 1))
+            .collect();
+        self.stage_ple(&ple_runs)?;
         Ok(())
     }
 
@@ -2538,41 +2471,9 @@ impl Qwen4ExpGpu {
             offs.push((last.off + last.len) as u32);
             self.exec.upload_u32(&offs, &mut self.sc.d_run_offs)?;
         }
-        for li in 0..self.cfg.n_layer {
-            if let Some(ple) = self.layers[li].ple.as_ref() {
-                match ple.table.as_ref() {
-                    Some(tab) => {
-                        let heads = self.cfg.ple_heads();
-                        let mut pids = Vec::with_capacity(n * heads);
-                        for r in runs {
-                            pids.extend_from_slice(&ple_row_ids(
-                                &self.cfg,
-                                ple,
-                                &self.stream[r.slot],
-                                2 + r.row0,
-                                r.len,
-                            )?);
-                        }
-                        stage_ple_device(&self.exec, &self.cfg, ple, tab, &pids, &mut self.sc)?;
-                    }
-                    None => {
-                        let mut emb = Vec::with_capacity(n * self.cfg.ple_embed);
-                        for r in runs {
-                            emb.extend_from_slice(&gather_ple_rows(
-                                &self.st,
-                                &self.cfg,
-                                ple,
-                                li,
-                                &self.stream[r.slot],
-                                2 + r.row0,
-                                r.len,
-                            )?);
-                        }
-                        self.exec.upload_f32(&emb, &mut self.sc.d_emb)?;
-                    }
-                }
-            }
-        }
+        let ple_runs: Vec<(usize, usize, usize)> =
+            runs.iter().map(|r| (r.slot, 2 + r.row0, r.len)).collect();
+        self.stage_ple(&ple_runs)?;
         Ok(())
     }
 
@@ -2820,28 +2721,7 @@ impl Qwen4ExpGpu {
         self.exec.upload_u32(&pos, &mut self.sc.d_pos)?;
         self.exec.upload_u32(&mrope, &mut self.sc.d_mrope)?;
         self.exec.upload_u32(&vec![0u32; n], &mut self.sc.d_slots)?;
-        for li in 0..self.cfg.n_layer {
-            if let Some(ple) = self.layers[li].ple.as_ref() {
-                match ple.table.as_ref() {
-                    Some(tab) => {
-                        let ids = ple_row_ids(&self.cfg, ple, &self.stream[0], base + 2, n)?;
-                        stage_ple_device(&self.exec, &self.cfg, ple, tab, &ids, &mut self.sc)?;
-                    }
-                    None => {
-                        let emb = gather_ple_rows(
-                            &self.st,
-                            &self.cfg,
-                            ple,
-                            li,
-                            &self.stream[0],
-                            base + 2,
-                            n,
-                        )?;
-                        self.exec.upload_f32(&emb, &mut self.sc.d_emb)?;
-                    }
-                }
-            }
-        }
+        self.stage_ple(&[(0, base + 2, n)])?;
         Ok(())
     }
 
@@ -4011,378 +3891,6 @@ fn ple_pass(
     e.add(&mut sc.d_h, &sc.d_pgv, n * hw)?;
     e.add(&mut sc.d_h, &sc.d_pconv, n * hw)?;
     Ok(())
-}
-
-/// The n-gram ids are a pure function of the token stream, so they are computed
-/// host-side and the 16 x 160 fp8 rows are gathered from the still-mapped
-/// shards and widened. Returns `[n, ple_embed]` f32.
-#[allow(clippy::too_many_arguments)]
-/// The n-gram row ids for `n` consecutive positions of one request's token
-/// stream, starting at stream index `first` - `[n, ple_heads]`, GLOBAL ids
-/// (each head's table offset already folded in).
-///
-/// Pure integer arithmetic on the token ids: it touches no table memory, which
-/// is exactly why the hash stays on the host while the GATHER moves to the
-/// device. `rq::ple_window`'s previous-EOS scan is O(i) per position, so the
-/// running cursor here is what keeps a long prefill linear.
-fn ple_row_ids(
-    c: &Qwen4ExpConfig,
-    ple: &PleW,
-    stream: &[i64],
-    first: usize,
-    n: usize,
-) -> Result<Vec<u32>, GpuModelError> {
-    let hpn = c.heads_per_ngram;
-    let heads = c.ple_heads();
-    let eos = c.bos_id as i64;
-    if first + n > stream.len() {
-        return Err(GpuModelError::Unsupported(format!(
-            "ple ids: {n} rows at {first} but the stream holds {}",
-            stream.len()
-        )));
-    }
-    let mut prev_eos: i64 = -1;
-    for (j, &t) in stream[..first].iter().enumerate() {
-        if t == eos {
-            prev_eos = j as i64;
-        }
-    }
-    let mut out = vec![0u32; n * heads];
-    for tk in 0..n {
-        let i = first + tk;
-        let pos_in_seg = i as i64 - prev_eos - 1;
-        // rq::ple_window: a token within `shift` of its segment start reads
-        // EOS instead of the real previous token
-        let mut w = [stream[i], eos, eos];
-        for (shift, slot) in [(1usize, 1usize), (2, 2)] {
-            if i >= shift && pos_in_seg >= shift as i64 {
-                w[slot] = stream[i - shift];
-            }
-        }
-        for ngram in 2..=c.ngram_size {
-            let mut mixed = w[0].wrapping_mul(ple.multipliers[0]);
-            for (wk, m) in w.iter().zip(&ple.multipliers).take(ngram).skip(1) {
-                mixed ^= wk.wrapping_mul(*m);
-            }
-            let start = (ngram - 2) * hpn;
-            for hh in 0..hpn {
-                let rid =
-                    mixed.rem_euclid(ple.head_vocab[start + hh]) + ple.head_offset[start + hh];
-                // a bad id would read anywhere in a 51.2 GB buffer, so it is
-                // checked rather than trusted
-                if rid < 0 || rid as usize >= ple.table_rows.max(1) {
-                    return Err(GpuModelError::Unsupported(format!(
-                        "ple row id {rid} outside the {}-row table",
-                        ple.table_rows
-                    )));
-                }
-                out[tk * heads + start + hh] = rid as u32;
-            }
-        }
-        if stream[i] == eos {
-            prev_eos = i as i64;
-        }
-    }
-    Ok(out)
-}
-
-/// Stage `n` PLE rows into `sc.d_emb` off the device table (slot 532).
-fn stage_ple_device(
-    exec: &Arc<GpuExecutor>,
-    c: &Qwen4ExpConfig,
-    ple: &PleW,
-    table: &CudaSlice<u8>,
-    ids: &[u32],
-    sc: &mut Scratch,
-) -> Result<(), GpuModelError> {
-    let heads = c.ple_heads();
-    let width = c.ple_embed / heads;
-    exec.upload_u32(ids, &mut sc.d_ple_ids)?;
-    exec.q4x_ple_gather(
-        table,
-        &sc.d_ple_ids,
-        &mut sc.d_emb,
-        ple.table_scale,
-        ids.len() / heads,
-        heads,
-        width,
-    )?;
-    Ok(())
-}
-
-/// Whether to make the 51.2 GB n-gram table device-resident. Refuses when
-/// the card cannot hold it on top of everything already loaded, so a smaller
-/// board still runs (slowly) rather than failing to load; `PADDOCK_Q4X_PLE_HOST`
-/// forces the host lane for A/Bs.
-/// Fault the host-lane PLE table into the page cache at LOAD, not during the
-/// first prompts.
-///
-/// The gather reads 16 rows a token out of a table that is 26.8 GiB on an
-/// MX-quantized export, so a cold mapping pays those as disk seeks on the
-/// critical path - a TTFT problem, not a throughput one, and the repo has met
-/// it before (`ple-table-page-cache-trap`, which the GGUF lane's baselines
-/// note handles by warming the shards by hand before every lane). Measured on
-/// Mia's export before this, 3 reps of one serve: 1486.8 -> 1312.5 -> 1168.1
-/// ms p50 latency, i.e. still warming on the third rep, with aiperf's
-/// end-to-end throughput climbing 24.35 -> 27.26 -> 28.24 underneath it.
-///
-/// Costs a one-off sequential read at load, which is the cheap way to buy it:
-/// the load is already disk-bound and the table is contiguous per shard. On
-/// an integrated die this is the whole table's residency plan - the mapping
-/// IS device memory there, so there is no second copy to make.
-fn warm_ple_table(st: &ShardedSafetensors, c: &Qwen4ExpConfig, li: usize) {
-    let emb = format!("model.language_model.layers.{li}.ple.ple_embedding");
-    let t0 = std::time::Instant::now();
-    let mut bytes = 0usize;
-    for sh in 0..c.ngram_split {
-        for suffix in ["weight", "weight_scale"] {
-            let name = format!("{emb}.ngram_embedding.shard_{sh}.{suffix}");
-            // a shard that has no scale plane is the FP8 table, not an error
-            if let Ok(n) = st.warm_tensor(&name) {
-                bytes += n;
-                // what the cache cannot keep faults back one row at a time:
-                // its page only, never the readahead window around it
-                let _ = st.advise_tensor(&name, MapAccess::Random, &[(0, n)]);
-            }
-        }
-    }
-    if bytes > 0 {
-        let s = t0.elapsed().as_secs_f64();
-        eprintln!(
-            "[q4x-ple] warmed {:.1} GiB of n-gram table in {s:.1}s ({:.0} MB/s)",
-            bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-            bytes as f64 / 1e6 / s.max(1e-9),
-        );
-    }
-}
-
-fn ple_device_table(exec: &Arc<GpuExecutor>, c: &Qwen4ExpConfig) -> bool {
-    if std::env::var("PADDOCK_Q4X_PLE_HOST").is_ok_and(|v| v != "0") {
-        eprintln!("[q4x-ple] HOST lane (PADDOCK_Q4X_PLE_HOST)");
-        return false;
-    }
-    if !exec.has_q4x_ple_gather() {
-        eprintln!("[q4x-ple] HOST lane: pack has no q4x_ple_gather (slot 532)");
-        return false;
-    }
-    // UNIFIED-MEMORY DIE: there is nothing to move. The table is already in
-    // DRAM as a file mapping, and on GB10/Jetson a "device" allocation is the
-    // same physical memory - so copying it in does not shorten a single read,
-    // it just holds 51.2 GB twice. The device table is a DISCRETE-card
-    // optimization: there the copy turns a PCIe round trip per gather into a
-    // local read, which is what bought the 891-48697 ms prefill ticks back.
-    //
-    // Taking it here is how NVIDIA's official NVFP4 checkpoint killed the box
-    // (2026-09-19): 79 GB of weights plus a 51.2 GB second copy of a table
-    // that was already resident, on a 121 GiB board. The GGUF lane has always
-    // host-mapped this table on this hardware and serves 29-34 tok/s doing it.
-    if exec.is_integrated() {
-        eprintln!(
-            "[q4x-ple] HOST lane: unified-memory die - the mapping IS device memory, \
-             a device copy would hold the table twice"
-        );
-        return false;
-    }
-    let want = (c.ngram_vocab_base as usize) * c.ple_heads() * (c.ple_embed / c.ple_heads());
-    let Ok((free, _)) = cudarc::driver::result::mem_get_info() else {
-        return true; // no honest number - let the allocation decide
-    };
-    // 4 GiB of slack: the table is the last big claim and the scratch planes
-    // below it still have to fit
-    const SLACK: usize = 4 << 30;
-    if want + SLACK > free {
-        eprintln!(
-            "[q4x-ple] HOST lane: table needs {:.1} GiB, {:.1} GiB free",
-            want as f64 / (1u64 << 30) as f64,
-            free as f64 / (1u64 << 30) as f64,
-        );
-        return false;
-    }
-    true
-}
-
-/// One row out of a `[rows, per_row]` plane. The n-gram table is read a row
-/// at a time (16 of ~10M per token), so this never materializes a shard.
-fn scb_slice(plane: &[u8], row: usize, per_row: usize) -> &[u8] {
-    &plane[row * per_row..(row + 1) * per_row]
-}
-
-fn gather_ple_rows(
-    src: &PleSource,
-    c: &Qwen4ExpConfig,
-    ple: &PleW,
-    li: usize,
-    stream: &[i64],
-    first: usize,
-    n: usize,
-) -> Result<Vec<f32>, GpuModelError> {
-    let st = match src {
-        PleSource::St(st) => st,
-        PleSource::Gguf {
-            map,
-            name,
-            ty,
-            row_bytes,
-        } => return gather_ple_rows_gguf(map, name, *ty, *row_bytes, c, ple, stream, first, n),
-    };
-    let width = c.ple_embed / c.ple_heads();
-    let emb_p = format!("model.language_model.layers.{li}.ple.ple_embedding");
-    // take the shard row split from shard 0's own shape, so a re-sharded
-    // checkpoint cannot silently read the wrong row
-    let rows_per_shard = {
-        let name = format!("{emb_p}.ngram_embedding.shard_0.weight");
-        let (t, _) = st
-            .bytes(&name)
-            .ok_or_else(|| GpuModelError::Unsupported(format!("{name}: missing")))?;
-        t.shape[0]
-    };
-    // the caller carries the 2-token EOS priming on the front of `stream`
-    // (vLLM's `ngram_context`), so a decode step hashes the same window a
-    // prefill of the whole sequence would have.
-    let eos = c.bos_id as i64;
-    let ids: Vec<Vec<i64>> = (0..n)
-        .map(|t| {
-            let w3 = rq::ple_window(stream, first + t, eos);
-            rq::ple_ngram_ids(
-                &w3,
-                &ple.multipliers,
-                &ple.head_vocab,
-                &ple.head_offset,
-                c.heads_per_ngram,
-            )
-        })
-        .collect();
-    // every row (and group-scale row) hinted before any is read - the page-in
-    // batching `gather_ple_rows_gguf` explains; a shard plane per hint call
-    {
-        let mut by_plane: std::collections::BTreeMap<String, Vec<(usize, usize)>> =
-            std::collections::BTreeMap::new();
-        for &rid in ids.iter().flatten() {
-            let rid = rid as usize;
-            let (sh, local) = (rid / rows_per_shard, rid % rows_per_shard);
-            let name = format!("{emb_p}.ngram_embedding.shard_{sh}.weight");
-            let packed = st.bytes(&name).is_some_and(|(t, _)| t.dtype == StDtype::U8);
-            let rb = if packed { width / 2 } else { width };
-            by_plane
-                .entry(name.clone())
-                .or_default()
-                .push((local * rb, rb));
-            if packed {
-                by_plane
-                    .entry(format!("{name}_scale"))
-                    .or_default()
-                    .push((local * (width / 16), width / 16));
-            }
-        }
-        for (name, ranges) in &by_plane {
-            let _ = st.advise_tensor(name, MapAccess::WillNeed, ranges);
-        }
-    }
-    let mut out = vec![0f32; n * c.ple_embed];
-    for (t, row_ids) in ids.iter().enumerate() {
-        for (hh, &rid) in row_ids.iter().enumerate() {
-            let rid = rid as usize;
-            let (sh, local) = (rid / rows_per_shard, rid % rows_per_shard);
-            let name = format!("{emb_p}.ngram_embedding.shard_{sh}.weight");
-            let (tinfo, sb) = st
-                .bytes(&name)
-                .ok_or_else(|| GpuModelError::Unsupported(format!("{name}: missing")))?;
-            let dst = t * c.ple_embed + hh * width;
-            match tinfo.dtype {
-                // FP8 table: e4m3 bytes, one scalar for the whole tensor
-                StDtype::F8E4m3 => {
-                    let row = &sb[local * width..(local + 1) * width];
-                    for (i, &byte) in row.iter().enumerate() {
-                        out[dst + i] = rq::e4m3_to_f32(byte) * ple.table_scale;
-                    }
-                }
-                // NVFP4 table: e2m1 nibbles with per-16 e4m3 group scales in a
-                // companion plane, times the tensor's global f32. Decoded
-                // through `Nvfp4View`, which is the same reference decode the
-                // expert seats validate against - low nibble is the even
-                // element, and the group scale is a second level, not a
-                // replacement for the global one.
-                StDtype::U8 => {
-                    let sname = format!("{name}_scale");
-                    let (st_i, scb) = st.bytes(&sname).ok_or_else(|| {
-                        GpuModelError::Unsupported(format!("{sname}: missing (NVFP4 table)"))
-                    })?;
-                    if st_i.dtype != StDtype::F8E4m3 {
-                        return Err(GpuModelError::Unsupported(format!(
-                            "{sname}: dtype {:?}, want F8E4m3 group scales",
-                            st_i.dtype
-                        )));
-                    }
-                    let view = paddock_models::modelopt::Nvfp4View {
-                        packed: scb_slice(sb, local, width / 2),
-                        scales: scb_slice(scb, local, width / 16),
-                        scale2: ple.table_scale,
-                        n: 1,
-                        k: width,
-                    };
-                    let vals = view.dequant_row_f32(0);
-                    out[dst..dst + width].copy_from_slice(&vals);
-                }
-                other => {
-                    return Err(GpuModelError::Unsupported(format!(
-                        "{name}: dtype {other:?}, want F8E4m3 (FP8 table) or U8 (NVFP4 table)"
-                    )));
-                }
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// The GGUF twin of `gather_ple_rows`: the same hashed row ids, rows read
-/// straight out of the mmapped table tensor and decoded per 32-wide block.
-#[allow(clippy::too_many_arguments)]
-fn gather_ple_rows_gguf(
-    map: &MappedGguf,
-    name: &str,
-    ty: GgmlType,
-    row_bytes: usize,
-    c: &Qwen4ExpConfig,
-    ple: &PleW,
-    stream: &[i64],
-    first: usize,
-    n: usize,
-) -> Result<Vec<f32>, GpuModelError> {
-    let (heads, width) = (c.ple_heads(), c.ple_embed / c.ple_heads());
-    let (_, table) = map
-        .tensor_bytes(name)
-        .map_err(|e| GpuModelError::Unsupported(format!("{name}: {e}")))?;
-    let rows = table.len() / row_bytes;
-    // Every row the walk reads, hinted before any of them is read. The table
-    // is tens of GB of hashed, effectively random rows (26.8 GiB IQ4_NL in
-    // the Flash-Next GGUF), and on a unified-memory die the page cache holds
-    // only part of it beside a resident model - GB10 kept 2-47% of it however
-    // it was warmed. Read one at a time, each miss was a device round trip in
-    // series with the next: a 4-row speculative verify gathers 64 rows, and
-    // the GPU sat idle 4-30 ms (median 16) in every round while they came in
-    // one by one. Hinted together (`MapAccess::WillNeed`), the misses go to
-    // the device at once and the gather waits for the slowest instead of
-    // their sum. Timing only - the bytes read are the same. (The ids are the
-    // device lane's hash: one pass over the stream, not one per row.)
-    let ids = ple_row_ids(c, ple, stream, first, n)?;
-    if let Some(&rid) = ids.iter().find(|&&r| r as usize >= rows) {
-        return Err(GpuModelError::Unsupported(format!(
-            "{name}: n-gram row {rid} past the table's {rows} rows"
-        )));
-    }
-    let ranges: Vec<(usize, usize)> = ids
-        .iter()
-        .map(|&r| (r as usize * row_bytes, row_bytes))
-        .collect();
-    let _ = map.advise_tensor(name, MapAccess::WillNeed, &ranges);
-    let mut out = vec![0f32; n * c.ple_embed];
-    for (i, &rid) in ids.iter().enumerate() {
-        let rid = rid as usize;
-        let row = &table[rid * row_bytes..(rid + 1) * row_bytes];
-        let dst = (i / heads) * c.ple_embed + (i % heads) * width;
-        ple_row_dequant(ty, row, &mut out[dst..dst + width]);
-    }
-    Ok(out)
 }
 
 /// Gated DeltaNet mixer. Writes `d_mix` `[n, hidden]` and advances `state`.
@@ -5961,12 +5469,27 @@ fn down_cols_min_rows() -> usize {
 /// the grouped arm look absurd at decode widths and is why it was only ever
 /// elected for prefill. Prefill is unaffected (at 2050 rows the first term
 /// already wins).
-/// Widest token wave the W4A4 routed pair will serve, set by what its
-/// partials plane costs: n * (k+1) * hidden f32, which at 512 tokens, top-10
-/// and hidden 2560 is 57.7 MB. Full width (max_tokens 4096) would be 461 MB
-/// of the KV pool's headroom for an arm that only runs at prefill, and the
-/// GEMV above this is correct, just slower.
-const NVF4_BS_MAX_ROWS: usize = 512;
+/// Widest token wave the W4A4 routed pair runs at once. The partials plane is
+/// sized to the walk (`walk_rows`, 4096 by default) up to this, so a prefill
+/// walk runs the pair ONCE and every expert's weights stream from DRAM once
+/// per walk - the SOTA shape (vLLM runs its fused MoE over up to 32768 tokens
+/// a chunk; nobody re-reads the experts inside a batch). A walk wider than the
+/// plane runs the pair in token sub-waves of its width (see the Nvf4 arm of
+/// the routed MoE), each a full DRAM pass over the experts; it never falls to
+/// the W4A16 GEMV, which re-reads every expert per token (a 4096-row walk at
+/// 110x a 264-row one).
+///
+/// The plane's price is n * (k+1) * hidden f32 - 461 MB at 4096 rows, top-10
+/// at hidden 2560 - the cost of the fixed-order f32 slot sum (the numerics
+/// doctrine; engines that finalize over bf16 pay half, fused-atomic finalizes
+/// are not deterministic). Measured on GB10, the MX export, a 16.5K-token
+/// prompt: 512-row waves 19.5 s TTFT (57.7 MB), 2048 14.5-14.9 s (231 MB),
+/// the whole walk 13.7-14.0 s (461 MB); re-measured when the cap moved from
+/// 2048 to the walk (2026-09-30, 32K x 2): 16.6K tokens 11.67 -> 10.99 s,
+/// 30.9K 21.57 -> 20.02 s, greedy streams bit-identical. Per 2048-row wave the
+/// pair's gate/up alone is one 0.94 GB pass (6.1 ms, flat in the block count -
+/// an expert's blocks after its first hit L2), so every extra wave re-pays it.
+const NVF4_BS_MAX_ROWS: usize = 32768;
 
 fn grp_align_blocks(rows: usize, n_expert: usize, bm: usize) -> usize {
     (rows + n_expert * (bm - 1)).div_ceil(bm).min(rows)
@@ -6896,67 +6419,83 @@ fn moe_pass(
             // 32-wide block is ~7.5% live (measured for the _st arm), which is
             // why the width gate is here and the decode tick keeps the GEMV
             // until the BM=8 tiled twin exists.
-            let rows = n * k;
             // `nvf4_moe_down_bs` lands per-(token, slot) partials at
-            // part[(tok*np + slot)*embd], so it needs n * (k+1) * hidden
+            // part[(tok*np + slot)*embd], so a wave needs wave * (k+1) * hidden
             // floats. `d_moe_part` is a DECODE-BAND buffer (64 rows x the
             // z-split's halved slots) and a 128-token prefill overruns it 4x -
             // measured as CUDA_ERROR_ILLEGAL_ADDRESS on the first serve where
-            // this arm actually ran. The bench never saw it because it
-            // allocates its own part. Refuse rather than scribble: the pair
-            // wants a chunked partials plane of its own (nemotron sizes one
-            // per chunk), which is the work this arm is waiting on.
-            let part_need = n * (k + 1) * h;
+            // this arm actually ran - so the pair has its own plane, sized for
+            // a whole walk up to NVF4_BS_MAX_ROWS tokens.
+            //
+            // A wider walk runs the pair in SUB-WAVES of the plane's width
+            // (`moe_align_at` & co. read one token range, land its partials
+            // local, fold them into that range's residual rows). It used to
+            // fall to the W4A16 GEMV instead, which re-reads every expert per
+            // token: a 4096-row prefill walk spent 395 ms a MoE layer there
+            // against 3.6 ms at 264 rows on the pair (GB10, the MX export),
+            // and a 16K-token prompt took 85 s. Every op of the pair is per
+            // token (the nvfp4 quantize, each output row's K loop, the fold),
+            // so a sub-wave's rows are bit-identical to a full-width wave's.
+            let wave_max = sc.d_nvf4_part.len() / ((k + 1) * h);
             let bs = n >= super::nvf4_bs_min_rows()
                 && e.has_nvf4_moe_gu_swiglu_bs()
                 && e.has_nvf4_moe_bs()
                 && c.hidden.is_multiple_of(32)
                 && c.moe_ff.is_multiple_of(16)
-                && sc.d_nvf4_part.len() >= part_need;
+                && wave_max >= super::nvf4_bs_min_rows();
             if bs {
-                let nb = grp_align_blocks(rows, c.n_expert, 32);
-                e.moe_align(
-                    &sc.d_idx,
-                    &mut sc.d_srow32,
-                    &mut sc.d_sslot32,
-                    &mut sc.d_bexp32,
-                    n,
-                    k,
-                    c.n_expert,
-                    nb,
-                )?;
                 e.quantize_nvf4(&sc.d_bi, &mut sc.d_xq4, &mut sc.d_xs4, n * h)?;
-                e.nvf4_moe_gu_swiglu_bs(
-                    gate,
-                    up,
-                    &sc.d_srow32,
-                    &sc.d_bexp32,
-                    &sc.d_xq4,
-                    &sc.d_xs4,
-                    &mut sc.d_nfq,
-                    &mut sc.d_nfs,
-                    nb,
-                )?;
-                e.nvf4_moe_down_bs(
-                    down,
-                    &sc.d_srow32,
-                    &sc.d_sslot32,
-                    &sc.d_bexp32,
-                    Some(&sc.d_topw),
-                    &sc.d_nfq,
-                    &sc.d_nfs,
-                    &mut sc.d_nvf4_part,
-                    k,
-                    k + 1,
-                    0,
-                    nb,
-                )?;
-                // the INIT twin: residual = sum. The plain `moe_slot_combine`
-                // ACCUMULATES, so using it here added every layer's MoE on top
-                // of the previous layer's stale d_mix - coherent-looking text
-                // that drifts from the GEMV arm on every prompt. The GEMV path
-                // beside this one has always used _init.
-                e.moe_slot_combine_init(&sc.d_nvf4_part, &mut sc.d_mix, h, k + 1, n)?;
+                let mut t0 = 0usize;
+                while t0 < n {
+                    let m = (n - t0).min(wave_max);
+                    let nb = grp_align_blocks(m * k, c.n_expert, 32);
+                    e.moe_align_at(
+                        &sc.d_idx,
+                        t0,
+                        &mut sc.d_srow32,
+                        &mut sc.d_sslot32,
+                        &mut sc.d_bexp32,
+                        m,
+                        k,
+                        c.n_expert,
+                        nb,
+                    )?;
+                    e.nvf4_moe_gu_swiglu_bs(
+                        gate,
+                        up,
+                        &sc.d_srow32,
+                        &sc.d_bexp32,
+                        &sc.d_xq4,
+                        &sc.d_xs4,
+                        &mut sc.d_nfq,
+                        &mut sc.d_nfs,
+                        nb,
+                        t0,
+                    )?;
+                    e.nvf4_moe_down_bs_at(
+                        down,
+                        &sc.d_srow32,
+                        &sc.d_sslot32,
+                        &sc.d_bexp32,
+                        Some(&sc.d_topw),
+                        &sc.d_nfq,
+                        &sc.d_nfs,
+                        &mut sc.d_nvf4_part,
+                        k,
+                        k + 1,
+                        0,
+                        nb,
+                        t0,
+                    )?;
+                    // the INIT twin: residual = sum. The plain
+                    // `moe_slot_combine` ACCUMULATES, so using it here added
+                    // every layer's MoE on top of the previous layer's stale
+                    // d_mix - coherent-looking text that drifts from the GEMV
+                    // arm on every prompt. The GEMV path beside this one has
+                    // always used _init.
+                    e.moe_slot_combine_init_at(&sc.d_nvf4_part, &mut sc.d_mix, t0, h, k + 1, m)?;
+                    t0 += m;
+                }
             } else {
                 e.q4x_moe_gu_swiglu(gate, up, &sc.d_idx, &sc.d_bi, &mut sc.d_act, k, n)?;
                 // z-split + deterministic combine (ncu: warp-per-row is CTA-starved;
@@ -7474,6 +7013,7 @@ impl Scratch {
 // `batched_slots_match_single_slot_runs`. So this is a seam, not a rewrite.
 mod chunked;
 mod mtp;
+mod ple;
 mod spec;
 
 fn q4x_gen_err(e: GpuModelError) -> crate::generator::GenError {

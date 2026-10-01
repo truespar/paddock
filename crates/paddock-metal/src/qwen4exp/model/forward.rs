@@ -26,13 +26,24 @@ impl FlashNext {
         outputs: &[usize],
         contracts: Option<&[usize]>,
     ) -> Result<Vec<f32>> {
-        objc2::rc::autoreleasepool(|_| self.execute_inner(rows, outputs, contracts))
+        objc2::rc::autoreleasepool(|_| self.execute_inner(rows, outputs, contracts, false))
+    }
+    /// A physical pass may cross logical prompt boundaries. Derive each
+    /// projection's original contraction from the immutable token plan, never
+    /// from the total number of rows or the scheduler's current grant.
+    pub(super) fn execute_planned(
+        &mut self,
+        rows: &[(usize, u32, u32)],
+        outputs: &[usize],
+    ) -> Result<Vec<f32>> {
+        objc2::rc::autoreleasepool(|_| self.execute_inner(rows, outputs, None, true))
     }
     fn execute_inner(
         &mut self,
         rows: &[(usize, u32, u32)],
         outputs: &[usize],
         contracts: Option<&[usize]>,
+        planned: bool,
     ) -> Result<Vec<f32>> {
         self.healthy()?;
         let n = rows.len();
@@ -65,9 +76,18 @@ impl FlashNext {
         let qp = qsa::Plan::new(&positions, &lengths, self.capacity, self.context)?;
         let mut projection_rows = Vec::new();
         if self.is_mlx() {
+            let mut span_end = 0;
             for (i, row) in rows.iter().enumerate() {
-                if i == 0 || rows[i - 1].0 != row.0 {
-                    projection_rows.push((i, 1, 1));
+                if i == 0 || rows[i - 1].0 != row.0 || (planned && i == span_end) {
+                    let (logical, remaining) = if planned {
+                        // Active decoders have consumed their prompt already;
+                        // their rows retain singleton arithmetic.
+                        self.slots[row.0].plan.execution_at(row.2 as usize)
+                    } else {
+                        (1, 1)
+                    };
+                    span_end = i + remaining;
+                    projection_rows.push((i, 1, logical));
                 } else {
                     projection_rows
                         .last_mut()
@@ -81,7 +101,9 @@ impl FlashNext {
                 ));
             }
             for (i, span) in projection_rows.iter_mut().enumerate() {
-                span.2 = contracts.map_or(span.1, |v| v[i]);
+                if !planned {
+                    span.2 = contracts.map_or(span.1, |v| v[i]);
+                }
                 if span.2 < span.1 || span.2 > self.chunk {
                     return Err(MetalError::Model(
                         "invalid Flash Next logical chunk size".into(),

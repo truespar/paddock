@@ -330,6 +330,27 @@ pub struct AlignModel {
     pub max_clip_s: f32,
 }
 
+/// The checkpoint DIRECTORY a safetensors shard belongs to: `path` is a
+/// `.safetensors` file whose directory holds the export's `config.json` (or a
+/// Splash `manifest.json`). None for a directory, a GGUF, or a safetensors
+/// file that is not part of a checkpoint.
+///
+/// The manager's spawn path hands a directory checkpoint's entry-point FILE -
+/// shard 1 of a sharded export - exactly as it hands every GGUF, and every
+/// safetensors-primary lane loads the directory. A shard passed on as-is fell
+/// through to the GGUF loader ("not a GGUF file (bad magic)"), so Flash-Next's
+/// and Nemotron's NVFP4 exports could not be started from the Studio at all.
+/// `aligner_dir` below already resolved its own case this way; this does it
+/// once, before the id and the arch are read, for every lane.
+pub fn checkpoint_dir_of_shard(path: &Path) -> Option<std::path::PathBuf> {
+    if path.is_dir() || !path.extension().is_some_and(|x| x == "safetensors") {
+        return None;
+    }
+    let dir = path.parent()?;
+    (dir.join("config.json").is_file() || dir.join("manifest.json").is_file())
+        .then(|| dir.to_path_buf())
+}
+
 /// The forced-aligner checkpoint DIRECTORY for `path`, if it is one - the
 /// first (and so far only) safetensors-primary route: a dir whose config.json
 /// names `Qwen3ASRForTokenClassification`. Accepts either the directory
@@ -576,6 +597,35 @@ pub fn image_mlx_dir(path: &Path) -> Option<std::path::PathBuf> {
         serde_json::from_slice(&std::fs::read(root.join("transformer/config.json")).ok()?).ok()?;
     (v["_class_name"] == "QwenImage21Transformer2DModel" && v["mlx_format"] == true)
         .then(|| root.to_path_buf())
+}
+
+#[cfg(test)]
+mod checkpoint_shard_tests {
+    use super::*;
+
+    /// The manager hands shard 1 of a directory checkpoint; the runner must
+    /// load the directory - and must leave every other kind of path alone.
+    #[test]
+    fn a_checkpoint_shard_resolves_to_its_directory() {
+        let root = std::env::temp_dir().join(format!("paddock-shard-{}", uuid::Uuid::new_v4()));
+        let ckpt = root.join("Some-Export-NVFP4");
+        std::fs::create_dir_all(&ckpt).unwrap();
+        std::fs::write(ckpt.join("config.json"), b"{}").unwrap();
+        let shard = ckpt.join("model-00001-of-00036.safetensors");
+        std::fs::write(&shard, b"").unwrap();
+        assert_eq!(checkpoint_dir_of_shard(&shard), Some(ckpt.clone()));
+        // the directory itself is already what the lanes load
+        assert_eq!(checkpoint_dir_of_shard(&ckpt), None);
+        // a GGUF is never re-pointed
+        let gguf = ckpt.join("model.gguf");
+        std::fs::write(&gguf, b"").unwrap();
+        assert_eq!(checkpoint_dir_of_shard(&gguf), None);
+        // a safetensors file outside a checkpoint (no config.json beside it)
+        let loose = root.join("adapter.safetensors");
+        std::fs::write(&loose, b"").unwrap();
+        assert_eq!(checkpoint_dir_of_shard(&loose), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 #[cfg(test)]

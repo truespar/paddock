@@ -53,6 +53,7 @@ pub mod startup;
 pub mod stats;
 pub mod subtitles;
 pub mod systemone;
+pub mod tabular;
 pub mod tiffdoc;
 pub use paddock_mcp::{loop_budget, tool_search};
 pub mod transcriptions;
@@ -323,6 +324,7 @@ pub async fn run(
     let (mut serving, mut embedder, mut asr, mut aligner) = (None, None, None, None);
     let mut segmenter = None;
     let mut laya = None;
+    let mut tabular = None;
     let mut image = None;
     // the resolved off policy, surfaced on admin identify (SpecInfo.off)
     let mut spec_policy_off = false;
@@ -333,6 +335,20 @@ pub async fn run(
         return Err(
             "Residency requires a configured Whisper or Metal DiffusionGemma model.".into(),
         );
+    }
+    // shard 1 of a directory checkpoint (the manager's entry-point file) ->
+    // the directory every safetensors-primary lane loads
+    if let Some(dir) = cfg
+        .model
+        .as_deref()
+        .and_then(serving::checkpoint_dir_of_shard)
+    {
+        tracing::info!(
+            shard = %cfg.model.as_deref().map(|p| p.display().to_string()).unwrap_or_default(),
+            dir = %dir.display(),
+            "model is a shard of a checkpoint directory - loading the directory"
+        );
+        cfg.model = Some(dir);
     }
     if let Some(path) = &cfg.model {
         // A DIRECTORY has no extension to strip, and `file_stem` would cut it
@@ -406,7 +422,26 @@ pub async fn run(
                 );
             }
         }
-        if let Some(root) = serving::image_mlx_dir(path) {
+        if tabular::is_kumo(path) {
+            if cfg.mmproj.is_some()
+                || cfg.kv_offload.enabled
+                || cfg.spec.as_deref().is_some_and(|s| s != "off")
+            {
+                return Err("Kumo is a tabular predictor; remove vision, KV-offload and speculative-decoding overrides".into());
+            }
+            tabular = Some(
+                tabular::load(
+                    cfg.served_model_name.clone().unwrap_or(id),
+                    path,
+                    &cfg.device,
+                    gpu_ordinal,
+                    cfg.kernel_pack.as_deref(),
+                    cfg.vram_budget.map(|mib| mib << 20),
+                )
+                .map_err(serving::ServeError::Engine)?,
+            );
+            tracing::info!("Kumo-Tabular ready (prepared and sdm_v1 tables)");
+        } else if let Some(root) = serving::image_mlx_dir(path) {
             if cfg.text_encoder.is_some() || cfg.vae.is_some() || cfg.mmproj.is_some() {
                 return Err("Qwen-Image MLX is self-contained; remove GGUF text-encoder, VAE and mmproj overrides".into());
             }
@@ -682,6 +717,13 @@ pub async fn run(
                 }
                 spec_off = spec_off || p.is_off();
                 unsafe { std::env::set_var("PADDOCK_SPEC", p.to_string()) };
+            } else if !spec_off && cfg.mtp.is_some() {
+                // Handing the runner a drafter IS asking for speculation, so
+                // name the default policy for the engine: the policy is
+                // unchanged, and a drafter that then cannot run stays a WARN
+                // instead of passing as the default's quiet no-drafter case.
+                let p = paddock_engine::spec_policy::SpecPolicy::default();
+                unsafe { std::env::set_var("PADDOCK_SPEC", p.to_string()) };
             }
             // The engine-wide speculative/MTP kill switch, set from the
             // RESOLVED policy - `no_spec` alone was not enough.
@@ -790,6 +832,7 @@ pub async fn run(
         .or_else(|| embedder.as_ref().map(|e| Arc::clone(&e.metrics)))
         .or_else(|| asr.as_ref().map(|a| Arc::clone(&a.metrics)))
         .or_else(|| laya.as_ref().map(|m| m.decider.metrics()))
+        .or_else(|| tabular.as_ref().map(|m| m.service.metrics()))
         .or_else(|| image.as_ref().map(|m| Arc::clone(&m.metrics)));
     let stats = crate::stats::start(engine_metrics.clone());
     // Held for the graceful-shutdown path below: on SIGINT/SIGTERM the engine
@@ -917,6 +960,7 @@ pub async fn run(
         aligner,
         segmenter,
         laya,
+        tabular,
         image,
         max_ctx: cfg.max_ctx,
         vad_gate: cfg.vad_gate,

@@ -16,14 +16,15 @@ import MenuSeparator from '@/components/ui/MenuSeparator.vue'
 import MenuTrigger from '@/components/ui/MenuTrigger.vue'
 import Tooltip from '@/components/ui/Tooltip.vue'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
+  noun?: 'read' | 'table'
   reads: ReadSummary[]
   activeId: string | null
   loaded: boolean
   error: string | null
   /** a run is in flight: switching reads under it would strand its answer */
   busy: boolean
-}>()
+}>(), { noun: 'read' })
 const emit = defineEmits<{
   new: []
   open: [id: string]
@@ -101,26 +102,26 @@ function detail(r: ReadSummary): string {
 <template>
   <aside class="rsb">
     <div class="rsb__top">
-      <Tooltip label="Hide reads">
-        <button class="pk-icon-btn rsb__fold" type="button" aria-label="Hide reads" @click="emit('fold')">
+      <Tooltip :label="`Hide ${noun}s`">
+        <button class="pk-icon-btn rsb__fold" type="button" :aria-label="`Hide ${noun}s`" @click="emit('fold')">
           <Icon name="chevron-left" :size="16" />
         </button>
       </Tooltip>
       <button class="pk-btn pk-btn--primary rsb__new" type="button" :disabled="busy" @click="emit('new')">
         <Icon name="plus" :size="16" />
-        <span class="rsb__new-label">New read</span>
+        <span class="rsb__new-label">New {{ noun }}</span>
       </button>
     </div>
 
     <div class="rsb__search">
       <Icon name="search" :size="14" class="rsb__search-icon" />
-      <input v-model="query" class="pk-input rsb__search-input" placeholder="Search reads" />
+      <input v-model="query" class="pk-input rsb__search-input" :placeholder="`Search ${noun}s`" />
     </div>
 
     <p v-if="error" class="rsb__empty" role="alert">{{ error }}</p>
     <div class="rsb__list">
       <div v-if="loaded && shown.length === 0" class="rsb__empty">
-        {{ query.trim() ? 'No matches' : 'No reads yet' }}
+        {{ query.trim() ? 'No matches' : `No ${noun}s yet` }}
       </div>
       <div
         v-for="r in shown"
@@ -147,7 +148,7 @@ function detail(r: ReadSummary): string {
             :aria-current="r.id === activeId ? 'true' : undefined"
             @click.stop="onRow(r)"
           >
-            <Icon name="list-checks" :size="13" class="rrow__kind" />
+            <Icon :name="noun === 'table' ? 'table' : 'list-checks'" :size="13" class="rrow__kind" />
             <Tooltip :label="detail(r)"><span class="rrow__title">{{ r.title }}</span></Tooltip>
           </button>
           <span class="rrow__right" @click.stop>
@@ -155,7 +156,7 @@ function detail(r: ReadSummary): string {
             <span class="rrow__actions">
               <Menu :open="menuOpenId === r.id" @update:open="(v: boolean) => (menuOpenId = v ? r.id : null)">
                 <MenuTrigger>
-                  <button class="pk-icon-btn rrow__act" type="button" aria-label="Read actions">
+                  <button class="pk-icon-btn rrow__act" type="button" :aria-label="`${noun} actions`">
                     <Icon name="more-horizontal" :size="15" />
                   </button>
                 </MenuTrigger>
@@ -179,7 +180,7 @@ function detail(r: ReadSummary): string {
     role="alertdialog"
     danger
     icon="alert-triangle"
-    title="Delete read?"
+    :title="`Delete ${noun}?`"
     size="sm"
     @close="pendingDelete = null"
   >

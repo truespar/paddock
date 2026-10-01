@@ -10,7 +10,7 @@ import { copyText } from '@/lib/clipboard'
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import Fuse from 'fuse.js'
-import { useFleetStore } from '@/stores/fleet'
+import { servedId, useFleetStore } from '@/stores/fleet'
 import { gpuApi, type GpuSnapshot } from '@/lib/api'
 import { metalAllocated } from '@/lib/gpu-metrics'
 import { fmtVram as gb, fmtClock, fmtStamp } from '@/lib/format'
@@ -70,8 +70,7 @@ onUnmounted(() => release?.())
 // unchanged, since Number('all') is NaN.
 // every serving role in the chain: a catalog model has `display`, but a
 // hand-started file in any other role would otherwise label as "undefined"
-const servedOf = (r: (typeof fleet.rows)[number]) =>
-  r.model ?? r.embedder ?? r.asr ?? r.aligner ?? r.image ?? undefined
+const servedOf = (r: (typeof fleet.rows)[number]) => servedId(r)
 const portOptions = computed(() => [
   { value: 'all', label: 'All servers' },
   ...fleet.rows.map((r) => ({

@@ -75,4 +75,5 @@
 #include "src/moe/offload.cuh"      // MoE expert offload: device-managed LRU slot cache over host-mapped expert planes (needs kquant.cuh layouts; plain CUDA)
 #include "src/dflash.cuh"        // DFlash2 drafter grouped dynamic conv (abi.cuh helpers only)
 #include "src/tier/xfer.cuh"     // KV tier extent gather/scatter (kv-offload 1a.2; abi.cuh helpers only)
+#include "src/kumo.cuh"         // Kumo-Tabular F32 graph: GEMM, norms, head transforms, attention, cell embedding (needs f32_qkv's pd_launch_status)
 #include "src/exports.cuh"

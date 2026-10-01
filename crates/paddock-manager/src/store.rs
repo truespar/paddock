@@ -23,6 +23,7 @@ mod read_history;
 mod read_history_migration;
 mod read_runs;
 mod reads;
+mod table_history;
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -405,6 +406,18 @@ CREATE TABLE IF NOT EXISTS read_history (
     updated_at INTEGER NOT NULL,
     doc        TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS table_history (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    model TEXT NOT NULL,
+    runs INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    revision TEXT NOT NULL,
+    doc TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS table_history_recent ON table_history(updated_at DESC, id);
 
 -- the native app's bounded result history (store/read_runs.rs): the last
 -- results per question set, a short excerpt and never the document

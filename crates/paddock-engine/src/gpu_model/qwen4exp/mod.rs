@@ -1688,6 +1688,17 @@ impl DensePlane {
         }
     }
 
+    /// The MXFP8 plane's raw device bytes - the checkpoint's `weight` payload
+    /// and its `weight_scale` plane, both uploaded unconverted - while they are
+    /// still row-major. `None` for every other class, and once a plane was
+    /// repacked tile-linear (a re-encoding, so no byte oracle may pass on it).
+    pub fn raw_mxf8(&self) -> Option<(&CudaSlice<u8>, &CudaSlice<u8>)> {
+        match self {
+            DensePlane::Mxf8 { plane, .. } if !plane.is_lin() => Some((&plane.data, &plane.scale)),
+            _ => None,
+        }
+    }
+
     /// Device bytes this plane occupies - for the load-time residency ledger.
     pub fn bytes(&self) -> usize {
         match self {

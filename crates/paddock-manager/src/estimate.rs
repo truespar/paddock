@@ -105,15 +105,22 @@ pub struct EstimateQuery {
 
 /// Capabilities served by one pass per input with nothing cached between
 /// calls: embedding, rerank and alignment encoders, decision models (typed
-/// questions in, one distribution per question out), dense prediction (image
-/// chips in, rasters out) and image generation (a prompt in, a render out).
+/// questions in, one distribution per question out), tabular predictors
+/// (labelled rows in, the missing column out), dense prediction (image chips
+/// in, rasters out) and image generation (a prompt in, a render out).
 /// None of them holds a KV cache, so none is priced with decode terms -
 /// weights, companions, workspace, and that is all. Pricing one as generative
 /// is how a 0.6B embedding model once came out "needing" 124 GB.
 fn is_single_pass(capability: &str) -> bool {
     matches!(
         capability,
-        "embeddings" | "rerank" | "alignment" | "decision" | "segmentation" | "image-generation"
+        "embeddings"
+            | "rerank"
+            | "alignment"
+            | "decision"
+            | "tabular"
+            | "segmentation"
+            | "image-generation"
     )
 }
 

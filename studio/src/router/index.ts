@@ -14,6 +14,7 @@ import TrustPanel from '@/components/manage/TrustPanel.vue'
 import PromptsPanel from '@/components/prompts/PromptsPanel.vue'
 import EmbeddingsPanel from '@/components/embeddings/EmbeddingsPanel.vue'
 import ReadsPanel from '@/components/reads/ReadsPanel.vue'
+import TablesPanel from '@/components/tables/TablesPanel.vue'
 import CloudPanel from '@/components/cloud/CloudPanel.vue'
 import ConnectorsPanel from '@/components/connectors/ConnectorsPanel.vue'
 import SettingsPanel from '@/components/settings/SettingsPanel.vue'
@@ -114,6 +115,12 @@ const router = createRouter({
         // running model advertises the capability.
         // /studio/reads/<id> names the read on screen; no id is a new read
         { path: 'reads/:id?', name: 'reads', component: ReadsPanel },
+        // Tables: labelled rows in, the missing column predicted (a tabular
+        // foundation model, POST /v1/tabular/predictions). A table in and a
+        // table out, so a page beside embeddings, never a chat lane.
+        // ?port= picks the endpoint (the model page's "open in Studio").
+        // /studio/tables/<id> names the session on screen, as reads/<id> does
+        { path: 'tables/:id?', name: 'tables', component: TablesPanel },
         // Pictures are made in a CONVERSATION: an image model holds a lane in
         // the chat like a speech model does, the prompt is the turn and the
         // picture the reply, with its seed and settings on the record. The
@@ -157,7 +164,7 @@ const router = createRouter({
 //
 // /manage/models itself stays reachable deliberately - it is where the readiness
 // notice lives, so "why can't I start anything" has somewhere to be answered.
-const NEEDS_A_GPU = new Set(['server-new', 'server-new-config', 'embeddings', 'reads'])
+const NEEDS_A_GPU = new Set(['server-new', 'server-new-config', 'embeddings', 'reads', 'tables'])
 
 router.beforeEach(async (to) => {
   if (!NEEDS_A_GPU.has(String(to.name))) return true
@@ -167,7 +174,9 @@ router.beforeEach(async (to) => {
   const readiness = useReadinessStore()
   await readiness.ensureLoaded()
   if (!readiness.blocked) return true
-  return to.name === 'embeddings' || to.name === 'reads' ? { name: 'home' } : { name: 'servers' }
+  return to.name === 'embeddings' || to.name === 'reads' || to.name === 'tables'
+    ? { name: 'home' }
+    : { name: 'servers' }
 })
 
 export default router

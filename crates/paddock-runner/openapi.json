@@ -24,6 +24,57 @@
     { "name": "operations", "description": "Health, metrics, discovery" }
   ],
   "paths": {
+    "/v1/tabular/predictions": {
+      "post": {
+        "tags": ["paddock"],
+        "summary": "Kumo-Tabular one-shot or fitted-context predictions",
+        "operationId": "tabularPredictions",
+        "description": "Three explicit contracts: prepared runs the neural core on caller-transformed numerical matrices; sdm_v1 fits the SDM numerical/categorical recipe on context only and ensembles predictions; context_id reuses a fitted GPU context. sdm_v1 includes constant-column removal, F64 standardization, four round-robin transforms, outlier clipping, categorical alignment/counts, seeded signs/Latin feature permutations/label shifts and target inversion. Its portable seed is not PyTorch RNG-compatible. Classification supports at most ten classes (no ECOC). Missing features are null; unknown raw categories map to -1. Raw numbers are bounded to ±1e30 and category strings to 4096 bytes. The optional model must match the served id. Total prepared context + query cells must not exceed 131072; body limit 8 MiB. No chat or JEV semantics.",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": {
+            "oneOf": [{
+            "type": "object", "additionalProperties": false,
+            "required": ["preprocessing", "context", "targets", "query", "categorical"],
+            "properties": {
+              "model": { "type": "string" },
+              "preprocessing": { "type": "string", "const": "prepared" },
+              "context": { "type": "array", "minItems": 1, "maxItems": 4096, "items": { "type": "array", "minItems": 1, "maxItems": 500, "items": { "type": ["number", "null"] } } },
+              "targets": { "type": "array", "minItems": 1, "maxItems": 4096, "items": { "type": "number" } },
+              "query": { "type": "array", "minItems": 1, "maxItems": 1024, "items": { "type": "array", "minItems": 1, "maxItems": 500, "items": { "type": ["number", "null"] } } },
+              "categorical": { "type": "array", "minItems": 1, "maxItems": 500, "items": { "type": "boolean" } }
+            }
+            }, {"allOf":[{"$ref":"#/components/schemas/TabularRecipe"},{"required":["query"],"properties":{"query":{"minItems":1}}}]}, {"$ref":"#/components/schemas/TabularCachedQuery"}]
+          } } }
+        },
+        "responses": {
+          "200": { "description": "object=tabular.prediction; model, task, preprocessing, predictions and usage. Classification predictions contain class, probabilities and logits in code order. Regression predictions contain median and 999 sorted quantiles, with shared quantile_levels 0.001..0.999. Usage reports context_rows, query_rows, columns, GPU milliseconds, elapsed milliseconds and workspace bytes (not tokens).", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "400": { "description": "Invalid table, class codes or preprocessing contract" },
+          "401": { "description": "Missing or invalid configured runner key" },
+          "404": { "description": "Requested model id is not served, or context was expired, evicted or released" },
+          "413": { "description": "Body exceeds 8 MiB" },
+          "429": { "description": "Configured rate limit reached" },
+          "503": { "description": "No tabular model loaded, queue full, draining or admission cap reached" },
+          "500": { "description": "Inference or memory-budget failure; no prediction returned" }
+        }
+      }
+    },
+    "/v1/tabular/contexts": {
+      "post": {
+        "tags":["paddock"],"summary":"Fit preprocessing and GPU attention context","operationId":"tabularFit",
+        "description":"Accepts sdm_v1 context, targets and column types; query must be absent or empty. Returns context_id, classes, num_estimators, recipe_seed, cache_bytes and measured usage. Opaque IDs are scoped to this runner and its authentication boundary. All original context processing is performed once per estimator. At most four contexts; idle TTL 600 seconds, LRU eviction, cache budget at most 1 GiB and one quarter of available model budget after weights (including retained host recipe allocations). Expired/evicted IDs return 404, never silent recomputation. Contexts are memory-only and do not survive runner restart. Failed or abandoned fits release their allocations.",
+        "requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/TabularRecipe"}}}},
+        "responses":{"200":{"description":"object=tabular.context, context_id and fitted metadata"},"400":{"description":"Invalid table or ensemble exceeds cache budget"},"401":{"description":"Runner authentication required"},"413":{"description":"Body exceeds 8 MiB"},"503":{"description":"Queue full, draining or admission cap reached"},"500":{"description":"Backend fit failed"}}
+      }
+    },
+    "/v1/tabular/contexts/{id}": {
+      "delete": {
+        "tags":["paddock"],"summary":"Release fitted context","operationId":"tabularRelease",
+        "parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"string"}}],
+        "description":"Serialized with inference on the owning thread; buffers are never freed while the GPU uses them. Requires the same runner authentication as predictions.",
+        "responses":{"200":{"description":"deleted=true after reclaiming context"},"401":{"description":"Runner authentication required"},"404":{"description":"Unknown, expired, evicted or previously released context"},"503":{"description":"Worker queue full or unavailable"}}
+      }
+    },
     "/healthz": {
       "get": {
         "tags": ["operations"],
@@ -702,6 +753,24 @@
       }
     },
     "schemas": {
+      "TabularCell":{"type":["number","string","boolean","null"]},
+      "TabularRows":{"type":"array","minItems":1,"maxItems":4096,"items":{"type":"array","minItems":1,"maxItems":500,"items":{"$ref":"#/components/schemas/TabularCell"}}},
+      "TabularRecipe":{
+        "type":"object","additionalProperties":false,"required":["preprocessing","context","targets","categorical"],
+        "properties":{
+          "model":{"type":"string"},"preprocessing":{"const":"sdm_v1"},
+          "context":{"$ref":"#/components/schemas/TabularRows"},
+          "targets":{"type":"array","minItems":1,"maxItems":4096,"items":{"type":["number","string","boolean"]}},
+          "query":{"type":"array","maxItems":1024,"items":{"type":"array","minItems":1,"maxItems":500,"items":{"$ref":"#/components/schemas/TabularCell"}}},
+          "categorical":{"type":"array","minItems":1,"maxItems":500,"items":{"type":"boolean"}},
+          "num_estimators":{"type":"integer","minimum":1,"maximum":16,"default":8},
+          "seed":{"type":"integer","minimum":0,"maximum":18446744073709551615,"default":0}
+        }
+      },
+      "TabularCachedQuery":{
+        "type":"object","additionalProperties":false,"required":["context_id","query"],
+        "properties":{"model":{"type":"string"},"context_id":{"type":"string"},"query":{"allOf":[{"$ref":"#/components/schemas/TabularRows"},{"maxItems":1024}]}}
+      },
       "Error": {
         "type": "object",
         "description": "The OpenAI-shaped error envelope every surface uses, 404s included",

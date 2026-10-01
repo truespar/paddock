@@ -9,6 +9,8 @@ import { useReadinessStore } from '@/stores/readiness'
 import { useFleetStore } from '@/stores/fleet'
 import { useUpdatesStore } from '@/stores/updates'
 import { useReadsStore } from '@/stores/reads'
+import { useTablesStore } from '@/stores/tables'
+import { predictorLabel } from '@/lib/tables'
 import { modelLabel } from '@/lib/model-name'
 import { selectStudioModel } from '@/lib/select-model'
 import { studioModelHeader } from '@/lib/studio-model-header'
@@ -142,6 +144,26 @@ const readerSel = computed<string | number>({
   get: () => readsStore.readerPort,
   set: (v) => (readsStore.readerPort = Number(v)),
 })
+
+// Tables, the same way: the picker chooses the PREDICTOR, the running tabular
+// endpoints the page sends its table to, and the chat's model stays out of it.
+const tablesStore = useTablesStore()
+const onTables = computed(() => route.name === 'tables')
+const predictorOptions = computed(() =>
+  models.models
+    .filter((m) => m.kind === 'tabular')
+    .map((m) => ({
+      value: m.port ?? 0,
+      label: predictorLabel(m),
+      hint: `port ${m.port}`,
+      vendor: m.vendor,
+      title: m.id,
+    })),
+)
+const predictorSel = computed<string | number>({
+  get: () => tablesStore.port,
+  set: (v) => (tablesStore.port = Number(v)),
+})
 </script>
 
 <template>
@@ -169,6 +191,12 @@ const readerSel = computed<string | number>({
         <template v-if="readerOptions.length">
           <span class="header__sep">/</span>
           <Select v-model="readerSel" :options="readerOptions" ghost />
+        </template>
+      </template>
+      <template v-else-if="onTables">
+        <template v-if="predictorOptions.length">
+          <span class="header__sep">/</span>
+          <Select v-model="predictorSel" :options="predictorOptions" ghost />
         </template>
       </template>
       <template v-else-if="area === 'studio' && currentModel && pickerOptions.length">

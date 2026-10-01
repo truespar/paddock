@@ -97,6 +97,7 @@ pub(crate) const SHADER_SOURCE: &str = concat!(
     include_str!("../../../packs/metal/qwen4exp_qsa.metal"),
     include_str!("../../../packs/metal/qwen_image.metal"),
     include_str!("../../../packs/metal/laya.metal"),
+    include_str!("../../../packs/metal/kumo.metal"),
 );
 
 #[derive(Debug, thiserror::Error)]
@@ -119,6 +120,12 @@ type Obj<T> = Retained<ProtocolObject<T>>;
 // Two samples per dispatch; normal command buffers allocate no counter pages.
 const PROFILE_SAMPLES: usize = 4096;
 const PROFILE_COUNTER_PAGES: usize = 4;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ISOLATE_ENCODERS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static LIMIT_PIPELINE_THREADS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 pub(crate) struct Buffer {
     pub raw: Obj<dyn MTLBuffer>,
@@ -177,6 +184,8 @@ pub struct MetalDevice {
     raw: Obj<dyn MTLDevice>,
     queue: Obj<dyn MTLCommandQueue>,
     kernels: HashMap<&'static str, Obj<dyn MTLComputePipelineState>>,
+    #[cfg(test)]
+    limited_kernels: HashMap<&'static str, Obj<dyn MTLComputePipelineState>>,
     ledger: Arc<AtomicU64>,
     budget: u64,
     healthy: AtomicBool,
@@ -367,7 +376,30 @@ impl MetalDevice {
             )
             .map_err(|e| MetalError::Device(e.to_string()))?;
         let mut kernels = HashMap::new();
+        #[cfg(test)]
+        let mut limited_kernels = HashMap::new();
         for name in [
+            "kumo_kv",
+            "kumo_mm",
+            "kumo_mlp_out",
+            "kumo_norm",
+            "kumo_add_norm",
+            "kumo_heads",
+            "kumo_scale",
+            "kumo_attention",
+            "kumo_add",
+            "kumo_fourier",
+            "kumo_cell_weights",
+            "kumo_cell_mm",
+            "kumo_cell_bias",
+            "kumo_copy_repeat",
+            "kumo_cache_heads",
+            "kumo_attention_tile32",
+            "kumo_attention_tile64",
+            "kumo_single_value",
+            "kumo_rows",
+            "kumo_unrows",
+            "kumo_labels",
             "laya_mm",
             "laya_geglu",
             "laya_embed",
@@ -772,6 +804,19 @@ impl MetalDevice {
             "q4a_mv4_narrow",
             "q4a_mv4_fast2",
             "q4a_expert_gate_up_vector",
+            "q4a_expert_gate_up_pair2",
+            #[cfg(test)]
+            "q4a_expert_gate_up_pair4",
+            #[cfg(test)]
+            "q4a_expert_gate_up_ordered",
+            "q4a_expert_gate_up_ordered_pair2",
+            "q4a_expert_gate_up_ordered_pair4",
+            #[cfg(test)]
+            "q4a_expert_down_vector4",
+            #[cfg(test)]
+            "q4a_expert_down_vector8",
+            #[cfg(test)]
+            "q4a_expert_down_vector16",
             "q4a_hc_down_vector",
             "q4a_hc_up_mix_vector",
             "q4a_mv8",
@@ -779,6 +824,10 @@ impl MetalDevice {
             "q4a_wide",
             "q4a_wide4_packed",
             "q4a_wide8_packed",
+            "q4a_wide4_rows2",
+            "q4a_wide4_rows4",
+            "q4a_wide8_rows2",
+            "q4a_wide8_rows4",
             "q4a_mm",
             "q4a_mm4_packed",
             "q4a_input",
@@ -897,6 +946,10 @@ impl MetalDevice {
             "q4b_attention_direct_keys",
             #[cfg(test)]
             "q4b_attention_direct_values",
+            #[cfg(test)]
+            "q4b_attention_pair_pack",
+            #[cfg(test)]
+            "q4b_attention_pairs",
             "q4b_join_gate_compact",
             "q4a_ple_staged",
             "q4b_join_gate",
@@ -1301,6 +1354,40 @@ impl MetalDevice {
             let pipeline = raw
                 .newComputePipelineStateWithFunction_error(&fun)
                 .map_err(|e| MetalError::Device(format!("{name}: {e}")))?;
+            #[cfg(test)]
+            if LIMIT_PIPELINE_THREADS_FOR_TEST.with(|v| v.get())
+                && matches!(
+                    name,
+                    "q4a_mm4_device128_pad8"
+                        | "q4a_mm4_device128_wide"
+                        | "q4a_mm4_pair_wide"
+                        | "q4a_mm4_slab"
+                        | "q4a_mm8_device128"
+                        | "q4a_mm4_split_device128_pad8"
+                        | "q4a_mm8_split_device128_pad8"
+                        | "q4a_expert_mm_group32_packed"
+                        | "q4a_expert_mm_direct"
+                )
+            {
+                let desc = MTLComputePipelineDescriptor::new();
+                desc.setComputeFunction(Some(&fun));
+                desc.setMaxTotalThreadsPerThreadgroup(128);
+                let limited = raw
+                    .newComputePipelineStateWithDescriptor_options_reflection_error(
+                        &desc,
+                        MTLPipelineOption::None,
+                        None,
+                    )
+                    .map_err(|e| MetalError::Device(format!("limited {name}: {e}")))?;
+                eprintln!(
+                    "FLASH_PIPELINE_LIMIT kernel={name} default_threads={} limited_threads={} default_shared={} limited_shared={}",
+                    pipeline.maxTotalThreadsPerThreadgroup(),
+                    limited.maxTotalThreadsPerThreadgroup(),
+                    pipeline.staticThreadgroupMemoryLength(),
+                    limited.staticThreadgroupMemoryLength(),
+                );
+                limited_kernels.insert(name, limited);
+            }
             kernels.insert(name, pipeline);
         }
         let profile = paddock_models::dev_var_os!("PADDOCK_METAL_PROFILE").is_some();
@@ -1316,6 +1403,8 @@ impl MetalDevice {
             raw,
             queue,
             kernels,
+            #[cfg(test)]
+            limited_kernels,
             ledger: Arc::new(AtomicU64::new(0)),
             budget,
             healthy: AtomicBool::new(true),
@@ -1440,7 +1529,11 @@ impl MetalDevice {
             .queue
             .commandBuffer()
             .ok_or_else(|| MetalError::Device("cannot create command buffer".into()))?;
-        let enc = if self.profile {
+        #[cfg(test)]
+        let isolate = ISOLATE_ENCODERS_FOR_TEST.with(|v| v.get());
+        #[cfg(not(test))]
+        let isolate = false;
+        let enc = if self.profile || isolate {
             None
         } else {
             Some(
@@ -1668,6 +1761,12 @@ impl Commands<'_> {
         threads: usize,
     ) {
         let pipeline = &self.device.kernels[name];
+        #[cfg(test)]
+        let pipeline = if LIMIT_PIPELINE_THREADS_FOR_TEST.with(|v| v.get()) {
+            self.device.limited_kernels.get(name).unwrap_or(pipeline)
+        } else {
+            pipeline
+        };
         let sample = self.profile_names.borrow().len() * 2;
         let measured = if !self.counters.is_empty() {
             let counters = self
@@ -1726,6 +1825,14 @@ impl Commands<'_> {
                 self.cmd
                     .computeCommandEncoderWithDescriptor(&desc)
                     .expect("profile encoder"),
+            )
+        } else if self.enc.is_none() {
+            // Counter-free test comparator for encoder-granularity costs.
+            // Keep the same command buffer, serial ordering and final fence.
+            Some(
+                self.cmd
+                    .computeCommandEncoderWithDispatchType(MTLDispatchType::Serial)
+                    .expect("isolated compute encoder"),
             )
         } else {
             None

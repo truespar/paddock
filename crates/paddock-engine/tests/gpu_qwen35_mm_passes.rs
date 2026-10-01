@@ -16,7 +16,7 @@
 
 mod common;
 
-use paddock_engine::generator::Generator;
+use paddock_engine::generator::{Generator, MmAdmit};
 use paddock_engine::gpu_model::qwen35::GpuQwen35;
 use paddock_engine::service::MmChunk;
 use paddock_models::mapped::MappedGguf;
@@ -246,4 +246,71 @@ fn a_long_picture_prompt_in_planned_passes_matches_the_single_path() {
         top(&lm, 3)
     );
     eprintln!("MM PASSES OK: {rows_ref} rows in {PASS_ROWS}-row passes == one pass");
+
+    // ---- the stepped lane (`Generator::prefill_begin_multimodal` +
+    // `encode_step`): the same planned passes, one unit a call - a pass's
+    // pictures, then the pass - with ANOTHER slot decoding between the units,
+    // as the scheduler's ticks do. It must land the blocking slot path's
+    // logits bit for bit: the units share nothing across a call but the
+    // slot's own KV / state and the job's pictures, so a decode tick that
+    // reuses every scratch plane in between cannot reach them. The step
+    // budget is capped by the 512-row planned pass here, so the two paths cut
+    // the same passes. Each side starts from a fresh prefix cache.
+    m.enable_batch(2).expect("fresh batch state");
+    let (l_block, rows_block) = m.forward_prefill_slot_mm(1, &chunks).expect("blocking");
+    m.enable_batch(2).expect("fresh batch state");
+    assert!(
+        Generator::supports_chunked_multimodal(&m),
+        "qwen35 with vision should take the stepped picture lane"
+    );
+    let text = tok.encode(&unit.repeat(3)).expect("enc");
+    let mut t0 = amax(&m.forward_prefill_slot(0, &text).expect("text slot"));
+    let mut p0 = text.len() as u32;
+    let verdicts = Generator::prefill_begin_multimodal(&mut m, vec![(1, chunks.clone())]);
+    assert!(
+        matches!(verdicts[..], [(1, MmAdmit::Encoding)]),
+        "the picture prompt should be held for stepping"
+    );
+    let (mut units, mut stepped) = (0usize, None);
+    while stepped.is_none() {
+        assert!(
+            Generator::encoding_pending(&m),
+            "held job vanished unreported"
+        );
+        for (slot, v) in Generator::encode_step(&mut m) {
+            assert_eq!(slot, 1);
+            match v {
+                MmAdmit::Prefilled { logits, rows } => stepped = Some((logits, rows)),
+                MmAdmit::Failed(e) => panic!("stepped unit failed: {e}"),
+                _ => panic!("unexpected verdict"),
+            }
+        }
+        units += 1;
+        assert!(units < 200, "the stepped lane never finished");
+        // the other slot's decode tick between the units
+        let l = m.forward_batch(&[t0], &[p0]).expect("slot 0 decode");
+        t0 = amax(&l[..vocab]);
+        p0 += 1;
+    }
+    let (l_step, rows_step) = stepped.expect("finished");
+    assert_eq!(
+        rows_step, rows_block,
+        "stepped prefill covered different rows"
+    );
+    let same = l_step
+        .iter()
+        .zip(&l_block)
+        .all(|(a, b)| a.to_bits() == b.to_bits());
+    assert!(
+        same,
+        "the stepped lane's logits differ from the blocking path's (units {units})"
+    );
+    assert!(
+        !Generator::encoding_pending(&m),
+        "a finished job stayed held"
+    );
+    eprintln!(
+        "MM STEPS OK: {rows_step} rows in {units} units with slot 0 decoding between them == \
+         the blocking pass, bit for bit"
+    );
 }

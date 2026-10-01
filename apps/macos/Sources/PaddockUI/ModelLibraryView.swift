@@ -96,14 +96,15 @@ struct ModelLibraryView: View {
     VStack(alignment: .leading, spacing: 0) {
       VStack(spacing: 14) {
         search
-        if purpose == .speech {
+        if purpose != .all {
           HStack {
-            Label("Speech to text", systemImage: "microphone")
+            Label(purpose.rawValue, systemImage: purpose == .speech ? "microphone" : "tablecells")
             Spacer(minLength: 4)
             Button("Show all models") { purpose = .all }
               .buttonStyle(.plain).foregroundStyle(.secondary)
           }.font(.system(size: 11))
-            .accessibilityIdentifier("model-speech-filter")
+            .accessibilityIdentifier(
+              purpose == .speech ? "model-speech-filter" : "model-tables-filter")
         }
         HStack(spacing: 8) {
           Dropdown(title: "Collection", value: downloadedOnly ? "On this Mac" : "All models") {

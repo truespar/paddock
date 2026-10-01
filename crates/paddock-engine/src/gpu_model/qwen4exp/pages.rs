@@ -83,12 +83,11 @@ pub(super) fn plan_pool(
         kv_plan::Reserve::new("graph pools + headroom", graph_headroom),
         kv_plan::Reserve::new("the pool's spare block", block_bytes),
     ];
-    let (mut ckpt_blocks, mut retention, mut ckpt) = (0, 0, None);
+    let (mut ckpt_blocks, mut retention, mut ppc) = (0, 0, None);
     if let Some(cb) = ckpt_bytes {
-        let ppc = cb.div_ceil(block_bytes.max(1)) as usize;
-        let (must, want) = crate::ckpt_pages::page_demand(slots, ppc, CKPTS_PER_SLOT);
-        (ckpt_blocks, retention) = (must, want);
-        ckpt = Some((((must + want) / ppc.max(1)).max(1) as u32, ppc));
+        let p = cb.div_ceil(block_bytes.max(1)) as usize;
+        let (must, want) = crate::ckpt_pages::page_demand(slots, p, CKPTS_PER_SLOT);
+        (ckpt_blocks, retention, ppc) = (must, want, Some(p));
         // a walk's in-walk cuts stage flat (two a walk) before they commit
         // into pages
         reserves.push(kv_plan::Reserve::new("checkpoint staging", 2 * cb));
@@ -118,6 +117,15 @@ pub(super) fn plan_pool(
         .plan(grant)
         .map_err(|w| GpuModelError::WontFit(w.message))?;
     plan.report(&demand, grant);
+    // The index space is bookkeeping, not memory: how many checkpoints exist
+    // at once is whatever pages the live contexts leave free, so it allows as
+    // many as the pool could ever hold (the qwen35 / nemotron sizing). It
+    // used to be the plan's guaranteed + wanted count - 16 at two slots -
+    // and that cap, not memory, is what bound: a 2 x 262K agentic soak stole
+    // a checkpoint on every allocation with ~20K pool pages (68 checkpoints'
+    // worth) free, and a conversation's newest turns lost the cut their next
+    // turn resumes from (2026-09-30: 61 steals, 0 free indices each time).
+    let ckpt = ppc.map(|p| ((plan.pool_blocks / p).max(1) as u32, p));
     Ok(PoolPlan {
         blocks: plan.pool_blocks + 1,
         ckpt,

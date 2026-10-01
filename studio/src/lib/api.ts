@@ -4,6 +4,7 @@
 
 import type { Conversation } from '@/types/chat'
 import type { ReadDoc, ReadSummary } from '@/lib/reads'
+import type { TableSession, TableSummary } from '@/lib/table-history'
 import { orderedRunQuestions } from '@/lib/reads'
 import { DEFAULT_PARAMS } from '@/types/chat'
 import { useModelsStore } from '@/stores/models'
@@ -54,6 +55,22 @@ async function jbody<T>(url: string, method: string, body?: unknown): Promise<T>
     throw new Error(msg || `HTTP ${r.status}`)
   }
   return data as T
+}
+
+export const tableHistoryApi = {
+  list: () => jget<TableSummary[]>('/api/table-history'),
+  async get(id: string): Promise<{ doc: TableSession; revision: string }> {
+    const reply = await jget<{ doc: string; revision: string }>(`/api/table-history/${encodeURIComponent(id)}`)
+    const doc = JSON.parse(reply.doc) as TableSession
+    if (doc.version !== 1 || doc.id !== id || !Array.isArray(doc.runs) || typeof doc.datasets?.[doc.draft?.dataset] !== 'string') {
+      throw new Error('Unsupported table session')
+    }
+    return { doc, revision: reply.revision }
+  },
+  save: (doc: TableSession, revision: string) => jbody<TableSummary>(
+    `/api/table-history/${encodeURIComponent(doc.id)}?revision=${encodeURIComponent(revision)}`, 'PUT', doc),
+  remove: (id: string, revision: string) => jbody<void>(
+    `/api/table-history/${encodeURIComponent(id)}?revision=${encodeURIComponent(revision)}`, 'DELETE'),
 }
 
 // ── GPU telemetry (/api/gpu) ────────────────────────────────────────────────
@@ -766,6 +783,11 @@ export const readHistoryApi = {
 export const readsPreferencesApi = {
   get: () => jget<{ readsPanelOpen?: boolean }>('/api/settings'),
   save: (open: boolean) => jbody('/api/settings', 'PUT', { readsPanelOpen: open }),
+}
+
+export const tablesPreferencesApi = {
+  get: () => jget<{ tablesPanelOpen?: boolean }>('/api/settings'),
+  save: (open: boolean) => jbody('/api/settings', 'PUT', { tablesPanelOpen: open }),
 }
 
 // ── MCP tool approvals ──────────────────────────────────────────────────────

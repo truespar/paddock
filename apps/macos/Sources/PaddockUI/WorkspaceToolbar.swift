@@ -35,12 +35,20 @@ struct WorkspaceToolbar: ToolbarContent {
     }.flatChrome()
     ToolbarItem(placement: .navigation) {
       Button {
-        if navigation.mode == .studio { onNewChat() } else { navigation.returnToChat() }
+        if navigation.mode == .studio && navigation.studio == .tables {
+          Task { await model.tables.newSession() }
+        } else if navigation.mode == .studio {
+          onNewChat()
+        } else {
+          navigation.returnToChat()
+        }
       } label: {
         Image(systemName: navigation.mode == .studio ? "square.and.pencil" : "arrow.left")
           .frame(width: 28, height: 28)
       }.buttonStyle(QuietButtonStyle()).foregroundStyle(.secondary)
-        .accessibilityLabel(navigation.mode == .studio ? "New chat" : "Back to chat")
+        .accessibilityLabel(
+          navigation.mode == .studio
+            ? (navigation.studio == .tables ? "New table" : "New chat") : "Back to chat")
     }.flatChrome()
     if !navigation.showsSidebar {
       ToolbarItem(placement: .navigation) {

@@ -73,6 +73,7 @@ import {
   PhStack,
   PhStop,
   PhSun,
+  PhTable,
   PhTerminalWindow,
   PhThermometerSimple,
   PhTrash,
@@ -117,6 +118,7 @@ const MAP: Record<string, Component> = {
   'arrow-up': PhArrowUp,
   // Reads: a fixed list of questions, each answered - the checklist glyph.
   'list-checks': PhListChecks,
+  table: PhTable,
   'git-branch': PhGitBranch,
   'corner-down-right': PhArrowElbowDownRight,
   // the grab handle on a reorderable row (six dots, the platform idiom)

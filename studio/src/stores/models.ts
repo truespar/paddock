@@ -8,7 +8,7 @@ import { isHarmony, isVisionModel } from '@/lib/model-caps'
 import { realtimeEnrichment, type RealtimeTranscriptionCaps } from '@/lib/audio-policy'
 import { DEFAULT_MAX_QUESTIONS, DEFAULT_MAX_SAMPLES, type StructuredReadCaps } from '@/lib/reads'
 
-export type ModelKind = 'chat' | 'encoder' | 'transcriber' | 'aligner' | 'image' | 'reader'
+export type ModelKind = 'chat' | 'encoder' | 'transcriber' | 'aligner' | 'image' | 'reader' | 'tabular'
 
 /** Can this kind hold a lane in the chat surface - i.e. does it ANSWER a user
  *  turn? Chat models reply in text, transcribers reply with a transcript; both
@@ -481,9 +481,47 @@ interface RunnerRow {
   /** decision-model runner (Laya): /v1/systemone and nothing else - it reads,
    *  it never chats */
   reader?: string | null
+  /** tabular predictor (Kumo-Tabular): /v1/tabular/* and nothing else -
+   *  labelled rows in, the missing column out; it never chats */
+  tabular?: string | null
   display?: string | null
   vendor?: string | null
   status?: string
+}
+
+/** The model a runner row serves, whichever role it is in (null: none yet). */
+function rowId(r: RunnerRow): string | null {
+  return r.model ?? r.embedder ?? r.asr ?? r.aligner ?? r.reader ?? r.tabular ?? r.image ?? null
+}
+
+/** A runner row as a picker entry. `prev` is the entry this id had before the
+ *  rebuild: its caps-fetched fields survive, and an 'unreachable' flap keeps
+ *  the last real status (the supervisor's health call misses under load). */
+function rowModel(r: RunnerRow, prev: ModelInfo | undefined): ModelInfo {
+  const raw = r.status ?? 'unknown'
+  return {
+    id: rowId(r) as string,
+    ownedBy: 'paddock',
+    display: r.display ?? undefined,
+    vendor: r.vendor ?? undefined,
+    port: r.port,
+    kind: r.model
+      ? 'chat'
+      : r.embedder
+        ? 'encoder'
+        : r.asr
+          ? 'transcriber'
+          : r.aligner
+            ? 'aligner'
+            : r.reader
+              ? 'reader'
+              : r.tabular
+                ? 'tabular'
+                : 'image',
+    status: raw === 'unreachable' && prev?.status ? prev.status : raw,
+    vision: prev?.vision,
+    spec: r.spec ?? undefined,
+  }
 }
 
 /**
@@ -671,6 +709,8 @@ export const useModelsStore = defineStore('models', () => {
         embedder?: string
         /** a decision model (Laya): it reads and serves nothing else */
         reader?: string
+        /** a tabular predictor (Kumo): tables in, predictions out */
+        tabular?: { model: string } | null
       }
       const c = parseCaps(body)
       // A runner answers /server before its model attaches, and caching that
@@ -682,7 +722,17 @@ export const useModelsStore = defineStore('models', () => {
       // and there is none while the runner just loads. `capsPending` is the
       // composer's honest signal for this exact window: confirmed loading,
       // not merely unfetched.
-      if (!(body.model || body.asr || body.embedder || body.aligner || body.image_model || body.reader)) {
+      if (
+        !(
+          body.model ||
+          body.asr ||
+          body.embedder ||
+          body.aligner ||
+          body.image_model ||
+          body.reader ||
+          body.tabular
+        )
+      ) {
         retry()
         return hit ?? c
       }
@@ -871,10 +921,11 @@ export const useModelsStore = defineStore('models', () => {
    *  switches to audio input rather than offering a text box that would earn
    *  a refusal. An aligner cannot either: it annotates transcripts, full stop.
    *  Nor can an image model: it answers a prompt with a picture, on its own
-   *  page. */
+   *  page - and a tabular predictor takes rows, never a turn (the Tables
+   *  page). */
   function canChat(id: string): boolean {
     const kind = models.value.find((m) => m.id === id)?.kind
-    return kind !== 'transcriber' && kind !== 'aligner' && kind !== 'image'
+    return kind !== 'transcriber' && kind !== 'aligner' && kind !== 'image' && kind !== 'tabular'
   }
 
   /** Whether this model makes pictures from a prompt: the endpoint's fetched
@@ -987,33 +1038,8 @@ export const useModelsStore = defineStore('models', () => {
   function integrateRunnerRows(rows: RunnerRow[]): void {
     const prevById = new Map(models.value.map((m) => [m.id, m]))
     const local: ModelInfo[] = rows
-      .filter((r) => r.model || r.embedder || r.asr || r.aligner || r.image || r.reader)
-      .map((r) => {
-        const id = (r.model ?? r.embedder ?? r.asr ?? r.aligner ?? r.reader ?? r.image) as string
-        const prev = prevById.get(id)
-        const raw = r.status ?? 'unknown'
-        return {
-          id,
-          ownedBy: 'paddock',
-          display: r.display ?? undefined,
-          vendor: r.vendor ?? undefined,
-          port: r.port,
-          kind: r.model
-            ? ('chat' as const)
-            : r.embedder
-              ? ('encoder' as const)
-              : r.asr
-                ? ('transcriber' as const)
-                : r.aligner
-                  ? ('aligner' as const)
-                  : r.reader
-                    ? ('reader' as const)
-                    : ('image' as const),
-          status: raw === 'unreachable' && prev?.status ? prev.status : raw,
-          vision: prev?.vision,
-          spec: r.spec ?? undefined,
-        }
-      })
+      .filter((r) => rowId(r))
+      .map((r) => rowModel(r, prevById.get(rowId(r) as string)))
     const cloud = models.value.filter((m) => m.cloud)
     const next = [...local, ...cloud]
     const sig = (m: { port?: number; status?: string }) => `${m.port ?? ''}:${m.status ?? ''}`
@@ -1077,33 +1103,8 @@ export const useModelsStore = defineStore('models', () => {
       // whose tools never changed - smooth it over with the last real status.
       const prevById = new Map(models.value.map((m) => [m.id, m]))
       const local: ModelInfo[] = rows
-        .filter((r) => r.model || r.embedder || r.asr || r.aligner || r.image || r.reader)
-        .map((r) => {
-          const id = (r.model ?? r.embedder ?? r.asr ?? r.aligner ?? r.reader ?? r.image) as string
-          const prev = prevById.get(id)
-          const raw = r.status ?? 'unknown'
-          return {
-            id,
-            ownedBy: 'paddock',
-            display: r.display ?? undefined,
-            vendor: r.vendor ?? undefined,
-            port: r.port,
-            kind: r.model
-              ? ('chat' as const)
-              : r.embedder
-                ? ('encoder' as const)
-                : r.asr
-                  ? ('transcriber' as const)
-                  : r.aligner
-                    ? ('aligner' as const)
-                    : r.reader
-                      ? ('reader' as const)
-                      : ('image' as const),
-            status: raw === 'unreachable' && prev?.status ? prev.status : raw,
-            vision: prev?.vision,
-            spec: r.spec ?? undefined,
-          }
-        })
+        .filter((r) => rowId(r))
+        .map((r) => rowModel(r, prevById.get(rowId(r) as string)))
       // Cloud models join the one list. Keyless endpoints require an explicit
       // no-auth choice (custom local servers); absence of a key alone is not
       // permission to send. Vision

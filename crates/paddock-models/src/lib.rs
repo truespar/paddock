@@ -16,6 +16,7 @@ pub mod gpu_support;
 pub mod granite;
 pub mod hadamard;
 pub mod hardening;
+pub mod kumo;
 pub mod kv_tier_geom;
 pub mod laya;
 pub mod mapped;

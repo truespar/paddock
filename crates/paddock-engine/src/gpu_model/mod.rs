@@ -8,6 +8,7 @@ pub mod dinov3;
 pub mod gemma4;
 pub mod gpt_oss;
 pub mod granite;
+pub mod kumo;
 pub mod laguna;
 pub mod laya;
 pub mod nemotron;

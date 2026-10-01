@@ -1,69 +1,83 @@
-# Paddock 0.1.11
+# Paddock 0.1.12
 
-A memory release: the Qwen 3.5-3.8 models, Nemotron and Qwen 3.8 Flash-Next
-fit more context on the same card, and long agent conversations resume from
-the cache on every turn. Nemotron gains speculative decoding for agent
-traffic and decodes long contexts much faster. Windows x64, Linux x64 and the
-NVIDIA DGX Spark. NVIDIA GPUs, driver 580 or newer. The macOS pre-release for
-Apple Silicon is built from the same commit.
+A tables release: Kumo Tabular, NVIDIA's model that predicts a missing
+column from labelled rows, runs natively on NVIDIA GPUs and on the Mac, with
+a Tables page in the Studio and the Mac app. Requests with many images or
+long audio use far less memory, Gemma 4 no longer fails on the DGX Spark and
+RTX 50-series cards with an f16 KV cache, and long Qwen 3.8 Flash-Next
+prompts prefill several times faster. Windows x64, Linux x64 and the NVIDIA
+DGX Spark. NVIDIA GPUs, driver 580 or newer. The macOS pre-release for Apple
+Silicon is built from the same commit.
 
 ## New
 
-- **More context on the same card.** The resume points a long conversation
-  picks up from used to take a fixed reserve before the context got any
-  memory - on a 24 GB card that alone held a 27B model to about 21K tokens
-  at one request. They now live inside the context cache itself and hand
-  their memory back as a conversation grows. Measured on the same card and
-  budget: Qwen 3.5 9B went from 23.8K to 41.6K tokens. This covers the
-  Qwen 3.5-3.8 hybrids, Nemotron and Qwen 3.8 Flash-Next; a roomy card still
-  keeps just as many resume points as before.
+- **Kumo Tabular.** Give it labelled rows and it predicts the missing column
+  of new ones - a class with its confidence, or a number with an 80% range -
+  with no training: the labelled rows are read in context on every call.
+  Small, medium and large, each for classification and for regression, in
+  the F32 weights NVIDIA ships, behind the same `/v1/tabular/predictions`
+  API on NVIDIA GPUs and on the Mac.
 
-- **Qwen 3.8 Flash-Next's cache is paged.** Its memory is now planned inside
-  the endpoint's budget (it used to take fixed amounts whatever the budget
-  said), and a cached prefix is shared instead of copied, so resumed turns
-  reach their first token 10-12% sooner.
-
-- **Nemotron speculates on agent traffic** with its DFlash and DSpark
-  drafters, including sampled and tool-calling requests and any number of
-  concurrent requests. On the DGX Spark, tool-carrying sampled requests went
-  from 80 to 118 tokens/s. DSpark, NVIDIA's recommended Spark drafter, is in
-  the catalog.
+- **Tables in the Studio and the Mac app.** Paste or open a CSV, pick the
+  column to predict, and the rows with it empty come back filled in; copy
+  the result as CSV, or see the equivalent curl. Every table and its runs
+  are saved and shared between the web Studio and the Mac app, and each
+  table has its own link.
 
 ## Improved
 
-- **Nemotron decodes long contexts about four times faster** - 12.5 to 49.8
-  tokens/s at 259K.
+- **Pictures cost far less memory.** The images in a prompt are encoded as
+  each prefill pass needs them, into memory the plan sets aside, instead of
+  all at once and held twice. On the DGX Spark an 18K-token prompt with a
+  picture peaks 1.3 GB above idle instead of 13.6 GB. This covers the Qwen
+  3.5-3.8 models, Gemma 4, Granite Vision and PaddleOCR-VL.
 
-- **Long Nemotron agent conversations resume from the cache on every turn.**
-  Past about 140K tokens every turn used to start over from the system
-  prompt.
+- **A Qwen prompt with pictures no longer pauses other conversations** while
+  its pictures are read: on the DGX Spark the longest pause another session
+  saw went from 15.4 s to 3.3 s.
 
-- **Bonsai runs faster on the DGX Spark**, with its ternary weights on the
-  tensor cores at every batch size and an fp8 KV cache by default.
+- **Long audio clips use a fixed amount of memory** in Qwen3-ASR and Granite
+  Speech, with the same transcript as before.
+
+- **Qwen 3.8 Flash-Next prefills long prompts much faster** on its NVFP4
+  versions - a 16.5K-token document question on the DGX Spark went from
+  85 s to under 15 s - keeps its prefix cache across agent sessions, and an
+  exact re-send of a long prompt resumes from its last walk instead of from
+  the start.
+
+- **An idle server hands the memory it freed back** instead of holding it
+  until the next request.
+
+- **Quieter logs.** A warning now means a client was held up or a real
+  fallback happened; long prompts and normal startup no longer warn.
 
 ## Fixed
 
-- **A Qwen 3.8 Flash-Next reply generated while speculating keeps its resume
-  points**, so the next turn picks up at the end of the reply instead of
-  reading the whole reply again.
+- **A Qwen 3.8 server on the DGX Spark could run out of memory after about a
+  day:** startup set aside up to 20 GB it never used. Under memory pressure
+  the system now stops the runner, not the manager.
 
-- **A vision or drafter file beside the weights is checked against the model
-  before it loads.** A folder several models share no longer hands one model
-  another's file, and a mismatched file named in the configuration is
-  refused with the reason.
+- **Gemma 4 with an f16 KV cache failed every request on the DGX Spark and
+  RTX 50-series cards.** It now serves there.
 
-- **A `vram_budget` written in GiB instead of MiB is refused** with the value
-  it should have been.
+- **A long Gemma 4 prompt with a picture could get a wrong answer** when the
+  picture fell across two prefill passes.
 
-- **Prefill on the DGX Spark** no longer fails for the Qwen 3.5-3.8
-  full-attention layers with an fp8 KV cache.
+- **Safetensors checkpoints start from the Studio.** The NVFP4 and FP8
+  versions of Qwen 3.8 Flash-Next, Nemotron and Granite were refused when
+  started from the Studio.
+
+- **Switching Vision off switches it off.** A vision file beside the model
+  is no longer loaded anyway, and saving the endpoint through the Advanced
+  tab keeps Vision off.
+
+- **The start form offers document and image features only to models that
+  chat.**
 
 ## macOS (pre-release)
 
-- Laya runs natively on Metal, with the native Reads page.
-- Qwen 3.8 Flash-Next runs faster on Metal and reuses cached prefixes across
-  agent turns.
-- Qwen agent-turn resume points are kept on Metal.
+- Kumo Tabular runs natively on Metal, with a native Tables workspace.
+- Qwen 3.8 Flash-Next decodes and prefills faster on Metal.
 
 ## Known
 
@@ -73,9 +87,11 @@ Apple Silicon is built from the same commit.
   calibrated:** the English checkpoint ships an out-of-range temperature for
   that case, which Paddock clamps, as Laya's own server does.
 
-- **Switching Vision off does not unload the image tower** when its file sits
-  beside the model: the model still answers images, and the memory estimate
-  does not count the tower (about 0.9 GB).
+- **Kumo Tabular predicts up to ten classes.**
+
+- **On Qwen 3.8 Flash-Next's NVFP4 versions a greedy speculative reply can
+  part from plain decoding at a near tie** - the same model with slightly
+  different numerics, not a wrong answer.
 
 - On-demand loading covers Whisper only.
 

@@ -3495,6 +3495,74 @@ struct KernelTableV1 {
                                   const void*, const void*, uint32_t, const void*, const void*,
                                   void*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
                                   uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
+    // 697: q4x_ple_rows (raw, out, fmt, scale, rows, width, row_bytes, stream) -
+    // decode n-gram rows the host staged raw off the table's mapping (fmt:
+    // qwen4exp.cuh). Pure append.
+    int (*q4x_ple_rows)(const void*, void*, uint32_t, float, uint32_t, uint32_t, uint32_t,
+                        void*);
+    // 698-708: Kumo-Tabular, F32 throughout (kumo.cuh). Pure append.
+    // 698: kumo_gemm (x, w, bias, y, y2, K, N, M, mode, batch, x_bs, w_bs, y_bs, stream)
+    int (*kumo_gemm)(const void*, const void*, const void*, void*, void*, uint32_t, uint32_t,
+                     uint32_t, uint32_t, uint32_t, uint64_t, uint64_t, uint64_t, void*);
+    // 699: kumo_norm (a, b, w, res, y, D, rows, len, stride, period, stream)
+    int (*kumo_norm)(const void*, const void*, const void*, void*, void*, uint32_t, uint32_t,
+                     uint32_t, uint32_t, uint32_t, void*);
+    // 700: kumo_heads (x, freq, y, H, hd, seq, vecs, rope, stream)
+    int (*kumo_heads)(const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                      uint32_t, void*);
+    // 701: kumo_scale (q, head_scale, gate, n, hd, H, klen, stream)
+    int (*kumo_scale)(void*, const void*, const void*, uint64_t, uint32_t, uint32_t, uint32_t,
+                      void*);
+    // 702: kumo_attention (q, k, v, out, H, hd, batch, qlen, klen, kvh, q_brows, qkvh, q0,
+    // qcount, stream)
+    int (*kumo_attention)(const void*, const void*, const void*, void*, uint32_t, uint32_t,
+                          uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                          uint32_t, void*);
+    // 703: kumo_fourier (x, means, cat, num_freq, cat_freq, out, R, C, stream)
+    int (*kumo_fourier)(const void*, const void*, const void*, const void*, const void*, void*,
+                        uint32_t, uint32_t, void*);
+    // 704: kumo_cell_weights (cat, nw, cw, out, C, D, stream)
+    int (*kumo_cell_weights)(const void*, const void*, const void*, void*, uint32_t, uint32_t,
+                             void*);
+    // 705: kumo_cell_bias (out, x, cat, nb, cb, missing, target, y, R, C, D, nc, cls, stream)
+    int (*kumo_cell_bias)(void*, const void*, const void*, const void*, const void*, const void*,
+                          const void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                          uint32_t, void*);
+    // 706: kumo_rows (cells, cls, rows, R, C, D, dir, stream)
+    int (*kumo_rows)(void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 707: kumo_labels (x, y, target, D, nc, cls, stream)
+    int (*kumo_labels)(void*, const void*, const void*, uint32_t, uint32_t, uint32_t, void*);
+    // 708: kumo_copy (src, dst, rows, width, src_stride, dst_stride, period, stream)
+    int (*kumo_copy)(const void*, void*, uint32_t, uint32_t, uint64_t, uint64_t, uint32_t, void*);
+    // 709-713: Kumo's fused passes (kumo.cuh). Pure append.
+    // 709: kumo_stats (a, b, res, inv, D, rows, period, stream)
+    int (*kumo_stats)(const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, void*);
+    // 710: kumo_gemm_fused (x, w, bias, y, y2, K, N, M, mode, ainv, aw, alen, astride, hd, seq,
+    // rope, hs, klen, stream)
+    int (*kumo_gemm_fused)(const void*, const void*, const void*, void*, void*, uint32_t, uint32_t,
+                           uint32_t, uint32_t, const void*, const void*, uint32_t, uint32_t,
+                           uint32_t, uint32_t, const void*, const void*, uint32_t, void*);
+    // 711: kumo_qgate (q, g0w, g0b, g2w, g2b, head_scale, vecs, hd, H, klen, stream)
+    int (*kumo_qgate)(void*, const void*, const void*, const void*, const void*, const void*,
+                      uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 712: kumo_rows_stats (cells, cls, rows, inv, R, C, D, dir, stream)
+    int (*kumo_rows_stats)(void*, void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 713: kumo_rope_table (freq, table, half, seq, stream)
+    int (*kumo_rope_table)(const void*, void*, uint32_t, uint32_t, void*);
+    // 714-717: Kumo's ensemble members in one pass (kumo.cuh). Pure append.
+    // 714: kumo_fourier_m (x, means, cat, num_freq, cat_freq, out, R, C, rpm, stream)
+    int (*kumo_fourier_m)(const void*, const void*, const void*, const void*, const void*, void*,
+                          uint32_t, uint32_t, uint32_t, void*);
+    // 715: kumo_cell_weights_m (cat, nw, cw, out, C, D, E, stream)
+    int (*kumo_cell_weights_m)(const void*, const void*, const void*, void*, uint32_t, uint32_t,
+                               uint32_t, void*);
+    // 716: kumo_cell_bias_m (out, x, cat, nb, cb, missing, target, y, R, C, D, nc, cls, rpm, stream)
+    int (*kumo_cell_bias_m)(void*, const void*, const void*, const void*, const void*, const void*,
+                            const void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                            uint32_t, uint32_t, void*);
+    // 717: kumo_labels_m (x, y, target, D, nc, cls, rpm, E, stream)
+    int (*kumo_labels_m)(void*, const void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                         uint32_t, void*);
 };
 
 } // extern "C"

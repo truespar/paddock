@@ -1483,6 +1483,7 @@ enum PrefillOptimization {
     SharedInput,
     JoinedInput,
     VectorGateUp,
+    PairedGateUp,
     DecodeFusion,
     CombineNorm,
     DirectAttention,
@@ -1504,6 +1505,12 @@ fn flash_next_mlx_combine_norm_execution_cost() {
 #[ignore = "full checkpoint and watchdog; singleton expert fusion exact vocabularies and rotated costs"]
 fn flash_next_mlx_vector_gate_up_execution_cost() {
     prefill_optimization_execution_cost(PrefillOptimization::VectorGateUp, false);
+}
+
+#[test]
+#[ignore = "checkpoint-backed paired expert reuse, unchanged incoming optimizations and exact full vocabulary"]
+fn flash_next_mlx_paired_gate_up_execution_cost() {
+    prefill_optimization_execution_cost(PrefillOptimization::PairedGateUp, false);
 }
 
 #[test]
@@ -1698,6 +1705,7 @@ fn prefill_optimization_execution_cost(comparison: PrefillOptimization, long: bo
             affine::JOINED_INPUT_FOR_TEST.with(|v| v.set(true));
             affine::JOINED_SLAB_FOR_TEST.with(|v| v.set(false));
             moe::VECTOR_GATE_UP_FOR_TEST.with(|v| v.set(true));
+            moe::PAIRED_GATE_UP_FOR_TEST.with(|v| v.set(true));
             super::super::residual::HC_VECTOR_FOR_TEST.with(|v| v.set(true));
             super::super::residual::HC_UP_FOR_TEST.with(|v| v.set(true));
         }
@@ -1726,8 +1734,10 @@ fn prefill_optimization_execution_cost(comparison: PrefillOptimization, long: bo
         let fusion = matches!(comparison, PrefillOptimization::DecodeFusion);
         let combine_norm = matches!(comparison, PrefillOptimization::CombineNorm);
         let direct_attention = matches!(comparison, PrefillOptimization::DirectAttention);
+        let paired = matches!(comparison, PrefillOptimization::PairedGateUp);
         let vector = fusion || matches!(comparison, PrefillOptimization::VectorGateUp);
-        let direct = direct_attention
+        let direct = paired
+            || direct_attention
             || combine_norm
             || vector
             || joined
@@ -1741,25 +1751,34 @@ fn prefill_optimization_execution_cost(comparison: PrefillOptimization, long: bo
         } else {
             3
         };
-        for round in 0..if joined && !long { 9 } else { 3 } {
+        for round in 0..if (joined || paired) && !long { 9 } else { 3 } {
             for index in 0..routes {
                 let route = (index + round) % routes;
-                qsa::DIRECT_RUNS_FOR_TEST.with(|v| v.set(direct_attention && route == 1));
+                qsa::DIRECT_RUNS_FOR_TEST
+                    .with(|v| v.set(paired || (direct_attention && route == 1)));
                 super::super::residual::HC_COMBINE_NORM_FOR_TEST
-                    .with(|v| v.set(combine_norm && route == 1));
+                    .with(|v| v.set(paired || (combine_norm && route == 1)));
                 forward::CACHE_ONLY_TAIL_FOR_TEST.with(|v| v.set(!cache_only || route == 1));
                 affine::SHARED_INPUT_FOR_TEST.with(|v| v.set(shared && route == 1));
                 affine::JOINED_INPUT_FOR_TEST.with(|v| {
-                    v.set(direct_attention || combine_norm || vector || (joined && route == 1))
+                    v.set(
+                        paired
+                            || direct_attention
+                            || combine_norm
+                            || vector
+                            || (joined && route == 1),
+                    )
                 });
                 moe::VECTOR_GATE_UP_FOR_TEST.with(|v| v.set(!vector || route == 1));
+                moe::PAIRED_GATE_UP_FOR_TEST.with(|v| v.set(paired && route == 1));
                 super::super::residual::HC_VECTOR_FOR_TEST.with(|v| v.set(!fusion || route == 1));
                 super::super::residual::HC_UP_FOR_TEST.with(|v| v.set(!fusion || route == 1));
                 affine::STAGED_ROUTER_FOR_TEST.with(|v| v.set(!router || route == 1));
                 moe::EXPERT_ROWS64_FOR_TEST.with(|v| v.set(wide && route == 1));
                 moe::DIRECT_EXPERT_FOR_TEST.with(|v| {
                     v.set(
-                        direct_attention
+                        paired
+                            || direct_attention
                             || combine_norm
                             || vector
                             || joined
@@ -1844,11 +1863,173 @@ fn prefill_optimization_execution_cost(comparison: PrefillOptimization, long: bo
                     "round":round,"route":route,"prefill_gpu_seconds":prefill_gpu,
                     "gather_comparison":gather,"prompt_tokens":full_tokens+512,
                     "comparison":format!("{comparison:?}"),
-                    "warmup":joined && !long && round < 2,
+                    "warmup":(joined || paired) && !long && round < 2,
                     "gpu_seconds":gpu,"wall_seconds":started.elapsed().as_secs_f64(),
                     "full_logits_exact":true,"allocated":allocated})
                 );
             }
+        }
+    }
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; matched-token c=1 execution versus the installed oMLX adapter, not serving"]
+fn flash_next_mlx_fixed_work_cost() {
+    fixed_work_cost(0);
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; counter-free encoder granularity A/B and exact vocabulary"]
+fn flash_next_mlx_encoder_granularity_cost() {
+    fixed_work_cost(1);
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; bounded-thread pipeline compilation A/B and exact vocabulary"]
+fn flash_next_mlx_pipeline_thread_limit_cost() {
+    fixed_work_cost(2);
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; grouped prompt chunks retain logical contractions, full vocabulary A/B"]
+fn flash_next_mlx_grouped_prompt_cost() {
+    fixed_work_cost(3);
+}
+
+fn fixed_work_cost(experiment: u8) {
+    use crate::device::{ISOLATE_ENCODERS_FOR_TEST, LIMIT_PIPELINE_THREADS_FOR_TEST};
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ISOLATE_ENCODERS_FOR_TEST.with(|v| v.set(false));
+            LIMIT_PIPELINE_THREADS_FOR_TEST.with(|v| v.set(false));
+            prompt::GROUPED_PROMPT_FOR_TEST.with(|v| v.set(false));
+        }
+    }
+    let _reset = Reset;
+    let profile = std::env::var_os("PADDOCK_METAL_PROFILE").is_some();
+    assert!(experiment == 0 || !profile, "A/B must not use counters");
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+    let budget = std::env::var("PADDOCK_FLASH_NEXT_TEST_BUDGET_BYTES")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let fixtures: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(std::env::var("PADDOCK_FLASH_NEXT_PREFIX_FIXTURES").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let seed = fixtures["prompts"][0]["token_ids"].as_array().unwrap();
+    assert!(!seed.is_empty());
+    let continuation = (100..132u32).collect::<Vec<_>>();
+    LIMIT_PIPELINE_THREADS_FOR_TEST.with(|v| v.set(experiment == 2));
+    // One allocation for both controls. Wider scratch is elected only inside
+    // the existing grant, with unchanged residency and retained-prefix count.
+    prompt::GROUPED_PROMPT_FOR_TEST.with(|v| v.set(experiment == 3));
+    let mut m = FlashNext::load(Path::new(&path), 16384, 1, Some(budget)).unwrap();
+    if experiment == 3 {
+        assert_eq!(m.capacity, 2048);
+    }
+    m.prefix.clear(&mut m.pool);
+    let _prefix = std::mem::take(&mut m.prefix);
+    for length in if profile {
+        vec![4096]
+    } else {
+        vec![4096, 8192]
+    } {
+        let ids = seed
+            .iter()
+            .cycle()
+            .take(length)
+            .map(|t| u32::try_from(t.as_u64().unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        assert!(ids.iter().all(|&t| (t as usize) < VOCAB));
+        eprintln!(
+            "FLASH_FIXED_INPUT {}",
+            serde_json::json!({"length":length,"ids":ids,"continuation":continuation})
+        );
+        let mut reference = None;
+        for (round, isolate) in (0..if profile { 2 } else { 4 }).flat_map(|round| {
+            if experiment != 0 {
+                vec![(round, round % 2 == 1), (round, round % 2 != 1)]
+            } else {
+                vec![(round, false)]
+            }
+        }) {
+            ISOLATE_ENCODERS_FOR_TEST.with(|v| v.set(experiment == 1 && isolate));
+            LIMIT_PIPELINE_THREADS_FOR_TEST.with(|v| v.set(experiment == 2 && isolate));
+            m.reset();
+            m.slots[0].plan = prompt::Plan::grid(length, MLX_CHUNK);
+            let mut waves = Vec::new();
+            let mut gpu = 0.;
+            let started = std::time::Instant::now();
+            let physical_chunk = if experiment == 3 && isolate {
+                2048
+            } else {
+                MLX_CHUNK
+            };
+            for offset in (0..length - 1).step_by(physical_chunk) {
+                let end = (offset + physical_chunk).min(length - 1);
+                let rows = (offset..end)
+                    .map(|p| (0, ids[p], p as u32))
+                    .collect::<Vec<_>>();
+                let wave = std::time::Instant::now();
+                if experiment == 3 && isolate {
+                    m.execute_planned(&rows, &[]).unwrap();
+                } else {
+                    m.execute(&rows, &[]).unwrap();
+                }
+                waves.push(wave.elapsed().as_secs_f64() * 1000.);
+                gpu += m.last_gpu_seconds;
+            }
+            ISOLATE_ENCODERS_FOR_TEST.with(|v| v.set(false));
+            LIMIT_PIPELINE_THREADS_FOR_TEST.with(|v| v.set(false));
+            let first = m
+                .execute(&[(0, ids[length - 1], (length - 1) as u32)], &[0])
+                .unwrap();
+            gpu += m.last_gpu_seconds;
+            let prefill_ms = started.elapsed().as_secs_f64() * 1000.;
+            let mut logits = first.clone();
+            let mut decode_ms = Vec::new();
+            let mut decode_gpu_ms = Vec::new();
+            for (step, &token) in continuation.iter().enumerate() {
+                let begin = std::time::Instant::now();
+                let output = m
+                    .execute(&[(0, token, (length + step) as u32)], &[0])
+                    .unwrap();
+                decode_ms.push(begin.elapsed().as_secs_f64() * 1000.);
+                decode_gpu_ms.push(m.last_gpu_seconds * 1000.);
+                logits.extend(output);
+            }
+            assert_eq!(logits.len(), VOCAB * (1 + continuation.len()));
+            assert!(logits.iter().all(|x| x.is_finite()));
+            let signature = blake3::hash(
+                &logits
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            );
+            if let Some(previous) = reference {
+                assert_eq!(signature, previous, "repeated execution changed vocabulary");
+            }
+            reference = Some(signature);
+            let first_greedy = first
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(&a.0)))
+                .unwrap()
+                .0;
+            eprintln!(
+                "FLASH_FIXED_COST {}",
+                serde_json::json!({"engine":"paddock","length":length,"chunk":MLX_CHUNK,
+                    "round":round,"mode":if profile {"stages"} else if round == 0 {"warm"} else {"control"},
+                    "isolated_prefill":experiment == 1 && isolate,"encoder_comparison":experiment == 1,
+                    "limited_threads":experiment == 2 && isolate,"pipeline_comparison":experiment == 2,
+                    "physical_chunk":physical_chunk,"grouped_prompt_comparison":experiment == 3,
+                    "prefill_ms":prefill_ms,"prefill_gpu_ms":gpu*1000.,"prefill_wave_ms":waves,
+                    "decode_ms":decode_ms,"decode_gpu_ms":decode_gpu_ms,
+                    "full_logits_blake3":signature.to_hex().to_string(),"repeat_exact":true,
+                    "first_greedy":first_greedy,"allocated_bytes":m.device.allocated_bytes()})
+            );
         }
     }
 }
@@ -1918,11 +2099,29 @@ fn flash_next_mlx_prefill_stage_attribution() {
 #[test]
 #[ignore = "full checkpoint and watchdog; unequal message-tail contractions, full vocabulary bits and rotated GPU costs"]
 fn flash_next_mlx_packed_message_tail_execution_cost() {
+    message_tail_execution_cost(false, false);
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; shared unpacking against packed-wide, complete vocabulary and rotated costs"]
+fn flash_next_mlx_shared_unpack_tail_execution_cost() {
+    message_tail_execution_cost(true, false);
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; routed prompt fusion with unchanged shared experts and full vocabulary"]
+fn flash_next_mlx_routed_prompt_execution_cost() {
+    message_tail_execution_cost(false, true);
+}
+
+fn message_tail_execution_cost(reuse: bool, prompt_fusion: bool) {
     use super::super::affine;
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
             affine::PACKED_WIDE_FOR_TEST.with(|v| v.set(true));
+            affine::ROW_REUSE_FOR_TEST.with(|v| v.set(true));
+            super::super::moe::PROMPT_GATE_UP_FOR_TEST.with(|v| v.set(4));
         }
     }
     let _reset = Reset;
@@ -1935,13 +2134,19 @@ fn flash_next_mlx_packed_message_tail_execution_cost() {
     let allocated = m.device.allocated_bytes();
     for slots in [1, 4] {
         let mut expected = None;
+        let routes = if prompt_fusion { 4 } else { 2 };
         for round in 0..3 {
-            for index in 0..2 {
-                let packed = (index + round) % 2 == 1;
-                affine::PACKED_WIDE_FOR_TEST.with(|v| v.set(packed));
+            for index in 0..routes {
+                let route = (index + round) % routes;
+                let packed = route == 1;
+                affine::PACKED_WIDE_FOR_TEST.with(|v| v.set(prompt_fusion || packed || reuse));
+                affine::ROW_REUSE_FOR_TEST.with(|v| v.set(prompt_fusion || (packed && reuse)));
+                super::super::moe::PROMPT_GATE_UP_FOR_TEST
+                    .with(|v| v.set(if prompt_fusion { route as u8 } else { 4 }));
                 m.reset();
                 m.prefix.clear(&mut m.pool);
                 let step = if slots == 1 { 1024 } else { 512 };
+                let mut prefill_gpu = 0.;
                 for offset in (0..2048).step_by(step) {
                     let rows = (0..slots)
                         .flat_map(|s| {
@@ -1951,6 +2156,7 @@ fn flash_next_mlx_packed_message_tail_execution_cost() {
                         .collect::<Vec<_>>();
                     m.execute_contracts(&rows, &[], Some(&vec![1024; slots]))
                         .unwrap();
+                    prefill_gpu += m.last_gpu_seconds;
                 }
                 let lengths = [12, 9, 14, 12];
                 let rows = (0..slots)
@@ -1976,6 +2182,7 @@ fn flash_next_mlx_packed_message_tail_execution_cost() {
                     .collect::<Vec<_>>();
                 let tail_gpu = m.last_gpu_seconds;
                 let tail_wall = began.elapsed().as_secs_f64();
+                let mut decode_gpu = 0.;
                 for step in 0..8 {
                     let rows = (0..slots)
                         .map(|s| (s, 100 + s as u32 * 17 + step, m.slots[s].length as u32))
@@ -1986,6 +2193,7 @@ fn flash_next_mlx_packed_message_tail_execution_cost() {
                             .into_iter()
                             .map(f32::to_bits),
                     );
+                    decode_gpu += m.last_gpu_seconds;
                 }
                 if let Some(expected) = &expected {
                     assert!(
@@ -1999,7 +2207,8 @@ fn flash_next_mlx_packed_message_tail_execution_cost() {
                 eprintln!(
                     "FLASH_PACKED_TAIL {}",
                     serde_json::json!({"slots":slots,"round":round,
-                    "packed":packed,"tail_gpu_seconds":tail_gpu,"tail_wall_seconds":tail_wall,
+                    "packed":packed,"shared_unpack_comparison":reuse,"prompt_fusion":prompt_fusion,"route":route,"tail_gpu_seconds":tail_gpu,"tail_wall_seconds":tail_wall,
+                    "prefill_gpu_seconds":prefill_gpu,"decode_step_gpu_seconds":decode_gpu/8.,
                     "rows":rows.len(),"logical_rows":&lengths[..slots],"full_logits_exact":true,"allocated":allocated})
                 );
             }
@@ -2067,6 +2276,174 @@ fn flash_next_mlx_tail_classes_preserve_cold_logits() {
         eprintln!(
             "FLASH_TAIL_CLASS source={source_len} target={target_len} reused={reused} full_logits_exact=true"
         );
+    }
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; rotated prompt-fusion costs from identical restored GPU state"]
+fn flash_next_mlx_routed_prompt_restored_execution_cost() {
+    routed_prompt_restored_cases(0);
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; production prompt-fusion election versus previous runner arithmetic"]
+fn flash_next_mlx_routed_prompt_qualified_execution_cost() {
+    routed_prompt_restored_cases(1);
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; medium vector tails, extended ordering versus identical restored state"]
+fn flash_next_mlx_routed_prompt_order_range_cost() {
+    routed_prompt_restored_cases(2);
+}
+
+fn routed_prompt_restored_cases(experiment: u8) {
+    use super::super::moe;
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            moe::PROMPT_GATE_UP_FOR_TEST.with(|v| v.set(4));
+            moe::EXTENDED_ORDER_FOR_TEST.with(|v| v.set(true));
+        }
+    }
+    let _reset = Reset;
+    let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
+    let budget = std::env::var("PADDOCK_FLASH_NEXT_TEST_BUDGET_BYTES")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut m = FlashNext::load(Path::new(&path), 4096, 4, Some(budget)).unwrap();
+    let allocated = m.device.allocated_bytes();
+    for slots in [1, 4] {
+        m.reset();
+        m.prefix.clear(&mut m.pool);
+        let tokens = |slot: usize, length: usize| {
+            (0..length)
+                .map(|p| 1000 + p as u32 + slot as u32 * 17)
+                .collect::<Vec<_>>()
+        };
+        let step = if slots == 1 { 1024 } else { 512 };
+        for offset in (0..2048).step_by(step) {
+            let rows = (0..slots)
+                .flat_map(|s| {
+                    (offset..offset + step)
+                        .map(move |p| (s, 1000 + p as u32 + s as u32 * 17, p as u32))
+                })
+                .collect::<Vec<_>>();
+            m.execute_contracts(&rows, &[], Some(&vec![1024; slots]))
+                .unwrap();
+        }
+        for slot in 0..slots {
+            let prompt = tokens(slot, 2049);
+            m.slots[slot].plan = prompt::Plan::grid(prompt.len(), 1024);
+            m.capture_prefix(slot, &prompt).unwrap();
+        }
+        let cases: &[[usize; 4]] = if experiment == 2 {
+            &[
+                [128, 1, 1, 1],
+                [129, 1, 1, 1],
+                [160, 1, 1, 1],
+                [192, 4, 4, 4],
+                [204, 1, 1, 1],
+                [96, 32, 32, 32],
+            ]
+        } else {
+            &[
+                [7, 7, 7, 7],
+                [12, 9, 14, 12],
+                [32, 17, 24, 23],
+                [96, 1, 1, 1],
+                [128, 32, 32, 32],
+            ]
+        };
+        for lengths in cases {
+            let mut expected = None;
+            let mut expected_decode = None;
+            let routes: &[usize] = match experiment {
+                1 => &[0, 4],
+                2 => &[0, 1],
+                _ => &[0, 1, 2, 3],
+            };
+            for round in 0..7 {
+                for index in 0..routes.len() {
+                    let route = routes[(index + round) % routes.len()];
+                    moe::PROMPT_GATE_UP_FOR_TEST.with(|v| {
+                        v.set(if experiment == 2 { 4 } else { route as u8 });
+                    });
+                    moe::EXTENDED_ORDER_FOR_TEST.with(|v| v.set(experiment == 2 && route == 1));
+                    m.reset();
+                    for (slot, &length) in lengths[..slots].iter().enumerate() {
+                        let prompt = tokens(slot, 2048 + length + 1);
+                        m.slots[slot].plan = prompt::Plan::grid(prompt.len(), 1024);
+                        assert_eq!(m.restore_prefix(slot, &prompt).unwrap(), 2048);
+                    }
+                    let rows = (0..slots)
+                        .flat_map(|s| {
+                            (2048..2048 + lengths[s])
+                                .map(move |p| (s, 1000 + p as u32 + s as u32 * 17, p as u32))
+                        })
+                        .collect::<Vec<_>>();
+                    let mut end = 0;
+                    let outputs = lengths[..slots]
+                        .iter()
+                        .map(|n| {
+                            end += n;
+                            end - 1
+                        })
+                        .collect::<Vec<_>>();
+                    let began = std::time::Instant::now();
+                    let logits = m
+                        .execute_contracts(&rows, &outputs, Some(&lengths[..slots]))
+                        .unwrap()
+                        .into_iter()
+                        .map(f32::to_bits)
+                        .collect::<Vec<_>>();
+                    let wall = began.elapsed().as_secs_f64();
+                    if let Some(expected) = &expected {
+                        assert!(
+                            &logits == expected,
+                            "vocabulary changed: slots={slots} round={round} route={route}"
+                        );
+                    } else {
+                        expected = Some(logits);
+                    }
+                    assert_eq!(m.device.allocated_bytes(), allocated);
+                    let tail_gpu_seconds = m.last_gpu_seconds;
+                    if experiment == 2 {
+                        let mut hash = blake3::Hasher::new();
+                        for step in 0..8 {
+                            let rows = (0..slots)
+                                .map(|slot| {
+                                    (
+                                        slot,
+                                        100 + step + slot as u32,
+                                        (2048 + lengths[slot]) as u32 + step,
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                            let logits = m.execute(&rows, &(0..slots).collect::<Vec<_>>()).unwrap();
+                            for value in logits {
+                                hash.update(&value.to_bits().to_le_bytes());
+                            }
+                        }
+                        if let Some(expected) = expected_decode {
+                            assert_eq!(
+                                hash.finalize(),
+                                expected,
+                                "continuation state changed: slots={slots} round={round} route={route}"
+                            );
+                        } else {
+                            expected_decode = Some(hash.finalize());
+                        }
+                        assert_eq!(m.device.allocated_bytes(), allocated);
+                    }
+                    eprintln!(
+                        "FLASH_RESTORED_PROMPT {}",
+                        serde_json::json!({"slots":slots,"round":round,"route":route,"experiment":experiment,"logical_rows":&lengths[..slots],"tail_gpu_seconds":tail_gpu_seconds,"wall_seconds":wall,"full_logits_exact":true,"decode_steps":if experiment==2 {8} else {0},"allocated":allocated})
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -2217,6 +2594,22 @@ fn flash_next_mlx_canonical_prefill_diagnostic() {
 #[test]
 #[ignore = "full checkpoint and watchdog; message-prefix full vocabularies, natural follow-ups and mixed arrivals"]
 fn flash_next_mlx_message_prefix_generations() {
+    message_prefix_generations(0);
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; grouped prefill natural-EOS, prefix restores, arrivals and cancellation"]
+fn flash_next_mlx_grouped_prompt_generations() {
+    message_prefix_generations(1);
+}
+
+#[test]
+#[ignore = "full checkpoint and watchdog; extended expert order natural-EOS, prefix restores, arrivals and cancellation"]
+fn flash_next_mlx_extended_order_generations() {
+    message_prefix_generations(2);
+}
+
+fn message_prefix_generations(experiment: u8) {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -2227,11 +2620,16 @@ fn flash_next_mlx_message_prefix_generations() {
             forward::PLE_LOOKAHEAD_FOR_TEST.with(|v| v.set(false));
             forward::ADAPTIVE_PLE_FOR_TEST.with(|v| v.set(true));
             super::super::moe::VECTOR_GATE_UP_FOR_TEST.with(|v| v.set(true));
+            super::super::moe::PAIRED_GATE_UP_FOR_TEST.with(|v| v.set(true));
+            super::super::moe::PROMPT_GATE_UP_FOR_TEST.with(|v| v.set(4));
             super::super::residual::HC_VECTOR_FOR_TEST.with(|v| v.set(true));
             super::super::residual::HC_UP_FOR_TEST.with(|v| v.set(true));
             super::super::affine::PACKED_WIDE_FOR_TEST.with(|v| v.set(true));
+            super::super::affine::ROW_REUSE_FOR_TEST.with(|v| v.set(true));
             super::super::residual::HC_COMBINE_NORM_FOR_TEST.with(|v| v.set(true));
             super::super::qsa::DIRECT_RUNS_FOR_TEST.with(|v| v.set(true));
+            prompt::GROUPED_PROMPT_FOR_TEST.with(|v| v.set(false));
+            super::super::moe::EXTENDED_ORDER_FOR_TEST.with(|v| v.set(true));
         }
     }
     let _reset = Reset;
@@ -2244,11 +2642,16 @@ fn flash_next_mlx_message_prefix_generations() {
     forward::PLE_LOOKAHEAD_FOR_TEST.with(|v| v.set(false));
     forward::ADAPTIVE_PLE_FOR_TEST.with(|v| v.set(false));
     super::super::moe::VECTOR_GATE_UP_FOR_TEST.with(|v| v.set(false));
+    super::super::moe::PAIRED_GATE_UP_FOR_TEST.with(|v| v.set(false));
+    super::super::moe::PROMPT_GATE_UP_FOR_TEST.with(|v| v.set(0));
     super::super::residual::HC_VECTOR_FOR_TEST.with(|v| v.set(false));
     super::super::residual::HC_UP_FOR_TEST.with(|v| v.set(false));
     super::super::affine::PACKED_WIDE_FOR_TEST.with(|v| v.set(false));
+    super::super::affine::ROW_REUSE_FOR_TEST.with(|v| v.set(false));
     super::super::residual::HC_COMBINE_NORM_FOR_TEST.with(|v| v.set(false));
     super::super::qsa::DIRECT_RUNS_FOR_TEST.with(|v| v.set(false));
+    prompt::GROUPED_PROMPT_FOR_TEST.with(|v| v.set(false));
+    super::super::moe::EXTENDED_ORDER_FOR_TEST.with(|v| v.set(false));
     let path = std::env::var("PADDOCK_FLASH_NEXT_MLX_MODEL").unwrap();
     let fixtures: serde_json::Value = serde_json::from_slice(
         &std::fs::read(std::env::var("PADDOCK_FLASH_NEXT_PREFIX_FIXTURES").unwrap()).unwrap(),
@@ -2330,7 +2733,23 @@ fn flash_next_mlx_message_prefix_generations() {
         (5, true),
         (6, false),
         (6, true),
-    ] {
+        (7, false),
+        (7, true),
+        (8, false),
+        (8, true),
+        (9, false),
+        (9, true),
+        (10, false),
+        (10, true),
+        (11, false),
+        (11, true),
+    ]
+    .into_iter()
+    .filter(|(mode, _)| match experiment {
+        1 => matches!(mode, 9 | 10),
+        2 => matches!(mode, 9 | 11),
+        _ => true,
+    }) {
         super::super::affine::SHARED_INPUT_FOR_TEST.with(|v| v.set(experimental == 1));
         forward::PLE_LOOKAHEAD_FOR_TEST.with(|v| v.set(experimental == 1));
         forward::ADAPTIVE_PLE_FOR_TEST.with(|v| v.set(experimental >= 2));
@@ -2340,14 +2759,48 @@ fn flash_next_mlx_message_prefix_generations() {
         super::super::residual::HC_VECTOR_FOR_TEST.with(|v| v.set(experimental >= 4));
         super::super::residual::HC_UP_FOR_TEST.with(|v| v.set(experimental >= 4));
         super::super::affine::PACKED_WIDE_FOR_TEST.with(|v| v.set(experimental >= 5));
-        super::super::residual::HC_COMBINE_NORM_FOR_TEST.with(|v| v.set(experimental == 6));
-        super::super::qsa::DIRECT_RUNS_FOR_TEST.with(|v| v.set(experimental == 6));
+        super::super::residual::HC_COMBINE_NORM_FOR_TEST.with(|v| v.set(experimental >= 6));
+        super::super::qsa::DIRECT_RUNS_FOR_TEST.with(|v| v.set(experimental >= 6));
+        super::super::affine::ROW_REUSE_FOR_TEST.with(|v| v.set(experimental >= 7));
+        super::super::moe::PAIRED_GATE_UP_FOR_TEST.with(|v| v.set(experimental >= 8));
+        super::super::moe::PROMPT_GATE_UP_FOR_TEST
+            .with(|v| v.set(if experimental >= 9 { 4 } else { 0 }));
+        prompt::GROUPED_PROMPT_FOR_TEST.with(|v| v.set(experimental == 10));
+        super::super::moe::EXTENDED_ORDER_FOR_TEST.with(|v| v.set(experimental == 11));
         m.reset();
         m.prefix.clear(&mut m.pool);
         if warm {
             for (slot, source) in sources.iter().enumerate() {
                 m.prefill(slot, source).unwrap();
             }
+        }
+        // Cold single-user execution must also exercise same-slot grouping;
+        // concurrent grants alone can fill the arena with one chunk per slot.
+        if experiment != 0 {
+            for (slot, target) in targets.iter().enumerate() {
+                m.reset();
+                let first = m.prefill(0, target).unwrap();
+                let result = generate(&mut m, first);
+                assert_eq!(result.0, expected[slot].0);
+                assert!(
+                    result
+                        .1
+                        .iter()
+                        .flatten()
+                        .map(|v| v.to_bits())
+                        .eq(expected[slot].1.iter().flatten().map(|v| v.to_bits()))
+                );
+            }
+            m.reset();
+            m.prefix.clear(&mut m.pool);
+            if warm {
+                for (slot, source) in sources.iter().enumerate() {
+                    m.prefill(slot, source).unwrap();
+                }
+            }
+            eprintln!(
+                "FLASH_SERIAL_GENERATIONS experimental={experimental} warm={warm} exact=4/4 full_vocabularies=true natural_eos=true"
+            );
         }
         m.reset();
         let mut actual = vec![Vec::new(); 4];
@@ -2540,7 +2993,23 @@ fn mlx_prefill_capacity_preserves_explicit_cache_budget() {
 
 #[test]
 fn mlx_wide_upgrade_preserves_residency_retention_and_grant() {
-    let (context, batch, weights, ple) = (256, 4, 1u64 << 30, 1u64 << 29);
+    wide_upgrade_preserves_grant(4);
+}
+
+#[test]
+fn mlx_grouped_prompt_upgrade_preserves_residency_retention_and_grant() {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            prompt::GROUPED_PROMPT_FOR_TEST.with(|v| v.set(self.0));
+        }
+    }
+    let _reset = Reset(prompt::GROUPED_PROMPT_FOR_TEST.with(|v| v.replace(true)));
+    wide_upgrade_preserves_grant(1);
+}
+
+fn wide_upgrade_preserves_grant(batch: usize) {
+    let (context, weights, ple) = (256, 1u64 << 30, 1u64 << 29);
     let (cache, scratch) = FlashNext::mlx_memory_rows(context, batch, MLX_CHUNK).unwrap();
     let entries = batch * 2;
     let cache = cache + prefix::PrefixCache::bytes(context, entries);
@@ -2588,7 +3057,7 @@ fn mlx_file_backed_ple_preserves_grant_and_wide_prefill() {
         assert!(paged);
         assert_eq!(
             rows,
-            if batch > 1 && d.tensor_accelerated() {
+            if (batch > 1 || prompt::grouping()) && d.tensor_accelerated() {
                 super::super::affine::MAX_ROWS
             } else {
                 MLX_CHUNK

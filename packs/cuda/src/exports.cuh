@@ -631,6 +631,22 @@ extern "C" int pd_q4x_qsa_logits_paged(const void*, const void*, const void*, co
 extern "C" int pd_q4x_qsa_logits_mma_paged(const void*, const void*, const void*, const void*, const void*, uint32_t, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_q4x_qsa_attn_paged(const void*, const void*, const void*, const void*, const void*, const void*, uint32_t, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
 extern "C" int pd_q4x_qsa_attn_mma_paged(const void*, const void*, const void*, const void*, const void*, const void*, uint32_t, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
+extern "C" int pd_q4x_ple_rows(const void*, void*, uint32_t, float, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_kumo_gemm(const void*, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint64_t, uint64_t, uint64_t, void*);
+extern "C" int pd_kumo_norm(const void*, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_kumo_heads(const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_kumo_scale(void*, const void*, const void*, uint64_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_kumo_attention(const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_kumo_fourier(const void*, const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, void*);
+extern "C" int pd_kumo_cell_weights(const void*, const void*, const void*, void*, uint32_t, uint32_t, void*);
+extern "C" int pd_kumo_cell_bias(void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_kumo_rows(void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_kumo_labels(void*, const void*, const void*, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_kumo_copy(const void*, void*, uint32_t, uint32_t, uint64_t, uint64_t, uint32_t, void*);
+extern "C" int pd_kumo_stats(const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_kumo_gemm_fused(const void*, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, const void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t, const void*, const void*, uint32_t, void*);
+extern "C" int pd_kumo_qgate(void*, const void*, const void*, const void*, const void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+extern "C" int pd_kumo_rows_stats(void*, void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_nvf4_moe_gu_swiglu_bs(const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_gated_delta_recurrent_runs_slots(const void*, const void*, const void*, const void*, const void*, void*, void*, const void*, const void*, const void*, const void*, const void*, float, uint32_t, uint32_t, uint32_t, void*);
 extern "C" int pd_bf16_hc_perm_pad(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
@@ -1750,6 +1766,27 @@ static const KernelTableV1 PD_KERNELS = {
     pd_q4x_qsa_logits_mma_paged,
     pd_q4x_qsa_attn_paged,
     pd_q4x_qsa_attn_mma_paged,
+    pd_q4x_ple_rows,
+    pd_kumo_gemm,
+    pd_kumo_norm,
+    pd_kumo_heads,
+    pd_kumo_scale,
+    pd_kumo_attention,
+    pd_kumo_fourier,
+    pd_kumo_cell_weights,
+    pd_kumo_cell_bias,
+    pd_kumo_rows,
+    pd_kumo_labels,
+    pd_kumo_copy,
+    pd_kumo_stats,
+    pd_kumo_gemm_fused,
+    pd_kumo_qgate,
+    pd_kumo_rows_stats,
+    pd_kumo_rope_table,
+    pd_kumo_fourier_m,
+    pd_kumo_cell_weights_m,
+    pd_kumo_cell_bias_m,
+    pd_kumo_labels_m,
 };
 
 PD_EXPORT const PackInfo* paddock_pack_info(void) {

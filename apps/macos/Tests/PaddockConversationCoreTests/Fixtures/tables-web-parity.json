@@ -1,0 +1,236 @@
+[
+  {
+    "task": "classification",
+    "text": "size,city,label\n1,a,yes\n2,b,no\n,a,yes\n4,c,\n5,,\n",
+    "table": {
+      "header": [
+        "size",
+        "city",
+        "label"
+      ],
+      "rows": [
+        [
+          "1",
+          "a",
+          "yes"
+        ],
+        [
+          "2",
+          "b",
+          "no"
+        ],
+        [
+          "",
+          "a",
+          "yes"
+        ],
+        [
+          "4",
+          "c",
+          ""
+        ],
+        [
+          "5",
+          "",
+          ""
+        ]
+      ]
+    },
+    "body": {
+      "preprocessing": "sdm_v1",
+      "context": [
+        [
+          1,
+          "a"
+        ],
+        [
+          2,
+          "b"
+        ],
+        [
+          null,
+          "a"
+        ]
+      ],
+      "targets": [
+        "yes",
+        "no",
+        "yes"
+      ],
+      "query": [
+        [
+          4,
+          "c"
+        ],
+        [
+          5,
+          null
+        ]
+      ],
+      "categorical": [
+        false,
+        true
+      ],
+      "num_estimators": 8,
+      "seed": 7
+    },
+    "contextRows": [
+      0,
+      1,
+      2
+    ],
+    "queryRows": [
+      3,
+      4
+    ],
+    "features": [
+      0,
+      1
+    ],
+    "classes": [
+      "yes",
+      "no"
+    ]
+  },
+  {
+    "task": "regression",
+    "text": "a;b;target\n1,5;2;10\n2,5;3;20\n3,5;4;\n",
+    "table": {
+      "header": [
+        "a",
+        "b",
+        "target"
+      ],
+      "rows": [
+        [
+          "1,5",
+          "2",
+          "10"
+        ],
+        [
+          "2,5",
+          "3",
+          "20"
+        ],
+        [
+          "3,5",
+          "4",
+          ""
+        ]
+      ]
+    },
+    "body": {
+      "preprocessing": "sdm_v1",
+      "context": [
+        [
+          "1,5",
+          2
+        ],
+        [
+          "2,5",
+          3
+        ]
+      ],
+      "targets": [
+        10,
+        20
+      ],
+      "query": [
+        [
+          "3,5",
+          4
+        ]
+      ],
+      "categorical": [
+        true,
+        false
+      ],
+      "num_estimators": 8,
+      "seed": 7
+    },
+    "contextRows": [
+      0,
+      1
+    ],
+    "queryRows": [
+      2
+    ],
+    "features": [
+      0,
+      1
+    ],
+    "classes": []
+  },
+  {
+    "task": "classification",
+    "text": "a\tb\ty\n1\tx\tyes\n2\ty\tno\n3\tz\t\n",
+    "table": {
+      "header": [
+        "a",
+        "b",
+        "y"
+      ],
+      "rows": [
+        [
+          "1",
+          "x",
+          "yes"
+        ],
+        [
+          "2",
+          "y",
+          "no"
+        ],
+        [
+          "3",
+          "z",
+          ""
+        ]
+      ]
+    },
+    "body": {
+      "preprocessing": "sdm_v1",
+      "context": [
+        [
+          1,
+          "x"
+        ],
+        [
+          2,
+          "y"
+        ]
+      ],
+      "targets": [
+        "yes",
+        "no"
+      ],
+      "query": [
+        [
+          3,
+          "z"
+        ]
+      ],
+      "categorical": [
+        false,
+        true
+      ],
+      "num_estimators": 8,
+      "seed": 7
+    },
+    "contextRows": [
+      0,
+      1
+    ],
+    "queryRows": [
+      2
+    ],
+    "features": [
+      0,
+      1
+    ],
+    "classes": [
+      "yes",
+      "no"
+    ]
+  }
+]

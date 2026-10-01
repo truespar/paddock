@@ -44,6 +44,11 @@ THIRD-PARTY-NOTICES  text eol=lf
 # CRLF in Windows working copies when this was pinned).
 crates/paddock-runner/tests/fixtures/*.jinja  text eol=lf
 
+# The Tables examples the macOS app bundles are the same bytes the web Studio
+# builds, and tables.test.ts compares the two exactly - a Windows checkout
+# rewrote the CSVs to CRLF and the parity test failed on files nobody touched.
+apps/macos/Sources/PaddockConversationCore/Resources/*.csv  text eol=lf
+
 # Binary, never touched.
 *.gguf        binary
 *.dll         binary

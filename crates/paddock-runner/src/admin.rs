@@ -57,6 +57,7 @@ async fn identify(State(s): State<Arc<AdminState>>) -> Response {
         aligner: s.app.aligner.as_ref().map(|a| a.id.clone()),
         image: s.app.image.as_ref().map(|m| m.id.clone()),
         reader: s.app.laya.as_ref().map(|m| m.id.clone()),
+        tabular: s.app.tabular.as_ref().map(|m| m.id.clone()),
         started_at_unix: s.started_at_unix,
         instance_id: s.app.instance_id.clone(),
         // the load's own record of what it wired - catalog predictions defer

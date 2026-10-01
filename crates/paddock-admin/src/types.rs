@@ -53,6 +53,12 @@ pub struct Identify {
     /// conversation it cannot have. Optional on the wire for older runners.
     #[serde(default)]
     pub reader: Option<String>,
+    /// Served tabular predictor id (Kumo-Tabular: labelled rows in, the
+    /// missing column predicted, `/v1/tabular/*` and nothing else), if one
+    /// is loaded. The seventh serving role: it takes tables, never a
+    /// conversation. Optional on the wire for older runners.
+    #[serde(default)]
+    pub tabular: Option<String>,
     /// Unix seconds when the runner started. Reset DETECTION only (the
     /// `process_start_time_seconds` job) - never an identity key: it is
     /// second-resolution, and two generations on one port inside the same

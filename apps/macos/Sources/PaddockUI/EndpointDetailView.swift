@@ -26,8 +26,8 @@ struct EndpointDetailView: View {
           PageHeading(title: row.title, subtitle: "Port \(String(port)) · \(row.status)") {
             if let runner = row.runner {
               Button(
-                runner.reader != nil ? "Open Reads" : "Open Studio",
-                systemImage: runner.reader != nil ? "list.bullet.clipboard" : "bubble"
+                runner.studioActionTitle,
+                systemImage: runner.studioActionSymbol
               ) { workspace.request(.chat(port: port)) }
               .buttonStyle(FlatButtonStyle()).disabled(
                 runner.status != "ok" || workspace.desktopNavigationBlocked)

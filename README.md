@@ -31,7 +31,7 @@ and the Studio in one window and our Metal backend running the models. It lives 
 
 ## macOS support (pre-release)
 
-macOS support is available in [v0.1.11](https://github.com/truespar/paddock/releases/tag/v0.1.11)
+macOS support is available in [v0.1.12](https://github.com/truespar/paddock/releases/tag/v0.1.12)
 for Apple Silicon running **macOS 26 or later**. The native app is pre-release;
 expect visual glitches and incomplete features. The native Swift app is under
 active development and is not yet feature-complete.
@@ -118,6 +118,12 @@ Every model below runs on the engine today. Sizes are the checkpoint's own, and
 
 - **Laya** - answers fixed questions about a text (yes or no, pick one, a
   score) with a calibrated probability each; it powers the Studio's Reads page
+
+**Tables**
+
+- **Kumo Tabular** (NVIDIA) - small, medium and large, each for classification
+  and regression: give it labelled rows and it predicts the missing column of
+  new ones, with no training; it powers the Studio's Tables page
 
 **Documents and OCR**
 

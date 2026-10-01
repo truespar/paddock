@@ -41,6 +41,7 @@ pub mod segment;
 pub mod service;
 pub mod spec;
 pub mod spec_policy;
+pub mod tabular;
 pub mod tickseg;
 pub mod transcriber;
 pub mod whisper;

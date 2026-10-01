@@ -131,6 +131,8 @@ pub(crate) fn is_inference_path(path: &str) -> bool {
             | "/v1/segmentations"
             | "/v1/images/generations"
             | "/v1/images/edits"
+            | "/v1/tabular/predictions"
+            | "/v1/tabular/contexts"
     )
 }
 
