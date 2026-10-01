@@ -161,15 +161,19 @@ that reports honestly instead of failing at load.
 **APIs.** OpenAI chat completions, completions, the Responses API, embeddings,
 image generations and edits, and audio transcriptions, live over the Realtime
 WebSocket too; Anthropic messages and token counting; plus reranking, forced
-alignment, the `/v1/systemone` decision call and a Model Context Protocol
-surface. The runner publishes its own `/openapi.json`.
+alignment, the `/v1/systemone` decision call, `/v1/tabular/predictions` for
+NVIDIA's Kumo Tabular (with fitted table contexts that later calls reuse) and a
+Model Context Protocol surface. The runner publishes its own `/openapi.json`.
 
 **Beyond text.** Vision models, image generation and editing, speech
-transcription, reranking, calibrated decisions, and document extraction from
-PDF and Office files.
+transcription, reranking, calibrated decisions, predictions on tables with
+NVIDIA's Kumo Tabular, and document extraction from PDF and Office files.
 
 **Studio.** A built-in web UI for downloading and managing models, running them,
-comparing them side by side, and serving them.
+comparing them side by side, and serving them. Beside the chat it has a Reads
+page, where a decision model answers fixed questions about a text, and a Tables
+page, where Kumo Tabular fills in the missing column of a table you paste or
+open.
 
 Side by side means across the boundary, not just within it: a model running on
 your own box against one behind OpenRouter or any other OpenAI-compatible
