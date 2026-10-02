@@ -1244,6 +1244,20 @@ fn openai_reasoning_family(model: &str) -> bool {
     model.starts_with("gpt-5") || ["o1", "o3", "o4"].iter().any(|p| model.starts_with(p))
 }
 
+fn validate_output_cap(body: &Value) -> Result<(), String> {
+    let Some(value) = body.get("max_output_tokens") else {
+        return Ok(());
+    };
+    if value.is_null() {
+        return Ok(());
+    }
+    value
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+        .map(|_| ())
+        .ok_or_else(|| "max_output_tokens must be a non-negative integer".to_owned())
+}
+
 /// OpenAI native: the Studio's Responses body is the wire format - sanitize
 /// rather than rebuild. Sampling arrives only when the user set a dial (the
 /// sampler popover; untouched means absent), so explicit temperature/top_p
@@ -1251,6 +1265,7 @@ fn openai_reasoning_family(model: &str) -> bool {
 /// families that reject them (the popover says so). top_k and seed don't
 /// exist on the Responses API at all.
 fn openai_body(model: &str, body: &Value) -> Result<Value, String> {
+    validate_output_cap(body)?;
     let mut out = body.clone();
     let obj = out
         .as_object_mut()
@@ -1324,6 +1339,7 @@ fn openrouter_responses_body(
     body: &Value,
     pinned_provider: Option<&str>,
 ) -> Result<Value, String> {
+    validate_output_cap(body)?;
     let mut out = body.clone();
     let obj = out
         .as_object_mut()
@@ -1413,6 +1429,7 @@ fn compat_body(
     pinned_provider: Option<&str>,
     openrouter: bool,
 ) -> Result<Value, String> {
+    validate_output_cap(body)?;
     let mut messages: Vec<Value> = Vec::new();
     if let Some(sys) = body.get("instructions").and_then(Value::as_str)
         && !sys.is_empty()
@@ -1546,6 +1563,7 @@ fn anthropic_adaptive_thinking(model: &str) -> bool {
 /// rejects them, and a compare history can legitimately produce user->user
 /// after failed turns are filtered out).
 fn anthropic_body(model: &str, body: &Value) -> Result<Value, String> {
+    validate_output_cap(body)?;
     let mut messages: Vec<Value> = Vec::new();
     for item in body
         .get("input")
@@ -2034,6 +2052,39 @@ impl AnthropicStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_adapters_reject_malformed_output_caps() {
+        for cap in [json!(1.5), json!(-1), json!("128"), json!(true)] {
+            let body = json!({"model": "m", "input": [], "max_output_tokens": cap});
+            assert!(
+                serde_json::from_value::<paddock_api::responses::ResponsesRequest>(body.clone())
+                    .is_err()
+            );
+            let rejected = [
+                openai_body("m", &body).is_err(),
+                openrouter_responses_body("m", &body, None).is_err(),
+                compat_body("m", &body, None, false).is_err(),
+                anthropic_body("m", &body).is_err(),
+            ];
+            assert_eq!(rejected, [true; 4]);
+        }
+    }
+
+    #[test]
+    fn cloud_adapters_accept_null_or_zero_output_caps() {
+        for cap in [Value::Null, json!(0)] {
+            let body = json!({"model": "m", "input": [], "max_output_tokens": cap});
+            assert!(
+                serde_json::from_value::<paddock_api::responses::ResponsesRequest>(body.clone())
+                    .is_ok()
+            );
+            assert!(openai_body("m", &body).is_ok());
+            assert!(openrouter_responses_body("m", &body, None).is_ok());
+            assert!(compat_body("m", &body, None, false).is_ok());
+            assert!(anthropic_body("m", &body).is_ok());
+        }
+    }
 
     #[test]
     fn bare_model_strips_only_the_known_prefix() {
