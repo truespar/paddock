@@ -131,6 +131,21 @@ public struct StudioState: Decodable, Sendable {
   public let nativeAudioPreview: AudioClip?
   public let markUnsure: Bool?
   public struct Speech: Decodable, Sendable, Equatable {
+    public struct Diarizer: Decodable, Sendable, Equatable {
+      public let id: String
+      public let title: String
+      public let port: Int
+    }
+    public struct Diarization: Decodable, Sendable, Equatable {
+      public struct Interval: Decodable, Sendable, Equatable {
+        public let speaker: Int
+        public let start: Double
+        public let end: Double
+      }
+      public let model: String
+      public let duration: Double
+      public let segments: [Interval]
+    }
     public struct Segment: Decodable, Sendable, Equatable {
       public let start: Double
     }
@@ -142,6 +157,8 @@ public struct StudioState: Decodable, Sendable {
       public let alt: String?
       public let margin: Double?
       public let segment: Int
+      public let speaker: Int?
+      public let speakers: [Int]?
     }
     public struct Fact: Decodable, Sendable, Equatable {
       public let label: String
@@ -161,6 +178,10 @@ public struct StudioState: Decodable, Sendable {
     public let facts: [Fact]
     public let guards: [Guard]
     public let subtitleExport: Bool
+    public let messageId: String?
+    public let conversationId: String?
+    public let diarization: Diarization?
+    public let diarizers: [Diarizer]?
   }
   public struct NativeTranscript: Decodable, Sendable {
     public struct Message: Decodable, Sendable, Identifiable, Equatable {

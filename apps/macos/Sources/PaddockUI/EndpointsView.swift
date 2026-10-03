@@ -160,7 +160,7 @@ struct EndpointsView: View {
 
   private func actions(_ row: EndpointRow) -> some View {
     HStack(spacing: 8) {
-      if row.runner?.status == "ok" {
+      if row.runner?.status == "ok", row.runner?.hasStudioSurface == true {
         Button(
           row.runner?.studioActionTitle ?? "Open Studio",
           systemImage: row.runner?.studioActionSymbol ?? "bubble"

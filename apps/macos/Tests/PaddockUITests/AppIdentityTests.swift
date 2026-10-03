@@ -65,5 +65,6 @@ struct AppIdentityTests {
     #expect(plist["CFBundleName"] as? String == "Paddock")
     #expect(plist["CFBundleDisplayName"] as? String == "Paddock")
     #expect((plist["NSMicrophoneUsageDescription"] as? String)?.isEmpty == false)
+    #expect((plist["NSCameraUsageDescription"] as? String)?.isEmpty == false)
   }
 }

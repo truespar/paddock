@@ -5,6 +5,16 @@ import Testing
 
 @Suite("Rust manager wire contracts")
 struct ContractTests {
+  @Test func diarizationKeepsItsNameWithoutOfferingAChatSurface() throws {
+    let runner = try ManagerWire.decode(
+      RunnerInfo.self,
+      from: Data(
+        #"{"port":11963,"pid":42,"status":"ok","diarization":"Nemotron-3-Diarization-MLX","endpoint":"http://127.0.0.1:11963"}"#
+          .utf8))
+    #expect(runner.title == "Nemotron-3-Diarization-MLX")
+    #expect(runner.diarization != nil)
+    #expect(!runner.hasStudioSurface)
+  }
   @Test func automaticPortsAreOmittedButFixedAddressesRemainExplicit() throws {
     for port: UInt16? in [nil, 12345] {
       let request = CreateEndpointRequest(model: "kb-whisper-large", artifact: "f16", port: port)

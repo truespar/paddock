@@ -191,6 +191,11 @@ export type ContentPart = TextPart | ImagePart | FilePart | AudioPart | GraphPar
  *  it is the same fact twice, and the probability is the one the UI reads. */
 export interface TranscriptWord {
   word: string
+  speaker?: number | null
+  speakers?: number[]
+  speaker_status?: 'assigned' | 'ambiguous' | 'unassigned' | 'untimed'
+  /** Duration fractions, NOT recognition confidence. */
+  speaker_coverage?: number[]
   /** Optional since the alignment enrichment: a word synthesized
    *  from plain text to carry aligner times has no model probability to
    *  report, and inventing one would defeat the point of showing them. Words
@@ -235,6 +240,7 @@ export interface TranscriptSegment {
  *  existing renderer keep working on a transcription turn untouched; this
  *  only ENRICHES the turn with a player, scrub and timings when present. */
 export interface TranscriptMeta {
+  diarization?: SpeakerTimeline
   /** ISO 639-1, as the model detected or the caller forced. */
   language?: string
   /** audio length in seconds, as the server measured it. */
@@ -272,6 +278,14 @@ export interface TranscriptMeta {
    *  answer was - a transcript re-read next year has to still say which four
    *  seconds of it were refused. */
   guards?: TranscriptGuard[]
+}
+
+export interface SpeakerTimeline {
+  model: string
+  duration: number
+  segments: { speaker: number; start: number; end: number }[]
+  preset: string
+  attribution: 'time_overlap_v1'
 }
 
 /** One span of audio whose decode was cut or refused. */

@@ -14,9 +14,11 @@ pub mod align;
 pub mod audio;
 pub mod backend;
 pub mod ckpt_pages;
+pub mod clef_decision;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod decision;
+pub mod diarization;
 pub mod encoder;
 pub mod envset;
 pub mod generator;

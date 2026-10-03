@@ -257,6 +257,69 @@
         }
       }
     },
+    "/v1/audio/diarizations/stream": {
+      "get": {
+        "tags": ["paddock"],
+        "summary": "Live speaker diarization over WebSocket",
+        "operationId": "audioDiarizationStream",
+        "description": "Paddock-native protocol, not OpenAI Realtime transcription. Upgrade with the same runner Bearer authentication. Send binary mono 16-kHz signed PCM16 little-endian messages, 1–16000 samples each, then a JSON text message {\"type\":\"finish\"}. No base64, compressed containers, midstream reconfiguration or resume. Unknown controls and odd/empty binary messages fail. One session is one recording, limited to 600 seconds of audio, 60 seconds without audio, 900 seconds total wall time. Socket output has a ten-second send deadline. All file/live sessions share two admission slots and one owning inference worker; idle sessions do not hold the worker. Disconnect discards its speaker state. In-flight sessions are counted during runner drain.\n\nThe server sends diarization.session (sequence_number=0), one diarization.update per accepted binary message, then exactly one diarization.done after finish. Sequence numbers increase by one, including lookahead-only updates. Updates carry received_samples, frames, finalized_through_seconds, gpu_seconds, completed and active. completed contains newly closed, append-only segments; active is a REPLACEMENT snapshot of at most eight open segments. An open segment keeps its (speaker,start) key until it appears in completed. Do not append active snapshots to history. At done, active is empty and completed flushes the final intervals. Interval seconds use the original untrimmed PCM timeline; overlap is preserved. Sort accumulated completed by (start,speaker) to recover file-result order. No complete recording/timeline is retained by the server.\n\nInput buffering: offline 30.4s, low 1.04s, very_low 0.64s, ultra_low 0.32s, plus 0.006s centered-FFT lookahead and execution time. An error emits diarization.error with sequence_number and error.{type,message}, then closes. No completion is implied after error or disconnect. Message/frame size violations close at the WebSocket protocol layer. File POST remains non-streaming; discovery advertises this separate path under realtime_diarization.",
+        "parameters": [
+          { "name": "model", "in": "query", "schema": { "type": "string" }, "description": "If supplied, must match the served id" },
+          { "name": "preset", "in": "query", "schema": { "type": "string", "enum": ["offline", "low", "very_low", "ultra_low"], "default": "low" } },
+          { "name": "threshold", "in": "query", "schema": { "type": "number", "minimum": 0, "exclusiveMaximum": 1, "default": 0.5 } }
+        ],
+        "responses": {
+          "101": { "description": "WebSocket upgraded; JSON text events and binary PCM input" },
+          "400": { "description": "Invalid query, model role or upgrade" },
+          "401": { "description": "Missing/invalid runner key" },
+          "404": { "description": "Model id mismatch" },
+          "429": { "description": "No session capacity; Retry-After header supplied" },
+          "503": { "description": "Worker unavailable or runner draining; Retry-After supplied" }
+        }
+      }
+    },
+    "/v1/audio/diarizations": {
+      "post": {
+        "tags": ["paddock"],
+        "summary": "Speaker diarization: who spoke when, including overlap",
+        "description": "Paddock-native, not an OpenAI transcription endpoint. Nemotron 3 Diarization serves eight anonymous arrival-order speaker channels at 10-ms resolution. No transcript, named-person recognition or ASR sidecar is implied. A file is processed through bounded speaker-cache/FIFO windows; its timestamps are relative to the original untrimmed audio. This HTTP operation returns one final result, not a live network stream. Limits: 25 MiB multipart body, 0.01–600 seconds of decoded audio, two admitted uploads/jobs. Corrupt or changing audio streams are rejected rather than silently shifting timestamps.",
+        "operationId": "audioDiarizations",
+        "requestBody": {
+          "required": true,
+          "content": { "multipart/form-data": { "schema": {
+            "type": "object", "required": ["file"], "additionalProperties": false,
+            "properties": {
+              "file": { "type": "string", "format": "binary", "description": "WAV, FLAC, MP3, MP4/M4A, OGG or WebM; downmixed and resampled to mono 16 kHz" },
+              "model": { "type": "string", "description": "If supplied, must match the served model ID" },
+              "preset": { "type": "string", "enum": ["offline", "low", "very_low", "ultra_low"], "default": "offline" },
+              "threshold": { "type": "number", "minimum": 0, "exclusiveMaximum": 1, "default": 0.5 },
+              "words": { "type": "string", "description": "Optional JSON array (at most 20000 entries / 2 MiB) of existing ASR word records: word, optional start/end in seconds, other metadata preserved. Finite complete intervals must lie inside this recording. No text recognition or timestamp synthesis. Returned attribution uses duration overlap: speakers contains every channel covering at least half the word; speaker is null unless exactly one qualifies. Silence, untimed and zero-duration words abstain; several candidates are ambiguous, not identified people. speaker_coverage is eight duration fractions, not confidence." }
+            }
+          } } }
+        },
+        "responses": {
+          "200": { "description": "Overlapping speaker segments", "content": { "application/json": { "schema": {
+            "type": "object", "required": ["model", "duration", "frames", "segments", "num_speakers"],
+            "properties": {
+              "model": { "type": "string" }, "duration": { "type": "number" },
+              "frames": { "type": "integer" }, "frame_seconds": { "type": "number", "const": 0.01 },
+              "num_speakers": { "type": "integer", "minimum": 0, "maximum": 8 },
+              "segments": { "type": "array", "items": { "type": "object", "required": ["speaker", "start", "end"], "properties": {
+                "speaker": { "type": "integer", "minimum": 0, "maximum": 7 }, "start": { "type": "number" }, "end": { "type": "number" }
+              } } },
+              "words": { "type": ["array", "null"], "items": { "type": "object" }, "description": "Original word records enriched with speaker, speakers, speaker_status and speaker_coverage; null when not requested" },
+              "attribution": { "const": "time_overlap_v1" },
+              "processing_seconds": { "type": "number" }, "gpu_seconds": { "type": "number", "description": "Measured command time, including the GPU audio frontend" }
+            }
+          } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "404": { "description": "The requested model is not served" },
+          "413": { "description": "The upload exceeds 25 MiB" },
+          "429": { "description": "Shared file/live session admission is full; Retry-After supplied" },
+          "503": { "description": "Worker unavailable or runner draining; Retry-After supplied" }
+        }
+      }
+    },
     "/v1/audio/alignments": {
       "post": {
         "tags": ["paddock"],
@@ -966,6 +1029,7 @@
           "embedder": { "type": ["string", "null"], "description": "Served encoder (embeddings/rerank) model id" },
           "asr": { "type": ["string", "null"], "description": "Served speech-to-text model id" },
           "aligner": { "type": ["string", "null"], "description": "Served forced-alignment model id - POST /v1/audio/alignments works iff set" },
+          "diarization": { "type": ["object", "null"], "description": "Served speaker model and capabilities; POST /v1/audio/diarizations works iff set. This does not enable transcription." },
           "alignment_max_clip_s": { "type": ["number", "null"], "description": "Longest clip one alignment call can address" },
           "structured_read": { "type": ["object", "null"], "description": "POST /v1/systemone works iff set (a block-diffusion model): {canvas_width, max_questions, max_samples, types}" },
           "reranker": { "type": ["boolean", "null"] },

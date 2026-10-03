@@ -829,21 +829,7 @@ pub(crate) fn decode_image_url(
     budget: Option<paddock_engine::generator::VisionBudget>,
     detail: ImageDetail,
 ) -> Result<RequestImage, String> {
-    use base64::Engine as _;
-    let Some(rest) = url.strip_prefix("data:") else {
-        return Err(
-            "only data: image URIs are supported (the server does not fetch remote URLs); \
-             inline the image as base64"
-                .into(),
-        );
-    };
-    let (meta, b64) = rest.split_once(',').ok_or("malformed data: URI")?;
-    if !meta.ends_with(";base64") {
-        return Err("data: image URI must be base64-encoded".into());
-    }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64.trim())
-        .map_err(|e| format!("image base64: {e}"))?;
+    let bytes = crate::reference_image::data_url_bytes(url)?;
     // an actionable refusal: the crate's error names the format it found
     // (or failed to sniff); we add what would work so the client can
     // convert instead of guessing. The HEIF pair is listed only when this

@@ -59,6 +59,9 @@ pub struct Identify {
     /// conversation. Optional on the wire for older runners.
     #[serde(default)]
     pub tabular: Option<String>,
+    /// Audio speaker activity, not a chat or transcription model.
+    #[serde(default)]
+    pub diarization: Option<String>,
     /// Unix seconds when the runner started. Reset DETECTION only (the
     /// `process_start_time_seconds` job) - never an identity key: it is
     /// second-resolution, and two generations on one port inside the same

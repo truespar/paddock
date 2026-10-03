@@ -37,6 +37,11 @@ extension ReadQuestion {
 }
 
 extension ReadDraft {
+  /// The bytes sent to SystemOne are also the exported request. Question order
+  /// is model input for Clef, and option order defines first-maximum ties.
+  public func requestData(model: String) throws -> Data {
+    Data(try orderedJSON(model: model).utf8)
+  }
   public static var example: ReadDraft {
     get throws {
       // The web Studio imports this same request; no independently maintained sample prose.

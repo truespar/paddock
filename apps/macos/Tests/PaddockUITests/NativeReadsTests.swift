@@ -7,6 +7,269 @@ import Testing
 
 @Suite("Native Reads state", .serialized) @MainActor
 struct NativeReadsTests {
+  @Test func cameraFrameWatchdogBoundsFirstFrameAndEstablishedStream() {
+    let start = ContinuousClock.now
+    var clock = NativeReadFrameWatchdog()
+    #expect(clock.failure(at: start, isRunning: false) == nil)
+    clock.start(at: start)
+    #expect(clock.failure(at: start.advanced(by: .seconds(4)), isRunning: true) == nil)
+    #expect(clock.failure(at: start.advanced(by: .seconds(5)), isRunning: true) != nil)
+    clock.received(at: start.advanced(by: .seconds(5)))
+    #expect(clock.failure(at: start.advanced(by: .seconds(6)), isRunning: true) == nil)
+    #expect(clock.failure(at: start.advanced(by: .seconds(7)), isRunning: true) != nil)
+    #expect(clock.failure(at: start.advanced(by: .seconds(6)), isRunning: false) != nil)
+    clock.start(at: start.advanced(by: .seconds(10)))
+    #expect(clock.failure(at: start.advanced(by: .seconds(11)), isRunning: true) == nil)
+  }
+
+  @Test func liveRequestUsesAuthoredOrderAndReorderMakesAnswerStale() async throws {
+    let m = model()
+    await m.refresh()
+    m.draft.state = "A test state"
+    m.draft.questions = ["zebra", "alpha", "middle", "bravo"].map { id in
+      var q = ReadQuestion(questionID: id, kind: .choice)
+      q.instructions = "Choose a category for \(id)"
+      q.options = ["z", "b", "a"].map { ReadQuestion.Option(name: $0, description: "Option \($0)") }
+      return q
+    }
+    let submitted = m.draft
+    var posted: Data?
+    m.readAPI = { port, bytes in
+      #expect(port == 1234)
+      posted = bytes
+      #expect(try ReadDraft.parse(bytes).ordering == submitted.ordering)
+      return .object([
+        "model": .string("diffusion"),
+        "answers": .object(
+          Dictionary(
+            uniqueKeysWithValues: submitted.questions.map {
+              (
+                $0.questionID,
+                ConversationValue.object([
+                  "type": .string("choice"), "choice": .string("z"),
+                  "probabilities": .object(["z": .number(1), "b": .number(0), "a": .number(0)]),
+                  "confidence": .number(1), "agreement": .number(1), "outside": .number(0),
+                ])
+              )
+            })),
+        "diagnostics": try value(
+          #"{"reads":1,"canvas":256,"questions":[],"timing":{"total_ms":1}}"#),
+      ])
+    }
+    m.run()
+    await m.settle()
+    #expect(m.error == nil && m.result != nil && !m.stale)
+    #expect(m.result?.fingerprint == NativeReadsModel.Run.fingerprint(try #require(posted)))
+    m.draft.questions.swapAt(0, 1)
+    #expect(m.stale)
+    m.draft = submitted
+    m.draft.questions[0].options.swapAt(0, 1)
+    #expect(m.stale)
+  }
+
+  @Test func advertisedQuestionLimitSurvivesImportAndHistory() async throws {
+    let m = model()
+    let original = m.api
+    m.api = { path, method, body, query in
+      if path.hasSuffix("1234/server") {
+        return try value(
+          #"{"structured_read":{"backend":"clef","max_questions":256,"max_samples":1,"max_steps":1}}"#
+        )
+      }
+      return try await original(path, method, body, query)
+    }
+    await m.refresh()
+    #expect(m.current?.maxQuestions == 256)
+    var draft = ReadDraft()
+    draft.questions = (0..<256).map { index in
+      var q = ReadQuestion(questionID: "q\(index)", kind: .noul)
+      q.instructions = "Is item \(index) present?"
+      return q
+    }
+    #expect(m.applyJSON(try draft.orderedJSON()))
+    #expect(m.draft.questions.count == 256 && m.validation == nil)
+    let restored = try ReadHistoryDocument.draft(
+      .object(["questions": draft.setBody["questions"]!]))
+    #expect(restored.questions.count == 256)
+    draft.questions.append(ReadQuestion(questionID: "extra", kind: .noul))
+    #expect(!m.applyJSON(try draft.orderedJSON()))
+    #expect(m.draft.questions.count == 256)
+  }
+
+  @Test func liveCameraKeepsOneRequestInFlightAndDiscardsLateClose() async throws {
+    let m = model()
+    let original = m.api
+    var pending: CheckedContinuation<ConversationValue, Error>?
+    var frames = 0
+    var calls = 0
+    m.api = { path, method, body, query in
+      if path.hasSuffix("1234/server") {
+        return try value(
+          #"{"structured_read":{"backend":"clef","images":true,"max_samples":1,"max_steps":1,"think":false}}"#
+        )
+      }
+      if path.hasSuffix("/systemone") {
+        calls += 1
+        return try await withCheckedThrowingContinuation { pending = $0 }
+      }
+      return try await original(path, method, body, query)
+    }
+    await m.refresh()
+    let camera = NativeReadCamera()
+    camera.startLoop(
+      model: m,
+      frame: { side in
+        #expect(side == 512)
+        frames += 1
+        return Data([1])
+      }, visible: { true })
+    for _ in 0..<1000 {
+      if pending != nil { break }
+      await Task.yield()
+    }
+    for _ in 0..<100 { await Task.yield() }
+    #expect(frames == 1 && calls == 1 && camera.live)
+    camera.close()
+    camera.startLoop(
+      model: m,
+      frame: { _ in
+        frames += 1
+        return Data([2])
+      }, visible: { true })
+    for _ in 0..<100 { await Task.yield() }
+    #expect(frames == 1 && calls == 1, "restart must not overlap an uncancelled transport")
+    camera.close()
+    let continuation = try #require(pending)
+    continuation.resume(returning: .object([:]))
+    for _ in 0..<100 { await Task.yield() }
+    #expect(!camera.live && camera.latest == nil && camera.error == nil && m.runs.isEmpty)
+    camera.startLoop(
+      model: m,
+      frame: { _ in
+        frames += 1
+        return Data([1])
+      }, visible: { false })
+    for _ in 0..<100 { await Task.yield() }
+    #expect(frames == 1 && calls == 1)
+    camera.close()
+  }
+  @Test func cameraFrameIsTransientUntilSnapshotAndKeepsEvaluatedPixels() async throws {
+    let m = model()
+    let original = m.api
+    var stored: ConversationValue?
+    var requests = 0
+    let jpeg = Data([0xff, 0xd8, 0xff, 0xd9])
+    m.api = { path, method, body, query in
+      if path.hasSuffix("1234/server") {
+        return try value(
+          #"{"structured_read":{"backend":"clef","images":true,"max_samples":1,"max_steps":1,"think":false,"types":["noul","choice","score"]}}"#
+        )
+      }
+      if path.hasSuffix("/systemone") {
+        requests += 1
+        #expect(
+          body?["images"]
+            == .array([.string("data:image/jpeg;base64," + jpeg.base64EncodedString())]))
+        return try value(
+          #"{"model":"clef-flash","answers":{"q1":{"type":"noul","noul":0.98,"confidence":0.96,"answer_confidence":0.98}},"diagnostics":{"backend":"clef","reads":1,"questions":[],"timing":{"total_ms":12}}}"#
+        )
+      }
+      if path.hasPrefix("api/read-history/") {
+        if method == "PUT" {
+          stored = body
+          return .object(["read": .object(["revision": .string("saved")])])
+        }
+        return .object(["doc": stored!["doc"]!, "revision": .string("saved")])
+      }
+      return try await original(path, method, body, query)
+    }
+    await m.refresh()
+    #expect(m.canReadCamera)
+    let frame = try await m.readCameraFrame(jpeg)
+    #expect(requests == 1 && m.runs.isEmpty && stored == nil)
+    #expect(m.draft.images.isEmpty && frame.pictures.count == 1)
+    await m.keepCameraFrame(frame)
+    #expect(stored != nil && m.runs.count == 1 && m.historyError == nil)
+    let id = try #require(m.activeSession?.id)
+    m.reset()
+    await m.openSession(id)
+    #expect(m.draft.images.first?.url == "data:image/jpeg;base64," + jpeg.base64EncodedString())
+  }
+  @Test func cameraRejectsChangedQuestionsAndTextOnlyReader() async throws {
+    let m = model()
+    await m.refresh()
+    #expect(!m.canReadCamera)
+    do {
+      _ = try await m.readCameraFrame(Data())
+      Issue.record("text-only camera accepted")
+    } catch is ConversationFailure {} catch { Issue.record("unexpected error: \(error)") }
+    let original = m.api
+    m.api = { path, method, body, query in
+      if path.hasSuffix("1234/server") {
+        return try value(
+          #"{"structured_read":{"backend":"clef","images":true,"max_samples":1,"max_steps":1,"think":false}}"#
+        )
+      }
+      if path.hasSuffix("/systemone") {
+        m.draft.state = "changed while inference was pending"
+        return .object([:])
+      }
+      return try await original(path, method, body, query)
+    }
+    await m.refresh()
+    do {
+      _ = try await m.readCameraFrame(Data([1]))
+      Issue.record("stale camera answer accepted")
+    } catch is CancellationError {} catch { Issue.record("unexpected error: \(error)") }
+    #expect(m.runs.isEmpty && m.activeSession == nil)
+  }
+  @Test func clefReaderUsesJointDecisionEndpointAndPreservesHistory() async throws {
+    let m = model()
+    var stored: ConversationValue?
+    m.api = { path, method, body, _ in
+      if path == "api/runners" {
+        return try value(
+          #"[{"port":1234,"reader":"clef-flash","display":"Clef Flash","vendor":"Cloudflare"}]"#)
+      }
+      if path.hasSuffix("/server") {
+        return try value(
+          #"{"structured_read":{"backend":"clef","max_questions":1024,"max_options":4096,"max_samples":1,"max_steps":1,"images":false,"conditional":false,"think":false,"types":["noul","choice","score"],"max_tokens":16384}}"#
+        )
+      }
+      if path.hasSuffix("/systemone") {
+        #expect(body?["model"] == .string("clef-flash"))
+        #expect(body?["samples"] == .string("auto"))
+        #expect(body?["images"] == nil)
+        return try value(
+          #"{"model":"clef-flash","answers":{"q1":{"type":"noul","noul":0.98,"confidence":0.96,"answer_confidence":0.98}},"usage":{"input_tokens":260,"output_tokens":0},"diagnostics":{"backend":"clef","state_tokens":24,"state_read":24,"reads":1,"questions":[],"timing":{"total_ms":300,"gpu_ms":290,"passes":1,"pass_requests":1}}}"#
+        )
+      }
+      if path.hasPrefix("api/read-history/") {
+        if method == "PUT" {
+          stored = body
+          return .object(["read": .object(["revision": .string("saved")])])
+        }
+        return .object(["doc": stored!["doc"]!, "revision": .string("saved")])
+      }
+      return .array([])
+    }
+    await m.refresh()
+    m.draft.state = "The invoice total is 1250 USD."
+    #expect(m.current?.backend == "clef" && m.current?.maxSamples == 1 && m.canRun)
+    #expect(m.current?.checkpoints.isEmpty == true)
+    m.run()
+    await m.settle()
+    #expect(m.error == nil && m.historyError == nil && stored != nil)
+    let id = try #require(m.activeSession?.id)
+    m.reset()
+    await m.openSession(id)
+    #expect(m.result?.response.model == "clef-flash" && !m.stale)
+    m.draft.images = [ReadPicture(name: "x.png", url: "data:image/png;base64,YQ==")]
+    #expect(!m.canRun)
+    m.draft.images = []
+    m.draft.samples = 2
+    #expect(!m.canRun)
+  }
   @Test func layaReaderRoutesAutomaticallyAndKeepsNativeHistory() async throws {
     let m = model()
     var stored: ConversationValue?
@@ -114,6 +377,10 @@ struct NativeReadsTests {
   }
   func model() -> NativeReadsModel {
     let m = NativeReadsModel(client: NativeManager())
+    m.readAPI = { [unowned m] port, bytes in
+      let value = try JSONDecoder().decode(ConversationValue.self, from: bytes)
+      return try await m.api("api/runners/\(port)/v1/systemone", "POST", value, [:])
+    }
     m.api = { path, _, _, _ in
       if path == "api/runners" {
         return try value(

@@ -1224,7 +1224,7 @@ const singlePass = computed(() =>
     // a decision model reads each question in one pass at the checkpoint's
     // own sequence length and packs its own passes, and a tabular predictor
     // reads a whole table in one pass - neither knob exists for either
-    (c) => c === 'image-generation' || c === 'segmentation' || c === 'decision' || c === 'tabular',
+    (c) => c === 'image-generation' || c === 'segmentation' || c === 'decision' || c === 'tabular' || c === 'diarization',
   ),
 )
 const canOffload = computed(() => backend.value !== 'metal' || selectedWeights.value?.kv_offload_supported === true)
@@ -1295,12 +1295,21 @@ const drafterSummary = computed(() => {
 function defaultSpecChoice(): string {
   return defaultSpeculation(catModel.value, selectedWeights.value, drafterArtifact.value)
 }
-// keep the weights choice valid as the model changes: prefer installed, then
-// the catalog default
+// keep the weights choice valid as the model changes - the manager's own
+// election (registry `elect_weights`): the catalog default when it is
+// installed, else any installed build (no download), else the default. Taking
+// the FIRST installed build put a model's other installed weights ahead of
+// its installed default whenever they were listed first (Clef Flash's BF16
+// checkpoint over its Q8_0 default), so the form proposed what `paddock
+// serve` would not
 watch(model, () => {
   const ws = automaticWeights(weightChoices.value)
   if (!ws.some((a) => a.id === artifactId.value)) {
-    artifactId.value = (ws.find((a) => a.installed) ?? ws.find((a) => a.default) ?? ws[0])?.id ?? ''
+    artifactId.value =
+      (ws.find((a) => a.default && a.installed) ??
+        ws.find((a) => a.installed) ??
+        ws.find((a) => a.default) ??
+        ws[0])?.id ?? ''
   }
   // These are per-MODEL facts, so re-derive them rather than carrying the
   // previous model's answer across - but not in edit mode, where the model is
@@ -1336,7 +1345,10 @@ function qualityTitle(a: { label?: string; min_cc?: [number, number] }): string 
  *  distinguishes nothing - which is the only job a blurb on a card has. */
 function qualityBlurb(a: { quant?: string; source?: { repo: string; base_model: string } }): string {
   const q = (a.quant ?? '').toUpperCase()
-  if (q.startsWith('Q8')) return 'Practically identical to the original.'
+  // the 8-bit class: Q8_0 and MLX's affine 8-bit (a scale and a bias per
+  // group) - which fell through to "a smaller build" below, beside a Q8_0
+  // card it is in fact a little larger than
+  if (q.startsWith('Q8') || q.startsWith('MLX-AFFINE-8')) return 'Practically identical to the original.'
   // NVFP4 before the Q4 test: it is four-bit too, but read from a published
   // low-bit checkpoint rather than converted from a bigger file. WHOSE
   // checkpoint is not something the quant tag knows - this line said "the
@@ -1353,6 +1365,9 @@ function qualityBlurb(a: { quant?: string; source?: { repo: string; base_model: 
   if (q.includes('MXFP4')) return 'The format it was trained in - nothing is higher.'
   // Prism ML's ternary packings: the model ships in nothing else
   if (q.startsWith('PTQ') || q.startsWith('PQ2')) return 'Ternary weights - the only build it ships in.'
+  // a float build is the unquantized one - beside a Q8_0 it is the LARGER
+  // card, and "a smaller build" (the fallback) said the opposite
+  if (q === 'BF16' || q === 'F16' || q === 'F32') return 'Full precision - no quantization.'
   return 'A smaller build - some quality for memory.'
 }
 /** Somebody else's conversion, rather than a low-bit file the model's own

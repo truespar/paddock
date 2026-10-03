@@ -3,7 +3,9 @@
 //! the newest llama.cpp release binary serving the identical GGUF
 //! (same-weights reference; no CPU references).
 
+pub mod clef;
 pub mod deepseek_ocr;
+pub mod diarization;
 pub mod dinov3;
 pub mod gemma4;
 pub mod gpt_oss;

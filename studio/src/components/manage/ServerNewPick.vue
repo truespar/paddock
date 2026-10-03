@@ -64,6 +64,7 @@ const CAP_META = [
   // Word timing for an existing transcript (the karaoke enrichment) - like
   // transcription, the chip is the whole of what an aligner does.
   { key: 'alignment', icon: 'clock', label: 'Word timing' },
+  { key: 'diarization', icon: 'microphone', label: 'Speaker timeline' },
   // Typed questions about a text in, a calibrated answer each out - the Reads
   // page's model. It neither chats nor generates, so the chip is all it does.
   { key: 'decision', icon: 'list-checks', label: 'Decisions' },
@@ -141,6 +142,7 @@ function sectionOf(m: CatalogModel): string {
   // An aligner cannot chat either - it times the words of a transcript some
   // other model produced, so it files with the speech tools.
   if (m.capability.includes('alignment')) return 'Speech to text'
+  if (m.capability.includes('diarization')) return 'Speaker timelines'
   // Answers questions with probabilities, never with text of its own.
   if (m.capability.includes('decision')) return 'Decisions'
   // Rows in, predictions out - no text surface at all.
@@ -332,7 +334,7 @@ function configure(m: CatalogModel): void {
                   <span class="c-name__meta">
                     {{ r.m.specs?.params }}<template v-if="r.m.specs?.context">
                       · {{ r.m.specs.context
-                      }}{{ r.m.capability.includes('tabular') ? '' : ' ctx' }}</template>
+                      }}{{ r.m.capability.some(c => c === 'tabular' || c === 'diarization') ? '' : ' ctx' }}</template>
                   </span>
                 </Tooltip>
                 <span v-if="!r.m.installed" class="c-name__get">

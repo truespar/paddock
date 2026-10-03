@@ -17,7 +17,7 @@ export type MetricKey = 'util' | 'mem' | 'power' | 'temp' | 'tok'
 export function gpuMetrics(g?: GpuInfo, hasEngine = false) {
   return [
     { key: 'util', label: 'Util', unit: '%', max: 100, enabled: g?.util_gpu != null },
-    { key: 'mem', label: g?.metal ? 'Allocations' : 'VRAM', unit: '%', max: 100, enabled: !!g?.metal || g?.mem_total != null },
+    { key: 'mem', label: g?.metal ? 'Allocations' : g?.host_memory ? 'Memory' : 'VRAM', unit: '%', max: 100, enabled: !!g?.metal || g?.mem_total != null },
     { key: 'power', label: 'Power', unit: 'W', max: 0, enabled: g?.power_w != null },
     { key: 'temp', label: 'Temp', unit: '°C', max: 100, enabled: g?.temp_c != null },
     { key: 'tok', label: 'tok/s', unit: 'tok/s', max: 0, enabled: hasEngine },

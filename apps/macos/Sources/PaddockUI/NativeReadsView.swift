@@ -15,11 +15,13 @@ struct NativeReadsView: View {
   @State private var confirmExample = false
   @State private var pendingSet: NativeReadsModel.SavedSet?
   @State private var confirmDeleteRead = false
+  @State private var cameraMode = false
+  @State private var camera = NativeReadCamera()
   var body: some View {
     GeometryReader { geometry in
       PaddockScrollView {
         VStack(alignment: .leading, spacing: 18) {
-          header(stacked: geometry.size.width < 600)
+          header(stacked: geometry.size.width < (model.current?.images == true ? 800 : 600))
           if let error = model.error {
             Text(error).foregroundStyle(PaddockStyle.caution).textSelection(.enabled)
               .accessibilityIdentifier("reads-error")
@@ -36,7 +38,9 @@ struct NativeReadsView: View {
               }
             }.frame(maxWidth: .infinity).padding(.vertical, 60)
           }
-          if geometry.size.width >= 1100 {
+          if cameraMode {
+            NativeReadCameraPanel(model: model, camera: camera) { cameraMode = false }
+          } else if geometry.size.width >= 1100 {
             HStack(alignment: .top, spacing: 20) {
               editor.frame(maxWidth: .infinity)
               answers.frame(maxWidth: .infinity)
@@ -89,6 +93,18 @@ struct NativeReadsView: View {
         Button("Cancel", role: .cancel) { pendingSet = nil }
       }
       .accessibilityIdentifier("native-reads")
+      .onChange(of: cameraMode) { _, active in if active { camera.open() } else { camera.close() } }
+      .onChange(of: model.port) { _, _ in
+        camera.pause(clear: true)
+        if model.current?.images != true { cameraMode = false }
+      }
+      .onChange(of: model.current?.images) { _, supported in
+        if supported != true { cameraMode = false }
+      }
+      .onChange(of: model.activeSession?.id) { old, _ in if old != nil { camera.pause(clear: true) }
+      }
+      .onDisappear { camera.close() }
+      .onAppear { if cameraMode { camera.open() } }
       .confirmationDialog(
         "Delete this read and its runs?", isPresented: $confirmDeleteRead, titleVisibility: .visible
       ) {
@@ -109,6 +125,7 @@ struct NativeReadsView: View {
       HStack(spacing: 16) {
         Text("Reads").font(.system(size: 25, weight: .semibold)).tracking(-0.5)
           .fixedSize().accessibilityAddTraits(.isHeader)
+        if !stacked, model.current?.images == true { modePicker }
         Spacer(minLength: 8)
         if !showsHistorySidebar {
           Button("New read", systemImage: "plus") {
@@ -119,6 +136,7 @@ struct NativeReadsView: View {
         }
         if !stacked, !model.readers.isEmpty { modelPicker.frame(width: 270) }
       }
+      if stacked, model.current?.images == true { modePicker }
       if stacked, !model.readers.isEmpty { modelPicker }
       if model.openingSession || model.historyUnsaved {
         HStack {
@@ -131,6 +149,13 @@ struct NativeReadsView: View {
         }
       }
     }.accessibilityIdentifier("reads-header")
+  }
+
+  private var modePicker: some View {
+    Picker("What to read", selection: $cameraMode) {
+      Text("Text").tag(false)
+      Text("Camera").tag(true)
+    }.pickerStyle(.segmented).frame(width: 160).accessibilityIdentifier("reads-mode")
   }
 
   private var modelPicker: some View {
@@ -328,39 +353,14 @@ struct NativeReadsView: View {
         HStack(spacing: 16) {
           editorTabs
           Spacer(minLength: 0)
-          samplePicker
+          NativeReadSamples(model: model)
         }
         VStack(alignment: .leading, spacing: 12) {
           editorTabs
-          samplePicker
+          NativeReadSamples(model: model)
         }
       }
-      HStack(spacing: 16) {
-        if model.current?.backend == "laya" || model.draft.checkpoint != nil {
-          Dropdown(title: "Checkpoint", value: model.draft.checkpoint ?? "Automatic language") {
-            Button("Automatic language") { model.draft.checkpoint = nil }
-            ForEach(model.current?.checkpoints ?? [], id: \.self) { checkpoint in
-              Button(checkpoint) { model.draft.checkpoint = checkpoint }
-            }
-          }.accessibilityIdentifier("reads-checkpoint")
-        }
-        if let max = model.current?.maxSteps, max > 1 {
-          Text("Steps").font(.system(size: 12)).foregroundStyle(.secondary)
-          Dropdown(title: "Steps", value: "\(model.draft.steps)") {
-            ForEach(1...max, id: \.self) { n in Button("\(n)") { model.draft.steps = n } }
-          }.accessibilityIdentifier("reads-steps")
-        }
-        if model.current?.think == true {
-          Text("Thought").font(.system(size: 12)).foregroundStyle(.secondary)
-          Dropdown(
-            title: "Thought", value: model.draft.think == 0 ? "None" : "\(model.draft.think) tokens"
-          ) {
-            ForEach([0, 128, 256, 512, 1024, 2048, 4096], id: \.self) { n in
-              Button(n == 0 ? "None" : "\(n) tokens") { model.draft.think = n }
-            }
-          }.accessibilityIdentifier("reads-thought")
-        }
-      }
+      NativeReadAdvancedOptions(model: model)
     }
     .onChange(of: jsonMode) { _, json in
       if json {
@@ -378,26 +378,6 @@ struct NativeReadsView: View {
       Text("JSON").tag(true)
     }.pickerStyle(.segmented).labelsHidden().frame(width: 140)
       .accessibilityIdentifier("reads-editor-tabs")
-  }
-
-  @ViewBuilder private var samplePicker: some View {
-    if model.current?.maxSamples != 1 || model.draft.samples > 1 {
-      HStack(spacing: 8) {
-        Text("Reads per question").font(.system(size: 12)).foregroundStyle(.secondary).fixedSize()
-        Dropdown(
-          title: "Reads per question",
-          value: model.draft.samples == 0 ? "Auto" : "\(model.draft.samples)"
-        ) {
-          Button("Auto") { model.draft.samples = 0 }
-          ForEach(
-            [1, 2, 4, 8, 16, 32].filter { $0 <= model.current?.maxSamples ?? 32 }, id: \.self
-          ) {
-            count in
-            Button("\(count)") { model.draft.samples = count }
-          }
-        }.fixedSize()
-      }.fixedSize(horizontal: true, vertical: false)
-    }
   }
 
   private var answers: some View {

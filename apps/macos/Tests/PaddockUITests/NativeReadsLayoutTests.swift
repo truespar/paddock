@@ -8,6 +8,68 @@ import Testing
 
 @Suite("Native Reads layout", .serialized) @MainActor
 struct NativeReadsLayoutTests {
+  @Test func liveCameraAnswersFitBothThemesWithoutCameraAccess() async throws {
+    let model = NativeReadsModel(client: NativeManager())
+    model.api = { path, _, _, _ in
+      let json: String
+      if path == "api/runners" {
+        json = #"[{"port":1234,"reader":"clef-flash","vendor":"Cloudflare"}]"#
+      } else if path.hasSuffix("/server") {
+        json =
+          #"{"structured_read":{"backend":"clef","images":true,"max_questions":256,"max_samples":1,"max_steps":1,"think":false}}"#
+      } else {
+        json = "[]"
+      }
+      return try JSONDecoder().decode(ConversationValue.self, from: Data(json.utf8))
+    }
+    model.readAPI = { _, _ in
+      try JSONDecoder().decode(
+        ConversationValue.self,
+        from: Data(
+          #"{"model":"clef-flash","answers":{"q1":{"type":"noul","noul":0.98,"confidence":0.96,"answer_confidence":0.98}},"usage":{"input_tokens":260,"output_tokens":0},"diagnostics":{"backend":"clef","reads":1,"images":1,"pictures":[{"width":512,"height":288,"resized":[512,288],"tokens":144}],"questions":[],"timing":{"total_ms":12,"gpu_ms":10,"pass_requests":1}}}"#
+            .utf8))
+    }
+    await model.refresh()
+    model.draft.questions[0].instructions = "Is a person visible at the door in the picture?"
+    let camera = NativeReadCamera()
+    camera.startLoop(model: model, frame: { _ in Data([1]) }, visible: { true })
+    for _ in 0..<1000 {
+      if camera.latest != nil { break }
+      await Task.yield()
+    }
+    camera.pause()
+    let response = try #require(camera.latest?.response)
+    #expect(response.diagnostics.images == 1)
+    #expect(response.diagnostics.pictures?.first?.tokens == 144)
+    #expect(response.diagnostics.pictures?.first?.resized == [512, 288])
+    for dark in [false, true] {
+      for width: CGFloat in [344, 392, 700] {
+        let host = NSHostingController(
+          rootView:
+            NativeReadCameraPanel(model: model, camera: camera, close: {})
+            .environment(\.colorScheme, dark ? .dark : .light))
+        #expect(host.sizeThatFits(in: NSSize(width: width, height: 4000)).width <= width + 1)
+      }
+    }
+    #expect(camera.capture == nil && !camera.opening)
+    camera.close()
+  }
+
+  @Test func cameraControlsFitWithoutOpeningCameraInBothThemes() {
+    let model = NativeReadsModel(client: NativeManager())
+    let camera = NativeReadCamera()
+    for dark in [false, true] {
+      for width: CGFloat in [344, 392, 700] {
+        let host = NSHostingController(
+          rootView:
+            NativeReadCameraPanel(model: model, camera: camera, close: {})
+            .environment(\.colorScheme, dark ? .dark : .light))
+        let size = host.sizeThatFits(in: NSSize(width: width, height: 2000))
+        #expect(size.width <= width + 1, "Camera controls overflow \(width): \(size)")
+      }
+    }
+    #expect(camera.capture == nil && !camera.opening)
+  }
   @Test func readsHistoryFitsTheSameSidebarWidthsInBothThemes() async throws {
     let model = NativeReadsModel(client: NativeManager())
     model.api = { _, _, _, _ in

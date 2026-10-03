@@ -12,7 +12,7 @@ extension NativeStudioRuntime {
     for row in rows {
       guard
         let id = row["model"]?.string ?? row["asr"]?.string ?? row["embedder"]?.string
-          ?? row["aligner"]?.string ?? row["image"]?.string
+          ?? row["aligner"]?.string ?? row["image"]?.string ?? row["diarization"]?.string
       else { continue }
       let kind =
         row["model"]?.string != nil
@@ -21,7 +21,8 @@ extension NativeStudioRuntime {
           ? "transcriber"
           : row["embedder"]?.string != nil
             ? "encoder"
-            : row["image"]?.string != nil ? "image" : "aligner"
+            : row["image"]?.string != nil
+              ? "image" : row["diarization"]?.string != nil ? "diarizer" : "aligner"
       var value: O = [
         "id": .string(id), "title": row["display"] ?? .string(id), "provider": .string("Local"),
         "vendor": row["vendor"] ?? .string(""), "port": row["port"] ?? .null,

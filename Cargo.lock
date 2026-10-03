@@ -2745,9 +2745,9 @@ dependencies = [
 
 [[package]]
 name = "nvml-wrapper"
-version = "0.12.1"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f049ae562349fefb8e837eb15443da1e7c6dcbd8a11f52a228f92220c2e5c85e"
+checksum = "d164abbde0b3c03edb9edb9cb8d31a7f5b79015c692b7c771f6e0840e9106b9f"
 dependencies = [
  "bitflags",
  "libloading 0.8.9",
@@ -2759,9 +2759,9 @@ dependencies = [
 
 [[package]]
 name = "nvml-wrapper-sys"
-version = "0.9.1"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b4d594420fcda43b1c2c4bd44d48974aa3c7a9ab2cbf10dc18e35265767bf0b"
+checksum = "5d2079f4c9b6d2170bfb71c6355734ead6c47da75c179847395c31f9f2f66ede"
 dependencies = [
  "libloading 0.8.9",
 ]
@@ -3013,6 +3013,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "paddock-jpeg"
+version = "0.1.12"
+
+[[package]]
 name = "paddock-kernels"
 version = "0.1.12"
 dependencies = [
@@ -3039,6 +3043,7 @@ dependencies = [
  "image",
  "libc",
  "nvml-wrapper",
+ "nvml-wrapper-sys",
  "objc2-foundation",
  "objc2-metal",
  "paddock-admin",
@@ -3111,6 +3116,7 @@ dependencies = [
 name = "paddock-models"
 version = "0.1.12"
 dependencies = [
+ "half",
  "memmap2",
  "serde",
  "serde_json",
@@ -3152,6 +3158,7 @@ dependencies = [
  "paddock-forensics",
  "paddock-geo",
  "paddock-heif",
+ "paddock-jpeg",
  "paddock-mcp",
  "paddock-metal",
  "paddock-models",
@@ -3166,6 +3173,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tiff",
  "tokio",
+ "tokio-tungstenite 0.30.0",
  "toml",
  "tower",
  "tracing",

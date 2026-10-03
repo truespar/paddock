@@ -990,6 +990,26 @@ struct RuntimeTests {
     #expect(!form.contains("timestamp_granularities[]"))
     #expect(requests.contains { $0["path"]?.string == "/api/runners/11541/v1/audio/alignments" })
     #expect(!requests.contains { $0["path"]?.string?.hasSuffix("/responses") == true })
+    let speech = state["nativeTranscript"]?["messages"]?.array?.last?["speech"]
+    #expect(speech?["diarizers"]?.array?.first?["id"] == .string("speaker-model"))
+    #expect(
+      state["models"]?.array?.contains(where: { $0["id"] == .string("speaker-model") }) == false)
+    _ = try await runtime.command(
+      "identifySpeakers",
+      [
+        "conversationId": doc["id"]!,
+        "messageId": assistant["id"]!, "modelId": .string("speaker-model"), "port": .number(11542),
+      ])
+    let enriched = try #require(await runtime.currentFields()?["messages"]?.array?.last)
+    #expect(enriched["content"] == assistant["content"])
+    #expect(enriched["transcript"]?["words"]?.array?.first?["speaker"] == .number(0))
+    #expect(enriched["transcript"]?["words"]?.array?.first?["confidence"] == .number(0.9))
+    #expect(enriched["transcript"]?["diarization"]?["segments"]?.array?.count == 1)
+    _ = try await runtime.command("newChat")
+    _ = try await runtime.command("open", ["id": doc["id"]!])
+    #expect(
+      await runtime.currentFields()?["messages"]?.array?.last?["transcript"]
+        == enriched["transcript"])
     await runtime.close()
   }
   @Test func failedLiveLaneDoesNotPoisonSuccessfulTranscriptOrOriginal() async throws {
@@ -1099,6 +1119,10 @@ final class RuntimeProtocol: URLProtocol, @unchecked Sendable {
             "status": .string("ok"),
           ]),
           .object(["aligner": .string("aligner"), "port": .number(11541), "status": .string("ok")]),
+          .object([
+            "diarization": .string("speaker-model"), "port": .number(11542),
+            "status": .string("ok"),
+          ]),
         ])
       } else if state.speechFeatures, path == "/api/runners/12481/server" {
         value = .object([
@@ -1122,6 +1146,13 @@ final class RuntimeProtocol: URLProtocol, @unchecked Sendable {
           200, "application/json",
           Data(
             "{\"words\":[{\"word\":\"Hello\",\"start\":0.2,\"end\":0.8},{\"word\":\"world\",\"start\":0.8,\"end\":1.5}],\"language_supported\":true}"
+              .utf8)
+        )
+      } else if state.speechFeatures, path.hasSuffix("/diarizations") {
+        return (
+          200, "application/json",
+          Data(
+            #"{"model":"speaker-model","duration":2,"preset":"offline","attribution":"time_overlap_v1","segments":[{"speaker":0,"start":0.1,"end":1.6}],"words":[{"word":"Hello","start":0.2,"end":0.8,"confidence":0.9,"speaker":0,"speakers":[0]},{"word":"world","start":0.8,"end":1.5,"speaker":0,"speakers":[0]}]}"#
               .utf8)
         )
       } else if path == "/api/settings" {

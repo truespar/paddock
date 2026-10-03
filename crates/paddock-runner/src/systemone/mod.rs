@@ -5,8 +5,9 @@
 //! option with a distribution over all of them), `score` (an ordered level
 //! set with a fractional score).
 //!
-//! A runner serving a decision model (Laya) answers the same endpoint with
-//! its own reader - see `laya/mod.rs`; everything below is the canvas one.
+//! A runner serving a decision model (Laya, Clef) answers the same endpoint
+//! with its own reader - see `laya/mod.rs`, `clef/mod.rs`; everything below
+//! is the canvas one.
 //!
 //! How it reads: the questions and their allowed labels go into a system
 //! turn, the state (and any images, ahead of it) into the user turn, both
@@ -51,7 +52,9 @@
 //! type, so a client written against Jev's act / review / human bands reads
 //! it the same way.
 
+pub mod clef;
 pub mod laya;
+pub mod pyjson;
 mod read;
 mod schema;
 
@@ -147,7 +150,7 @@ async fn read_body(req: Request) -> Result<(Vec<u8>, Vec<String>), Fail> {
 
 /// `images` in the JSON body: data URLs, or objects with a `url`, or with
 /// base64 `data` and its `media_type`.
-fn json_images(v: Option<&Value>) -> Result<Vec<String>, String> {
+pub(super) fn json_images(v: Option<&Value>) -> Result<Vec<String>, String> {
     let Some(v) = v.filter(|v| !v.is_null()) else {
         return Ok(Vec::new());
     };
@@ -314,6 +317,23 @@ fn thought_json(model: &ServingModel, t: &Thought) -> Value {
 pub async fn handle(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let t0 = Instant::now();
     // a decision model answers the same endpoint with its own reader
+    if let Some(cm) = state.clef.as_ref() {
+        let (raw, file_images) = match read_body(req).await {
+            Ok(v) => v,
+            Err(r) => return *r,
+        };
+        let body: Value = match serde_json::from_slice(&raw) {
+            Ok(v) => v,
+            Err(e) => return invalid(format!("the body is not JSON: {e}")),
+        };
+        let Some(body) = body.as_object() else {
+            return invalid("the body must be a JSON object");
+        };
+        return match clef::decide(cm, body, &raw, file_images, t0).await {
+            Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+            Err(r) => *r,
+        };
+    }
     if let Some(lm) = state.laya.as_ref() {
         let (raw, file_images) = match read_body(req).await {
             Ok(v) => v,

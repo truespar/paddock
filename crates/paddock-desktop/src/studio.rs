@@ -186,6 +186,20 @@ fn api_allowed(method: &Method, path: &str) -> bool {
         ["api", "cloud", "mcp-approvals", _] => *method == Method::POST,
         ["api", "cloud", _, "v1", "responses"]
         | ["api", "cloud", _, "v1", "audio", "transcriptions"] => *method == Method::POST,
+        ["api", "runners", port, "v1", "audio", "diarizations"]
+            if port.parse::<u16>().is_ok_and(|p| p != 0) =>
+        {
+            *method == Method::POST
+        }
+        [
+            "api",
+            "runners",
+            port,
+            "v1",
+            "audio",
+            "diarizations",
+            "stream",
+        ] if port.parse::<u16>().is_ok_and(|p| p != 0) => *method == Method::GET,
         ["api", "runners", port, tail @ ..] if port.parse::<u16>().is_ok() => matches!(
             tail,
             ["server"]
@@ -609,6 +623,11 @@ mod tests {
             (Method::DELETE, "/api/reads/set-1"),
             (Method::POST, "/api/runners/12587/v1/systemone"),
             (Method::POST, "/api/runners/12587/v1/tabular/predictions"),
+            (Method::POST, "/api/runners/12587/v1/audio/diarizations"),
+            (
+                Method::GET,
+                "/api/runners/12587/v1/audio/diarizations/stream",
+            ),
             (Method::POST, "/api/runners/12587/v1/tabular/contexts"),
             (
                 Method::DELETE,
@@ -641,6 +660,11 @@ mod tests {
             (Method::POST, "/api/runners/invalid/v1/systemone"),
             (Method::POST, "/api/runners/12587/stop"),
             (Method::GET, "/api/runners/12587/v1/tabular/predictions"),
+            (Method::GET, "/api/runners/12587/v1/audio/diarizations"),
+            (
+                Method::POST,
+                "/api/runners/12587/v1/audio/diarizations/stream",
+            ),
             (Method::POST, "/api/runners/0/v1/tabular/predictions"),
             (Method::POST, "/api/runners/12587/v1/tabular/contexts/ctx-1"),
             (

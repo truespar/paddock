@@ -94,6 +94,9 @@ export interface GpuInfo {
   sm_clock_mhz?: number | null
   mem_clock_mhz?: number | null
   fan_pct?: number | null
+  /** an NVIDIA part with no memory of its own (DGX Spark's GB10): mem_used /
+   *  mem_total are the machine's RAM as the OS books it, not VRAM */
+  host_memory?: boolean
   /** processes holding memory on this device (per-PID attribution input). */
   procs?: { pid: number; mem?: number | null }[]
 }

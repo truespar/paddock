@@ -371,6 +371,15 @@ impl ShardedSafetensors {
         Ok(Self { shards, index })
     }
 
+    /// One file as a single-shard set (a companion file beside a GGUF, say).
+    pub fn from_file(f: SafetensorsFile) -> Self {
+        let index = f.tensors().keys().map(|k| (k.clone(), 0usize)).collect();
+        Self {
+            shards: vec![f],
+            index,
+        }
+    }
+
     pub fn names(&self) -> impl Iterator<Item = &String> {
         self.index.keys()
     }

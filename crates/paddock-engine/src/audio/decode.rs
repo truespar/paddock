@@ -161,9 +161,24 @@ fn probe() -> &'static Probe {
 /// Errors are user-facing: they surface as 400s on the transcription
 /// endpoints, so each one names the format that arrived and what would work.
 pub fn decode_audio(bytes: &[u8]) -> Result<WavAudio, String> {
+    decode_with_limit(bytes, None)
+}
+
+/// Bound decoded duration as packets arrive, before resampling or queueing.
+/// Also reject damaged/changing streams: dropping packets would silently
+/// shift the speaker timeline. The older transcription policy is unchanged.
+pub fn decode_audio_limited(bytes: &[u8], seconds: u32) -> Result<WavAudio, String> {
+    decode_with_limit(bytes, Some(seconds))
+}
+
+fn decode_with_limit(bytes: &[u8], seconds: Option<u32>) -> Result<WavAudio, String> {
     let kind = sniff(bytes);
     match kind {
-        Container::Wav => return decode_wav(bytes),
+        Container::Wav => {
+            let audio = decode_wav(bytes)?;
+            check_duration(audio.samples.len(), audio.sample_rate, seconds)?;
+            return Ok(audio);
+        }
         Container::Aiff | Container::Caf => {
             return Err(format!(
                 "this is an {} file, which this build does not decode (accepted: {ACCEPTED})",
@@ -232,6 +247,9 @@ pub fn decode_audio(bytes: &[u8]) -> Result<WavAudio, String> {
             // A track-list change mid-stream (chained OGG). Everything decoded
             // up to here is real audio, so keep it rather than failing the
             // request - and stop, because the decoder past this point is stale.
+            Err(SymphErr::ResetRequired) if seconds.is_some() => {
+                return Err("audio track changes mid-stream; convert to a single WAV first".into());
+            }
             Err(SymphErr::ResetRequired) => break,
             Err(e) => return Err(format!("{} stream: {e}", kind.name())),
         };
@@ -242,10 +260,16 @@ pub fn decode_audio(bytes: &[u8]) -> Result<WavAudio, String> {
             Ok(b) => b,
             // Both are per-packet faults: a torn packet in the middle of a
             // recording should cost that packet, not the transcript.
-            Err(SymphErr::IoError(_)) | Err(SymphErr::DecodeError(_)) => continue,
+            Err(SymphErr::IoError(_)) | Err(SymphErr::DecodeError(_)) if seconds.is_none() => {
+                continue;
+            }
             Err(e) => return Err(format!("{} decode: {e}", kind.name())),
         };
+        if seconds.is_some() && rate != 0 && buf.spec().rate() != rate {
+            return Err("audio sample rate changes mid-stream".into());
+        }
         push_mono(&buf, &mut inter, &mut samples, &mut rate);
+        check_duration(samples.len(), rate, seconds)?;
     }
 
     if samples.is_empty() {
@@ -258,6 +282,15 @@ pub fn decode_audio(bytes: &[u8]) -> Result<WavAudio, String> {
         samples,
         sample_rate: rate,
     })
+}
+
+fn check_duration(samples: usize, rate: u32, seconds: Option<u32>) -> Result<(), String> {
+    if let Some(seconds) = seconds
+        && (rate == 0 || samples as u64 > u64::from(rate) * u64::from(seconds))
+    {
+        return Err(format!("audio exceeds {seconds} seconds"));
+    }
+    Ok(())
 }
 
 /// Append one decoded buffer to `out`, averaged down to mono - the same
@@ -287,6 +320,14 @@ fn push_mono(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoded_duration_limit_is_checked_without_rounding() {
+        assert!(check_duration(16000 * 600, 16000, Some(600)).is_ok());
+        assert!(check_duration(16000 * 600 + 1, 16000, Some(600)).is_err());
+        assert!(check_duration(0, 0, Some(600)).is_err());
+        assert!(check_duration(48000 * 601, 48000, Some(600)).is_err());
+    }
 
     #[test]
     fn sniffs_every_accepted_container_from_its_magic() {

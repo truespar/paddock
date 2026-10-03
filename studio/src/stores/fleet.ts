@@ -46,6 +46,7 @@ export interface FleetRow {
    *  /v1/tabular/*) serving ids - the sixth and seventh roles */
   reader?: string | null
   tabular?: string | null
+  diarization?: string | null
   /** The catalog's human name ("Qwen 3.5 9B") + maker - what the UI shows;
    *  the technical id stays in `model` for tooltips. Absent for models this
    *  build's catalog doesn't know. */
@@ -311,8 +312,9 @@ export function servedId(r: {
   image?: string | null
   reader?: string | null
   tabular?: string | null
+  diarization?: string | null
 }): string | undefined {
-  return r.model ?? r.embedder ?? r.asr ?? r.aligner ?? r.image ?? r.reader ?? r.tabular ?? undefined
+  return r.model ?? r.embedder ?? r.asr ?? r.aligner ?? r.image ?? r.reader ?? r.tabular ?? r.diarization ?? undefined
 }
 
 export const useFleetStore = defineStore('fleet', () => {

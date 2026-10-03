@@ -348,6 +348,7 @@ extension NativeStudioRuntime {
       case "toolPicker": try await changeTools(p)
       case "toolApproval": try await approveTool(p)
       case "transcriptExport": result = try transcriptExport(p)
+      case "identifySpeakers": try await identifySpeakers(p)
       default: throw ConversationFailure.invalid("Unsupported native command: \(kind)")
       }
       error = ""

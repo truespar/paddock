@@ -13,9 +13,10 @@
 // read is the text, its questions and every run of them, kept by the manager
 // and named in the URL, so a read opens again from any browser.
 // What a reader advertises decides what the page offers: pictures beside the
-// text (a vision companion is loaded), denoising steps, a thought before the
-// read, and conditional questions.
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+// text (a vision companion is loaded) - and with them the camera, the same
+// questions asked of the webcam frame after frame - denoising steps, a
+// thought before the read, and conditional questions.
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { useModelsStore } from '@/stores/models'
@@ -33,12 +34,16 @@ import MenuSeparator from '@/components/ui/MenuSeparator.vue'
 import MenuTrigger from '@/components/ui/MenuTrigger.vue'
 import Select, { type SelectOption } from '@/components/ui/Select.vue'
 import Tabs, { type TabOption } from '@/components/ui/Tabs.vue'
+import ToggleGroup from '@/components/ui/ToggleGroup.vue'
+import ToggleGroupItem from '@/components/ui/ToggleGroupItem.vue'
 import Tooltip from '@/components/ui/Tooltip.vue'
 import { uuid } from '@/lib/uuid'
 import { readsPreferencesApi } from '@/lib/api'
 import { readExample } from '@/lib/reads-example'
 import QuestionRow from './QuestionRow.vue'
 import AnswersCard from './AnswersCard.vue'
+import CameraRead, { type LiveFrame } from './CameraRead.vue'
+import LiveQuestions from './LiveQuestions.vue'
 import ReadsSidebar from './ReadsSidebar.vue'
 import {
   DEFAULT_MAX_QUESTIONS,
@@ -65,6 +70,7 @@ import {
   withRun,
   type ReadDoc,
   type ReadQuestion,
+  type ReadRequest,
   type ReadResponse,
   type ReadRun,
   type ReadType,
@@ -281,6 +287,132 @@ function onPaste(e: ClipboardEvent): void {
   void addPictures(files)
 }
 
+// ── the camera: the questions asked of the webcam, frame after frame ───────
+// The browser gives a page the camera only in a secure context (https, or
+// localhost - the Studio on this machine); elsewhere the button says why.
+const cameraOk =
+  typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getUserMedia && window.isSecureContext
+const camera = ref(false)
+const cameraLive = ref(false)
+/** The newest frame's answers: shown in place of the read's runs while the
+ *  camera is open, never kept unless the user keeps one. */
+const liveRun = ref<ReadRun | null>(null)
+const liveImages = ref<Record<string, string> | undefined>(undefined)
+/** A frame's request: the text, questions and settings on the page, the
+ *  frame as its one picture (attached pictures stay out of a live read). */
+function frameBody(frame: string): ReadRequest {
+  return requestBody(state.value, questions.value, samples.value, {
+    steps: stepsSent.value,
+    think: thinkSent.value,
+    images: [frame],
+  })
+}
+function runOfFrame(f: LiveFrame, ref: string, name: string): ReadRun {
+  const model = current.value
+  const r: ReadRun = {
+    at: Date.now(),
+    model: model ? (model.display ?? modelLabel(model.id)) : '',
+    port: port.value,
+    excerpt: excerptOf(f.request.state),
+    chars: f.request.state.length,
+    state: f.request.state,
+    fileName: '',
+    questions: f.request.questions,
+    samples: f.request.samples ?? 'auto',
+    response: f.response,
+    ms: f.ms,
+    images: [{ name, ref }],
+  }
+  if (f.request.steps) r.steps = f.request.steps
+  if (f.request.think) r.think = f.request.think
+  return r
+}
+function onFrame(f: LiveFrame): void {
+  serverRowErrors.value = {}
+  questionsError.value = null
+  pageError.value = null
+  liveRun.value = runOfFrame(f, 'live', 'camera frame')
+  liveImages.value = { live: f.frame }
+  lastMs.value = f.ms
+}
+/** The frame on show becomes a run of the read, like any run: its picture
+ *  and answers kept, the read saved. */
+async function keepFrame(f: LiveFrame): Promise<void> {
+  const ref = imageRef(f.frame)
+  const r = runOfFrame(f, ref, `camera ${new Date().toLocaleTimeString()}`)
+  r.id = uuid()
+  await keepRun(r, { [ref]: f.frame })
+  toasts.push({ tone: 'good', title: 'Kept this frame', description: 'It is a run of this read now.' })
+}
+// Camera is a MODE of the page, not a widget inside the text card: the
+// picture fills the column with the answers riding on it, the questions are a
+// compact list under it, and the text becomes optional context. Text mode is
+// the page as it always was. Both edit the same questions.
+/** Opening the camera with nothing asked yet goes straight to the question:
+ *  a live read has nothing to send until one is written. */
+function openCamera(): void {
+  camera.value = true
+  if (questions.value.every((q) => !q.instructions.trim())) void nextTick(focusQuestions)
+}
+const liveQs = ref<InstanceType<typeof LiveQuestions> | null>(null)
+function focusQuestions(): void {
+  liveQs.value?.focusFirstEmpty()
+}
+const mode = computed<string>({
+  get: () => (camera.value ? 'camera' : 'text'),
+  set: (v) => (v === 'camera' ? openCamera() : closeCamera()),
+})
+/** Why Start cannot run yet, in the words of what to do next. */
+const cameraBlock = computed(() => {
+  if (!current.value) return 'Start a model that reads.'
+  if (validation.value.ok) return ''
+  if (questions.value.every((q) => !q.instructions.trim())) return 'Write a question below to start.'
+  return validation.value.set[0] ?? Object.values(validation.value.rows)[0] ?? 'A question below needs fixing.'
+})
+/** One chip on the picture per question, named by its text. */
+const cameraRows = computed(() =>
+  questions.value.map((q, i) => ({ id: q.id, text: q.instructions.trim() || q.id || `Question ${i + 1}` })),
+)
+/** Each question's problem, by key, for the compact list. */
+const rowErrors = computed<Record<string, string | undefined>>(() =>
+  Object.fromEntries(questions.value.map((q) => [q.key, rowError(q)])),
+)
+function patchByKey(key: string, patch: Partial<ReadQuestion>): void {
+  const q = questions.value.find((x) => x.key === key)
+  if (q) onPatch(q, patch)
+}
+/** The context text stays folded in camera mode until it is wanted. */
+const contextOpen = ref(false)
+/** The camera frames kept in this read, oldest first: a click opens that
+ *  run in Text mode, with its picture and its answers. */
+const snapshots = computed(() => {
+  const doc = activeRead.value
+  if (!doc) return []
+  return doc.runs.flatMap((r, i) => {
+    const img = r.images?.[0]
+    const url = img && img.name.startsWith('camera') ? doc.images?.[img.ref] : undefined
+    return url ? [{ i, url, at: r.at }] : []
+  })
+})
+function openSnapshot(i: number): void {
+  closeCamera()
+  runIdx.value = i
+}
+function closeCamera(): void {
+  camera.value = false
+  cameraLive.value = false
+  liveRun.value = null
+  liveImages.value = undefined
+}
+// a reader that takes no pictures has no camera
+watch(takesImages, (v) => {
+  if (!v) closeCamera()
+})
+/** What the answers show: the live frame's while the camera is open, else
+ *  the read's run. */
+const live = computed(() => camera.value && !!liveRun.value)
+const shownRun = computed(() => (live.value ? liveRun.value : run.value))
+
 // ── the questions ──────────────────────────────────────────────────────────
 const questions = ref<ReadQuestion[]>([newQuestion()])
 const samples = ref<Samples>('auto')
@@ -495,6 +627,7 @@ const canRun = computed(
   () =>
     !!current.value &&
     !busy.value &&
+    !cameraLive.value &&
     (state.value.trim().length > 0 || pictures.value.length > 0) &&
     validation.value.ok &&
     !picturesError.value,
@@ -543,18 +676,9 @@ async function doRun(): Promise<void> {
     const json: unknown = await res.json().catch(() => null)
     const ms = Math.round(performance.now() - t0)
     if (!res.ok) {
-      const msg =
-        (json as { error?: { message?: string } } | null)?.error?.message ?? `HTTP ${res.status}`
-      const target = routeError(msg)
-      if (target.where === 'row' && questions.value.some((q) => q.id === target.id)) {
-        serverRowErrors.value = { [target.id]: msg }
-      } else if (target.where === 'state') {
-        stateError.value = msg
-      } else if (target.where === 'questions' || target.where === 'row') {
-        questionsError.value = msg
-      } else {
-        pageError.value = msg
-      }
+      showRunError(
+        (json as { error?: { message?: string } } | null)?.error?.message ?? `HTTP ${res.status}`,
+      )
       return
     }
     const r: ReadRun = {
@@ -580,6 +704,20 @@ async function doRun(): Promise<void> {
     pageError.value = e instanceof Error ? e.message : String(e)
   } finally {
     busy.value = false
+  }
+}
+/** A runner refusal goes where it can be acted on: the question it names,
+ *  the text, the questions as a whole, or the page. */
+function showRunError(msg: string): void {
+  const target = routeError(msg)
+  if (target.where === 'row' && questions.value.some((q) => q.id === target.id)) {
+    serverRowErrors.value = { [target.id]: msg }
+  } else if (target.where === 'state') {
+    stateError.value = msg
+  } else if (target.where === 'questions' || target.where === 'row') {
+    questionsError.value = msg
+  } else {
+    pageError.value = msg
   }
 }
 /** A run lands on the read on screen - a new read is created by its first
@@ -679,8 +817,12 @@ const setBody = computed(() =>
   ),
 )
 const dirty = computed(() => !!activeSet.value && activeSet.value.body !== setBody.value)
+/** The picker's "no saved set" entry. Not '': Reka refuses an empty-string
+ *  item value (it is how a Select clears to its placeholder), and threw the
+ *  moment the list rendered. */
+const UNSAVED_SET = 'unsaved'
 const setOptions = computed<SelectOption[]>(() => [
-  { value: '', label: 'Unsaved set' },
+  { value: UNSAVED_SET, label: 'Unsaved set' },
   ...sets.sets.map((s) => ({ value: s.id, label: s.name })),
 ])
 function selectSet(v: string | number): void {
@@ -955,10 +1097,21 @@ async function copyCurl(): Promise<void> {
       <div>
         <h1 class="rd__title">Reads</h1>
         <p class="rd__lead">
-          Ask fixed questions about a text and get probabilities back - the same /v1/systemone your
-          code calls.
+          {{
+            camera
+              ? 'Ask fixed questions about what the camera sees - the answers follow the newest frame.'
+              : 'Ask fixed questions about a text and get probabilities back - the same /v1/systemone your code calls.'
+          }}
         </p>
       </div>
+      <ToggleGroup v-if="takesImages && current" v-model="mode" label="What to read" class="rd__mode">
+        <ToggleGroupItem value="text" class="rd__modeitem">
+          <Icon name="file-text" :size="14" /> Text
+        </ToggleGroupItem>
+        <ToggleGroupItem value="camera" class="rd__modeitem" :disabled="!cameraOk">
+          <Icon name="webcam" :size="14" /> Camera
+        </ToggleGroupItem>
+      </ToggleGroup>
     </div>
 
     <div v-if="opening && !activeRead" class="rd__none">
@@ -973,7 +1126,7 @@ async function copyCurl(): Promise<void> {
       <Icon name="list-checks" :size="32" class="rd__none-icon" />
       <p class="rd__none-title">No model that can read is running</p>
       <p class="rd__none-txt">
-        Reads need a model that reads - start DiffusionGemma or Laya in the Manager.
+        Reads need a model that reads - start DiffusionGemma, Laya or Clef in the Manager.
       </p>
       <RouterLink class="pk-btn pk-btn--primary" :to="{ name: 'server-new' }">
         <Icon name="play" :size="14" /> Start a model
@@ -983,11 +1136,74 @@ async function copyCurl(): Promise<void> {
     <template v-else>
       <div v-if="pageError" class="rd__error" role="alert">{{ pageError }}</div>
       <p v-if="!readers.length" class="rd__noreader">
-        No model that can read is running, so this read cannot run again until DiffusionGemma or
-        Laya is started in the Manager.
+        No model that can read is running, so this read cannot run again until DiffusionGemma,
+        Laya or Clef is started in the Manager.
       </p>
 
-      <div class="rd__cols">
+      <div v-if="camera && current" class="rd__live">
+        <CameraRead
+          :port="port"
+          :build-body="frameBody"
+          :blocked="!current || !validation.ok"
+          :blocked-reason="cameraBlock"
+          :rows="cameraRows"
+          @need="focusQuestions"
+          @result="onFrame"
+          @error="showRunError"
+          @keep="keepFrame"
+          @live="cameraLive = $event"
+          @close="closeCamera"
+        />
+        <section class="rd__card">
+          <div class="rd__cardhead">
+            <h2 class="rd__h2">Questions</h2>
+            <span class="rd__count">{{ questions.length }} of {{ maxQuestions }}</span>
+            <div class="rd__sets">
+              <Select :model-value="activeSetId ?? UNSAVED_SET" :options="setOptions" @update:model-value="selectSet" />
+            </div>
+          </div>
+          <LiveQuestions
+            ref="liveQs"
+            :questions="questions"
+            :errors="rowErrors"
+            :types="caps?.types ?? []"
+            @patch="patchByKey"
+            @add="addQuestion"
+            @remove="remove"
+          />
+          <p v-for="m in validation.set" :key="m" class="rd__hint rd__hint--warn" role="alert">{{ m }}</p>
+          <p v-if="questionsError" class="rd__hint rd__hint--warn" role="alert">{{ questionsError }}</p>
+          <button
+            v-if="!contextOpen && !state.trim()"
+            class="pk-btn pk-btn--sm pk-btn--ghost rd__ctxbtn"
+            type="button"
+            @click="contextOpen = true"
+          >
+            <Icon name="file-text" :size="13" /> Add context text
+          </button>
+          <textarea
+            v-else
+            v-model="state"
+            class="pk-input rd__ta"
+            rows="3"
+            spellcheck="false"
+            placeholder="Text read with every frame, beside the picture"
+          />
+        </section>
+        <div v-if="snapshots.length" class="rd__snaps">
+          <span class="rd__snapslabel">Snapshots</span>
+          <Tooltip
+            v-for="sn in snapshots"
+            :key="sn.i"
+            :label="`Open the snapshot from ${new Date(sn.at).toLocaleTimeString()}`"
+          >
+            <button class="rd__snap" type="button" :aria-label="`Snapshot ${new Date(sn.at).toLocaleTimeString()}`" @click="openSnapshot(sn.i)">
+              <img :src="sn.url" alt="" />
+            </button>
+          </Tooltip>
+        </div>
+      </div>
+      <div v-else class="rd__cols">
         <div class="rd__left">
           <section class="rd__card">
             <div class="rd__cardhead">
@@ -1085,7 +1301,7 @@ async function copyCurl(): Promise<void> {
                   <Icon name="save" :size="13" /> {{ activeSet ? 'Save' : 'Save set' }}
                 </button>
                 <Select
-                  :model-value="activeSetId ?? ''"
+                  :model-value="activeSetId ?? UNSAVED_SET"
                   :options="setOptions"
                   @update:model-value="selectSet"
                 />
@@ -1165,8 +1381,8 @@ async function copyCurl(): Promise<void> {
                   :error="rowError(q)"
                   :types="caps?.types ?? []"
                   :dragging="dragFrom === i"
-                  :answer="run?.response.answers[q.id] ?? undefined"
-                  :skipped="!!run?.response.diagnostics.skipped?.[q.id]"
+                  :answer="shownRun?.response.answers[q.id] ?? undefined"
+                  :skipped="!!shownRun?.response.diagnostics.skipped?.[q.id]"
                   :conditional="caps?.conditional ?? false"
                   :others="othersFor(q)"
                   @patch="onPatch(q, $event)"
@@ -1257,12 +1473,12 @@ async function copyCurl(): Promise<void> {
             <button v-if="readSaveFailed && activeRead" type="button" class="pk-btn pk-btn--sm" :disabled="busy" @click="persistRead(activeRead)">Retry saving</button>
             <p v-if="run?.stateMissing" class="rd__meta">The original input was not retained with this older result.</p>
             <AnswersCard
-              :run="run"
-              :images="activeRead?.images"
+              :run="shownRun"
+              :images="live ? liveImages : activeRead?.images"
               :run-index="runIdx"
-              :run-count="activeRead?.runs.length ?? 0"
+              :run-count="live ? 0 : (activeRead?.runs.length ?? 0)"
               :busy="busy"
-              :stale="stale"
+              :stale="!live && stale"
               :can-example="!!current && !busy"
               @step="stepRun"
               @example="loadExample"
@@ -1479,6 +1695,78 @@ async function copyCurl(): Promise<void> {
   }
 }
 /* the surface card: fields sit on bg-surface, rows step down to bg-base */
+/* the page's mode, Text or Camera - the header's area toggle, same recipe
+   (:deep because Reka clones the item and drops the scope attribute) */
+.rd__mode {
+  display: inline-flex;
+  flex: none;
+  padding: 2px;
+  gap: 2px;
+  border-radius: var(--pk-radius-md);
+  background: var(--pk-bg-inset);
+}
+.rd__mode :deep(.rd__modeitem) {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border: none;
+  border-radius: var(--pk-radius-sm);
+  background: transparent;
+  color: var(--pk-text-muted);
+  font: inherit;
+  font-size: var(--pk-font-size-sm);
+  cursor: pointer;
+}
+.rd__mode :deep(.rd__modeitem:hover) {
+  color: var(--pk-text-primary);
+}
+.rd__mode :deep(.rd__modeitem[data-state='on']) {
+  background: var(--pk-bg-surface);
+  color: var(--pk-text-primary);
+  box-shadow: 0 0 0 1px var(--pk-border-default);
+}
+.rd__mode :deep(.rd__modeitem[data-disabled]) {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.rd__live {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.rd__ctxbtn {
+  align-self: flex-start;
+}
+.rd__snaps {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.rd__snapslabel {
+  color: var(--pk-text-muted);
+  font-size: var(--pk-font-size-sm);
+}
+.rd__snap {
+  width: 72px;
+  height: 44px;
+  padding: 0;
+  border: 1px solid var(--pk-border-default);
+  border-radius: var(--pk-radius-sm);
+  overflow: hidden;
+  background: #000;
+  cursor: pointer;
+}
+.rd__snap:focus-visible {
+  outline: 2px solid var(--pk-accent);
+  outline-offset: 2px;
+}
+.rd__snap img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
 .rd__card {
   display: flex;
   flex-direction: column;

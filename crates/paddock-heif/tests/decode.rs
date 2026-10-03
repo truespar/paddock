@@ -17,6 +17,20 @@ const AVIF32: &[u8] = include_bytes!("data/avif32.heif");
 const HEVC32: &[u8] = include_bytes!("data/hevc32.heif");
 
 #[test]
+fn avif_pixel_budget_is_enforced_by_the_decoder() {
+    let full = paddock_heif::decode(AVIF32).unwrap();
+    let bounded = paddock_heif::decode_limited(AVIF32, 1024).unwrap();
+    assert_eq!(bounded.rgb, full.rgb);
+    assert!(paddock_heif::decode_limited(AVIF32, 1023).is_err());
+    assert!(paddock_heif::decode_limited(AVIF32, 0).is_err());
+    // A rejected decode must not poison the next image or leak a context.
+    assert_eq!(
+        paddock_heif::decode_limited(AVIF32, 1024).unwrap().rgb,
+        full.rgb
+    );
+}
+
+#[test]
 fn a_real_avif_decodes_to_pixels() {
     assert_eq!(paddock_heif::sniff(AVIF32), Some(Codec::Avif));
     let r = paddock_heif::decode(AVIF32).expect("AVIF must decode");

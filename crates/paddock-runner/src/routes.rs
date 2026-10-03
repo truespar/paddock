@@ -285,7 +285,11 @@ pub struct AppState {
     /// The loaded decision model (a Laya bundle), if one was configured -
     /// serves `POST /v1/systemone` only.
     pub laya: Option<crate::systemone::laya::LayaModel>,
+    /// The loaded decision model (a Clef checkpoint), if one was configured -
+    /// serves `POST /v1/systemone` only.
+    pub clef: Option<crate::systemone::clef::ClefModel>,
     pub tabular: Option<crate::tabular::TabularModel>,
+    pub diarization: Option<crate::diarizations::DiarizationModel>,
     /// The loaded image-generation model (Qwen-Image), if one was configured
     /// - serves `/v1/images/*` only.
     pub image: Option<crate::serving::ImageModel>,
@@ -420,7 +424,9 @@ impl AppState {
             aligner: None,
             segmenter: None,
             laya: None,
+            clef: None,
             tabular: None,
+            diarization: None,
             image: None,
             max_ctx: 8192,
             vad_gate: false,
@@ -527,6 +533,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(crate::transcriptions::handle),
         )
         .route("/v1/audio/alignments", post(crate::alignments::handle))
+        .route(
+            "/v1/audio/diarizations/stream",
+            get(crate::diarization_live::route),
+        )
+        .route(
+            "/v1/audio/diarizations",
+            post(crate::diarizations::handle)
+                .layer(axum::extract::DefaultBodyLimit::max(25 * 1024 * 1024)),
+        )
         .route("/v1/segmentations", post(crate::segmentations::handle))
         .route("/v1/images/generations", post(crate::images::generations))
         .route("/v1/images/edits", post(crate::images::edits))
@@ -943,11 +958,14 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
             })
         // a decision model reads and does nothing else: the same key, its
         // own values (one read, one step, text only, no thought)
-        }).or_else(|| state.laya.as_ref().map(|l| l.caps())),
+        }).or_else(|| state.laya.as_ref().map(|l| l.caps()))
+          .or_else(|| state.clef.as_ref().map(|c| c.caps())),
         // Decision model id (Laya): POST /v1/systemone works iff this is set,
         // and it is the ONLY thing such a runner serves - the sixth role.
-        "reader": state.laya.as_ref().map(|l| l.id.clone()),
+        "reader": state.laya.as_ref().map(|l| l.id.clone())
+            .or_else(|| state.clef.as_ref().map(|c| c.id.clone())),
         "tabular": state.tabular.as_ref().map(|m| serde_json::json!({"model":m.id,"capabilities":m.capabilities()})),
+        "diarization": state.diarization.as_ref().map(|m|serde_json::json!({"model":m.id,"capabilities":m.capabilities()})),
         // The longest clip TRANSCRIPTION can take, same reason and same shape
         // as the alignment cap above. Null means no ceiling worth
         // publishing: whisper windows a clip into 30 s pieces, so length costs
@@ -1444,6 +1462,26 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
             ),
         );
     }
+    if let Some(cm) = &state.clef {
+        // a decision model only: one joint sequence per request, every
+        // question answered in the same pass - /v1/systemone and nothing else
+        data.push(
+            ModelObject::new(cm.id.clone(), 0, "paddock").with_listing_meta(
+                serde_json::json!({
+                    "input_modalities": ["text"],
+                    "output_modalities": ["decision"],
+                    "modality": "text->decision",
+                }),
+                serde_json::json!({"structured_read": true}),
+                vec![
+                    "model".to_owned(),
+                    "ask".to_owned(),
+                    "max_state_tokens".to_owned(),
+                ],
+                cm.max_len(),
+            ),
+        );
+    }
     if let Some(lm) = &state.laya {
         // a decision model only: a state and typed questions in, calibrated
         // answers out - /v1/systemone and nothing else. Its context is the
@@ -1472,6 +1510,11 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
                 max_len,
             ),
         );
+    }
+    if let Some(m) = &state.diarization {
+        data.push(ModelObject::new(m.id.clone(),0,"paddock").with_listing_meta(
+            serde_json::json!({"input_modalities":["audio"],"output_modalities":["speaker_segments"],"modality":"audio->speaker_segments"}),
+            m.capabilities(),vec!["file".into(),"model".into(),"preset".into(),"threshold".into()],0));
     }
     if let Some(m) = &state.tabular {
         data.push(ModelObject::new(m.id.clone(),0,"paddock").with_listing_meta(
@@ -1549,6 +1592,8 @@ pub(crate) fn is_generation_path(path: &str) -> bool {
             | "/v1/images/edits"
             | "/v1/systemone"
             | "/v1/tabular/predictions"
+            | "/v1/audio/diarizations"
+            | "/v1/audio/diarizations/stream"
             | "/v1/tabular/contexts"
     )
 }

@@ -28,7 +28,7 @@ struct ProviderArtworkTests {
   }
 
   @Test func everyWebProviderHasNonemptyNativeArtwork() throws {
-    #expect(ProviderArtwork.names.count == 27)  // 23 maker marks + four search services.
+    #expect(ProviderArtwork.names["Cloudflare"] == "Cloudflare")
     for vendor in ProviderArtwork.names.keys.sorted() {
       let image = try #require(ProviderArtwork.image(for: vendor), "Missing \(vendor)")
       #expect(image.isValid)

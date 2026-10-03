@@ -49,6 +49,7 @@ unsafe extern "C" {
         s: Option<NonNull<Dav1dSettings>>,
     ) -> i32;
     fn dav1d_data_create(buf: Option<NonNull<Dav1dData>>, sz: usize) -> *mut u8;
+    fn dav1d_data_unref(buf: Option<NonNull<Dav1dData>>);
     fn dav1d_send_data(c: Option<Dav1dContext>, r#in: Option<NonNull<Dav1dData>>) -> i32;
     fn dav1d_get_picture(c: Option<Dav1dContext>, out: Option<NonNull<Dav1dPicture>>) -> i32;
     fn dav1d_picture_unref(p: Option<NonNull<Dav1dPicture>>);
@@ -79,7 +80,7 @@ pub fn describe() -> Option<String> {
     Some("rav1d (built in)".to_string())
 }
 
-pub fn decode(bytes: &[u8], codec: Codec) -> Result<Rendition, Error> {
+pub fn decode(bytes: &[u8], codec: Codec, max_pixels: Option<u32>) -> Result<Rendition, Error> {
     if codec != Codec::Avif {
         return Err(Error::NoDecoder { codec });
     }
@@ -90,7 +91,7 @@ pub fn decode(bytes: &[u8], codec: Codec) -> Result<Rendition, Error> {
     // therefore renders as whatever the colour plane holds underneath, which is
     // the same thing every "flatten to JPEG" path does. Verified against a real
     // alpha AVIF: colour is unaffected.
-    let mut r = decode_av1(&av.primary_item)?;
+    let mut r = decode_av1(&av.primary_item, max_pixels)?;
     // avif-parse does not read `irot`/`imir` - the fields do not exist on its
     // types - so a rotated photo would come out sideways with nothing to say
     // so. Recovered by our own scan of the same bytes; see `orientation`.
@@ -128,7 +129,7 @@ fn parse_container(bytes: &[u8]) -> Result<avif_parse::AvifData, Error> {
 }
 
 /// Decode one AV1 still image to RGB8.
-fn decode_av1(obu: &[u8]) -> Result<Rendition, Error> {
+fn decode_av1(obu: &[u8], max_pixels: Option<u32>) -> Result<Rendition, Error> {
     if obu.is_empty() {
         return Err(Error::Decode("this AVIF holds no image data".into()));
     }
@@ -144,6 +145,9 @@ fn decode_av1(obu: &[u8]) -> Result<Rendition, Error> {
         // guessed: the first version of this returned -11 and nothing else.
         settings.max_frame_delay = 1;
         settings.n_threads = 1;
+        if let Some(max_pixels) = max_pixels {
+            settings.frame_size_limit = max_pixels;
+        }
 
         let mut ctx: Option<Dav1dContext> = None;
         if dav1d_open(
@@ -169,6 +173,9 @@ fn decode_av1(obu: &[u8]) -> Result<Rendition, Error> {
         std::ptr::copy_nonoverlapping(obu.as_ptr(), buf, obu.len());
 
         let sent = dav1d_send_data(ctx, Some(NonNull::from(&mut data)));
+        // send_data empties this on success, but leaves ownership with us on
+        // refusal (including the frame-size gate). Unref safely handles both.
+        dav1d_data_unref(Some(NonNull::from(&mut data)));
         if sent < 0 {
             return finish(Err(Error::Decode(format!(
                 "the AV1 bitstream was rejected ({sent})"
@@ -562,7 +569,7 @@ mod tests {
         assert!(!available_for(Codec::Heic));
         assert!(available_for(Codec::Avif));
         assert!(matches!(
-            decode(b"whatever", Codec::Heic),
+            decode(b"whatever", Codec::Heic, None),
             Err(Error::NoDecoder { codec: Codec::Heic })
         ));
     }

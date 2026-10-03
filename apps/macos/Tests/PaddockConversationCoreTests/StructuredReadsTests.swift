@@ -5,6 +5,30 @@ import Testing
 
 @Suite("Structured Reads wire parity")
 struct StructuredReadsTests {
+  @Test func clefDecodesJointDecisionsWithoutCanvasOrLanguageRouting() throws {
+    let text =
+      #"{"model":"clef-flash","answers":{"q1":{"type":"noul","noul":0.98,"confidence":0.96,"answer_confidence":0.98}},"usage":{"input_tokens":260,"output_tokens":0},"diagnostics":{"backend":"clef","reads":1,"state_tokens":100,"state_read":80,"questions":[{"id":"q1","label":"yes","entropy":0.1,"options":2,"option_ids":["true","false"],"logits":[2.1,-1.8]}],"timing":{"total_ms":300,"gpu_ms":290,"pass_requests":4}}}"#
+    let response = try JSONDecoder().decode(ReadResponse.self, from: Data(text.utf8))
+    try response.validate(for: [ReadQuestion(questionID: "q1")])
+    #expect(response.diagnostics.canvas == nil && response.routing == nil)
+    #expect(response.diagnostics.stateRead == 80)
+    #expect(response.diagnostics.timing.passRequests == 4)
+    #expect(response.diagnostics.timing.gpuMilliseconds == 290)
+    #expect(response.diagnostics.questions.first?.optionIDs == ["true", "false"])
+    #expect(response.diagnostics.questions.first?.logits == [2.1, -1.8])
+    for invalid in [
+      text.replacingOccurrences(of: "\"reads\":1", with: "\"reads\":2"),
+      text.replacingOccurrences(of: "\"state_read\":80", with: "\"state_read\":101"),
+      text.replacingOccurrences(of: "\"gpu_ms\":290", with: "\"gpu_ms\":-1"),
+      text.replacingOccurrences(of: "\"pass_requests\":4", with: "\"pass_requests\":0"),
+      text.replacingOccurrences(of: "\"backend\":\"clef\"", with: "\"backend\":\"unknown\""),
+    ] {
+      #expect(throws: (any Error).self) {
+        try JSONDecoder().decode(ReadResponse.self, from: Data(invalid.utf8))
+          .validate(for: [ReadQuestion(questionID: "q1")])
+      }
+    }
+  }
   @Test func layaDecodesWithoutInventingDiffusionMetrics() throws {
     let text =
       #"{"model":"laya","answers":{"q1":{"type":"noul","noul":0.98,"confidence":0.96,"answer_confidence":0.98}},"routing":{"model":"multilingual","reason":"Swedish text"},"diagnostics":{"backend":"laya","checkpoint":"multilingual","reads":1,"state_tokens":1500,"windowed":true,"questions":[{"id":"q1","label":"yes","entropy":0.1,"options":2,"tokens":[1024,900],"temperature":1.2,"entropy_confidence":0.8,"window":{"index":1,"count":2,"token_start":400,"token_end":1500}}],"timing":{"total_ms":12}}}"#

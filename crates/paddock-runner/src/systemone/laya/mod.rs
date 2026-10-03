@@ -32,7 +32,7 @@
 //! `steps`, `think` and `images`, which this model has no way to honour.
 
 pub mod lang;
-pub mod pyjson;
+pub use super::pyjson;
 pub mod question;
 pub mod sequence;
 #[cfg(test)]

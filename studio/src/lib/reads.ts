@@ -612,6 +612,11 @@ export interface ReadDiagQuestion {
   window?: { index: number; count: number; token_start: number; token_end: number } | null
   /** every option was cut to this many tokens to fit the option budget */
   options_cut_to?: number | null
+  // ---- Clef's ----
+  /** the options in the order the model read them */
+  option_ids?: string[]
+  /** each option's raw logit, in that order */
+  logits?: number[]
 }
 /** A thought the model wrote before its read. */
 export interface ReadThought {
@@ -637,17 +642,24 @@ export interface ReadResponse {
   /** a decision model's router: which checkpoint read the state, and why */
   routing?: { model: string; reason: string }
   diagnostics: {
-    /** 'laya' for a decision model; absent for a canvas reader */
-    backend?: 'laya'
+    /** 'laya' / 'clef' for a decision model; absent for a canvas reader */
+    backend?: 'laya' | 'clef'
     /** the checkpoint that answered (a decision model) */
     checkpoint?: string
     state_tokens?: number
+    /** Clef: the state's tokens the sequence carried (all of them, or the
+     *  caller's `max_state_tokens` cut) */
+    state_read?: number
     windowed?: boolean
     reads: number
     canvas?: number
     steps?: number
     format?: 'lines' | 'indexed'
+    /** the pictures read with the text */
     images?: number
+    /** Clef: each picture as decoded, the size the processor resized it to
+     *  (`[width, height]`) and the tokens it took */
+    pictures?: { width: number; height: number; resized: [number, number]; tokens: number }[]
     /** the questions read together, in the order they were read */
     stages?: string[][]
     chunks?: string[][]
@@ -657,7 +669,7 @@ export interface ReadResponse {
     conditioning?: string | null
     thought?: ReadThought | ReadThought[] | null
     questions: ReadDiagQuestion[]
-    timing: { total_ms: number; gpu_ms?: number; passes?: number }
+    timing: { total_ms: number; gpu_ms?: number; passes?: number; pass_requests?: number }
   }
 }
 

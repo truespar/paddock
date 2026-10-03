@@ -1,10 +1,11 @@
-//! JSON the way Python holds and writes it - because Laya's sequences are
-//! built from Python's text of the request, not from ours.
+//! JSON the way Python holds and writes it - because the decision models'
+//! sequences are built from Python's text of the request, not from ours.
 //!
-//! A structured `state` reaches the tokenizer as `json.dumps(state,
-//! ensure_ascii=False)`, a dict-valued criterion as the same with the same
-//! separators, a non-string instruction likewise, and a list label as
-//! `str(label)`. Every byte of those strings is a token the model reads, so
+//! Laya reads a structured `state` as `json.dumps(state, ensure_ascii=False)`,
+//! a dict-valued criterion as the same with the same separators, a non-string
+//! instruction likewise, and a list label as `str(label)`; Clef renders every
+//! non-string value with `sort_keys=True` and the compact `(",", ":")`
+//! separators. Every byte of those strings is a token the model reads, so
 //! "equivalent JSON" is not good enough: the key order must be the caller's
 //! (Python dicts keep insertion order; `serde_json::Map` sorts), `12.50`
 //! must come out `12.5`, `1e16` as `1e+16`, `True` as `true` in JSON and
@@ -51,11 +52,25 @@ impl PyVal {
     /// `": "` (which is also what `separators=(", ", ": ")` spells).
     pub fn dumps(&self) -> String {
         let mut out = String::new();
-        self.write_json(&mut out);
+        self.write_json(&mut out, false);
         out
     }
 
-    fn write_json(&self, out: &mut String) {
+    /// `json.dumps(v, ensure_ascii=False, separators=(",", ":"),
+    /// sort_keys=True)`. Python sorts the keys as strings, i.e. by code
+    /// point, which is the byte order of their UTF-8.
+    pub fn dumps_sorted_compact(&self) -> String {
+        let mut out = String::new();
+        self.write_json(&mut out, true);
+        out
+    }
+
+    fn write_json(&self, out: &mut String, sorted_compact: bool) {
+        let (item_sep, key_sep) = if sorted_compact {
+            (",", ":")
+        } else {
+            (", ", ": ")
+        };
         match self {
             PyVal::Null => out.push_str("null"),
             PyVal::Bool(true) => out.push_str("true"),
@@ -67,21 +82,25 @@ impl PyVal {
                 out.push('[');
                 for (i, v) in items.iter().enumerate() {
                     if i > 0 {
-                        out.push_str(", ");
+                        out.push_str(item_sep);
                     }
-                    v.write_json(out);
+                    v.write_json(out, sorted_compact);
                 }
                 out.push(']');
             }
             PyVal::Dict(kv) => {
+                let mut order: Vec<&(String, PyVal)> = kv.iter().collect();
+                if sorted_compact {
+                    order.sort_by(|a, b| a.0.cmp(&b.0));
+                }
                 out.push('{');
-                for (i, (k, v)) in kv.iter().enumerate() {
+                for (i, (k, v)) in order.into_iter().enumerate() {
                     if i > 0 {
-                        out.push_str(", ");
+                        out.push_str(item_sep);
                     }
                     write_str(k, out);
-                    out.push_str(": ");
-                    v.write_json(out);
+                    out.push_str(key_sep);
+                    v.write_json(out, sorted_compact);
                 }
                 out.push('}');
             }
@@ -466,6 +485,20 @@ mod tests {
         );
         assert_eq!(parse("[]").unwrap().dumps(), "[]");
         assert_eq!(parse("{}").unwrap().dumps(), "{}");
+    }
+
+    #[test]
+    fn sorted_compact_follows_sort_keys() {
+        let v = parse(
+            r#"{"z": 1e21, "a": [1.5, -0.0, 3, true, null, "\u00f6"], "\u00c4": "x",
+               "m": {"k": 0.1, "big": 12345678901234567890, "small": 1e-7}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            v.dumps_sorted_compact(),
+            "{\"a\":[1.5,-0.0,3,true,null,\"\u{f6}\"],\"m\":{\"big\":12345678901234567890,\
+             \"k\":0.1,\"small\":1e-07},\"z\":1e+21,\"\u{c4}\":\"x\"}"
+        );
     }
 
     #[test]

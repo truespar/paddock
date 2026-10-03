@@ -7,8 +7,44 @@ struct NativeSpeechView: View {
   var workspace: StudioWorkspace?
   @State private var nextDifference = 0
   @State private var focusedWord: Int?
+  @State private var identifying = false
+  @State private var identification: Task<Void, Never>?
   var body: some View {
     VStack(alignment: .leading, spacing: 10) {
+      if let timeline = speech.diarization {
+        NativeSpeakerTimeline(timeline: timeline) { seconds in
+          guard let workspace, let clip = speech.clip else { return }
+          Task { await workspace.playAudio(clip, at: seconds) }
+        }
+      }
+      if let workspace, let models = speech.diarizers, !models.isEmpty,
+        let messageID = speech.messageId, let conversationID = speech.conversationId
+      {
+        Menu {
+          ForEach(models, id: \.port) { model in
+            Button(model.title) {
+              identifying = true
+              identification = Task {
+                defer { identifying = false }
+                await workspace.perform(
+                  "identifySpeakers",
+                  [
+                    "messageId": .string(messageID), "conversationId": .string(conversationID),
+                    "modelId": .string(model.id), "port": .number(Double(model.port)),
+                  ])
+              }
+            }
+          }
+        } label: {
+          Label(
+            identifying ? "Identifying speakers…" : "Identify speakers",
+            systemImage: "person.wave.2")
+        }.menuStyle(.borderlessButton).fixedSize().disabled(identifying)
+          .accessibilityIdentifier("identify-speakers")
+        if identifying {
+          Button("Cancel") { identification?.cancel() }.buttonStyle(.plain)
+        }
+      }
       ForEach(speech.guards.indices, id: \.self) { index in
         let guardrail = speech.guards[index]
         Label(
@@ -64,7 +100,7 @@ struct NativeSpeechView: View {
         HStack(spacing: 14) { facts }
         VStack(alignment: .leading, spacing: 4) { facts }
       }.font(.system(size: 11)).foregroundStyle(.secondary)
-    }
+    }.onDisappear { identification?.cancel() }
   }
   private var facts: some View {
     ForEach(speech.facts.indices, id: \.self) { index in
@@ -191,7 +227,22 @@ struct NativeSpeechText: NSViewRepresentable {
       let paragraph = NSMutableParagraphStyle()
       paragraph.lineSpacing = 5
       for (index, word) in words.enumerated() {
-        if index > 0 { body.append(NSAttributedString(string: " ")) }
+        if word.speakers != (index > 0 ? words[index - 1].speakers : nil),
+          let speakers = word.speakers
+        {
+          let label =
+            speakers.isEmpty
+            ? "Unassigned" : speakers.map { "Speaker \($0 + 1)" }.joined(separator: " / ")
+          body.append(
+            NSAttributedString(
+              string: "\(index > 0 ? "\n" : "")\(label)\n",
+              attributes: [
+                .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+                .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: paragraph,
+              ]))
+        } else if index > 0 {
+          body.append(NSAttributedString(string: " "))
+        }
         let range = NSRange(location: body.length, length: (word.word as NSString).length)
         ranges.append(range)
         segmentWords[word.segment, default: []].append(index)
@@ -208,6 +259,9 @@ struct NativeSpeechText: NSViewRepresentable {
           attributes[.link] = URL(string: "paddock-word:\(index)")!
         }
         var hints: [String] = []
+        if let speakers = word.speakers, speakers.count > 1 {
+          hints.append("Multiple speakers cover this word's time range; its speaker is ambiguous.")
+        }
         if differenceSet.contains(index) {
           attributes[.underlineStyle] = NSUnderlineStyle.double.rawValue
           attributes[.underlineColor] = NSColor.systemOrange

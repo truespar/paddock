@@ -25,12 +25,14 @@ struct EndpointDetailView: View {
         if let row {
           PageHeading(title: row.title, subtitle: "Port \(String(port)) · \(row.status)") {
             if let runner = row.runner {
-              Button(
-                runner.studioActionTitle,
-                systemImage: runner.studioActionSymbol
-              ) { workspace.request(.chat(port: port)) }
-              .buttonStyle(FlatButtonStyle()).disabled(
-                runner.status != "ok" || workspace.desktopNavigationBlocked)
+              if runner.hasStudioSurface {
+                Button(
+                  runner.studioActionTitle,
+                  systemImage: runner.studioActionSymbol
+                ) { workspace.request(.chat(port: port)) }
+                .buttonStyle(FlatButtonStyle()).disabled(
+                  runner.status != "ok" || workspace.desktopNavigationBlocked)
+              }
               editButton
               Button("Stop", systemImage: "stop.fill") { stopReview = runner }
                 .buttonStyle(FlatButtonStyle()).disabled(!workspace.canSubmit)

@@ -276,7 +276,7 @@ const noTools = computed(() => !!cfg.value && !webProvider.value && !mcpLabels.v
           </span>
         </div>
         <div class="sd__actions">
-          <button class="pk-btn pk-btn--sm" @click="openInStudio">
+          <button v-if="!row.diarization" class="pk-btn pk-btn--sm" @click="openInStudio">
             <Icon name="external-link" :size="13" /> Open in Studio
           </button>
           <RouterLink

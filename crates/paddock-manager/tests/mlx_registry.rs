@@ -42,6 +42,47 @@ fn flash_next_spec() -> SpawnSpec {
 }
 
 #[tokio::test]
+async fn diarization_previews_both_formats_without_chat_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let metal = supervisor(dir.path(), "metal");
+    for (artifact, path) in [
+        ("mlx-bf16", "Nemotron-3-Diarization-MLX"),
+        (
+            "q8",
+            "Nemotron-3-Diarization-GGUF/Nemotron-3-Diarization.q8_0.gguf",
+        ),
+    ] {
+        let request = SpawnSpec {
+            model: "nemotron-3-diarization".into(),
+            artifact: Some(artifact.into()),
+            ..Default::default()
+        };
+        let raw = metal.preview_config(request.clone()).await.unwrap();
+        let config: toml::Value = toml::from_str(&raw).unwrap();
+        assert_eq!(
+            config["model"].as_str(),
+            dir.path().join("models").join(path).to_str()
+        );
+        assert_eq!(config["spec"].as_str(), Some("off"));
+        assert_eq!(config["max_ctx"].as_integer(), Some(684));
+        assert_eq!(config["max_batch"].as_integer(), Some(1));
+        assert_eq!(config["kv_cache_dtype"].as_str(), Some("auto"));
+        assert!(config.get("mmproj").is_none());
+        // the same artifact previews on CUDA with the same envelope
+        let raw = supervisor(dir.path(), "cuda")
+            .preview_config(request)
+            .await
+            .unwrap();
+        let cuda: toml::Value = toml::from_str(&raw).unwrap();
+        assert_eq!(cuda["model"], config["model"]);
+        assert_eq!(cuda["spec"].as_str(), Some("off"));
+        assert_eq!(cuda["max_ctx"].as_integer(), Some(684));
+        assert_eq!(cuda["max_batch"].as_integer(), Some(1));
+        assert!(cuda.get("mmproj").is_none());
+    }
+}
+
+#[tokio::test]
 async fn bonsai_preview_elects_native_ternary_bundle_and_exact_kv_precision() {
     let dir = tempfile::tempdir().unwrap();
     let metal = supervisor(dir.path(), "metal");

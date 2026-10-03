@@ -126,11 +126,11 @@ const items = computed(() => renderWords(props.segments, props.words, props.plai
 /** Grouped back into segments for the playing highlight and the seek. A lane
  *  with no times is one group that clicks nowhere. */
 const groups = computed(() => {
-  const out: { segment: number; start?: number; words: (RenderWord & { at: number })[] }[] = []
+  const out: { segment: number; start?: number; speakers?: number[]; words: (RenderWord & { at: number })[] }[] = []
   items.value.forEach((w, at) => {
     const last = out[out.length - 1]
-    if (last && last.segment === w.segment) last.words.push({ ...w, at })
-    else out.push({ segment: w.segment, start: w.start, words: [{ ...w, at }] })
+    if (last && last.segment === w.segment && JSON.stringify(last.speakers) === JSON.stringify(w.speakers)) last.words.push({ ...w, at })
+    else out.push({ segment: w.segment, start: w.start, speakers: w.speakers, words: [{ ...w, at }] })
   })
   return out
 })
@@ -252,6 +252,7 @@ watch(diffAt, () => (cursor.value = -1))
  *  leads when both apply. */
 function label(w: RenderWord & { at: number }): string | undefined {
   const bits: string[] = []
+  if ((w.speakers?.length ?? 0) > 1) bits.push("multiple speakers cover this word's time range; its speaker is ambiguous")
   if (props.differs.has(w.at)) bits.push('the other model heard this differently')
   if (w.confidence !== undefined && marked(w.confidence)) {
     // The ALTERNATIVE where the lane could give one AND the margin says it was
@@ -316,6 +317,9 @@ function onWord(w: RenderWord & { at: number }): void {
         :data-seg="g.segment"
         :class="{ 'tv__seg--now': g.segment >= 0 && g.segment === now }"
       >
+        <span v-if="g.speakers !== undefined && (gi === 0 || JSON.stringify(g.speakers) !== JSON.stringify(groups[gi - 1].speakers))" class="tv__speaker">
+          {{ g.speakers.length ? g.speakers.map(s => `Speaker ${s + 1}`).join(' / ') : 'Unassigned' }}
+        </span>
         <template v-for="w in g.words" :key="w.at"
           ><Tooltip :label="label(w)"
             ><component
@@ -339,6 +343,7 @@ function onWord(w: RenderWord & { at: number }): void {
 </template>
 
 <style scoped>
+.tv__speaker { display: block; margin-top: 10px; font-size: var(--pk-font-size-xs); font-weight: 600; color: var(--pk-text-muted); }
 .tv__key {
   display: flex;
   align-items: baseline;

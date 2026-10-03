@@ -16,6 +16,7 @@ members = [
     "crates/paddock-filemeta",
     "crates/paddock-geo",
     "crates/paddock-heif",
+    "crates/paddock-jpeg",
     "crates/paddock-websearch",
     "crates/paddock-admin",
     "crates/paddock-tls",
@@ -49,7 +50,10 @@ repository = "https://github.com/truespar/paddock"
 axum = "0.8.9"
 tokio = { version = "1.53.1", features = ["full"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+# Word timestamps and confidence pass through the runner, relay and persisted
+# Studio metadata. Best-effort float parsing loses one ULP on valid JSON and
+# breaks lossless transcript attribution; preserve f64 across every hop.
+serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 toml = "1.1.4"
@@ -183,6 +187,7 @@ paddock-mcp = { path = "crates/paddock-mcp" }
 paddock-filemeta = { path = "crates/paddock-filemeta" }
 paddock-geo = { path = "crates/paddock-geo" }
 paddock-heif = { path = "crates/paddock-heif" }
+paddock-jpeg = { path = "crates/paddock-jpeg" }
 paddock-runner = { path = "crates/paddock-runner" }
 paddock-websearch = { path = "crates/paddock-websearch" }
 paddock-models = { path = "crates/paddock-models" }

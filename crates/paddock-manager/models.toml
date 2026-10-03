@@ -46,6 +46,167 @@
 
 schema = 3
 
+# Speaker activity is a separate API, never transcription/chat. R2 mirrors the
+# exact pinned upstream files, with model cards and OpenMDW-1.1 in each bundle.
+# Both artifacts serve on Metal and CUDA from the same files. weight_bytes is
+# the larger lane's own count (CUDA, GB10 2026-10-01: MLX 200,623,648 with
+# the head widened to F32, Q8 114,751,008 with int8 rows and F32 block
+# scales; Metal 199,106,592 / 107,176,992); workspace is Metal's resident
+# planes, above the CUDA lane's 34,700,800.
+[[model]]
+id = "nemotron-3-diarization"
+vendor = "NVIDIA"
+display = "Nemotron 3 Diarization"
+family = "nemotron-diarization"
+capability = ["diarization"]
+license = "openmdw-1.1"
+revision = "2026-10-01"
+
+  [model.specs]
+  published_at = "2026-09-23"
+  published_source = "https://huggingface.co/nvidia/Nemotron-3-Diarization"
+  params = "99M"
+  context = "Up to 10 minutes per recording"
+  homepage = "https://huggingface.co/nvidia/Nemotron-3-Diarization"
+  about = "Finds who spoke when, including overlapping speech, with up to eight anonymous speakers and 10-ms timestamps. Serves file uploads and live PCM audio through the diarization API; does not transcribe words or identify people."
+  strengths = ["Overlapping speakers", "Four latency presets", "Bounded speaker-cache memory"]
+  tradeoffs = ["Pair with transcription for words", "Speaker numbers are recording-local, not identities"]
+
+  [[model.artifact]]
+  id = "mlx-bf16"
+  kind = "weights"
+  format = "safetensors"
+  label = "MLX BF16"
+  quant = "BF16"
+  default = true
+  workspace = 36133888
+
+  [model.artifact.source]
+  repo = "mlx-community/Nemotron-3-Diarization"
+  base_model = "nvidia/Nemotron-3-Diarization"
+  license_url = "https://openmdw.ai/license/1-1/"
+  revision = "59ed2dbfc1346dcea9d423c71306a3a2499c568f"
+  license = "openmdw-1.1"
+
+  [model.artifact.runtime]
+  backends = ["metal", "cuda"]
+  checkpoint_dir = true
+  companions = []
+  kv_cache_dtype = "auto"
+  default_spec = "off"
+  default_max_ctx = 684
+  default_max_batch = 1
+
+  [model.artifact.runtime.memory]
+  weight_bytes = 200623648
+  source = "measured"
+  max_ctx = 684
+  max_batch = 1
+  full_paged_kv = false
+  kv_reserve_sequences = 0
+  workspace_bytes = 36133888
+
+  [model.artifact.shape]
+  weight_bytes = 200623648
+  kind = "encoder"
+  vocab = 0
+  max_ctx = 684
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = []
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3-Diarization-MLX/model.safetensors"
+    dest = "Nemotron-3-Diarization-MLX/model.safetensors"
+    sha256 = "21e8427d1795c9c46c5800f56b16061734ffd0dcadd71d9bcf0b4d6ef7261da5"
+    size = 198632220
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3-Diarization-MLX/config.json"
+    dest = "Nemotron-3-Diarization-MLX/config.json"
+    sha256 = "f215091252bc54f8dcc7d682962a659e03a6bcb26d1c86e4728b8c6730130eb4"
+    size = 1521
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3-Diarization-MLX/README.md"
+    dest = "Nemotron-3-Diarization-MLX/README.md"
+    sha256 = "d1b1fbd0f419306e2de500e1e1884aff0a90d8cc0b9422152c18929d903e44e9"
+    size = 1402
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3-Diarization-MLX/NVIDIA_MODEL_CARD.md"
+    dest = "Nemotron-3-Diarization-MLX/NVIDIA_MODEL_CARD.md"
+    sha256 = "5fe88ca4020d2ee134f806a0a02c52c19855b73047bc2e6f25b9171e1abeebfd"
+    size = 43239
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3-Diarization-MLX/LICENSE"
+    dest = "Nemotron-3-Diarization-MLX/LICENSE"
+    sha256 = "2ab44b68365473c112f5092211a38f231cb23e50de68b75a13369adbd76a74df"
+    size = 2619
+
+  [[model.artifact]]
+  id = "q8"
+  kind = "weights"
+  format = "gguf"
+  label = "GGUF Q8_0"
+  quant = "Q8_0"
+  default = false
+  workspace = 36133888
+
+  [model.artifact.source]
+  repo = "nvidia/Nemotron-3-Diarization"
+  base_model = "nvidia/Nemotron-3-Diarization"
+  license_url = "https://openmdw.ai/license/1-1/"
+  revision = "f667ed73aee57d40cc39428eb768b4fd87a0a29e"
+  license = "openmdw-1.1"
+
+  [model.artifact.runtime]
+  backends = ["metal", "cuda"]
+  checkpoint_dir = false
+  companions = []
+  kv_cache_dtype = "auto"
+  default_spec = "off"
+  default_max_ctx = 684
+  default_max_batch = 1
+
+  [model.artifact.runtime.memory]
+  weight_bytes = 114751008
+  source = "measured"
+  max_ctx = 684
+  max_batch = 1
+  full_paged_kv = false
+  kv_reserve_sequences = 0
+  workspace_bytes = 36133888
+
+  [model.artifact.shape]
+  weight_bytes = 114751008
+  kind = "encoder"
+  vocab = 0
+  max_ctx = 684
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = []
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3-Diarization-GGUF/Nemotron-3-Diarization.q8_0.gguf"
+    dest = "Nemotron-3-Diarization-GGUF/Nemotron-3-Diarization.q8_0.gguf"
+    sha256 = "08456d9e22cd9a323c0364d98375f3746d6e68507ebb705cd46438c534c7a3a1"
+    size = 107012128
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3-Diarization-GGUF/README.md"
+    dest = "Nemotron-3-Diarization-GGUF/README.md"
+    sha256 = "5fe88ca4020d2ee134f806a0a02c52c19855b73047bc2e6f25b9171e1abeebfd"
+    size = 43239
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3-Diarization-GGUF/LICENSE"
+    dest = "Nemotron-3-Diarization-GGUF/LICENSE"
+    sha256 = "2ab44b68365473c112f5092211a38f231cb23e50de68b75a13369adbd76a74df"
+    size = 2619
+
+
 # ── generative (chat) ────────────────────────────────────────────────────────
 
 [[model]]
@@ -6095,6 +6256,537 @@ revision = "2026-09-25"
     dest = "laya/typed-decisions/tokenizer/tokenizer_config.json"
     sha256 = "08d4cf3ac4dca381759441b85b91a6d40e688471dcd33d15d6649eb0a9a854d1"
     size = 337
+
+# Clef (Cloudflare, released 2026-10-01): a post-trained Qwen3.5-9B (with its
+# vision tower) under a joint schema head that scores every option of every
+# question in ONE pass over one joint sequence - the state, then the whole
+# schema. The same /v1/systemone body Laya answers, far stronger on the
+# vendor's Decision Index (MMLU 91.8 vs 30.7, BFCL 98.8 vs 38.1) at 9B instead
+# of 0.4B.
+#
+# Q8_0 default (2026-10-03): ggml-org/Clef-Flash-GGUF rev
+# 4a7a08c09bc6, llama.cpp's own converter on Cloudflare/clef-flash rev
+# 17f0b0ad64ef plus llama-quantize, mirrored unchanged and sha256-checked
+# against the LFS id. ggml-org is named here deliberately, as for gpt-oss: no
+# official or unsloth GGUF of Clef exists, and this is a straight conversion
+# of Cloudflare's release by llama.cpp's maintainers, not a re-quant recipe.
+# Q8_0 moves the release's answers about as far as Cloudflare's own BF16
+# serving does (probabilities median 0.0007 / worst 0.032 against its 0.0012
+# / 0.050 over 26 fixtures, no flips either) at half the memory, so the
+# official BF16 checkpoint is not in the catalog any more (it was mirrored
+# here 2026-10-02 to 10-03): the engine still loads it, downloaded by hand
+# from Hugging Face. Metal serves packed Q8_0 and the separately requested
+# mlx-community affine-8/group-64 checkpoint, both with their exact vision tower.
+#
+# The GGUF holds the backbone and head only; the vision companion is OUR cut
+# of the release's own tower - its model.visual.* tensors byte for byte, its
+# config.json and processor_config.json verbatim in the header (our companion
+# cutter) - so images read exactly as on the release. Served Q8_0 as stored
+# (int8 rows and the file's f16 block scales, slot 741: the backbone's
+# two-part bf16 activation split against the exact int8, F32 everywhere else,
+# attention 3xTF32): against the release evaluated in F32 with these Q8_0
+# weights, logits within 5.2e-5 and probabilities 2.0e-5 on the text
+# fixtures, 2.0e-4 / 1.6e-5 on the image fixtures (preprocessed as the
+# reference's processor and decoded as its libjpeg-turbo, byte for byte), no
+# flips; tokenization from the GGUF token-exact on all 26. Measured on the
+# DGX Spark 2026-10-03: 9.66 GB of weights without the tower.
+
+[[model]]
+id = "clef-flash"
+vendor = "Cloudflare"
+display = "Clef Flash"
+family = "clef"
+capability = ["decision", "vision"]
+license = "apache-2.0"
+revision = "2026-10-03"
+
+  [model.specs]
+  params = "9B + 122M schema head"
+  context = "16K tokens a request (state + schema)"
+  published_at = "2026-10-01"
+  published_source = "https://developers.cloudflare.com/changelog/post/2026-10-01-clef-workers-ai/"
+  homepage = "https://huggingface.co/Cloudflare/clef-flash"
+  about = "Answers a whole schema of typed questions about a state - text, JSON or pictures - pick one of these, score it on this scale, yes or no - in one pass, every answer seeing every other question. It writes nothing: the same /v1/systemone call Jev clients make, with a probability for every option."
+  strengths = [
+    "Decides every field jointly from one read of the state",
+    "Strong reasoning for its size - MMLU 91.8, BFCL 98.8 on the vendor's Decision Index",
+    "Reads states up to 16K tokens; any number of options a question",
+    "Reads images too on CUDA and Metal - up to 16 a request",
+  ]
+  tradeoffs = [
+    "A 9B model - hundreds of milliseconds a request where Laya takes a few",
+    "Large photos are slow: a 12 MP picture spends ~20 s in the vision tower (send it smaller, or set media_kwargs)",
+    "No video input; no conditional questions (depends_on / ask_if)",
+  ]
+
+  # ggml-org's Q8_0 of this release, the default (see the note above).
+  # The loader's own count: 9,658,079,232 bytes resident (the file's Q8_0 as
+  # stored, the head's block scales widened), 4,730,142,720 of workspace
+  # without the tower.
+  [[model.artifact]]
+  id = "q8"
+  kind = "weights"
+  format = "gguf"
+  label = "Full quality"
+  quant = "Q8_0"
+  default = true
+  workspace = 4730142720
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  companions = ["vision"]
+  default_max_ctx = 16384
+  default_spec = "off"
+
+  [model.artifact.runtime.backend_overrides.metal]
+  capability = ["decision", "vision"]
+  companions = ["vision"]
+  kv_cache_dtype = "auto"
+  default_max_batch = 1
+  note = "Native packed Q8_0 text and image decisions with the original BF16 vision companion. No autoregressive KV cache or speculative decoding."
+
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 9650477056
+  # Fixed scratch plus 32 MiB load-time/rotary margin; no per-chat KV pool.
+  workspace_bytes = 3730311168
+  source = "measured"
+  max_ctx = 16384
+  max_batch = 256
+  full_paged_kv = false
+  kv_reserve_sequences = 0
+
+  [model.artifact.shape]
+  weight_bytes = 9658079232
+  kind = "encoder"
+  vocab = 248320
+  max_ctx = 16384
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = []
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Clef-Flash-GGUF/Clef-Flash-Q8_0.gguf"
+    dest = "Clef-Flash-GGUF/Clef-Flash-Q8_0.gguf"
+    sha256 = "8754b06f7d16d6d6ab63493b2ee385cc0ed6abde8c25c39298dc3e1eb05593d9"
+    size = 9657260096
+
+  # Explicitly requested MLX 8-bit alternative; native Rust/Metal, not Python.
+  # Preserve every upstream data file and its attribution. The checkpoint's
+  # bundled BF16 vision tower runs natively with the MLX image processor contract.
+  [[model.artifact]]
+  id = "mlx8"
+  kind = "weights"
+  format = "safetensors"
+  label = "MLX 8-bit"
+  quant = "MLX-AFFINE-8-G64"
+  default = false
+  workspace = 3696560128
+
+  [model.artifact.source]
+  repo = "mlx-community/clef-flash-8bit"
+  revision = "dfa0993decb4f8507a0eae01afd1b2d33a4bb734"
+  base_model = "Cloudflare/clef-flash"
+  license = "apache-2.0"
+  license_url = "https://huggingface.co/mlx-community/clef-flash-8bit/resolve/dfa0993decb4f8507a0eae01afd1b2d33a4bb734/LICENSE"
+
+  [model.artifact.runtime]
+  backends = ["metal"]
+  checkpoint_dir = true
+  embedded_vision = true
+  companions = []
+  capability = ["decision", "vision"]
+  kv_cache_dtype = "auto"
+  default_max_ctx = 16384
+  default_max_batch = 1
+  default_spec = "off"
+  note = "Native packed affine-8/group-64 text and image decisions, with the bundled BF16 tower. No Python runtime, chat generation or speculative decoding."
+
+  [model.artifact.runtime.memory]
+  weight_bytes = 10677937088
+  # Text scratch, bounded per-image peak, and 512 MiB load-time margin.
+  workspace_bytes = 8226605056
+  source = "measured"
+  max_ctx = 16384
+  max_batch = 256
+  full_paged_kv = false
+  kv_reserve_sequences = 0
+
+  [model.artifact.shape]
+  weight_bytes = 10677937088
+  kind = "encoder"
+  vocab = 248320
+  max_ctx = 16384
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = []
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/dfa0993decb4f8507a0eae01afd1b2d33a4bb734/clef-flash-MLX-8bit/model-00001-of-00002.safetensors"
+    dest = "clef-flash-MLX-8bit/model-00001-of-00002.safetensors"
+    sha256 = "1c271c5d4ca9e47967b52cd6abdbb411e2a49f33e3d85e28da4e6c1ff1490fe9"
+    size = 5339521769
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/dfa0993decb4f8507a0eae01afd1b2d33a4bb734/clef-flash-MLX-8bit/model-00002-of-00002.safetensors"
+    dest = "clef-flash-MLX-8bit/model-00002-of-00002.safetensors"
+    sha256 = "7463f18facfc454cc550ad748e39b46c54242c1af2dbf276493a066f1a4c05f0"
+    size = 5087069142
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/dfa0993decb4f8507a0eae01afd1b2d33a4bb734/clef-flash-MLX-8bit/LICENSE"
+    dest = "clef-flash-MLX-8bit/LICENSE"
+    sha256 = "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+    size = 11544
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/dfa0993decb4f8507a0eae01afd1b2d33a4bb734/clef-flash-MLX-8bit/README.md"
+    dest = "clef-flash-MLX-8bit/README.md"
+    sha256 = "b4a6d7ee3ee12c6e02b1c397576f401e4f7228ac3ec1ba60b01b730aa1926634"
+    size = 8338
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/dfa0993decb4f8507a0eae01afd1b2d33a4bb734/clef-flash-MLX-8bit/chat_template.jinja"
+    dest = "clef-flash-MLX-8bit/chat_template.jinja"
+    sha256 = "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715"
+    size = 7756
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/dfa0993decb4f8507a0eae01afd1b2d33a4bb734/clef-flash-MLX-8bit/config.json"
+    dest = "clef-flash-MLX-8bit/config.json"
+    sha256 = "794941bb5a4afd83fe7501fc210eb89c5c984aec98d47a85870b0c2d7e8790dc"
+    size = 3722
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/dfa0993decb4f8507a0eae01afd1b2d33a4bb734/clef-flash-MLX-8bit/generation_config.json"
+    dest = "clef-flash-MLX-8bit/generation_config.json"
+    sha256 = "45707f8467bf4e54e112c6095a1b2d1f2d63651cf86816344cfff21f02dda0d4"
+    size = 116
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/dfa0993decb4f8507a0eae01afd1b2d33a4bb734/clef-flash-MLX-8bit/joint_head.safetensors"
+    dest = "clef-flash-MLX-8bit/joint_head.safetensors"
+    sha256 = "19cdcec8c81dc9212be320fff47462ab342fbc1278be4368fb3da71241cf5ba0"
+    size = 243538016
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/dfa0993decb4f8507a0eae01afd1b2d33a4bb734/clef-flash-MLX-8bit/joint_head_config.json"
+    dest = "clef-flash-MLX-8bit/joint_head_config.json"
+    sha256 = "77efe959a38b5b17b241543e129e695f3c77465ece55a25985279bd8176279a0"
+    size = 119
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/dfa0993decb4f8507a0eae01afd1b2d33a4bb734/clef-flash-MLX-8bit/model.safetensors.index.json"
+    dest = "clef-flash-MLX-8bit/model.safetensors.index.json"
+    sha256 = "d5f988b19a21f9799d71bad1610be045d597204148d65e25dc1f2a8f8fe53cdf"
+    size = 123593
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/dfa0993decb4f8507a0eae01afd1b2d33a4bb734/clef-flash-MLX-8bit/processor_config.json"
+    dest = "clef-flash-MLX-8bit/processor_config.json"
+    sha256 = "d89ef49ce9cd37fbf510158e13c1ef063d9286411c1ec9049932dbe0487143b1"
+    size = 1191
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/dfa0993decb4f8507a0eae01afd1b2d33a4bb734/clef-flash-MLX-8bit/tokenizer.json"
+    dest = "clef-flash-MLX-8bit/tokenizer.json"
+    sha256 = "a5cd9732badce41de57e6efce8302930ded1c1188c5f81feb2bd6c24c4a1941f"
+    size = 19989339
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/dfa0993decb4f8507a0eae01afd1b2d33a4bb734/clef-flash-MLX-8bit/tokenizer_config.json"
+    dest = "clef-flash-MLX-8bit/tokenizer_config.json"
+    sha256 = "7d884d6eaf8142a3343a933ca5ab6ccc2fa93d52591cdbbe2ea33559bb2b503a"
+    size = 1190
+
+
+  # The Q8_0's image input: the release's vision tower cut byte for byte
+  # (333 model.visual.* tensors, BF16) with its configs in the header. Its
+  # workspace is what the loader holds beyond the file: the tower's F32 norms
+  # and padded MLP (3,357,152) and the three backbone planes it widens
+  # (365,166,600).
+  [[model.artifact]]
+  id = "vision"
+  kind = "vision"
+  format = "safetensors"
+  label = "Vision (image input)"
+  default = true
+  workspace = 368523752
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { memory = { weight_bytes = 913427392, workspace_bytes = 3994342176, source = "measured", max_ctx = 16384, max_batch = 256, full_paged_kv = false, kv_reserve_sequences = 0 } } } }
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Clef-Flash-GGUF/vision-BF16.safetensors"
+    dest = "Clef-Flash-GGUF/vision-BF16.safetensors"
+    sha256 = "fe8ef75dc46be2f5094260f7ea53a6e616d9ff6fc89e812cba73ee2c400104cc"
+    size = 912062624
+
+# Clef (Cloudflare, released 2026-10-01 with Clef Flash): the same joint
+# schema head on a post-trained Qwen3.8-27B (64 layers, 5120 wide, its vision
+# tower beside it), the same tokenizer, prompt and /v1/systemone contract.
+# Stronger than Flash where a decision needs more of the world - intents
+# (BANKING77 94.2 vs 90.9, CLINC150+OOS 97.4 vs 66.8), hallucination
+# (RAGTruth 79.4 vs 35.6), GSM8K 80.8 vs 67.3 - and not everywhere (MMLU 90.3
+# vs 91.8), at ~4x its latency (the vendor's H200: 209 vs 39 ms median).
+#
+# Q8_0 default (2026-10-03): ggml-org/Clef-GGUF rev
+# 5f70656b6670, llama.cpp's conversion of Cloudflare/clef rev 2f3de3dd85f3 -
+# the ggml-org note on Clef Flash applies - mirrored unchanged and
+# sha256-checked against the LFS id; the official BF16 (51 GiB) is not
+# offered. Its vision companion is our byte-for-byte cut of that release's
+# tower. The same lane as Flash's Q8_0: against the release evaluated in F32
+# with these Q8_0 weights, logits within 2.6e-4 and probabilities 3.0e-5 on
+# the text fixtures (the 64 layers spend more of the F32 class's 5e-4 budget
+# than Flash's 32), 1.9e-4 / 3.1e-5 on the image fixtures, no flips; the
+# GGUF's tokenizer token-exact on all 26. Measured on the DGX Spark
+# 2026-10-03: 28.73 GB resident, 6.67 GB of workspace (the tower adds 0.92 GB
+# and 4.5 MB - the 27B's planes already hold it); ~580 ms a 260-token
+# request, 35 s at 16K.
+
+[[model]]
+id = "clef"
+vendor = "Cloudflare"
+display = "Clef"
+family = "clef"
+capability = ["decision", "vision"]
+license = "apache-2.0"
+revision = "2026-10-03"
+
+  [model.specs]
+  params = "27B + 128M schema head"
+  context = "16K tokens a request (state + schema)"
+  published_at = "2026-10-01"
+  published_source = "https://developers.cloudflare.com/changelog/post/2026-10-01-clef-workers-ai/"
+  homepage = "https://huggingface.co/Cloudflare/clef"
+  about = "Clef Flash's larger sibling: the same whole-schema decisions about a state - text, JSON or pictures - in one pass, with a probability for every option, on a 27B backbone. The same /v1/systemone call; pick it when the decision needs more knowledge than Flash carries."
+  strengths = [
+    "Decides every field jointly from one read of the state",
+    "Ahead of Flash on intents and grounding - BANKING77 94.2, CLINC150+OOS 97.4, RAGTruth 79.4, GSM8K 80.8",
+    "Reads states up to 16K tokens; any number of options a question",
+    "Reads images too on CUDA and Metal - up to 16 a request",
+  ]
+  tradeoffs = [
+    "A 27B model - about four times Clef Flash's time a request, and ~37 GB to serve with images",
+    "Not ahead of Flash everywhere (MMLU 90.3 vs 91.8, BFCL 98.5 vs 98.8)",
+    "No video input; no conditional questions (depends_on / ask_if)",
+  ]
+
+  [[model.artifact]]
+  id = "q8"
+  kind = "weights"
+  format = "gguf"
+  label = "Full quality"
+  quant = "Q8_0"
+  default = true
+  workspace = 6672105472
+
+  [model.artifact.runtime]
+  backends = ["cuda", "metal"]
+  companions = ["vision"]
+  default_max_ctx = 16384
+  default_spec = "off"
+
+  [model.artifact.runtime.backend_overrides.metal]
+  capability = ["decision", "vision"]
+  companions = ["vision"]
+  kv_cache_dtype = "auto"
+  default_max_batch = 1
+  note = "Native packed Q8_0 text and image decisions with the original BF16 vision companion. No autoregressive KV cache or speculative decoding."
+
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 28725405696
+  # Fixed scratch plus 32 MiB load-time/rotary margin; no per-chat KV pool.
+  workspace_bytes = 5048371200
+  source = "measured"
+  max_ctx = 16384
+  max_batch = 256
+  full_paged_kv = false
+  kv_reserve_sequences = 0
+
+  [model.artifact.shape]
+  weight_bytes = 28733401088
+  kind = "encoder"
+  vocab = 248320
+  max_ctx = 16384
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = []
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Clef-GGUF/Clef-Q8_0.gguf"
+    dest = "Clef-GGUF/Clef-Q8_0.gguf"
+    sha256 = "ab027f7c4a77686befe7ac5a77d31778ee1a2fb65499daa0f144ed27b1400e15"
+    size = 28732215264
+
+  # Explicitly requested MLX 8-bit alternative; native Rust/Metal, not Python.
+  # Preserve every upstream data file and its attribution. The checkpoint's
+  # bundled BF16 vision tower runs natively with the MLX image processor contract.
+  [[model.artifact]]
+  id = "mlx8"
+  kind = "weights"
+  format = "safetensors"
+  label = "MLX 8-bit"
+  quant = "MLX-AFFINE-8-G64"
+  default = false
+  workspace = 5014620160
+
+  [model.artifact.source]
+  repo = "mlx-community/clef-8bit"
+  revision = "ffcdb6132b3cc94e523860321dd9ed58bc1ee9a1"
+  base_model = "Cloudflare/clef"
+  license = "apache-2.0"
+  license_url = "https://huggingface.co/mlx-community/clef-8bit/resolve/ffcdb6132b3cc94e523860321dd9ed58bc1ee9a1/LICENSE"
+
+  [model.artifact.runtime]
+  backends = ["metal"]
+  checkpoint_dir = true
+  embedded_vision = true
+  companions = []
+  capability = ["decision", "vision"]
+  kv_cache_dtype = "auto"
+  default_max_ctx = 16384
+  default_max_batch = 1
+  default_spec = "off"
+  note = "Native packed affine-8/group-64 text and image decisions, with the bundled BF16 tower. No Python runtime, chat generation or speculative decoding."
+
+  [model.artifact.runtime.memory]
+  weight_bytes = 29768205248
+  # Text scratch, bounded per-image peak, and 512 MiB load-time margin.
+  workspace_bytes = 9611773952
+  source = "measured"
+  max_ctx = 16384
+  max_batch = 256
+  full_paged_kv = false
+  kv_reserve_sequences = 0
+
+  [model.artifact.shape]
+  weight_bytes = 29768205248
+  kind = "encoder"
+  vocab = 248320
+  max_ctx = 16384
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = []
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/ffcdb6132b3cc94e523860321dd9ed58bc1ee9a1/clef-MLX-8bit/model-00001-of-00006.safetensors"
+    dest = "clef-MLX-8bit/model-00001-of-00006.safetensors"
+    sha256 = "c7921fe72af5c961c3c4230ea25068ed6d1e502d5ecb2b4a53b7c9c213effa0c"
+    size = 5317707581
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/ffcdb6132b3cc94e523860321dd9ed58bc1ee9a1/clef-MLX-8bit/model-00002-of-00006.safetensors"
+    dest = "clef-MLX-8bit/model-00002-of-00006.safetensors"
+    sha256 = "e9d93d15495354045da281f102649b99793e5b6ed0e05852c58f46e6616b54a0"
+    size = 5354102610
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/ffcdb6132b3cc94e523860321dd9ed58bc1ee9a1/clef-MLX-8bit/model-00003-of-00006.safetensors"
+    dest = "clef-MLX-8bit/model-00003-of-00006.safetensors"
+    sha256 = "7015f40310c86a18230e28644832b624532333d5dfbf7584e6c62341dbd8975e"
+    size = 5354184694
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/ffcdb6132b3cc94e523860321dd9ed58bc1ee9a1/clef-MLX-8bit/model-00004-of-00006.safetensors"
+    dest = "clef-MLX-8bit/model-00004-of-00006.safetensors"
+    sha256 = "b99b75d269cc037e6501bc7ce951126b66ab8be876e936980bdda045bd76017d"
+    size = 5337309653
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/ffcdb6132b3cc94e523860321dd9ed58bc1ee9a1/clef-MLX-8bit/model-00005-of-00006.safetensors"
+    dest = "clef-MLX-8bit/model-00005-of-00006.safetensors"
+    sha256 = "83d7b64daac098749889b74307e3c2b41be8c256ac643be8cae40bccdd8778ab"
+    size = 5292848464
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/ffcdb6132b3cc94e523860321dd9ed58bc1ee9a1/clef-MLX-8bit/model-00006-of-00006.safetensors"
+    dest = "clef-MLX-8bit/model-00006-of-00006.safetensors"
+    sha256 = "17442d87f0ca4d71ae790349b1eccb14b5c82886358b5b45e3e6bd1a0d17f1fc"
+    size = 2845065477
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/ffcdb6132b3cc94e523860321dd9ed58bc1ee9a1/clef-MLX-8bit/LICENSE"
+    dest = "clef-MLX-8bit/LICENSE"
+    sha256 = "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+    size = 11544
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/ffcdb6132b3cc94e523860321dd9ed58bc1ee9a1/clef-MLX-8bit/README.md"
+    dest = "clef-MLX-8bit/README.md"
+    sha256 = "5ac57aef94f8d9906f1b0c49aa9393f85c566373df70e88844c5dd097b61d7a3"
+    size = 8251
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/ffcdb6132b3cc94e523860321dd9ed58bc1ee9a1/clef-MLX-8bit/chat_template.jinja"
+    dest = "clef-MLX-8bit/chat_template.jinja"
+    sha256 = "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"
+    size = 8952
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/ffcdb6132b3cc94e523860321dd9ed58bc1ee9a1/clef-MLX-8bit/config.json"
+    dest = "clef-MLX-8bit/config.json"
+    sha256 = "ff17906eec7f9e3035bc83537cf968bdf7d559be88287afe1cef5fbf855d9e82"
+    size = 5031
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/ffcdb6132b3cc94e523860321dd9ed58bc1ee9a1/clef-MLX-8bit/generation_config.json"
+    dest = "clef-MLX-8bit/generation_config.json"
+    sha256 = "dc36854b2b25176764cfeeda32a3d80fb4fcffbef2b00d55c6614079bf21eb9f"
+    size = 214
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/ffcdb6132b3cc94e523860321dd9ed58bc1ee9a1/clef-MLX-8bit/joint_head.safetensors"
+    dest = "clef-MLX-8bit/joint_head.safetensors"
+    sha256 = "a010ac04f078e699988e4049cbea5e62c962393f59fec366640b64e8d69a4953"
+    size = 256125024
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/ffcdb6132b3cc94e523860321dd9ed58bc1ee9a1/clef-MLX-8bit/joint_head_config.json"
+    dest = "clef-MLX-8bit/joint_head_config.json"
+    sha256 = "890be585d75b981201eb96a35f98a9967afe37bc8d220cfdea2e72d56507534f"
+    size = 119
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/ffcdb6132b3cc94e523860321dd9ed58bc1ee9a1/clef-MLX-8bit/model.safetensors.index.json"
+    dest = "clef-MLX-8bit/model.safetensors.index.json"
+    sha256 = "4301ca600788afb2a45c0aa367140d6144ecf617d0a51a8187fc6755d65301f8"
+    size = 218281
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/ffcdb6132b3cc94e523860321dd9ed58bc1ee9a1/clef-MLX-8bit/processor_config.json"
+    dest = "clef-MLX-8bit/processor_config.json"
+    sha256 = "d89ef49ce9cd37fbf510158e13c1ef063d9286411c1ec9049932dbe0487143b1"
+    size = 1191
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/ffcdb6132b3cc94e523860321dd9ed58bc1ee9a1/clef-MLX-8bit/tokenizer.json"
+    dest = "clef-MLX-8bit/tokenizer.json"
+    sha256 = "a5cd9732badce41de57e6efce8302930ded1c1188c5f81feb2bd6c24c4a1941f"
+    size = 19989339
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/ffcdb6132b3cc94e523860321dd9ed58bc1ee9a1/clef-MLX-8bit/tokenizer_config.json"
+    dest = "clef-MLX-8bit/tokenizer_config.json"
+    sha256 = "7d884d6eaf8142a3343a933ca5ab6ccc2fa93d52591cdbbe2ea33559bb2b503a"
+    size = 1190
+
+
+  # The release's vision tower cut byte for byte, its configs in the header.
+  # Workspace: the tower's F32 norms and padded MLP beyond the file
+  # (3,358,256) and its resident resize plans (4,456,456) - the 27B's own
+  # planes are already as wide as the tower needs.
+  [[model.artifact]]
+  id = "vision"
+  kind = "vision"
+  format = "safetensors"
+  label = "Vision (image input)"
+  default = true
+  workspace = 7814712
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { memory = { weight_bytes = 922868672, workspace_bytes = 4061452144, source = "measured", max_ctx = 16384, max_batch = 256, full_paged_kv = false, kv_reserve_sequences = 0 } } } }
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Clef-GGUF/vision-BF16.safetensors"
+    dest = "Clef-GGUF/vision-BF16.safetensors"
+    sha256 = "b64dfeb5b89e02c6a1f3d4ac19db3a098b00ae6aeb1e16ee195960b4690579f8"
+    size = 921502800
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Speech-to-text. Four ASR models in two shapes, and the shapes

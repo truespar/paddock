@@ -96,6 +96,7 @@ paddock-filemeta = { workspace = true }
 # about, once per photo.
 paddock-geo = { workspace = true }
 paddock-heif = { workspace = true }
+paddock-jpeg = { workspace = true }
 # Spreadsheet attachments -> markdown tables (xlsx/xlsm/xls/xlsb/ods).
 calamine = { workspace = true }
 # Text-native attachments: encoding detection + decoding (never assume UTF-8).
@@ -128,6 +129,7 @@ windows-service = "0.8.1"
 paddock-metal = { path = "../paddock-metal", optional = true }
 
 [dev-dependencies]
+tokio-tungstenite = "0.30"
 tempfile = "3"
 # builds in-memory .docx fixtures for the extraction tests
 scriptor-ooxml = { workspace = true }

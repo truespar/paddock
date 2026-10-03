@@ -111,44 +111,75 @@ kernel void kumo_cache_heads(device const float* x [[buffer(0)]],device float* o
 // F32 FlashAttention: queries share tensor-matrix key/value tiles. No score
 // plane proportional to sequence length, no F16/BF16 conversion. Dispatches
 // split at the context/query boundary so Test-GQA never changes mid-tile.
-template<ushort D> inline void kumo_attention_tile_impl(device float* q,device float* k,device float* v,
+template<ushort D,uint N=64,bool Base2=false,bool Relaxed=false,typename T=float,bool BF16Output=false,bool HeadMajor=false,bool PrepareHalf=false> inline void kumo_attention_tile_impl(device T* q,device T* k,device T* v,
  device float* out,constant uint* p,uint3 g,uint tid,threadgroup float* scores,
- threadgroup float* probs,threadgroup float* maximum,threadgroup float* denominator,threadgroup float* correction) {
- constexpr uint M=32,N=64;
+ threadgroup float* probs,threadgroup float* maximum,threadgroup float* denominator,threadgroup float* correction,device half* prepared=nullptr) {
+ constexpr uint M=32;
+ const float scale=rsqrt(float(D))*(Base2?1.44269504089f:1.f);
  uint H=p[0],Q=p[2],K=p[3],KH=p[6],head=g.x,first=p[7]+g.y*M;
  uint count=min(M,p[8]-g.y*M),kh=(p[4] && first>=p[5])?head/(H/p[4]):head;
- auto tq=tensor(q+(ulong(g.z)*Q*H+first*H+head)*D,dextents<int,2>{D,int(count)},array<int,2>{1,int(H*D)});
+ // Head-major storage keeps padding between heads; the visible key count K
+ // may be shorter. p[9] is that physical row pitch, never a mask length.
+ uint qs=HeadMajor?D:H*D,ks=HeadMajor?D:KH*D,stored_k=HeadMajor?p[9]:K;
+ q+=(ulong(g.z)*Q*H+(HeadMajor?head*Q:head))*D;
+ k+=(ulong(g.z)*stored_k*KH+(HeadMajor?kh*stored_k:kh))*D;
+ v+=(ulong(g.z)*stored_k*KH+(HeadMajor?kh*stored_k:kh))*D;
+ auto tq=tensor(q+first*qs,dextents<int,2>{D,int(count)},array<int,2>{1,int(qs)});
  auto ts=tensor(scores,extents<int,N,M>(),array<int,2>{1,N});
  auto tp=tensor(probs,extents<int,N,M>(),array<int,2>{1,N});
- constexpr auto qkd=matmul2d_descriptor(M,N,D,false,true,false);
- constexpr auto pvd=matmul2d_descriptor(M,D,N,false,false,false,matmul2d_descriptor::mode::multiply_accumulate);
+ constexpr uint KD=Relaxed?16:D,PVK=Relaxed?16:N;
+ constexpr auto qkd=Relaxed?matmul2d_descriptor(M,N,KD,false,true,true,matmul2d_descriptor::mode::multiply_accumulate):matmul2d_descriptor(M,N,D,false,true,false);
+ constexpr auto pvd=matmul2d_descriptor(M,D,PVK,false,false,Relaxed,matmul2d_descriptor::mode::multiply_accumulate);
  matmul2d<qkd,execution_simdgroups<4>> qk;
  matmul2d<pvd,execution_simdgroups<4>> pv;
- auto tv0=tensor(v,dextents<int,2>{D,N},array<int,2>{1,int(KH*D)});
+ auto tv0=tensor(v,dextents<int,2>{D,N},array<int,2>{1,int(ks)});
  auto acc=pv.template get_destination_cooperative_tensor<decltype(tp),decltype(tv0),float>();
  for(ushort i=0;i<acc.get_capacity();++i)acc[i]=0;
  if(tid<M){maximum[tid]=-INFINITY;denominator[tid]=0;}
  for(uint base=0;base<K;base+=N) {
   uint valid=min(N,K-base);
-  auto tk=tensor(k+(ulong(g.z)*K*KH+base*KH+kh)*D,dextents<int,2>{D,int(valid)},array<int,2>{1,int(KH*D)});
+  auto tk=tensor(k+base*ks,dextents<int,2>{D,int(valid)},array<int,2>{1,int(ks)});
   auto score=qk.template get_destination_cooperative_tensor<decltype(tq),decltype(tk),float>();
-  qk.run(tq,tk,score);score.store(ts);
+  if constexpr (Relaxed) {
+   for(ushort i=0;i<score.get_capacity();++i)score[i]=0;
+   for(uint d=0;d<D;d+=KD) {
+    auto qpart=tensor(q+first*qs+d,dextents<int,2>{KD,int(count)},array<int,2>{1,int(qs)});
+    auto kpart=tensor(k+base*ks+d,dextents<int,2>{KD,int(valid)},array<int,2>{1,int(ks)});
+    qk.run(qpart,kpart,score);
+   }
+  } else {qk.run(tq,tk,score);}
+  score.store(ts);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   uint row=tid/4,lane=tid%4;float hi=maximum[row];
-  for(uint j=lane;j<N;j+=4)if(j<valid)hi=max(hi,scores[row*N+j]*rsqrt(float(D)));
+  for(uint j=lane;j<N;j+=4)if(j<valid)hi=max(hi,scores[row*N+j]*scale);
   hi=max(hi,simd_shuffle_xor(hi,1));hi=max(hi,simd_shuffle_xor(hi,2));
-  float old=isfinite(maximum[row])?exp(maximum[row]-hi):0,sum=0;
-  for(uint j=lane;j<N;j+=4) {float z=j<valid?exp(scores[row*N+j]*rsqrt(float(D))-hi):0;probs[row*N+j]=z;sum+=z;}
+  float old=isfinite(maximum[row])?(Base2?fast::exp2(maximum[row]-hi):exp(maximum[row]-hi)):0,sum=0;
+  for(uint j=lane;j<N;j+=4) {float z=j<valid?(Base2?fast::exp2(scores[row*N+j]*scale-hi):exp(scores[row*N+j]*scale-hi)):0;probs[row*N+j]=z;sum+=z;}
   sum+=simd_shuffle_xor(sum,1);sum+=simd_shuffle_xor(sum,2);
   if(lane==0){maximum[row]=hi;denominator[row]=denominator[row]*old+sum;correction[row]=old;}
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for(ushort i=0;i<acc.get_capacity();++i)if(acc.is_valid_element(i))acc[i]*=correction[acc.get_multidimensional_index(i)[1]];
-  auto tv=tensor(v+(ulong(g.z)*K*KH+base*KH+kh)*D,dextents<int,2>{D,int(valid)},array<int,2>{1,int(KH*D)});
-  pv.run(tp,tv,acc);
+  auto tv=tensor(v+base*ks,dextents<int,2>{D,int(valid)},array<int,2>{1,int(ks)});
+  if constexpr (Relaxed) {
+   for(uint j=0;j<N;j+=PVK) {
+    auto ppart=tensor(probs+j,dextents<int,2>{PVK,M},array<int,2>{1,N});
+    auto vpart=tensor(v+(base+j)*ks,dextents<int,2>{D,int(j<valid?min(PVK,valid-j):0)},array<int,2>{1,int(ks)});
+    pv.run(ppart,vpart,acc);
+   }
+  } else {pv.run(tp,tv,acc);}
   threadgroup_barrier(mem_flags::mem_threadgroup);
  }
  for(ushort i=0;i<acc.get_capacity();++i)if(acc.is_valid_element(i)) {
-  auto ij=acc.get_multidimensional_index(i);if(ij[1]<count)out[(ulong(g.z)*Q*H+(first+ij[1])*H+head)*D+ij[0]]=acc[i]/denominator[ij[1]];
+  auto ij=acc.get_multidimensional_index(i);if(ij[1]<count){float z=acc[i]/denominator[ij[1]];z=BF16Output?mlx_bf(z):z;out[(ulong(g.z)*Q*H+(first+ij[1])*H+head)*D+ij[0]]=z;
+   if constexpr(PrepareHalf)prepared[(ulong(g.z)*((Q+127)/128*128)*H+(first+ij[1])*H+head)*D+ij[0]]=half(z);
+  }
+ }
+ // Diarization's Q8 consumer needs zero-padded F16 rows. The first query
+ // tile clears only its head's disjoint tail; no extra scratch/dispatch and
+ // no read of stale values from a larger previous window. Other callers
+ // compile out this epilogue entirely.
+ if constexpr(PrepareHalf)if(g.y==0){uint padded=(Q+127)/128*128;
+  for(uint i=tid;i<(padded-Q)*D;i+=128)prepared[(ulong(g.z)*padded*H+(Q+i/D)*H+head)*D+i%D]=half(0);
  }
 }
 #define KUMO_ATTENTION_TILE(NAME,D) \

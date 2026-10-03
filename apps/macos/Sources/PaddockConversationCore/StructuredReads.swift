@@ -133,7 +133,7 @@ public struct ReadDraft: Equatable, Sendable {
     if !images.isEmpty { v["images"] = .array(images.map { .string($0.url) }) }
     return .object(v)
   }
-  public static func parse(_ data: Data) throws -> ReadDraft {
+  public static func parse(_ data: Data, maxQuestions: Int = 64) throws -> ReadDraft {
     guard data.count <= 512 * 1024 else { throw ConversationFailure.tooLarge }
     let value = try JSONDecoder().decode(ConversationValue.self, from: data)
     guard let root = value.object, let map = (root["questions"] ?? value).object else {
@@ -217,7 +217,9 @@ public struct ReadDraft: Equatable, Sendable {
       }
       return q
     }
-    if let error = draft.validation() { throw ConversationFailure.invalid(error) }
+    if let error = draft.validation(maxQuestions: maxQuestions) {
+      throw ConversationFailure.invalid(error)
+    }
     return draft
   }
   public static func json(_ value: ConversationValue) throws -> String {
@@ -274,6 +276,11 @@ public struct ReadResponse: Decodable, Sendable {
     }
   }
   public struct Diagnostics: Decodable, Sendable {
+    public struct Picture: Decodable, Sendable {
+      public let width, height, tokens: Int
+      /// Width, height, matching the backend's JSON (not its internal H/W).
+      public let resized: [Int]
+    }
     public struct Question: Decodable, Sendable {
       public struct Sample: Decodable, Sendable {
         public let pick: String
@@ -290,6 +297,8 @@ public struct ReadResponse: Decodable, Sendable {
       public let tokens: [Int]?
       public let temperature: Double?
       public let entropyConfidence: Double?
+      public let optionIDs: [String]?
+      public let logits: [Double]?
       public struct Window: Decodable, Sendable {
         public let index, count, tokenStart, tokenEnd: Int
         private enum CodingKeys: String, CodingKey {
@@ -300,26 +309,37 @@ public struct ReadResponse: Decodable, Sendable {
       }
       public let window: Window?
       private enum CodingKeys: String, CodingKey {
-        case id, label, entropy, reads, position, options, tokens, temperature, window
+        case id, label, entropy, reads, position, options, tokens, temperature, window, logits
         case labelMass = "label_mass"
         case entropyConfidence = "entropy_confidence"
+        case optionIDs = "option_ids"
       }
     }
     public struct Timing: Decodable, Sendable {
       public let totalMilliseconds: Double
-      private enum CodingKeys: String, CodingKey { case totalMilliseconds = "total_ms" }
+      public let gpuMilliseconds: Double?
+      public let passRequests: Int?
+      private enum CodingKeys: String, CodingKey {
+        case totalMilliseconds = "total_ms"
+        case gpuMilliseconds = "gpu_ms"
+        case passRequests = "pass_requests"
+      }
     }
     public let reads: Int
     public let canvas: Int?
     public let backend: String?
     public let checkpoint: String?
     public let stateTokens: Int?
+    public let stateRead: Int?
+    public let images: Int?
+    public let pictures: [Picture]?
     public let windowed: Bool?
     public let questions: [Question]
     public let timing: Timing
     private enum CodingKeys: String, CodingKey {
-      case reads, canvas, backend, checkpoint, windowed, questions, timing
+      case reads, canvas, backend, checkpoint, windowed, questions, timing, images, pictures
       case stateTokens = "state_tokens"
+      case stateRead = "state_read"
     }
   }
   public struct Routing: Decodable, Sendable {
@@ -341,14 +361,24 @@ public struct ReadResponse: Decodable, Sendable {
   public let usage: Usage?
   public func validate(for questions: [ReadQuestion]) throws {
     func probability(_ p: Double) -> Bool { p.isFinite && (0...1).contains(p) }
-    let decision = diagnostics.backend == "laya"
+    let decision = ["laya", "clef"].contains(diagnostics.backend ?? "")
+    let validBackend: Bool
+    switch diagnostics.backend {
+    case "laya":
+      validBackend =
+        diagnostics.reads == 1
+        && ["english", "multilingual", "typed-decisions"].contains(diagnostics.checkpoint ?? "")
+    case "clef": validBackend = diagnostics.reads == 1
+    case nil: validBackend = (diagnostics.canvas ?? 0) > 0
+    default: validBackend = false
+    }
     guard Set(answers.keys) == Set(questions.map(\.questionID)),
       (1...32).contains(diagnostics.reads),
-      decision
-        ? (diagnostics.reads == 1
-          && ["english", "multilingual", "typed-decisions"].contains(diagnostics.checkpoint ?? ""))
-        : (diagnostics.canvas ?? 0) > 0,
-      diagnostics.timing.totalMilliseconds.isFinite, diagnostics.timing.totalMilliseconds >= 0
+      validBackend,
+      diagnostics.timing.totalMilliseconds.isFinite, diagnostics.timing.totalMilliseconds >= 0,
+      diagnostics.timing.gpuMilliseconds.map({ $0.isFinite && $0 >= 0 }) ?? true,
+      diagnostics.timing.passRequests.map({ (1...256).contains($0) }) ?? true,
+      diagnostics.stateRead.map({ $0 >= 0 && $0 <= (diagnostics.stateTokens ?? $0) }) ?? true
     else {
       throw ConversationFailure.invalid("The runner returned an incomplete or invalid read result.")
     }

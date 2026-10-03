@@ -7581,6 +7581,83 @@ pub struct KernelTableV1 {
     pub kumo_cell_bias_m: Option<KumoCellBiasMFn>,
     /// Slot 717: `pd_kumo_labels_m` - [`Self::kumo_labels`] per member block.
     pub kumo_labels_m: Option<KumoLabelsMFn>,
+    /// Slot 718: `pd_diar_frontend` - Nemotron 3 Diarization's log-mel
+    /// frames of a PCM window at absolute coordinates (preemphasis, centered
+    /// 512-point FFT, sparse filterbank spans, log with the 2^-24 guard).
+    pub diar_frontend: Option<DiarFrontendFn>,
+    /// Slot 719: `pd_diar_norm` - torch.nn.LayerNorm (eps 1e-5) over 512
+    /// channels.
+    pub diar_norm: Option<DiarNormFn>,
+    /// Slot 720: `pd_diar_conv_rows` - the kernel-3 sub-pixel convolution's
+    /// rows as a GEMM operand.
+    pub diar_conv_rows: Option<DiarConvRowsFn>,
+    /// Slot 721: `pd_diar_act` - ReLU (op 0) or sigmoid (op 1) in place.
+    pub diar_act: Option<DiarActFn>,
+    /// Slot 722: `pd_diar_gemm` - an F32-class GEMM on the stored weights
+    /// (BF16 rows, or Q8_0 repacked to int8 rows + [K/32][N] F32 scales): the
+    /// activation split three ways in bf16 against the exact bf16 weight;
+    /// mode 3 is the qkv projection with the rope in its epilogue.
+    pub diar_gemm: Option<DiarGemmFn>,
+    /// Slot 723: `pd_diar_attention` - 3xTF32 flash attention at 8 heads of
+    /// 64 with k/v read in place from wider rows.
+    pub diar_attention: Option<DiarAttentionFn>,
+    /// Slot 724: `pd_clef_norm` - torch.nn.LayerNorm at any width, eps given
+    /// (Clef's joint schema head; its projections are slot 722).
+    pub clef_norm: Option<ClefNormFn>,
+    /// Slot 725: `pd_clef_span_mean` - the mean of rows over token spans.
+    pub clef_span_mean: Option<ClefSpanMeanFn>,
+    /// Slot 726: `pd_clef_lex_mean` - the mean of BF16 table rows (the output
+    /// embedding) over each span's token ids.
+    pub clef_lex_mean: Option<ClefLexMeanFn>,
+    /// Slot 727: `pd_clef_attention` - F32 multi-head attention, heads of 64,
+    /// every query over its own key rows.
+    pub clef_attention: Option<ClefAttentionFn>,
+    /// Slot 728: `pd_clef_route` - per question, the softmax-routed summary
+    /// of its options against its field.
+    pub clef_route: Option<ClefRouteFn>,
+    /// Slot 729: `pd_clef_gather_add` - `y[r] += src[idx[r]]`.
+    pub clef_gather_add: Option<ClefGatherAddFn>,
+    /// Slot 730: `pd_clef_features` - the scorer's `[f, o, f*o, |f-o|]` rows.
+    pub clef_features: Option<ClefFeaturesFn>,
+    /// Slot 731: `pd_clef_score` - an option's logit: lexical prior + gated
+    /// (scaled cosine + residual scorer).
+    pub clef_score: Option<ClefScoreFn>,
+    /// Slot 732: `pd_clef_attn_tc` - causal 3xTF32 flash attention at
+    /// head_dim 256 (grouped kv heads) over one request's F32 rows.
+    pub clef_attn_tc: Option<ClefAttnTcFn>,
+    /// Slot 733: `pd_clef_gemm` - the backbone's projections on the stored
+    /// BF16 rows with the activation split two ways in bf16 (two mma a k16);
+    /// modes as slot 722's (store / gelu / resid / swiglu pairs).
+    pub clef_gemm: Option<ClefGemmFn>,
+    /// Slot 734: `pd_clef_rope` - the backbone's rotary embedding from a
+    /// `(cos, sin)` table `[positions][32]`, interleaved mrope axes.
+    pub clef_rope: Option<ClefRopeFn>,
+    /// Slot 735: `pd_clef_resample_plan` - one axis of torch's uint8
+    /// antialiased bicubic resize: per output index its first input, tap
+    /// count and int16 weights, and the axis's weight precision.
+    pub clef_resample_plan: Option<ClefResamplePlanFn>,
+    /// Slot 736: `pd_clef_resample` - one separable pass of that resize over
+    /// interleaved RGB8 rows (integer sums, as the reference's CPU kernel).
+    pub clef_resample: Option<ClefResampleFn>,
+    /// Slot 737: `pd_clef_patchify` - the processor's normalized pixel rows
+    /// `[patches][1536]` in 2 x 2 merge-window order.
+    pub clef_patchify: Option<ClefPatchifyFn>,
+    /// Slot 738: `pd_clef_vpos` - the vision tower's learned position grid
+    /// read bilinearly at each patch, added to its row.
+    pub clef_vpos: Option<ClefVposFn>,
+    /// Slot 739: `pd_clef_vrope` - the 2D vision rope (row / column pairs of
+    /// a 72-wide head) on q and k of the fused qkv rows.
+    pub clef_vrope: Option<ClefVropeFn>,
+    /// Slot 740: `pd_clef_vattn` - bidirectional 3xTF32 attention at
+    /// head_dim 72 within each image of a pass.
+    pub clef_vattn: Option<ClefVattnFn>,
+    /// Slot 741: `pd_clef_gemm_q8` - the GGUF backbone's projections: slot
+    /// 733's two-part split against Q8_0 repacked as int8 rows `[N][K]` and
+    /// the file's f16 block scales `[K/32][N]`.
+    pub clef_gemm_q8: Option<ClefGemmQ8Fn>,
+    /// Slot 742: `pd_clef_lex_mean_q8` - slot 726's lexical mean over Q8_0
+    /// table rows as stored (the GGUF's output embedding).
+    pub clef_lex_mean_q8: Option<ClefLexMeanFn>,
 }
 
 /// `(a, b, res, inv, D, rows, period, stream)` - see
@@ -7683,6 +7760,325 @@ pub type KumoCellBiasMFn = unsafe extern "C" fn(
     u32,
     *mut core::ffi::c_void,
 ) -> KernelStatus;
+
+/// `(pcm, window, fb, spans, twiddle, out, offset, total, start, count,
+/// frames, stream)` - see [`KernelTableV1::diar_frontend`].
+pub type DiarFrontendFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(x, w, b, y, d, rows, stream)` - see [`KernelTableV1::diar_norm`].
+pub type DiarNormFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(p, rows, R, stream)` - see [`KernelTableV1::diar_conv_rows`].
+pub type DiarConvRowsFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(x, w, scale, bias, y, y2, rope, K, N, M, wtype, mode, stream)` - see
+/// [`KernelTableV1::diar_gemm`].
+pub type DiarGemmFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(q, k, v, out, rows, klen, kvh, stream)` - see
+/// [`KernelTableV1::diar_attention`].
+pub type DiarAttentionFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(x, w, b, y, d, rows, eps, stream)` - see [`KernelTableV1::clef_norm`].
+pub type ClefNormFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    f32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(x, ld, d, spans, n, out, stream)` - see
+/// [`KernelTableV1::clef_span_mean`].
+pub type ClefSpanMeanFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    *const core::ffi::c_void,
+    u32,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(table, d, ids, spans, n, out, stream)` - see
+/// [`KernelTableV1::clef_lex_mean`].
+pub type ClefLexMeanFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    u32,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(q, ldq, k, ldk, v, ldv, out, ldo, ranges, nq, heads, scale, stream)` -
+/// see [`KernelTableV1::clef_attention`].
+pub type ClefAttentionFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    u32,
+    *const core::ffi::c_void,
+    u32,
+    *const core::ffi::c_void,
+    u32,
+    *mut core::ffi::c_void,
+    u32,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    f32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(opts, fields, qopts, nq, d, max_opts, out, stream)` - see
+/// [`KernelTableV1::clef_route`].
+pub type ClefRouteFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(y, src, idx, rows, d, stream)` - see [`KernelTableV1::clef_gather_add`].
+pub type ClefGatherAddFn = unsafe extern "C" fn(
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(fields, opts, qof, nopt, d, out, stream)` - see
+/// [`KernelTableV1::clef_features`].
+pub type ClefFeaturesFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(lex, qvec, glob, qof, rof, fields, opts, hid, w3, b3, dd, w, ps, joint,
+/// gate, nopt, logits, stream)` - see [`KernelTableV1::clef_score`].
+pub type ClefScoreFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    f32,
+    u32,
+    u32,
+    f32,
+    f32,
+    f32,
+    u32,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(q, ldq, k, ldk, v, ldv, out, ldo, n, heads, kv_heads, scale, stream)` -
+/// see [`KernelTableV1::clef_attn_tc`].
+pub type ClefAttnTcFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    u32,
+    *const core::ffi::c_void,
+    u32,
+    *const core::ffi::c_void,
+    u32,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    f32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(x, w, bias, y, K, N, M, mode, stream)` - see [`KernelTableV1::clef_gemm`].
+pub type ClefGemmFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(x, heads, rows, pos, table, max_pos, hmask, wmask, stream)` - see
+/// [`KernelTableV1::clef_rope`].
+pub type ClefRopeFn = unsafe extern "C" fn(
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(x, w, scale, bias, y, K, N, M, mode, stream)` - see
+/// [`KernelTableV1::clef_gemm_q8`].
+pub type ClefGemmQ8Fn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(in, out, taps, xmin, xsize, w, prec, stream)` - see
+/// [`KernelTableV1::clef_resample_plan`].
+pub type ClefResamplePlanFn = unsafe extern "C" fn(
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(src, dst, lines, in, out, horiz, xmin, xsize, w, taps, prec, stream)` -
+/// see [`KernelTableV1::clef_resample`].
+pub type ClefResampleFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(img, h, w, out, stream)` - see [`KernelTableV1::clef_patchify`].
+pub type ClefPatchifyFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(x, table, info, rows, side, d, stream)` - see
+/// [`KernelTableV1::clef_vpos`].
+pub type ClefVposFn = unsafe extern "C" fn(
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(qkv, heads, rows, info, table, max_pos, stream)` - see
+/// [`KernelTableV1::clef_vrope`].
+pub type ClefVropeFn = unsafe extern "C" fn(
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(qkv, out, cu, segs, max_len, heads, scale, stream)` - see
+/// [`KernelTableV1::clef_vattn`].
+pub type ClefVattnFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    f32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(x, n, op, stream)` - see [`KernelTableV1::diar_act`].
+pub type DiarActFn =
+    unsafe extern "C" fn(*mut core::ffi::c_void, u64, u32, *mut core::ffi::c_void) -> KernelStatus;
 
 /// `(x, y, target, D, nc, cls, rpm, E, stream)` - see
 /// [`KernelTableV1::kumo_labels_m`].
@@ -9056,7 +9452,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 703;
+pub const KERNEL_TABLE_SLOTS: usize = 728;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,

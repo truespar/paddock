@@ -112,7 +112,7 @@ const blocks = computed<(Block | Skipped)[]>(() => {
         // a decision model's entropy is its answer's by construction; on a
         // canvas reader a missing slot figure marks a run from before it
         entropyOf:
-          run.response.diagnostics.backend === 'laya' || diag.get(id)?.slot_entropy !== undefined
+          run.response.diagnostics.backend !== undefined || diag.get(id)?.slot_entropy !== undefined
             ? 'answer'
             : 'slot',
         reads,
@@ -374,7 +374,43 @@ function isSkipped(b: Block | Skipped): b is Skipped {
             </tbody>
           </table>
         </div>
-        <table v-if="diag?.backend !== 'laya'" class="ac__table">
+        <table v-if="diag?.backend === 'clef'" class="ac__table">
+          <tbody>
+            <tr>
+              <th>state</th>
+              <td class="c-num">
+                {{ diag.state_tokens ?? '-' }} tokens<template v-if="diag.state_read !== undefined && diag.state_read !== diag.state_tokens">, first {{ diag.state_read }} read</template>
+              </td>
+              <th>read</th>
+              <td class="c-num">{{ run.response.usage?.input_tokens ?? '-' }} tokens</td>
+              <th>pass</th>
+              <td class="c-num">{{ diag.timing.pass_requests ?? 1 }} {{ (diag.timing.pass_requests ?? 1) === 1 ? 'request' : 'requests' }}</td>
+              <th>time</th>
+              <td class="c-num">{{ Math.round(diag.timing.total_ms) }} ms</td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-if="diag?.backend === 'clef'" class="ac__scroll">
+          <table class="ac__table ac__table--q">
+            <thead>
+              <tr>
+                <th>question</th>
+                <th>answer</th>
+                <th class="c-num">options</th>
+                <th class="c-num">entropy</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="d in diag.questions" :key="d.id">
+                <td class="ac__mono">{{ d.id }}</td>
+                <td class="ac__mono">{{ d.label }}</td>
+                <td class="c-num">{{ d.options ?? '-' }}</td>
+                <td class="c-num">{{ Number.isFinite(d.entropy) ? d.entropy.toFixed(3) : '-' }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <table v-if="!diag?.backend" class="ac__table">
           <tbody>
             <tr>
               <th>canvas</th>
@@ -398,7 +434,7 @@ function isSkipped(b: Block | Skipped): b is Skipped {
             </tr>
           </tbody>
         </table>
-        <div v-if="diag?.backend !== 'laya'" class="ac__scroll">
+        <div v-if="!diag?.backend" class="ac__scroll">
           <table class="ac__table ac__table--q">
             <thead>
               <tr>

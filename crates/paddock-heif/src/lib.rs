@@ -140,7 +140,17 @@ pub fn sniff(bytes: &[u8]) -> Option<Codec> {
 /// a broken image tile.
 pub fn decode(bytes: &[u8]) -> Result<Rendition, Error> {
     let codec = sniff(bytes).ok_or(Error::NotHeif)?;
-    backend::decode(bytes, codec)
+    backend::decode(bytes, codec, None)
+}
+
+/// Bound the AV1 frame before its pixel planes are allocated. A check on the
+/// returned RGB is too late for compressed images with enormous dimensions.
+pub fn decode_limited(bytes: &[u8], max_pixels: u32) -> Result<Rendition, Error> {
+    if max_pixels == 0 {
+        return Err(Error::Decode("the image pixel budget is exhausted".into()));
+    }
+    let codec = sniff(bytes).ok_or(Error::NotHeif)?;
+    backend::decode(bytes, codec, Some(max_pixels))
 }
 
 /// Can we decode this codec at all? AVIF yes, HEIC no - see the module header.

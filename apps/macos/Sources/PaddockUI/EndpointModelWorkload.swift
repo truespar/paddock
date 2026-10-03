@@ -97,6 +97,7 @@ struct EndpointModelWorkload: View {
     }
     if !editor.isImageGeneration && !editor.capabilities.contains("decision")
       && !editor.capabilities.contains("tabular")
+      && !editor.capabilities.contains("diarization")
     {
       EndpointFormField("Workload") {
         LazyVGrid(

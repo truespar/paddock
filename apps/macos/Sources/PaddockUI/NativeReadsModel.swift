@@ -10,20 +10,30 @@ private actor ReadsConnection {
   let client: any ManagerLoading
   var transport: NativeConversationTransport?
   init(client: any ManagerLoading) { self.client = client }
+  private func connection() async throws -> NativeConversationTransport {
+    if let transport { return transport }
+    let host = try await client.nativeConversationHost()
+    let next = try NativeConversationTransport(host: host)
+    transport = next
+    return next
+  }
+  func read(_ port: UInt16, _ body: Data) async throws -> ConversationValue {
+    let transport = try await connection()
+    let bytes = try await transport.bytes(
+      "api/runners/\(port)/v1/systemone", method: "POST", body: body)
+    return try JSONDecoder().decode(ConversationValue.self, from: bytes)
+  }
   func call(_ path: String, _ method: String, _ body: ConversationValue?, _ query: [String: String])
     async throws -> ConversationValue
   {
-    if transport == nil {
-      let host = try await client.nativeConversationHost()
-      transport = try NativeConversationTransport(host: host)
-    }
+    let transport = try await connection()
     if path.hasPrefix("api/read-history/") && method == "GET" {
       // A 16 MiB document expands when carried as a JSON string envelope.
-      let data = try await transport!.bytes(
+      let data = try await transport.bytes(
         path, method: method, query: query, maximum: 40 * 1024 * 1024)
       return try JSONDecoder().decode(ConversationValue.self, from: data)
     }
-    return try await transport!.api(path, method: method, body: body, query: query)
+    return try await transport.api(path, method: method, body: body, query: query)
   }
 }
 
@@ -82,8 +92,8 @@ private actor ReadsConnection {
       return ((try? JSONEncoder().encode(metadata).count) ?? 0)
         + pictures.reduce(0) { $0 + $1.url.utf8.count + $1.name.utf8.count }
     }
-    nonisolated static func fingerprint(_ value: ConversationValue) -> String {
-      SHA256.hash(data: Data(((try? ReadDraft.json(value)) ?? "").utf8))
+    nonisolated static func fingerprint(_ bytes: Data) -> String {
+      SHA256.hash(data: bytes)
         .map { String(format: "%02x", $0) }.joined()
     }
   }
@@ -124,9 +134,12 @@ private actor ReadsConnection {
   private(set) var openingSession = false
   private(set) var historyUnsaved = false
   @ObservationIgnored var api: API
+  // Inference takes authored JSON bytes, never an unordered dictionary.
+  @ObservationIgnored var readAPI: @MainActor (UInt16, Data) async throws -> ConversationValue
   @ObservationIgnored private var task: Task<Void, Never>?
   @ObservationIgnored private var refreshError: String?
   @ObservationIgnored private var latestRequest: ConversationValue?
+  @ObservationIgnored private var latestOrdering: [[String]]?
   @ObservationIgnored private var latestRunID: UUID?
   @ObservationIgnored private var setsEpoch = 0
   @ObservationIgnored private var originalBody = ReadDraft().setBody
@@ -202,11 +215,13 @@ private actor ReadsConnection {
     guard let result else { return false }
     guard result.id == latestRunID else { return false }
     return result.port != port || latestRequest != draft.request(model: requestModel)
+      || latestOrdering != draft.ordering
   }
   var previousRead: Bool { result != nil && result?.id != latestRunID }
   init(client: any ManagerLoading) {
     let connection = ReadsConnection(client: client)
     api = { path, method, body, query in try await connection.call(path, method, body, query) }
+    readAPI = { port, body in try await connection.read(port, body) }
   }
   private func decode<T: Decodable>(_ type: T.Type, _ v: ConversationValue) throws -> T {
     try JSONDecoder().decode(type, from: JSONEncoder().encode(v))
@@ -226,7 +241,8 @@ private actor ReadsConnection {
         do {
           let info = try await api("api/runners/\(port)/server", "GET", nil, [:])
           guard let caps = info["structured_read"],
-            (caps["canvas_width"]?.integer ?? 0) > 0 || caps["backend"]?.string == "laya"
+            (caps["canvas_width"]?.integer ?? 0) > 0
+              || ["laya", "clef"].contains(caps["backend"]?.string ?? "")
           else {
             continue
           }
@@ -234,7 +250,7 @@ private actor ReadsConnection {
             Reader(
               port: port, model: id, title: runner["display"]?.string ?? id,
               vendor: runner["vendor"]?.string,
-              maxQuestions: min(64, max(1, caps["max_questions"]?.integer ?? 64)),
+              maxQuestions: min(1024, max(1, caps["max_questions"]?.integer ?? 64)),
               maxSamples: min(32, max(1, caps["max_samples"]?.integer ?? 32)),
               types: caps["types"]?.array?.compactMap(\.string) ?? ["noul", "choice", "score"],
               images: caps["images"] == .bool(true),
@@ -310,7 +326,7 @@ private actor ReadsConnection {
   }
   @discardableResult func applyJSON(_ text: String) -> Bool {
     do {
-      var parsed = try ReadDraft.parse(Data(text.utf8))
+      var parsed = try ReadDraft.parse(Data(text.utf8), maxQuestions: current?.maxQuestions ?? 64)
       // The questions tab and saved sets omit state; keep the loaded document.
       if try JSONDecoder().decode(ConversationValue.self, from: Data(text.utf8))["state"] == nil {
         parsed.state = draft.state
@@ -351,6 +367,7 @@ private actor ReadsConnection {
     historyUnsaved = false
     runs = []
     latestRequest = nil
+    latestOrdering = nil
     latestRunID = nil
     selectedRun = nil
     error = nil
@@ -359,7 +376,8 @@ private actor ReadsConnection {
   func open(_ set: SavedSet) {
     guard !busy && !saving && !importing else { return }
     do {
-      var parsed = try ReadDraft.parse(Data(set.body.utf8))
+      var parsed = try ReadDraft.parse(
+        Data(set.body.utf8), maxQuestions: current?.maxQuestions ?? 1024)
       parsed.state = draft.state
       parsed.images = draft.images
       draft = parsed
@@ -435,6 +453,8 @@ private actor ReadsConnection {
       return
     }
     let request = draft.request(model: requestModel)
+    let input = draft
+    let name = requestModel
     guard draft.state.utf8.count <= 4 * 1024 * 1024 else {
       stateError = "The text exceeds the 4 MiB reading limit. Use a smaller section."
       return
@@ -453,7 +473,11 @@ private actor ReadsConnection {
       defer { busy = false }
       do {
         let started = ContinuousClock.now
-        let raw = try await api("api/runners/\(reader.port)/v1/systemone", "POST", request, [:])
+        let bytes = try await Task.detached(priority: .userInitiated) {
+          try input.requestData(model: name)
+        }.value
+        try Task.checkCancellation()
+        let raw = try await readAPI(reader.port, bytes)
         try Task.checkCancellation()
         let response = try decode(ReadResponse.self, raw)
         try response.validate(for: questions)
@@ -461,7 +485,7 @@ private actor ReadsConnection {
         let milliseconds =
           Double(elapsed.components.seconds) * 1000
           + Double(elapsed.components.attoseconds) / 1e15
-        let fingerprint = await Task.detached(priority: .utility) { Run.fingerprint(request) }.value
+        let fingerprint = await Task.detached(priority: .utility) { Run.fingerprint(bytes) }.value
         try Task.checkCancellation()
         let result = Run(
           fingerprint: fingerprint,
@@ -475,6 +499,7 @@ private actor ReadsConnection {
           pictures: submittedPictures, steps: submittedSteps, think: submittedThink,
           checkpoint: submittedCheckpoint)
         latestRequest = request
+        latestOrdering = input.ordering
         latestRunID = result.id
         runs = Array(([result] + runs).prefix(20))
         selectedRun = result.id
@@ -483,6 +508,61 @@ private actor ReadsConnection {
     }
   }
   func cancel() { task?.cancel() }
+  var canReadCamera: Bool {
+    current?.images == true && !historyNavigationBlocked && validation == nil
+      && draft.state.utf8.count <= 4 * 1024 * 1024
+  }
+  /// Same transport and response validation as a text read, but no automatic
+  /// history write. Freeze all metadata before awaiting the runner; stale
+  /// results never migrate to a newly selected model/read/question set.
+  func readCameraFrame(_ jpeg: Data) async throws -> Run {
+    guard canReadCamera, let reader = current else {
+      throw ConversationFailure.invalid(validation ?? "Choose a reader with vision.")
+    }
+    let epoch = sessionEpoch
+    let original = draft
+    var input = draft
+    input.images = [
+      ReadPicture(name: "camera frame", url: "data:image/jpeg;base64," + jpeg.base64EncodedString())
+    ]
+    let name = requestModel
+    let bytes = try await Task.detached(priority: .userInitiated) {
+      try input.requestData(model: name)
+    }.value
+    try Task.checkCancellation()
+    guard epoch == sessionEpoch, port == reader.port, original == draft else {
+      throw CancellationError()
+    }
+    let started = ContinuousClock.now
+    let raw = try await readAPI(reader.port, bytes)
+    try Task.checkCancellation()
+    guard epoch == sessionEpoch, port == reader.port, original == draft else {
+      throw CancellationError()
+    }
+    let response = try decode(ReadResponse.self, raw)
+    try response.validate(for: input.questions)
+    let duration = started.duration(to: .now)
+    let fingerprint = await Task.detached(priority: .utility) { Run.fingerprint(bytes) }.value
+    try Task.checkCancellation()
+    guard epoch == sessionEpoch, port == reader.port, original == draft else {
+      throw CancellationError()
+    }
+    return Run(
+      fingerprint: fingerprint, excerpt: "camera frame", characters: input.state.count,
+      questions: input.questions, raw: raw, port: reader.port,
+      elapsedMilliseconds: Double(duration.components.seconds) * 1000 + Double(
+        duration.components.attoseconds) / 1e15,
+      response: response, state: input.state, samples: input.samples, pictures: input.images,
+      steps: input.steps, think: input.think, checkpoint: input.checkpoint)
+  }
+  func keepCameraFrame(_ frame: Run) async {
+    guard !historyNavigationBlocked else { return }
+    var saved = frame
+    saved.id = UUID()
+    runs = Array(([saved] + runs).prefix(20))
+    selectedRun = saved.id
+    await keepRun(saved)
+  }
   func runExample() {
     guard current != nil, !busy, !saving, !importing, !openingSession else { return }
     do {
@@ -504,6 +584,7 @@ private actor ReadsConnection {
     runs = runs.filter { keep.contains($0.id) }
     if let latestRunID, !keep.contains(latestRunID) {
       latestRequest = nil
+      latestOrdering = nil
       self.latestRunID = nil
     }
   }
@@ -699,6 +780,7 @@ private actor ReadsConnection {
       latestRequest = draft.request(
         model: runs.first?.response.diagnostics.backend == "laya"
           ? "" : (runs.first?.response.model ?? ""))
+      latestOrdering = draft.ordering
       selectedSet = nil
       setName = ""
       jsonText = ""

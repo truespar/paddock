@@ -235,6 +235,14 @@ pub fn mel_filterbank(
 /// spectrum (re^2 + im^2) over the n_fft/2 + 1 bins, mel dot in f64,
 /// floor 1e-10, log10.
 pub fn log_mel_frame(frame: &[f64], window: &[f64], fb: &[f64], plan: &FftPlan, out: &mut [f64]) {
+    mel_power_frame(frame, window, fb, plan, out);
+    for o in out {
+        *o = o.max(1e-10).log10();
+    }
+}
+
+/// Linear mel energies; callers select the model's log/normalization contract.
+pub fn mel_power_frame(frame: &[f64], window: &[f64], fb: &[f64], plan: &FftPlan, out: &mut [f64]) {
     let n_fft = frame.len();
     let n_bins = n_fft / 2 + 1;
     debug_assert_eq!(window.len(), n_fft);
@@ -254,13 +262,82 @@ pub fn log_mel_frame(frame: &[f64], window: &[f64], fb: &[f64], plan: &FftPlan, 
         for k in 0..n_bins {
             sum += row[k] * power[k];
         }
-        *o = sum.max(1e-10).log10();
+        *o = sum;
+    }
+}
+
+/// Allocation-free radix-2 frontend. `scratch` holds 2*n complex scalars and
+/// n/2+1 powers. The butterfly expressions/trig tables match `fft` above;
+/// input bit reversal replaces the recursive temporary vectors, not the FFT.
+pub fn mel_power_frame_buffered(
+    frame: &[f64],
+    window: &[f64],
+    fb: &[f64],
+    plan: &FftPlan,
+    scratch: &mut [f64],
+    out: &mut [f64],
+) {
+    let n = frame.len();
+    assert!(n.is_power_of_two() && n > 1);
+    assert_eq!(window.len(), n);
+    assert_eq!(fb.len(), out.len() * (n / 2 + 1));
+    let (buf, power) = scratch.split_at_mut(n * 2);
+    assert!(power.len() > n / 2);
+    let shift = usize::BITS - n.ilog2();
+    for i in 0..n {
+        let j = i.reverse_bits() >> shift;
+        buf[2 * j] = frame[i] * window[i];
+        buf[2 * j + 1] = 0.;
+    }
+    let mut size = 2;
+    while size <= n {
+        let half = size / 2;
+        let tw = plan.twiddles(size);
+        for base in (0..n).step_by(size) {
+            for (k, &(s, c)) in tw.iter().enumerate() {
+                let a = 2 * (base + k);
+                let b = 2 * (base + k + half);
+                let re = c * buf[b] - s * buf[b + 1];
+                let im = s * buf[b] + c * buf[b + 1];
+                let er = buf[a];
+                let ei = buf[a + 1];
+                buf[a] = er + re;
+                buf[a + 1] = ei + im;
+                buf[b] = er - re;
+                buf[b + 1] = ei - im;
+            }
+        }
+        size *= 2;
+    }
+    for (k, p) in power[..=n / 2].iter_mut().enumerate() {
+        *p = buf[2 * k] * buf[2 * k] + buf[2 * k + 1] * buf[2 * k + 1];
+    }
+    for (row, o) in fb.chunks_exact(n / 2 + 1).zip(out) {
+        *o = row.iter().zip(&power[..=n / 2]).map(|(f, p)| f * p).sum();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffered_radix_two_preserves_recursive_fft_arithmetic() {
+        for n in [32, 512] {
+            let frame: Vec<_> = (0..n)
+                .map(|i| ((i * 1337 % 337) as f64 - 168.) / 100.)
+                .collect();
+            let window = hann_periodic(n);
+            let fb = mel_filterbank_slaney(16, n, 16000., 0., 8000.);
+            let plan = FftPlan::new(n);
+            let mut a = [0.; 16];
+            let mut b = [0.; 16];
+            let mut scratch = vec![0.; n * 2 + n / 2 + 1];
+            mel_power_frame(&frame, &window, &fb, &plan, &mut a);
+            mel_power_frame_buffered(&frame, &window, &fb, &plan, &mut scratch, &mut b);
+            assert_eq!(a, b);
+        }
+    }
 
     #[test]
     fn fft_matches_dft_on_n400() {

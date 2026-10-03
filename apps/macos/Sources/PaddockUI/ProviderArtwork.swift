@@ -10,6 +10,7 @@ import Foundation
     "Anthropic": "Anthropic", "DeepSeek": "DeepSeek", "Meta": "Meta", "Mistral": "Mistral",
     "NVIDIA": "NVIDIA", "Xiaomi": "Xiaomi", "Moonshot": "Moonshot", "Perplexity": "Perplexity",
     "Baidu": "Baidu", "ByteDance": "ByteDance", "PaddlePaddle": "PaddlePaddle",
+    "Cloudflare": "Cloudflare",
     "MiniMax": "MiniMax", "Hugging Face": "HuggingFace", "OpenRouter": "OpenRouter",
     "Prism ML": "PrismML",
     "Exa": "Exa", "Tavily": "Tavily", "Firecrawl": "Firecrawl", "Brave": "Brave",

@@ -1,0 +1,12 @@
+[package]
+name = "paddock-jpeg"
+description = "A pure-Rust JPEG decoder whose pixels are libjpeg-turbo's default decompression, bit for bit: the reference decoder of the Python model stacks (torchvision, Pillow) that model-parity lanes are held to."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

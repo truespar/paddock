@@ -23,6 +23,8 @@ mod basic_ops;
 mod batch_ops;
 mod bf16;
 mod canvas;
+mod clef;
+mod clef_vision;
 mod deltanet;
 mod dense_pred;
 mod dit;
@@ -45,6 +47,10 @@ pub use moe_cache::{
 mod kquant;
 mod kumo;
 pub use kumo::{KumoEpi, KumoFuse, KumoHeads, KumoIn};
+mod diarization;
+pub use clef::{ClefIn, ClefQ8, ClefScoreIn};
+pub use clef_vision::{ClefPlanMem, ClefResamplePlan, clef_resample_taps};
+pub use diarization::{DiarAct, DiarEpi, DiarFrontendPlanes, DiarWeights};
 mod types;
 pub use kquant::q40_to_q8_blocks;
 mod mamba;
@@ -473,9 +479,13 @@ impl GpuExecutor {
         if let Some(budget) = self.vram_budget()
             && weights_bytes + FLOOR > budget
         {
+            // the need is named whole: the model's bytes AND the floor. Naming
+            // only the first read as "15.5 GiB will not fit in 16.3 GiB".
             return Err(format!(
-                "{model} will not fit its configured VRAM budget: weights need {:.1} GiB but vram_budget grants {:.1} GiB. Raise vram_budget in the server's config file (or remove the line), stop another model to free its budget, or pick a smaller quant.",
+                "{model} will not fit its configured VRAM budget: it needs {:.1} GiB at load ({:.1} GiB for the model + a {:.1} GiB working floor) but vram_budget grants {:.1} GiB. Raise vram_budget in the server's config file (or remove the line), stop another model to free its budget, or pick a smaller quant.",
+                gib(weights_bytes + FLOOR),
                 gib(weights_bytes),
+                gib(FLOOR),
                 gib(budget),
             ));
         }
@@ -530,8 +540,10 @@ impl GpuExecutor {
                 }
             }
             return Err(format!(
-                "{model} will not fit: weights need {:.1} GiB but only {:.1} GiB of {:.1} GiB VRAM is free. Another model likely holds the rest - stop it first, or pick a smaller quant. Refusing to load: oversubscribed VRAM pages into system RAM and can freeze the machine.",
+                "{model} will not fit: it needs {:.1} GiB at load ({:.1} GiB for the model + a {:.1} GiB working floor) but only {:.1} GiB of {:.1} GiB VRAM is free. Another model likely holds the rest - stop it first, or pick a smaller quant. Refusing to load: oversubscribed VRAM pages into system RAM and can freeze the machine.",
+                gib(weights_bytes + FLOOR),
                 gib(weights_bytes),
+                gib(FLOOR),
                 gib(free),
                 gib(total),
             ));

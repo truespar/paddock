@@ -67,6 +67,12 @@ pub struct GpuInfo {
     /// Apple unified-memory capacity, not dedicated VRAM or GPU usage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metal: Option<MetalHardware>,
+    /// An NVIDIA part with no memory of its own (DGX Spark's GB10): NVML
+    /// reports no framebuffer, so `mem_total` / `mem_used` are the machine's
+    /// RAM as the OS books it - used = total - MemAvailable, the runner load
+    /// gate's own reading.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub host_memory: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -245,7 +251,23 @@ fn sample(nvml: &nvml_wrapper::Nvml) -> GpuSnapshot {
         };
         // Each read is independently capability-probed -> None when unsupported.
         let util = d.utilization_rates().ok();
-        let mem = d.memory_info().ok();
+        // A part that computes in the host's memory has no framebuffer for
+        // NVML to report; its device memory is the OS's (see
+        // `nvml::host_memory_device`). Without this every fit check on a DGX
+        // Spark read "no GPU telemetry".
+        let (mem, host_memory) = match d.memory_info() {
+            Ok(m) => (Some((m.used, m.total)), false),
+            Err(nvml_wrapper::error::NvmlError::NotSupported)
+                if crate::nvml::host_memory_device(nvml, &d) =>
+            {
+                let m = paddock_models::meminfo::MemInfo::read();
+                (
+                    m.map(|m| (m.total.saturating_sub(m.usable()), m.total)),
+                    m.is_some(),
+                )
+            }
+            Err(_) => (None, false),
+        };
         // Per-PID memory: compute + graphics lists (WDDM classifies CUDA work
         // as either), de-duplicated by pid keeping the larger figure.
         let mut procs: Vec<GpuProc> = Vec::new();
@@ -268,8 +290,8 @@ fn sample(nvml: &nvml_wrapper::Nvml) -> GpuSnapshot {
             pci: d.pci_info().ok().map(|p| p.bus_id),
             util_gpu: util.as_ref().map(|u| u.gpu),
             util_mem: util.as_ref().map(|u| u.memory),
-            mem_used: mem.as_ref().map(|m| m.used),
-            mem_total: mem.as_ref().map(|m| m.total),
+            mem_used: mem.map(|(used, _)| used),
+            mem_total: mem.map(|(_, total)| total),
             temp_c: d.temperature(TemperatureSensor::Gpu).ok(),
             // NVML reports milliwatts.
             power_w: d.power_usage().ok().map(|mw| f64::from(mw) / 1000.0),
@@ -282,6 +304,7 @@ fn sample(nvml: &nvml_wrapper::Nvml) -> GpuSnapshot {
             fan_pct: d.fan_speed(0).ok(),
             procs,
             metal: None,
+            host_memory,
         });
     }
     GpuSnapshot {

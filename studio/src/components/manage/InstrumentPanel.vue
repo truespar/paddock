@@ -529,7 +529,8 @@ watch(
               <span class="gpu__v">{{ g.util_gpu ?? '-' }}%</span>
             </div>
             <div v-if="g.mem_total != null" class="gpu__stat gpu__stat--wide">
-              <span class="gpu__k">VRAM</span>
+              <!-- a GB10 computes in the machine's RAM: no VRAM to name -->
+              <span class="gpu__k">{{ g.host_memory ? 'Unified memory' : 'VRAM' }}</span>
               <Progress
                 class="gpu__bar"
                 :value="g.mem_used ?? 0"

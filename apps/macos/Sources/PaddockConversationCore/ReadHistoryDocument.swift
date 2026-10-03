@@ -46,7 +46,7 @@ public struct ReadHistoryDocument: Sendable {
           "steps": run["steps"] ?? .number(1),
           "think": run["think"] ?? .number(0),
           "model": run["checkpoint"] ?? .null,
-        ])))
+        ])), maxQuestions: 1024)
     if let order = run["questionOrder"]?.array {
       let original = result.questions
       let ids = order.compactMap { $0.array?.first?.string }

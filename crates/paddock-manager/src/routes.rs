@@ -253,6 +253,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/api/runners/{port}/v1/audio/transcriptions",
             post(relay_transcriptions),
         )
+        .route(
+            "/api/runners/{port}/v1/audio/diarizations",
+            post(relay_diarizations).layer(axum::extract::DefaultBodyLimit::max(25 * 1024 * 1024)),
+        )
+        .route(
+            "/api/runners/{port}/v1/audio/diarizations/stream",
+            get(relay_diarization_live),
+        )
         // Forced alignment: same multipart story as transcribe -
         // the Studio's enrichment pass sends the clip + transcript here after
         // a lane without word times settles.
@@ -1804,6 +1812,44 @@ async fn relay_alignments(
         .unwrap_or("application/octet-stream")
         .to_owned();
     relay_raw(state, port, "v1/audio/alignments", &ct, body).await
+}
+
+async fn relay_diarizations(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(port): axum::extract::Path<u16>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let ct = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    relay_raw(state, port, "v1/audio/diarizations", ct, body).await
+}
+
+async fn relay_diarization_live(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(port): axum::extract::Path<u16>,
+    axum::extract::RawQuery(q): axum::extract::RawQuery,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let key = state.supervisor.runner_key(port).await;
+    let query = q
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("?{s}"))
+        .unwrap_or_default();
+    let url = format!("ws://127.0.0.1:{port}/v1/audio/diarizations/stream{query}");
+    ws.max_message_size(32000)
+        .max_frame_size(32000)
+        .write_buffer_size(4096)
+        .max_write_buffer_size(2 * 1024 * 1024)
+        .on_upgrade(move |socket| async move {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(900),
+                realtime_ws(socket, url, key),
+            )
+            .await;
+        })
 }
 
 /// The Studio's Images page: JSON in, base64 images out, same verbatim

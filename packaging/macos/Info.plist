@@ -21,6 +21,10 @@
     <string>Use model endpoints you configure on your local network.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>Dictate into your draft or transcribe audio with the models you select. Recording starts only when you press the microphone.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Read images from your camera with the local model you select. The camera starts only when you open Camera in Reads; frames are saved only when you take a snapshot.</string>
+    <key>NSCameraUseContinuityCameraDeviceType</key>
+    <true/>
     <key>NSAppTransportSecurity</key>
     <dict>
         <key>NSAllowsLocalNetworking</key><true/>

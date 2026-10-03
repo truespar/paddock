@@ -8,7 +8,7 @@ import { isHarmony, isVisionModel } from '@/lib/model-caps'
 import { realtimeEnrichment, type RealtimeTranscriptionCaps } from '@/lib/audio-policy'
 import { DEFAULT_MAX_QUESTIONS, DEFAULT_MAX_SAMPLES, type StructuredReadCaps } from '@/lib/reads'
 
-export type ModelKind = 'chat' | 'encoder' | 'transcriber' | 'aligner' | 'image' | 'reader' | 'tabular'
+export type ModelKind = 'chat' | 'encoder' | 'transcriber' | 'aligner' | 'image' | 'reader' | 'tabular' | 'diarizer'
 
 /** Can this kind hold a lane in the chat surface - i.e. does it ANSWER a user
  *  turn? Chat models reply in text, transcribers reply with a transcript; both
@@ -484,6 +484,7 @@ interface RunnerRow {
   /** tabular predictor (Kumo-Tabular): /v1/tabular/* and nothing else -
    *  labelled rows in, the missing column out; it never chats */
   tabular?: string | null
+  diarization?: string | null
   display?: string | null
   vendor?: string | null
   status?: string
@@ -491,7 +492,7 @@ interface RunnerRow {
 
 /** The model a runner row serves, whichever role it is in (null: none yet). */
 function rowId(r: RunnerRow): string | null {
-  return r.model ?? r.embedder ?? r.asr ?? r.aligner ?? r.reader ?? r.tabular ?? r.image ?? null
+  return r.model ?? r.embedder ?? r.asr ?? r.aligner ?? r.reader ?? r.tabular ?? r.diarization ?? r.image ?? null
 }
 
 /** A runner row as a picker entry. `prev` is the entry this id had before the
@@ -517,7 +518,7 @@ function rowModel(r: RunnerRow, prev: ModelInfo | undefined): ModelInfo {
               ? 'reader'
               : r.tabular
                 ? 'tabular'
-                : 'image',
+                : r.diarization ? 'diarizer' : 'image',
     status: raw === 'unreachable' && prev?.status ? prev.status : raw,
     vision: prev?.vision,
     spec: r.spec ?? undefined,
@@ -711,6 +712,7 @@ export const useModelsStore = defineStore('models', () => {
         reader?: string
         /** a tabular predictor (Kumo): tables in, predictions out */
         tabular?: { model: string } | null
+        diarization?: { model: string } | null
       }
       const c = parseCaps(body)
       // A runner answers /server before its model attaches, and caching that
@@ -730,7 +732,7 @@ export const useModelsStore = defineStore('models', () => {
           body.aligner ||
           body.image_model ||
           body.reader ||
-          body.tabular
+          body.tabular || body.diarization
         )
       ) {
         retry()
@@ -925,7 +927,7 @@ export const useModelsStore = defineStore('models', () => {
    *  page). */
   function canChat(id: string): boolean {
     const kind = models.value.find((m) => m.id === id)?.kind
-    return kind !== 'transcriber' && kind !== 'aligner' && kind !== 'image' && kind !== 'tabular'
+    return kind !== 'transcriber' && kind !== 'aligner' && kind !== 'image' && kind !== 'tabular' && kind !== 'diarizer'
   }
 
   /** Whether this model makes pictures from a prompt: the endpoint's fetched

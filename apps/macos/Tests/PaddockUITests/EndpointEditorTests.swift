@@ -8,6 +8,24 @@ import Testing
 
 @Suite("Acknowledged native endpoint editing", .timeLimit(.minutes(1))) @MainActor
 struct EndpointEditorTests {
+  @Test func quantizedClefShowsItsArtifactPrecisionWithoutChatOrVisionControls() throws {
+    let catalog = try ManagerWire.decode(
+      ModelCatalog.self,
+      from: Data(
+        #"{"schema":3,"models":[{"id":"clef","display":"Clef","capability":["decision","vision"],"installed":true,"total_size":30000000000,"artifacts":[{"id":"q8","kind":"weights","format":"gguf","label":"GGUF Q8_0","quant":"Q8_0","installed":true,"total_size":28732215264,"backend_supported":true,"runtime":{"checkpoint_dir":false,"kv_cache_dtype":"auto","capability":["decision"],"companions":[]}},{"id":"mlx8","kind":"weights","format":"safetensors","label":"MLX 8-bit","quant":"MLX-AFFINE-8-G64","installed":true,"total_size":29800000000,"backend_supported":true,"runtime":{"checkpoint_dir":true,"embedded_vision":false,"kv_cache_dtype":"auto","capability":["decision"],"companions":[]}}]}]}"#
+          .utf8))
+    for (id, label) in [("q8", "GGUF · Q8_0"), ("mlx8", "MLX · 8-bit")] {
+      let editor = EndpointEditor(
+        client: EndpointEditFixture(), endpoint: try editEndpoint(), pid: nil)
+      editor.catalog = catalog.models
+      editor.modelID = "clef"
+      editor.artifactID = id
+      editor.selectArtifact(try #require(editor.selectedArtifact), newModel: true)
+      #expect(editor.checkpointLabel == label)
+      #expect(editor.capabilities == ["decision"] && editor.kvDtype == "auto")
+      #expect(!editor.canSpeculate && !editor.canTools && !editor.embeddedVision)
+    }
+  }
   @Test func layaUsesOfficialF16CheckpointAndNoChatFeatures() throws {
     let editor = EndpointEditor(
       client: EndpointEditFixture(), endpoint: try editEndpoint(), pid: nil)

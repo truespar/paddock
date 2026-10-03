@@ -24,6 +24,7 @@ import type { TranscriptMeta, TranscriptSegment, TranscriptWord } from '@/types/
  *  the one that was compared - the failure mode of computing the two
  *  separately. */
 export interface RenderWord {
+  speakers?: number[]
   word: string
   /** the model's own probability, where the lane reported one */
   confidence?: number
@@ -76,6 +77,7 @@ export function renderWords(
   const out: RenderWord[] = []
   if (words?.length) {
     return words.map((w) => ({
+      speakers: w.speakers,
       word: w.word,
       confidence: w.confidence,
       alt: w.alt,

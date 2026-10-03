@@ -157,6 +157,8 @@ pub struct RunnerView {
     /// not be offered as any text surface.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tabular: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diarization: Option<String>,
     /// The catalog's human name for the served model ("Qwen 3.5 9B") + its
     /// maker - the labels every UI surface shows, with the technical id kept
     /// for tooltips. Absent when the catalog doesn't know the model.
@@ -2290,6 +2292,7 @@ impl Supervisor {
                         .or(id.image.as_deref())
                         .or(id.reader.as_deref())
                         .or(id.tabular.as_deref())
+                        .or(id.diarization.as_deref())
                         .and_then(|n| self.registry.display_of(n))
                         // The runner names its weights FILE. When the catalog
                         // does not know that file - a copy, a rename, a quant
@@ -2318,6 +2321,7 @@ impl Supervisor {
                         image: id.image,
                         reader: id.reader,
                         tabular: id.tabular,
+                        diarization: id.diarization,
                         display: labels.as_ref().map(|(d, _)| d.clone()),
                         vendor: labels.and_then(|(_, v)| v),
                         version: Some(id.version),
@@ -2354,6 +2358,7 @@ impl Supervisor {
                             image: None,
                             reader: None,
                             tabular: None,
+                            diarization: None,
                             display: labels.as_ref().map(|(d, _)| d.clone()),
                             vendor: labels.and_then(|(_, v)| v),
                             version: None,
@@ -2388,6 +2393,7 @@ impl Supervisor {
                             image: None,
                             reader: None,
                             tabular: None,
+                            diarization: None,
                             display: None,
                             vendor: None,
                             version: None,

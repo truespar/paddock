@@ -3563,6 +3563,87 @@ struct KernelTableV1 {
     // 717: kumo_labels_m (x, y, target, D, nc, cls, rpm, E, stream)
     int (*kumo_labels_m)(void*, const void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t,
                          uint32_t, void*);
+    // 718-723: Nemotron 3 Diarization, F32 class (diarization.cuh); the head's small
+    // GEMMs are the Kumo one. Pure append.
+    // 718: diar_frontend (pcm, window, fb, spans, twiddle, out, offset, total, start, count,
+    // frames, stream)
+    int (*diar_frontend)(const void*, const void*, const void*, const void*, const void*, void*,
+                         uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 719: diar_norm (x, w, b, y, d, rows, stream)
+    int (*diar_norm)(const void*, const void*, const void*, void*, uint32_t, uint32_t, void*);
+    // 720: diar_conv_rows (p, rows, R, stream)
+    int (*diar_conv_rows)(const void*, void*, uint32_t, void*);
+    // 721: diar_act (x, n, op, stream)
+    int (*diar_act)(void*, uint64_t, uint32_t, void*);
+    // 722: diar_gemm (x, w, scale, bias, y, y2, rope, K, N, M, wtype, mode, stream) - the
+    // projections on the stored BF16 / Q8_0 weights, the rope in the qkv epilogue
+    int (*diar_gemm)(const void*, const void*, const void*, const void*, void*, void*, const void*,
+                     uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 723: diar_attention (q, k, v, out, rows, klen, kvh, stream) - 3xTF32 flash attention,
+    // 8 heads of 64
+    int (*diar_attention)(const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t,
+                          void*);
+    // 724-731: Clef's joint schema head, F32 (clef.cuh); its projections are 722. Pure
+    // append.
+    // 724: clef_norm (x, w, b, y, d, rows, eps, stream) - LayerNorm at any width
+    int (*clef_norm)(const void*, const void*, const void*, void*, uint32_t, uint32_t, float, void*);
+    // 725: clef_span_mean (x, ld, d, spans, n, out, stream)
+    int (*clef_span_mean)(const void*, uint32_t, uint32_t, const void*, uint32_t, void*, void*);
+    // 726: clef_lex_mean (table_bf16, d, ids, spans, n, out, stream)
+    int (*clef_lex_mean)(const void*, uint32_t, const void*, const void*, uint32_t, void*, void*);
+    // 727: clef_attention (q, ldq, k, ldk, v, ldv, out, ldo, ranges, nq, heads, scale, stream)
+    int (*clef_attention)(const void*, uint32_t, const void*, uint32_t, const void*, uint32_t, void*,
+                          uint32_t, const void*, uint32_t, uint32_t, float, void*);
+    // 728: clef_route (opts, fields, qopts, nq, d, max_opts, out, stream)
+    int (*clef_route)(const void*, const void*, const void*, uint32_t, uint32_t, uint32_t, void*,
+                      void*);
+    // 729: clef_gather_add (y, src, idx, rows, d, stream)
+    int (*clef_gather_add)(void*, const void*, const void*, uint32_t, uint32_t, void*);
+    // 730: clef_features (fields, opts, qof, nopt, d, out, stream)
+    int (*clef_features)(const void*, const void*, const void*, uint32_t, uint32_t, void*, void*);
+    // 731: clef_score (lex, qvec, glob, qof, rof, fields, opts, hid, w3, b3, dd, w, ps, joint,
+    // gate, nopt, logits, stream)
+    int (*clef_score)(const void*, const void*, const void*, const void*, const void*, const void*,
+                      const void*, const void*, const void*, float, uint32_t, uint32_t, float, float,
+                      float, uint32_t, void*, void*);
+    // 732: clef_attn_tc (q, ldq, k, ldk, v, ldv, out, ldo, n, heads, kv_heads, scale, stream) -
+    // causal 3xTF32 flash attention at head_dim 256, grouped, over one request's rows
+    int (*clef_attn_tc)(const void*, uint32_t, const void*, uint32_t, const void*, uint32_t, void*,
+                        uint32_t, uint32_t, uint32_t, uint32_t, float, void*);
+    // 733: clef_gemm (x, w, bias, y, K, N, M, mode, stream) - the backbone's projections on
+    // the stored BF16 rows, the activation split two ways (mode: 722's store / gelu / resid /
+    // swiglu)
+    int (*clef_gemm)(const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t,
+                     uint32_t, void*);
+    // 734: clef_rope (x, heads, rows, pos, table, max_pos, hmask, wmask, stream) - the
+    // backbone's rotary embedding from a (cos, sin) table, interleaved mrope axes
+    int (*clef_rope)(void*, uint32_t, uint32_t, const void*, const void*, uint32_t, uint32_t,
+                     uint32_t, void*);
+    // 735: clef_resample_plan (in, out, taps, xmin, xsize, w, prec, stream) - one axis of
+    // torch's uint8 antialiased bicubic: per output its taps and int16 weights
+    int (*clef_resample_plan)(uint32_t, uint32_t, uint32_t, void*, void*, void*, void*, void*);
+    // 736: clef_resample (src, dst, lines, in, out, horiz, xmin, xsize, w, taps, prec, stream) -
+    // one separable pass of that resize over interleaved RGB8 rows
+    int (*clef_resample)(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, const void*,
+                         const void*, const void*, uint32_t, const void*, void*);
+    // 737: clef_patchify (img, h, w, out, stream) - the processor's normalized pixel rows
+    // [patches][1536] in merge-window order
+    int (*clef_patchify)(const void*, uint32_t, uint32_t, void*, void*);
+    // 738: clef_vpos (x, table, info, rows, side, d, stream) - the vision tower's bilinear
+    // position embedding added to the patch rows
+    int (*clef_vpos)(void*, const void*, const void*, uint32_t, uint32_t, uint32_t, void*);
+    // 739: clef_vrope (qkv, heads, rows, info, table, max_pos, stream) - the 2D vision rope on
+    // q and k of the fused qkv rows
+    int (*clef_vrope)(void*, uint32_t, uint32_t, const void*, const void*, uint32_t, void*);
+    // 740: clef_vattn (qkv, out, cu, segs, max_len, heads, scale, stream) - bidirectional
+    // 3xTF32 attention at head_dim 72 within each image
+    int (*clef_vattn)(const void*, void*, const void*, uint32_t, uint32_t, uint32_t, float, void*);
+    // 741: clef_gemm_q8 (x, w, scale, bias, y, K, N, M, mode, stream) - the GGUF backbone's
+    // projections: 733's two-part split against Q8_0 as int8 rows + the file's f16 block scales
+    int (*clef_gemm_q8)(const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t,
+                        uint32_t, uint32_t, void*);
+    // 742: clef_lex_mean_q8 (table_q8_0, d, ids, spans, n, out, stream) - 726 over Q8_0 rows as stored
+    int (*clef_lex_mean_q8)(const void*, uint32_t, const void*, const void*, uint32_t, void*, void*);
 };
 
 } // extern "C"

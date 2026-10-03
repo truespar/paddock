@@ -76,4 +76,7 @@
 #include "src/dflash.cuh"        // DFlash2 drafter grouped dynamic conv (abi.cuh helpers only)
 #include "src/tier/xfer.cuh"     // KV tier extent gather/scatter (kv-offload 1a.2; abi.cuh helpers only)
 #include "src/kumo.cuh"         // Kumo-Tabular F32 graph: GEMM, norms, head transforms, attention, cell embedding (needs f32_qkv's pd_launch_status)
+#include "src/diarization.cuh"  // Nemotron 3 Diarization: log-mel frontend, LayerNorm, rope, conv rows, activations (needs f32_qkv's pd_launch_status)
+#include "src/clef.cuh"         // Clef's joint schema head: LayerNorm, span/lexical means, varlen F32 attention, option routing, scorer (needs f32_qkv's pd_launch_status)
+#include "src/clef_vision.cuh"  // Clef's image lane: the processor's uint8 resize + patchify, the vision tower's position embedding, rope, attention (needs clef.cuh's pd_clef_cpa16)
 #include "src/exports.cuh"

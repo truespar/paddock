@@ -246,6 +246,14 @@ extension NativeStudioRuntime {
         ]))
     }
     return .object([
+      "messageId": m["id"] ?? .null, "conversationId": document.map { .string($0.id) } ?? .null,
+      "diarization": meta["diarization"] ?? .null,
+      "diarizers": .array(
+        streaming || clip == nil
+          ? []
+          : models.filter {
+            $0["kind"]?.string == "diarizer" && $0["status"]?.string == "ok"
+          }.map { .object($0) }),
       "clip": clip.map(V.object) ?? .null, "words": .array(words),
       "segments": streaming ? .array([]) : meta["segments"] ?? .array([]), "differs": .array([]),
       "facts": .array(facts),

@@ -444,6 +444,249 @@ pub fn load_segmenter(
     Ok(SegmentModel { id, segmenter })
 }
 
+/// The Clef checkpoint directory for `path`, if it is one: the joint schema
+/// head's two files beside a sharded Qwen3.5 backbone. The directory, or any
+/// `.safetensors` / index file inside it (the manager's spawn path hands a
+/// checkpoint directory's first file).
+pub fn clef_dir(path: &Path) -> Option<std::path::PathBuf> {
+    let dir = if path.is_dir() {
+        path
+    } else if path
+        .extension()
+        .is_some_and(|x| x == "safetensors" || x == "json")
+    {
+        path.parent()?
+    } else {
+        return None;
+    };
+    paddock_models::clef::ClefConfig::is_clef_dir(dir).then(|| dir.to_path_buf())
+}
+
+/// Where a Clef is read from: the official checkpoint directory (BF16
+/// shards + the joint head's files), or a GGUF (ggml-org's conversions) with
+/// its vision companion when there is one.
+pub enum ClefSource {
+    Dir(std::path::PathBuf),
+    Gguf {
+        path: std::path::PathBuf,
+        companion: Option<std::path::PathBuf>,
+    },
+}
+
+/// The vision companion beside a Clef GGUF, if one is there: a
+/// `.safetensors` file in the GGUF's folder whose header carries a Clef
+/// config (`paddock_models::clef::COMPANION_CONFIG`) - the layout catalog
+/// pulls produce. Whether it belongs to THIS GGUF is checked at load.
+pub fn clef_companion_beside(gguf: &Path) -> Option<std::path::PathBuf> {
+    let dir = gguf.parent()?;
+    let mut found: Vec<_> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+        .filter(|p| {
+            paddock_models::safetensors::SafetensorsFile::open(p).is_ok_and(|f| {
+                f.metadata
+                    .contains_key(paddock_models::clef::COMPANION_CONFIG)
+            })
+        })
+        .collect();
+    found.sort();
+    (found.len() == 1).then(|| found.remove(0))
+}
+
+/// Load a Clef on its own decision thread. Native CUDA or Metal (the
+/// checkpoint directory or GGUF); both use the identical tokenizer, request
+/// batching and SystemOne contract.
+pub fn load_clef(
+    id: String,
+    src: ClefSource,
+    device: &str,
+    gpu: usize,
+    pack: Option<&Path>,
+    vram_budget: Option<u64>,
+) -> Result<crate::systemone::clef::ClefModel, ServeError> {
+    use crate::systemone::clef::{ClefModel, encode::ClefTok};
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    if device == "metal" {
+        let (tok, path) = match &src {
+            ClefSource::Dir(dir) => (
+                ClefTok::load(dir).map_err(|e| ServeError::Open(dir.clone(), e))?,
+                dir.clone(),
+            ),
+            ClefSource::Gguf { path, .. } => {
+                let g = MappedGguf::open(path)
+                    .map_err(|e| ServeError::Open(path.clone(), e.to_string()))?;
+                (
+                    ClefTok::from_gguf(g.gguf()).map_err(|e| ServeError::Open(path.clone(), e))?,
+                    path.clone(),
+                )
+            }
+        };
+        let companion = match &src {
+            ClefSource::Gguf { companion, .. } => companion.clone(),
+            _ => None,
+        };
+        let cfg = match &src {
+            ClefSource::Dir(dir) => paddock_models::clef::ClefConfig::read(dir),
+            ClefSource::Gguf { path, .. } => {
+                let g = MappedGguf::open(path)
+                    .map_err(|e| ServeError::Open(path.clone(), e.to_string()))?;
+                let meta = companion
+                    .as_ref()
+                    .map(|p| {
+                        paddock_models::safetensors::SafetensorsFile::open(p).map(|f| f.metadata)
+                    })
+                    .transpose()
+                    .map_err(|e| ServeError::Engine(e.to_string()))?;
+                paddock_models::clef::ClefConfig::from_gguf(g.gguf(), meta.as_ref())
+            }
+        }
+        .map_err(ServeError::Engine)?;
+        let vision = cfg
+            .vision
+            .as_ref()
+            .map(|(v, ip)| crate::systemone::clef::ClefVision {
+                pad: v.image_token,
+                min_pixels: ip.min_pixels,
+                max_pixels: ip.max_pixels,
+            });
+        let decider = paddock_engine::clef_decision::ClefDecider::spawn(move || {
+            let mut model =
+                paddock_metal::Clef::load_with_companion(&path, companion.as_deref(), vram_budget)
+                    .map_err(|e| e.to_string())?;
+            let ids: Vec<u32> = (1..=24).collect();
+            let q = paddock_engine::clef_decision::ClefQuestion {
+                qtype: 1,
+                span: (4, 8),
+                options: vec![(10, 14), (16, 20)],
+            };
+            model
+                .forward(&[paddock_engine::clef_decision::ClefRequest {
+                    ids: &ids,
+                    questions: std::slice::from_ref(&q),
+                    images: &[],
+                }])
+                .map_err(|e| format!("Clef Metal warm-up: {e}"))?;
+            if let Some(v) = vision {
+                let mut ids = ids;
+                ids.extend(std::iter::repeat_n(v.pad, 64));
+                let image = paddock_engine::clef_decision::ClefImage {
+                    rgb: vec![128; 64 * 48 * 3],
+                    width: 64,
+                    height: 48,
+                    resized: (256, 256),
+                    row: 24,
+                };
+                model
+                    .forward(&[paddock_engine::clef_decision::ClefRequest {
+                        ids: &ids,
+                        questions: std::slice::from_ref(&q),
+                        images: std::slice::from_ref(&image),
+                    }])
+                    .map_err(|e| format!("Clef Metal image warm-up: {e}"))?;
+            }
+            Ok(model)
+        })
+        .map_err(ServeError::Engine)?;
+        return Ok(ClefModel::new(id, decider, tok, vision));
+    }
+    if device != "cuda" {
+        return Err(ServeError::Engine(format!(
+            "Clef needs CUDA or a macOS build with Metal enabled (got {device:?})"
+        )));
+    }
+    let (tok, cfg) = match &src {
+        ClefSource::Dir(dir) => (
+            ClefTok::load(dir).map_err(|e| ServeError::Open(dir.to_path_buf(), e))?,
+            paddock_models::clef::ClefConfig::read(dir)
+                .map_err(|e| ServeError::Open(dir.to_path_buf(), e))?,
+        ),
+        ClefSource::Gguf { path, companion } => {
+            let open = |e: String| ServeError::Open(path.to_path_buf(), e);
+            let g = MappedGguf::open(path).map_err(|e| open(e.to_string()))?;
+            let meta = match companion {
+                Some(c) => Some(
+                    paddock_models::safetensors::SafetensorsFile::open(c)
+                        .map_err(|e| ServeError::Open(c.to_path_buf(), e.to_string()))?
+                        .metadata,
+                ),
+                None => None,
+            };
+            (
+                ClefTok::from_gguf(g.gguf()).map_err(open)?,
+                paddock_models::clef::ClefConfig::from_gguf(g.gguf(), meta.as_ref())
+                    .map_err(open)?,
+            )
+        }
+    };
+    let vision = cfg
+        .vision
+        .as_ref()
+        .map(|(v, ip)| crate::systemone::clef::ClefVision {
+            pad: v.image_token,
+            min_pixels: ip.min_pixels,
+            max_pixels: ip.max_pixels,
+        });
+    let pack = pack.map(Path::to_path_buf);
+    let decider = paddock_engine::clef_decision::ClefDecider::spawn(move || {
+        let exec = paddock_engine::gpu::GpuExecutor::with_pack(gpu, pack.as_deref())
+            .map_err(|e| e.to_string())?;
+        note_device_cc(&exec);
+        if let Some(b) = vram_budget {
+            exec.set_vram_budget(b);
+        }
+        let exec = Arc::new(exec);
+        let mut m = match &src {
+            ClefSource::Dir(dir) => paddock_engine::gpu_model::clef::GpuClef::load(exec, dir),
+            ClefSource::Gguf { path, companion } => {
+                paddock_engine::gpu_model::clef::GpuClef::load_gguf(
+                    exec,
+                    path,
+                    companion.as_deref(),
+                )
+            }
+        }
+        .map_err(|e| format!("clef: {e}"))?;
+        // one small pass before the first request: every kernel's first
+        // launch pays its module load, which belongs to startup
+        let ids: Vec<u32> = (1..=24).collect();
+        let q = paddock_engine::clef_decision::ClefQuestion {
+            qtype: 1,
+            span: (4, 8),
+            options: vec![(10, 14), (16, 20)],
+        };
+        m.forward(&[paddock_engine::clef_decision::ClefRequest {
+            ids: &ids,
+            questions: std::slice::from_ref(&q),
+            images: &[],
+        }])
+        .map_err(|e| format!("clef warm-up: {e}"))?;
+        // and the image lane's, with a small gray picture (resized up to
+        // 256 x 256: 64 tokens)
+        if let Some(pad) = vision.filter(|_| m.has_vision()).map(|v| v.pad) {
+            let mut ids: Vec<u32> = (1..=24).collect();
+            ids.extend(std::iter::repeat_n(pad, 64));
+            let im = paddock_engine::clef_decision::ClefImage {
+                rgb: vec![128; 48 * 64 * 3],
+                width: 64,
+                height: 48,
+                resized: (256, 256),
+                row: 24,
+            };
+            m.forward(&[paddock_engine::clef_decision::ClefRequest {
+                ids: &ids,
+                questions: std::slice::from_ref(&q),
+                images: std::slice::from_ref(&im),
+            }])
+            .map_err(|e| format!("clef image warm-up: {e}"))?;
+        }
+        Ok(m)
+    })
+    .map_err(ServeError::Engine)?;
+    Ok(ClefModel::new(id, decider, tok, vision))
+}
+
 /// The decision-model (Laya) bundle directory for `path`, if it is one: its
 /// root holds a checkpoint (`rl_agent_config.json` + `encoder/` +
 /// `model.safetensors`). The directory, or the root `model.safetensors` the

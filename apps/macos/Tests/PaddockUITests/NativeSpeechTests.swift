@@ -8,6 +8,32 @@ import Testing
 
 @Suite("Native speech rendering and playback", .serialized) @MainActor
 struct NativeSpeechTests {
+  @Test func speakerLabelsKeepOneSelectableTextSurfaceAndWordClock() throws {
+    let value = try JSONDecoder().decode(
+      StudioState.Speech.self,
+      from: Data(
+        #"""
+        {"clip":{"id":"clip","name":"recording.wav","mime":"audio/wav"},
+         "words":[{"word":"Hello","start":0,"end":1,"segment":0,"speaker":0,"speakers":[0]},
+                  {"word":"both","start":1,"end":2,"segment":0,"speakers":[0,1]},
+                  {"word":"unknown","start":2,"end":3,"segment":0,"speakers":[]}],
+         "differs":[],"facts":[],"guards":[],"subtitleExport":true,
+         "diarization":{"model":"Nemotron","duration":3,"segments":[
+           {"speaker":0,"start":0,"end":2},{"speaker":1,"start":1,"end":2}]}}
+        """#.utf8))
+    let view = SpeechTextView(usingTextLayoutManager: true)
+    view.isSelectable = true
+    view.update(speech: value, marks: false, position: nil, focus: nil)
+    #expect(view.string == "Speaker 1\nHello\nSpeaker 1 / Speaker 2\nboth\nUnassigned\nunknown")
+    let selection = NSRange(location: 0, length: (view.string as NSString).length)
+    view.setSelectedRange(selection)
+    let storage = try #require(view.textStorage)
+    let at = (view.string as NSString).range(of: "both").location
+    view.update(speech: value, marks: false, position: 1.5, focus: nil)
+    #expect(view.selectedRange() == selection)
+    #expect(view.textStorage === storage)
+    #expect(storage.attribute(.backgroundColor, at: at, effectiveRange: nil) != nil)
+  }
   @Test func highlightFollowsViewAppearanceInsteadOfTheClockCallbackAppearance() throws {
     let speech = try speech()
     let view = SpeechTextView(usingTextLayoutManager: true)

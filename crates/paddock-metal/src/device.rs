@@ -98,6 +98,12 @@ pub(crate) const SHADER_SOURCE: &str = concat!(
     include_str!("../../../packs/metal/qwen_image.metal"),
     include_str!("../../../packs/metal/laya.metal"),
     include_str!("../../../packs/metal/kumo.metal"),
+    include_str!("../../../packs/metal/diarization.metal"),
+    include_str!("../../../packs/metal/clef.metal"),
+    include_str!("../../../packs/metal/clef_quant.metal"),
+    include_str!("../../../packs/metal/clef_attention.metal"),
+    include_str!("../../../packs/metal/clef_head.metal"),
+    include_str!("../../../packs/metal/clef_vision.metal"),
 );
 
 #[derive(Debug, thiserror::Error)]
@@ -379,8 +385,58 @@ impl MetalDevice {
         #[cfg(test)]
         let mut limited_kernels = HashMap::new();
         for name in [
+            "diar_round",
+            "diar_project64",
+            "diar_project32",
+            "diar_q8_project32",
+            "diar_q8_project32_prepare",
+            "diar_frontend",
+            "diar_attention_bf16",
+            "diar_attention_f32",
+            "diar_attention_q8_input",
+            "diar_attention_row_check",
+            "diar_heads_trace",
+            "diar_norm",
+            "diar_residual_norm_bf16",
+            "diar_residual_norm_f32",
+            "diar_norm_q8_input",
+            "diar_residual_norm_q8_input",
+            "diar_post",
+            "diar_heads",
+            "diar_conv_rows",
             "kumo_kv",
             "kumo_mm",
+            "clef_mm",
+            "clef_mm_quant",
+            "clef_quant_gather",
+            "clef_vis_resize",
+            "clef_vis_patch_weight",
+            "clef_vis_patches",
+            "clef_vis_position",
+            "clef_vis_qkv",
+            "clef_vis_unpad",
+            "clef_vision_attention",
+            "clef_mlx_qk_norm",
+            "clef_mm_parts",
+            "clef_mm_parts_linear",
+            "clef_mm_parts_k256",
+            "clef_mm_parts_k1024",
+            "clef_prepare",
+            "clef_embed",
+            "clef_norm",
+            "clef_rope",
+            "clef_attn_gate",
+            "clef_conv",
+            "clef_gates",
+            "clef_recurrent",
+            "clef_causal",
+            "clef_attention",
+            "clef_mean",
+            "clef_lex",
+            "clef_gather_add",
+            "clef_route",
+            "clef_features",
+            "clef_score",
             "kumo_mlp_out",
             "kumo_norm",
             "kumo_add_norm",
@@ -1787,7 +1843,11 @@ impl Commands<'_> {
             }
             // Shape attribution is control metadata only. Keep the generic
             // kernel name for every unrelated backend/profiler consumer.
-            let label = if name.starts_with("dg_project")
+            let label = if name.starts_with("diar_project")
+                || name.starts_with("clef_mm")
+                || name.starts_with("diar_q8_project")
+                || name == "gmlx_vmm64"
+                || name.starts_with("dg_project")
                 || name.starts_with("dg_experts")
                 || name.starts_with("q4a_mv")
                 || name.starts_with("q4a_mm")
@@ -2144,6 +2204,33 @@ mod tests {
         }
         assert!(cmd.finish().unwrap().is_finite());
         assert_eq!(unsafe { bad.read_u32(1) }, [0]);
+    }
+
+    #[test]
+    fn clef_pipelines_fit_threadgroup_memory() {
+        let device = MetalDevice::new(Some(32 << 20)).unwrap();
+        for (name, pipeline) in &device.kernels {
+            if name.starts_with("clef_") {
+                let used = pipeline.staticThreadgroupMemoryLength();
+                assert!(
+                    used <= device.raw.maxThreadgroupMemoryLength(),
+                    "{name}: {used} bytes"
+                );
+                let required = if matches!(*name, "clef_rope" | "clef_mlx_qk_norm") {
+                    32
+                } else if name.starts_with("clef_mm")
+                    || matches!(*name, "clef_attention" | "clef_causal" | "clef_recurrent")
+                {
+                    128
+                } else {
+                    256
+                };
+                assert!(
+                    pipeline.maxTotalThreadsPerThreadgroup() >= required,
+                    "{name}: insufficient thread capacity"
+                );
+            }
+        }
     }
 
     #[test]

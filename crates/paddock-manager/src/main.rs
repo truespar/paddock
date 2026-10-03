@@ -269,9 +269,11 @@ fn resolve_target(target: &str, rows: &[serde_json::Value], what: &str) -> Resul
 /// An encoder runner carries its id in `embedder` (it has no generative
 /// model) - the MODEL column shows whichever the runner serves.
 fn served_id(v: &serde_json::Value) -> String {
+    // a decision model (Laya, Clef) serves no chat model: its id is `reader`
     v["model"]
         .as_str()
         .or_else(|| v["embedder"].as_str())
+        .or_else(|| v["reader"].as_str())
         .unwrap_or("-")
         .to_owned()
 }

@@ -1,6 +1,78 @@
 use super::*;
 
 #[test]
+fn diarization_catalog_serves_metal_and_cuda_non_chat_with_measured_bounded_memory() {
+    let metal = Registry::new("./models".into()).with_backend("metal");
+    let model = metal.catalog_of("nemotron-3-diarization").unwrap();
+    assert_eq!(model.capability, ["diarization"]);
+    assert_eq!(
+        crate::estimate::kind_for(&model.capability),
+        paddock_estimator::ModelKind::Encoder
+    );
+    // the trained BF16 values are the default on both lanes; Q8_0 is the
+    // smaller option
+    for backend in ["metal", "cuda"] {
+        assert_eq!(
+            model.default_weights_for_backend(backend, None).unwrap().id,
+            "mlx-bf16"
+        );
+    }
+    assert!(model.default_weights_for_backend("vulkan", None).is_none());
+    for id in ["mlx-bf16", "q8"] {
+        let a = model.artifact(id).unwrap();
+        assert!(a.runtime.supports_backend("metal"));
+        assert!(a.runtime.supports_backend("cuda"));
+        assert_eq!(a.runtime.checkpoint_dir, id == "mlx-bf16");
+        assert_eq!(a.runtime.default_spec.as_deref(), Some("off"));
+        assert_eq!(a.workspace, Some(36_133_888));
+        assert_eq!(a.runtime.memory.as_ref().unwrap().kv_reserve_sequences, 0);
+        assert!(a.shape.as_ref().unwrap().kv_layers.is_empty());
+        assert_eq!(metal.default_envelope(&model.id, Some(id)), (684, 1));
+        for f in &a.files {
+            assert_eq!(
+                f.url,
+                format!("https://models.truespar.io/models/{}", f.dest)
+            );
+            assert!(f.size > 0 && f.sha256.len() == 64);
+        }
+        assert_eq!(a.files.len(), if id == "mlx-bf16" { 5 } else { 3 });
+        assert!(a.files.iter().any(|f| f.dest.ends_with("/LICENSE")));
+        assert!(a.files.iter().any(|f| f.dest.ends_with("/README.md")));
+        if id == "mlx-bf16" {
+            assert!(
+                a.files
+                    .iter()
+                    .any(|f| f.dest.ends_with("/NVIDIA_MODEL_CARD.md"))
+            );
+        }
+        let source = a
+            .source
+            .as_ref()
+            .expect("mirror retains upstream provenance");
+        assert_eq!(source.base_model, "nvidia/Nemotron-3-Diarization");
+        assert_eq!(source.license, "openmdw-1.1");
+        assert_eq!(source.license_url, "https://openmdw.ai/license/1-1/");
+        let (repo, revision) = if id == "mlx-bf16" {
+            (
+                "mlx-community/Nemotron-3-Diarization",
+                "59ed2dbfc1346dcea9d423c71306a3a2499c568f",
+            )
+        } else {
+            (
+                "nvidia/Nemotron-3-Diarization",
+                "f667ed73aee57d40cc39428eb768b4fd87a0a29e",
+            )
+        };
+        assert_eq!(source.repo, repo);
+        assert_eq!(source.revision, revision);
+        let caps = metal
+            .capability_of(a.entry_path(metal.models_dir()).unwrap().to_str().unwrap())
+            .unwrap();
+        assert_eq!(caps, ["diarization"]);
+    }
+}
+
+#[test]
 fn laya_metal_uses_original_bundle_and_encoder_memory_not_chat_kv() {
     let metal = Registry::new("./models".into()).with_backend("metal");
     let model = metal.catalog_of("laya").unwrap();
@@ -25,6 +97,165 @@ fn laya_metal_uses_original_bundle_and_encoder_memory_not_chat_kv() {
     let artifact = cuda.catalog_of("laya").unwrap().default_weights().unwrap();
     assert_eq!(artifact.workspace, Some(337_865_736));
     assert!(artifact.runtime.memory.is_none());
+}
+
+#[test]
+fn clef_flash_cuda_keeps_its_q8_gguf_and_vision_companion() {
+    let cuda = Registry::new("./models".into()).with_backend("cuda");
+    let model = cuda.catalog_of("clef-flash").unwrap();
+    assert_eq!(
+        model
+            .weights()
+            .filter(|a| a.runtime.supports_backend("cuda"))
+            .map(|a| a.id.as_str())
+            .collect::<Vec<_>>(),
+        ["q8"]
+    );
+    let artifact = model.default_weights_for_backend("cuda", None).unwrap();
+    assert_eq!(artifact.quant.as_deref(), Some("Q8_0"));
+    assert!(artifact.runtime.memory.is_none());
+    assert_eq!(artifact.workspace, Some(4_730_142_720));
+    assert_eq!(artifact.shape.as_ref().unwrap().weight_bytes, 9_658_079_232);
+    assert_eq!(artifact.capabilities(model), ["decision", "vision"]);
+    let bundle: Vec<&str> = model
+        .default_bundle_for_backend("cuda", None)
+        .iter()
+        .map(|a| a.id.as_str())
+        .collect();
+    assert_eq!(bundle, ["q8", "vision"]);
+    assert!(
+        model
+            .artifacts
+            .iter()
+            .filter(|a| a.runtime.supports_backend("cuda"))
+            .flat_map(|a| &a.files)
+            .all(|f| {
+                f.url
+                    .starts_with("https://models.truespar.io/models/Clef-Flash-GGUF/")
+            })
+    );
+}
+
+#[test]
+fn clef_27b_cuda_keeps_its_q8_gguf_and_vision_companion() {
+    let cuda = Registry::new("./models".into()).with_backend("cuda");
+    let model = cuda.catalog_of("clef").unwrap();
+    let artifact = model.default_weights_for_backend("cuda", None).unwrap();
+    assert_eq!(artifact.id, "q8");
+    assert_eq!(artifact.workspace, Some(6_672_105_472));
+    assert_eq!(
+        artifact.shape.as_ref().unwrap().weight_bytes,
+        28_733_401_088
+    );
+    let bundle: Vec<&str> = model
+        .default_bundle_for_backend("cuda", None)
+        .iter()
+        .map(|a| a.id.as_str())
+        .collect();
+    assert_eq!(bundle, ["q8", "vision"]);
+    assert!(artifact.files.iter().all(|f| {
+        f.url
+            .starts_with("https://models.truespar.io/models/Clef-GGUF/")
+    }));
+}
+
+#[test]
+fn both_clefs_offer_native_metal_q8_and_mlx8_text_and_vision_decisions_without_chat() {
+    let metal = Registry::new("./models".into()).with_backend("metal");
+    for (id, q8_bytes, mlx_bytes, files, revision) in [
+        (
+            "clef-flash",
+            9_650_477_056,
+            10_677_937_088,
+            13,
+            "dfa0993decb4f8507a0eae01afd1b2d33a4bb734",
+        ),
+        (
+            "clef",
+            28_725_405_696,
+            29_768_205_248,
+            17,
+            "ffcdb6132b3cc94e523860321dd9ed58bc1ee9a1",
+        ),
+    ] {
+        let model = metal.catalog_of(id).unwrap();
+        assert_eq!(
+            model.default_weights_for_backend("metal", None).unwrap().id,
+            "q8"
+        );
+        assert_eq!(
+            model
+                .default_bundle_for_backend("metal", None)
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>(),
+            ["q8", "vision"]
+        );
+        assert_eq!(
+            model.weights().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+            ["q8", "mlx8"]
+        );
+        for (artifact_id, bytes) in [("q8", q8_bytes), ("mlx8", mlx_bytes)] {
+            let a = model.artifact(artifact_id).unwrap();
+            assert!(a.runtime.supports_backend("metal"));
+            assert_eq!(a.capabilities(model), ["decision", "vision"]);
+            assert_eq!(a.runtime.embedded_vision, artifact_id == "mlx8");
+            assert_eq!(
+                a.runtime.companions,
+                Some(if artifact_id == "q8" {
+                    vec!["vision".into()]
+                } else {
+                    vec![]
+                })
+            );
+            assert_eq!(a.runtime.default_spec.as_deref(), Some("off"));
+            let memory = a.runtime.memory.as_ref().unwrap();
+            assert_eq!(memory.weight_bytes, bytes);
+            assert_eq!(memory.kv_reserve_sequences, 0);
+            assert_eq!((memory.max_ctx, memory.max_batch), (16384, 256));
+            assert!(a.shape.as_ref().unwrap().kv_layers.is_empty());
+            assert_eq!(metal.default_envelope(id, Some(artifact_id)), (16384, 1));
+            let entry = a.entry_path(metal.models_dir()).unwrap();
+            assert_eq!(
+                metal.capability_of(entry.to_str().unwrap()).unwrap(),
+                ["decision", "vision"]
+            );
+        }
+        let mlx = model.artifact("mlx8").unwrap();
+        let tower = model.artifact("vision").unwrap();
+        assert!(tower.runtime.supports_backend("metal"));
+        assert!(tower.workspace.unwrap() > 3_900_000_000);
+        assert!(mlx.runtime.checkpoint_dir);
+        assert!(!mlx.runtime.supports_backend("cuda"));
+        assert_eq!(mlx.files.len(), files);
+        let source = mlx.source.as_ref().unwrap();
+        assert_eq!(source.repo, format!("mlx-community/{id}-8bit"));
+        assert_eq!(source.revision, revision);
+        assert_eq!(source.base_model, format!("Cloudflare/{id}"));
+        for file in &mlx.files {
+            assert_eq!(
+                file.url,
+                format!(
+                    "https://models.truespar.io/models/mlx-community/{revision}/{}",
+                    file.dest
+                )
+            );
+            assert!(file.size > 0 && file.sha256.len() == 64);
+            assert!(!file.dest.ends_with(".py"));
+        }
+        for name in [
+            "LICENSE",
+            "README.md",
+            "joint_head.safetensors",
+            "config.json",
+        ] {
+            assert!(
+                mlx.files
+                    .iter()
+                    .any(|f| f.dest.ends_with(&format!("/{name}")))
+            );
+        }
+    }
 }
 
 #[test]
@@ -1119,7 +1350,13 @@ fn metal_projection_preserves_cuda_contracts_and_is_reversible() {
                 a.runtime.kv_cache_dtype.as_deref(),
                 Some(if model.id == "bonsai-2-27b" && a.id == "mlx-2bit" {
                     "f32"
-                } else if a.runtime.checkpoint_dir {
+                } else if a.runtime.checkpoint_dir
+                    || model
+                        .capability
+                        .iter()
+                        .any(|c| c == "diarization" || c == "decision")
+                {
+                    // Single-pass audio/decision graphs have no decode KV.
                     "auto"
                 } else {
                     "f16"
@@ -1140,7 +1377,7 @@ fn metal_projection_preserves_cuda_contracts_and_is_reversible() {
                 artifact.runtime.supports_backend("cuda"),
                 !matches!(
                     artifact.id.as_str(),
-                    "mlx-4bit" | "mlx-2bit" | "splash-4bit"
+                    "mlx-4bit" | "mlx-2bit" | "mlx8" | "splash-4bit"
                 ),
                 "{}/{}",
                 model.id,

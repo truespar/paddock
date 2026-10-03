@@ -117,6 +117,7 @@ fn is_single_pass(capability: &str) -> bool {
         "embeddings"
             | "rerank"
             | "alignment"
+            | "diarization"
             | "decision"
             | "tabular"
             | "segmentation"
@@ -952,7 +953,15 @@ pub async fn handle(
             "name": metal.as_ref().map(|(s, _)| s.name.clone()).or_else(|| gpu.map(|g| g.name.clone())),
             "unified": metal.is_some(),
             "physical": metal.as_ref().map(|(s, _)| s.physical),
-            "planning_basis": if metal.is_some() { "conservative unified-memory budget; runtime rechecks allocations" } else { "NVML" },
+            "planning_basis": if metal.is_some() {
+                "conservative unified-memory budget; runtime rechecks allocations"
+            } else if gpu.is_some_and(|g| g.host_memory) {
+                // a GB10: NVML has no framebuffer, so the device is the
+                // machine's RAM as the OS books it (the runner gate's reading)
+                "NVML device, the host's RAM (MemAvailable)"
+            } else {
+                "NVML"
+            },
             "held_by_loaded_model": if metal.is_some() { 0 } else { reclaimable },
             "used_by_others": if metal.is_some() { d.total_bytes.saturating_sub(d.free_bytes) } else { in_use_by_others },
             // §10.1 pinned runners: resident by policy, so their VRAM is part

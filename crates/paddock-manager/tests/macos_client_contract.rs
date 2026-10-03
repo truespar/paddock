@@ -104,6 +104,30 @@ async fn assert_native_client_read_routes() {
                         .is_empty()
                 );
                 let models = json["models"].as_array().expect("catalog models");
+                let diarization = models
+                    .iter()
+                    .find(|m| m["id"] == "nemotron-3-diarization")
+                    .expect("Diarization reaches both Studio catalogs");
+                assert_eq!(
+                    diarization["capability"],
+                    serde_json::json!(["diarization"])
+                );
+                for a in diarization["artifacts"].as_array().expect("artifacts") {
+                    assert_eq!(a["backend_supported"], true);
+                    assert_eq!(a["runtime"]["default_spec"], "off");
+                    assert_eq!(a["runtime"]["memory"]["workspace_bytes"], 36133888);
+                    let files = a["files"].as_array().expect("downloadable R2 bundle");
+                    assert!(files.iter().all(|f| f["url"].as_str().expect("url")
+                        == format!(
+                            "https://models.truespar.io/models/{}",
+                            f["dest"].as_str().expect("dest")
+                        )));
+                    assert!(
+                        files
+                            .iter()
+                            .any(|f| f["dest"].as_str().expect("dest").ends_with("/LICENSE"))
+                    );
+                }
                 let diffusion = models
                     .iter()
                     .find(|m| m["id"] == "diffusiongemma-26b-a4b")

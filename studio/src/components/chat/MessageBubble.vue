@@ -30,6 +30,7 @@ import { docContext } from '@/lib/docrun'
 import FilePreview from './FilePreview.vue'
 import AudioPlayer from './AudioPlayer.vue'
 import TranscriptView from './TranscriptView.vue'
+import SpeakerTimeline from './SpeakerTimeline.vue'
 import Menu from '@/components/ui/Menu.vue'
 import MenuTrigger from '@/components/ui/MenuTrigger.vue'
 import MenuContent from '@/components/ui/MenuContent.vue'
@@ -1038,6 +1039,7 @@ onBeforeUnmount(() => {
              The transport lives on the USER's turn, where the audio is, and
              drives every lane at once. -->
         <div v-else-if="transcript" class="tx" :class="{ 'tx--flat': inLane }">
+          <SpeakerTimeline :transcript="transcript" :clip-id="clipId" :message-id="message.id" :streaming="message.streaming" @seek="seek" />
           <ul v-if="transcript.guards?.length" class="tx__guards">
             <li v-for="(g, i) in transcript.guards" :key="i">
               <span class="tx__guard-span">{{ clock(g.start) }}-{{ clock(g.end) }}</span>

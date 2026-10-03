@@ -64,6 +64,21 @@ struct NativeReadDiagnostics: View {
             if let canvas = response.diagnostics.canvas { metric("Canvas", "\(canvas) positions") }
             if let checkpoint = response.diagnostics.checkpoint { metric("Checkpoint", checkpoint) }
             if let tokens = response.diagnostics.stateTokens { metric("State tokens", "\(tokens)") }
+            if let read = response.diagnostics.stateRead, read != response.diagnostics.stateTokens {
+              metric("State tokens read", "\(read)")
+            }
+            if let images = response.diagnostics.images, images > 0 {
+              metric("Images", "\(images)")
+            }
+            ForEach(Array((response.diagnostics.pictures ?? []).enumerated()), id: \.offset) {
+              index, picture in
+              if picture.resized.count == 2 {
+                metric(
+                  "Image \(index + 1)",
+                  "\(picture.width) x \(picture.height) to \(picture.resized[0]) x \(picture.resized[1]) · \(picture.tokens) tokens"
+                )
+              }
+            }
             if let routing = response.routing { metric("Routing", routing.reason) }
             metric("Reads", "\(response.diagnostics.reads)")
             if let input = response.usage?.inputTokens { metric("Prompt tokens", "\(input)") }
@@ -71,6 +86,12 @@ struct NativeReadDiagnostics: View {
             metric(
               "Model time", String(format: "%.0f ms", response.diagnostics.timing.totalMilliseconds)
             )
+            if let gpu = response.diagnostics.timing.gpuMilliseconds {
+              metric("Decision pass", String(format: "%.0f ms", gpu))
+            }
+            if let requests = response.diagnostics.timing.passRequests {
+              metric("Batch", "\(requests) \(requests == 1 ? "request" : "requests")")
+            }
             metric("Total time", String(format: "%.0f ms", elapsedMilliseconds))
           }.font(.caption).textSelection(.enabled)
           ForEach(response.diagnostics.questions, id: \.id) { row in
@@ -79,6 +100,10 @@ struct NativeReadDiagnostics: View {
               HStack {
                 if let position = row.position { Text("Position \(position)") }
                 if let mass = row.labelMass { Text("Label mass \(mass, specifier: "%.3f")") }
+                if response.diagnostics.backend == "clef" {
+                  Text(row.label)
+                  if let options = row.options { Text("\(options) options") }
+                }
                 Text("Entropy \(row.entropy, specifier: "%.3f")")
               }.font(.caption).foregroundStyle(.secondary).monospacedDigit()
               if let temperature = row.temperature {

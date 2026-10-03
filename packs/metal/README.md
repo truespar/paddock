@@ -44,6 +44,7 @@ drives those kernels.
 | `splash`, `splash_attention`, `splash_draft`, `splash_draft_attention` | `splash` (the packed-Q4 package format) |
 | `gpt_oss`, `laguna`, `nemotron`, `paddleocr`, `whisper` | the folder of the same name |
 | `unlimited_ocr`, `unlimited_vision` | `unlimited_ocr/` |
+| `clef`, `clef_quant`, `clef_attention`, `clef_head`, `clef_vision` | `clef/` |
 
 `granite.metal` comes first in the list and also defines the weight-decoding
 helpers most later files call, which is why it is not only about Granite.

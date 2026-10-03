@@ -37,6 +37,7 @@ blanket license for the brands; source and per-icon metadata follow.
 - MiniMax: https://github.com/MiniMax-AI/MiniMax-01/blob/57cf223b177e99636c7711a0f179e9fdc9c38e8a/figures/minimax.svg — license metadata: {"type":"custom","url":"https://github.com/simple-icons/simple-icons/pull/13982#issuecomment-3531627803"}
 - Hugging Face: https://huggingface.co/brand — guidelines: https://huggingface.co/brand
 - OpenRouter: https://openrouter.ai
+- Cloudflare (2026-10-03): https://www.cloudflare.com/logo/ — guidelines: https://www.cloudflare.com/trademark/
 
 Search-provider controls (2026-09-16) reuse Exa and Firecrawl path geometry from
 `studio/src/components/manage/SearchLogo.vue`, the Tavily SVG from

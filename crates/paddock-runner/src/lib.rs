@@ -21,6 +21,8 @@ pub mod constrained;
 pub mod context_management;
 pub mod deepseek_ocr;
 mod device_admission;
+pub mod diarization_live;
+pub mod diarizations;
 pub mod doc;
 pub mod drain;
 pub mod embeddings;
@@ -43,6 +45,7 @@ pub mod pdf;
 pub mod ratelimit;
 pub mod realtime;
 pub mod reasoning;
+pub(crate) mod reference_image;
 pub mod residency;
 pub mod responses;
 pub mod routes;
@@ -324,7 +327,9 @@ pub async fn run(
     let (mut serving, mut embedder, mut asr, mut aligner) = (None, None, None, None);
     let mut segmenter = None;
     let mut laya = None;
+    let mut clef = None;
     let mut tabular = None;
+    let mut diarization = None;
     let mut image = None;
     // the resolved off policy, surfaced on admin identify (SpecInfo.off)
     let mut spec_policy_off = false;
@@ -422,7 +427,28 @@ pub async fn run(
                 );
             }
         }
-        if tabular::is_kumo(path) {
+        if diarizations::is_model(path, &arch) {
+            if cfg.mmproj.is_some()
+                || cfg.kv_offload.enabled
+                || cfg.spec.as_deref().is_some_and(|s| s != "off")
+            {
+                return Err("Diarization is not a generator; remove vision, KV-offload and speculative-decoding overrides".into());
+            }
+            diarization = Some(
+                diarizations::load(
+                    cfg.served_model_name.clone().unwrap_or(id),
+                    path,
+                    &cfg.device,
+                    gpu_ordinal,
+                    cfg.kernel_pack.as_deref(),
+                    cfg.vram_budget.map(|mib| mib << 20),
+                )
+                .map_err(serving::ServeError::Engine)?,
+            );
+            tracing::info!(
+                "Nemotron 3 Diarization ready (eight overlapping speakers, 10-ms frames)"
+            );
+        } else if tabular::is_kumo(path) {
             if cfg.mmproj.is_some()
                 || cfg.kv_offload.enabled
                 || cfg.spec.as_deref().is_some_and(|s| s != "off")
@@ -484,6 +510,60 @@ pub async fn run(
             )?;
             tracing::info!(model = %m.id, "image-generation model ready");
             image = Some(m);
+        } else if arch == "clef" {
+            // Clef from a GGUF (ggml-org's conversions): the backbone and head
+            // in the file, the vision tower from its companion - the
+            // configured mmproj, else the one beside the GGUF, unless vision
+            // is switched off.
+            let companion = cfg.mmproj.clone().or_else(|| {
+                (cfg.vision != Some(false))
+                    .then(|| serving::clef_companion_beside(path))
+                    .flatten()
+            });
+            if let Some(c) = &companion {
+                tracing::info!(companion = %c.display(), "Clef vision companion");
+            }
+            let m = serving::load_clef(
+                cfg.served_model_name.clone().unwrap_or(id),
+                serving::ClefSource::Gguf {
+                    path: path.clone(),
+                    companion,
+                },
+                &cfg.device,
+                gpu_ordinal,
+                cfg.kernel_pack.as_deref(),
+                cfg.vram_budget.map(|mib| mib << 20),
+            )?;
+            tracing::info!(
+                model = %m.id,
+                weight_bytes = m.decider.info().weight_bytes,
+                workspace_bytes = m.decider.info().workspace_bytes,
+                "decision model ready"
+            );
+            clef = Some(m);
+        } else if let Some(dir) = serving::clef_dir(path) {
+            // A decision model (Clef): one joint sequence per request through
+            // a Qwen3.5 backbone and the joint schema head - /v1/systemone and
+            // nothing else. Its honest id is the directory's name.
+            let dir_id = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or(id);
+            let m = serving::load_clef(
+                cfg.served_model_name.clone().unwrap_or(dir_id),
+                serving::ClefSource::Dir(dir),
+                &cfg.device,
+                gpu_ordinal,
+                cfg.kernel_pack.as_deref(),
+                cfg.vram_budget.map(|mib| mib << 20),
+            )?;
+            tracing::info!(
+                model = %m.id,
+                weight_bytes = m.decider.info().weight_bytes,
+                workspace_bytes = m.decider.info().workspace_bytes,
+                "decision model ready"
+            );
+            clef = Some(m);
         } else if let Some(dir) = serving::laya_dir(path) {
             // A decision model (Laya): typed questions in, calibrated answers
             // out, /v1/systemone and nothing else. The bundle directory holds
@@ -832,7 +912,9 @@ pub async fn run(
         .or_else(|| embedder.as_ref().map(|e| Arc::clone(&e.metrics)))
         .or_else(|| asr.as_ref().map(|a| Arc::clone(&a.metrics)))
         .or_else(|| laya.as_ref().map(|m| m.decider.metrics()))
+        .or_else(|| clef.as_ref().map(|m| m.decider.metrics()))
         .or_else(|| tabular.as_ref().map(|m| m.service.metrics()))
+        .or_else(|| diarization.as_ref().map(|m| m.service.metrics()))
         .or_else(|| image.as_ref().map(|m| Arc::clone(&m.metrics)));
     let stats = crate::stats::start(engine_metrics.clone());
     // Held for the graceful-shutdown path below: on SIGINT/SIGTERM the engine
@@ -960,7 +1042,9 @@ pub async fn run(
         aligner,
         segmenter,
         laya,
+        clef,
         tabular,
+        diarization,
         image,
         max_ctx: cfg.max_ctx,
         vad_gate: cfg.vad_gate,

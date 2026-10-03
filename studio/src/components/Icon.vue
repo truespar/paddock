@@ -78,6 +78,7 @@ import {
   PhThermometerSimple,
   PhTrash,
   PhWarning,
+  PhWebcam,
   PhWrench,
   PhX,
 } from '@phosphor-icons/vue'
@@ -159,6 +160,7 @@ const MAP: Record<string, Component> = {
   activity: PhPulse,
   play: PhPlay,
   pause: PhPause,
+  webcam: PhWebcam,
   rewind: PhRewind,
   'fast-forward': PhFastForward,
   volume: PhSpeakerHigh,

@@ -9,6 +9,8 @@
 //! without flattening; mmproj companions and hidden dirs are skipped.
 
 pub mod bonsai;
+pub mod clef;
+pub mod diarization;
 pub mod dinov3;
 pub mod ggml_type;
 pub mod gguf;
@@ -20,6 +22,7 @@ pub mod kumo;
 pub mod kv_tier_geom;
 pub mod laya;
 pub mod mapped;
+pub mod meminfo;
 pub mod mlx;
 pub mod modelopt;
 pub mod nemotron;

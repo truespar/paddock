@@ -57,7 +57,10 @@ fs4 = "1.1"
 # GPU telemetry: in-process NVML binding (dynamically loads the driver's
 # management lib). Not nvidia-smi - no process is ever spawned. NVML runs in
 # exactly one process per box: this one (manager-runner doc §9).
-nvml-wrapper = "0.12"
+nvml-wrapper = "0.13"
+# its raw bindings, for the one call the wrapper does not expose
+# (nvmlDeviceGetAddressingMode - see nvml.rs); the same version it links
+nvml-wrapper-sys = "0.10"
 # fallback leg of the readiness probe: when we have shipped nothing, ask the OS
 # to load CUDA's libraries exactly the way the runner will
 # what a shipped CUDA runtime looks like on disk - the same manifest the engine

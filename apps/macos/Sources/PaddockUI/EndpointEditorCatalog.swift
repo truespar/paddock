@@ -85,6 +85,13 @@ extension EndpointEditor {
   }
   var isSplash: Bool { selectedArtifact?.format == "splash-packed-q4" }
   var checkpointLabel: String {
+    // A decision/table route does not imply a precision. Quantized Clef uses
+    // the same artifact label as Catalog, without enabling chat KV controls.
+    if capabilities.contains("decision") || capabilities.contains("tabular"),
+      let artifact = selectedArtifact, artifact.quant != nil
+    {
+      return artifact.shortFormat
+    }
     if capabilities.contains("tabular") { return "F32 checkpoint" }
     if capabilities.contains("decision") { return "F16 checkpoint" }
     return isSplash
