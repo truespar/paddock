@@ -179,10 +179,10 @@ struct StudioHistoryTests {
         let size = controller.sizeThatFits(in: CGSize(width: width, height: 650))
         #expect(size.width <= width + 1)
         #expect(size.height <= 650)
-        // Reads, Prompt library and Settings: three 34-point rows, two
+        // Reads, Tables, Prompt library and Settings: four 34-point rows, three
         // 3-point gaps and 22 points of vertical padding. The footer stays
         // outside the scrolling history and must not compress any row.
-        let footerHeight: CGFloat = 3 * 34 + 2 * 3 + 22
+        let footerHeight: CGFloat = 4 * 34 + 3 * 3 + 22
         let footer = NSHostingController(
           rootView: StudioSidebarFooter(navigation: .constant(WorkspaceNavigation()))
             .environment(\.colorScheme, dark ? .dark : .light))

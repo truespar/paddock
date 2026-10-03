@@ -119,7 +119,7 @@ struct NativeReadCameraPanel: View {
         Text("\(Int(result.elapsedMilliseconds)) ms").monospacedDigit().foregroundStyle(
           .secondary)
         if camera.rate > 0 {
-          Text(camera.rate, format: .number.precision(.fractionLength(1))) + Text("/s")
+          Text("\(camera.rate, format: .number.precision(.fractionLength(1)))/s")
         }
       }
     }.fixedSize()

@@ -118,9 +118,12 @@ class ReleaseTests(unittest.TestCase):
             self.assertIn("--timestamp", args)
             self.assertIn("runtime", args)
 
-    def test_minimal_microphone_entitlement(self):
+    def test_minimal_capture_entitlements(self):
         value = plistlib.loads(Path(__file__).with_name("App.entitlements").read_bytes())
-        self.assertEqual(value, {"com.apple.security.device.audio-input": True})
+        self.assertEqual(value, {
+            "com.apple.security.device.audio-input": True,
+            "com.apple.security.device.camera": True,
+        })
 
     def test_app_icon_is_the_packaged_icns(self):
         info = plistlib.loads(Path(__file__).with_name("Info.plist").read_bytes())
