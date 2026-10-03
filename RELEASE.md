@@ -1,91 +1,72 @@
-# Paddock 0.1.12
+# Paddock 0.1.13
 
-A tables release: Kumo Tabular, NVIDIA's model that predicts a missing
-column from labelled rows, runs natively on NVIDIA GPUs and on the Mac, with
-a Tables page in the Studio and the Mac app. Requests with many images or
-long audio use far less memory, Gemma 4 no longer fails on the DGX Spark and
-RTX 50-series cards with an f16 KV cache, and long Qwen 3.8 Flash-Next
-prompts prefill several times faster. Windows x64, Linux x64 and the NVIDIA
-DGX Spark. NVIDIA GPUs, driver 580 or newer. The macOS pre-release for Apple
-Silicon is built from the same commit.
+A decisions and speech release: Cloudflare's Clef and Clef Flash answer
+fixed questions about a text or a picture, NVIDIA's Nemotron 3 Diarization
+tells who spoke when, and Reads gains a Camera mode that asks your questions
+of the webcam live. The DGX Spark now reports its memory. Windows x64,
+Linux x64 and the NVIDIA DGX Spark. NVIDIA GPUs, driver 580 or newer. The
+macOS pre-release for Apple Silicon is built from the same commit.
 
 ## New
 
-- **Kumo Tabular.** Give it labelled rows and it predicts the missing column
-  of new ones - a class with its confidence, or a number with an 80% range -
-  with no training: the labelled rows are read in context on every call.
-  Small, medium and large, each for classification and for regression, in
-  the F32 weights NVIDIA ships, behind the same `/v1/tabular/predictions`
-  API on NVIDIA GPUs and on the Mac.
+- **Clef and Clef Flash** (Cloudflare). Decision models: give them a text, a
+  picture or both, and a set of yes/no, choice and score questions, and each
+  answer comes back with a calibrated probability, every option scored in one
+  pass. Clef Flash is built on a 9B model and Clef on a 27B one; both serve
+  in 8-bit with their own vision, on NVIDIA GPUs and on the Mac, behind the
+  same `/v1/systemone` call the Reads page uses. Clef Flash needs about 16 GB
+  of GPU memory, Clef about 37 GB.
 
-- **Tables in the Studio and the Mac app.** Paste or open a CSV, pick the
-  column to predict, and the rows with it empty come back filled in; copy
-  the result as CSV, or see the equivalent curl. Every table and its runs
-  are saved and shared between the web Studio and the Mac app, and each
-  table has its own link.
+- **Nemotron 3 Diarization** (NVIDIA). Who spoke when, for a recording or
+  live audio, on NVIDIA GPUs and on the Mac. The Studio shows a speaker
+  timeline beside the transcript, with each word attributed to its speaker,
+  and keeps it with the conversation.
+
+- **Camera mode in Reads.** Switch Reads to Camera and your questions are
+  asked of the webcam frame after frame. The answers ride on the picture as
+  large cards - yes in green, no in red, a choice in white, each with its
+  confidence - and a card flashes when its answer flips. Snapshot keeps a
+  frame and its answers in the read's history. In the web Studio and the Mac
+  app, with any reader that takes pictures.
 
 ## Improved
 
-- **Pictures cost far less memory.** The images in a prompt are encoded as
-  each prefill pass needs them, into memory the plan sets aside, instead of
-  all at once and held twice. On the DGX Spark an 18K-token prompt with a
-  picture peaks 1.3 GB above idle instead of 13.6 GB. This covers the Qwen
-  3.5-3.8 models, Gemma 4, Granite Vision and PaddleOCR-VL.
+- **The start form proposes the weights `paddock serve` would start**, and a
+  full-precision build is labelled "Full precision - no quantization" instead
+  of being offered as a smaller one.
 
-- **A Qwen prompt with pictures no longer pauses other conversations** while
-  its pictures are read: on the DGX Spark the longest pause another session
-  saw went from 15.4 s to 3.3 s.
+- **`paddock ps` names decision models** such as Laya and Clef instead of
+  showing "-".
 
-- **Long audio clips use a fixed amount of memory** in Qwen3-ASR and Granite
-  Speech, with the same transcript as before.
-
-- **Qwen 3.8 Flash-Next prefills long prompts much faster** on its NVFP4
-  versions - a 16.5K-token document question on the DGX Spark went from
-  85 s to under 15 s - keeps its prefix cache across agent sessions, and an
-  exact re-send of a long prompt resumes from its last walk instead of from
-  the start.
-
-- **An idle server hands the memory it freed back** instead of holding it
-  until the next request.
-
-- **Quieter logs.** A warning now means a client was held up or a real
-  fallback happened; long prompts and normal startup no longer warn.
+- **Models from Cloudflare show Cloudflare's logo.**
 
 ## Fixed
 
-- **A Qwen 3.8 server on the DGX Spark could run out of memory after about a
-  day:** startup set aside up to 20 GB it never used. Under memory pressure
-  the system now stops the runner, not the manager.
+- **The DGX Spark reports its memory.** The Studio said "No GPU" beside every
+  model on a Spark, and starting a model there was never checked against the
+  memory it needs. Both now read the Spark's unified memory.
 
-- **Gemma 4 with an f16 KV cache failed every request on the DGX Spark and
-  RTX 50-series cards.** It now serves there.
-
-- **A long Gemma 4 prompt with a picture could get a wrong answer** when the
-  picture fell across two prefill passes.
-
-- **Safetensors checkpoints start from the Studio.** The NVFP4 and FP8
-  versions of Qwen 3.8 Flash-Next, Nemotron and Granite were refused when
-  started from the Studio.
-
-- **Switching Vision off switches it off.** A vision file beside the model
-  is no longer loaded anyway, and saving the endpoint through the Advanced
-  tab keeps Vision off.
-
-- **The start form offers document and image features only to models that
-  chat.**
+- **A cloud model refuses a malformed output cap.** A `max_output_tokens`
+  that is not a whole number used to be forwarded, dropped or replaced
+  depending on the provider; it is now refused with a 400 before anything is
+  sent. Thanks to @DevChiniwala (#35).
 
 ## macOS (pre-release)
 
-- Kumo Tabular runs natively on Metal, with a native Tables workspace.
-- Qwen 3.8 Flash-Next decodes and prefills faster on Metal.
+- Clef and Clef Flash run natively on Metal, in 8-bit, with vision.
+- Reads has a native camera, with snapshots saved in the read's history.
+- Nemotron 3 Diarization runs on Metal, with speaker timelines in the app.
 
 ## Known
 
-- **Laya reads text only.**
+- **Clef reads text and pictures; videos are refused.**
 
-- **Laya's confidence on choices with more than ten options is not
-  calibrated:** the English checkpoint ships an out-of-range temperature for
-  that case, which Paddock clamps, as Laya's own server does.
+- **Nemotron 3 Diarization is qualified against NVIDIA's reference on the
+  pyannote and AMI test sets;** other recordings are not measured yet.
+
+- **Laya reads text only**, and its confidence on choices with more than ten
+  options is not calibrated: the English checkpoint ships an out-of-range
+  temperature for that case, which Paddock clamps, as Laya's own server does.
 
 - **Kumo Tabular predicts up to ten classes.**
 

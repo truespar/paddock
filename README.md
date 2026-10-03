@@ -31,7 +31,7 @@ and the Studio in one window and our Metal backend running the models. It lives 
 
 ## macOS support (pre-release)
 
-macOS support is available in [v0.1.12](https://github.com/truespar/paddock/releases/tag/v0.1.12)
+macOS support is available in [v0.1.13](https://github.com/truespar/paddock/releases/tag/v0.1.13)
 for Apple Silicon running **macOS 26 or later**. The native app is pre-release;
 expect visual glitches and incomplete features. The native Swift app is under
 active development and is not yet feature-complete.
