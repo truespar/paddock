@@ -1,68 +1,96 @@
-# Paddock 0.1.13
+# Paddock 0.1.14
 
-A decisions and speech release: Cloudflare's Clef and Clef Flash answer
-fixed questions about a text or a picture, NVIDIA's Nemotron 3 Diarization
-tells who spoke when, and Reads gains a Camera mode that asks your questions
-of the webcam live. The DGX Spark now reports its memory. Windows x64,
-Linux x64 and the NVIDIA DGX Spark. NVIDIA GPUs, driver 580 or newer. The
-macOS pre-release for Apple Silicon is built from the same commit.
+A new-models release: Aleph Alpha's Kolibri 1, Google's EmbeddingGemma 2,
+and Meta's SAM 3, which masks every instance of what you name in a picture
+or a live camera, with a Masks page in the Studio. Windows x64, Linux x64
+and the NVIDIA DGX Spark. NVIDIA GPUs, driver 580 or newer. The macOS
+pre-release for Apple Silicon is built from the same commit.
 
 ## New
 
-- **Clef and Clef Flash** (Cloudflare). Decision models: give them a text, a
-  picture or both, and a set of yes/no, choice and score questions, and each
-  answer comes back with a calibrated probability, every option scored in one
-  pass. Clef Flash is built on a 9B model and Clef on a 27B one; both serve
-  in 8-bit with their own vision, on NVIDIA GPUs and on the Mac, behind the
-  same `/v1/systemone` call the Reads page uses. Clef Flash needs about 16 GB
-  of GPU memory, Clef about 37 GB.
+- **Kolibri 1** (Aleph Alpha). A German-English mixture-of-experts model for
+  reasoning, retrieval and tool calling, with a 262K context. On NVIDIA GPUs
+  it serves a 4-bit GGUF on every card, with the NVFP4 checkpoint offered on
+  Blackwell; on the Mac a mixed 4/8-bit build. Plan for at least 64 GB of GPU
+  or unified memory.
 
-- **Nemotron 3 Diarization** (NVIDIA). Who spoke when, for a recording or
-  live audio, on NVIDIA GPUs and on the Mac. The Studio shows a speaker
-  timeline beside the transcript, with each word attributed to its speaker,
-  and keeps it with the conversation.
+- **EmbeddingGemma 2** (Google). Turns text, pictures and audio into vectors
+  in one shared space, so photos and recordings can be searched with words.
+  The text model is 0.3 GB; the picture tower (0.4 GB, on by default) and
+  the audio tower (0.6 GB, off by default) are switches on the start form,
+  and the download follows them. The Embeddings page takes pictures and
+  audio. On NVIDIA GPUs.
 
-- **Camera mode in Reads.** Switch Reads to Camera and your questions are
-  asked of the webcam frame after frame. The answers ride on the picture as
-  large cards - yes in green, no in red, a choice in white, each with its
-  confidence - and a card flashes when its answer flips. Snapshot keeps a
-  frame and its answers in the read's history. In the web Studio and the Mac
-  app, with any reader that takes pictures.
+- **SAM 3** (Meta). Name a thing - "person", "red car" - and it returns a
+  mask, box and score for every one in the picture; draw boxes to say what
+  to include or leave out, or click on a part of the picture to mask that
+  object. Asking again about the same picture only costs the new prompt.
+  Over the API, `/v1/masks` answers a picture and `/v1/masks/sessions`
+  follows objects from frame to frame. On NVIDIA GPUs.
+
+- **The Masks page.** Drop, paste or open a picture, or turn on the camera
+  and track up to four named things at once, each in its own colour, with
+  snapshots of the moments you keep. Every picture is kept in a side panel
+  like Tables and Reads, and exports as COCO JSON, cut-outs or mask PNGs.
+
+- **Gated downloads with your own Hugging Face token.** SAM 3's weights are
+  not redistributed: accept Meta's licence on its Hugging Face page and add
+  a token in Manager > Settings, and the download comes straight from
+  Hugging Face. A refused download now says so, instead of "the file is
+  gone".
 
 ## Improved
 
-- **The start form proposes the weights `paddock serve` would start**, and a
-  full-precision build is labelled "Full precision - no quantization" instead
-  of being offered as a smaller one.
+- **The context cache is 8-bit by default on most models**, so the same
+  memory holds about twice the context and long agent sessions run faster.
+  The OCR and speech models keep their 16-bit cache.
 
-- **`paddock ps` names decision models** such as Laya and Clef instead of
-  showing "-".
+- **A start that names no context window gets a long one sized to the
+  card.** Qwen 3.8 27B, Nemotron and Kolibri ask for 262K on NVIDIA GPUs and
+  fall back to the largest window that fits; a window you type is never
+  shrunk.
 
-- **Models from Cloudflare show Cloudflare's logo.**
+- **Nemotron answers faster on NVIDIA GPUs.** On Blackwell it defaults to
+  its NVFP4 weights with their speculative drafter, and each speculative
+  round does less work.
+
+- **Agent sessions resume instead of starting over** when the end of a
+  prompt is rewritten - the same document with another question - on
+  Nemotron, Qwen 3.5 to 3.8, Laguna and Kolibri.
+
+- **Models with sliding-window attention get the context they can hold.**
+  The memory estimate charged their window layers as if they kept growing,
+  so Gemma 4, gpt-oss, Laguna and Kolibri were offered a fraction of the
+  context that fits.
+
+- **Reads, Tables and Masks share one page layout**, and switching between
+  them no longer flashes the side panel.
 
 ## Fixed
 
-- **The DGX Spark reports its memory.** The Studio said "No GPU" beside every
-  model on a Spark, and starting a model there was never checked against the
-  memory it needs. Both now read the Spark's unified memory.
-
-- **A cloud model refuses a malformed output cap.** A `max_output_tokens`
-  that is not a whole number used to be forwarded, dropped or replaced
-  depending on the provider; it is now refused with a 400 before anything is
-  sent. Thanks to @DevChiniwala (#35).
+- **Shipped builds use the speed settings the engine picks for each card.**
+  Some of those choices were dropped in release builds, among them a faster
+  decode on the DGX Spark and a faster prompt read on Qwen 3.5 to 3.8.
 
 ## macOS (pre-release)
 
-- Clef and Clef Flash run natively on Metal, in 8-bit, with vision.
-- Reads has a native camera, with snapshots saved in the read's history.
-- Nemotron 3 Diarization runs on Metal, with speaker timelines in the app.
+- Kolibri 1 runs natively on Metal, in a mixed 4/8-bit build.
+- Qwen models in MLX format decode faster at small batch sizes, and their
+  speculative rounds cost less.
+- The settings pages share one layout.
+- Updates are checked against a pinned signing identity.
 
 ## Known
 
-- **Clef reads text and pictures; videos are refused.**
+- **SAM 3 runs on NVIDIA GPUs only**, and its weights download only with a
+  Hugging Face account that has accepted Meta's licence.
 
-- **Nemotron 3 Diarization is qualified against NVIDIA's reference on the
-  pyannote and AMI test sets;** other recordings are not measured yet.
+- **Kolibri 1 has no same-weights llama.cpp reference yet:** no llama.cpp
+  release reads it, so its correctness is checked against Aleph Alpha's own
+  serving code.
+
+- **EmbeddingGemma 2 takes audio clips of up to 30 seconds;** video is not
+  served yet.
 
 - **Laya reads text only**, and its confidence on choices with more than ten
   options is not calibrated: the English checkpoint ships an out-of-range

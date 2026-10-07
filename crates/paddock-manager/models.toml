@@ -9100,7 +9100,7 @@ revision = "2026-10-07"
   tradeoffs = [
     "Gated: accept Meta's licence on Hugging Face and use your own token to download",
     "Short noun phrases, not instructions - it finds things, it does not reason",
-    "CUDA only for now; video tracking and click prompts are still to come",
+    "CUDA only for now; a video session tracks up to four concepts at once",
   ]
 
   [[model.artifact]]
