@@ -38,7 +38,7 @@ import ToggleGroup from '@/components/ui/ToggleGroup.vue'
 import ToggleGroupItem from '@/components/ui/ToggleGroupItem.vue'
 import Tooltip from '@/components/ui/Tooltip.vue'
 import { uuid } from '@/lib/uuid'
-import { readsPreferencesApi } from '@/lib/api'
+import { usePanelFold } from '@/composables/usePanelFold'
 import { readExample } from '@/lib/reads-example'
 import QuestionRow from './QuestionRow.vue'
 import AnswersCard from './AnswersCard.vue'
@@ -1030,29 +1030,8 @@ async function removeRead(id: string): Promise<void> {
   }
 }
 
-// the side panel folds like the chat list; a narrow window starts folded
-const panelOpen = ref(window.innerWidth >= 1100)
-let panelEdited = false
-let restoringPanel = false
-onMounted(async () => {
-  try {
-    const saved = await readsPreferencesApi.get()
-    if (!panelEdited && typeof saved.readsPanelOpen === 'boolean') {
-      restoringPanel = true
-      panelOpen.value = saved.readsPanelOpen
-    }
-  } catch (e) {
-    toasts.push({ tone: 'bad', title: 'Layout could not be loaded', description: String(e) })
-  } finally { restoringPanel = false }
-})
-let panelSave: Promise<unknown> = Promise.resolve()
-watch(panelOpen, (v) => {
-  if (restoringPanel) return
-  panelEdited = true
-  panelSave = panelSave.catch(() => {}).then(() => readsPreferencesApi.save(v)).catch((e) => {
-    toasts.push({ tone: 'bad', title: 'Layout was not saved', description: String(e) })
-  })
-}, { flush: 'sync' })
+// the side panel folds like the chat list, as it was left
+const panelOpen = usePanelFold('readsPanelOpen')
 
 // ── API pane ───────────────────────────────────────────────────────────────
 const copied = ref(false)
@@ -1678,7 +1657,7 @@ async function copyCurl(): Promise<void> {
    question row's type, id, answer chip and menu. */
 @container (min-width: 1100px) {
   .rd__inner {
-    max-width: 1400px;
+    max-width: var(--pk-panel-width-wide);
   }
   .rd__cols {
     display: grid;

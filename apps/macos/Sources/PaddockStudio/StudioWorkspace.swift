@@ -107,6 +107,7 @@ public final class StudioWorkspace: NSObject {
   @ObservationIgnored private let client: any ManagerLoading
   @ObservationIgnored private var host: StudioHost?
   @ObservationIgnored private var startTask: Task<Void, Never>?
+  @ObservationIgnored private let presentationDecoder = StudioPresentationDecoder()
   @ObservationIgnored private var uploads: [String: Task<Void, Never>] = [:]
   @ObservationIgnored private var network = URLSession(
     configuration: .ephemeral, delegate: NoRedirects(), delegateQueue: nil)
@@ -133,11 +134,14 @@ public final class StudioWorkspace: NSObject {
     startTask = nil
   }
   private func boot(assets: URL?) async {
+    guard !closed, !Task.isCancelled else { return }
     restoring = true
     defer { restoring = false }
     do {
       if runtime == nil {
         let value = try await client.nativeConversationHost()
+        try Task.checkCancellation()
+        guard !closed else { return }
         guard Self.validHost(value) else { throw ManagerError.core("Invalid private native host") }
         host = value
         let transport = try NativeConversationTransport(host: value)
@@ -164,6 +168,8 @@ public final class StudioWorkspace: NSObject {
       } else {
         _ = try await runtime?.command("refresh")
       }
+      try Task.checkCancellation()
+      guard !closed else { return }
       guard state != nil else {
         throw ManagerError.core(error ?? "The native Studio could not restore its presentation")
       }
@@ -172,15 +178,17 @@ public final class StudioWorkspace: NSObject {
       NSLog(
         "Paddock native Studio ready: %d model choices; hidden web workspace: none",
         state?.models.count ?? 0)
-    } catch { self.error = error.localizedDescription }
+    } catch {
+      if !closed, !Task.isCancelled { self.error = error.localizedDescription }
+    }
   }
   private func receiveNative(_ fields: [String: ConversationValue]) async {
+    guard !closed else { return }
     do {
-      let value = try await Task.detached(priority: .userInitiated) {
-        try JSONDecoder().decode(StudioState.self, from: JSONEncoder().encode(fields))
-      }.value
+      let value = try await presentationDecoder.decode(fields)
       apply(value)
     } catch {
+      guard !closed, !(error is CancellationError) else { return }
       self.error = "Invalid native presentation: \(error)"
       NSLog("Paddock native presentation failed: %@", String(describing: error))
     }
@@ -202,6 +210,7 @@ public final class StudioWorkspace: NSObject {
     _ = await (document, graph)
   }
   private func prepareGraph(_ fields: [String: ConversationValue]) async throws -> String {
+    guard !closed, !Task.isCancelled else { throw CancellationError() }
     preparingGraph = true
     defer { preparingGraph = false }
     let viewer = viewer(for: .graph)
@@ -218,7 +227,7 @@ public final class StudioWorkspace: NSObject {
     return url.scheme == origin.scheme && url.host == origin.host && url.port == origin.port
   }
   func apply(_ value: StudioState) {
-    guard value.version == 1, value.revision > receivedRevision else { return }
+    guard !closed, value.version == 1, value.revision > receivedRevision else { return }
     receivedRevision = value.revision
     if value.conversation?.id != state?.conversation?.id {
       if state?.conversation?.id != nil { closeViewers() }
@@ -696,6 +705,14 @@ public final class StudioWorkspace: NSObject {
     return (try await Task.detached { try Data(contentsOf: file) }.value, http)
   }
   public func shutdown() async {
+    // Close admission before the first suspension. A host request may ignore
+    // cancellation; boot and presentation delivery also check this terminal flag.
+    guard !closed else { return }
+    closed = true
+    ready = false
+    restoring = false
+    startTask?.cancel()
+    await presentationDecoder.close()
     audioPlayback.reset()
     audioMedia.reset()
     documentMedia.reset()
@@ -708,12 +725,18 @@ public final class StudioWorkspace: NSObject {
     await microphone?.cancel()
     microphone = nil
     await runtime?.close()
+    await startTask?.value
+    startTask = nil
     runtime = nil
     nativeTransport = nil
-    closed = true
-    ready = false
     network.invalidateAndCancel()
     closeViewers()
+  }
+  public func reclaimCaches() async {
+    audioMedia.reclaim()
+    documentMedia.reclaim()
+    await presentationDecoder.reclaim()
+    await runtime?.reclaimPresentationCaches()
   }
   private func describe(_ error: any Error) -> String { error.localizedDescription }
 }

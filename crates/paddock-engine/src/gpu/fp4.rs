@@ -2867,6 +2867,88 @@ impl GpuExecutor {
             .kernels
             .nvf4_moe_down_bs
             .ok_or(GpuError::MissingOp("nvf4_moe_down_bs"))?;
+        self.nvf4_moe_down_bs_with(
+            f,
+            w,
+            sorted_row,
+            sorted_slot,
+            block_expert,
+            topk_w,
+            fq,
+            fs,
+            part,
+            kw,
+            np,
+            slot_off,
+            nb,
+            tok_off,
+        )
+    }
+
+    /// The bf16-partials twin of [`Self::nvf4_moe_down_bs_at`] (slot 758):
+    /// `part` holds `rows * np * embd` bf16 in the f32 plane's bytes (half
+    /// of it), for [`Self::moe_slot_combine_bf16`] to fold onto a residual.
+    #[allow(clippy::too_many_arguments)]
+    pub fn nvf4_moe_down_bs_b16_at(
+        &self,
+        w: &Nvf4MoePlane,
+        sorted_row: &CudaSlice<u32>,
+        sorted_slot: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        topk_w: Option<&CudaSlice<f32>>,
+        fq: &CudaSlice<u8>,
+        fs: &CudaSlice<u8>,
+        part: &mut CudaSlice<f32>,
+        kw: usize,
+        np: usize,
+        slot_off: usize,
+        nb: usize,
+        tok_off: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .nvf4_moe_down_bs_b16
+            .ok_or(GpuError::MissingOp("nvf4_moe_down_bs_b16"))?;
+        self.nvf4_moe_down_bs_with(
+            f,
+            w,
+            sorted_row,
+            sorted_slot,
+            block_expert,
+            topk_w,
+            fq,
+            fs,
+            part,
+            kw,
+            np,
+            slot_off,
+            nb,
+            tok_off,
+        )
+    }
+
+    pub fn has_nvf4_moe_down_bs_b16(&self) -> bool {
+        self.kernels.nvf4_moe_down_bs_b16.is_some()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn nvf4_moe_down_bs_with(
+        &self,
+        f: paddock_kernels::abi::Nvf4MoeDownBsFn,
+        w: &Nvf4MoePlane,
+        sorted_row: &CudaSlice<u32>,
+        sorted_slot: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        topk_w: Option<&CudaSlice<f32>>,
+        fq: &CudaSlice<u8>,
+        fs: &CudaSlice<u8>,
+        part: &mut CudaSlice<f32>,
+        kw: usize,
+        np: usize,
+        slot_off: usize,
+        nb: usize,
+        tok_off: usize,
+    ) -> Result<(), GpuError> {
         Self::moe_layout_ok(w, Nvf4MoeLayout::Row, "nvf4_moe_down_bs")?;
         debug_assert!(sorted_row.len() >= nb * 32);
         debug_assert!(sorted_slot.len() >= nb * 32);

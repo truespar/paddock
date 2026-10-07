@@ -32,6 +32,8 @@ pub mod image;
 pub mod kv_plan;
 pub mod kv_pool;
 pub mod kv_tier;
+#[cfg(feature = "cuda")]
+pub mod masks;
 pub mod metrics;
 pub mod pacing;
 pub mod paged_radix;

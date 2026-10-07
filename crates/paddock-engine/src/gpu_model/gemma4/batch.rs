@@ -557,7 +557,7 @@ pub(super) fn attn_fmha16_arm(
     dtype: crate::gpu::KvDtype,
 ) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_ATTN_FMHA16").is_some())
+    *ON.get_or_init(|| std::env::var_os("PADDOCK_ATTN_FMHA16").is_some())
         && exec.has_attn_decode_fmha16()
         && dtype == crate::gpu::KvDtype::Fp8E4m3
         && hd == 128
@@ -6516,7 +6516,7 @@ pub(super) fn g4_moe_tail(
         && hp.n_embd.is_multiple_of(128)
         && exec.has_moe_head_xg()
         && exec.has_q8_moe_mma2g()
-        && paddock_models::dev_var!("PADDOCK_HIBATCH_XG")
+        && std::env::var("PADDOCK_HIBATCH_XG")
             .ok()
             .is_some_and(|v| v != "0");
     // P1-1 bf16-partials lane (PADDOCK_HIBATCH_PARTBF16, r>=thresh): runtime
@@ -6526,7 +6526,7 @@ pub(super) fn g4_moe_tail(
         && tail_fold  // combine_init fallback reads f32 part - never mix
         && exec.has_q8_moe_down_pbf16()
         && exec.has_moe_tail_combine_bf16()
-        && paddock_models::dev_var!("PADDOCK_HIBATCH_PARTBF16").ok().is_some_and(|v| v != "0");
+        && std::env::var("PADDOCK_HIBATCH_PARTBF16").ok().is_some_and(|v| v != "0");
     // dn64: per-64 Y-scale pair - the mma2g y64 producer
     // and fs64 down consumer flip together (fs encoding coherence within
     // the tick; fs_is_64 is set only when the y64 gu actually ran, so the
@@ -7121,7 +7121,7 @@ pub(super) fn g4_moe_tail(
                     && ff % 64 == 0
                     && exec.has_q8_moe_g2()
                     && paddock_models::dev_var_os!("PADDOCK_NO_MOE_QMMA2").is_none()
-                    && paddock_models::dev_var!("PADDOCK_MOE_G2")
+                    && std::env::var("PADDOCK_MOE_G2")
                         .ok()
                         .is_some_and(|v| v != "0");
                 let g2_mb16 = (r * k + hp.n_expert * 15).div_ceil(16);

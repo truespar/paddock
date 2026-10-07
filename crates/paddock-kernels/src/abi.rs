@@ -7658,7 +7658,1260 @@ pub struct KernelTableV1 {
     /// Slot 742: `pd_clef_lex_mean_q8` - slot 726's lexical mean over Q8_0
     /// table rows as stored (the GGUF's output embedding).
     pub clef_lex_mean_q8: Option<ClefLexMeanFn>,
+    /// Slot 743: `pd_q8_0_moe_up_relu2_mma` - `q8_0_moe_gate_up_mma`'s
+    /// single-plane relu(up)^2 twin (nemotron_h_moe's routed experts, and its
+    /// shared expert as a one-expert sorted MoE): same sorted layout and
+    /// fq/fs handshake, bitwise vs the dp4a `q8_0_moe_up_relu2_sorted` +
+    /// `quantize_q8` pair it replaces. in_dim % 32 == 0, ff % 32 == 0.
+    pub q8_0_moe_up_relu2_mma: Option<Q8MoeUpRelu2MmaFn>,
+    /// Slot 744: `pd_attn_rows_partial_pow2` - slot 683's per-row fixed-split
+    /// law with the split SIZE a pure function of the row's key count n:
+    /// max(256, next_pow2(ceil(n / n_splits))), so a shallow context fills
+    /// the die while a decode row and the verify row at its position still
+    /// attend bit for bit alike. n_splits is the budget and the launched
+    /// count; callers keep each group inside one size bucket.
+    pub attn_rows_partial_pow2: Option<AttnRowsPartialFn>,
+    /// Slot 745: `pd_attn_rows_partial_kh` - the rows partial with every
+    /// row's keys split across two warps (each its own online softmax over
+    /// half of every 32-key tile, folded in f32 at the split's end): the
+    /// one-warp kernel's split-f16 class and split laws (683's fixed or
+    /// 744's pow2 via `split_keys`), a different fixed fold, still a row's
+    /// own law. e4m3 paged pools only, <= 6 rows a group; `max_rows` sizes
+    /// the block (64 threads a row).
+    pub attn_rows_partial_kh: Option<AttnRowsPartialKhFn>,
+    /// Slot 746: `pd_mamba2_scan_seq_keep_f16` - slot 444's verify walk
+    /// without per-row snapshots: `state` is read and left as it was (the
+    /// pre-round state until the commit), y as 444's, and each row's x | B |
+    /// raw dt lands in `keep` [n_tokens, H*hd + G*S + H] f32 for the replay.
+    pub mamba2_scan_seq_keep_f16: Option<Mamba2ScanSeqKeepF16Fn>,
+    /// Slot 747: `pd_mamba2_rescan_f16` - replays kept rows (746) from a
+    /// state in one launch, one descriptor of six u64 words {src, dst, keep,
+    /// A, dt_bias, rows} a replay: dst ends where 444's snap row `rows - 1`
+    /// would, bit for bit; src == dst replays in place.
+    pub mamba2_rescan_f16: Option<Mamba2RescanF16Fn>,
+    /// Slot 748: `pd_moe_topk_logit_sigmoid_batch` - Kolibri 1's router:
+    /// top-k SELECTED on the raw logits + `exp_probs_b`, weighted by
+    /// sigmoid(selected raw logit) * routed_scale, never renormalized (the
+    /// Laguna router `moe_topk_sigmoid_batch` selects on sigmoid + bias). Up
+    /// to 512 experts, k <= 16; same arguments as `moe_topk_sigmoid_batch`.
+    pub moe_topk_logit_sigmoid_batch: Option<MoeTopkSigmoidBatchFn>,
+    /// Slot 749: `pd_kquant_moe_down_mma_b16` - `kquant_moe_down_mma` with
+    /// each weighted (token, slot) partial rounded to bf16 at the store, so
+    /// `part` holds rows * n_active * embd bf16 (half the f32 plane's bytes);
+    /// `moe_slot_combine_bf16` folds it in f32, fixed slot order.
+    pub kquant_moe_down_mma_b16: Option<KquantMoeDownMmaFn>,
+    /// Slot 750: `pd_kquant_gemm_w4a8_pipe3` - the Q4_K prefill tile with its
+    /// activation tile double-buffered on the cp.async ring (pipe2 loads it
+    /// synchronously in front of every half's barrier); byte-identical to
+    /// `kquant_gemm_w4a8_pipe2`, which it hands every other type to. Same
+    /// arguments as pipe2.
+    pub kquant_gemm_w4a8_pipe3: Option<KquantGemmW4a8Fn>,
+    /// Slot 751: `pd_sam3_patch_rows` - u8 RGB pictures at side x side ->
+    /// SAM 3's patch GEMM rows, f16, in WINDOW-MAJOR row order (window r / 576,
+    /// cell r % 576), normalized as torchvision does it - (u8 * f32(1/255) -
+    /// 0.5) / 0.5, each step rounded - and K zero-padded to kp.
+    /// (pixels, out, pics, side, patch, win, ch, kp, stream).
+    pub sam3_patch_rows: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 752: `pd_sam3_qkv_split_rope_h` - slot 621 with k's bias and the
+    /// rope on every row, row t of a chip_rows-row cos/sin table [.][hd/2];
+    /// q scaled by qscale before its round. (qkv, bq, bk, bv, cos, sin, q, k,
+    /// v, d, hd, rows, chip_rows, qscale, stream).
+    pub sam3_qkv_split_rope_h: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 753: `pd_sam3_rows_to_raster_h` - window-major f32 rows -> raster
+    /// f16 rows (row = y * g + x), SAM 3's trunk exit to its necks.
+    /// (x, out, pics, g, win, d, stream).
+    pub sam3_rows_to_raster_h: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 754: `pd_sam3_convt2_bias_h` - a 2x2 / stride-2 transposed conv's
+    /// depth-to-space off its GEMM's f32 landing [pics][h*w][4*C] (tap-major
+    /// rows) + bias, erf GELU when `gelu` != 0, f16 raster out [pics][2h][2w][C].
+    /// (g, bias, out, pics, h, w, C, gelu, stream).
+    pub sam3_convt2_bias_h: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 755: `pd_f16_gemm_h_gelu_tanh` - slot 624 with the tanh-approximate
+    /// GELU (SAM 3's ViT fc1, cuBLASLt's GELU epilogue in Meta's inference).
+    /// (w, x, y, bias, in_dim, out_dim, batch, stream).
+    pub f16_gemm_h_gelu_tanh: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 756: `pd_bf16_gemm_pf` - the bf16 GEMM at prefill widths, with
+    /// `bf16_gemm_mma`'s arguments except that `x` is the rows already
+    /// narrowed to bf16 (`convert_f32_bf16`): both operands ride the cp.async
+    /// ring and the grid walks batch tiles fastest in ~8 MB groups, so a
+    /// plane past L2 streams once a group. Bit-identical to the unsplit
+    /// plain tile; -2 on a ragged in_dim.
+    pub bf16_gemm_pf: Option<Bf16GemmF32Fn>,
+    /// Slot 757: `pd_bf16_qkv_gemm_pf` - the fused q|k|v twin of slot 756,
+    /// `bf16_qkv_gemm_mma`'s arguments with `x` as bf16 rows.
+    pub bf16_qkv_gemm_pf: Option<Bf16QkvGemmFn>,
+    /// Slot 758: `pd_nvf4_moe_down_bs_b16` - `nvf4_moe_down_bs` with each
+    /// weighted (token, slot) partial rounded to bf16 at the store, so `part`
+    /// holds rows * np * embd bf16 (half the f32 plane);
+    /// `moe_slot_combine_bf16` folds it in f32, fixed slot order, onto the
+    /// residual it is handed. Packed-fp4 tensor-core dies only (rc 801
+    /// elsewhere - the caller keeps the f32 entry).
+    pub nvf4_moe_down_bs_b16: Option<Nvf4MoeDownBsFn>,
+    /// Slot 759: `pd_sam3_text_attn_h` - causal self-attention over SAM 3's
+    /// 32-token CLIP prompts: f16 planes [prompts][T][H][hd] (q pre-scaled),
+    /// one block a (prompt, head), f32 softmax in key order. T <= 64, hd <= 64.
+    /// (q, k, v, out, prompts, T, H, hd, stream).
+    pub sam3_text_attn_h: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 760: `pd_sam3_seam_h` - every detector residual seam: x (+ proj + bias), pre/post LayerNorm or none, f16 out and f16 out + pos[row % period] (none past npos).
+    /// (x, proj, bias, w, b, pos, out, outq, rows, n, period, npos, eps, flags, stream).
+    pub sam3_seam_h: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            f32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 761: `pd_sam3_box_attn_h` - the decoder's image cross-attention with the factorized box bias by[q][y][h] + bx[q][x][h] on its scores; rows past nbias unbiased.
+    /// (q, k, v, bx, by, out, nq, nk, H, hd, gh, gw, nbias, stream).
+    pub sam3_box_attn_h: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 762: `pd_sam3_rpb_tables` - the two box-bias tables (log mode) for the reference boxes, f32.
+    /// (ref, w1x, b1x, w2x, b2x, w1y, b1y, w2y, b2y, tx, ty, nq, gh, gw, hid, H, stream).
+    pub sam3_rpb_tables: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 763: `pd_sam3_box_sine` - sine embeddings of boxes, f16: mode 0 the decoder query position [y|x|w|h], mode 1 the geometry box encoding [y|x|h|w raw].
+    /// (boxes, out, n, npf, mode, ld, temperature, stream).
+    pub sam3_box_sine: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 764: `pd_sam3_box_refine` - ref = sigmoid(delta + bias + inverse_sigmoid(ref)) in place, Meta's inverse sigmoid (eps 1e-3).
+    /// (ref, delta, bias, n, ld, stream).
+    pub sam3_box_refine: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 765: `pd_sam3_roi_align` - torchvision roi_align, aligned=False, adaptive sampling, NHWC f32 in, [n][C][p][p] f16 out.
+    /// (feat, boxes, out, n, H, W, C, pooled, stream).
+    pub sam3_roi_align: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 766: `pd_sam3_gn_relu_f16` - slot 613 with ReLU in place of GELU.
+    /// (x, xb, w, b, out, part, stat, chips, P, C, G, eps, stream).
+    pub sam3_gn_relu_f16: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 767: `pd_sam3_up2_add_h` - the pixel decoder seam: f16(skip + nearest x2 (prev)).
+    /// (prev, skip, out, pics, h, w, C, stream).
+    pub sam3_up2_add_h: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 768: `pd_sam3_score` - the dot-product scorer's clamp(scale * hp . pp) and sigmoid(logit) * sigmoid(presence).
+    /// (hp, pp, presence, logit, prob, nq, d, scale, clamp, stream).
+    pub sam3_score: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            f32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 769: `pd_f16_gemm_h_bias` - the f16 landing with an optional bias added before its round.
+    /// (w, x, y, bias, in_dim, out_dim, batch, stream).
+    pub f16_gemm_h_bias: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 770: `pd_sam3_resize_aa_u8` - torchvision's antialiased bilinear resize of a u8 HWC
+    /// picture, to the bit (f32, torch's weights and walk, round half to even). (src, dst, H, W,
+    /// OH, OW, C, stream).
+    pub sam3_resize_aa_u8: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 771: `pd_sam3_mask_up` - query q's 288^2 mask logits bilinear to the picture, sigmoid >
+    /// 0.5, u8 0/1 column-major [W][H]. (logits, out, side, nq, q, H, W, stream).
+    pub sam3_mask_up: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 772: `pd_sam3_rle` - COCO RLE of a column-major 0/1 mask: zeros first, alternating run
+    /// lengths; nruns 0xffffffff past cap. (mask, starts, counts, nruns, n, cap, stream).
+    pub sam3_rle: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u64,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 773: `pd_bf16_qkv_gemv_mr` - q|k|v off the load-time-fused plane
+    /// in one decode-band (2..=8 rows) multi-row GEMV launch, each output row
+    /// routed to its segment plane; per row the plain `bf16_gemv_mr_f32`
+    /// arithmetic. `bf16_qkv_gemm_mma`'s arguments; -2 outside the band.
+    pub bf16_qkv_gemv_mr: Option<Bf16QkvGemmFn>,
+    /// Slot 774: `pd_sam3_box_attn_mma` - slot 761 on the tensor cores: the keys split across
+    /// `nsplit` runs of grid-row pairs and folded in order; `part` is `[nsplit][nq][H][hd + 2]`
+    /// f32 scratch, unread at nsplit 1. hd 32 and gw 72 only (SAM 3's detector).
+    /// (q, k, v, bx, by, part, out, nq, H, hd, gh, gw, nbias, nsplit, stream).
+    pub sam3_box_attn_mma: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 775: `pd_f16_conv3_gemm` - a 3x3 / stride 1 / pad 1 convolution as one GEMM with the
+    /// im2row gathered in the stage: bit-identical to `pd_dp_im2row3` + `pd_f16_gemm` on cc 8.6.
+    /// `src` f16 `[chips][src_chip_rows][C]`, `w` `[out_dim][9 C]` tap-major, `y` f32
+    /// `[chips * H * W][out_dim]`, `bias` f32 `[out_dim]` or null. C % 8 == 0.
+    /// (w, src, y, bias, chips, H, W, C, out_dim, src_chip_rows, stream).
+    pub f16_conv3_gemm: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 776: `pd_f16_gemm_qkv_rope` - the q|k|v projection landed as the three half planes
+    /// the attention eats: the three biases, the rotate-half rope on q and k from
+    /// `[chip_rows][hd / 2]` tables (null = none) and q's scale - the split kernel's (slot 752)
+    /// arithmetic on the f32 accumulator. hd 64, d % 128 == 0.
+    /// (w, x, q, k, v, bias, cs, sn, in_dim, d, hd, batch, chip_rows, qscale, stream).
+    pub f16_gemm_qkv_rope: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 777: `pd_rmsnorm_add_scale_norm` - a sandwich block's post-norm
+    /// (`x += rmsnorm(proj) * w_post * s`) fused with the next norm
+    /// (`xn = rmsnorm(x) * w_pre`), with an optional bf16 copy of xn (the
+    /// prefill pair's input) and an optional f32 xn: (x, proj, w_post,
+    /// w_pre, xn, x16, n, eps, s, rows, stream). Bit-identical to
+    /// `rmsnorm_add_scale` + `rmsnorm_batch` (+ `convert_f32_bf16`); -2
+    /// outside rows >= 256 with n % 4 and aligned planes.
+    pub rmsnorm_add_scale_norm: Option<RmsnormAddScaleNormFn>,
+    /// Slot 778: `pd_sam3_point_pe` - random-Fourier point features (`[sin, cos]` of `2pi((2xy-1) G)`) plus the label's embedding:
+    /// -1 padding (replaced by not_a_point), 0..3 point_embed added, `labels` null the plain pe.
+    /// (xy, labels, g, emb, nap, out, n, nf, stream).
+    pub sam3_point_pe: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 779: `pd_sam3_mask_down` - one stage of the mask prompt's downscaling: Conv2d k2 s2 -> LayerNorm2d -> GELU(erf), the
+    /// input a column of a channel-last plane (clamped when clamp > 0).
+    /// (in, w, b, lw, lb, out, H, W, cin, cout, in_stride, in_off, clamp, eps, out16, stream).
+    pub sam3_mask_down: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            f32,
+            f32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 780: `pd_sam3_up_skip` - the mask decoder's upscaling seam: convT 2x2/s2 depth-to-space (754's layout) + bias + skip,
+    /// then LayerNorm2d when `lw` is given, then GELU(erf); f16 or f32 out.
+    /// (g, bias, skip, lw, lb, out, h, w, C, eps, out16, stream).
+    pub sam3_up_skip: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            f32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 781: `pd_sam3_mlp3_rows` - a 3-layer MLP (Linear, ReLU, Linear, ReLU, Linear, optional sigmoid) a row, row r reading its
+    /// weights at r * stride; f32 out and optionally f16.
+    /// (x, w1, b1, w2, b2, w3, b3, out, out16, rows, in, hid, od, ws1, ws2, ws3, wsb, wsb3, sig, stream).
+    pub sam3_mlp3_rows: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 782: `pd_sam3_mask_stats` - the single-mask stability count: `counts[0]` = #(v > delta), `counts[1]` = #(v > -delta) over
+    /// column k of a `[px][nm]` logits plane. (m, counts, px, nm, k, delta, stream).
+    pub sam3_mask_stats: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 783: `pd_sam3_fill_holes` - Meta's hole fill: 8-connected background components (logit <= 0) of at most `max_area` pixels
+    /// in column k of a side^2 `[px][nm]` plane become logit 10, in place; `lab` / `area` u32
+    /// scratch of side^2. (m, lab, area, side, nm, k, max_area, stream).
+    pub sam3_fill_holes: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 784: `pd_sam3_mem_down3` - one small stage of SAM 3's memory-encoder mask downsampler,
+    /// Conv2d(k3, s2, p1) -> LayerNorm2d -> GELU(erf), for `nb` objects. mode 0 reads a channel-last
+    /// f32 `[nb][H][W][cin]` plane; modes 1 / 2 read the objects' `[nb][sh][sw]` logits (sigmoid /
+    /// binarized, then * 20 - 10, bilinear to H x W). Out `[nb][H/2][W/2][cout]` f32 or f16; cout 4
+    /// or 16. (in, w, b, lw, lb, out, nb, H, W, cin, cout, mode, sh, sw, eps, out16, stream).
+    pub sam3_mem_down3: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            f32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 785: `pd_f16_conv3s2_gemm` - slot 775's implicit 3x3 conv at stride 2: H x W is the
+    /// OUTPUT grid of a 2H x 2W source (`src_chip_rows >= 4 H W`). Same arguments as 775.
+    pub f16_conv3s2_gemm: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 786: `pd_sam3_dwconv7_ln_h` - depthwise Conv2d(k7, p3) + bias -> LayerNorm2d over
+    /// `[nb][H][W][C]` f32, f16 out; `w` tap-major `[49][C]`. C a multiple of 32, <= 1024.
+    /// (in, w, b, lw, lb, out, nb, H, W, C, eps, stream).
+    pub sam3_dwconv7_ln_h: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 787: `pd_sam3_ln_gelu_h` - LayerNorm2d -> GELU(erf) over `[rows][n]` f32, f16 out; n a
+    /// multiple of 32, <= 1024. (in, lw, lb, out, rows, n, eps, stream).
+    pub sam3_ln_gelu_h: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 788: `pd_sam3_rope_rows_h` - f32 rows `[rows][in_stride]` from column `in_off`, `d`
+    /// wide, to f16 `[rows][d]`: rotate-half rope (pairs j, j + d/2) on the first `nrope` rows of
+    /// each `group`, table row `(r % group) % period` of `[period][d/2]` cs / sn, then `* scale`.
+    /// cs null = a plain convert. (in, out, cs, sn, rows, in_stride, in_off, d, group, nrope,
+    /// period, scale, stream).
+    pub sam3_rope_rows_h: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 789: `pd_sam3_mem_attn_h` - one-head attention for `ngroups` groups: q
+    /// `[g][nq][256]` f16 pre-scaled, k `[g][nk][256]`, v rows of `dv` (64 or 128) at stride
+    /// `ldv`, out rows of `dv` at stride `ldo`. (q, k, v, out, nq, nk, ngroups, dv, ldv, ldo,
+    /// stream).
+    pub sam3_mem_attn_h: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 790: `pd_sam3_bank_mem_rows` - one memory frame's bf16 rows `[rows][64]` to the
+    /// memory attention's f16 key input `m + (pos + tpos)` (`pos` f32 `[rows][64]`, `tpos` f32
+    /// `[64]`) and value `m`. (mem, pos, tpos, kin, v, rows, stream).
+    pub sam3_bank_mem_rows: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 791: `pd_sam3_bank_ptr_rows` - `np` object pointers (f32 `[*][256]` pool rows
+    /// `meta[0..np]`, distances `meta[np..2np]`) to 4 f16 tokens of 64 each: the value, and the
+    /// key input with `Linear(256 -> 64)` (`w` `[64][256]`, `b`) over the 1-D sine of
+    /// `distance / tmax` added. (pool, meta, w, b, kin, v, np, tmax, stream).
+    pub sam3_bank_ptr_rows: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 792: `pd_sam3_mask_bits` - n f32 planes (`stride` apart) as bitplanes `[n][ceil(px/32)]` (> 0) and their areas. (planes, bits, area, stride, n, px, stream).
+    pub sam3_mask_bits: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u64,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 793: `pd_sam3_mask_pairs` - the pairwise intersections `[na][nb]` of two bitplane sets. (a, b, inter, words, na, nb, stream).
+    pub sam3_mask_pairs: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 794: `pd_sam3_mask_clean` - Meta's `fill_holes_in_mask_scores` on n planes: 8-connected background components of at most `max_area` take `hole_val`, then foreground ones of at most `min(fg / 2, max_area)` take `sprinkle_val`. (planes, lab, area, tot, stride, side, n, max_area, hole_val, sprinkle_val, stream).
+    pub sam3_mask_clean: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u64,
+            u32,
+            u32,
+            u32,
+            f32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 795: `pd_sam3_mask_set` - a plane of `n` floats set to `val` (mode 0) or clamped to at most `val` (mode 1). (plane, n, val, mode, stream).
+    pub sam3_mask_set: Option<
+        unsafe extern "C" fn(*mut core::ffi::c_void, u64, f32, u32, *mut core::ffi::c_void) -> i32,
+    >,
+    /// Slot 796: `pd_sam3_mask_up2` - slot 771's bilinear mask upsample with a threshold mode: 0 sigmoid > 0.5, 1 logit > 0 (Meta's video outputs). (logits, out, side, nq, q, H, W, mode, stream).
+    pub sam3_mask_up2: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 797: `pd_sam3_mask_owner` - one owner a pixel over n u8 masks: the highest-scoring covering mask (the first on a tie) keeps it, when its score is positive. (masks, scores, n, px, stream).
+    pub sam3_mask_owner: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 798: `pd_sam3_mask_boxes` - each column-major u8 mask's `{x0, y0, x1, y1, area}` (extremes inclusive). (masks, out, n, H, W, stream).
+    pub sam3_mask_boxes: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 799: `pd_sam3_pil_coeffs` - Pillow's bilinear taps for one axis: bounds `[out][2]`, fixed-point weights `[out][ksize]`. (bounds, kk, in_size, out_size, ksize, stream).
+    pub sam3_pil_coeffs: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 800: `pd_sam3_pil_pass` - one Pillow resample pass over a u8 HWC picture, axis 0 horizontal, 1 vertical. (src, dst, bounds, kk, rows, in_size, out_size, ch, ksize, axis, stream).
+    pub sam3_pil_pass: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 801: `pd_sam3_patch_rows_norm` - slot 751's patch stem with a normalization: 0 the picture processor's, 1 Meta's video frames' (fp16 storage, fp16 normalize). (pixels, out, pics, side, patch, win, ch, kp, norm, stream).
+    pub sam3_patch_rows_norm: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 802: `pd_sam3_mask_pick` - column `q` of a pixel-major `[px][nq]` plane as a plane of its own. (src, dst, px, nq, q, stream).
+    pub sam3_mask_pick: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 803: `pd_sam3_resize_f32` - f32 planes resized as torch's bilinear (aa 0) or antialiased bilinear (aa 1), then as is (mode 0) or `v > thr ? hi : lo` (mode 1). (src, dst, n, ih, iw, oh, ow, istride, ostride, aa, mode, thr, lo, hi, stream).
+    pub sam3_resize_f32: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u64,
+            u64,
+            u32,
+            u32,
+            f32,
+            f32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 804: `pd_sam3_mask_down4` - the tracker's mask_downsample, Conv2d(1, 1, k4, s4) + bias, `4s x 4s` planes to `s x s`. (src, dst, w, b, n, s, istride, ostride, stream).
+    pub sam3_mask_down4: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            u64,
+            u64,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 805: `pd_sam3_nonoverlap` - Meta's pixel-wise non-overlap across n planes: areas before / after into `counts` (`[n][2]`, or null), the losers clamped to at most -10 when `write`. (planes, counts, stride, n, px, write, stream).
+    pub sam3_nonoverlap: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u64,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 806: `pd_eg2_rms` - EmbeddingGemma 2's batch-invariant row norm,
+    /// `rmsnorm(x * scale) * w` over `[n_rows][512]` f32, one fixed-shape
+    /// block a row, into f32 `out` and/or the mmq-quantized `yq` (either
+    /// nullable, not both); `ple_tokens` > 0 writes the PLE planes
+    /// layer-major (`n_rows = 24 * ple_tokens`, f32 only). (x, w, out, yq,
+    /// n_rows, ple_tokens, scale, eps, stream)
+    pub eg2_rms: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            f32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 807: `pd_eg2_sandwich` - `x = (x + rmsnorm(proj) * wpost) * s`
+    /// over `[rows][512]`, then `xn = rmsnorm(x) * wnext` when `wnext` is
+    /// set; `xn` (f32, needs wnext) and `yq` (mmq layout of xn, or of x
+    /// without wnext) are each nullable. (x, proj, wpost, wnext, xn, yq,
+    /// rows, s, eps, stream)
+    pub eg2_sandwich: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            f32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 808: `pd_eg2_heads` - q/k/v RMS norm (q and k weighted) and
+    /// split-half rope off the fused `[rows][stride]` f32 landing (q at 0, k
+    /// at 4 hd, v at 4 hd + 512) into f16 q `[rows][4][hd]` and k / v
+    /// `[rows][512 / hd][hd]`; angle `pos * theta_scale^i`. hd 256 or 512.
+    /// (qkv, pos, qw, kw, q16, k16, v16, rows, stride, head_dim,
+    /// theta_scale, eps, stream)
+    pub eg2_heads: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            f32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 809: `pd_eg2_attn` - bidirectional attention over packed
+    /// sequences (`cu` row offsets), f16 q/k/v from slot 808, f32 out
+    /// `[rows][4][hd]`; `tiles` = `(seq << 12) | tile` per 64 query rows at
+    /// hd 256, per 16 at hd 512; window 0 = full, else |i - j| <= window.
+    /// (q16, k16, v16, cu, tiles, n_tiles, out, head_dim, window, stream)
+    pub eg2_attn: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 810: `pd_eg2_pool` - mean pool `[rows][768]` token outputs per
+    /// sequence, L2-normalize the first `dims` (128 / 256 / 512 / 768) into
+    /// `[n_seq][dims]`. (tok, cu, n_seq, dims, out, stream)
+    pub eg2_pool: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 811: `pd_eg2_gemm_rows` - the small-pass Q8_0 GEMM over the
+    /// repacked rows and mmq-quantized activations, `y [batch][out]`, GEMV
+    /// shaped (a 32-token group's activations staged once a block, warps
+    /// streaming whole weight rows, a lane a token), in a multiple of 512
+    /// up to 2048; bit-identical per output to the mmq tile (same
+    /// block-order f32 accumulate of exact int dots).
+    /// (data, scale, yq, y, in_dim, out_dim, batch, stream)
+    pub eg2_gemm_rows: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 812: `pd_eg2_geglu_q` - `gelu_tanh(gate) * up` of `in_dim`-wide
+    /// rows at row stride `ld` straight into the mmq layout (the fused
+    /// gate|up landing, the PLE gate). (gate, up, ld, yq, in_dim, batch,
+    /// stream)
+    pub eg2_geglu_q: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 813: `pd_eg2a_mel` - the audio frontend: one log-mel frame a CTA
+    /// (320-sample periodic-Hann frames every 160 samples, the clip left-padded
+    /// by 160, 512-point FFT magnitudes, 128 HTK triangles, `ln(mel + 1e-3)` or
+    /// with `llama_floor` `ln(max(mel, 1e-3))`). (pcm, n, window, fb, spans,
+    /// twiddle, out, frames, llama_floor, stream)
+    pub eg2a_mel: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            u32,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 814: `pd_eg2a_sscp` - one subsampling layer: conv 3x3 stride 2 pad
+    /// 1 over `[t][f][c_in]`, LayerNorm over the channels (weight, no bias),
+    /// ReLU, into `[t'][f'][c_out]` (c_out 128 or 32). (in, w, nw, out, t_in,
+    /// f_in, c_in, c_out, eps, stream)
+    pub eg2a_sscp: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 815: `pd_eg2a_rows` - the audio tower's residual seam over
+    /// 1024-wide rows: fold a clamped (optionally RMS-normed, scaled) sublayer
+    /// output into `x`, optionally the block's closing norm, optionally the
+    /// next GEMM's clamped f16 input. (x, y, y_lo, y_hi, post_w, y_scale,
+    /// out_w, next_norm, next_w, n_lo, n_hi, x16, rows, eps, stream)
+    pub eg2a_rows: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            f32,
+            f32,
+            *const core::ffi::c_void,
+            f32,
+            *const core::ffi::c_void,
+            u32,
+            *const core::ffi::c_void,
+            f32,
+            f32,
+            *mut core::ffi::c_void,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 816: `pd_eg2a_act` - clamp, optional SiLU, clamp, f16 - one clipped
+    /// linear's output into the next one's input. (y, out, total, lo, hi, silu,
+    /// lo2, hi2, stream)
+    pub eg2a_act: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u64,
+            f32,
+            f32,
+            u32,
+            f32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 817: `pd_eg2a_attn` - the audio tower's chunked local attention: a
+    /// causal window of 12 keys per row, Transformer-XL relative positions,
+    /// tanh softcap, over the fused q|k|v landing, into the output projection's
+    /// clamped f16 input. `lims` (host) = q, k, v, out clamp pairs. (qkv, rel,
+    /// pds, out, rows, lims, q_scale, k_scale, cap, stream)
+    pub eg2a_attn: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            *const f32,
+            f32,
+            f32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 818: `pd_eg2a_conv` - the conv module's middle: GLU of the clamped
+    /// pointwise landing, causal depthwise conv (kernel 5), RMS norm, SiLU,
+    /// into the next pointwise linear's clamped f16 input. (g, dw, nw, out,
+    /// rows, g_lo, g_hi, n_lo, n_hi, eps, stream)
+    pub eg2a_conv: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            f32,
+            f32,
+            f32,
+            f32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 819: `pd_eg2a_out` - the audio tower's output seam: `y + bias`,
+    /// weightless RMS norm, f16. (y, bias, out, rows, n, eps, stream)
+    pub eg2a_out: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
 }
+
+/// See [`KernelTableV1::rmsnorm_add_scale_norm`].
+pub type RmsnormAddScaleNormFn = unsafe extern "C" fn(
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    f32,
+    f32,
+    u32,
+    *mut core::ffi::c_void,
+) -> i32;
+
+/// `(w, x, yq, yk, yv, in_dim, oq, okv, batch, stream)` - see
+/// [`KernelTableV1::bf16_qkv_gemm_pf`].
+pub type Bf16QkvGemmFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> i32;
+
+/// `(data, scales, yq, xsums, y, in_dim, out_dim, batch, dtype, stream)` - see
+/// [`KernelTableV1::kquant_gemm_w4a8_pipe3`].
+pub type KquantGemmW4a8Fn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(down_data, down_scales, sorted_row, sorted_slot, block_expert, topk_w,
+/// fq, fs, fsums, part, ff, embd, n_active, max_blocks, dtype, stream)` - see
+/// [`KernelTableV1::kquant_moe_down_mma_b16`].
+pub type KquantMoeDownMmaFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(state, xbc, dt_raw, dt_stride, A, D, dt_bias, y, keep, n_tokens,
+/// n_heads, head_dim, d_state, n_groups, stream)` - see
+/// [`KernelTableV1::mamba2_scan_seq_keep_f16`].
+pub type Mamba2ScanSeqKeepF16Fn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// `(descs, n, n_heads, head_dim, d_state, n_groups, stream)` - see
+/// [`KernelTableV1::mamba2_rescan_f16`].
+pub type Mamba2RescanF16Fn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
 
 /// `(a, b, res, inv, D, rows, period, stream)` - see
 /// [`KernelTableV1::kumo_stats`].
@@ -8467,6 +9720,37 @@ pub type AttnRowsPartialFixedFn = unsafe extern "C" fn(
     u32,
     u32,
     f32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// [`AttnRowsPartialFixedFn`]'s arguments plus `max_rows` (the largest
+/// group's row count, 1..=6) before the stream - see
+/// [`KernelTableV1::attn_rows_partial_kh`].
+pub type AttnRowsPartialKhFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    f32,
+    u32,
     u32,
     u32,
     u32,
@@ -9452,7 +10736,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 728;
+pub const KERNEL_TABLE_SLOTS: usize = 805;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,
@@ -10932,6 +12216,24 @@ pub type AddRmsnormBatchFn = unsafe extern "C" fn(
 pub type Q8MoeGateUpMmaFn = unsafe extern "C" fn(
     gate_data: *const core::ffi::c_void,
     gate_scale: *const core::ffi::c_void,
+    up_data: *const core::ffi::c_void,
+    up_scale: *const core::ffi::c_void,
+    sorted_row: *const core::ffi::c_void,
+    block_expert: *const core::ffi::c_void,
+    xq: *const core::ffi::c_void,
+    xs: *const core::ffi::c_void,
+    fq: *mut core::ffi::c_void,
+    fs: *mut core::ffi::c_void,
+    in_dim: u32,
+    ff: u32,
+    max_blocks: u32,
+    bm: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// int8-MMA sorted MoE single-plane relu^2 up (see
+/// `KernelTableV1::q8_0_moe_up_relu2_mma`).
+pub type Q8MoeUpRelu2MmaFn = unsafe extern "C" fn(
     up_data: *const core::ffi::c_void,
     up_scale: *const core::ffi::c_void,
     sorted_row: *const core::ffi::c_void,

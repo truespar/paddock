@@ -15,10 +15,14 @@ struct SelectableMarkdownSurface<Content: View>: NSViewRepresentable {
   }
 
   func makeNSView(context: Context) -> SelectionHostingView {
-    SelectionHostingView(rootView: AnyView(content.environment(\.self, context.environment)))
+    let view = SelectionHostingView(
+      rootView: AnyView(content.environment(\.self, context.environment)))
+    context.environment.nativeMarkdownWork?.surface = view
+    return view
   }
 
   func updateNSView(_ view: SelectionHostingView, context: Context) {
+    context.environment.nativeMarkdownWork?.surface = view
     #if DEBUG
       view.contentUpdates += 1
     #endif
@@ -41,6 +45,40 @@ final class SelectionHostingView: PaddockScrollHostingView {
     let ranges: [NSValue]
   }
   private var pending: Selection?
+
+  /// Call outside layout(), immediately before viewport eviction. Inline
+  /// SwiftUI hosts invalidate TextKit asynchronously; their last published
+  /// intrinsic size can still omit a newly installed diagram under load.
+  /// Complete the active TextKit engine's layout instead of caching that stale
+  /// size. Never force a TextKit 2 view into TextKit 1 compatibility mode.
+  func completedTextHeight() -> CGFloat? {
+    guard let text = textSurface(in: self), text.bounds.width > 0 else { return nil }
+    let maximumY: CGFloat
+    if let manager = text.textLayoutManager {
+      manager.invalidateLayout(for: manager.documentRange)
+      manager.ensureLayout(for: manager.documentRange)
+      var bottom: CGFloat = 0
+      manager.enumerateTextSegments(
+        in: manager.documentRange, type: .standard, options: [.rangeNotRequired]
+      ) { _, frame, _, _ in
+        bottom = max(bottom, frame.maxY)
+        return true
+      }
+      maximumY = bottom
+    } else if let manager = text.layoutManager, let container = text.textContainer {
+      // MarkdownView currently selects TextKit 1 on macOS. This is an already
+      // legacy view, not a fallback triggered by querying layoutManager first.
+      manager.invalidateLayout(
+        forCharacterRange: NSRange(location: 0, length: text.string.utf16.count),
+        actualCharacterRange: nil)
+      manager.ensureLayout(for: container)
+      maximumY = manager.usedRect(for: container).maxY
+    } else {
+      return nil
+    }
+    let height = ceil(maximumY + text.textContainerOrigin.y)
+    return height.isFinite && height >= 0 ? height : nil
+  }
 
   func preserveSelectionForUpdate() {
     guard pending == nil, let text = textSurface(in: self),

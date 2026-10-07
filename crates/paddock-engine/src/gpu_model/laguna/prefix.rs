@@ -3,8 +3,10 @@
 //! SWA-WINDOW checkpoints as the resume state for the 30 ring-backed layers
 //! (the gemma4 scheme; gemma4/prefix.rs is the annotated original). A prompt
 //! can only resume at a position whose whole 512-token SWA window was
-//! snapshotted; policy = one checkpoint per cached prompt at its last full
-//! page boundary - the position the next agentic turn resumes from.
+//! snapshotted; policy = two checkpoints per cached prompt: its last full
+//! page boundary - the position the next agentic turn resumes from - and the
+//! back-off boundary ~256 tokens behind it, where a prompt whose tail was
+//! rewritten (the same document, another question) resumes.
 //!
 //! Sharing is safe without COW because checkpoints sit on block boundaries:
 //! the tail re-prefill starts at the (block-aligned) cut, so adopted full-
@@ -42,11 +44,15 @@ const MIN_CACHE_PREFIX: usize = 64;
 /// Don't checkpoint prompts shorter than this.
 const MIN_SNAPSHOT_LEN: usize = 4 * BLOCK_TOKENS;
 
-fn ckpt_slots() -> usize {
+/// Window checkpoint slots. A prompt now lands two (its trailing cut and the
+/// back-off cut behind it), so where a checkpoint is small - Kolibri's 40
+/// fp8 SWA layers are ~21 MB - the pool holds 8; Laguna's ~63 MB f16
+/// windows keep 4. PADDOCK_LAGUNA_PREFIX_CKPTS overrides.
+fn ckpt_slots(state_bytes: usize) -> usize {
     paddock_models::dev_var!("PADDOCK_LAGUNA_PREFIX_CKPTS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(4)
+        .unwrap_or(if state_bytes <= 32 << 20 { 8 } else { 4 })
 }
 
 /// Free-margin kept by evict-ahead at insert (see gemma4's px_margin: LIFO
@@ -74,15 +80,21 @@ pub(crate) struct LagunaPrefix {
 }
 
 impl GpuLaguna {
+    /// Blocks a resume needs from before a block-aligned cut: the window
+    /// counts the current token, so a row at the cut reads `window - 1`
+    /// earlier keys - 32 blocks for Laguna's 512 and Kolibri's 513 alike.
+    fn win_blocks(&self) -> usize {
+        self.hp.swa_window.saturating_sub(1).div_ceil(BLOCK_TOKENS)
+    }
+
     /// One SWA checkpoint's size in bytes (0 = prefix cache not applicable).
     pub(crate) fn prefix_state_bytes(&self) -> usize {
         let n_swa = self.layers.iter().filter(|l| l.is_swa).count();
-        if n_swa == 0 || !self.hp.swa_window.is_multiple_of(BLOCK_TOKENS) {
+        if n_swa == 0 || self.hp.swa_window == 0 {
             return 0;
         }
         let kv_dim = self.hp.n_kv_heads * self.hp.head_dim;
-        let win_blocks = self.hp.swa_window / BLOCK_TOKENS;
-        n_swa * 2 * win_blocks * BLOCK_TOKENS * kv_dim * self.kv_dtype.bytes()
+        n_swa * 2 * self.win_blocks() * BLOCK_TOKENS * kv_dim * self.kv_dtype.bytes()
     }
 
     /// VRAM `build_prefix` will claim - the reserve enable_batch carves out.
@@ -90,7 +102,7 @@ impl GpuLaguna {
         if paddock_models::dev_var_os!("PADDOCK_NO_PREFIX_CACHE").is_some() {
             return 0;
         }
-        ckpt_slots() * self.prefix_state_bytes()
+        ckpt_slots(self.prefix_state_bytes()) * self.prefix_state_bytes()
     }
 
     /// Build the prefix cache (end of enable_batch - the d_ckpt blob
@@ -105,8 +117,8 @@ impl GpuLaguna {
         if state_bytes == 0 {
             return Ok(());
         }
-        let win_blocks = self.hp.swa_window / BLOCK_TOKENS;
-        let n_states = ckpt_slots();
+        let win_blocks = self.win_blocks();
+        let n_states = ckpt_slots(state_bytes);
         let mut radix = PagedRadix::new();
         radix.set_state_capacity(n_states as u32);
         let d_ckpt = self
@@ -278,14 +290,15 @@ impl GpuLaguna {
     }
 
     /// After the tail prefill: cache the prompt's full-layer blocks in the
-    /// radix and land the SWA window checkpoint at `ckpt_pos` (if any).
+    /// radix, attach the windows `staged` at the scheduler's hints during the
+    /// prefill, and land an SWA window checkpoint at each of `cuts`.
     pub(crate) fn prefix_insert(
         &mut self,
         slot: usize,
         tokens: &[u32],
-        ckpt_pos: Option<usize>,
+        cuts: &[usize],
+        staged: &[(usize, u32)],
     ) -> Result<(), GpuModelError> {
-        let kv_dim = self.hp.n_kv_heads * self.hp.head_dim;
         let bs = self.batch.as_mut().expect("batch enabled");
         let Some(pf) = bs.prefix.as_mut() else {
             return Ok(());
@@ -326,48 +339,109 @@ impl GpuLaguna {
         }
         if paddock_models::dev_var_os!("PADDOCK_PREFIX_STATS").is_some() {
             tracing::info!(
-                "laguna-prefix: insert slot {slot} len {} ckpt {ckpt_pos:?}",
+                "laguna-prefix: insert slot {slot} len {} ckpts {cuts:?}",
                 tokens.len()
             );
         }
-        if let Some(pos) = ckpt_pos
-            && let Some(cidx) = pf.radix.attach_state(tokens, pos)
-        {
-            // land the window ending at `pos` STRAIGHT from the slot's
-            // rings, count-sized. Ring safety: 65 blocks of ring vs 32
-            // of window, and only the ≤16-token tail appended since the
-            // cut - the window is still resident; decode appends run
-            // after this copy in stream order.
-            let count = (pos / BLOCK_TOKENS).min(pf.win_blocks);
-            let first = pos / BLOCK_TOKENS - count;
-            let bt = (BLOCK_TOKENS * kv_dim * self.kv_dtype.bytes()) as u64;
-            let (cp, _g) = pf.d_ckpt.device_ptr(&self.exec.stream);
-            let mut dst = cp + (cidx as usize * pf.state_bytes) as u64;
-            let mut descs: Vec<u64> = Vec::new();
-            for (lw, kvl) in self.layers.iter().zip(bs.kv.iter()) {
-                if !lw.is_swa {
-                    continue;
-                }
-                for plane in [&kvl.k, &kvl.v] {
-                    let (pp, _g2) = plane.device_ptr(&self.exec.stream);
-                    for i in 0..count {
-                        let j = first + i;
-                        let src_blk = slot * bs.ring + (j % bs.ring);
-                        descs.extend([pp + src_blk as u64 * bt, dst + i as u64 * bt, bt]);
-                    }
-                    // blob layout reserves win_blocks slots per plane
-                    // (the shape prefix_resume reads)
-                    dst += pf.win_blocks as u64 * bt;
-                }
+        // checkpoints staged mid-prefill at the scheduler's hints: their
+        // windows already sit in reserved slots; attach (or hand back)
+        for (pos, idx) in staged {
+            if !pf.radix.attach_state_at(tokens, *pos, *idx) {
+                pf.radix.recycle_state(*idx);
             }
-            let d = self
-                .exec
-                .stream
-                .clone_htod(&descs)
-                .map_err(|e| GpuError::Driver(e.to_string()))?;
-            self.exec.batched_copy(&d, descs.len() / 3)?;
+        }
+        let landed: Vec<(usize, u32)> = cuts
+            .iter()
+            .filter_map(|&pos| pf.radix.attach_state(tokens, pos).map(|c| (pos, c)))
+            .collect();
+        // land each window ending at its cut STRAIGHT from the slot's rings,
+        // count-sized. Ring safety: 65 blocks of ring vs 32 of window, and
+        // `prefix_cuts` keeps every cut whose window the ring still holds
+        // (the trailing cut is <= 16 tokens back, the back-off cut ~17
+        // blocks); decode appends run after this copy in stream order.
+        for (pos, cidx) in landed {
+            self.land_window(slot, pos, cidx)?;
         }
         Ok(())
+    }
+
+    /// Copy the SWA window ending at `pos` (block-aligned) out of `slot`'s
+    /// rings into checkpoint slot `cidx`, stream-ordered after the walk that
+    /// wrote it. The caller keeps the window ring-resident: the ring holds
+    /// the slot's last `ring` blocks, the window `win_blocks`.
+    pub(crate) fn land_window(&self, slot: usize, pos: usize, cidx: u32) -> Result<(), GpuError> {
+        let kv_dim = self.hp.n_kv_heads * self.hp.head_dim;
+        let bs = self.batch.as_ref().expect("batch enabled");
+        let Some(pf) = bs.prefix.as_ref() else {
+            return Ok(());
+        };
+        let count = (pos / BLOCK_TOKENS).min(pf.win_blocks);
+        let first = pos / BLOCK_TOKENS - count;
+        let bt = (BLOCK_TOKENS * kv_dim * self.kv_dtype.bytes()) as u64;
+        let (cp, _g) = pf.d_ckpt.device_ptr(&self.exec.stream);
+        let mut dst = cp + (cidx as usize * pf.state_bytes) as u64;
+        let mut descs: Vec<u64> = Vec::new();
+        for (lw, kvl) in self.layers.iter().zip(bs.kv.iter()) {
+            if !lw.is_swa {
+                continue;
+            }
+            for plane in [&kvl.k, &kvl.v] {
+                let (pp, _g2) = plane.device_ptr(&self.exec.stream);
+                for i in 0..count {
+                    let j = first + i;
+                    let src_blk = slot * bs.ring + (j % bs.ring);
+                    descs.extend([pp + src_blk as u64 * bt, dst + i as u64 * bt, bt]);
+                }
+                // blob layout reserves win_blocks slots per plane
+                // (the shape prefix_resume reads)
+                dst += pf.win_blocks as u64 * bt;
+            }
+        }
+        let d = self
+            .exec
+            .stream
+            .clone_htod(&descs)
+            .map_err(|e| GpuError::Driver(e.to_string()))?;
+        self.exec.batched_copy(&d, descs.len() / 3)
+    }
+
+    /// Stage a hint checkpoint mid-prefill: reserve a state slot and land the
+    /// window ending at `pos` (the chunk just landed there, so it is
+    /// ring-resident). None when the cache is off or no slot can be had.
+    pub(crate) fn stage_window(
+        &mut self,
+        slot: usize,
+        pos: usize,
+    ) -> Result<Option<u32>, GpuError> {
+        let idx = {
+            let bs = self.batch.as_mut().expect("batch enabled");
+            let Some(pf) = bs.prefix.as_mut() else {
+                return Ok(None);
+            };
+            match pf.radix.reserve_state_slot() {
+                Some(i) => i,
+                None => return Ok(None),
+            }
+        };
+        self.land_window(slot, pos, idx)?;
+        Ok(Some(idx))
+    }
+
+    /// Hand back the slots a dropped prefill had staged.
+    pub(crate) fn recycle_staged(&mut self, staged: &[(usize, u32)]) {
+        if let Some(pf) = self.batch.as_mut().and_then(|b| b.prefix.as_mut()) {
+            for &(_, idx) in staged {
+                pf.radix.recycle_state(idx);
+            }
+        }
+    }
+
+    /// The scheduler's shared-prefix floor (see `Generator::prefix_share_floor`):
+    /// prompts sharing at least this much with an in-flight one wait for it
+    /// and resume off the checkpoint its hints stage. None without a cache.
+    pub(crate) fn prefix_share_floor_impl(&self) -> Option<usize> {
+        self.batch.as_ref()?.prefix.as_ref()?;
+        Some(MIN_CACHE_PREFIX.max(2 * BLOCK_TOKENS))
     }
 
     /// The per-tick tier pump (see `Generator::tier_pump`).
@@ -515,9 +589,36 @@ impl GpuLaguna {
         tier.mirror_slack(&pf.radix, &mut bs.pool, exec.record_event().ok(), 2, state);
     }
 
-    /// The checkpoint cut for a prompt: its last full page boundary (always
-    /// < len, so the tail chunk after the cut is never empty).
-    pub(crate) fn prefix_cut(&self, t_len: usize, start: usize) -> Option<usize> {
+    /// The checkpoint cuts for a prompt, ascending: its last full page
+    /// boundary (always < len, so the tail chunk after the cut is never
+    /// empty) and the BACK-OFF boundary behind it (`backoff_cut`, ~256
+    /// tokens back) - where a prompt whose tail was rewritten (the same
+    /// document with another question, an edited last instruction) resumes,
+    /// as the hybrids' does. Both land straight from the slot's rings at
+    /// insert, so the back-off cut is kept only while its whole window is
+    /// still ring-resident then.
+    pub(crate) fn prefix_cuts(&self, t_len: usize, start: usize) -> Vec<usize> {
+        let Some(cut) = self.prefix_cut(t_len, start) else {
+            return Vec::new();
+        };
+        let Some(bs) = self.batch.as_ref() else {
+            return vec![cut];
+        };
+        let step = match bs.prefix.as_ref().and_then(|pf| pf.tier.as_ref()) {
+            Some(t) => t.run_blocks() * BLOCK_TOKENS,
+            None => BLOCK_TOKENS,
+        };
+        // the ring holds the last `ring` blocks of the prompt written so far
+        let last = (t_len - 1) / BLOCK_TOKENS;
+        let resident = |c: usize| c / BLOCK_TOKENS + bs.ring >= last + 1 + self.win_blocks();
+        match crate::gpu_model::prefix_cache::backoff_cut(cut, step) {
+            Some(b) if b > start && b >= MIN_SNAPSHOT_LEN && resident(b) => vec![b, cut],
+            _ => vec![cut],
+        }
+    }
+
+    /// The trailing checkpoint cut alone (see [`Self::prefix_cuts`]).
+    fn prefix_cut(&self, t_len: usize, start: usize) -> Option<usize> {
         let has = self.batch.as_ref().is_some_and(|b| b.prefix.is_some());
         if !has || t_len < MIN_SNAPSHOT_LEN {
             return None;

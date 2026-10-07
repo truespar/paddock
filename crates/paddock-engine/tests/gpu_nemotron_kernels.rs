@@ -2833,7 +2833,8 @@ fn nvf4_tm_plane_matches_rowmajor() {
 /// identity held by coincidence of shape. The per-segment comparison stays
 /// as the regroup-class check (rel-to-rms 5e-5) so a thin-plane routing or
 /// layout bug still shows as O(1); the plain-over-fused reference is
-/// bit-exact through bt 32 and regroup class above (tiers diverge there).
+/// bit-exact at every width - the fused launcher walks the plain one's tier
+/// ladder over the fused row count, prefill widths included.
 #[test]
 fn bf16_qkv_fused_matches_segment_gemms() {
     let _scr = bf16ks_lock();
@@ -2867,8 +2868,9 @@ fn bf16_qkv_fused_matches_segment_gemms() {
     let fused = qt(&fraw, q_dim + 2 * kv_dim);
     let planes = [qt(&qraw, q_dim), qt(&kraw, kv_dim), qt(&vraw, kv_dim)];
 
-    // launcher bands: <=8 (n32e), <=16 (n32d), >16 (n32f), gridY>1 (33)
-    for bt in [2usize, 8, 9, 16, 17, 32, 33] {
+    // launcher bands: <=8 (n32e), <=16 (n32d), <=32 (n32f), <=64 or a
+    // sub-wave fat grid (64x64), the fat 128x128 tile (prefill chunks)
+    for bt in [2usize, 8, 9, 16, 17, 32, 33, 64, 65, 300, 2048] {
         let x = det(bt * hid, 0x9c0 + bt as u64);
         let d_x = exec.to_device(&x).expect("x");
         let mut d_q = exec.alloc(bt * q_dim).expect("q");
@@ -2899,23 +2901,15 @@ fn bf16_qkv_fused_matches_segment_gemms() {
         if bt > 8 {
             // same mma class, same plane, same grid -> same K-split election
             // -> bit-exact: the plain GEMM over the concatenated plane,
-            // sliced per segment. Same grid holds through bt 32 (both
-            // launchers tier at BM=32 to 16 rows and BM=64/BN=32 to 32); at
-            // bt 33 the plain launcher's fat tier (BN=64, gridY 1) and the
-            // fused BN=32 tier (gridY 2) put the fused plane on opposite
-            // sides of the fill early-out on a 48-SM die (72 vs 144 CTAs
-            // against 96), so past 32 the plain reference is the regroup
-            // class too.
+            // sliced per segment. Both launchers share one tier ladder
+            // (BM=32 to 16 rows, BM=64/BN=32 to 32, 64x64 to 64 rows or a
+            // sub-wave fat grid, 128x128 above) over the same row count, so
+            // the grids - and the fill early-out - agree at every width.
             let fdim = q_dim + 2 * kv_dim;
             let mut d_f = exec.alloc(bt * fdim).expect("fused y");
             exec.bf16_gemm(&fused, None, &d_x, &mut d_f, bt)
                 .expect("plain over fused");
             let full = exec.to_host(&d_f).expect("fused y host");
-            let frms = (full.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>()
-                / full.len() as f64)
-                .sqrt()
-                .max(1e-20);
-            let same_grid = bt <= 32;
             for (p, (off, out)) in [(0, q_dim), (q_dim, kv_dim), (q_dim + kv_dim, kv_dim)]
                 .into_iter()
                 .enumerate()
@@ -2924,19 +2918,11 @@ fn bf16_qkv_fused_matches_segment_gemms() {
                     for r in 0..out {
                         let want = full[c * fdim + off + r];
                         let have = got[p][c * out + r];
-                        if same_grid {
-                            assert_eq!(
-                                have.to_bits(),
-                                want.to_bits(),
-                                "bt {bt} plane {p} row {c} col {r}: fused {have} vs plain-over-fused {want}"
-                            );
-                        } else {
-                            let rel = (have as f64 - want as f64).abs() / frms;
-                            assert!(
-                                rel < 5e-5,
-                                "bt {bt} plane {p} row {c} col {r}: fused {have} vs plain-over-fused {want} (rel-to-rms {rel:.3e})"
-                            );
-                        }
+                        assert_eq!(
+                            have.to_bits(),
+                            want.to_bits(),
+                            "bt {bt} plane {p} row {c} col {r}: fused {have} vs plain-over-fused {want}"
+                        );
                     }
                 }
             }
@@ -3485,5 +3471,192 @@ fn q8_moe_decode_band_matches_the_sorted_route() {
     assert!(
         rel < 1e-5,
         "decode-band MoE disagrees with the sorted route: rel {rel:.3e}"
+    );
+}
+
+/// Rollback by replay (slots 746-747) against the snapshot walk (444) it
+/// replaces in the verify round. The keep walk's y must be the snap walk's
+/// y BIT FOR BIT and leave the state untouched (it stays the pre-round state
+/// until the commit); a replay of n kept rows must land on snap row n - 1 bit
+/// for bit, for every n - into another buffer, in place, and beside other
+/// replays in the same launch; a rows = 0 descriptor leaves its target alone.
+/// A few heads ride past the softplus cut so both dt branches replay.
+#[test]
+fn mamba2_keep_walk_and_replay_match_the_snap_walk_bitexact() {
+    use cudarc::driver::{CudaSlice, DevicePtr};
+    use half::f16 as h16;
+    let Some(exec) = common::gpu() else { return };
+    if !exec.has_mamba2_f16_state() || !exec.has_mamba2_rescan() {
+        common::missing("pack lacks rollback by replay (slots 746-747)");
+        return;
+    }
+    let (nh, hd, ds, ng) = (H, HD, S, G);
+    let se = nh * hd * ds;
+    let n_tok = 7usize;
+    let kr = paddock_engine::gpu::mamba2_keep_row(nh, hd, ds, ng);
+    let seed: Vec<h16> = det(se, 7001)
+        .iter()
+        .map(|&v| h16::from_f32(v * 0.75))
+        .collect();
+    let xbc = det(n_tok * CONV_DIM, 7002);
+    let dtr: Vec<f32> = det(n_tok * nh, 7003)
+        .iter()
+        .enumerate()
+        .map(|(i, v)| if i % 13 == 0 { 24.0 + v } else { v * 3.0 })
+        .collect();
+    let a: Vec<f32> = (0..nh).map(|i| -0.3 - (i % 9) as f32 * 0.17).collect();
+    let dd = det(nh, 7005);
+    let bias: Vec<f32> = det(nh, 7006).iter().map(|v| v * 0.5).collect();
+    let d_xbc = exec.to_device(&xbc).expect("xbc");
+    let d_dt = exec.to_device(&dtr).expect("dt");
+    let d_a = exec.to_device(&a).expect("a");
+    let d_d = exec.to_device(&dd).expect("d");
+    let d_b = exec.to_device(&bias).expect("bias");
+    let up16 = |v: &[h16], copies: usize| -> CudaSlice<h16> {
+        let mut b = exec.alloc_f16(v.len() * copies).expect("f16 plane");
+        for c in 0..copies {
+            let mut w = b
+                .try_slice_mut(c * v.len()..(c + 1) * v.len())
+                .expect("f16 view");
+            exec.stream.memcpy_htod(v, &mut w).expect("htod f16");
+        }
+        b
+    };
+    let bits = |b: &CudaSlice<h16>, off: usize, n: usize| -> Vec<u16> {
+        let h = exec.to_host_f16_len(b, off + n).expect("dtoh f16");
+        h[off..off + n].iter().map(|x| x.to_bits()).collect()
+    };
+
+    // the reference: the snapshot walk the verify ran until now
+    let mut s_snap = up16(&seed, 1);
+    let mut snap = exec.alloc_f16(n_tok * se).expect("snap");
+    let mut y_snap = exec.alloc(n_tok * D_INNER).expect("y snap");
+    exec.mamba2_scan_seq_snap_at_f16(
+        &mut s_snap,
+        0,
+        &d_xbc,
+        0,
+        &d_dt,
+        0,
+        nh,
+        &d_a,
+        &d_d,
+        &d_b,
+        &mut y_snap,
+        0,
+        &mut snap,
+        0,
+        n_tok,
+        nh,
+        hd,
+        ds,
+        ng,
+    )
+    .expect("snap walk");
+
+    // the keep walk on slot 1 of a two-slot arena, its rows kept at row 2
+    let arena = up16(&seed, 2);
+    let mut keep = exec.alloc((2 + n_tok) * kr).expect("keep");
+    let mut y_keep = exec.alloc(n_tok * D_INNER).expect("y keep");
+    exec.mamba2_scan_seq_keep_at_f16(
+        &arena,
+        se,
+        &d_xbc,
+        0,
+        &d_dt,
+        0,
+        nh,
+        &d_a,
+        &d_d,
+        &d_b,
+        &mut y_keep,
+        0,
+        &mut keep,
+        2 * kr,
+        n_tok,
+        nh,
+        hd,
+        ds,
+        ng,
+    )
+    .expect("keep walk");
+    let ys = exec.to_host(&y_snap).expect("y snap host");
+    let yk = exec.to_host(&y_keep).expect("y keep host");
+    assert!(
+        ys.iter().zip(&yk).all(|(p, q)| p.to_bits() == q.to_bits()),
+        "the keep walk's y must be the snap walk's bit for bit"
+    );
+    let seed_bits: Vec<u16> = seed.iter().map(|x| x.to_bits()).collect();
+    assert_eq!(
+        bits(&arena, se, se),
+        seed_bits,
+        "the keep walk wrote the live state"
+    );
+
+    let ptr = |b: &CudaSlice<h16>, off: usize| -> u64 {
+        let (p, _g) = b.device_ptr(&exec.stream);
+        p + (off * 2) as u64
+    };
+    let (kp, _g1) = keep.device_ptr(&exec.stream);
+    let kp = kp + (2 * kr * 4) as u64;
+    let (ap, _g2) = d_a.device_ptr(&exec.stream);
+    let (bp, _g3) = d_b.device_ptr(&exec.stream);
+    let mut desc = exec.alloc_u64(6 * 4).expect("descs");
+    let tmp = exec.alloc_f16(se).expect("tmp");
+    for n in 1..=n_tok {
+        let d = [ptr(&arena, se), ptr(&tmp, 0), kp, ap, bp, n as u64];
+        exec.mamba2_rescan_upload(&mut desc, &d, nh, hd, ds, ng)
+            .expect("replay");
+        assert_eq!(
+            bits(&tmp, 0, se),
+            bits(&snap, (n - 1) * se, se),
+            "replay of {n} rows differs from snap row {}",
+            n - 1
+        );
+    }
+    // in place on slot 1, slot 0 into tmp at 3 rows, and a rows = 0 no-op,
+    // one launch
+    let idle = up16(&vec![h16::from_f32(0.5); se], 1);
+    let d = [
+        ptr(&arena, se),
+        ptr(&arena, se),
+        kp,
+        ap,
+        bp,
+        n_tok as u64,
+        ptr(&arena, 0),
+        ptr(&tmp, 0),
+        kp,
+        ap,
+        bp,
+        3,
+        ptr(&arena, 0),
+        ptr(&idle, 0),
+        kp,
+        ap,
+        bp,
+        0,
+    ];
+    exec.mamba2_rescan_upload(&mut desc, &d, nh, hd, ds, ng)
+        .expect("replays");
+    assert_eq!(
+        bits(&arena, se, se),
+        bits(&s_snap, 0, se),
+        "in-place replay of the whole round differs from the snap walk's final state"
+    );
+    assert_eq!(
+        bits(&tmp, 0, se),
+        bits(&snap, 2 * se, se),
+        "the batched 3-row replay differs"
+    );
+    assert_eq!(bits(&arena, 0, se), seed_bits, "a replay source changed");
+    assert!(
+        bits(&idle, 0, se)
+            .iter()
+            .all(|&b| b == h16::from_f32(0.5).to_bits()),
+        "a rows = 0 replay wrote its target"
+    );
+    println!(
+        "rollback by replay: keep-walk y == snap y, replay n rows == snap row n-1 for n = 1..{n_tok}, in place and batched"
     );
 }

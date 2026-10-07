@@ -236,6 +236,8 @@ fn gguf_bulk_prefill_matches_serial() {
     };
     let map = MappedGguf::open(&path).expect("mmap");
     let mut model = GpuNemotron::load(exec, &map, 4096).expect("load gguf");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     drop(map);
 
     // ---- serial reference walk + greedy continuation ----------------------
@@ -323,6 +325,8 @@ fn gguf_batch_lane_matches_serial() {
     };
     let map = MappedGguf::open(&path).expect("mmap");
     let mut model = GpuNemotron::load(exec, &map, 4096).expect("load gguf");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     drop(map);
 
     // serial spine
@@ -438,6 +442,8 @@ fn gguf_prefix_resume_and_fp8_kv_smoke() {
     };
     let map = MappedGguf::open(&path).expect("mmap");
     let mut model = GpuNemotron::load(exec, &map, 4096).expect("load gguf");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     drop(map);
     assert_eq!(model.batch_enable_probe(4).expect("enable"), 4);
 
@@ -465,6 +471,17 @@ fn gguf_prefix_resume_and_fp8_kv_smoke() {
     assert_eq!(
         reused, 688,
         "exact repeat must resume at the deep checkpoint"
+    );
+    // The in-file MTP drafts from a resumed prompt too: its cells ride the
+    // pages slot 1 just adopted from slot 0, so the drafter is warm through
+    // the prompt end. With a dense per-slot cache it went cold at every
+    // resume - every agent turn after the first drafted nothing. (Slot 0
+    // has decoded past its prompt by now, so it is not asked here.)
+    assert!(
+        model
+            .spec_ensure_warm(1, &[], (PROMPT_LEN - 1) as u32)
+            .expect("warm probe"),
+        "MTP drafter cold after a prefix resume"
     );
     assert_eq!(
         argmax(&cold),
@@ -564,6 +581,8 @@ fn gguf_spec_verify_round_rolls_back_state() {
     };
     let map = MappedGguf::open(&path).expect("mmap");
     let mut model = GpuNemotron::load(exec, &map, 4096).expect("load gguf");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     drop(map);
     assert_eq!(model.batch_enable_probe(4).expect("enable"), 4);
 
@@ -672,6 +691,8 @@ fn gguf_spec_serve_cadence_matches_greedy() {
     };
     let map = MappedGguf::open(&path).expect("mmap");
     let mut model = GpuNemotron::load(exec, &map, 4096).expect("load gguf");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     drop(map);
     assert_eq!(model.batch_enable_probe(4).expect("enable"), 4);
 
@@ -825,6 +846,8 @@ fn gguf_mtp_drafts_accept() {
     };
     let map = MappedGguf::open(&path).expect("mmap");
     let mut model = GpuNemotron::load(exec, &map, 4096).expect("load gguf");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     drop(map);
     assert_eq!(model.batch_enable_probe(4).expect("enable"), 4);
     assert!(
@@ -978,6 +1001,8 @@ fn gguf_spec_replay_dump() {
 
     let map = MappedGguf::open(&path).expect("mmap");
     let mut model = GpuNemotron::load(exec, &map, 4096).expect("load gguf");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     drop(map);
     assert_eq!(model.batch_enable_probe(4).expect("enable"), 4);
 

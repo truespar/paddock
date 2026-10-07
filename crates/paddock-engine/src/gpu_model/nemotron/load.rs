@@ -46,20 +46,16 @@ fn small_die_defaults(exec: &GpuExecutor) {
     if std::env::var_os("PADDOCK_PIPE_MIN_LIVE").is_none() {
         crate::envset::set_env("PADDOCK_PIPE_MIN_LIVE", "8");
     }
-    // Speculation off by default on the small die (measured on agentic
-    // turns). A spec-capable serve routes every decode tick
-    // through the spec-round path (`spec_capable()` wins the single-user
-    // election over the decode pipe, and the batched loop's rounds are the
-    // eager tick-at-a-time path), so with the n-gram drafter at 37%
+    // Speculation is NOT defaulted off here any more (2026-10-04). It used to
+    // be, measured when a spec-capable serve meant the n-gram drafter: at 37%
     // acceptance on agentic prose the c1 tick was 17.0 ms/token against the
-    // pipe's 11.6, and `adaptive` (K = 0 rounds included) paid the same -
-    // a K = 0 round is still an eager tick. The operator's explicit choice
-    // wins: `--spec on|adaptive|<K>` (PADDOCK_SPEC) or PADDOCK_NO_SPEC as
-    // written. The door that keeps spec available is a K = 0 round that
-    // runs on the pipe.
-    if std::env::var_os("PADDOCK_SPEC").is_none() && std::env::var_os("PADDOCK_NO_SPEC").is_none() {
-        crate::envset::set_env("PADDOCK_NO_SPEC", "1");
-    }
+    // pipe's 11.6. Since then the family is spec-capable only with a MODEL
+    // drafter attached (`spec_capable`: DSpark/DFlash sideload or the in-file
+    // MTP), and those win on this die - DSpark on GB10: tool-carrying sampled
+    // 126.5 tok/s, code 129.7, against ~83 without speculation; a Claude Code
+    // replay to 248K decodes at 105.6 tok/s. The blanket kill set here at
+    // load, before any drafter attached, turned all of that off for every
+    // serve that did not say `spec` explicitly.
 }
 
 impl GpuNemotron {
@@ -551,7 +547,7 @@ impl GpuNemotron {
             tok_embd,
             final_norm,
             lm_head,
-            kv_dtype: KvDtype::Fp16,
+            kv_dtype: default_kv_dtype(),
             ssm_dtype,
             prefill_chunk,
             max_ctx,
@@ -915,7 +911,7 @@ impl GpuNemotron {
             tok_embd,
             final_norm,
             lm_head,
-            kv_dtype: KvDtype::Fp16,
+            kv_dtype: default_kv_dtype(),
             ssm_dtype,
             prefill_chunk,
             max_ctx,
@@ -943,8 +939,9 @@ impl GpuNemotron {
         matches!(self.lm_head, HeadW::Qw(_))
     }
 
-    /// Select the attention KV cache element type (fp8-e4m3 is the
-    /// checkpoint's own KV spec; f16 is the greedy-exact bring-up default).
+    /// Select the attention KV cache element type (fp8-e4m3 is the default
+    /// and the checkpoint's own KV spec - see `default_kv_dtype`; f16 is the
+    /// greedy-exact class the reference tests pin).
     /// Drops decode state AND the batch lane so every cache re-allocates at
     /// the new element size - a live pool sized for the old dtype would be
     /// silently mis-strided by the paged kernels.
@@ -957,4 +954,27 @@ impl GpuNemotron {
         self.batch = None;
         self.chunked.clear();
     }
+}
+
+/// The family's KV default: fp8-e4m3 (KV8) on both lanes. It is the NVFP4
+/// checkpoint's own spec (`kv_cache_quant_algo: FP8`), the class every board
+/// and the vLLM rival run, and the batched lane's attention ladder has fp8
+/// arms at every shape it elects (the G=16 prefill tile, the head-packed
+/// decode partial, the verify rows). f16 was the default until 2026-10-04 -
+/// the bring-up's greedy-exact class - so an `auto` serve paid twice the KV
+/// bytes: on GB10 a Claude Code replay to 248K ran 193 -> 148 s at fp8
+/// (NVFP4 + DSpark, TTFT 146 -> 98 s) and 253 -> 216 s on the Q8_0 lane.
+/// Quality at fp8: top-1 equal with greedy 8/8 against f16 on the batch and
+/// GGUF gates, but NOT free on long-context recall - six attention layers
+/// carry every lookup, and e4m3's 3-bit mantissa shows. A paired probe (the
+/// same 100 greedy route lookups in a ~32K ledger of look-alike records) read
+/// fp8 75/100 against f16 82/100 (8 questions only f16 got, 1 only fp8), and
+/// a recorded Claude Code post-compaction lookup resolved 2/40 sampled at fp8
+/// against 9/40 at f16 (greedy wrong at both). KV8 stays the default
+/// regardless (decided 2026-10-05): the speed above and the checkpoint's own
+/// spec; per-head dynamic INT4/INT8 with inline scales is the KV doctrine's
+/// next rung. A runner on a die that cannot store fp8 KV overrides this back
+/// to f16 (serving.rs), and an explicit kv_cache_dtype wins.
+pub(crate) fn default_kv_dtype() -> KvDtype {
+    KvDtype::Fp8E4m3
 }

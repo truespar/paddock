@@ -52,6 +52,8 @@ import SwiftUI
       url.scheme == "https", url.host == "github.com", url.user == nil, url.password == nil,
       url.port == nil, url.query == nil, url.fragment == nil,
       url.path == "/truespar/paddock/releases/latest/download/appcast.xml",
+      info["SURequireSignedFeed"] as? Bool == true,
+      info["SUVerifyUpdateBeforeExtraction"] as? Bool == true,
       let key = info["SUPublicEDKey"] as? String, Data(base64Encoded: key)?.count == 32
     else { return false }
     return true

@@ -231,6 +231,26 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/runners/{port}/v1/embeddings", post(relay_embeddings))
         .route("/api/runners/{port}/v1/rerank", post(relay_rerank))
         .route("/api/runners/{port}/v1/systemone", post(relay_systemone))
+        // the Masks page (SAM 3): a data-URL picture and a prompt in, COCO
+        // RLE masks out - JSON both ways, under the relay's own body cap
+        .route("/api/runners/{port}/v1/masks", post(relay_masks))
+        // its camera: a video session, its frames, its end (a DELETE drops it)
+        .route(
+            "/api/runners/{port}/v1/masks/sessions",
+            post(relay_mask_session),
+        )
+        .route(
+            "/api/runners/{port}/v1/masks/sessions/{id}/frames",
+            post(relay_mask_frame),
+        )
+        .route(
+            "/api/runners/{port}/v1/masks/sessions/{id}/finish",
+            post(relay_mask_finish),
+        )
+        .route(
+            "/api/runners/{port}/v1/masks/sessions/{id}",
+            axum::routing::delete(relay_mask_drop),
+        )
         // Tables (Kumo-Tabular): a one-shot or fitted-context prediction, a
         // context fitted for reuse, and its release - JSON both ways; the
         // release is a DELETE, so this relay carries the method.
@@ -683,9 +703,13 @@ fn arm_follow(state: Arc<AppState>, job_id: String) {
                             Some(serde_json::json!({ "state": "error", "message": e }));
                         return;
                     }
-                    pin_envelope(&mut spec, &state.registry);
+                    let fit_ctx = pin_envelope(&mut spec, &state.registry);
                     let _admission = state.admission.lock().await;
-                    match vram_admission(&state, AdmitReq::for_spec(&spec, freeing)).await {
+                    let req = AdmitReq {
+                        fit_ctx,
+                        ..AdmitReq::for_spec(&spec, freeing)
+                    };
+                    match vram_admission(&state, req).await {
                         Err(refusal) => {
                             *job.follow_state
                                 .lock()
@@ -694,7 +718,7 @@ fn arm_follow(state: Arc<AppState>, job_id: String) {
                             );
                             return;
                         }
-                        Ok(grant) => spec.vram_budget = spec.vram_budget.or(grant),
+                        Ok(admitted) => admitted.apply(&mut spec),
                     }
                     let outcome = if action == "switch" {
                         // honor the edit page's optimistic-concurrency token:
@@ -985,7 +1009,12 @@ struct AdmitReq<'a> {
     /// The grant envelope (spec fields; the runner's own defaults otherwise).
     max_batch: Option<usize>,
     max_ctx: Option<usize>,
-    fp8_kv: bool,
+    /// The KV class the endpoint asks for: `Some(true)` fp8, `Some(false)`
+    /// f16, `None` = auto/absent, which the runner serves at the family's
+    /// own default - priced from the catalog row's `kv_default` (KV8 for
+    /// every generative family but three, since 2026-10-04). Pricing auto at
+    /// f16 charged KV8 endpoints twice the pool they draw.
+    fp8_kv: Option<bool>,
     /// Endpoint arms the prefix-cache tier: device staging goes resident for
     /// as long as it is armed. Admission has to price it for the same reason
     /// it prices speculation - a start admitted on arithmetic the runner does
@@ -1001,6 +1030,89 @@ struct AdmitReq<'a> {
     /// `vision: false`, so charging it unconditionally refused starts that
     /// would have fit.
     vision: bool,
+    /// A split-tower model's audio tower (`spec.audio`; absent = the
+    /// catalog default) - priced by the same rule the supervisor serves by.
+    audio: Option<bool>,
+    /// `max_ctx` is the catalog's TARGET, not a choice anyone made (the start
+    /// left it unset and `pin_envelope` filled it): shrink it onto what the
+    /// card backs instead of pricing it verbatim. Never set for an explicit
+    /// window - a typed number is the operator's, and is priced as asked.
+    fit_ctx: bool,
+}
+
+/// What admission hands back: the budget grant (MiB), and for a start whose
+/// window was the catalog target, the window it fitted that target down to.
+#[derive(Debug, Default)]
+struct Admitted {
+    grant: Option<u64>,
+    max_ctx: Option<usize>,
+}
+
+impl Admitted {
+    /// Fill what the spec left open: an explicit budget was admitted verbatim
+    /// and keeps its value; a fitted window replaces the target it came from.
+    fn apply(self, spec: &mut crate::supervisor::SpawnSpec) {
+        spec.vram_budget = spec.vram_budget.or(self.grant);
+        if let Some(ctx) = self.max_ctx {
+            spec.max_ctx = Some(ctx);
+        }
+    }
+}
+
+/// The Studio's context ladder (`CTX_STEPS` in studio/src/lib/ctx-ladder.ts).
+/// A defaulted window lands on one of these rungs, so a CLI/API start and the
+/// form pick the same number for the same card.
+const CTX_STEPS: [u64; 7] = [4096, 8192, 16384, 32768, 65536, 131072, 262144];
+
+/// Fit a DEFAULTED window to the card (decided 2026-10-04: "fit-aware long
+/// ctx" - the catalog names a target, e.g. the full 262K at 4 slots, and the
+/// card decides how much of it is real). The target when it fits at this
+/// concurrency, else the largest ladder rung under it that does, else the
+/// exact page-aligned window the smallest rung's pool backs - the form's
+/// fallback too. `price(ctx)` is the caller's own estimate at that window, so
+/// the pick and the grant come out of one calculation (and the dense spec
+/// plane, which scales with the window, is re-priced at every step). When
+/// nothing fits the target's price comes back unchanged for the refusal.
+fn fit_window(
+    target: u64,
+    price: impl Fn(u64) -> paddock_estimator::Estimate,
+) -> (u64, paddock_estimator::Estimate) {
+    let fits = |e: &paddock_estimator::Estimate, ctx: u64| {
+        !matches!(e.fit, paddock_estimator::Fit::DoesNotFit { .. }) && e.max_ctx >= ctx
+    };
+    let at_target = price(target);
+    if fits(&at_target, target) {
+        return (target, at_target);
+    }
+    let mut smallest = None;
+    for &rung in CTX_STEPS.iter().rev().filter(|&&r| r < target) {
+        let e = price(rung);
+        if fits(&e, rung) {
+            return (rung, e);
+        }
+        smallest = Some(e);
+    }
+    if let Some(e) = smallest
+        .filter(|e| !matches!(e.fit, paddock_estimator::Fit::DoesNotFit { .. }) && e.max_ctx >= 16)
+    {
+        let ctx = e.max_ctx;
+        let e = price(ctx);
+        if fits(&e, ctx) {
+            return (ctx, e);
+        }
+    }
+    (target, at_target)
+}
+
+/// An endpoint's `kv_cache_dtype` as admission reads it: `Some(true)` fp8,
+/// `Some(false)` an explicit exact class, `None` auto/absent (the family
+/// default - see `AdmitReq::fp8_kv`).
+fn kv_ask(v: Option<&str>) -> Option<bool> {
+    match v {
+        Some("fp8_e4m3" | "fp8") => Some(true),
+        Some("f16" | "bf16" | "f32") => Some(false),
+        _ => None,
+    }
 }
 
 /// The runner's own config defaults (`paddock-runner/src/config.rs`). They
@@ -1022,14 +1134,20 @@ const RUNNER_DEFAULT_MAX_BATCH: usize = 32;
 /// silently invalidates the budget with nothing to notice it.
 ///
 /// Only fills what is absent: an explicit choice (CLI flag, Studio form, or a
-/// hand-edited file on a verbatim start) always wins.
-fn pin_envelope(spec: &mut crate::supervisor::SpawnSpec, registry: &crate::registry::Registry) {
+/// hand-edited file on a verbatim start) always wins. True when the window
+/// was filled here - the catalog's target, which admission then fits to the
+/// card (`AdmitReq::fit_ctx`).
+fn pin_envelope(
+    spec: &mut crate::supervisor::SpawnSpec,
+    registry: &crate::registry::Registry,
+) -> bool {
     // An image lane has no envelope to pin: nothing is priced per token or
     // per slot, and the runner reads neither key for it.
     if crate::estimate::is_image_lane(registry, &spec.model) {
-        return;
+        return false;
     }
     let (ctx, batch) = registry.default_envelope(&spec.model, spec.artifact.as_deref());
+    let defaulted = spec.max_ctx.is_none();
     spec.max_ctx.get_or_insert(ctx);
     spec.max_batch.get_or_insert(batch);
     // `spec` is deliberately not pinned here. The Studio form writes an
@@ -1040,6 +1158,7 @@ fn pin_envelope(spec: &mut crate::supervisor::SpawnSpec, registry: &crate::regis
     // pre-flight then refused the start (granite-4.1 showed this) and the
     // legacy heal had to warn it away. Absent is the honest spelling for
     // "the engine decides per capability".
+    defaulted
 }
 
 /// Is this endpoint's `spec` key anything but off? Matches the runner's
@@ -1063,7 +1182,7 @@ impl<'a> AdmitReq<'a> {
             fixed_need: spec.vram_budget.map(|mib| mib << 20),
             max_batch: spec.max_batch,
             max_ctx: spec.max_ctx,
-            fp8_kv: matches!(spec.kv_cache_dtype.as_deref(), Some("fp8_e4m3" | "fp8")),
+            fp8_kv: kv_ask(spec.kv_cache_dtype.as_deref()),
             offload_ram_bytes: spec
                 .kv_offload
                 .as_ref()
@@ -1073,6 +1192,8 @@ impl<'a> AdmitReq<'a> {
             // absent = on, matching `supervisor.rs`, which drops the mmproj
             // only on an explicit `Some(false)`
             vision: spec.vision != Some(false),
+            audio: spec.audio,
+            fit_ctx: false,
         }
     }
 }
@@ -1090,16 +1211,16 @@ impl<'a> AdmitReq<'a> {
 async fn vram_admission(
     state: &Arc<AppState>,
     req: AdmitReq<'_>,
-) -> Result<Option<u64>, AdmissionRefusal> {
+) -> Result<Admitted, AdmissionRefusal> {
     // This starts only an API listener. The runner admits the actual serving
     // envelope against fresh device/host availability on EACH cold load.
     if req.on_demand {
-        return Ok(None);
+        return Ok(Admitted::default());
     }
     // loud escape hatch for benches/experts - default is the hard no
     if std::env::var_os("PADDOCK_ALLOW_VRAM_OVERCOMMIT").is_some() {
         tracing::warn!(model = %req.model, "VRAM admission BYPASSED (PADDOCK_ALLOW_VRAM_OVERCOMMIT)");
-        return Ok(None);
+        return Ok(Admitted::default());
     }
     // one admission at a time: two concurrent starts must not both price
     // themselves against the same residual
@@ -1109,7 +1230,7 @@ async fn vram_admission(
     }
     let snap = state.gpu.latest();
     if !snap.available || snap.gpus.is_empty() {
-        return Ok(None); // no NVML view - nothing honest to refuse on
+        return Ok(Admitted::default()); // no NVML view - nothing honest to refuse on
     }
     // resolve a pin (UUID or ordinal) to an NVML index
     let resolve_pin = |p: &str| {
@@ -1126,7 +1247,7 @@ async fn vram_admission(
         .find(|g| g.index == sel)
         .and_then(|g| g.mem_total)
     else {
-        return Ok(None);
+        return Ok(Admitted::default());
     };
     let single_gpu = snap.gpus.len() <= 1;
 
@@ -1285,7 +1406,7 @@ async fn vram_admission(
     let Some((path, weights, kind, workspace)) =
         crate::estimate::resolve_weights_for(state, req.model, req.artifact)
     else {
-        return Ok(None);
+        return Ok(Admitted::default());
     };
 
     // The grant, estimator-priced when the file is on disk to probe. The
@@ -1348,11 +1469,9 @@ async fn vram_admission(
             crate::estimate::lane_companion_bytes_for(m, &state.registry, weights_artifact)
         });
         shape.tower_bytes = lane
-            + if req.vision {
-                row.map_or(0, |m| crate::estimate::tower_bytes(m, &state.registry))
-            } else {
-                0
-            };
+            + row.map_or(0, |m| {
+                crate::estimate::towers_bytes_for(m, &state.registry, None, req.vision, req.audio)
+            });
         // A speculating endpoint holds its drafter resident for its whole life,
         // so it comes out of the same budget as the weights. In-file MTP adds
         // no drafter bytes (already inside `weights`) but still widens the
@@ -1376,11 +1495,13 @@ async fn vram_admission(
             // (serving.rs::apply_kv_dtype), which DOUBLES the KV pool - so
             // admitting on the fp8 rate grants a budget the runner then
             // exceeds, which is exactly what this guard exists to prevent.
-            kv_dtype: if req.fp8_kv
-                && state
-                    .readiness
-                    .cc
-                    .is_none_or(|cc| paddock_models::gpu_support::fp8_kv((cc[0], cc[1])))
+            kv_dtype: if req.fp8_kv.unwrap_or_else(|| {
+                row.and_then(|m| m.kv_default.as_deref())
+                    .is_some_and(|k| matches!(k, "fp8_e4m3" | "fp8"))
+            }) && state
+                .readiness
+                .cc
+                .is_none_or(|cc| paddock_models::gpu_support::fp8_kv((cc[0], cc[1])))
             {
                 KvDtype::Fp8E4m3
             } else {
@@ -1400,14 +1521,28 @@ async fn vram_admission(
         // A fixed budget is the endpoint's whole world - price inside it, not
         // inside the card's residual (see bar 2 above).
         let ceiling = req.fixed_need.unwrap_or(residual);
-        let est = estimate(
-            &shape,
-            &env,
-            &Device {
-                free_bytes: ceiling,
-                total_bytes: total,
-            },
-        );
+        let device = Device {
+            free_bytes: ceiling,
+            total_bytes: total,
+        };
+        // A defaulted window is the catalog's target: fit it to this card at
+        // this concurrency before pricing it (fit_window).
+        let mut fitted = None;
+        let est = if req.fit_ctx && shape.kind == paddock_estimator::ModelKind::Generative {
+            let (ctx, est) = fit_window(shape.max_ctx, |ctx| {
+                let mut at = shape.clone();
+                at.max_ctx = ctx;
+                estimate(&at, &env, &device)
+            });
+            if req.max_ctx != Some(ctx as usize) {
+                tracing::info!(model = %req.model, target = ?req.max_ctx, fitted = ctx, "default window fitted to the card");
+                fitted = Some(ctx as usize);
+            }
+            shape.max_ctx = ctx;
+            est
+        } else {
+            estimate(&shape, &env, &device)
+        };
         if let Fit::DoesNotFit { short_by_bytes } = est.fit {
             if let Some(budget) = req.fixed_need {
                 tracing::warn!(model = %req.model, resident = est.resident, budget, "VRAM admission refused a start (configured budget too small for the envelope)");
@@ -1448,7 +1583,10 @@ async fn vram_admission(
         // A verbatim start priced clean: keep the file's own number, never
         // rewrite it from under the operator.
         if req.fixed_need.is_some() {
-            return Ok(None);
+            return Ok(Admitted {
+                grant: None,
+                max_ctx: fitted,
+            });
         }
         let grant_mib = (est.resident + est.kv_pool)
             .max(weights + (3 << 29))
@@ -1460,9 +1598,13 @@ async fn vram_admission(
             resident = est.resident,
             kv_pool = est.kv_pool,
             residual,
+            max_ctx = shape.max_ctx,
             "VRAM admission granted a budget"
         );
-        return Ok(Some(grant_mib));
+        return Ok(Admitted {
+            grant: Some(grant_mib),
+            max_ctx: fitted,
+        });
     }
 
     // No probeable file yet (pre-download spawn, foreign path): the plain
@@ -1479,14 +1621,16 @@ async fn vram_admission(
         .iter()
         .find(|m| m.id == req.model)
         .map_or(0, |m| {
-            crate::estimate::tower_bytes(m, &state.registry)
+            // the floor charges the picture tower whatever the switch (as
+            // it always did); a split model's audio tower by its own
+            crate::estimate::towers_bytes_for(m, &state.registry, None, true, req.audio)
                 + crate::estimate::lane_companion_bytes_for(m, &state.registry, None)
         });
     // Unprobeable + a configured budget: bar 1 already cleared it against the
     // fleet, and there is no shape to price bar 2 with. The engine's own load
     // gate is the remaining guard, as it was before budgets.
     if req.fixed_need.is_some() {
-        return Ok(None);
+        return Ok(Admitted::default());
     }
     // the declared serving workspace is pinned at load like the companions
     let need = weights + mmproj + workspace + ADMIT_FLOOR;
@@ -1503,7 +1647,7 @@ async fn vram_admission(
             eviction: Some(eviction_offer(cands, residual, need)),
         });
     }
-    Ok(None)
+    Ok(Admitted::default())
 }
 
 fn pin_budget_text(text: &str, grant: u64) -> String {
@@ -1521,7 +1665,7 @@ fn pin_budget_text(text: &str, grant: u64) -> String {
 async fn metal_admission(
     state: &Arc<AppState>,
     req: AdmitReq<'_>,
-) -> Result<Option<u64>, AdmissionRefusal> {
+) -> Result<Admitted, AdmissionRefusal> {
     use paddock_estimator::{Device, Envelope, KvDtype};
     let refuse = |message| AdmissionRefusal {
         message,
@@ -1555,7 +1699,7 @@ async fn metal_admission(
             .or_else(|| m.default_weights_for_backend("metal", None))
     });
     let (mut shape, env) = if let (Some(model), Some(artifact)) = (model, artifact) {
-        let shape = crate::estimate::artifact_shape(state, model, artifact, req.vision);
+        let shape = crate::estimate::artifact_shape(state, model, artifact, req.vision, req.audio);
         (
             shape,
             Envelope {
@@ -1579,20 +1723,38 @@ async fn metal_admission(
         )
     };
     let ceiling = req.fixed_need.unwrap_or(free);
+    let mut fitted = None;
     let required = if let Some(shape) = &mut shape {
         shape.max_ctx = shape.max_ctx.min(req.max_ctx.unwrap_or(32768) as u64);
-        if let Some(model) = model {
-            crate::estimate::metal_cache_shape(shape, model, &env);
-        }
-        let estimate = crate::estimate::backend_estimate(
-            "metal",
-            shape,
-            &env,
-            &Device {
-                free_bytes: ceiling,
-                total_bytes: snapshot.limit,
-            },
-        );
+        let device = Device {
+            free_bytes: ceiling,
+            total_bytes: snapshot.limit,
+        };
+        // The cache geometry follows the window, so every try re-derives it.
+        let at = |ctx: u64| {
+            let mut s = shape.clone();
+            s.max_ctx = ctx;
+            if let Some(model) = model {
+                crate::estimate::metal_cache_shape(&mut s, model, &env);
+            }
+            s
+        };
+        // Same fit as CUDA admission: a defaulted window is a target.
+        let ctx = if req.fit_ctx && shape.kind == paddock_estimator::ModelKind::Generative {
+            let ctx = fit_window(shape.max_ctx, |ctx| {
+                crate::estimate::backend_estimate("metal", &at(ctx), &env, &device)
+            })
+            .0;
+            if req.max_ctx != Some(ctx as usize) {
+                fitted = Some(ctx as usize);
+            }
+            ctx
+        } else {
+            shape.max_ctx
+        };
+        let priced = at(ctx);
+        *shape = priced;
+        let estimate = crate::estimate::backend_estimate("metal", shape, &env, &device);
         if matches!(estimate.fit, paddock_estimator::Fit::DoesNotFit { .. })
             || (shape.kind == paddock_estimator::ModelKind::Generative
                 && estimate.max_ctx < shape.max_ctx)
@@ -1626,10 +1788,13 @@ async fn metal_admission(
     if required > ceiling || ceiling < 1 << 20 {
         return Err(refuse("Insufficient unified memory for this model.".into()));
     }
-    Ok(req
-        .fixed_need
-        .is_none()
-        .then_some(required.div_ceil(1 << 20).min(free >> 20)))
+    Ok(Admitted {
+        grant: req
+            .fixed_need
+            .is_none()
+            .then_some(required.div_ceil(1 << 20).min(free >> 20)),
+        max_ctx: fitted,
+    })
 }
 
 // ── runner supervision (doc §3, §5) ─────────────────────────────────────────
@@ -1720,6 +1885,74 @@ async fn relay_systemone(
     body: axum::body::Bytes,
 ) -> Response {
     relay_v1(state, port, "v1/systemone", body).await
+}
+
+async fn relay_masks(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(port): axum::extract::Path<u16>,
+    body: axum::body::Bytes,
+) -> Response {
+    relay_v1(state, port, "v1/masks", body).await
+}
+
+async fn relay_mask_session(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(port): axum::extract::Path<u16>,
+    body: axum::body::Bytes,
+) -> Response {
+    relay_v1(state, port, "v1/masks/sessions", body).await
+}
+
+/// A video session id is the runner's number; anything else never reaches
+/// the runner's path (the refusal, when it is not one).
+fn bad_mask_session_id(id: &str) -> Option<Response> {
+    (id.is_empty() || id.len() > 20 || !id.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| relay_err(StatusCode::BAD_REQUEST, "not a video session id".into()))
+}
+
+async fn relay_mask_frame(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((port, id)): axum::extract::Path<(u16, String)>,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Some(r) = bad_mask_session_id(&id) {
+        return r;
+    }
+    relay_v1(state, port, &format!("v1/masks/sessions/{id}/frames"), body).await
+}
+
+async fn relay_mask_finish(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((port, id)): axum::extract::Path<(u16, String)>,
+) -> Response {
+    if let Some(r) = bad_mask_session_id(&id) {
+        return r;
+    }
+    relay_v1(
+        state,
+        port,
+        &format!("v1/masks/sessions/{id}/finish"),
+        axum::body::Bytes::new(),
+    )
+    .await
+}
+
+async fn relay_mask_drop(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((port, id)): axum::extract::Path<(u16, String)>,
+) -> Response {
+    if let Some(r) = bad_mask_session_id(&id) {
+        return r;
+    }
+    relay_method(
+        state,
+        port,
+        reqwest::Method::DELETE,
+        &format!("v1/masks/sessions/{id}"),
+        "application/json",
+        axum::body::Bytes::new(),
+    )
+    .await
 }
 
 async fn relay_tabular_predictions(
@@ -2321,12 +2554,17 @@ async fn runners_spawn(
     {
         return relay_err(StatusCode::CONFLICT, e);
     }
-    pin_envelope(&mut spec, &state.registry);
-    match vram_admission(&state, AdmitReq::for_spec(&spec, None)).await {
+    let fit_ctx = pin_envelope(&mut spec, &state.registry);
+    let req = AdmitReq {
+        fit_ctx,
+        ..AdmitReq::for_spec(&spec, None)
+    };
+    match vram_admission(&state, req).await {
         Err(msg) => return admission_refused(msg),
         // the grant becomes the endpoint's vram_budget (config-file field);
-        // an explicit caller value was already admitted verbatim
-        Ok(grant) => spec.vram_budget = spec.vram_budget.or(grant),
+        // an explicit caller value was already admitted verbatim. A fitted
+        // default window replaces the target it came from.
+        Ok(admitted) => admitted.apply(&mut spec),
     }
     // every-server connectors join a new endpoint's config at birth (existing
     // configs were rewritten when the checkbox flipped) - a chat feature, so
@@ -2491,11 +2729,15 @@ async fn runners_switch(
     }
     // a takeover frees its own incumbent - that VRAM counts as available;
     // the edit gets a FRESH grant (its envelope may have changed)
-    pin_envelope(&mut spec, &state.registry);
+    let fit_ctx = pin_envelope(&mut spec, &state.registry);
     let _admission = state.admission.lock().await;
-    match vram_admission(&state, AdmitReq::for_spec(&spec, Some(port))).await {
+    let req = AdmitReq {
+        fit_ctx,
+        ..AdmitReq::for_spec(&spec, Some(port))
+    };
+    match vram_admission(&state, req).await {
         Err(msg) => return admission_refused(msg),
-        Ok(grant) => spec.vram_budget = spec.vram_budget.or(grant),
+        Ok(admitted) => admitted.apply(&mut spec),
     }
     let _ = state.db.note_start_cause(port, "manual");
     match state
@@ -2632,10 +2874,7 @@ async fn servers_file_put(
             fixed_need: get_int("vram_budget").map(|n| (n.max(0) as u64) << 20),
             max_batch: get_int("max_batch").map(|n| n as usize),
             max_ctx: get_int("max_ctx").map(|n| n as usize),
-            fp8_kv: matches!(
-                doc.get("kv_cache_dtype").and_then(toml::Value::as_str),
-                Some("fp8_e4m3" | "fp8")
-            ),
+            fp8_kv: kv_ask(doc.get("kv_cache_dtype").and_then(toml::Value::as_str)),
             // same verbatim rule as `mmproj` below: the FILE's own block is
             // the answer on this path, not anything the manager remembers
             offload_ram_bytes: doc.get("kv_offload").and_then(|k| {
@@ -2653,10 +2892,16 @@ async fn servers_file_put(
             // The runner attaches the tower whenever `mmproj` names a file,
             // so on this verbatim path the file's own key is the answer.
             vision: doc.get("mmproj").is_some(),
+            // and an audio tower when `audio_mmproj` names one
+            audio: Some(doc.get("audio_mmproj").is_some()),
+            // a saved file's window is the file's - priced as written
+            fit_ctx: false,
         };
         match vram_admission(&state, req).await {
             Err(msg) => return admission_refused(msg),
-            Ok(Some(grant)) if state.readiness.backend == "metal" => {
+            Ok(Admitted {
+                grant: Some(grant), ..
+            }) if state.readiness.backend == "metal" => {
                 body.content = pin_budget_text(&body.content, grant);
             }
             _ => {}
@@ -2891,7 +3136,9 @@ async fn start_saved(state: Arc<AppState>, port: u16, evict: Vec<u16>, cause: &s
     {
         match vram_admission(&state, AdmitReq::for_spec(&spec, None)).await {
             Err(msg) => return admission_refused(msg),
-            Ok(Some(grant)) if state.readiness.backend == "metal" => {
+            Ok(Admitted {
+                grant: Some(grant), ..
+            }) if state.readiness.backend == "metal" => {
                 let Ok((text, hash)) = state.supervisor.read_config_file(port) else {
                     return relay_err(
                         StatusCode::BAD_REQUEST,
@@ -3430,6 +3677,46 @@ mod tests {
         assert_eq!(before, after);
         assert!(pinned.starts_with("# operator settings"));
         assert_eq!(pin_budget_text(&pinned, 99999), pinned);
+    }
+
+    /// The fit-aware default (decided 2026-10-04): a defaulted window is the
+    /// catalog target when the card backs it at the default slot count, the
+    /// largest Studio rung under it when not, and never more than the card.
+    /// Priced by the real estimator on qwen3.8's published Q8_0 shape.
+    #[test]
+    fn a_default_window_fits_onto_the_studio_ladder() {
+        use paddock_estimator::{Device, Envelope, KvDtype, estimate};
+        let registry = crate::registry::Registry::new(std::env::temp_dir());
+        let a = registry
+            .catalog_of("qwen3.8-27b")
+            .and_then(|m| m.artifact("q8"))
+            .unwrap();
+        let shape = a.shape.clone().unwrap().into_model_shape(0, 0);
+        let env = Envelope {
+            concurrency: 4,
+            kv_dtype: KvDtype::Fp8E4m3,
+            spec: None,
+            offload: None,
+        };
+        let fit = |gib: u64| {
+            let dev = Device {
+                free_bytes: gib << 30,
+                total_bytes: gib << 30,
+            };
+            fit_window(262144, |ctx| {
+                let mut s = shape.clone();
+                s.max_ctx = ctx;
+                estimate(&s, &env, &dev)
+            })
+        };
+        // a Spark-class budget backs the whole window at 4 slots
+        assert_eq!(fit(100).0, 262144);
+        // a 48 GB card does not; it lands on a rung, and that rung fits
+        let (ctx, est) = fit(44);
+        assert!(CTX_STEPS.contains(&ctx) && ctx < 262144, "{ctx}");
+        assert!(est.max_ctx >= ctx, "{} < {ctx}", est.max_ctx);
+        // more card never buys less window
+        assert!(fit(36).0 <= ctx && ctx <= fit(100).0);
     }
 
     /// An image lane gets no envelope pinned: the first image endpoint's

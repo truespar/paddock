@@ -14,12 +14,16 @@ pub struct EmbeddingRequest {
     pub model: String,
     /// string | array of strings | array of token ids | array of token-id arrays.
     pub input: serde_json::Value,
-    /// "float" (default) or "base64". Only "float" supported so far.
+    /// "float" (default) or "base64" little-endian f32 bytes.
     #[serde(default)]
     pub encoding_format: Option<String>,
-    /// Truncate/project the embedding to N dims (Matryoshka). Not supported yet.
+    /// Matryoshka prefix width; accepted only by models trained for it.
     #[serde(default)]
     pub dimensions: Option<usize>,
+    /// Optional published task prompt, for task-aware embedding models.
+    /// Omitted means raw input: callers can supply their own exact prefix.
+    #[serde(default)]
+    pub task: Option<String>,
     /// Telemetry hint, accepted and unused.
     #[serde(default)]
     pub user: Option<String>,

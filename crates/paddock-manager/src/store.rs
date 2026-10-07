@@ -16,6 +16,7 @@ use uuid::Uuid;
 mod connections;
 mod downloads;
 mod integrations;
+mod mask_history;
 mod model_profiles;
 mod native_benchmarks;
 mod prompts;
@@ -23,6 +24,8 @@ mod read_history;
 mod read_history_migration;
 mod read_runs;
 mod reads;
+mod settings;
+pub(crate) use settings::SECRET_PREFIX;
 mod table_history;
 
 pub struct Store {
@@ -406,18 +409,6 @@ CREATE TABLE IF NOT EXISTS read_history (
     updated_at INTEGER NOT NULL,
     doc        TEXT NOT NULL
 );
-
-CREATE TABLE IF NOT EXISTS table_history (
-    id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
-    model TEXT NOT NULL,
-    runs INTEGER NOT NULL,
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL,
-    revision TEXT NOT NULL,
-    doc TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS table_history_recent ON table_history(updated_at DESC, id);
 
 -- the native app's bounded result history (store/read_runs.rs): the last
 -- results per question set, a short excerpt and never the document
@@ -875,6 +866,8 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         downloads::migrate(&conn)?;
         connections::migrate(&conn)?;
+        table_history::migrate(&conn)?;
+        mask_history::migrate(&conn)?;
         // Hygiene migration: MODEL configuration must never live
         // in this database - it is each endpoint's servers/<port>.toml,
         // entirely. Older schemas kept an mcp_servers table and a
@@ -1667,66 +1660,6 @@ impl Store {
             )
             .optional()?;
         Ok(row)
-    }
-
-    // ── settings ─────────────────────────────────────────────────────────────
-
-    pub fn all_settings(&self) -> Result<Value, StoreError> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare("SELECT key, value FROM settings")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        let mut map = serde_json::Map::new();
-        for row in rows {
-            let (k, v) = row?;
-            map.insert(k, serde_json::from_str(&v).unwrap_or(Value::Null));
-        }
-        Ok(Value::Object(map))
-    }
-
-    pub fn set_setting(&self, key: &str, value: &Value) -> Result<(), StoreError> {
-        let v = serde_json::to_string(value).map_err(|e| StoreError::Bad(e.to_string()))?;
-        self.lock().execute(
-            "INSERT INTO settings (key, value) VALUES (?1,?2)
-             ON CONFLICT(key) DO UPDATE SET value=?2",
-            params![key, v],
-        )?;
-        Ok(())
-    }
-
-    /// Commit a settings patch as one unit. Imports never overwrite an existing
-    /// key (including a null tombstone), even with simultaneous Studio clients.
-    pub fn patch_settings(&self, patch: &Value, import: bool) -> Result<(), StoreError> {
-        let map = patch
-            .as_object()
-            .ok_or_else(|| StoreError::Bad("settings must be an object".into()))?;
-        if map.len() > 128 || patch.to_string().len() > 1024 * 1024 {
-            return Err(StoreError::Bad("settings patch is too large".into()));
-        }
-        for key in map.keys() {
-            if key.is_empty() || key.len() > 160 {
-                return Err(StoreError::Bad("invalid setting key".into()));
-            }
-            if import && !key.starts_with("studio.") && key != "readsPanelOpen" {
-                return Err(StoreError::Bad(
-                    "only Studio preferences can be imported".into(),
-                ));
-            }
-        }
-        let mut conn = self.lock();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        for (key, value) in map {
-            tx.execute(
-                if import {
-                    "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)"
-                } else {
-                    "INSERT INTO settings (key, value) VALUES (?1, ?2)
-                     ON CONFLICT(key) DO UPDATE SET value=excluded.value"
-                },
-                params![key, value.to_string()],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
     }
 
     // ── api keys ─────────────────────────────────────────────────────────────

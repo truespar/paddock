@@ -1505,6 +1505,64 @@ impl GpuExecutor {
 
     /// Fused post-norm + residual + scale: `x = (x + rmsnorm(proj)·w)·s`.
     #[allow(clippy::too_many_arguments)]
+    /// A sandwich block's post-norm fused with the NEXT norm (slot 777):
+    /// `x += rmsnorm(proj) * w_post * s`, then `xn = rmsnorm(x) * w_pre` into
+    /// the f32 plane and/or its bf16 copy - bit-identical to
+    /// [`Self::rmsnorm_add_scale`] + `rmsnorm_batch` (+ `convert_f32_bf16`).
+    /// `Ok(false)` (nothing launched) when the pack lacks the slot or the
+    /// shape is outside its band (rows < 256, ragged or unaligned planes):
+    /// the caller runs the pair.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_add_scale_norm(
+        &self,
+        x: &mut CudaSlice<f32>,
+        proj: &CudaSlice<f32>,
+        w_post: &CudaSlice<f32>,
+        w_pre: &CudaSlice<f32>,
+        xn: Option<&mut CudaSlice<f32>>,
+        x16: Option<&mut CudaSlice<half::bf16>>,
+        n: usize,
+        eps: f32,
+        s: f32,
+        rows: usize,
+    ) -> Result<bool, GpuError> {
+        let Some(f) = self.kernels.rmsnorm_add_scale_norm else {
+            return Ok(false);
+        };
+        if rows < 256 || !n.is_multiple_of(4) {
+            return Ok(false);
+        }
+        let (xp, _g1) = x.device_ptr_mut(&self.stream);
+        let (pp, _g2) = proj.device_ptr(&self.stream);
+        let (wa, _g3) = w_post.device_ptr(&self.stream);
+        let (wb, _g4) = w_pre.device_ptr(&self.stream);
+        let xn = xn.map(|v| v.device_ptr_mut(&self.stream));
+        let x16 = x16.map(|v| v.device_ptr_mut(&self.stream));
+        // SAFETY: ABI contract (slot 777); every plane holds rows * n
+        let rc = unsafe {
+            f(
+                xp as *mut _,
+                pp as *const _,
+                wa as *const _,
+                wb as *const _,
+                xn.as_ref()
+                    .map_or(std::ptr::null_mut(), |(p, _)| *p as *mut _),
+                x16.as_ref()
+                    .map_or(std::ptr::null_mut(), |(p, _)| *p as *mut _),
+                n as u32,
+                eps,
+                s,
+                rows as u32,
+                self.stream_ptr(),
+            )
+        };
+        if rc == -2 {
+            return Ok(false);
+        }
+        check(rc)?;
+        Ok(true)
+    }
+
     pub fn rmsnorm_add_scale(
         &self,
         x: &mut CudaSlice<f32>,

@@ -9,6 +9,23 @@ const LIMIT: usize = 64 * 1024 * 1024;
 #[path = "table_history_tests.rs"]
 mod tests;
 
+pub(super) fn migrate(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS table_history (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            model TEXT NOT NULL,
+            runs INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            revision TEXT NOT NULL,
+            doc TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS table_history_recent ON table_history(updated_at DESC, id);",
+    )?;
+    Ok(())
+}
+
 fn hash(text: &str) -> String {
     Sha256::digest(text.as_bytes())
         .iter()

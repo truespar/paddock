@@ -54,21 +54,26 @@ pub(super) const MIN_SNAPSHOT_LEN: usize = 3 * BLOCK_TOKENS;
 /// A resume must skip at least this much, or the restore costs more than the
 /// rows it saves (two pages).
 const MIN_RESUME: usize = 2 * BLOCK_TOKENS;
-/// In-walk cuts a walk carries at most (a prompt's two), so staging blobs.
-pub(super) const STAGED_CUTS: usize = 2;
+/// In-walk cuts a walk carries at most (a prompt's three: the trailing pair
+/// and the back-off boundary), so staging blobs.
+pub(super) const STAGED_CUTS: usize = 3;
 
 /// The checkpoint boundaries for a prompt: its last two full page boundaries,
 /// ascending ([0, 0] when the prompt is too short). Two, not one: a re-rendered
 /// multi-turn history diverges inside the trailing generation header, and
 /// whenever the prompt's final partial page is shorter than that header the
 /// divergence crosses the last boundary - a checkpoint only there is
-/// unreachable for the next turn (the qwen35 law).
-pub(super) fn ckpt_cuts(t_len: usize) -> [usize; 2] {
+/// unreachable for the next turn (the qwen35 law). Ahead of them the back-off
+/// boundary (`prefix_cache::backoff_cut`, 0 when the prompt is too short): a
+/// prompt whose tail was rewritten - same document, new question - resumes
+/// there instead of re-prefilling whole. Every cut stages in the walk.
+pub(super) fn ckpt_cuts(t_len: usize) -> [usize; 3] {
     if t_len < MIN_SNAPSHOT_LEN {
-        return [0, 0];
+        return [0, 0, 0];
     }
     let b1 = (t_len - 1) / BLOCK_TOKENS * BLOCK_TOKENS;
-    [b1.saturating_sub(BLOCK_TOKENS), b1]
+    let back = crate::gpu_model::prefix_cache::backoff_cut(b1, BLOCK_TOKENS).unwrap_or(0);
+    [back, b1.saturating_sub(BLOCK_TOKENS), b1]
 }
 
 /// One checkpoint's record, in f32 elements: per GDN layer, in layer order,

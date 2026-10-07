@@ -88,9 +88,10 @@ pub(super) fn plan_pool(
         let p = cb.div_ceil(block_bytes.max(1)) as usize;
         let (must, want) = crate::ckpt_pages::page_demand(slots, p, CKPTS_PER_SLOT);
         (ckpt_blocks, retention, ppc) = (must, want, Some(p));
-        // a walk's in-walk cuts stage flat (two a walk) before they commit
-        // into pages
-        reserves.push(kv_plan::Reserve::new("checkpoint staging", 2 * cb));
+        // a walk's in-walk cuts stage flat (STAGED_CUTS a walk) before they
+        // commit into pages
+        let staged = super::prefix::STAGED_CUTS as u64;
+        reserves.push(kv_plan::Reserve::new("checkpoint staging", staged * cb));
     }
     let demand = kv_plan::Demand {
         family: "qwen4exp",

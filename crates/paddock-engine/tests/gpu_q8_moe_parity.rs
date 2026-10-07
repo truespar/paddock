@@ -1173,4 +1173,66 @@ fn q8_moe_up_relu2_matches_cpu() {
         max_band < 0.05,
         "lanes disagree beyond requantization noise: {max_band}"
     );
+
+    // ---- the int8-MMA pair on the same routing: BITWISE vs the dp4a pair ----
+    // (slot 743's relu^2 up writes fq/fs in its epilogue; the down is the
+    // shared mma down). Same k32 integer dots, same scale fold order, same
+    // relu^2 and per-32 rounding - so the quantized plane, and with it the
+    // combined output, must be the same bits, tails included (in_dim 160 and
+    // ff 96 put a ragged K chunk and a half-empty 64-row strip on the path).
+    if !exec.has_q8_moe_relu2_mma() {
+        common::missing("pack lacks q8_0_moe_up_relu2_mma (slot 743)");
+        return;
+    }
+    let mut d_fq3: CudaSlice<i8> = exec.alloc_i8(max_blocks * 32 * ff).expect("fq3");
+    let mut d_fs3 = exec.alloc(max_blocks * 32 * ff / 32).expect("fs3");
+    exec.q8_0_moe_up_relu2_mma(
+        &up, &srow, &bexp, &d_xq, &d_xs, &mut d_fq3, &mut d_fs3, max_blocks, 32,
+    )
+    .expect("up relu2 mma");
+    let fq3_host: Vec<i8> = exec.to_host_i8(&d_fq3).expect("fq3 back");
+    let fs3_host = exec.to_host(&d_fs3).expect("fs3 back");
+    let fq_mismatch = fq3_host
+        .iter()
+        .zip(&fq2_host)
+        .filter(|(a, b)| a != b)
+        .count();
+    let fs_mismatch = fs3_host
+        .iter()
+        .zip(&fs2_host)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    eprintln!("q8 relu2 mma vs dp4a: fq {fq_mismatch} / fs {fs_mismatch} mismatches");
+    assert_eq!(
+        (fq_mismatch, fs_mismatch),
+        (0, 0),
+        "relu2 mma up is not bitwise"
+    );
+    let mut d_part3 = exec.alloc(batch * n_active * in_dim).expect("part3");
+    exec.q8_0_moe_down_mma(
+        &down,
+        &srow,
+        &sslot,
+        &bexp,
+        &d_w,
+        &d_fq3,
+        &d_fs3,
+        &mut d_part3,
+        n_active,
+        max_blocks,
+        32,
+    )
+    .expect("down mma");
+    let mut d_out_m = exec.alloc(batch * in_dim).expect("out m");
+    exec.stream.memset_zeros(&mut d_out_m).expect("zero");
+    exec.moe_slot_combine(&d_part3, &mut d_out_m, in_dim, n_active, batch)
+        .expect("combine m");
+    let out_mma = exec.to_host(&d_out_m).expect("out mma back");
+    let out_mismatch = out_mma
+        .iter()
+        .zip(&out_sorted)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    eprintln!("q8 relu2 mma pair vs dp4a pair: {out_mismatch} output mismatches");
+    assert_eq!(out_mismatch, 0, "relu2 mma pair is not bitwise");
 }

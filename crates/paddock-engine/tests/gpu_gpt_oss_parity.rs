@@ -70,6 +70,8 @@ fn forward_batch_matches_single_stream() {
 
     // single-stream: prefill, then the next-token logits
     let mut single = GpuGptOss::load(std::sync::Arc::new(exec), &map, 512).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    single.set_kv_dtype(KvDtype::Fp16);
     single.reset();
     let mut logits = Vec::new();
     for &t in &prompt {
@@ -183,6 +185,8 @@ fn forward_prefill_prefix_cache_reuse() {
         (num.sqrt() / den.sqrt().max(1e-12)) as f32
     };
     let mut m = GpuGptOss::load(std::sync::Arc::new(exec), &map, 512).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    m.set_kv_dtype(KvDtype::Fp16);
     let single_last = |m: &mut GpuGptOss, seq: &[u32]| -> Vec<f32> {
         m.reset();
         let mut l = Vec::new();
@@ -294,6 +298,8 @@ fn forward_prefill_batch_matches_single_stream() {
         .collect();
 
     let mut m = GpuGptOss::load(std::sync::Arc::new(exec), &map, 512).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    m.set_kv_dtype(KvDtype::Fp16);
     let single = |m: &mut GpuGptOss, seq: &[u32]| -> Vec<f32> {
         m.reset();
         let mut l = Vec::new();
@@ -394,6 +400,8 @@ fn forward_prefill_radix_multi_entry() {
         (num.sqrt() / den.sqrt().max(1e-12)) as f32
     };
     let mut m = GpuGptOss::load(std::sync::Arc::new(exec), &map, 512).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    m.set_kv_dtype(KvDtype::Fp16);
     let single = |m: &mut GpuGptOss, seq: &[u32]| -> Vec<f32> {
         m.reset();
         let mut l = Vec::new();
@@ -495,6 +503,8 @@ fn forward_prefill_matches_single_stream() {
     };
 
     let mut m = GpuGptOss::load(std::sync::Arc::new(exec), &map, 512).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    m.set_kv_dtype(KvDtype::Fp16);
     // single-stream reference: last logits, then the step after the greedy token
     m.reset();
     let mut single_last = Vec::new();
@@ -565,6 +575,8 @@ fn forward_batch_heterogeneous_positions() {
 
     // Independent single-stream greedy references (own KV cache, reset between).
     let mut m = GpuGptOss::load(std::sync::Arc::new(exec), &map, 512).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    m.set_kv_dtype(KvDtype::Fp16);
     let greedy = |m: &mut GpuGptOss, prompt: &[u32], n: usize| -> Vec<u32> {
         m.reset();
         let mut logits = Vec::new();
@@ -669,6 +681,8 @@ fn profile_moe_b64() {
     };
     let map = MappedGguf::open(&model_path).expect("open");
     let mut gpu = GpuGptOss::load(std::sync::Arc::new(exec), &map, 1024).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    gpu.set_kv_dtype(KvDtype::Fp16);
     gpu.enable_batch(64).expect("enable_batch");
     let toks: Vec<u32> = vec![100u32; 64];
     for s in 0..40u32 {
@@ -693,6 +707,8 @@ fn batched_aggregate_throughput() {
     };
     let map = MappedGguf::open(&model_path).expect("open");
     let mut gpu = GpuGptOss::load(std::sync::Arc::new(exec), &map, 1024).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    gpu.set_kv_dtype(KvDtype::Fp16);
     let max_batch = 64usize;
     gpu.enable_batch(max_batch).expect("enable_batch");
     let steps = 64usize;
@@ -734,6 +750,8 @@ fn prefill_timing() {
     };
     let map = MappedGguf::open(&model_path).expect("open");
     let mut m = GpuGptOss::load(std::sync::Arc::new(exec), &map, 1024).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    m.set_kv_dtype(KvDtype::Fp16);
     m.enable_batch(16).expect("enable_batch");
     // COLD prefill: every iteration gets a DISTINCT prompt (varied from token 0)
     // so the radix prefix cache never matches. Re-running one prompt measured
@@ -784,6 +802,8 @@ fn decode_launch_bound_probe() {
         .encode("The three laws of robotics are")
         .expect("encode");
     let mut gpu = GpuGptOss::load(std::sync::Arc::new(exec), &map, 512).expect("gpu load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    gpu.set_kv_dtype(KvDtype::Fp16);
     // small N fills GPU bubbles between a few tokens (graphs-help signal) without
     // overflowing the WDDM command queue (which large N does, confounding it).
     for n in [2usize, 4, 8, 32, 128] {
@@ -813,6 +833,8 @@ fn b1_long_context_decode_latency() {
     };
     let map = MappedGguf::open(&model_path).expect("open");
     let mut gpu = GpuGptOss::load(std::sync::Arc::new(exec), &map, 4096).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    gpu.set_kv_dtype(KvDtype::Fp16);
     gpu.enable_batch(1).expect("enable_batch");
     let steps = 32usize;
 
@@ -940,6 +962,8 @@ fn spec_greedy_matches_plain_greedy() {
     // dp4a decode and mmq verify kernels. Pin one class end to end.
     paddock_engine::gpu_model::gpt_oss::set_moe_bs(false);
     let mut gpu = GpuGptOss::load(std::sync::Arc::new(exec), &map, 2048).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    gpu.set_kv_dtype(KvDtype::Fp16);
     let text = "Convert each item to a JSON object with fields name, id and \
                 price, one per line:\napple 1 3.50\nbanana 2 1.25\ncherry 3 \
                 8.00\ndamson 4 2.75\nelderberry 5 9.10\nfig 6 4.20\ngrape 7 \
@@ -983,6 +1007,8 @@ fn spec_batch_matches_plain_batch() {
     let map = MappedGguf::open(&model_path).expect("open");
     let tok = GgufTokenizer::from_gguf(map.gguf()).expect("tokenizer");
     let mut gpu = GpuGptOss::load(std::sync::Arc::new(exec), &map, 2048).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    gpu.set_kv_dtype(KvDtype::Fp16);
     let b = 3usize;
     gpu.enable_batch(b).expect("enable_batch");
     let vocab = 201088usize;
@@ -1159,6 +1185,8 @@ fn paged_prefix_reuse_swa_checkpoint() {
     // scatter - so each path is deterministic run-to-run; the old set_moe_tc
     // pin targeted the deleted f32-sorted lane)
     let mut m = GpuGptOss::load(std::sync::Arc::new(exec), &map, 512).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    m.set_kv_dtype(KvDtype::Fp16);
     // cold single-stream references (no pool, no reuse)
     let single_last = |m: &mut GpuGptOss, seq: &[u32]| -> Vec<f32> {
         m.reset();
@@ -1268,6 +1296,8 @@ fn paged_prefix_reuse_mixed_path() {
     };
 
     let mut m = GpuGptOss::load(std::sync::Arc::new(exec), &map, 512).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    m.set_kv_dtype(KvDtype::Fp16);
     let single_last = |m: &mut GpuGptOss, seq: &[u32]| -> Vec<f32> {
         m.reset();
         let mut l = Vec::new();
@@ -1393,6 +1423,8 @@ fn spec_batch_under_pool_grows_span() {
             unsafe { std::env::set_var("PADDOCK_NO_SPEC_POOL_GROW", "1") };
         }
         let mut m = GpuGptOss::load(std::sync::Arc::new(exec), &map, 512).expect("load");
+        // the exact class this test is stated in (the KV8 default is lossy)
+        m.set_kv_dtype(KvDtype::Fp16);
         m.enable_batch(2).expect("batch");
         assert!(m.pool_active());
         m.forward_prefill(0, &prompt[..s]).expect("prefill");
@@ -1415,6 +1447,8 @@ fn spec_batch_under_pool_grows_span() {
         let exec = GpuExecutor::new(0, &pack).expect("exec");
         let map = MappedGguf::open(&model_path).expect("open");
         let mut m = GpuGptOss::load(std::sync::Arc::new(exec), &map, 512).expect("load ref");
+        // the exact class this test is stated in (the KV8 default is lossy)
+        m.set_kv_dtype(KvDtype::Fp16);
         m.reset();
         let mut l = Vec::new();
         for &t in &prompt[..=s] {

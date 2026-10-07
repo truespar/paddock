@@ -17,7 +17,7 @@ import MenuTrigger from '@/components/ui/MenuTrigger.vue'
 import Tooltip from '@/components/ui/Tooltip.vue'
 
 const props = withDefaults(defineProps<{
-  noun?: 'read' | 'table'
+  noun?: 'read' | 'table' | 'picture'
   reads: ReadSummary[]
   activeId: string | null
   loaded: boolean
@@ -93,8 +93,11 @@ function when(ts: number): string {
     sameYear ? { month: 'short', day: 'numeric' } : { month: 'short', day: 'numeric', year: 'numeric' },
   )
 }
+// a picture's count is its prompts that found something, not runs
+const unit = computed(() => (props.noun === 'picture' ? 'prompt' : 'run'))
+const icon = computed(() => (props.noun === 'table' ? 'table' : props.noun === 'picture' ? 'masks' : 'list-checks'))
 function detail(r: ReadSummary): string {
-  const runs = `${r.runs} run${r.runs === 1 ? '' : 's'}`
+  const runs = `${r.runs} ${unit.value}${r.runs === 1 ? '' : 's'}`
   return `${r.title} · ${runs} · ${r.model || 'no model'} · ${new Date(r.updatedAt).toLocaleString()}`
 }
 </script>
@@ -148,7 +151,7 @@ function detail(r: ReadSummary): string {
             :aria-current="r.id === activeId ? 'true' : undefined"
             @click.stop="onRow(r)"
           >
-            <Icon :name="noun === 'table' ? 'table' : 'list-checks'" :size="13" class="rrow__kind" />
+            <Icon :name="icon" :size="13" class="rrow__kind" />
             <Tooltip :label="detail(r)"><span class="rrow__title">{{ r.title }}</span></Tooltip>
           </button>
           <span class="rrow__right" @click.stop>
@@ -185,8 +188,9 @@ function detail(r: ReadSummary): string {
     @close="pendingDelete = null"
   >
     <p class="rsb__confirm">
-      <strong>{{ pendingDelete?.title }}</strong> and its runs will be permanently removed. This can't
-      be undone.
+      <strong>{{ pendingDelete?.title }}</strong> and its
+      {{ noun === 'picture' ? 'masks and snapshots' : 'runs' }} will be permanently removed. This
+      can't be undone.
     </p>
     <template #footer>
       <button class="pk-btn pk-btn--ghost" type="button" @click="pendingDelete = null">Cancel</button>

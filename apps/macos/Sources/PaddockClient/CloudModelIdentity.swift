@@ -11,7 +11,7 @@ public enum CloudModelIdentity {
     "moonshotai": "Moonshot", "x-ai": "xAI", "qwen": "Alibaba", "alibaba": "Alibaba",
     "perplexity": "Perplexity", "baidu": "Baidu", "bytedance": "ByteDance", "minimax": "MiniMax",
     "poolside": "Poolside", "ibm": "IBM", "cohere": "Cohere", "huggingface": "Hugging Face",
-    "openrouter": "OpenRouter",
+    "openrouter": "OpenRouter", "aleph-alpha": "Aleph Alpha",
   ]
   public static func vendor(_ id: String) -> String? {
     let s = id.lowercased()
@@ -26,6 +26,7 @@ public enum CloudModelIdentity {
       (["claude"], "Anthropic"), (["gemini", "gemma"], "Google"), (["qwen"], "Alibaba"),
       (["granite"], "IBM"), (["llama"], "Meta"), (["grok"], "xAI"), (["kimi"], "Moonshot"),
       (["glm"], "Z.ai"), (["deepseek"], "DeepSeek"), (["mistral", "mixtral"], "Mistral"),
+      (["kolibri"], "Aleph Alpha"),
     ] { if needles.contains(where: s.contains) { return vendor } }
     return nil
   }

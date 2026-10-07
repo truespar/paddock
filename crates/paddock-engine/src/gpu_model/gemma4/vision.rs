@@ -138,8 +138,10 @@ pub struct VisionModel {
     max_tokens: usize,
     conv: HalfTensor, // [3*patch*patch, embd] flattened conv-as-GEMM
     blocks: Vec<VBlock>,
-    std_bias: Vec<f32>,
-    std_scale: Vec<f32>,
+    /// The pooled tokens' standardization (bias, scale) - Gemma 4's own
+    /// mmprojs carry it; EmbeddingGemma 2's tower (the E2B/E4B geometry)
+    /// does not, and llama.cpp's gemma4v graph skips the step when absent.
+    std: Option<(Vec<f32>, Vec<f32>)>,
     mm_proj: HalfTensor, // [embd, llm_embd]
     ones_hd: CudaSlice<f32>,
 }
@@ -228,8 +230,17 @@ impl VisionModel {
         }
         let pos_size = pd[1];
 
-        let (std_bias, _) = host_f32(map, "v.std_bias")?;
-        let (std_scale, _) = host_f32(map, "v.std_scale")?;
+        let std = match (
+            map.tensor_info("v.std_bias").is_some(),
+            map.tensor_info("v.std_scale").is_some(),
+        ) {
+            (true, true) => Some((
+                host_f32(map, "v.std_bias")?.0,
+                host_f32(map, "v.std_scale")?.0,
+            )),
+            (false, false) => None,
+            _ => return Err(GpuError::Driver("mmproj carries half of v.std_*".into())),
+        };
 
         // `dt` = f16 GEMM plane (the file's bf16 narrowed, checked); `vf` = f32
         // norm vector. Everything this tower multiplies goes through `dt`.
@@ -270,8 +281,7 @@ impl VisionModel {
             max_tokens: resolved_max_tokens(pos_size, max_image_tokens),
             conv,
             blocks,
-            std_bias,
-            std_scale,
+            std,
             mm_proj,
             ones_hd,
         };
@@ -362,6 +372,19 @@ impl VisionModel {
     pub fn preprocess_rgb(&self, rgb: &[u8], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
         let (tw, th) = self.resize_target(w, h);
         let resized = resize_bilinear_u8(rgb, w, h, tw, th);
+        self.patches_from_rgb(&resized, tw, th)
+    }
+
+    /// im2row patches of an image ALREADY at its target size (sides whole
+    /// output tokens, `patch * 3` px), with the graph's ×2-1 scaling folded
+    /// in - for a caller that runs its own processor's resize (EmbeddingGemma
+    /// 2 resizes as Hugging Face's Gemma 4 processor does).
+    pub fn patches_from_rgb(
+        &self,
+        resized: &[u8],
+        tw: usize,
+        th: usize,
+    ) -> (Vec<f32>, usize, usize) {
         let (gw, gh) = (tw / self.patch, th / self.patch);
         let pp = self.patch * self.patch;
         let mut out = vec![0f32; gw * gh * 3 * pp];
@@ -487,8 +510,11 @@ impl VisionModel {
                 }
                 let inv = scale / (N_MERGE * N_MERGE) as f32;
                 for (e, d) in dst.iter_mut().enumerate() {
-                    // pooled·√embd -> (h - std_bias)·std_scale
-                    *d = (*d * inv - self.std_bias[e]) * self.std_scale[e];
+                    // pooled·√embd -> (h - std_bias)·std_scale, when carried
+                    *d *= inv;
+                    if let Some((bias, scale)) = &self.std {
+                        *d = (*d - bias[e]) * scale[e];
+                    }
                 }
                 // weightless RMS norm
                 let ms = dst.iter().map(|v| v * v).sum::<f32>() / embd as f32;

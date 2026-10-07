@@ -6,7 +6,25 @@ pub trait EncoderBackend {
     type Pending;
     fn weights_mem_bytes(&self) -> Option<u64>;
     fn device_mem_used(&self) -> Option<u64>;
+    /// Opt-in scratch reclamation after this much queue-and-device idle time.
+    /// Return None once reclaimed to avoid waking a completely idle runner.
+    fn idle_reclaim_after(&self) -> Option<std::time::Duration> {
+        None
+    }
+    /// Called only with no queued or uncollected work. Never evict weights.
+    fn reclaim_idle(&mut self) {}
     fn coalesce_row_budget(&self) -> usize;
+    /// How long an IDLE encoder holds a lone job after a merged batch, to
+    /// catch its clients' turnaround burst: (wait for a second job, trailing
+    /// wait per further arrival). None launches at once. The default suits
+    /// a pass with a large fixed cost; a backend whose small pass is cheap
+    /// does better launching and letting the in-flight merge absorb the rest.
+    fn burst_windows(&self) -> Option<(std::time::Duration, std::time::Duration)> {
+        Some((
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(5),
+        ))
+    }
     /// Validate each request before merging, so one malformed caller cannot
     /// fail unrelated callers sharing its GPU batch. No device work here.
     fn validate(&self, _seqs: &[Vec<u32>]) -> Result<(), String> {
@@ -18,6 +36,53 @@ pub trait EncoderBackend {
     }
     fn pool_ready(&self, pending: &Self::Pending) -> bool;
     fn embed_submit(&mut self, seqs: &[Vec<u32>], lane: usize) -> Result<Self::Pending, String>;
+    fn validate_dimensions(&self, dimensions: Option<usize>) -> Result<(), String> {
+        if dimensions.is_some() {
+            Err("this encoder does not support Matryoshka dimensions".into())
+        } else {
+            Ok(())
+        }
+    }
+    fn embed_submit_dimensions(
+        &mut self,
+        seqs: &[Vec<u32>],
+        lane: usize,
+        dimensions: Option<usize>,
+    ) -> Result<Self::Pending, String> {
+        self.validate_dimensions(dimensions)?;
+        self.embed_submit(seqs, lane)
+    }
+    /// Admission for a sequence batch that may carry media (`media[i]` is
+    /// sequence i's pictures / clips, placeholder-run order). A text-only
+    /// backend accepts only empty media lists.
+    fn validate_media(
+        &self,
+        seqs: &[Vec<u32>],
+        media: &[Vec<crate::service::MmChunk>],
+    ) -> Result<(), String> {
+        if media.iter().any(|m| !m.is_empty()) {
+            return Err("this encoder embeds text only".into());
+        }
+        self.validate(seqs)
+    }
+    /// The media this backend embeds: (pictures, audio). Known once built
+    /// (an mmproj may carry a tower the pack cannot run).
+    fn media_kinds(&self) -> (bool, bool) {
+        (false, false)
+    }
+    /// Submit with media; a text-only backend takes the text path.
+    fn embed_submit_media(
+        &mut self,
+        seqs: &[Vec<u32>],
+        media: &[Vec<crate::service::MmChunk>],
+        lane: usize,
+        dimensions: Option<usize>,
+    ) -> Result<Self::Pending, String> {
+        if media.iter().any(|m| !m.is_empty()) {
+            return Err("this encoder embeds text only".into());
+        }
+        self.embed_submit_dimensions(seqs, lane, dimensions)
+    }
     fn embed_collect(&mut self, pending: &Self::Pending) -> Result<Vec<Vec<f32>>, String>;
     fn rerank_submit(
         &mut self,
@@ -61,6 +126,92 @@ pub trait EncoderBackend {
     }
     fn export_smooth(&self) -> Result<Option<Vec<u8>>, String> {
         Ok(None)
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl EncoderBackend for crate::gpu_model::embedding_gemma2::GpuEmbeddingGemma2 {
+    type Pending = crate::gpu_model::embedding_gemma2::PendingEmbedding;
+    fn burst_windows(&self) -> Option<(std::time::Duration, std::time::Duration)> {
+        self.burst_windows()
+    }
+    fn media_kinds(&self) -> (bool, bool) {
+        (self.serves_images(), self.serves_audio())
+    }
+    fn weights_mem_bytes(&self) -> Option<u64> {
+        self.weights_mem_bytes()
+    }
+    fn device_mem_used(&self) -> Option<u64> {
+        self.device_mem_used()
+    }
+    fn idle_reclaim_after(&self) -> Option<std::time::Duration> {
+        self.idle_reclaim_after()
+    }
+    fn reclaim_idle(&mut self) {
+        self.reclaim_idle();
+    }
+    fn coalesce_row_budget(&self) -> usize {
+        self.coalesce_row_budget()
+    }
+    fn validate(&self, seqs: &[Vec<u32>]) -> Result<(), String> {
+        self.validate(seqs)
+    }
+    fn lanes(&mut self) -> usize {
+        1
+    }
+    fn pool_ready(&self, p: &Self::Pending) -> bool {
+        self.pool_ready(p)
+    }
+    fn embed_submit(&mut self, s: &[Vec<u32>], lane: usize) -> Result<Self::Pending, String> {
+        EncoderBackend::embed_submit_dimensions(self, s, lane, None)
+    }
+    fn validate_dimensions(&self, dims: Option<usize>) -> Result<(), String> {
+        crate::gpu_model::embedding_gemma2::GpuEmbeddingGemma2::validate_dimensions(dims)
+    }
+    fn embed_submit_dimensions(
+        &mut self,
+        s: &[Vec<u32>],
+        lane: usize,
+        dims: Option<usize>,
+    ) -> Result<Self::Pending, String> {
+        if lane != 0 {
+            return Err("invalid embedding lane".into());
+        }
+        self.embed_submit_dimensions(s, dims)
+    }
+    fn validate_media(
+        &self,
+        seqs: &[Vec<u32>],
+        media: &[Vec<crate::service::MmChunk>],
+    ) -> Result<(), String> {
+        self.validate_media(seqs, media)
+    }
+    fn embed_submit_media(
+        &mut self,
+        seqs: &[Vec<u32>],
+        media: &[Vec<crate::service::MmChunk>],
+        lane: usize,
+        dims: Option<usize>,
+    ) -> Result<Self::Pending, String> {
+        if lane != 0 {
+            return Err("invalid embedding lane".into());
+        }
+        self.embed_submit_media(seqs, media, dims)
+    }
+    fn embed_collect(&mut self, p: &Self::Pending) -> Result<Vec<Vec<f32>>, String> {
+        self.embed_collect(p)
+    }
+    fn rerank_submit(
+        &mut self,
+        _: &[Vec<u32>],
+        _: u32,
+        _: u32,
+        _: usize,
+    ) -> Result<Self::Pending, String> {
+        Err("EmbeddingGemma 2 is an embedder, not a yes/no reranker".into())
+    }
+    fn rerank_collect(&mut self, _: &Self::Pending, _: u32, _: u32) -> Result<Vec<f32>, String> {
+        Err("EmbeddingGemma 2 is an embedder, not a yes/no reranker".into())
     }
 }
 

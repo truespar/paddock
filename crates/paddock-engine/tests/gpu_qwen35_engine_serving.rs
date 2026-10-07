@@ -40,6 +40,8 @@ fn engine_scheduler_batches_qwen35() {
         };
         let map = MappedGguf::open(&path).expect("open gguf");
         let mut m = GpuQwen35::load(exec, &map, 4096).expect("load 9B");
+        // the exact class this test is stated in (the KV8 default is lossy)
+        m.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
         m.generate_greedy(&prompt, n_new, None).expect("reference")
     };
 
@@ -50,7 +52,9 @@ fn engine_scheduler_batches_qwen35() {
     let engine = Engine::spawn(8, move || {
         let exec = Arc::new(GpuExecutor::new(0, &pack2).map_err(|e| e.to_string())?);
         let map = MappedGguf::open(&path2).map_err(|e| e.to_string())?;
-        let m = GpuQwen35::load(exec, &map, 4096).map_err(|e| e.to_string())?;
+        let mut m = GpuQwen35::load(exec, &map, 4096).map_err(|e| e.to_string())?;
+        // the exact class this test is stated in (the KV8 default is lossy)
+        m.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
         Ok(Box::new(m) as Box<dyn paddock_engine::generator::Generator>)
     })
     .expect("spawn engine");

@@ -440,6 +440,7 @@ fn w16_attn_fixed_splits_rows_invariant() {
                             scale,
                             dt,
                             split,
+                            None,
                         )
                         .expect("fixed partial");
                     } else {
@@ -494,6 +495,141 @@ fn w16_attn_fixed_splits_rows_invariant() {
                     "[w16] attn {dt:?} {name} split {split}: rows invariant, {maxd:.1e} off the shared law"
                 );
             }
+        }
+    }
+}
+
+/// Slot 745 (two warps a row, f32 fold of the halves): under both split
+/// laws a row's bits must not depend on its group - a verify group's row and
+/// the same row alone (a decode tick) combine to the same bits - and the
+/// fold must agree with the one-warp kernel on the same law to the
+/// summation-order class. e4m3 paged only (745 refuses anything else),
+/// nemotron's geometry, groups of up to six rows.
+#[test]
+fn w16_attn_kh_rows_invariant() {
+    let Some(exec) = common::gpu() else { return };
+    if !exec.has_attn_rows_partial_kh() || !exec.has_attn_rows_partial_pow2() {
+        common::missing("pack has no two-warps-a-row rows partial");
+        return;
+    }
+    let (n_heads, n_kv_heads, head_dim) = (32usize, 2usize, 128usize);
+    let kv_dim = n_kv_heads * head_dim;
+    let qdim = n_heads * head_dim;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let max_ctx = 8192usize;
+    let bps = max_ctx / 16;
+    let n_slots = 2usize;
+    // a scattered block table (the serve pool hands out freed pages)
+    let nb = (n_slots * bps) as u32;
+    let bt_host: Vec<u32> = (0..nb).map(|j| (j * 7919) % nb).collect();
+    let d_bt = exec.stream.clone_htod(&bt_host).unwrap();
+    let d_s = exec.alloc_no_sinks(n_heads).unwrap();
+    let kv = |seed: u64| -> CudaSlice<u8> {
+        let v = det(n_slots * max_ctx * kv_dim, seed);
+        let bytes: Vec<u8> = v
+            .iter()
+            .map(|&x| ((x.to_bits() >> 24) as u8 & 0x80) | ((x.to_bits() >> 8) as u8 % 0x40))
+            .collect();
+        exec.stream.clone_htod(&bytes).unwrap()
+    };
+    let (d_k, d_v) = (kv(31), kv(32));
+    // (rows as (slot, position), groups as (first row, rows <= 6))
+    let verify: Vec<(u32, u32)> = (0..8).map(|i| (1, 7000 + i)).collect();
+    let dspark: Vec<(u32, u32)> = (0..6).map(|i| (0, 3001 + i)).collect();
+    let two: Vec<(u32, u32)> = (0..4)
+        .map(|i| (1, 300 + i))
+        .chain((0..5).map(|i| (0, 1000 + i)))
+        .collect();
+    let short: Vec<(u32, u32)> = (0..3).map(|i| (0, 5 + i)).collect();
+    let cases: [(&str, &[(u32, u32)], Vec<u32>); 4] = [
+        ("8-row verify as 6 + 2", &verify, vec![0, 6, 6, 2]),
+        ("DSpark round", &dspark, vec![0, 6]),
+        ("two slots", &two, vec![0, 4, 4, 5]),
+        ("inside one split", &short, vec![0, 3]),
+    ];
+    for (name, rows, groups) in &cases {
+        let n_rows = rows.len();
+        let q = det(n_rows * qdim, 41);
+        let d_q = exec.to_device(&q).unwrap();
+        let d_pos = exec
+            .stream
+            .clone_htod(&rows.iter().map(|r| r.1).collect::<Vec<u32>>())
+            .unwrap();
+        let d_slots = exec
+            .stream
+            .clone_htod(&rows.iter().map(|r| r.0).collect::<Vec<u32>>())
+            .unwrap();
+        let solo: Vec<u32> = (0..n_rows as u32).flat_map(|i| [i, 1]).collect();
+        let gmax = groups.chunks(2).map(|g| g[1] as usize).max().unwrap();
+        // 683's fixed law at the serving split and a coarser one; 744's pow2
+        // law (split_keys 0) at its 128-split budget; 745's TILE law at a
+        // 120-split budget (the one-warp reference runs 744 there - the
+        // same 256-key splits at this depth)
+        for (split, n_splits) in [
+            (512usize, max_ctx / 512),
+            (1024, max_ctx / 1024),
+            (0, 128),
+            (0x4000_0000 | 120, 128),
+        ] {
+            let run = |groups: &[u32], kh: Option<usize>, law: usize| -> Vec<f32> {
+                let d_groups = exec.stream.clone_htod(groups).unwrap();
+                let mut d_o = exec.alloc(n_heads * n_rows * n_splits * head_dim).unwrap();
+                let mut d_ml = exec.alloc(n_heads * n_rows * n_splits * 2).unwrap();
+                let mut d_out = exec.alloc(n_rows * qdim).unwrap();
+                exec.attn_rows_partial_fixed(
+                    &d_q,
+                    &d_k,
+                    &d_v,
+                    &mut d_o,
+                    &mut d_ml,
+                    &d_pos,
+                    &d_slots,
+                    &d_groups,
+                    groups.len() / 2,
+                    Some((&d_bt, bps)),
+                    max_ctx,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    kv_dim,
+                    n_rows,
+                    n_splits,
+                    0,
+                    scale,
+                    KvDtype::Fp8E4m3,
+                    law,
+                    kh,
+                )
+                .expect("rows partial");
+                exec.attn_combine_batch(
+                    &d_o, &d_ml, &d_s, &mut d_out, n_heads, head_dim, n_splits, n_rows,
+                )
+                .expect("combine");
+                exec.to_host(&d_out).unwrap()
+            };
+            let grouped = run(groups, Some(gmax), split);
+            let alone = run(&solo, Some(1), split);
+            assert!(
+                bits_eq(&grouped, &alone),
+                "{name} split {split}: a row's bits depend on its group under 745"
+            );
+            // the one-warp kernel has no TILE law: below 30K keys its splits
+            // are 744's 256-key ones
+            let ref_law = if split & 0x4000_0000 != 0 { 0 } else { split };
+            let one_warp = run(&solo, None, ref_law);
+            let peak = one_warp.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let maxd = grouped
+                .iter()
+                .zip(&one_warp)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                grouped.iter().all(|v| v.is_finite()) && maxd <= 1e-4 * peak.max(1.0),
+                "{name} split {split}: {maxd:.3e} off the one-warp kernel (peak {peak:.3})"
+            );
+            println!(
+                "[w16] attn kh {name} split {split}: rows invariant, {maxd:.1e} off the one-warp kernel"
+            );
         }
     }
 }

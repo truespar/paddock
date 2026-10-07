@@ -3,7 +3,7 @@
   "info": {
     "title": "Paddock Runner API",
     "version": "__VERSION__",
-    "description": "The complete HTTP surface of one Paddock runner (one served model, one port).\n\nThe surface has three families:\n\n- **OpenAI-compatible** - `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/audio/transcriptions`, `/v1/models`. These conform to OpenAI's API and are documented by OpenAI's own reference; this document lists them with Paddock's deviations and extensions only, and deliberately does not re-specify their schemas. Point an official OpenAI SDK at the runner's base URL and it works.\n- **Anthropic-compatible** - `/v1/messages`, `/v1/messages/count_tokens`. Same rule: Anthropic's reference is the specification.\n- **Paddock-native** - forced alignment, rerank, dense prediction (`/v1/segmentations`), the extraction preview, the model card, stats, and the realtime socket. These exist nowhere else, so they are fully specified here.\n\nAuthentication: a runner started without an API key accepts unauthenticated requests. With a key configured, `/v1/*` and `/api/*` require `Authorization: Bearer <key>`; `/healthz` and this document stay open, and `/metrics` is open on loopback but keyed over the network.\n\nOne runner serves one model, so `model` request fields are accepted and ignored everywhere; `GET /v1/models` lists exactly one entry with Paddock capability extensions.",
+    "description": "The complete HTTP surface of one Paddock runner (one served model, one port).\n\nThe surface has three families:\n\n- **OpenAI-compatible** - `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/audio/transcriptions`, `/v1/models`. These conform to OpenAI's API and are documented by OpenAI's own reference; this document lists them with Paddock's deviations and extensions only, and deliberately does not re-specify their schemas. Point an official OpenAI SDK at the runner's base URL and it works.\n- **Anthropic-compatible** - `/v1/messages`, `/v1/messages/count_tokens`. Same rule: Anthropic's reference is the specification.\n- **Paddock-native** - forced alignment, rerank, dense prediction (`/v1/segmentations`), promptable segmentation (`/v1/masks`), the extraction preview, the model card, stats, and the realtime socket. These exist nowhere else, so they are fully specified here.\n\nAuthentication: a runner started without an API key accepts unauthenticated requests. With a key configured, `/v1/*` and `/api/*` require `Authorization: Bearer <key>`; `/healthz` and this document stay open, and `/metrics` is open on loopback but keyed over the network.\n\nOne runner serves one model, so `model` request fields are accepted and ignored everywhere; `GET /v1/models` lists exactly one entry with Paddock capability extensions.",
     "license": { "name": "MIT OR Apache-2.0", "identifier": "MIT OR Apache-2.0" }
   },
   "servers": [
@@ -626,6 +626,500 @@
           },
           "503": {
             "description": "No dense-prediction model is loaded on this runner."
+          }
+        }
+      }
+    },
+    "/v1/masks": {
+      "post": {
+        "tags": ["paddock"],
+        "summary": "Promptable segmentation: a picture and a concept, example boxes or clicks in, masks out",
+        "description": "Paddock-native - no OpenAI equivalent exists. Served by promptable-segmentation models (`masks` capability in `/v1/models`; today `sam3`, Meta's SAM 3). The prompt is a concept in words (`text`, a short noun phrase - \"red car\", \"shoe\"), example boxes in the picture's pixels (`boxes`, each positive or negative), or both; a box-only prompt is read with the word \"visual\", as Meta's processor does it. Every instance the model keeps comes back, best first, with its score, its box and its mask as uncompressed COCO RLE over the picture's own size.\n\nThe other task is one object: clicks on it (`points`, each positive or negative) and/or its box (`object_box`), never together with `text` / `boxes`. It comes back as up to three candidate masks (three for a lone click unless `multimask` says otherwise), best first, scored by the model's predicted IoU, with `presence` saying how sure the model is there is an object under them. The answer carries a `refine_id`: send it back as `refine` with the same clicks and more, on the same picture, and the model builds on its best mask (Meta's notebook flow). Only the endpoint's last click answer can be refined; an older id is refused with 400. `GET /api/server` says whether clicks are served (`masks.clicks`, `masks.max_points`).\n\nThe picture arrives as a `data:` URL (JPEG or PNG) and is decoded upright by its EXIF orientation. A picture byte-identical to the previous request's reuses its encoding, and the same prompt reuses its text features; `timings.image_reused` / `timings.text_reused` say so. A prompt past `max_prompt_tokens` tokens is refused rather than truncated (Meta truncates silently); `GET /api/server` names the limits under `masks`.",
+        "operationId": "masks",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["image"],
+                "properties": {
+                  "model": {"type": "string", "description": "Checked against the served model's id."},
+                  "image": {"type": "string", "description": "The picture as a base64 `data:` URL (JPEG or PNG)."},
+                  "text": {"type": "string", "description": "A concept: a short noun phrase."},
+                  "boxes": {"type": "array", "description": "Example boxes in the picture's pixels; negative boxes say what not to include.", "items": {"type": "object", "required": ["box"], "properties": {"box": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4, "description": "x0, y0, x1, y1"}, "positive": {"type": "boolean", "default": true}}}},
+                  "threshold": {"type": "number", "default": 0.5, "description": "Keep instances scoring above this (0 <= t < 1)."},
+                  "max_instances": {"type": "integer", "description": "At most this many instances, best first."},
+                  "points": {
+                    "type": "array",
+                    "description": "Clicks on one object, in the picture's pixels; negative clicks say what is not it.",
+                    "items": {
+                      "type": "object",
+                      "required": ["point"],
+                      "properties": {
+                        "point": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2, "description": "x, y"},
+                        "positive": {"type": "boolean", "default": true}
+                      }
+                    }
+                  },
+                  "object_box": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4, "description": "The clicked object's box, x0, y0, x1, y1 in the picture's pixels."},
+                  "multimask": {"type": "boolean", "description": "Three candidates or one; default three for a lone click without a box or refine."},
+                  "refine": {"type": "string", "description": "A previous click answer's refine_id on the same picture: its best mask becomes part of this prompt."}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The kept instances, best first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "object": {"type": "string", "enum": ["masks"]},
+                    "model": {"type": "string"},
+                    "width": {"type": "integer"},
+                    "height": {"type": "integer"},
+                    "presence": {"type": "number", "description": "A concept: sigmoid of the presence logit, does it appear at all. Clicks: sigmoid of the object score, is there an object under them."},
+                    "instances": {"type": "array", "items": {"type": "object", "properties": {"score": {"type": "number"}, "box": {"type": "array", "items": {"type": "number"}, "description": "x0, y0, x1, y1 in the picture's pixels"}, "area": {"type": "integer", "description": "Mask pixels set."}, "mask": {"type": "object", "description": "Uncompressed COCO RLE: column-major, zeros first, alternating run lengths.", "properties": {"size": {"type": "array", "items": {"type": "integer"}, "description": "[height, width]"}, "counts": {"type": "array", "items": {"type": "integer"}}}}}}},
+                    "prompt_tokens": {"type": "integer"},
+                    "timings": {"type": "object", "properties": {"resize_ms": {"type": "number"}, "encode_ms": {"type": "number"}, "prompt_ms": {"type": "number"}, "detect_ms": {"type": "number"}, "masks_ms": {"type": "number"}, "image_reused": {"type": "boolean"}, "text_reused": {"type": "boolean"}}},
+                    "refine_id": {"type": "string", "description": "Clicks only: send it back as `refine` to refine this answer."}
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "A request the caller can fix: no prompt, a prompt past the token limit, a picture past the size limit, an inverted box, a threshold out of range", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}} },
+          "503": { "description": "No promptable-segmentation model is loaded on this runner", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Error"}}} }
+        }
+      }
+    },
+    "/v1/masks/sessions": {
+      "post": {
+        "tags": [
+          "paddock"
+        ],
+        "summary": "Start a video session: a concept tracked through frames sent one at a time",
+        "description": "Paddock-native. Meta's SAM 3 video predictor: its detector runs on every frame and its tracker carries each object from frame to frame under one id. Start a session with the concept (`text`) - or up to `max_concepts` of them (`texts`), each tracked as its own session would be, the frame read once for all - then send the frames in order (`POST /v1/masks/sessions/{id}/frames`), every frame the first one's size, and end it with `finish`.\n\nAn output is final `hold_frames` (15) frames after its frame, once Meta's hot start has passed over it: a new object that turns out to be noise in that window is removed from the frames it was seen on too. With `preview` (the default) every frame also answers with its own output as it stands, which is what a live view shows. Frames are decoded and resized the way Meta's frame loader does a JPEG folder.\n\nAt most `max_sessions` are live on an endpoint (429 past that); a session with no frame for `idle_seconds` is dropped. `GET /api/server` says whether sessions are served (`masks.video`, or `masks.video_unavailable`).",
+        "operationId": "masks_session_create",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "model": {
+                    "type": "string",
+                    "description": "Checked against the served model's id."
+                  },
+                  "text": {
+                    "type": "string",
+                    "description": "The concept: a short noun phrase. Give `text` or `texts`."
+                  },
+                  "texts": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "Several concepts, in place of `text`; an object's `concept` is its index here."
+                  },
+                  "frames": {
+                    "type": "integer",
+                    "description": "The video's length, when it is known (a clip under 16 frames tracks a little differently)."
+                  },
+                  "preview": {
+                    "type": "boolean",
+                    "description": "Answer every frame with its provisional output too (default true)."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The session.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "object": {
+                      "type": "string",
+                      "enum": [
+                        "masks.session"
+                      ]
+                    },
+                    "id": {
+                      "type": "string"
+                    },
+                    "model": {
+                      "type": "string"
+                    },
+                    "concepts": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "The concepts tracked, in the order an object's `concept` counts."
+                    },
+                    "hold_frames": {
+                      "type": "integer",
+                      "description": "Frames an output is held before it is final."
+                    },
+                    "idle_seconds": {
+                      "type": "integer",
+                      "description": "A session with no frame for this long is dropped."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No concept, too many, a concept past the token limit, or video not served on this endpoint."
+          },
+          "429": {
+            "description": "Every session slot is taken."
+          }
+        }
+      }
+    },
+    "/v1/masks/sessions/{id}/frames": {
+      "post": {
+        "tags": [
+          "paddock"
+        ],
+        "summary": "The session's next frame",
+        "description": "One frame, as a `data:` URL (JPEG or PNG), the first frame's size. The answer holds the frames whose output is final now (one a frame once the hold has filled), oldest first, and, unless the session declined it, `preview`: the frame just sent as it stands.",
+        "operationId": "masks_session_frame",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The session's id, from `POST /v1/masks/sessions`."
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "image"
+                ],
+                "properties": {
+                  "image": {
+                    "type": "string",
+                    "description": "The frame as a base64 `data:` URL."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Final frames and the preview.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "object": {
+                      "type": "string",
+                      "enum": [
+                        "masks.frame"
+                      ]
+                    },
+                    "frame": {
+                      "type": "integer",
+                      "description": "The index of the frame just sent."
+                    },
+                    "width": {
+                      "type": "integer"
+                    },
+                    "height": {
+                      "type": "integer"
+                    },
+                    "frames": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "frame": {
+                            "type": "integer",
+                            "description": "The frame's index in the session, from 0."
+                          },
+                          "objects": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "id": {
+                                  "type": "integer",
+                                  "description": "The object's id, the same on every frame it is tracked on and unique across the session's concepts."
+                                },
+                                "concept": {
+                                  "type": "integer",
+                                  "description": "Which of the session's `concepts` it was found for."
+                                },
+                                "score": {
+                                  "type": "number",
+                                  "description": "The detection score the object was born with."
+                                },
+                                "box": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "number"
+                                  },
+                                  "description": "x0, y0, x1, y1 in the frame's pixels (pixel edges)"
+                                },
+                                "area": {
+                                  "type": "integer",
+                                  "description": "Mask pixels set."
+                                },
+                                "mask": {
+                                  "type": "object",
+                                  "description": "Uncompressed COCO RLE at the video's size: column-major, zeros first, alternating run lengths.",
+                                  "properties": {
+                                    "size": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "integer"
+                                      },
+                                      "description": "[height, width]"
+                                    },
+                                    "counts": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "integer"
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "preview": {
+                      "type": "object",
+                      "properties": {
+                        "frame": {
+                          "type": "integer",
+                          "description": "The frame's index in the session, from 0."
+                        },
+                        "objects": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "id": {
+                                "type": "integer",
+                                "description": "The object's id, the same on every frame it is tracked on and unique across the session's concepts."
+                              },
+                              "concept": {
+                                "type": "integer",
+                                "description": "Which of the session's `concepts` it was found for."
+                              },
+                              "score": {
+                                "type": "number",
+                                "description": "The detection score the object was born with."
+                              },
+                              "box": {
+                                "type": "array",
+                                "items": {
+                                  "type": "number"
+                                },
+                                "description": "x0, y0, x1, y1 in the frame's pixels (pixel edges)"
+                              },
+                              "area": {
+                                "type": "integer",
+                                "description": "Mask pixels set."
+                              },
+                              "mask": {
+                                "type": "object",
+                                "description": "Uncompressed COCO RLE at the video's size: column-major, zeros first, alternating run lengths.",
+                                "properties": {
+                                  "size": {
+                                    "type": "array",
+                                    "items": {
+                                      "type": "integer"
+                                    },
+                                    "description": "[height, width]"
+                                  },
+                                  "counts": {
+                                    "type": "array",
+                                    "items": {
+                                      "type": "integer"
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "ms": {
+                      "type": "number",
+                      "description": "The engine's time on this frame."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A frame that does not decode, or not the first frame's size."
+          },
+          "404": {
+            "description": "No such session: never started, finished, or idle past `idle_seconds`."
+          }
+        }
+      }
+    },
+    "/v1/masks/sessions/{id}/finish": {
+      "post": {
+        "tags": [
+          "paddock"
+        ],
+        "summary": "End the video: the frames still held, final",
+        "description": "The session is gone after it.",
+        "operationId": "masks_session_finish",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The session's id, from `POST /v1/masks/sessions`."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The held frames, oldest first.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "object": {
+                      "type": "string",
+                      "enum": [
+                        "masks.frames"
+                      ]
+                    },
+                    "frames": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "frame": {
+                            "type": "integer",
+                            "description": "The frame's index in the session, from 0."
+                          },
+                          "objects": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "id": {
+                                  "type": "integer",
+                                  "description": "The object's id, the same on every frame it is tracked on and unique across the session's concepts."
+                                },
+                                "concept": {
+                                  "type": "integer",
+                                  "description": "Which of the session's `concepts` it was found for."
+                                },
+                                "score": {
+                                  "type": "number",
+                                  "description": "The detection score the object was born with."
+                                },
+                                "box": {
+                                  "type": "array",
+                                  "items": {
+                                    "type": "number"
+                                  },
+                                  "description": "x0, y0, x1, y1 in the frame's pixels (pixel edges)"
+                                },
+                                "area": {
+                                  "type": "integer",
+                                  "description": "Mask pixels set."
+                                },
+                                "mask": {
+                                  "type": "object",
+                                  "description": "Uncompressed COCO RLE at the video's size: column-major, zeros first, alternating run lengths.",
+                                  "properties": {
+                                    "size": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "integer"
+                                      },
+                                      "description": "[height, width]"
+                                    },
+                                    "counts": {
+                                      "type": "array",
+                                      "items": {
+                                        "type": "integer"
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such session: never started, finished, or idle past `idle_seconds`."
+          }
+        }
+      }
+    },
+    "/v1/masks/sessions/{id}": {
+      "delete": {
+        "tags": [
+          "paddock"
+        ],
+        "summary": "Drop a video session, held frames and all",
+        "operationId": "masks_session_delete",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "description": "The session's id, from `POST /v1/masks/sessions`."
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Dropped."
+          },
+          "404": {
+            "description": "No such session: never started, finished, or idle past `idle_seconds`."
           }
         }
       }

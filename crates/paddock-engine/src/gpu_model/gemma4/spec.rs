@@ -131,7 +131,7 @@ pub(crate) const SPEC_K1_MAX: usize = 8;
 /// designed to pay at every batch width - so the default is uncapped
 /// (bounded by max_batch); env still pins it down for A/Bs.
 pub(crate) fn spec_live_max() -> usize {
-    paddock_models::dev_var!("PADDOCK_G4_SPEC_LIVE_MAX")
+    std::env::var("PADDOCK_G4_SPEC_LIVE_MAX")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(usize::MAX)

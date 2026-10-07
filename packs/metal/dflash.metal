@@ -189,16 +189,17 @@ kernel void df_top16_merge(device const uint* x [[buffer(0)]],device uint* out [
 
 // One SIMD per candidate. Codebooks are gathered directly from the exact GGUF
 // rows: only 16*256 elements/position, no expanded vocab-sized cache.
-kernel void df_select(device const uint* top [[buffer(0)]],device const uchar* pred [[buffer(1)]],
-                      device const uchar* succ [[buffer(2)]],device const float* h [[buffer(3)]],
-                      device const uint* tokens [[buffer(4)]],device uint* out [[buffer(5)]],
-                      constant uint* p [[buffer(6)]],uint block [[threadgroup_position_in_grid]],
-                      uint tid [[thread_index_in_threadgroup]]) {
-    threadgroup float scores[16];threadgroup uint chosen;
+template<bool Prefix>
+inline void df_select_impl(device const uint* top,device const uchar* pred,
+                      device const uchar* succ,device const float* h,
+                      device const uint* tokens,device uint* out,constant uint* p,
+                      uint block,uint tid,threadgroup float* scores,threadgroup uint& chosen) {
     uint lane=tid%32,sg=tid/32;
     if(tid==0){chosen=tokens[block*p[0]];out[block*p[0]]=chosen;}
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for(uint j=1;j<p[0];++j) {
+    // p[0] is storage stride; p[3] is the requested prefix including its
+    // seed. The autoregressive selector never reads later candidate rows.
+    for(uint j=1;j<(Prefix?p[3]:p[0]);++j) {
         uint row=block*p[0]+j;
         for(uint c=sg;c<16;c+=8) {
             uint token=top[(row*16+c)*2];float sum=0;
@@ -214,3 +215,13 @@ kernel void df_select(device const uint* top [[buffer(0)]],device const uchar* p
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
+#define DF_SELECT(NAME,PREFIX) \
+kernel void NAME(device const uint* top [[buffer(0)]],device const uchar* pred [[buffer(1)]], \
+device const uchar* succ [[buffer(2)]],device const float* h [[buffer(3)]], \
+device const uint* tokens [[buffer(4)]],device uint* out [[buffer(5)]],constant uint* p [[buffer(6)]], \
+uint block [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) { \
+threadgroup float scores[16];threadgroup uint chosen; \
+df_select_impl<PREFIX>(top,pred,succ,h,tokens,out,p,block,tid,scores,chosen); }
+DF_SELECT(df_select,false)
+DF_SELECT(df_select_prefix,true)
+#undef DF_SELECT

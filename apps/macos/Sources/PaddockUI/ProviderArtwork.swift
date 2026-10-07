@@ -12,7 +12,7 @@ import Foundation
     "Baidu": "Baidu", "ByteDance": "ByteDance", "PaddlePaddle": "PaddlePaddle",
     "Cloudflare": "Cloudflare",
     "MiniMax": "MiniMax", "Hugging Face": "HuggingFace", "OpenRouter": "OpenRouter",
-    "Prism ML": "PrismML",
+    "Prism ML": "PrismML", "Aleph Alpha": "AlephAlpha",
     "Exa": "Exa", "Tavily": "Tavily", "Firecrawl": "Firecrawl", "Brave": "Brave",
   ]
 

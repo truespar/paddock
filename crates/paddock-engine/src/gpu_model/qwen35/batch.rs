@@ -13,10 +13,10 @@ use cudarc::driver::sys::CUstreamCaptureMode;
 /// Max rows a tick may overdraw to absorb a prompt tail that would otherwise
 /// ride a whole extra tick (chunk-tail finding).
 /// Staged DeltaNet checkpoint blobs per tick (`d_ckpt_stage`): the number of
-/// checkpoint seams the unified tick can fuse. Two covers one prompt's two
-/// boundaries; a cold cohort's other prompts overflow it (see the overflow
-/// absorb in `unified_launch_core`).
-const CKPT_STAGE_BLOBS: usize = 2;
+/// checkpoint seams the unified tick can fuse. Three cover one prompt's
+/// trailing pair and its back-off boundary (`chunk_cuts`); a cold cohort's
+/// other prompts overflow them (the overflow absorb in `unified_launch_core`).
+const CKPT_STAGE_BLOBS: usize = 3;
 const TAIL_SLOP: usize = 64;
 
 /// f8t unified arm master switch (see the bs_f8t_attn_p note in
@@ -43,7 +43,7 @@ fn f8t_unified_on() -> bool {
 pub(super) fn f8t_dec_bmax() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        paddock_models::dev_var!("PADDOCK_F8T_DEC_BMAX")
+        std::env::var("PADDOCK_F8T_DEC_BMAX")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(64)
@@ -450,7 +450,7 @@ impl GpuQwen35 {
             * (self.conv_k as u64 - 1 + unified_prefill_rows().max(8192) as u64)
             * self.conv_dim as u64
             * 4;
-        let ckpt_staging = 2 * n_lin * state_win * 4;
+        let ckpt_staging = CKPT_STAGE_BLOBS as u64 * n_lin * state_win * 4;
         let wave_bufs = self.pf_bufs_bytes(chunk, chunk, max_batch);
         let graph_headroom = graph_pools_headroom_bytes();
         let tier_staging = if crate::kv_tier::pool_tier::tier_ram_bytes().is_some() {
@@ -2851,7 +2851,7 @@ impl GpuQwen35 {
                                 // entry (ABI-247 consumer) reads it back
                                 static MO16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                                 let mo16 = *MO16.get_or_init(|| {
-                                    paddock_models::dev_var_os!("PADDOCK_NO_F8W8_TMA").is_none()
+                                    std::env::var_os("PADDOCK_NO_F8W8_TMA").is_none()
                                         && paddock_models::dev_var_os!("PADDOCK_NO_O16").is_none()
                                 });
                                 // P74: PADDOCK_QWEN35_O16_TC5 opts the sm_100 tc5
@@ -3615,7 +3615,7 @@ impl GpuQwen35 {
                                 }
                                 static MO16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                                 let mo16 = *MO16.get_or_init(|| {
-                                    paddock_models::dev_var_os!("PADDOCK_NO_F8W8_TMA").is_none()
+                                    std::env::var_os("PADDOCK_NO_F8W8_TMA").is_none()
                                         && paddock_models::dev_var_os!("PADDOCK_NO_O16").is_none()
                                 });
                                 // P74: PADDOCK_QWEN35_O16_TC5 opts the sm_100 tc5
@@ -3788,7 +3788,7 @@ impl GpuQwen35 {
                                 // reads bf16 - else the f32 chain below.
                                 static O16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                                 let o16 = *O16.get_or_init(|| {
-                                    paddock_models::dev_var_os!("PADDOCK_NO_F8W8_TMA").is_none()
+                                    std::env::var_os("PADDOCK_NO_F8W8_TMA").is_none()
                                         && paddock_models::dev_var_os!("PADDOCK_NO_O16").is_none()
                                 });
                                 // P74: see the MO16T note - sm_100 tc5 route, wash
@@ -5552,8 +5552,8 @@ impl GpuQwen35 {
             // attention), and the boundary state/window are staged to
             // d_ckpt_stage between the two shares per layer so the prefix
             // checkpoint survives (see the stage copies in the walk and
-            // snapshot_staged_pool at finish). Capped at the two stage
-            // blobs; overflow tails keep the old two-tick path.
+            // snapshot_staged_pool at finish). Capped at CKPT_STAGE_BLOBS;
+            // overflow tails keep the old two-tick path.
             // PADDOCK_NO_CKPT_FUSE reverts.
             static NO_FUSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let fuse = !*NO_FUSE
@@ -6697,7 +6697,7 @@ impl GpuQwen35 {
                         // entry (ABI-247 consumer) reads it back
                         static MO16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                         let mo16 = *MO16.get_or_init(|| {
-                            paddock_models::dev_var_os!("PADDOCK_NO_F8W8_TMA").is_none()
+                            std::env::var_os("PADDOCK_NO_F8W8_TMA").is_none()
                                 && paddock_models::dev_var_os!("PADDOCK_NO_O16").is_none()
                         });
                         // P74: PADDOCK_QWEN35_O16_TC5 opts the sm_100 tc5
@@ -7431,7 +7431,7 @@ impl GpuQwen35 {
                         }
                         static MO16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                         let mo16 = *MO16.get_or_init(|| {
-                            paddock_models::dev_var_os!("PADDOCK_NO_F8W8_TMA").is_none()
+                            std::env::var_os("PADDOCK_NO_F8W8_TMA").is_none()
                                 && paddock_models::dev_var_os!("PADDOCK_NO_O16").is_none()
                         });
                         // P74: PADDOCK_QWEN35_O16_TC5 opts the sm_100 tc5
@@ -7593,7 +7593,7 @@ impl GpuQwen35 {
                         // reads bf16 - else the f32 chain below.
                         static O16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                         let o16 = *O16.get_or_init(|| {
-                            paddock_models::dev_var_os!("PADDOCK_NO_F8W8_TMA").is_none()
+                            std::env::var_os("PADDOCK_NO_F8W8_TMA").is_none()
                                 && paddock_models::dev_var_os!("PADDOCK_NO_O16").is_none()
                         });
                         // P74: see the MO16T note - sm_100 tc5 route, wash

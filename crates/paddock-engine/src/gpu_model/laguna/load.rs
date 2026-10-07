@@ -17,6 +17,9 @@ use super::*;
 /// llama.cpp's `expert_gating_func` enum value for sigmoid scoring - the only
 /// router class Laguna ships (softmax = 1 would be silently-wrong math here).
 const GATING_FUNC_SIGMOID: u64 = 2;
+/// Kolibri 1's `sigmoid_logit_add` (select on logits + bias, weight by the
+/// unbiased sigmoid) - the value the kolibri1 converter stamps.
+const GATING_FUNC_SIGMOID_LOGIT_ADD: u64 = 5;
 
 impl GpuLaguna {
     pub fn load(
@@ -36,7 +39,12 @@ impl GpuLaguna {
         max_ctx: usize,
         _fp8_native_dir: Option<&std::path::Path>,
     ) -> Result<Self, GpuModelError> {
-        exec.vram_load_gate(map.total_len(), "laguna")
+        let flavor = match map.gguf().architecture() {
+            Some("kolibri1") => Flavor::Kolibri,
+            _ => Flavor::Laguna,
+        };
+        let fam = flavor.name();
+        exec.vram_load_gate(map.total_len(), fam)
             .map_err(GpuModelError::WontFit)?;
         // Single-stream engine: cudarc's cross-stream event tracking is pure
         // overhead and blocks CUDA-graph capture. Must precede all allocs.
@@ -65,14 +73,17 @@ impl GpuLaguna {
         let n_layer = u("block_count")? as usize;
         let n_embd = u("embedding_length")? as usize;
         // Per-layer Q-head counts - Laguna's signature quirk. The converter
-        // always writes the array form.
-        let n_heads: Vec<usize> = u_arr("attention.head_count")?
-            .into_iter()
-            .map(|v| v as usize)
-            .collect();
+        // always writes the array form; Kolibri's writes one count.
+        let n_heads: Vec<usize> = match flavor {
+            Flavor::Laguna => u_arr("attention.head_count")?
+                .into_iter()
+                .map(|v| v as usize)
+                .collect(),
+            Flavor::Kolibri => vec![u("attention.head_count")? as usize; n_layer],
+        };
         if n_heads.len() != n_layer {
             return Err(GpuModelError::Unsupported(format!(
-                "laguna: attention.head_count array has {} entries for {} layers",
+                "{fam}: attention.head_count array has {} entries for {} layers",
                 n_heads.len(),
                 n_layer
             )));
@@ -80,9 +91,9 @@ impl GpuLaguna {
         let n_kv_heads = u("attention.head_count_kv")? as usize;
         let head_dim = u("attention.key_length")? as usize;
         if u("attention.value_length")? as usize != head_dim {
-            return Err(GpuModelError::Unsupported(
-                "laguna: value_length != key_length is not a shipped geometry".into(),
-            ));
+            return Err(GpuModelError::Unsupported(format!(
+                "{fam}: value_length != key_length is not a shipped geometry"
+            )));
         }
         let eps = f("attention.layer_norm_rms_epsilon").unwrap_or(1e-6);
         let ctx_train = u("context_length")? as usize;
@@ -92,18 +103,39 @@ impl GpuLaguna {
         // array is cross-checked against the pattern - all full layers must
         // share one count and all SWA layers another; a mismatch means the
         // file doesn't follow the convention and we refuse rather than guess.
+        // Kolibri stamps its pattern ([SWA x4, full]) as a per-layer bool
+        // array, true = sliding; that array is the authority there.
         let swa_window = u("attention.sliding_window")? as usize;
         if swa_window == 0 {
-            return Err(GpuModelError::Unsupported(
-                "laguna: sliding_window 0 (M.1-class all-full geometry) is not supported".into(),
-            ));
+            return Err(GpuModelError::Unsupported(format!(
+                "{fam}: sliding_window 0 (M.1-class all-full geometry) is not supported"
+            )));
         }
-        let is_swa = |i: usize| !i.is_multiple_of(4);
+        let swa_pattern: Vec<bool> = match flavor {
+            Flavor::Laguna => (0..n_layer).map(|i| !i.is_multiple_of(4)).collect(),
+            Flavor::Kolibri => match map.gguf().arch_field("attention.sliding_window_pattern") {
+                Some(Value::Array(items)) if items.len() == n_layer => items
+                    .iter()
+                    .map(|v| match v {
+                        Value::Bool(b) => Ok(*b),
+                        _ => Err(GpuModelError::MissingMeta(
+                            "attention.sliding_window_pattern".into(),
+                        )),
+                    })
+                    .collect::<Result<_, _>>()?,
+                _ => {
+                    return Err(GpuModelError::MissingMeta(
+                        "attention.sliding_window_pattern".into(),
+                    ));
+                }
+            },
+        };
+        let is_swa = |i: usize| swa_pattern[i];
         for (i, &h) in n_heads.iter().enumerate() {
             let expect = if is_swa(i) { n_heads[1] } else { n_heads[0] };
             if h != expect {
                 return Err(GpuModelError::Unsupported(format!(
-                    "laguna: head_count[{i}] = {h} breaks the [full, SWA×3] convention \
+                    "{fam}: head_count[{i}] = {h} breaks the [full, SWA×3] convention \
                      (full layers {} / SWA layers {})",
                     n_heads[0], n_heads[1]
                 )));
@@ -117,27 +149,71 @@ impl GpuLaguna {
             moe_ff: u("expert_feed_forward_length")? as usize,
             shexp_ff: u("expert_shared_feed_forward_length")? as usize,
             routed_scale: f("expert_weights_scale").unwrap_or(1.0),
+            router: match flavor {
+                Flavor::Laguna => Router::SigmoidNorm,
+                Flavor::Kolibri => Router::LogitSigmoid,
+            },
+        };
+        let (want_gating, want_name) = match flavor {
+            Flavor::Laguna => (GATING_FUNC_SIGMOID, "sigmoid"),
+            Flavor::Kolibri => (GATING_FUNC_SIGMOID_LOGIT_ADD, "sigmoid_logit_add"),
         };
         let gating = u("expert_gating_func").unwrap_or(GATING_FUNC_SIGMOID);
-        if gating != GATING_FUNC_SIGMOID {
+        if gating != want_gating {
             return Err(GpuModelError::Unsupported(format!(
-                "laguna: expert_gating_func {gating} (only sigmoid = {GATING_FUNC_SIGMOID} shipped)"
+                "{fam}: expert_gating_func {gating} (only {want_name} = {want_gating} shipped)"
             )));
         }
-        let n_dense_lead = u("leading_dense_block_count")? as usize;
+        // Kolibri's router never renormalizes (norm_topk_prob false); a file
+        // that says otherwise asks for math slot 748 does not do
+        if flavor == Flavor::Kolibri
+            && matches!(
+                map.gguf().arch_field("expert_weights_norm"),
+                Some(Value::Bool(true))
+            )
+        {
+            return Err(GpuModelError::Unsupported(format!(
+                "{fam}: expert_weights_norm true (renormalized sigmoid_logit_add) is not shipped"
+            )));
+        }
+        if flavor == Flavor::Kolibri && !exec.has_moe_topk_logit_sigmoid() {
+            return Err(GpuModelError::Unsupported(format!(
+                "{fam}: the kernel pack has no sigmoid_logit_add router (slot 748) - update the pack"
+            )));
+        }
+        // Kolibri routes every layer (no dense lead, no key)
+        let n_dense_lead = match flavor {
+            Flavor::Laguna => u("leading_dense_block_count")? as usize,
+            Flavor::Kolibri => 0,
+        };
 
         // Rope, per layer type. Full layers: YaRN over n_rot=64 of 128 dims
         // (partial rotary - the tail passes through untouched); the GGUF
         // stamps yarn_attn_factor 1.0 and YarnRope derives the real mscale
         // 1 + 0.1·ln(factor) from freq_scale. SWA layers: plain rope over the
         // whole head (ext_factor 0 disables the YaRN ramp).
-        let n_rot = u("rope.dimension_count")? as usize;
+        // Kolibri: the SWA layers rotate the whole head at the base theta
+        // (no dimension_count key; freq_base_swa defaults to freq_base, the
+        // converter's contract) and the full layers are NoPE - rope_full is
+        // never read there.
+        let n_rot = match flavor {
+            Flavor::Laguna => u("rope.dimension_count")? as usize,
+            Flavor::Kolibri => u("rope.dimension_count").map_or(head_dim, |v| v as usize),
+        };
         let n_rot_swa = u("rope.dimension_count_swa")
             .map(|v| v as usize)
             .unwrap_or(head_dim);
         let rope_base = f("rope.freq_base")
             .ok_or_else(|| GpuModelError::MissingMeta("rope.freq_base".into()))?;
-        let rope_base_swa = f("rope.freq_base_swa").unwrap_or(10_000.0);
+        let rope_base_swa = f("rope.freq_base_swa").unwrap_or(match flavor {
+            Flavor::Laguna => 10_000.0,
+            Flavor::Kolibri => rope_base,
+        });
+        if flavor == Flavor::Kolibri && (n_rot_swa != head_dim || n_rot != head_dim) {
+            return Err(GpuModelError::Unsupported(format!(
+                "{fam}: partial rotary ({n_rot_swa} of {head_dim}) is not a shipped geometry"
+            )));
+        }
         let factor = f("rope.scaling.factor").unwrap_or(1.0);
         let orig_ctx =
             u("rope.scaling.original_context_length").unwrap_or(ctx_train as u64) as usize;
@@ -200,7 +276,7 @@ impl GpuLaguna {
         };
         let v_embd = vfree();
         tracing::info!(
-            "laguna VRAM  input embeddings token_embd          {:>7.2} GB",
+            "{fam} VRAM  input embeddings token_embd          {:>7.2} GB",
             gb(v_start.saturating_sub(v_embd))
         );
 
@@ -305,96 +381,112 @@ impl GpuLaguna {
             };
 
             let va = vfree();
-            let qkg_names = [
+            // [q | k | gate], or [q | k] on a gateless (Kolibri) file
+            let gated = flavor == Flavor::Laguna;
+            let mut qkg_names = vec![
                 format!("blk.{i}.attn_q.weight"),
                 format!("blk.{i}.attn_k.weight"),
-                format!("blk.{i}.attn_gate.weight"),
             ];
+            if gated {
+                qkg_names.push(format!("blk.{i}.attn_gate.weight"));
+            }
             let qkg = if fuse_gemv && same_kq(&qkg_names) {
-                let p = exec.repack_kquant_concat(
-                    map,
-                    &[
-                        qkg_names[0].as_str(),
-                        qkg_names[1].as_str(),
-                        qkg_names[2].as_str(),
-                    ],
-                )?;
+                let names: Vec<&str> = qkg_names.iter().map(String::as_str).collect();
+                let p = exec.repack_kquant_concat(map, &names)?;
                 qkg_dup_bytes += (p.data.len() + p.scales.len()) as u64;
                 Some(p)
             } else {
                 None
             };
+            let sandwich = |name: &str| -> Result<Option<DeviceTensor>, GpuError> {
+                match flavor {
+                    Flavor::Laguna => Ok(None),
+                    Flavor::Kolibri => dt(name).map(Some),
+                }
+            };
             let layer = LagunaLayer {
                 attn_norm: dt("attn_norm.weight")?,
-                wq: qt("attn_q.weight")?,
-                wk: qt("attn_k.weight")?,
-                wv: qt("attn_v.weight")?,
-                wo: qt("attn_output.weight")?,
-                g_proj: qt("attn_gate.weight")?,
+                proj: Proj::Quant(QProj {
+                    wq: qt("attn_q.weight")?,
+                    wk: qt("attn_k.weight")?,
+                    wv: qt("attn_v.weight")?,
+                    wo: qt("attn_output.weight")?,
+                    g_proj: if gated {
+                        Some(qt("attn_gate.weight")?)
+                    } else {
+                        None
+                    },
+                    qkg,
+                }),
                 q_norm: dt("attn_q_norm.weight")?,
                 k_norm: dt("attn_k_norm.weight")?,
                 ffn_norm: dt("ffn_norm.weight")?,
+                post_attn_norm: sandwich("post_attention_norm.weight")?,
+                post_ffn_norm: sandwich("post_ffw_norm.weight")?,
                 ffn,
                 is_swa: swa,
+                nope: !swa && flavor == Flavor::Kolibri,
                 n_heads: n_heads[i],
-                qkg,
             };
+            let q = layer.proj.quant().expect("GGUF planes");
             attn_bytes += va.saturating_sub(vfree());
 
             // Shape audit on the layer's signature tensors: the per-head gate
             // width is the per-head declaration (llama.cpp detects the gate
             // class the same way) - refuse a per-element file rather than
             // serve it with per-head math.
-            let gd = layer.g_proj.dims();
-            if gd[1] != n_heads[i] {
+            if let Some(g) = &q.g_proj
+                && g.dims()[1] != n_heads[i]
+            {
                 return Err(GpuModelError::Unsupported(format!(
-                    "laguna blk.{i}: attn_gate width {} != n_heads {} - per-element gate \
+                    "{fam} blk.{i}: attn_gate width {} != n_heads {} - per-element gate \
                      files (M.1 class) are not supported yet",
-                    gd[1], n_heads[i]
+                    g.dims()[1],
+                    n_heads[i]
                 )));
             }
-            let qd = layer.wq.dims();
+            let qd = q.wq.dims();
             if qd[1] != n_heads[i] * head_dim {
                 return Err(GpuModelError::Unsupported(format!(
-                    "laguna blk.{i}: attn_q out {} != {}×{}",
+                    "{fam} blk.{i}: attn_q out {} != {}×{}",
                     qd[1], n_heads[i], head_dim
                 )));
             }
             layers.push(layer);
         }
         tracing::info!(
-            "laguna VRAM  attention (q/k/v/o + per-head gates)  {:>7.2} GB",
+            "{fam} VRAM  attention (q/k/v/o + per-head gates)  {:>7.2} GB",
             gb(attn_bytes)
         );
         if qkg_dup_bytes > 0 {
             tracing::info!(
-                "laguna VRAM    of which fused q|k|gate duplicate planes {:>5.2} GB \
+                "{fam} VRAM    of which fused q|k|gate duplicate planes {:>5.2} GB \
                  (splits stay for r>1)",
                 gb(qkg_dup_bytes)
             );
         }
         tracing::info!(
-            "laguna VRAM  routed experts ({}e × {} layers)      {:>7.2} GB",
+            "{fam} VRAM  routed experts ({}e × {} layers)      {:>7.2} GB",
             moe.n_expert,
             n_layer - n_dense_lead,
             gb(expert_bytes)
         );
         tracing::info!(
-            "laguna VRAM  shared experts + dense FFN + routers  {:>7.2} GB",
+            "{fam} VRAM  shared experts + dense FFN + routers  {:>7.2} GB",
             gb(dense_ffn_bytes)
         );
         if shexp_dup_bytes > 0 {
             tracing::info!(
-                "laguna VRAM    of which fused shexp gate|up duplicate planes {:>5.2} GB",
+                "{fam} VRAM    of which fused shexp gate|up duplicate planes {:>5.2} GB",
                 gb(shexp_dup_bytes)
             );
         }
 
         let vh = vfree();
         let output_norm = exec.upload(map, "output_norm.weight")?;
-        let lm_head = exec.load_quantw(map, "output.weight")?;
+        let lm_head = Head::Quant(exec.load_quantw(map, "output.weight")?);
         tracing::info!(
-            "laguna VRAM  output head + final norm              {:>7.2} GB",
+            "{fam} VRAM  output head + final norm              {:>7.2} GB",
             gb(vh.saturating_sub(vfree()))
         );
 
@@ -407,7 +499,7 @@ impl GpuLaguna {
             .settled_mem_used()
             .unwrap_or_else(|| v_start.saturating_sub(vfree()));
         tracing::info!(
-            "laguna VRAM  = model resident total                {:>7.2} GB  \
+            "{fam} VRAM  = model resident total                {:>7.2} GB  \
              ({} layers: {} full / {} SWA-{}, heads {}/{}, {} experts top-{})",
             gb(weights_bytes),
             n_layer,
@@ -423,6 +515,7 @@ impl GpuLaguna {
         Ok(Self {
             exec,
             hp: Hparams {
+                flavor,
                 n_layer,
                 n_embd,
                 n_heads,
@@ -446,7 +539,11 @@ impl GpuLaguna {
                 crate::kv_tier::fingerprint::weights(map),
                 crate::kv_tier::fingerprint::tokenizer(map),
             ),
-            kv_dtype: KvDtype::Fp16,
+            // KV8 (fp8-e4m3) by default since 2026-10-04 - the class this
+            // family's boards and rivals run, with fp8 arms on every serving
+            // path; a die that cannot store fp8 gets f16 back (serving.rs)
+            // and an explicit kv_cache_dtype wins
+            kv_dtype: KvDtype::Fp8E4m3,
             decode: None,
             scratch: None,
             batch: None,

@@ -190,6 +190,10 @@ impl GpuQwen3Asr {
             // The switch still works (`--kv-cache-dtype fp8_e4m3`) for anyone
             // who wants the VRAM back; it just must not be the default. Revisit
             // if the ratio-2 fp8 prefill arm ever lands.
+            // KV stays f16 - the exception to the KV8 default (2026-10-04):
+            // the fp8 prefill tile has no group-2 arm (16q/8kv; batch.rs
+            // wmma_pf), and measured at fp8 the family is exact (11/11) but
+            // 2-6% slower (measured 2026-10-04), so f16 is the faster class.
             kv_dtype: KvDtype::Fp16,
             tok_embd,
             layers,

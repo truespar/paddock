@@ -32,6 +32,9 @@ public struct ReadQuestion: Identifiable, Equatable, Codable, Sendable {
   // Retain the other type's fields when switching types, like the web editor.
   public var options = [Option(), Option()]
   public var levels = [Option(), Option(), Option()]
+  public var askIf: [Condition] = []
+  public var after: [UUID] = []
+  public var alone = false
   public init(questionID: String, kind: Kind = .noul) {
     self.questionID = questionID
     self.kind = kind
@@ -49,7 +52,7 @@ public struct ReadQuestion: Identifiable, Equatable, Codable, Sendable {
     }
     return nil
   }
-  public var wire: ConversationValue {
+  public func wire(in questions: [ReadQuestion]) -> ConversationValue {
     var q: [String: ConversationValue] = [
       "type": .string(kind.rawValue),
       "instructions": .string(instructions.trimmingCharacters(in: .whitespacesAndNewlines)),
@@ -78,6 +81,18 @@ public struct ReadQuestion: Identifiable, Equatable, Codable, Sendable {
       q["criteria"] = .array(
         levels.map { .string($0.name.trimmingCharacters(in: .whitespacesAndNewlines)) })
     }
+    func name(_ id: UUID) -> String {
+      questions.first { $0.id == id }?.questionID ?? id.uuidString
+    }
+    if !askIf.isEmpty {
+      q["ask_if"] = .object(
+        Dictionary(
+          askIf.map {
+            (name($0.question), ConversationValue.array($0.answers.map(ConversationValue.string)))
+          }, uniquingKeysWith: { _, last in last }))
+    }
+    if !after.isEmpty { q["depends_on"] = .array(after.map { .string(name($0)) }) }
+    if alone { q["alone"] = .bool(true) }
     return .object(q)
   }
 }
@@ -109,14 +124,15 @@ public struct ReadDraft: Equatable, Sendable {
     if Set(questions.map(\.questionID)).count != questions.count {
       return "Question IDs must differ."
     }
-    return questions.compactMap(\.validation).first
+    return questions.compactMap(\.validation).first ?? conditionValidation
   }
   public var setBody: ConversationValue {
     var fields: [String: ConversationValue] = [
       "samples": samples == 0 ? .string("auto") : .number(Decimal(samples)),
       "questions": .object(
         Dictionary(
-          questions.map { ($0.questionID, $0.wire) }, uniquingKeysWith: { _, last in last })),
+          questions.map { ($0.questionID, $0.wire(in: questions)) },
+          uniquingKeysWith: { _, last in last })),
     ]
     if steps > 1 { fields["steps"] = .number(Decimal(steps)) }
     if think > 0 { fields["think"] = .number(Decimal(think)) }
@@ -175,11 +191,6 @@ public struct ReadDraft: Equatable, Sendable {
     let path = root["questions"] == nil ? [] : ["questions"]
     draft.questions = try (order.keys[path] ?? []).map { id in
       let raw = map[id]!
-      if ["depends_on", "ask_if", "alone"].contains(where: { raw[$0] != nil }) {
-        throw ConversationFailure.invalid(
-          "\(id): conditional question editing is not supported in this native editor yet. The request was not changed."
-        )
-      }
       let type = raw["type"]?.string ?? ""
       guard
         let kind = ReadQuestion.Kind(rawValue: ["bool", "boolean"].contains(type) ? "noul" : type)
@@ -217,6 +228,7 @@ public struct ReadDraft: Equatable, Sendable {
       }
       return q
     }
+    try draft.importConditions(map)
     if let error = draft.validation(maxQuestions: maxQuestions) {
       throw ConversationFailure.invalid(error)
     }
@@ -236,6 +248,8 @@ public struct ReadResponse: Decodable, Sendable {
     public let agreement: Double?
     public let outside: Double?
     public let answerConfidence: Double?
+    public let stderr: Double?
+    public let scoreStderr: Double?
     public let noul: Double?
     public let choice: String?
     public let score: Double?
@@ -245,6 +259,8 @@ public struct ReadResponse: Decodable, Sendable {
     private enum CodingKeys: String, CodingKey {
       case type, confidence, agreement, outside, noul, choice, score, level, probabilities, legend
       case answerConfidence = "answer_confidence"
+      case stderr
+      case scoreStderr = "score_stderr"
     }
     public var label: String {
       if let noul { return noul >= 0.5 ? "Yes" : "No" }
@@ -286,10 +302,12 @@ public struct ReadResponse: Decodable, Sendable {
         public let pick: String
         public let confidence: Double
         public let entropy: Double
+        public let argmax: String?
       }
       public let id: String
       public let label: String
       public let entropy: Double
+      public let slotEntropy: Double?
       public let labelMass: Double?
       public let position: Int?
       public let reads: [Sample]?
@@ -311,6 +329,7 @@ public struct ReadResponse: Decodable, Sendable {
       private enum CodingKeys: String, CodingKey {
         case id, label, entropy, reads, position, options, tokens, temperature, window, logits
         case labelMass = "label_mass"
+        case slotEntropy = "slot_entropy"
         case entropyConfidence = "entropy_confidence"
         case optionIDs = "option_ids"
       }
@@ -334,10 +353,18 @@ public struct ReadResponse: Decodable, Sendable {
     public let images: Int?
     public let pictures: [Picture]?
     public let windowed: Bool?
+    public let steps: Int?
+    public let format: String?
+    public let stages: [[String]]?
+    public let chunks: [[String]]?
+    public let conditioning: String?
+    public let skipped: [String: Skip]?
+    public let thought: Thoughts?
     public let questions: [Question]
     public let timing: Timing
     private enum CodingKeys: String, CodingKey {
       case reads, canvas, backend, checkpoint, windowed, questions, timing, images, pictures
+      case steps, format, stages, chunks, conditioning, skipped, thought
       case stateTokens = "state_tokens"
       case stateRead = "state_read"
     }
@@ -359,6 +386,21 @@ public struct ReadResponse: Decodable, Sendable {
     }
   }
   public let usage: Usage?
+  private enum CodingKeys: String, CodingKey { case routing, model, answers, diagnostics, usage }
+  public init(from decoder: any Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    routing = try c.decodeIfPresent(Routing.self, forKey: .routing)
+    model = try c.decode(String.self, forKey: .model)
+    diagnostics = try c.decode(Diagnostics.self, forKey: .diagnostics)
+    usage = try c.decodeIfPresent(Usage.self, forKey: .usage)
+    let raw = try c.decode([String: Answer?].self, forKey: .answers)
+    let skipped = diagnostics.skipped ?? [:]
+    // Null is legal only for an explicitly skipped conditional question.
+    guard raw.allSatisfy({ $0.value != nil || skipped[$0.key] != nil }) else {
+      throw ConversationFailure.invalid("The runner returned an unexplained missing answer.")
+    }
+    answers = raw.compactMapValues { $0 }
+  }
   public func validate(for questions: [ReadQuestion]) throws {
     func probability(_ p: Double) -> Bool { p.isFinite && (0...1).contains(p) }
     let decision = ["laya", "clef"].contains(diagnostics.backend ?? "")
@@ -372,7 +414,9 @@ public struct ReadResponse: Decodable, Sendable {
     case nil: validBackend = (diagnostics.canvas ?? 0) > 0
     default: validBackend = false
     }
-    guard Set(answers.keys) == Set(questions.map(\.questionID)),
+    let skipped = diagnostics.skipped ?? [:]
+    guard Set(answers.keys).union(skipped.keys) == Set(questions.map(\.questionID)),
+      Set(answers.keys).isDisjoint(with: skipped.keys),
       (1...32).contains(diagnostics.reads),
       validBackend,
       diagnostics.timing.totalMilliseconds.isFinite, diagnostics.timing.totalMilliseconds >= 0,
@@ -383,13 +427,36 @@ public struct ReadResponse: Decodable, Sendable {
       throw ConversationFailure.invalid("The runner returned an incomplete or invalid read result.")
     }
     for question in questions {
-      let answer = answers[question.questionID]!
+      if let skip = skipped[question.questionID] {
+        guard let source = questions.first(where: { $0.questionID == skip.because }),
+          question.askIf.contains(where: {
+            $0.question == source.id && Set($0.answers) == Set(skip.wanted)
+          }),
+          skip.was.map({ !skip.wanted.contains($0) }) ?? true
+        else {
+          throw ConversationFailure.invalid("Invalid skip reason for \(question.questionID).")
+        }
+        let sourceAnswer = answers[source.questionID]
+        let expected = sourceAnswer.map { answer in
+          answer.type == "noul" ? answer.label.lowercased() : answer.label
+        }
+        guard skip.was == expected else {
+          throw ConversationFailure.invalid(
+            "The skip reason disagrees with \(source.questionID)'s answer.")
+        }
+        continue
+      }
+      guard let answer = answers[question.questionID] else {
+        throw ConversationFailure.invalid("Missing answer for \(question.questionID).")
+      }
       guard answer.type == question.kind.rawValue,
         probability(answer.confidence),
         decision
           ? answer.answerConfidence.map(probability) == true
           : (answer.agreement.map(probability) == true && answer.outside.map(probability) == true),
         answer.agreement.map(probability) ?? true, answer.outside.map(probability) ?? true,
+        answer.stderr.map({ $0.isFinite && $0 >= 0 }) ?? true,
+        answer.scoreStderr.map({ $0.isFinite && $0 >= 0 }) ?? true,
         answer.probabilities?.values.allSatisfy(probability) ?? true
       else {
         throw ConversationFailure.invalid("Invalid probabilities for \(question.questionID).")

@@ -171,7 +171,7 @@ fn spec_low_rows(block: Option<usize>) -> usize {
 
 fn serve_spec_k_budget(live: usize, block: Option<usize>) -> usize {
     let b = serve_spec_max_rows();
-    let deep_live_max: usize = paddock_models::dev_var!("PADDOCK_SPEC_DEEP_LIVE_MAX")
+    let deep_live_max: usize = std::env::var("PADDOCK_SPEC_DEEP_LIVE_MAX")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0); // deep tier off by default: k15 measured worse than k7
@@ -3343,7 +3343,7 @@ mod cohort_grace_tests {
 fn pipe_min_live() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
-        paddock_models::dev_var!("PADDOCK_PIPE_MIN_LIVE")
+        std::env::var("PADDOCK_PIPE_MIN_LIVE")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0)
@@ -5855,7 +5855,7 @@ fn run_batched(
                     // 2 below - so fall through instead.
                     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
                     *CAP.get_or_init(|| {
-                        paddock_models::dev_var!("PADDOCK_G4_SPEC_LIVE_MAX")
+                        std::env::var("PADDOCK_G4_SPEC_LIVE_MAX")
                             .ok()
                             .and_then(|v| v.parse().ok())
                             .unwrap_or(usize::MAX)

@@ -76,6 +76,10 @@ const CAP_META = [
   // are). It reads images but it is no vision chat - it answers with rasters,
   // so it gets its own chip rather than borrowing 'Vision'.
   { key: 'segmentation', icon: 'map', label: 'Image to map' },
+  // A picture and a concept (or example boxes) in, every matching object's
+  // mask out - the Masks page's model. It reads pictures but answers with
+  // masks, never text, so it gets its own chip too.
+  { key: 'masks', icon: 'masks', label: 'Masks' },
   // A prompt in, a picture out. Not a chat model and not a vision one - it
   // never reads an image - so it wears its own chip, and its row files under
   // its own section below.
@@ -150,6 +154,8 @@ function sectionOf(m: CatalogModel): string {
   // Chips in, rasters out - it has no text surface at all, so filing it under
   // 'Chat' would promise the one thing it refuses.
   if (m.capability.includes('segmentation')) return 'Maps from imagery'
+  // A picture and a prompt in, masks out - no text surface either.
+  if (m.capability.includes('masks')) return 'Masks'
   // Text in, a picture out - no text surface either.
   if (m.capability.includes('image-generation')) return 'Image generation'
   return 'Chat'

@@ -153,8 +153,14 @@ final class NativeReadCameraCapture: NSObject, AVCaptureVideoDataOutputSampleBuf
 
 struct NativeReadCameraPreview: NSViewRepresentable {
   let capture: NativeReadCameraCapture
+  var camera: NativeReadCamera
   final class View: NSView {
     let preview = AVCaptureVideoPreviewLayer()
+    weak var camera: NativeReadCamera?
+    override func viewDidMoveToWindow() {
+      super.viewDidMoveToWindow()
+      camera?.window = window
+    }
     override init(frame: NSRect) {
       super.init(frame: frame)
       wantsLayer = true
@@ -172,6 +178,8 @@ struct NativeReadCameraPreview: NSViewRepresentable {
   }
   func makeNSView(context: Context) -> View { View(frame: .zero) }
   func updateNSView(_ view: View, context: Context) {
+    view.camera = camera
+    camera.window = view.window
     if view.preview.session !== capture.session { view.preview.session = capture.session }
     if let connection = view.preview.connection, connection.isVideoMirroringSupported {
       connection.automaticallyAdjustsVideoMirroring = false

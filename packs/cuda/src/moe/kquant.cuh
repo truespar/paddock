@@ -1807,7 +1807,11 @@ int pd_kquant_moe_down_list(const void* down_data, const void* down_scales,
 // Numeric class: identical expressions in identical K-fold order as the
 // dense ks v2 (super-ascending, kk 0..7) - exact int8 dots, f32 scale
 // application, deterministic for a fixed sorted layout.
-template <uint32_t DT, bool GU, bool GELU>
+// P16 (down only, slot 749): each weighted partial rounds to bf16 at the store
+// - half the plane's bytes; pd_moe_slot_combine_bf16 folds it in f32, fixed
+// slot order (the PADDOCK_MOE_PART_BF16 class).
+template <uint32_t DT, bool GU, bool GELU, bool P16 = false, uint32_t ST_ = 2u,
+          uint32_t RW = 4u>
 __global__ void __launch_bounds__(256) pd_kq_moe_mma_kernel(
         const uint8_t* __restrict__ wd0, const uint8_t* __restrict__ ws0,
         const uint8_t* __restrict__ wd1, const uint8_t* __restrict__ ws1,
@@ -1822,24 +1826,29 @@ __global__ void __launch_bounds__(256) pd_kq_moe_mma_kernel(
 #if PD_MMA_OK
     constexpr bool MU = (DT == PD_KQ_Q4K || DT == PD_KQ_Q5K || DT == PD_KQ_Q40);
     constexpr bool K16 = (DT == PD_KQ_Q6K);
-    constexpr uint32_t BN = 32u, ST = 2u;
-    constexpr uint32_t CPW = BN / 2u;    // 8 warps = 4 row x 2 col
+    constexpr uint32_t BN = 32u, ST = ST_;  // ring depth: a seam, not math
+    // 8 warps = RW row x (8 / RW) col; the strip is RW x 16 rows. RW 4 is the
+    // 64-row strip every launcher uses; RW 8 gives each warp all BN columns
+    // (each unpacked fragment feeds NSUB = 4 mmas). Geometry, not math.
+    constexpr uint32_t CW = 8u / RW, STRIP = RW * 16u, SST = STRIP + 1u;
+    constexpr uint32_t CPW = BN / CW;
     constexpr uint32_t NSUB = CPW / 8u;
     constexpr uint32_t DATAB = DT == PD_KQ_Q6K ? PD_KQ6_DATA
                              : DT == PD_KQ_Q5K ? PD_KQ5_DATA : PD_KQ4_DATA;
     constexpr uint32_t WSTR = DATAB + 16u;
 
     // ring planes - the dense ks v2 layout verbatim (same size helper)
-    constexpr uint32_t W_PL = 64u * WSTR, R_PL = 64u * PD_KQ_SCB;
+    constexpr uint32_t W_PL = STRIP * WSTR, R_PL = STRIP * PD_KQ_SCB;
     constexpr uint32_t B_PL = BN * (PD_KM_BSTR * 4u);
     constexpr uint32_t XS_PL = BN * 48u, SU_PL = BN * 80u;
     constexpr uint32_t OFF_R = ST * W_PL, OFF_B = OFF_R + ST * R_PL;
     constexpr uint32_t OFF_XS = OFF_B + ST * B_PL;
     constexpr uint32_t OFF_SU = OFF_XS + ST * XS_PL;
-    static_assert(OFF_SU + (MU ? ST * SU_PL : 0u) == pd_km_smem_bytes(DT, BN, ST),
+    static_assert(RW != 4u
+                      || OFF_SU + (MU ? ST * SU_PL : 0u) == pd_km_smem_bytes(DT, BN, ST),
                   "smem layout matches the launcher's size");
-    // the GU epilogue bounce (BN cols x 65-f32 stride) reuses the ring space
-    static_assert(!GU || BN * 65u * 4u <= pd_km_smem_bytes(DT, BN, ST),
+    // the GU epilogue bounce (BN cols x SST-f32 stride) reuses the ring space
+    static_assert(!GU || BN * SST * 4u <= OFF_SU + (MU ? ST * SU_PL : 0u),
                   "fused bounce fits the ring");
     extern __shared__ __align__(16) unsigned char pd_kqm_sh[];
     auto rw = [&](uint32_t buf) { return pd_kqm_sh + buf * W_PL; };
@@ -1860,9 +1869,9 @@ __global__ void __launch_bounds__(256) pd_kq_moe_mma_kernel(
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u, warp = tid >> 5u;
     const uint32_t g = lane >> 2u, t = lane & 3u;
-    const uint32_t wr = (warp & 3u) * 16u;
-    const uint32_t wc = (warp >> 2u) * CPW;
-    const uint32_t row_base = blockIdx.y * 64u;
+    const uint32_t wr = (warp % RW) * 16u;
+    const uint32_t wc = (warp / RW) * CPW;
+    const uint32_t row_base = blockIdx.y * STRIP;
     const uint32_t n_super = in_dim >> 8u;
     const uint32_t nb32 = in_dim >> 5u, nb16 = in_dim >> 4u;
     const size_t wrow0 = (size_t)e * out_dim + row_base;
@@ -1888,14 +1897,14 @@ __global__ void __launch_bounds__(256) pd_kq_moe_mma_kernel(
         // commit at the call site (the dense ks ring discipline)
         auto stage = [&](uint32_t kt, uint32_t buf) {
             constexpr uint32_t WI4 = DATAB / 16u;
-            for (uint32_t i = tid; i < 64u * WI4; i += 256u) {
+            for (uint32_t i = tid; i < STRIP * WI4; i += 256u) {
                 const uint32_t row = i / WI4, c = i % WI4;
                 const bool ok = (row_base + row) < out_dim;
                 pd_mma_cpa16p(rw(buf) + row * WSTR + c * 16u,
                               wd + ((wrow0 + row) * n_super + kt) * DATAB + c * 16u,
                               ok);
             }
-            for (uint32_t i = tid; i < 64u * 3u; i += 256u) {  // recs: 3 x 8 B
+            for (uint32_t i = tid; i < STRIP * 3u; i += 256u) {  // recs: 3 x 8 B
                 const uint32_t row = i / 3u, c = i % 3u;
                 const bool ok = (row_base + row) < out_dim;
                 pd_kq_cpa8p(rrec(buf) + row * PD_KQ_SCB + c * 8u,
@@ -2113,7 +2122,7 @@ __global__ void __launch_bounds__(256) pd_kq_moe_mma_kernel(
         // SwiGLU + per-32 quantize epilogue. PAD columns carry exact-zero
         // accs (zero-filled activations AND scales), so their fq/fs rows
         // write zeros - the flat fsums pass over the sorted rows needs that.
-        float* sf = (float*)pd_kqm_sh;  // BN cols x 65-f32 stride (bank skew)
+        float* sf = (float*)pd_kqm_sh;  // BN cols x SST-f32 stride (bank skew)
         #pragma unroll
         for (uint32_t sub = 0; sub < NSUB; ++sub) {
             const uint32_t c0 = wc + sub * 8u + 2u * t;
@@ -2122,25 +2131,26 @@ __global__ void __launch_bounds__(256) pd_kq_moe_mma_kernel(
                 const uint32_t c = c0 + (q & 1u);
                 const uint32_t rl = wr + g + (q & 2u ? 8u : 0u);
                 const float gv = acc_g[sub][q], uv = acc_u[sub][q];
-                sf[c * 65u + rl] = pd_kq_glu_epi<GELU>(gv, uv);
+                sf[c * SST + rl] = pd_kq_glu_epi<GELU>(gv, uv);
             }
         }
         __syncthreads();
         const uint32_t n_sb = out_dim >> 5u;
-        if (tid < BN * 2u) {
-            const uint32_t col = tid >> 1u, half = tid & 1u;
+        constexpr uint32_t QB = STRIP / 32u;  // per-32 quantize blocks a column
+        if (tid < BN * QB) {
+            const uint32_t col = tid / QB, half = tid % QB;
             const uint32_t r0 = row_base + half * 32u;
             if (r0 < out_dim) {
                 float amax = 0.0f;
                 #pragma unroll
                 for (uint32_t j = 0; j < 32u; ++j)
-                    amax = fmaxf(amax, fabsf(sf[col * 65u + half * 32u + j]));
+                    amax = fmaxf(amax, fabsf(sf[col * SST + half * 32u + j]));
                 const float scl = amax * (1.0f / 127.0f);
                 const float inv = scl > 0.0f ? 1.0f / scl : 0.0f;
                 const size_t frow = (size_t)blk * BN + col;
                 #pragma unroll
                 for (uint32_t j = 0; j < 32u; ++j) {
-                    int qi = __float2int_rn(sf[col * 65u + half * 32u + j] * inv);
+                    int qi = __float2int_rn(sf[col * SST + half * 32u + j] * inv);
                     qi = qi < -127 ? -127 : (qi > 127 ? 127 : qi);
                     fq[frow * out_dim + r0 + j] = (int8_t)qi;
                 }
@@ -2160,7 +2170,12 @@ __global__ void __launch_bounds__(256) pd_kq_moe_mma_kernel(
                 const unsigned int token = tok[c];
                 if (token == PD_MOE_PAD || r >= out_dim) continue;
                 const size_t pair = (size_t)token * n_active + slt[c];
-                part[pair * out_dim + r] = topk_w[pair] * acc_g[sub][q];
+                const float pv = topk_w[pair] * acc_g[sub][q];
+                if (P16)
+                    reinterpret_cast<__nv_bfloat16*>(part)[pair * out_dim + r] =
+                        __float2bfloat16_rn(pv);
+                else
+                    part[pair * out_dim + r] = pv;
             }
         }
     }
@@ -2174,16 +2189,16 @@ __global__ void __launch_bounds__(256) pd_kq_moe_mma_kernel(
 
 // dynamic-smem opt-in per instantiation (Q5K/Q6K rings exceed the 48 KB
 // static window; Q4K/IQ4 stay under -> 2 CTA/SM)
-#define PD_KQM_LAUNCH(DTV, GUV, GEV, ...)                                     \
+#define PD_KQM_LAUNCH(DTV, GUV, GEV, P16V, ...)                               \
     do {                                                                      \
         constexpr uint32_t smem = pd_km_smem_bytes(DTV, 32u, 2u);             \
         if (smem > 48u * 1024u) {                                             \
             static cudaError_t attr = cudaFuncSetAttribute(                   \
-                (const void*)pd_kq_moe_mma_kernel<DTV, GUV, GEV>,             \
+                (const void*)pd_kq_moe_mma_kernel<DTV, GUV, GEV, P16V>,       \
                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);      \
             if (attr != cudaSuccess) return attr;                             \
         }                                                                     \
-        pd_kq_moe_mma_kernel<DTV, GUV, GEV><<<grid, 256, smem, st>>>(__VA_ARGS__); \
+        pd_kq_moe_mma_kernel<DTV, GUV, GEV, P16V><<<grid, 256, smem, st>>>(__VA_ARGS__); \
     } while (0)
 
 template <bool GELU>
@@ -2202,7 +2217,7 @@ static int pd_kquant_moe_gate_up_mma_impl(const void* gate_data, const void* gat
     cudaStream_t st = (cudaStream_t)stream;
     switch (dtype) {
         #define PD_KQM_GU(DTV)                                                \
-            PD_KQM_LAUNCH(DTV, true, GELU, (const uint8_t*)gate_data,         \
+            PD_KQM_LAUNCH(DTV, true, GELU, false, (const uint8_t*)gate_data,  \
                 (const uint8_t*)gate_scales, (const uint8_t*)up_data,         \
                 (const uint8_t*)up_scales, (const unsigned int*)sorted_row,   \
                 nullptr, (const unsigned int*)block_expert, nullptr,          \
@@ -2243,14 +2258,14 @@ int pd_kquant_moe_gate_up_mma_geglu(const void* gate_data, const void* gate_scal
                                                 fs, in_dim, ff, max_blocks, dtype, stream);
 }
 
-PD_EXPORT
-int pd_kquant_moe_down_mma(const void* down_data, const void* down_scales,
-                           const void* sorted_row, const void* sorted_slot,
-                           const void* block_expert, const void* topk_w,
-                           const void* fq, const void* fs, const void* fsums,
-                           void* part, uint32_t ff, uint32_t embd,
-                           uint32_t n_active, uint32_t max_blocks,
-                           uint32_t dtype, void* stream) {
+template <bool P16>
+static int pd_kquant_moe_down_mma_impl(const void* down_data, const void* down_scales,
+                                       const void* sorted_row, const void* sorted_slot,
+                                       const void* block_expert, const void* topk_w,
+                                       const void* fq, const void* fs, const void* fsums,
+                                       void* part, uint32_t ff, uint32_t embd,
+                                       uint32_t n_active, uint32_t max_blocks,
+                                       uint32_t dtype, void* stream) {
     if (embd == 0 || max_blocks == 0) return 0;
     if ((ff & 255u) != 0 || (embd & 31u) != 0) return cudaErrorInvalidValue;
     if (!pd_kq_valid(dtype)) return cudaErrorInvalidValue;
@@ -2260,7 +2275,7 @@ int pd_kquant_moe_down_mma(const void* down_data, const void* down_scales,
     cudaStream_t st = (cudaStream_t)stream;
     switch (dtype) {
         #define PD_KQM_DN(DTV)                                                \
-            PD_KQM_LAUNCH(DTV, false, false, (const uint8_t*)down_data,       \
+            PD_KQM_LAUNCH(DTV, false, false, P16, (const uint8_t*)down_data,  \
                 (const uint8_t*)down_scales, nullptr, nullptr,                \
                 (const unsigned int*)sorted_row,                              \
                 (const unsigned int*)sorted_slot,                             \
@@ -2277,3 +2292,30 @@ int pd_kquant_moe_down_mma(const void* down_data, const void* down_scales,
     return pd_launch_status();
 }
 #undef PD_KQM_LAUNCH
+
+PD_EXPORT
+int pd_kquant_moe_down_mma(const void* down_data, const void* down_scales,
+                           const void* sorted_row, const void* sorted_slot,
+                           const void* block_expert, const void* topk_w,
+                           const void* fq, const void* fs, const void* fsums,
+                           void* part, uint32_t ff, uint32_t embd,
+                           uint32_t n_active, uint32_t max_blocks,
+                           uint32_t dtype, void* stream) {
+    return pd_kquant_moe_down_mma_impl<false>(down_data, down_scales, sorted_row, sorted_slot,
+                                              block_expert, topk_w, fq, fs, fsums, part, ff,
+                                              embd, n_active, max_blocks, dtype, stream);
+}
+
+// slot 749: the bf16-partials twin (part holds rows * n_active * embd bf16)
+PD_EXPORT
+int pd_kquant_moe_down_mma_b16(const void* down_data, const void* down_scales,
+                               const void* sorted_row, const void* sorted_slot,
+                               const void* block_expert, const void* topk_w,
+                               const void* fq, const void* fs, const void* fsums,
+                               void* part, uint32_t ff, uint32_t embd,
+                               uint32_t n_active, uint32_t max_blocks,
+                               uint32_t dtype, void* stream) {
+    return pd_kquant_moe_down_mma_impl<true>(down_data, down_scales, sorted_row, sorted_slot,
+                                             block_expert, topk_w, fq, fs, fsums, part, ff,
+                                             embd, n_active, max_blocks, dtype, stream);
+}

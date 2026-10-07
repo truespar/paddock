@@ -790,7 +790,11 @@ impl GpuGranite {
                 crate::kv_tier::fingerprint::weights_safetensors(&st),
                 crate::kv_tier::fingerprint::tokenizer_dir(dir),
             ),
-            kv_dtype: KvDtype::Fp16,
+            // KV8 (fp8-e4m3) by default since 2026-10-04 - the class this
+            // family's boards and rivals run, with fp8 arms on every serving
+            // path; a die that cannot store fp8 gets f16 back (serving.rs)
+            // and an explicit kv_cache_dtype wins
+            kv_dtype: KvDtype::Fp8E4m3,
             decode: None,
             scratch: None,
             batch: None,

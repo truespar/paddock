@@ -340,18 +340,26 @@ kernel void gemma_merge_shared(device const float* parts [[buffer(0)]],device fl
 // MPP online-softmax prefill, with a smaller key tile for global HD=512.
 // The SWA lower bound is per query, not per chunk; partial tiles never read
 // sequence-neighbour metadata. Rings include CHUNK slack before all KV writes.
-template<uint HD,uint KT,uint BM=32,typename T=half,bool Image=false,bool Muse=false,typename KV=half,bool Relaxed=false>
+template<uint HD,uint KT,uint BM=32,typename T=half,bool Image=false,bool Muse=false,typename KV=half,bool Relaxed=false,bool Bidir=false,typename P=T,bool Exp2=false,uint TilePanel=0>
 inline void gemma_prefill(device T* q,device const KV* k,device const KV* v,device const uint* meta,
     device const uint* pages,device float* out,constant uint* p,uint head,uint first,uint count,uint tid,
-    threadgroup T* kv,threadgroup T* probability,threadgroup float* scores,
+    threadgroup T* kv,threadgroup P* probability,threadgroup float* scores,
     threadgroup float* maximum,threadgroup float* denominator,threadgroup float* correction,device const uint* limits=nullptr) {
     constexpr uint G=128/BM;
     // Stream contraction/output panels, not the entire HD512 KV tile. MPP
     // compiler staging counts against the same 32 KiB threadgroup budget.
-    constexpr uint Panel=sizeof(T)==4?128:(HD<256?HD:256);
+    constexpr uint Panel=TilePanel?TilePanel:(sizeof(T)==4?128:(HD<256?HD:256));
     uint kh=head/(p[0]/p[1]),slot=meta[2*first],lastpos=meta[2*(first+count-1)+1],width=p[0]*HD;
     if constexpr(Image)lastpos=limits[first+count-1];
     uint low=p[3] && meta[2*first+1]+1>p[3]?meta[2*first+1]+1-p[3]:0;
+    // Retrieval has a symmetric window and no persistent KV pages. `limits`
+    // is the last local position; meta's slot is the packed sequence start.
+    // Compile-time specialization leaves every generative caller unchanged.
+    if constexpr(Bidir) {
+        lastpos=p[3]?min(limits[first],lastpos+p[3]):limits[first];
+        low=p[3] && meta[2*first+1]>p[3]?meta[2*first+1]-p[3]:0;
+        if constexpr(Exp2)low=low/KT*KT;
+    }
     auto tq=tensor(q+ulong(first)*width+head*HD,dextents<int,2>(HD,count),array<int,2>{1,int(width)});
     auto tk=tensor(kv,extents<int,Panel,KT>(),array<int,2>{1,Panel});
     auto tv=tensor(kv,extents<int,KT,Panel>(),array<int,2>{1,KT});
@@ -374,29 +382,31 @@ inline void gemma_prefill(device T* q,device const KV* k,device const KV* v,devi
         for(uint i=0;i<score.get_capacity();++i)score[i]=0;
         for(uint panel=0;panel<HD/Panel;++panel){
             for(uint i=tid;i<KT*Panel;i+=128){uint t=base+i/Panel,d=panel*Panel+i%Panel;
-                kv[i]=t<=lastpos?T(k[(ulong(gemma_physical(pages,slot,t,p))*p[1]+kh)*HD+d]):T(0);}
+                kv[i]=t<=lastpos?T(k[(ulong(Bidir?slot+t:gemma_physical(pages,slot,t,p))*p[1]+kh)*HD+d]):T(0);}
             threadgroup_barrier(mem_flags::mem_threadgroup);
             auto query=tq.slice(panel*Panel,0);qk.run(query,tk,score);
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         if constexpr(Muse)for(uint i=0;i<score.get_capacity();++i)score[i]*=0.08838834764831845f;
+        if constexpr(Exp2)for(uint i=0;i<score.get_capacity();++i)score[i]*=1.44269504089f;
         score.store(ts);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         uint row=tid/G,lane=tid%G,pos=row<count?meta[2*(first+row)+1]:0;
         uint upper=pos;if constexpr(Image)upper=row<count?limits[first+row]:0;
         uint lo=p[3] && pos+1>p[3]?pos+1-p[3]:0;
+        if constexpr(Bidir) { upper=p[3]?min(limits[first],pos+p[3]):limits[first];lo=p[3] && pos>p[3]?pos-p[3]:0; }
         float high=maximum[row];for(uint j=lane;j<KT;j+=G)if(row<count && base+j<=upper && base+j>=lo)high=max(high,scores[row*KT+j]);
         #pragma unroll
         for(uint shift=1;shift<G;shift*=2)high=max(high,simd_shuffle_xor(high,shift));
-        float old=isfinite(maximum[row])?exp(maximum[row]-high):0.0f,sum=0;
-        for(uint j=lane;j<KT;j+=G){float pr=row<count && base+j<=upper && base+j>=lo?exp(scores[row*KT+j]-high):0.0f;
-            probability[row*KT+j]=T(pr);sum+=pr;}
+        float old=isfinite(maximum[row])?(Exp2?fast::exp2(maximum[row]-high):exp(maximum[row]-high)):0.0f,sum=0;
+        for(uint j=lane;j<KT;j+=G){float pr=row<count && base+j<=upper && base+j>=lo?(Exp2?fast::exp2(scores[row*KT+j]-high):exp(scores[row*KT+j]-high)):0.0f;
+            probability[row*KT+j]=P(pr);sum+=pr;}
         #pragma unroll
         for(uint shift=1;shift<G;shift*=2)sum+=simd_shuffle_xor(sum,shift);
         if(lane==0){maximum[row]=high;correction[row]=old;denominator[row]=row<count?denominator[row]*old+sum:1.0f;}
         for(uint panel=0;panel<HD/Panel;++panel){
             for(uint i=tid;i<KT*Panel;i+=128){uint t=base+i%KT,d=panel*Panel+i/KT;
-                kv[i]=t<=lastpos?T(v[(ulong(gemma_physical(pages,slot,t,p))*p[1]+kh)*HD+d]):T(0);}
+                kv[i]=t<=lastpos?T(v[(ulong(Bidir?slot+t:gemma_physical(pages,slot,t,p))*p[1]+kh)*HD+d]):T(0);}
             threadgroup_barrier(mem_flags::mem_threadgroup);
             auto product=pv.template get_destination_cooperative_tensor<decltype(tp),decltype(tv),float>();
             for(uint i=0;i<product.get_capacity();++i)product[i]=0;pv.run(tp,tv,product);

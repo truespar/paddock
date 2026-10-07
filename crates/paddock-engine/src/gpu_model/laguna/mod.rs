@@ -26,16 +26,31 @@
 //! forward + Generator next. Correctness bar = same-weights greedy match vs
 //! the NEWEST llama.cpp release binary serving the identical file (no CPU
 //! references).
+//!
+//! The same body serves Aleph Alpha's **Kolibri 1** (`kolibri1` GGUFs,
+//! [`Flavor::Kolibri`]); Aleph Alpha's vLLM plugin (`kolibri1.py`) is the
+//! study reference. Its deltas, each a per-layer or per-model field here:
+//! [SWA x4, full] with a 513-key window (the current token + 512), RoPE on
+//! the SWA layers only (the full layers are NoPE), no attention output gate,
+//! sandwich norms (`post_attention_norm` after the attention block,
+//! `post_ffw_norm` after routed + shared experts), MoE on every layer, and
+//! the `sigmoid_logit_add` router ([`Router::LogitSigmoid`]).
 
 use std::sync::Arc;
 
-use crate::gpu::{DeviceTensor, GpuExecutor, KvDtype, QuantTensor, QuantW, RepackedKQ, RepackedQ8};
+use crate::gpu::{
+    DeviceTensor, GpuExecutor, KvDtype, Nvf4MoePlane, QuantTensor, QuantW, RepackedKQ, RepackedQ8,
+};
 
 mod batch;
 mod dflash;
 mod forward;
+mod head;
 mod load;
+mod load_hf;
+mod moe_nv;
 mod prefix;
+mod profile;
 
 pub use dflash::DflashSelftest;
 
@@ -51,6 +66,35 @@ unsafe impl Send for SendGraph {}
 pub(crate) enum ExpW {
     Q8(RepackedQ8),
     Kq(RepackedKQ),
+}
+
+/// Which checkpoint family the body serves - see the module docs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Flavor {
+    Laguna,
+    Kolibri,
+}
+
+impl Flavor {
+    /// The family's name in the logs and refusals.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Flavor::Laguna => "laguna",
+            Flavor::Kolibri => "kolibri1",
+        }
+    }
+}
+
+/// Router class (llama.cpp's `expert_gating_func`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Router {
+    /// Laguna (gating 2): select on sigmoid(logits) + bias, weights = the
+    /// unbiased sigmoid scores, sum-normalized, * routed_scale.
+    SigmoidNorm,
+    /// Kolibri 1 (gating 5, `sigmoid_logit_add`): select on the RAW logits +
+    /// bias, weights = sigmoid(selected logit) * routed_scale, never
+    /// renormalized.
+    LogitSigmoid,
 }
 
 /// 256-expert MoE FFN + always-on shared expert. Router math (from the HF
@@ -81,6 +125,29 @@ pub(crate) struct MoeWeights {
     pub shexp_gateup: Option<RepackedKQ>,
 }
 
+/// The NVFP4 safetensors build's MoE (Kolibri's `primitive-ai` export):
+/// routed experts NVFP4 (W4A16 GEMVs at decode, the W4A4 block-scaled pair at
+/// prefill), the shared expert BF16 as shipped.
+pub(crate) struct MoeNv {
+    /// router [embd, n_expert] f32 (the checkpoint's BF16, widened exactly)
+    /// - the prefill widths' f32 GEMM
+    pub router_w: DeviceTensor,
+    /// the same router as shipped (BF16 `[embd, n_expert]`) for the decode
+    /// widths' f32-activation GEMVs: exact products, half the bytes
+    pub router_b16: QuantTensor,
+    /// selection bias [n_expert] f32 (BF16 widened)
+    pub probs_bias: DeviceTensor,
+    /// routed gate / up `[n_expert * ff, embd]` and down `[n_expert * embd, ff]`
+    /// (Row layout, per-expert global scales)
+    pub gate: Nvf4MoePlane,
+    pub up: Nvf4MoePlane,
+    pub down: Nvf4MoePlane,
+    /// shared expert, BF16 `[k, n]` planes
+    pub sh_gate: QuantTensor,
+    pub sh_up: QuantTensor,
+    pub sh_down: QuantTensor,
+}
+
 /// Per-layer FFN: layer 0 is dense (ffn 8192), everything else is MoE.
 // one value per layer, matched by reference from load/forward/batch - boxing the
 // MoE arm would buy nothing and touch every site
@@ -92,11 +159,11 @@ pub(crate) enum Ffn {
         down: QuantW,
     },
     Moe(MoeWeights),
+    MoeNv(MoeNv),
 }
 
-/// One transformer block.
-pub(crate) struct LagunaLayer {
-    pub attn_norm: DeviceTensor,
+/// The GGUF builds' attention projections (Q8_0 / k-quant, the W4A8 ladders).
+pub(crate) struct QProj {
     /// `attn_q` [embd, n_heads*head_dim] - width varies per layer.
     pub wq: QuantW,
     /// `attn_k` / `attn_v` [embd, n_kv_heads*head_dim] (uniform).
@@ -104,23 +171,74 @@ pub(crate) struct LagunaLayer {
     pub wv: QuantW,
     /// `attn_output` [n_heads*head_dim, embd].
     pub wo: QuantW,
-    /// `attn_gate` [embd, n_heads] - the per-head softplus output gate.
-    pub g_proj: QuantW,
-    /// `attn_{q,k}_norm` [head_dim] F32 - per-head QK-RMSNorm (pre-rope).
-    pub q_norm: DeviceTensor,
-    pub k_norm: DeviceTensor,
-    pub ffn_norm: DeviceTensor,
-    pub ffn: Ffn,
-    /// SWA-512 layer (il % 4 != 0). Full layers run partial-rotary YaRN.
-    pub is_swa: bool,
-    /// This layer's Q-head count (48 full / 64 SWA on XS-2.1).
-    pub n_heads: usize,
-    /// Merged [q | k | gate] plane for the r==1 GEMV lane: one big launch
+    /// `attn_gate` [embd, n_heads] - the per-head softplus output gate
+    /// (Laguna); Kolibri ships none.
+    pub g_proj: Option<QuantW>,
+    /// Merged [q | k | gate] plane ([q | k] without a gate) for the r==1 GEMV lane: one big launch
     /// (near-roof bandwidth, like the lm head) replaces three small GEMVs.
     /// v stays separate (Q6_K on the XS file). Duplicate residency (~400 MB
     /// on XS) - the r>1 mmq lane keeps the split tensors; the profile showed
     /// the decode tick is small-kernel-bound, not bandwidth-bound.
     pub qkg: Option<crate::gpu::RepackedKQ>,
+}
+
+/// Attention projections per weight class.
+// one value per layer; the Quant arm is the larger and the common one
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Proj {
+    Quant(QProj),
+    /// The NVFP4 safetensors build keeps attention BF16: the q|k|v rows fused
+    /// into one `[embd, q + 2 kv]` plane (one launch above r 1) and `wo`.
+    Bf16 {
+        wqkv: QuantTensor,
+        wo: QuantTensor,
+    },
+}
+
+impl Proj {
+    /// The GGUF planes - the dev probes and the GGUF-only paths read these.
+    pub(crate) fn quant(&self) -> Option<&QProj> {
+        match self {
+            Proj::Quant(q) => Some(q),
+            Proj::Bf16 { .. } => None,
+        }
+    }
+}
+
+/// The LM head per weight class.
+pub(crate) enum Head {
+    Quant(QuantW),
+    Bf16(QuantTensor),
+}
+
+/// One transformer block.
+pub(crate) struct LagunaLayer {
+    pub attn_norm: DeviceTensor,
+    pub proj: Proj,
+    /// `attn_{q,k}_norm` [head_dim] F32 - per-head QK-RMSNorm (pre-rope).
+    pub q_norm: DeviceTensor,
+    pub k_norm: DeviceTensor,
+    pub ffn_norm: DeviceTensor,
+    /// Sandwich norms (Kolibri): `post_attention_norm` on the attention
+    /// block's output before the residual add, `post_ffw_norm` on routed +
+    /// shared experts' sum before theirs. None on Laguna.
+    pub post_attn_norm: Option<DeviceTensor>,
+    pub post_ffn_norm: Option<DeviceTensor>,
+    pub ffn: Ffn,
+    /// SWA layer (Laguna il % 4 != 0, Kolibri the file's sliding pattern).
+    /// Laguna's full layers run partial-rotary YaRN.
+    pub is_swa: bool,
+    /// Full layer with no positional encoding at all (Kolibri's NoPE layers):
+    /// q/k are normed and attended unrotated.
+    pub nope: bool,
+    /// This layer's Q-head count (48 full / 64 SWA on XS-2.1).
+    pub n_heads: usize,
+}
+
+impl LagunaLayer {
+    pub(crate) fn has_gate(&self) -> bool {
+        self.proj.quant().is_some_and(|q| q.g_proj.is_some())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -131,10 +249,36 @@ pub(crate) struct MoeDims {
     pub shexp_ff: usize,
     /// `expert_weights_scale` (2.5) - multiplies the routed combine.
     pub routed_scale: f32,
+    pub router: Router,
+}
+
+impl MoeDims {
+    /// The router epilogue over [rows, n_expert] logits, per the class.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn route(
+        &self,
+        exec: &GpuExecutor,
+        logits: &cudarc::driver::CudaSlice<f32>,
+        bias: &DeviceTensor,
+        idx: &mut cudarc::driver::CudaSlice<u32>,
+        w: &mut cudarc::driver::CudaSlice<f32>,
+        rows: usize,
+    ) -> Result<(), crate::gpu::GpuError> {
+        let (e, k, s) = (self.n_expert, self.n_active, self.routed_scale);
+        match self.router {
+            Router::SigmoidNorm => {
+                exec.moe_topk_sigmoid_batch(logits, &bias.buf, s, e, k, idx, w, rows)
+            }
+            Router::LogitSigmoid => {
+                exec.moe_topk_logit_sigmoid_batch(logits, &bias.buf, s, e, k, idx, w, rows)
+            }
+        }
+    }
 }
 
 /// Geometry + rope constants from the GGUF header.
 pub(crate) struct Hparams {
+    pub flavor: Flavor,
     pub n_layer: usize,
     pub n_embd: usize,
     /// Per-layer Q-head counts (`attention.head_count` ships as an ARRAY).
@@ -158,6 +302,8 @@ pub(crate) struct Hparams {
 pub(crate) enum TokEmbd {
     Q8(QuantTensor),
     Kq(RepackedKQ),
+    /// the safetensors builds' BF16 table, as shipped
+    Bf16(QuantTensor),
 }
 
 /// The Laguna GPU model. Loader-only milestone: weights resident + geometry
@@ -168,8 +314,9 @@ pub struct GpuLaguna {
     pub(crate) tok_embd: TokEmbd,
     pub(crate) layers: Vec<LagunaLayer>,
     pub(crate) output_norm: DeviceTensor,
-    /// `output` [embd, vocab] (Q6_K on the XS election).
-    pub(crate) lm_head: QuantW,
+    /// `output` [embd, vocab] (Q6_K on the XS election; BF16 on the NVFP4
+    /// safetensors build).
+    pub(crate) lm_head: Head,
     pub(crate) max_ctx: usize,
     /// VRAM the load phase consumed (ledger delta) - feeds
     /// Generator::weights_mem_bytes.

@@ -829,6 +829,12 @@ impl GpuExecutor {
         self.batched_copy(scratch, n / 3)
     }
 
+    /// True when the pack carries the batched device copy (one launch for a
+    /// descriptor list of {src, dst, bytes % 16 == 0} copies).
+    pub fn has_batched_copy(&self) -> bool {
+        self.kernels.batched_copy.is_some()
+    }
+
     pub fn batched_copy(&self, descs: &CudaSlice<u64>, n: usize) -> Result<(), GpuError> {
         let f = self
             .kernels

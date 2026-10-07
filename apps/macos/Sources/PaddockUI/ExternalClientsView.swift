@@ -65,86 +65,76 @@ struct ExternalClientsView: View {
   }
   private var runner: RunnerInfo? { choices.first { $0.id == selected } ?? choices.first }
   var body: some View {
-    PaddockScrollView {
-      VStack(alignment: .leading, spacing: 24) {
-        PageHeading(title: "Client setup") { EmptyView() }
-        if let runner {
-          SettingsGroup(title: "Local endpoint") {
-            SettingsRow(title: "Instance", compact: true) {
-              Dropdown(title: "Instance", value: runner.title) {
-                ForEach(choices) { r in Button("\(r.title) · \(r.port)") { selected = r.id } }
-              }
-            }
-            if let setup {
-              HStack {
-                Text(setup.baseUrl).textSelection(.enabled).font(
-                  .system(.body, design: .monospaced))
-                Spacer()
-                Button("Copy URL", systemImage: "doc.on.doc") { copy(setup.baseUrl) }
-              }
-              Text(setup.model).foregroundStyle(.secondary).textSelection(.enabled)
-            }
+    SettingsPage(title: "Client setup") { stacked in
+      if let runner {
+        SettingsGroup(title: "Local endpoint") {
+          SettingsRow(title: "Instance", stacked: stacked) {
+            Dropdown(title: "Instance", value: runner.title, fillsWidth: true) {
+              ForEach(choices) { r in Button("\(r.title) · \(r.port)") { selected = r.id } }
+            }.accessibilityIdentifier("client-instance")
           }
           if let setup {
-            SettingsGroup(title: "Configuration") {
-              Dropdown(title: "Client", value: format.rawValue) {
-                ForEach(ExternalClient.allCases) { option in
-                  Button(option.rawValue) { format = option }
+            SettingsRow(title: "Base URL", stacked: stacked) {
+              HStack(alignment: .center, spacing: 12) {
+                Text(setup.baseUrl).textSelection(.enabled)
+                  .font(.system(size: 12, design: .monospaced))
+                  .fixedSize(horizontal: false, vertical: true)
+                  .frame(maxWidth: .infinity, alignment: .leading)
+                Button {
+                  copy(setup.baseUrl)
+                } label: {
+                  Image(systemName: "doc.on.doc")
                 }
-              }
-              Text(format.configuration(setup)).font(.system(size: 12, design: .monospaced))
-                .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
-              HStack {
-                Button("Copy configuration", systemImage: "doc.on.doc") {
-                  copy(format.configuration(setup))
-                }
-                if setup.hasKey {
-                  Button(exporting ? "Exporting…" : "Export credentials…", systemImage: "key") {
-                    confirmExport = true
-                  }.disabled(exporting)
-                }
-              }
-              if let exportedPath {
-                HStack {
-                  Text("source \(ExternalClient.quote(exportedPath))").font(
-                    .system(.caption, design: .monospaced)
-                  ).textSelection(.enabled)
-                  Spacer()
-                  Button("Copy command") { copy("source \(ExternalClient.quote(exportedPath))") }
-                }
-              }
+                .accessibilityLabel("Copy URL").help("Copy URL")
+              }.frame(minHeight: 30)
             }
+            SettingsRow(title: "Model", stacked: stacked) {
+              Text(setup.model).foregroundStyle(.secondary).textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(minHeight: 30, alignment: .leading)
+            }
+          } else if error == nil {
+            ProgressView().controlSize(.small).accessibilityLabel("Loading endpoint")
           }
-        } else {
-          ContentUnavailableView(
-            "Start a chat model first", systemImage: "network",
-            description: Text("Running local models provide endpoints for other apps."))
         }
-        if let error { Text(error).foregroundStyle(PaddockStyle.caution).textSelection(.enabled) }
-      }.padding(32).frame(maxWidth: 900).frame(maxWidth: .infinity)
-    }.font(.system(size: 13)).buttonStyle(FlatButtonStyle())
-      .task(id: runner?.id) {
-        setup = nil
-        error = nil
-        exportedPath = nil
-        guard let runner else { return }
-        do {
-          let value = try await client.inspect(
-            .clientInfo(port: runner.port, pid: runner.pid), as: LocalClientSetup.self)
-          try Task.checkCancellation()
-          setup = value
-        } catch { if !Task.isCancelled { self.error = error.localizedDescription } }
+        if let setup {
+          ClientConfigurationSection(
+            setup: setup, format: $format, stacked: stacked,
+            exporting: exporting, exportedPath: exportedPath,
+            copy: copy, export: { confirmExport = true })
+        }
+      } else {
+        ContentUnavailableView(
+          "Start a chat model first", systemImage: "network",
+          description: Text("Running local models provide endpoints for other apps."))
       }
-      .confirmationDialog(
-        "Export this instance’s API key?", isPresented: $confirmExport, titleVisibility: .visible
-      ) {
-        Button("Choose export location…") { exportKey() }
-        Button("Cancel", role: .cancel) {}
-      } message: {
-        Text(
-          "The file contains a plaintext credential and is readable only by your macOS account. Keep it private and do not add it to source control."
-        )
+      if let error {
+        Text(error).foregroundStyle(PaddockStyle.caution).textSelection(.enabled)
+          .fixedSize(horizontal: false, vertical: true)
       }
+    }
+    .task(id: runner?.id) {
+      setup = nil
+      error = nil
+      exportedPath = nil
+      guard let runner else { return }
+      do {
+        let value = try await client.inspect(
+          .clientInfo(port: runner.port, pid: runner.pid), as: LocalClientSetup.self)
+        try Task.checkCancellation()
+        setup = value
+      } catch { if !Task.isCancelled { self.error = error.localizedDescription } }
+    }
+    .confirmationDialog(
+      "Export this instance's API key?", isPresented: $confirmExport, titleVisibility: .visible
+    ) {
+      Button("Choose export location…") { exportKey() }
+      Button("Cancel", role: .cancel) {}
+    } message: {
+      Text(
+        "The file contains a plaintext credential and is readable only by your macOS account. Keep it private and do not add it to source control."
+      )
+    }
   }
   private func copy(_ text: String) {
     NSPasteboard.general.clearContents()
@@ -168,6 +158,59 @@ struct ExternalClientsView: View {
           exportedPath = url.path
         } catch { self.error = error.localizedDescription }
       }
+    }
+  }
+}
+
+/// Configuration stays selectable native text. Soft wrapping affects display
+/// only; copying always returns the original JSON/shell source unchanged.
+struct ClientConfigurationSection: View {
+  let setup: LocalClientSetup
+  @Binding var format: ExternalClient
+  let stacked: Bool
+  let exporting: Bool
+  let exportedPath: String?
+  let copy: (String) -> Void
+  let export: () -> Void
+
+  var body: some View {
+    SettingsGroup(title: "Configuration") {
+      SettingsRow(title: "Client", stacked: stacked) {
+        Dropdown(title: "Client", value: format.rawValue, fillsWidth: true) {
+          ForEach(ExternalClient.allCases) { option in
+            Button(option.rawValue) { format = option }
+          }
+        }.accessibilityIdentifier("client-format")
+      }
+      Text(format.configuration(setup)).font(.system(size: 12, design: .monospaced))
+        .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14).background(PaddockStyle.canvas, in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityIdentifier("client-configuration-source")
+      ViewThatFits(in: .horizontal) {
+        HStack(spacing: 12) { actions }
+        VStack(alignment: .leading, spacing: 12) { actions }
+      }
+      if let exportedPath {
+        VStack(alignment: .leading, spacing: 12) {
+          Text("source \(ExternalClient.quote(exportedPath))")
+            .font(.system(size: 12, design: .monospaced)).textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+          Button("Copy command", systemImage: "doc.on.doc") {
+            copy("source \(ExternalClient.quote(exportedPath))")
+          }
+        }
+      }
+    }
+  }
+
+  @ViewBuilder private var actions: some View {
+    Button("Copy configuration", systemImage: "doc.on.doc") {
+      copy(format.configuration(setup))
+    }.fixedSize().accessibilityIdentifier("client-copy-configuration")
+    if setup.hasKey {
+      Button(exporting ? "Exporting…" : "Export credentials…", systemImage: "key", action: export)
+        .fixedSize().disabled(exporting).accessibilityIdentifier("client-export-credentials")
     }
   }
 }

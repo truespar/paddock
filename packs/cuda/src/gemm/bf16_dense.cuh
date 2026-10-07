@@ -34,18 +34,40 @@
 // f32-FMA tile; the correctness battery gates the switch. The f32-FMA tile
 // GEMM stays as the fallback for older packs and ragged in_dim.
 
+// The bf16 decode GEMVs' row prefetch election: the pack's small-die rule
+// (pd_gemv_pf_elect) for the one-row kernel, PADDOCK_BF16_GEMV_PF=0|1 pins
+// it. GB10, Kolibri NVFP4 decode tick: r=1 25.09 -> 24.45 ms. The multi-row
+// arms carry it but do NOT elect it (PADDOCK_BF16_MR_PF=1 opts in): an
+// 8-row block's span is up to ~98 KB, and the 4-row tick went 37.26 ->
+// 38.35 ms with it on.
+static inline bool pd_bf16_gemv_pf() {
+    static const bool on = pd_gemv_pf_elect(pd_env("PADDOCK_BF16_GEMV_PF"));
+    return on;
+}
+static inline bool pd_bf16_mr_pf() {
+    static const bool on = pd_env("PADDOCK_BF16_MR_PF") != nullptr &&
+                           pd_gemv_pf_elect(pd_env("PADDOCK_BF16_MR_PF"));
+    return on;
+}
+
 // One block per output row, 16 elements per thread: one 32-byte weight load
 // (two int4) plus four float4 activation loads, so a warp issues fully
 // coalesced 512-byte transactions. 128 threads, not 256, for the same reason
 // pd_q8_0_gemv_repacked uses 128 - this die's maxThreadsPerMultiProcessor is
 // 1536, so 128 gets 12 resident blocks/SM against 256's 6, and this kernel is
 // bandwidth-bound end to end.
+//
+// PF (small dies, pd_gemv_pf_elect): thread 0 hands the block's weight row to
+// L2 as one bulk prefetch ahead of everything, the PDL wait included - the
+// weights are no predecessor's output. A hint: no numerics move.
+template <bool PF = false>
 __global__ void pd_bf16_gemv_f32_kernel(
     const __nv_bfloat16* __restrict__ w, const float* __restrict__ bias,
     const float* __restrict__ x, float* __restrict__ y,
     uint32_t in_dim, uint32_t out_dim) {
     uint32_t o = blockIdx.x;
     if (o >= out_dim) return;
+    if (PF && threadIdx.x == 0) pd_l2_prefetch_bulk(w + (size_t)o * in_dim, in_dim * 2u);
     uint32_t tid = threadIdx.x, nth = blockDim.x;
     // dep-free prologue: nothing above touches chain data, so the wait gates
     // only the x reads below. No-op under plain launches.
@@ -96,9 +118,14 @@ PD_EXPORT
 int pd_bf16_gemv_f32(const void* w, const void* bias, const void* x, void* y,
                      uint32_t in_dim, uint32_t out_dim, void* stream) {
     if (out_dim == 0 || in_dim == 0) return 0;
-    pd_pdl_go(pd_bf16_gemv_f32_kernel, out_dim, 128u, 0u, (cudaStream_t)stream,
-              (const __nv_bfloat16*)w, (const float*)bias, (const float*)x,
-              (float*)y, in_dim, out_dim);
+    if (pd_bf16_gemv_pf())
+        pd_pdl_go(pd_bf16_gemv_f32_kernel<true>, out_dim, 128u, 0u, (cudaStream_t)stream,
+                  (const __nv_bfloat16*)w, (const float*)bias, (const float*)x,
+                  (float*)y, in_dim, out_dim);
+    else
+        pd_pdl_go(pd_bf16_gemv_f32_kernel<false>, out_dim, 128u, 0u, (cudaStream_t)stream,
+                  (const __nv_bfloat16*)w, (const float*)bias, (const float*)x,
+                  (float*)y, in_dim, out_dim);
     return pd_launch_status();
 }
 
@@ -629,19 +656,14 @@ int pd_bf16_gemv_nk_f32(const void* w, const void* bias, const void* x, void* y,
 // scratch, and at these in_dims (<= a few K) the block-shared L1 window
 // carries it - the f16 kernel's swizzled stage exists because its X is f16
 // activations it must also transpose.
+// The row dot, shared by the plain and the fused q|k|v launches so the two
+// are the same arithmetic: lane-strided 16-weight packs, f32 products into
+// acc[NB], butterfly reduce (every lane ends holding all NB sums).
 template <uint32_t NB>
-__global__ void __launch_bounds__(256) pd_bf16_gemv_mr_f32_kernel(
-    const __nv_bfloat16* __restrict__ w, const float* __restrict__ bias,
-    const float* __restrict__ x, float* __restrict__ y,
-    uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
-    const uint32_t o = blockIdx.x * 8u + (threadIdx.x >> 5);
-    const uint32_t lane = threadIdx.x & 31u;
-    // arm before the ragged-edge return: the grid over-covers out_dim, and
-    // every thread must pass the griddepcontrol.wait
-    PD_PDL_ARM();
-    if (o >= out_dim) return;
-    const __nv_bfloat16* row = w + (size_t)o * in_dim;
-    float acc[NB];
+__device__ __forceinline__ void pd_bf16_mr_dot(const __nv_bfloat16* __restrict__ row,
+                                               const float* __restrict__ x,
+                                               uint32_t in_dim, uint32_t batch,
+                                               uint32_t lane, float (&acc)[NB]) {
 #pragma unroll
     for (uint32_t b = 0; b < NB; ++b) acc[b] = 0.0f;
     // 16 weights (two int4) per lane per iter, the single-row kernel's pack
@@ -675,11 +697,96 @@ __global__ void __launch_bounds__(256) pd_bf16_gemv_mr_f32_kernel(
 #pragma unroll
     for (uint32_t b = 0; b < NB; ++b)
         for (uint32_t s = 16; s; s >>= 1) acc[b] += __shfl_xor_sync(~0u, acc[b], s);
+}
+
+// The 8-row block's weight rows, one contiguous span, as one L2 bulk
+// prefetch (the PF arm of the decode GEMVs - see pd_bf16_gemv_f32_kernel).
+__device__ __forceinline__ void pd_bf16_mr_prefetch(const __nv_bfloat16* w, uint32_t in_dim,
+                                                    uint32_t rows) {
+    const uint32_t first = blockIdx.x * 8u;
+    if (threadIdx.x == 0 && first < rows) {
+        const uint32_t n = rows - first < 8u ? rows - first : 8u;
+        pd_l2_prefetch_bulk(w + (size_t)first * in_dim, n * in_dim * 2u);
+    }
+}
+
+template <uint32_t NB, bool PF = false>
+__global__ void __launch_bounds__(256) pd_bf16_gemv_mr_f32_kernel(
+    const __nv_bfloat16* __restrict__ w, const float* __restrict__ bias,
+    const float* __restrict__ x, float* __restrict__ y,
+    uint32_t in_dim, uint32_t out_dim, uint32_t batch) {
+    if (PF) pd_bf16_mr_prefetch(w, in_dim, out_dim);
+    const uint32_t o = blockIdx.x * 8u + (threadIdx.x >> 5);
+    const uint32_t lane = threadIdx.x & 31u;
+    // arm before the ragged-edge return: the grid over-covers out_dim, and
+    // every thread must pass the griddepcontrol.wait
+    PD_PDL_ARM();
+    if (o >= out_dim) return;
+    float acc[NB];
+    pd_bf16_mr_dot<NB>(w + (size_t)o * in_dim, x, in_dim, batch, lane, acc);
     if (lane < batch) {
         float v = acc[lane];  // NB-bounded select, pd_f16_gemv_kernel's epilogue
         if (bias) v += bias[o];
         y[(size_t)lane * out_dim + o] = v;
     }
+}
+
+// Slot 773's kernel: the same row dot over the load-time-fused [q; k; v]
+// plane, each output row routed to its segment plane (the tile QKV arm's
+// contract) - one launch where the k/v segments' own 64-CTA grids would sit
+// latency-bound. Per output row the plain kernel's arithmetic exactly.
+template <uint32_t NB, bool PF = false>
+__global__ void __launch_bounds__(256) pd_bf16_qkv_gemv_mr_kernel(
+    const __nv_bfloat16* __restrict__ w, const float* __restrict__ x,
+    float* __restrict__ yq, float* __restrict__ yk, float* __restrict__ yv,
+    uint32_t in_dim, uint32_t oq, uint32_t okv, uint32_t batch) {
+    if (PF) pd_bf16_mr_prefetch(w, in_dim, oq + 2u * okv);
+    const uint32_t o = blockIdx.x * 8u + (threadIdx.x >> 5);
+    const uint32_t lane = threadIdx.x & 31u;
+    PD_PDL_ARM();
+    if (o >= oq + 2u * okv) return;
+    float acc[NB];
+    pd_bf16_mr_dot<NB>(w + (size_t)o * in_dim, x, in_dim, batch, lane, acc);
+    if (lane < batch) {
+        const float v = acc[lane];
+        if (o < oq) yq[(size_t)lane * oq + o] = v;
+        else if (o < oq + okv) yk[(size_t)lane * okv + (o - oq)] = v;
+        else yv[(size_t)lane * okv + (o - oq - okv)] = v;
+    }
+}
+
+// Slot 773: q|k|v in one decode-band launch (2 <= batch <= 8) over the fused
+// plane. GB10, Kolibri's 2560 -> 6144 | 512 | 512 at 4 rows: the fused tile
+// arm (pd_bf16_qkv_gemm_mma's b<=8 BN=32 tier) 196 us against the multi-row
+// dot's 159 (bench/dense_ab.cu, plain mr over the same 7168 rows). Declines
+// (-2) outside the band or on a ragged in_dim.
+PD_EXPORT
+int pd_bf16_qkv_gemv_mr(const void* w, const void* x, void* yq, void* yk, void* yv,
+                        uint32_t in_dim, uint32_t oq, uint32_t okv, uint32_t batch,
+                        void* stream) {
+    if (in_dim == 0 || (oq == 0 && okv == 0) || batch == 0) return 0;
+    if (batch < 2u || batch > 8u || (in_dim & 15u)) return -2;
+    const uint32_t grid = (oq + 2u * okv + 7u) / 8u;
+    cudaStream_t st = (cudaStream_t)stream;
+    const __nv_bfloat16* wp = (const __nv_bfloat16*)w;
+    const float* xp = (const float*)x;
+    float* qp = (float*)yq;
+    float* kp = (float*)yk;
+    float* vp = (float*)yv;
+#define PD_QMR_GO(NB)                                                              \
+    do {                                                                           \
+        if (pd_bf16_mr_pf())                                                       \
+            pd_pdl_go(pd_bf16_qkv_gemv_mr_kernel<NB, true>, grid, 256u, 0u, st, wp, \
+                      xp, qp, kp, vp, in_dim, oq, okv, batch);                     \
+        else                                                                       \
+            pd_pdl_go(pd_bf16_qkv_gemv_mr_kernel<NB, false>, grid, 256u, 0u, st,   \
+                      wp, xp, qp, kp, vp, in_dim, oq, okv, batch);                 \
+    } while (0)
+    if (batch <= 2u) PD_QMR_GO(2u);
+    else if (batch <= 4u) PD_QMR_GO(4u);
+    else PD_QMR_GO(8u);
+#undef PD_QMR_GO
+    return pd_launch_status();
 }
 
 PD_EXPORT
@@ -696,15 +803,19 @@ int pd_bf16_gemv_mr_f32(const void* w, const void* bias, const void* x, void* y,
     const float* bp = (const float*)bias;
     const float* xp = (const float*)x;
     float* yp = (float*)y;
-    if (batch <= 2u)
-        pd_pdl_go(pd_bf16_gemv_mr_f32_kernel<2u>, grid, 256u, 0u, st, wp, bp, xp,
-                  yp, in_dim, out_dim, batch);
-    else if (batch <= 4u)
-        pd_pdl_go(pd_bf16_gemv_mr_f32_kernel<4u>, grid, 256u, 0u, st, wp, bp, xp,
-                  yp, in_dim, out_dim, batch);
-    else
-        pd_pdl_go(pd_bf16_gemv_mr_f32_kernel<8u>, grid, 256u, 0u, st, wp, bp, xp,
-                  yp, in_dim, out_dim, batch);
+#define PD_MR_GO(NB)                                                               \
+    do {                                                                           \
+        if (pd_bf16_mr_pf())                                                       \
+            pd_pdl_go(pd_bf16_gemv_mr_f32_kernel<NB, true>, grid, 256u, 0u, st, wp, \
+                      bp, xp, yp, in_dim, out_dim, batch);                         \
+        else                                                                       \
+            pd_pdl_go(pd_bf16_gemv_mr_f32_kernel<NB, false>, grid, 256u, 0u, st,   \
+                      wp, bp, xp, yp, in_dim, out_dim, batch);                     \
+    } while (0)
+    if (batch <= 2u) PD_MR_GO(2u);
+    else if (batch <= 4u) PD_MR_GO(4u);
+    else PD_MR_GO(8u);
+#undef PD_MR_GO
     return pd_launch_status();
 }
 
@@ -910,9 +1021,21 @@ __device__ unsigned int pd_bf16ks_ctr[PD_BF16KS_TILES];
 // Yv = the mixed output [rows][hidden], OQ = hidden, OKV = hc. `Y` is unused -
 // the gate plane never has to be materialised at all, which is the second
 // saving after the launch.
+//
+// RAST + XB: the prefill pair (pd_bf16_gemm_pf / pd_bf16_qkv_gemm_pf).
+// RAST walks a 1D grid in GROUPS of batch tiles - every batch tile of a group
+// for one weight tile, then the next weight tile - so a plane past L2 is read
+// from DRAM once a group instead of once a batch tile (the 2D grid's x-fastest
+// walk re-read a 36.7 MB q|k|v plane 16 times at 2048 rows). The group holds
+// ~8 MB of activation rows, inside the 24 MB L2 beside the weight tiles in
+// flight. XB reads activations already narrowed to bf16 (convert_f32_bf16:
+// the same round-to-nearest the in-loop cast does), so they ride the cp.async
+// ring with the weights instead of a synchronous f32 load + cast every stage.
+// Neither moves the k walk or a tile's mma sequence: outputs are bit-identical
+// to the plain arm on the same tile.
 template <uint32_t BM, uint32_t BN, uint32_t NWARP, uint32_t ST, uint32_t KT,
           uint32_t RG, uint32_t CG, bool QKV = false, bool KS = false,
-          bool KSF = false, bool HCMIX = false>
+          bool KSF = false, bool HCMIX = false, bool RAST = false, bool XB = false>
 __global__ void __launch_bounds__(NWARP * 32) pd_bf16_gemm_mma_kernel(
         const __nv_bfloat16* __restrict__ W, const float* __restrict__ X,
         const float* __restrict__ bias, float* __restrict__ Y,
@@ -944,8 +1067,20 @@ __global__ void __launch_bounds__(NWARP * 32) pd_bf16_gemm_mma_kernel(
     const uint32_t g = lane >> 2, t = lane & 3u;
     const uint32_t wr = (warp % WR) * WM;   // warp row base within tile
     const uint32_t wc = (warp / WR) * WN;   // warp col base within tile
-    const uint32_t row_base = blockIdx.x * BM;
-    const uint32_t col_base = blockIdx.y * BN;
+    static_assert(!(RAST && (KS || KSF || HCMIX)), "the grouped walk is the plain/qkv arm's");
+    uint32_t tile_m = blockIdx.x, tile_n = blockIdx.y;
+    if constexpr (RAST) {
+        const uint32_t mt = (M + BM - 1u) / BM, nt = (N + BN - 1u) / BN;
+        const uint32_t row_bytes = BN * K * (XB ? 2u : 4u);
+        uint32_t grp = (8u << 20) / (row_bytes ? row_bytes : 1u);
+        grp = grp < 1u ? 1u : (grp > nt ? nt : grp);
+        const uint32_t per = grp * mt, gi = blockIdx.x / per, in = blockIdx.x % per;
+        const uint32_t n0 = gi * grp, gsz = (nt - n0) < grp ? (nt - n0) : grp;
+        tile_n = n0 + in % gsz;
+        tile_m = in / gsz;
+    }
+    const uint32_t row_base = tile_m * BM;
+    const uint32_t col_base = tile_n * BN;
     const __nv_bfloat16 zero = __float2bfloat16(0.0f);
 
     // KS slab bounds: gridDim.z slabs measured in 512-ELEMENT blocks, not
@@ -976,6 +1111,17 @@ __global__ void __launch_bounds__(NWARP * 32) pd_bf16_gemm_mma_kernel(
             __nv_bfloat16* dst = &sh_a[buf][row * KPAD + h8];
             const __nv_bfloat16* src = W + (size_t)(row_base + row) * K + gk;
             pd_bf16m_cpa16(dst, src, ok);   // K%16==0: no ragged 8-group exists
+        }
+        if constexpr (XB) {
+            const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(X);
+            #pragma unroll
+            for (uint32_t i = tid; i < BN * H8PR; i += NTH) {
+                const uint32_t col = i / H8PR, h8 = (i % H8PR) * 8u, gk = k0 + h8;
+                const bool ok = (col_base + col) < N && gk + 8u <= k_eff;
+                pd_bf16m_cpa16(&sh_b[buf][col * KPAD + h8],
+                               xb + (size_t)(col_base + col) * K + gk, ok);
+            }
+            return;
         }
         #pragma unroll
         for (uint32_t i = tid; i < BN * H8PR; i += NTH) {
@@ -1672,6 +1818,31 @@ static int pd_bf16_qkv_cfg(const __nv_bfloat16* w, const float* x, float* yq,
     return (int)cudaGetLastError();
 }
 
+// The prefill pair's launcher: the grouped 1D walk (RAST), no K-split (a
+// prefill grid fills the die many times over), the weights and - with XB -
+// the bf16 activations on the cp.async ring. QKV routes rows to their segment
+// planes exactly as the decode arm does; bias rides the plain arm only.
+template <uint32_t BM, uint32_t BN, uint32_t NW, uint32_t ST, uint32_t KT,
+          uint32_t RG, uint32_t CG, bool QKV, bool XB>
+static int pd_bf16_pf_cfg(const __nv_bfloat16* w, const void* x, const float* bias,
+                          float* y, float* yk, float* yv, uint32_t in_dim, uint32_t m,
+                          uint32_t oq, uint32_t okv, uint32_t batch, cudaStream_t st) {
+    constexpr uint32_t KPAD = KT + 8u;
+    constexpr uint32_t smem = ST * (BM * KPAD + BN * KPAD) * 2u;
+    static_assert(smem <= 101376u, "past the per-block opt-in shared memory");
+    auto kern = pd_bf16_gemm_mma_kernel<BM, BN, NW, ST, KT, RG, CG, QKV, false, false,
+                                        false, true, XB>;
+    static bool set = false;
+    if (!set) {
+        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        set = true;
+    }
+    const uint32_t tiles = ((m + BM - 1u) / BM) * ((batch + BN - 1u) / BN);
+    kern<<<tiles, NW * 32u, smem, st>>>(w, (const float*)x, bias, y, in_dim, m, batch,
+                                        yk, yv, oq, okv);
+    return (int)cudaGetLastError();
+}
+
 // Two-segment twin of pd_bf16_qkv_cfg. Identical kernel and identical row
 // routing; the only difference is the fused row count.
 //
@@ -2085,8 +2256,76 @@ int pd_bf16_qkv_gemm_mma(const void* w, const void* x, void* yq, void* yk,
                 wp, xp, qp, kp, vp, in_dim, oq, okv, batch, st);
     // same sweep: ST=4/KT=64 over ST=2/KT=128 on the fused plane -
     // 4608x2688 b32 28.7 us vs 34.6, bit-neutral (config, not k order).
-    return pd_bf16_qkv_cfg<64u, 32u, 8u, 4u, 64u, 2u, 1u>(
+    if (batch <= 32u)
+        return pd_bf16_qkv_cfg<64u, 32u, 8u, 4u, 64u, 2u, 1u>(
+                wp, xp, qp, kp, vp, in_dim, oq, okv, batch, st);
+    // Above the decode band: pd_bf16_gemm_mma's own grid-fill ladder over the
+    // fused row count. The b32 tile above was the only arm here, so a
+    // prefill chunk rode it - Kolibri's NVFP4 build (q|k|v 2560 -> 7168,
+    // 2048 rows) spent 13.0 ms a launch there, ~6 TF/s, half its prefill.
+    static int sms = -1;
+    if (sms < 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev)
+                != cudaSuccess || sms <= 0)
+            sms = 1;
+    }
+    const uint32_t m = oq + 2u * okv;
+    const uint32_t fat_blocks = ((m + 127u) / 128u) * ((batch + 127u) / 128u);
+    if (batch <= 64u || fat_blocks < (uint32_t)sms)
+        return pd_bf16_qkv_cfg<64u, 64u, 8u, 3u, 32u, 2u, 2u>(
+                wp, xp, qp, kp, vp, in_dim, oq, okv, batch, st);
+    return pd_bf16_qkv_cfg<128u, 128u, 8u, 3u, 32u, 4u, 4u>(
             wp, xp, qp, kp, vp, in_dim, oq, okv, batch, st);
+}
+
+// Slots 756 / 757: the bf16 GEMM at PREFILL widths, plain and fused q|k|v.
+// x is the rows already narrowed to bf16 (convert_f32_bf16 - the in-loop cast's
+// own round-to-nearest), so both operands ride the cp.async ring, and the grid
+// walks batch tiles fastest inside ~8 MB groups so a plane past L2 streams once
+// a group (pd_bf16_pf_cfg). bench/bf16_pf_tile_gb10_bench.cu, GB10, 2048 rows:
+//   q|k|v 2560 -> 7168   5.52 ms (shipped 128x128) -> 1.18 ms, 64 TF/s
+//   wo    6144 -> 2560   3.45 ms                   -> 1.17 ms, 55 TF/s
+// against cuBLASLt bf16 x bf16 at 1.20 / 1.09. Every tile here is bit-identical
+// to the unsplit plain tile (the bench checks each arm). The ENGINE elects
+// these from ~128 rows on wide planes (narrow ones need ~16 tiles of grid);
+// below that the decode ladder's K-split fills the die better. 128x256 takes
+// long-K planes from 1024 rows (wo 1024 rows 674 -> 563 us); KT=64 elsewhere.
+// Declines (-2) a ragged in_dim (16-byte cp.async rows).
+PD_EXPORT
+int pd_bf16_gemm_pf(const void* w, const void* bias, const void* x16, void* y,
+                    uint32_t in_dim, uint32_t out_dim, uint32_t batch, void* stream) {
+    if (out_dim == 0 || in_dim == 0 || batch == 0) return 0;
+    if (in_dim & 15u) return -2;
+    const __nv_bfloat16* wp = (const __nv_bfloat16*)w;
+    const float* bp = (const float*)bias;
+    float* yp = (float*)y;
+    cudaStream_t st = (cudaStream_t)stream;
+    if (in_dim >= 4096u && batch >= 1024u)
+        return pd_bf16_pf_cfg<128u, 256u, 8u, 3u, 32u, 4u, 8u, false, true>(
+                wp, x16, bp, yp, nullptr, nullptr, in_dim, out_dim, 0u, 0u, batch, st);
+    return pd_bf16_pf_cfg<128u, 128u, 8u, 2u, 64u, 4u, 4u, false, true>(
+            wp, x16, bp, yp, nullptr, nullptr, in_dim, out_dim, 0u, 0u, batch, st);
+}
+
+PD_EXPORT
+int pd_bf16_qkv_gemm_pf(const void* w, const void* x16, void* yq, void* yk, void* yv,
+                        uint32_t in_dim, uint32_t oq, uint32_t okv, uint32_t batch,
+                        void* stream) {
+    if (in_dim == 0 || (oq == 0 && okv == 0) || batch == 0) return 0;
+    if (in_dim & 15u) return -2;
+    const __nv_bfloat16* wp = (const __nv_bfloat16*)w;
+    float* qp = (float*)yq;
+    float* kp = (float*)yk;
+    float* vp = (float*)yv;
+    cudaStream_t st = (cudaStream_t)stream;
+    const uint32_t m = oq + 2u * okv;
+    if (in_dim >= 4096u && batch >= 1024u)
+        return pd_bf16_pf_cfg<128u, 256u, 8u, 3u, 32u, 4u, 8u, true, true>(
+                wp, x16, nullptr, qp, kp, vp, in_dim, m, oq, okv, batch, st);
+    return pd_bf16_pf_cfg<128u, 128u, 8u, 2u, 64u, 4u, 4u, true, true>(
+            wp, x16, nullptr, qp, kp, vp, in_dim, m, oq, okv, batch, st);
 }
 
 // bf16 -> f32 widen with the DequantF32Fn shape (src, dst, n_blocks, stream),

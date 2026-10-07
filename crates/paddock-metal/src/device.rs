@@ -31,6 +31,7 @@ pub(crate) const SHADER_SOURCE: &str = concat!(
     include_str!("../../../packs/metal/qwen_projection.metal"),
     "\n",
     include_str!("../../../packs/metal/mlx_affine.metal"),
+    include_str!("../../../packs/metal/mlx_affine_few.metal"),
     include_str!("../../../packs/metal/splash.metal"),
     "\n",
     include_str!("../../../packs/metal/qwen4exp_affine.metal"),
@@ -79,7 +80,10 @@ pub(crate) const SHADER_SOURCE: &str = concat!(
     include_str!("../../../packs/metal/qwen_moe.metal"),
     include_str!("../../../packs/metal/gemma_moe.metal"),
     include_str!("../../../packs/metal/diffusion_gemma.metal"),
+    include_str!("../../../packs/metal/embedding_gemma2.metal"),
+    include_str!("../../../packs/metal/embedding_gemma2_attention.metal"),
     include_str!("../../../packs/metal/laguna.metal"),
+    include_str!("../../../packs/metal/kolibri.metal"),
     include_str!("../../../packs/metal/nemotron.metal"),
     include_str!("../../../packs/metal/paddleocr.metal"),
     include_str!("../../../packs/metal/unlimited_ocr.metal"),
@@ -406,6 +410,18 @@ impl MetalDevice {
             "diar_conv_rows",
             "kumo_kv",
             "kumo_mm",
+            "kolibri_route",
+            "kolibri_tiles",
+            "kolibri_expert_mv",
+            "kolibri_grouped",
+            #[cfg(test)]
+            "kolibri_grouped_scalar",
+            "kolibri_fold",
+            "kolibri_rope",
+            "kolibri_store",
+            "kolibri_decode",
+            "kolibri_prefill",
+            "kolibri_round",
             "clef_mm",
             "clef_mm_quant",
             "clef_quant_gather",
@@ -749,6 +765,27 @@ impl MetalDevice {
             "oss_attention_check",
             "qwen3_head_rope",
             "qwen3_attention",
+            "eg2_attention256",
+            "eg2_attention512",
+            "eg2_mlx_attention256",
+            "eg2_mlx_attention512",
+            "eg2_norm",
+            "eg2_heads",
+            "eg2_ple_gate",
+            "eg2_pool",
+            "eg2_embed",
+            "eg2_project_a8",
+            "eg2_project_a8_narrow",
+            "eg2_project_q8_narrow",
+            "eg2_project_a4",
+            "eg2_project_bf16",
+            "eg2_project_q8",
+            "eg2_project_q4",
+            "eg2_project_q6",
+            "eg2_project_gguf_bf16",
+            "eg2_global_qk",
+            "eg2_global_softmax",
+            "eg2_global_pv",
             "qwen3_pool",
             "qwen3_score",
             "mlx_small",
@@ -1144,6 +1181,109 @@ impl MetalDevice {
             "mlx_affine_stable3",
             "mlx_affine_stable4",
             "mlx_affine_stable5",
+            #[cfg(test)]
+            "mlx_few_r2c2",
+            #[cfg(test)]
+            "mlx_few_r3c2",
+            #[cfg(test)]
+            "mlx_few_r4c2",
+            #[cfg(test)]
+            "mlx_few_r5c2",
+            #[cfg(test)]
+            "mlx_few_r8c1",
+            #[cfg(test)]
+            "mlx_few_r8c2",
+            #[cfg(test)]
+            "mlx_few_mma",
+            #[cfg(test)]
+            "mlx_few_register",
+            #[cfg(test)]
+            "mlx_few_fold2l4",
+            #[cfg(test)]
+            "mlx_few_fold3l4",
+            #[cfg(test)]
+            "mlx_few_fold4l4",
+            #[cfg(test)]
+            "mlx_few_fold5l4",
+            #[cfg(test)]
+            "mlx_few_fold2l2",
+            #[cfg(test)]
+            "mlx_few_fold3l2",
+            #[cfg(test)]
+            "mlx_few_fold4l2",
+            #[cfg(test)]
+            "mlx_few_fold5l2",
+            #[cfg(test)]
+            "mlx_few_packed1",
+            #[cfg(test)]
+            "mlx_few_packed2",
+            #[cfg(test)]
+            "mlx_few_packed3",
+            #[cfg(test)]
+            "mlx_few_packed4",
+            #[cfg(test)]
+            "mlx_few_packed5",
+            #[cfg(test)]
+            "mlx_few_packed8",
+            #[cfg(test)]
+            "mlx_few_shared2",
+            #[cfg(test)]
+            "mlx_few_shared3",
+            #[cfg(test)]
+            "mlx_few_shared4",
+            #[cfg(test)]
+            "mlx_few_shared5",
+            #[cfg(test)]
+            "mlx_few_shape_r2c4k0",
+            #[cfg(test)]
+            "mlx_few_shape_r2c16k0",
+            #[cfg(test)]
+            "mlx_few_shape_r2c32k0",
+            #[cfg(test)]
+            "mlx_few_shape_r2c8k5120",
+            #[cfg(test)]
+            "mlx_few_shape_r2c8k6144",
+            #[cfg(test)]
+            "mlx_few_shape_r2c8k17408",
+            #[cfg(test)]
+            "mlx_few_shape_r3c4k0",
+            #[cfg(test)]
+            "mlx_few_shape_r3c16k0",
+            #[cfg(test)]
+            "mlx_few_shape_r3c32k0",
+            #[cfg(test)]
+            "mlx_few_shape_r3c8k5120",
+            #[cfg(test)]
+            "mlx_few_shape_r3c8k6144",
+            #[cfg(test)]
+            "mlx_few_shape_r3c8k17408",
+            #[cfg(test)]
+            "mlx_few_shape_r4c4k0",
+            #[cfg(test)]
+            "mlx_few_shape_r4c16k0",
+            #[cfg(test)]
+            "mlx_few_shape_r4c32k0",
+            #[cfg(test)]
+            "mlx_few_shape_r4c8k5120",
+            #[cfg(test)]
+            "mlx_few_shape_r4c8k6144",
+            #[cfg(test)]
+            "mlx_few_shape_r4c8k17408",
+            #[cfg(test)]
+            "mlx_few_shape_r5c4k0",
+            #[cfg(test)]
+            "mlx_few_shape_r5c16k0",
+            #[cfg(test)]
+            "mlx_few_shape_r5c32k0",
+            #[cfg(test)]
+            "mlx_few_shape_r5c8k5120",
+            #[cfg(test)]
+            "mlx_few_shape_r5c8k6144",
+            #[cfg(test)]
+            "mlx_few_shape_r5c8k17408",
+            "mlx_affine_packed3",
+            "mlx_affine_packed4",
+            "mlx_affine_packed5",
             "mlx_affine_compact2",
             "mlx_affine_compact3",
             "mlx_affine_compact4",
@@ -1287,6 +1427,7 @@ impl MetalDevice {
             "df_top16",
             "df_top16_merge",
             "df_select",
+            "df_select_prefix",
             "dn_conv",
             "dn_qk_norm",
             "dn_gates",
@@ -1761,6 +1902,18 @@ impl Drop for Completion {
     }
 }
 impl Commands<'_> {
+    /// Stage-counter diagnostics must wait for resolution. Keep this test-only
+    /// so a profiling session cannot silently serialize the production encoder.
+    #[cfg(test)]
+    pub(crate) fn submit_for_test(self) -> Result<Completion> {
+        if self.counters.is_empty() {
+            self.submit()
+        } else {
+            let command = self.cmd.clone();
+            self.finish()?;
+            Ok(Completion(command, AtomicBool::new(true)))
+        }
+    }
     pub(crate) fn submit(self) -> Result<Completion> {
         if !self.counters.is_empty() {
             return Err(MetalError::Device(
@@ -2340,6 +2493,22 @@ mod tests {
             );
             assert!(used <= d.raw.maxThreadgroupMemoryLength());
         }
+    }
+
+    #[test]
+    fn embeddinggemma2_pipelines_fit_threadgroup_memory() {
+        let device = MetalDevice::new(Some(32 << 20)).unwrap();
+        let limit = device.raw.maxThreadgroupMemoryLength();
+        let mut count = 0;
+        for (name, pipeline) in &device.kernels {
+            if name.starts_with("eg2_") {
+                let used = pipeline.staticThreadgroupMemoryLength();
+                eprintln!("{name}: {used}/{limit} threadgroup bytes");
+                assert!(used <= limit, "{name}: {used} exceeds {limit}");
+                count += 1;
+            }
+        }
+        assert!(count >= 20, "missing EmbeddingGemma 2 pipelines");
     }
 
     #[test]

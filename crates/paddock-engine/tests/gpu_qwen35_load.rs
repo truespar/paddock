@@ -43,6 +43,8 @@ fn decode_throughput() {
     };
     let map = MappedGguf::open(&path).expect("open gguf");
     let mut model = GpuQwen35::load(exec, &map, 4096).expect("load qwen35");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
 
     let prompt: Vec<u32> = vec![760, 6511, 314, 9338, 369];
     let _ = model.generate_greedy(&prompt, 8, None).expect("warmup"); // warm CUDA + alloc
@@ -98,6 +100,8 @@ fn pp512_profile() {
     };
     let map = MappedGguf::open(&path).expect("open gguf");
     let mut model = GpuQwen35::load(exec, &map, 4096).expect("load qwen35");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     let prompt: Vec<u32> = (0..512).map(|i| 314 + (i as u32 % 4096)).collect();
     model.reset();
     model.prefill(&prompt).expect("warm prefill");
@@ -125,6 +129,8 @@ fn kv_fp8_decodes_and_reports_drift() {
     };
     let map = MappedGguf::open(&path).expect("open gguf");
     let mut m = GpuQwen35::load(exec, &map, 2048).expect("load qwen35");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    m.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     let vocab = m.vocab;
 
     let prompt: Vec<u32> = vec![760, 6511, 314, 9338, 369]; // robust counting-style

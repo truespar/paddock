@@ -172,6 +172,11 @@ function openInStudio(): void {
     void router.push({ name: 'tables', query: { port: String(port.value) } })
     return
   }
+  // so does SAM 3: a picture and a prompt in, masks out
+  if (row.value?.masker) {
+    void router.push({ name: 'masks', query: { port: String(port.value) } })
+    return
+  }
   // an image model takes turns in the chat surface like any other, so it
   // opens there too - selected, on a fresh draft
   const id = row.value?.model ?? row.value?.embedder ?? row.value?.image
@@ -276,7 +281,7 @@ const noTools = computed(() => !!cfg.value && !webProvider.value && !mcpLabels.v
           </span>
         </div>
         <div class="sd__actions">
-          <button v-if="!row.diarization" class="pk-btn pk-btn--sm" @click="openInStudio">
+          <button v-if="!row.diarization && !row.segmenter" class="pk-btn pk-btn--sm" @click="openInStudio">
             <Icon name="external-link" :size="13" /> Open in Studio
           </button>
           <RouterLink

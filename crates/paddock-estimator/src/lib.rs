@@ -76,6 +76,11 @@ const PREFILL_SPAN: u64 = 8192;
 const PREFIX_CKPT_FLOOR: u64 = 16;
 /// ...and the ceiling, matching the engine's own clamp.
 const PREFIX_CKPT_CAP: u64 = 256;
+/// Checkpoint staging blobs a hybrid engine keeps beside its pool: one per
+/// cut a prompt stages in a pass - the trailing pair and the back-off
+/// boundary (qwen35 CKPT_STAGE_BLOBS, qwen4exp STAGED_CUTS; nemotron keeps
+/// its two a slot - no back-off there). Two until the back-off cut.
+const CKPT_STAGING_BLOBS: u64 = 3;
 /// Checkpoints one turn writes (two prompt cuts and the reply's) - what a
 /// family with paged checkpoints must back per slot, up to the floor above.
 /// Mirrors qwen35's `STATE_CKPTS_PER_TURN`.
@@ -502,6 +507,47 @@ impl ModelShape {
             .map(|l| (l.k_dim + l.v_dim) * kv.bytes() * l.window.map_or(ctx, |w| w.min(ctx)))
             .sum()
     }
+
+    /// The longest context (up to the trained window) whose KV for ONE
+    /// sequence fits in `bytes` - the inverse of `kv_per_sequence`. That cost
+    /// is piecewise linear, flattening as each windowed layer reaches its
+    /// window, so dividing by the one-token cost (which charges every windowed
+    /// layer as if it kept growing) undercounts any windowed model: gemma4's
+    /// full 262K pool bought "24752" that way. Monotone, so bisect.
+    pub fn ctx_for_kv_bytes(&self, bytes: u64, kv: KvDtype) -> u64 {
+        let top = self.max_ctx;
+        if self.kv_per_sequence(top, kv) <= bytes {
+            return top;
+        }
+        // invariant: lo fits, hi does not
+        let (mut lo, mut hi) = (0, top);
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if self.kv_per_sequence(mid, kv) <= bytes {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// One token's share of a full-window sequence: the slope a client may
+    /// multiply by context x sessions. Exactly the one-token cost for an
+    /// unwindowed model; for a windowed one, the average at the trained
+    /// window, so the bounded layers stop inflating it. Rounded DOWN: Studio
+    /// compares slope x window x sessions against the pool, which is sized to
+    /// the exact cost, and rounding up made a pool that holds every session
+    /// read as one short.
+    pub fn kv_bytes_per_token(&self, kv: KvDtype) -> u64 {
+        match self.max_ctx {
+            0 => self.kv_per_sequence(1, kv),
+            top => match self.kv_per_sequence(top, kv) {
+                0 => 0,
+                total => (total / top).max(1),
+            },
+        }
+    }
 }
 
 /// What the user is asking the server to serve.
@@ -780,7 +826,7 @@ pub fn estimate(shape: &ModelShape, env: &Envelope, dev: &Device) -> Estimate {
     // What the engine reserves for prefix REUSE, before the KV pool exists.
     //
     // Two terms, both per-checkpoint multiples: the checkpoint pool itself at
-    // its floor, and the two staging blobs the engine keeps to move a snapshot
+    // its floor, and the CKPT_STAGING_BLOBS the engine keeps to move a snapshot
     // in and out. A checkpoint is one slot's worth of recurrent state, so it is
     // the same arithmetic as `state` above with the slot count replaced by the
     // pool depth. Together they were the largest single thing this estimate did
@@ -807,7 +853,7 @@ pub fn estimate(shape: &ModelShape, env: &Envelope, dev: &Device) -> Estimate {
     } else {
         per_ckpt
     };
-    let prefix_ckpt = ckpt_floor * ckpt_bytes + 2 * per_ckpt;
+    let prefix_ckpt = ckpt_floor * ckpt_bytes + CKPT_STAGING_BLOBS * per_ckpt;
     // ...and the pool above its floor, which is a different kind of number.
     //
     // Measured: the engine self-sizes this pool from the grant -
@@ -936,16 +982,16 @@ pub fn estimate(shape: &ModelShape, env: &Envelope, dev: &Device) -> Estimate {
         .min((KV_POOL_SHARE_CAP * dev.free_bytes as f64) as u64);
 
     // The inversion: context is what the pool BUYS, not what the user asks for.
-    let per_token = shape.kv_per_sequence(1, env.kv_dtype);
+    let per_token = shape.kv_bytes_per_token(env.kv_dtype);
     let (max_ctx, limited_by) = if encoder || per_token == 0 {
         (0, LimitedBy::NotApplicable)
     } else {
-        // round down to a whole 16-token page, the engine's allocation unit
-        let by_vram = (kv_pool / kv_sequences / per_token) / 16 * 16;
+        let by_vram = shape.ctx_for_kv_bytes(kv_pool / kv_sequences, env.kv_dtype);
         if by_vram >= shape.max_ctx {
             (shape.max_ctx, LimitedBy::Model)
         } else {
-            (by_vram, LimitedBy::Vram)
+            // round down to a whole 16-token page, the engine's allocation unit
+            (by_vram / 16 * 16, LimitedBy::Vram)
         }
     };
 
@@ -1457,6 +1503,41 @@ mod tests {
                 e.kv_pool
             );
         }
+    }
+
+    /// A windowed model's context is the inverse of its real KV cost, not the
+    /// pool over its one-token cost: gemma4's full 262K window fits a 5.6 GB
+    /// pool, and the division used to report 24752 of it, limited by "vram",
+    /// with gigabytes spare - so every start shrank onto that.
+    #[test]
+    fn windowed_models_reach_the_window_their_pool_holds() {
+        let shape = gemma4_a4b();
+        let e = at(&shape, 1);
+        assert_eq!(e.max_ctx, 262_144);
+        assert_eq!(e.limited_by, LimitedBy::Model);
+        // and where the card does bind, the window is tight against the pool:
+        // one page more would not fit
+        for n in [8u64, 32] {
+            let e = at(&shape, n);
+            assert_eq!(e.limited_by, LimitedBy::Vram);
+            let cost = |ctx| shape.kv_per_sequence(ctx, KvDtype::F16) * n;
+            assert!(cost(e.max_ctx) <= e.kv_pool, "n={n}");
+            assert!(cost(e.max_ctx + 16) > e.kv_pool, "n={n}");
+        }
+        // the slope a client multiplies by context: the full-window average
+        // (~the 5 full layers' rate), not the one-token cost that charges all
+        // 25 windowed layers on every token
+        assert!(
+            shape.kv_bytes_per_token(KvDtype::F16) < shape.kv_per_sequence(1, KvDtype::F16) / 10
+        );
+        assert_eq!(
+            qwen35_9b().kv_bytes_per_token(KvDtype::F16),
+            qwen35_9b().kv_per_sequence(1, KvDtype::F16)
+        );
+        // and a client's slope x window x sessions never exceeds the pool that
+        // holds them all
+        let e = at(&shape, 1);
+        assert!(shape.kv_bytes_per_token(KvDtype::F16) * e.max_ctx <= e.kv_pool);
     }
 
     /// Context is a whole number of the engine's 16-token pages.

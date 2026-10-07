@@ -50,6 +50,8 @@ use paddock_models::nemotron::NemotronBlock;
 /// the whole weight set).
 pub(super) struct PfCuts {
     pub(super) runs: Vec<(usize, usize, u32)>,
+    /// each run's first position (a run's rows are consecutive positions)
+    pub(super) run_pos: Vec<u32>,
     pub(super) dec: usize,
     pub(super) breaks: Vec<(usize, usize)>,
 }
@@ -119,19 +121,79 @@ pub(crate) fn attn_split_election(
 /// warp a row, eight warps a CTA.
 pub(crate) const ROWS_GROUP: usize = 8;
 
+/// Rows per group under slot 745 (two warps a row, twelve a CTA): the W16
+/// class caps its verify groups here whenever it attends through 745.
+pub(crate) const ROWS_GROUP_KH: usize = 6;
+
 /// Split the rows of each same-slot run `(first row, rows)` into the
 /// multi-row partial's groups - flat `[first row, rows <= ROWS_GROUP]` pairs.
 pub(crate) fn rows_groups(runs: impl IntoIterator<Item = (usize, usize)>) -> Vec<u32> {
+    rows_groups_cap(runs, ROWS_GROUP)
+}
+
+/// [`rows_groups`] at `cap` rows a group.
+pub(crate) fn rows_groups_cap(
+    runs: impl IntoIterator<Item = (usize, usize)>,
+    cap: usize,
+) -> Vec<u32> {
     let mut g = Vec::new();
     for (off, len) in runs {
         let mut o = off;
         while o < off + len {
-            let n = (off + len - o).min(ROWS_GROUP);
+            let n = (off + len - o).min(cap);
             g.extend([o as u32, n as u32]);
             o += n;
         }
     }
     g
+}
+
+/// The split size a row with `n` keys attends by under a W16 law word: 0 or
+/// `0x8000_0000 | budget` = slot 744's pow2 law (0 takes `ns` as the
+/// budget), `0x4000_0000 | budget` = slot 745's TILE law, anything else a
+/// fixed size. Mirrors the kernels' own arithmetic - the host groups rows by
+/// it, so it must stay exact.
+pub(crate) fn w16_split_size(law: usize, ns: usize, n: usize) -> usize {
+    if law == 0 || law & 0x8000_0000 != 0 {
+        let budget = if law == 0 { ns } else { law & 0x7fff_ffff };
+        n.div_ceil(budget.max(1)).next_power_of_two().max(256)
+    } else if law & 0x4000_0000 != 0 {
+        let budget = (law & 0x3fff_ffff).max(1);
+        (64 * n.div_ceil(64 * budget)).max(256)
+    } else {
+        law
+    }
+}
+
+/// [`rows_groups`] under a key-dependent split law (744's pow2, 745's TILE):
+/// a group's rows must share one split size, and the size follows the key
+/// count (n = pos + 1), so a run that crosses a size-bucket edge splits
+/// there too. `runs` carry each run's first position; `cap` rows a group.
+pub(crate) fn rows_groups_law(
+    runs: impl IntoIterator<Item = (usize, usize, u32)>,
+    z: impl Fn(usize) -> usize,
+    cap: usize,
+) -> Vec<u32> {
+    let mut pieces = Vec::new();
+    for (off, len, p0) in runs {
+        let p0 = p0 as usize;
+        let mut a = 0;
+        for j in 1..=len {
+            if j == len || z(p0 + j + 1) != z(p0 + a + 1) {
+                pieces.push((off + a, j - a));
+                a = j;
+            }
+        }
+    }
+    rows_groups_cap(pieces, cap)
+}
+
+/// Slot 745's TILE-law budget: whole waves of one CTA an SM over the kv
+/// heads - the largest multiple of sm / n_kv splits the `ns` planes hold
+/// (GB10, 2 kv heads: 120 splits = 240 CTAs = five waves).
+pub(crate) fn kh_tile_budget(sm: usize, n_kv: usize, ns: usize) -> usize {
+    let per = (sm / n_kv.max(1)).max(1);
+    if per >= ns { ns } else { ns / per * per }
 }
 
 /// Splits for the multi-row partial: one live CTA per SM over the (kv head,
@@ -245,11 +307,15 @@ pub(crate) struct NemoBatchScratch {
     /// chunk's MoE folds over every row (W16_ROWS rows)
     pub d_band_x: CudaSlice<f32>,
     /// the W16 class's attention: fixed-split partial planes for up to
-    /// `w16_rows` rows x `w16_ns` splits of `w16_split` keys, and the
-    /// one-row-a-group list a decode tick attends through
+    /// `w16_rows` rows x `w16_ns` splits, the law word (`w16_split_size`:
+    /// a fixed size, 0 = 744's pow2 law, 0x4000_0000 | budget = 745's TILE
+    /// law), and the one-row-a-group list a decode tick attends through
     pub w16_split: usize,
     pub w16_ns: usize,
     pub w16_rows: usize,
+    /// the class attends through slot 745 (two warps a row): decode ticks
+    /// and verify rounds alike, verify groups capped at ROWS_GROUP_KH
+    pub w16_kh: bool,
     pub d_w16o: CudaSlice<f32>,
     pub d_w16ml: CudaSlice<f32>,
     pub d_w16_groups: CudaSlice<u32>,
@@ -670,9 +736,10 @@ impl GpuNemotron {
 
         // One block id addresses every attention layer (combined table), so a
         // block costs all n_attn layers' K+V at once - and the drafter's
-        // stripes, which ride the same ids (dflash.rs).
+        // stripes, which ride the same ids (dflash.rs, mtp.rs).
         let block_bytes = n_attn * 16 * kv_dim * 2 * kvb
-            + self.dflash.as_ref().map_or(0, |d| d.stripe_bytes(kv_dim));
+            + self.dflash.as_ref().map_or(0, |d| d.stripe_bytes(kv_dim))
+            + self.mtp_stripe_bytes(kv_dim);
         // per-slot recurrent state (flat, not paged)
         let state_elems = hp.mamba_heads * hp.mamba_head_dim * hp.d_state;
         let win_elems = (hp.d_conv - 1) * conv_dim;
@@ -827,7 +894,9 @@ impl GpuNemotron {
         let mut ssm: Vec<Option<SsmArena>> = Vec::with_capacity(hp.n_layer);
         let mut conv_win: Vec<Option<CudaSlice<f32>>> = Vec::with_capacity(hp.n_layer);
         let mut kv_bytes = arena_bytes as u64
-            + (pool_blocks * self.dflash.as_ref().map_or(0, |d| d.stripe_bytes(kv_dim))) as u64;
+            + (pool_blocks
+                * (self.dflash.as_ref().map_or(0, |d| d.stripe_bytes(kv_dim))
+                    + self.mtp_stripe_bytes(kv_dim))) as u64;
         for li in 0..hp.n_layer {
             match hp.blocks[li] {
                 NemotronBlock::Attention => {
@@ -856,7 +925,23 @@ impl GpuNemotron {
         }
 
         // the W16 class's attention: a decode tick's rows or a verify round's
-        let (w16_split, w16_ns) = w16_attn_splits(self.max_ctx);
+        let (mut w16_split, w16_ns) = w16_attn_splits(self.max_ctx);
+        // slot 744: the split size follows each row's keys instead of
+        // max_ctx (0 = that law; w16_ns stays the budget and the planes)
+        if e.has_attn_rows_partial_pow2()
+            && paddock_models::dev_var_os!("PADDOCK_NO_W16_POW2").is_none()
+        {
+            w16_split = 0;
+        }
+        // slot 745 when the pack carries it and the pool is e4m3 (the class
+        // must not mix kernels: decode == verify rides on one fold)
+        let w16_kh = e.has_attn_rows_partial_kh()
+            && self.kv_dtype == KvDtype::Fp8E4m3
+            && paddock_models::dev_var_os!("PADDOCK_NO_ROWS_KH").is_none();
+        if w16_kh {
+            // 745 attends by its TILE law: whole waves at every depth
+            w16_split = 0x4000_0000 | kh_tile_budget(e.sm_count(), hp.n_kv_heads, w16_ns);
+        }
         let w16_rows = slots.clamp(super::spec::SPEC_ROWS_NEMO, W16_ROWS).min(cap);
         let d_sh_w = e.to_device(&vec![1.0f32; cap])?;
         let sc = NemoBatchScratch {
@@ -917,6 +1002,7 @@ impl GpuNemotron {
             w16_split,
             w16_ns,
             w16_rows,
+            w16_kh,
             d_w16o: e.alloc(nh * w16_rows * w16_ns * hd)?,
             d_w16ml: e.alloc(nh * w16_rows * w16_ns * 2)?,
             d_w16_groups: e.to_device_u32(
@@ -1335,7 +1421,17 @@ impl GpuNemotron {
             }
             spans
         };
-        self.layer_walk(chunk.len(), Some(&PfCuts { runs, dec, breaks }), false)?;
+        let run_pos = runs.iter().map(|&(off, _, _)| positions[off]).collect();
+        self.layer_walk(
+            chunk.len(),
+            Some(&PfCuts {
+                runs,
+                run_pos,
+                dec,
+                breaks,
+            }),
+            false,
+        )?;
         if self.dflash.as_ref().is_some_and(|d| d.state.is_some()) {
             self.dflash_append_features(chunk.len())?;
             for &(s, a, b, _) in &note {
@@ -1714,5 +1810,59 @@ impl GpuNemotron {
         self.batch
             .as_ref()
             .map(|b| (b.pool.free_blocks(), b.pool.capacity() as usize))
+    }
+}
+
+#[cfg(test)]
+mod law_tests {
+    use super::*;
+
+    #[test]
+    fn split_size_mirrors_the_kernel_laws() {
+        // 744's pow2 law at the 128-split budget (0 and the flagged word agree)
+        assert_eq!(w16_split_size(0, 128, 10_431), 256);
+        assert_eq!(w16_split_size(0, 128, 83_027), 1024);
+        assert_eq!(w16_split_size(0x8000_0000 | 128, 0, 233_332), 2048);
+        // 745's TILE law at B = 120: whole 64-key tiles, ~B splits
+        let tile = 0x4000_0000 | 120;
+        assert_eq!(w16_split_size(tile, 128, 10_431), 256);
+        assert_eq!(w16_split_size(tile, 128, 83_027), 704);
+        assert_eq!(w16_split_size(tile, 128, 233_332), 1984);
+        for n in [1usize, 255, 7_680, 7_681, 83_027, 262_144] {
+            let z = w16_split_size(tile, 128, n);
+            assert!(
+                z.is_multiple_of(64) && z >= 256 && n.div_ceil(z) <= 120,
+                "n {n}: z {z}"
+            );
+        }
+        // a fixed size is itself
+        assert_eq!(w16_split_size(2048, 128, 5), 2048);
+    }
+
+    #[test]
+    fn tile_budget_fills_whole_waves() {
+        assert_eq!(kh_tile_budget(48, 2, 128), 120);
+        assert_eq!(kh_tile_budget(170, 2, 128), 85);
+        assert_eq!(kh_tile_budget(300, 2, 128), 128);
+    }
+
+    #[test]
+    fn law_groups_split_at_a_size_edge_and_at_the_cap() {
+        let tile = 0x4000_0000 | 120;
+        let z = |n| w16_split_size(tile, 128, n);
+        // 6 rows from position 30716: n = 30717..30722 crosses the TILE
+        // law's first step past the 256 floor (z 256 -> 320 at n 30721)
+        assert_eq!((z(30_720), z(30_721)), (256, 320));
+        let g = rows_groups_law([(0usize, 6usize, 30_716u32)], z, 6);
+        assert_eq!(g, vec![0, 4, 4, 2]);
+        assert!(g.chunks(2).all(|c| {
+            let (o, l) = (c[0] as usize, c[1] as usize);
+            (o..o + l).all(|r| z(30_716 + r + 1) == z(30_716 + o + 1))
+        }));
+        // inside one bucket: one group up to the cap
+        assert_eq!(
+            rows_groups_law([(0usize, 8usize, 3000u32)], z, 6),
+            vec![0, 6, 6, 2]
+        );
     }
 }

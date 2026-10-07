@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 tokenizers = { workspace = true }
+htmlize = { workspace = true }
 thiserror = { workspace = true }
 paddock-models = { workspace = true }
 serde_json = { workspace = true }

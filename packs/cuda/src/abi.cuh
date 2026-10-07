@@ -3644,6 +3644,310 @@ struct KernelTableV1 {
                         uint32_t, uint32_t, void*);
     // 742: clef_lex_mean_q8 (table_q8_0, d, ids, spans, n, out, stream) - 726 over Q8_0 rows as stored
     int (*clef_lex_mean_q8)(const void*, uint32_t, const void*, const void*, uint32_t, void*, void*);
+    // 743: q8_0_moe_up_relu2_mma (up_data, up_scale, sorted_row, block_expert, xq, xs, fq, fs,
+    // in_dim, ff, max_blocks, bm, stream) - q8_0_moe_gate_up_mma's single-plane relu(up)^2 twin
+    // (nemotron_h_moe), bitwise vs the dp4a up_relu2_sorted + quantize_q8 pair
+    int (*q8_0_moe_up_relu2_mma)(const void*, const void*, const void*, const void*, const void*,
+                                 const void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                                 void*);
+    // 744: attn_rows_partial_pow2 (683's arguments without split_keys) - 683's per-row law with
+    // the split size max(256, next_pow2(ceil(n / n_splits))) from the row's own key count n
+    int (*attn_rows_partial_pow2)(const void*, const void*, const void*, void*, void*,
+                                  const void*, const void*, const void*, uint32_t, const void*,
+                                  uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                                  uint32_t, uint32_t, uint32_t, float, uint32_t, uint32_t, void*);
+    // 745: attn_rows_partial_kh (683's arguments + max_rows) - the rows partial with every row's
+    // keys split across two warps (f32 fold at the split end); e4m3 paged, <= 6 rows a group
+    int (*attn_rows_partial_kh)(const void*, const void*, const void*, void*, void*, const void*,
+                                const void*, const void*, uint32_t, const void*, uint32_t,
+                                uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                                uint32_t, uint32_t, float, uint32_t, uint32_t, uint32_t, uint32_t,
+                                void*);
+    // 746: mamba2_scan_seq_keep_f16 (state read-only, xbc, dt_raw, dt_stride, A, D, dt_bias, y,
+    // keep, n_tokens, n_heads, head_dim, d_state, n_groups, stream) - 444's verify walk without
+    // per-row snapshots: each row's x | B | raw dt kept for the replay
+    int (*mamba2_scan_seq_keep_f16)(const void*, const void*, const void*, uint32_t, const void*,
+                                    const void*, const void*, void*, void*, uint32_t, uint32_t,
+                                    uint32_t, uint32_t, uint32_t, void*);
+    // 747: mamba2_rescan_f16 (descs, n, n_heads, head_dim, d_state, n_groups, stream) - replay of
+    // kept rows: six u64 words a descriptor {src, dst, keep, A, dt_bias, rows}
+    int (*mamba2_rescan_f16)(const void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 748: moe_topk_logit_sigmoid_batch (moe_topk_sigmoid_batch's arguments) - Kolibri 1's
+    // router: select on raw logits + bias, weights sigmoid(logit) * scale, no renormalization
+    int (*moe_topk_logit_sigmoid_batch)(const void*, const void*, float, uint32_t, uint32_t,
+                                        void*, void*, uint32_t, void*);
+    // 749: kquant_moe_down_mma_b16 (kquant_moe_down_mma's arguments) - the sorted down with each
+    // weighted partial rounded to bf16 at the store; fold with moe_slot_combine_bf16
+    int (*kquant_moe_down_mma_b16)(const void*, const void*, const void*, const void*,
+                                   const void*, const void*, const void*, const void*,
+                                   const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                                   uint32_t, void*);
+    // 750: kquant_gemm_w4a8_pipe3 (kquant_gemm_w4a8_pipe2's arguments) - the Q4_K prefill tile with
+    // its activation tile double-buffered on the cp.async ring; byte-identical to pipe2, which it
+    // hands every other type to
+    int (*kquant_gemm_w4a8_pipe3)(const void*, const void*, const void*, const void*, void*,
+                                  uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 751: sam3_patch_rows (pixels, out, pics, side, patch, win, ch, kp, stream) - u8 RGB
+    // pictures -> SAM 3's patch GEMM rows, window-major, K zero-padded to kp
+    int (*sam3_patch_rows)(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                           uint32_t, void*);
+    // 752: sam3_qkv_split_rope_h (qkv, bq, bk, bv, cos, sin, q, k, v, d, hd, rows, chip_rows,
+    // qscale, stream) - 621 with k's bias and every row roped off a chip_rows-row table
+    int (*sam3_qkv_split_rope_h)(const void*, const void*, const void*, const void*, const void*,
+                                 const void*, void*, void*, void*, uint32_t, uint32_t, uint32_t,
+                                 uint32_t, float, void*);
+    // 753: sam3_rows_to_raster_h (x, out, pics, g, win, d, stream) - window-major f32 rows ->
+    // raster f16 rows, the trunk's exit to the necks
+    int (*sam3_rows_to_raster_h)(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                                 void*);
+    // 754: sam3_convt2_bias_h (g, bias, out, pics, h, w, C, gelu, stream) - 2x2/s2 convT
+    // depth-to-space + bias (+ erf GELU) off the GEMM's f32 landing, f16 raster out
+    int (*sam3_convt2_bias_h)(const void*, const void*, void*, uint32_t, uint32_t, uint32_t,
+                              uint32_t, uint32_t, void*);
+    // 755: f16_gemm_h_gelu_tanh (624's arguments) - bias + tanh-approximate GELU epilogue
+    int (*f16_gemm_h_gelu_tanh)(const void*, const void*, void*, const void*, unsigned int,
+                                unsigned int, unsigned int, void*);
+    // 756: bf16_gemm_pf (bf16_gemm_mma's arguments; x = the rows as bf16) - the prefill bf16
+    // GEMM: grouped tile walk, both operands on the cp.async ring; bit-identical to the unsplit
+    // plain tile; -2 on a ragged in_dim
+    int (*bf16_gemm_pf)(const void*, const void*, const void*, void*, uint32_t, uint32_t,
+                        uint32_t, void*);
+    // 757: bf16_qkv_gemm_pf (bf16_qkv_gemm_mma's arguments; x = bf16 rows) - its fused q|k|v twin
+    int (*bf16_qkv_gemm_pf)(const void*, const void*, void*, void*, void*, uint32_t, uint32_t,
+                            uint32_t, uint32_t, void*);
+    // 758: nvf4_moe_down_bs_b16 (nvf4_moe_down_bs's arguments; part holds bf16) - the sorted
+    // NVFP4 down with each weighted partial rounded to bf16 at the store; fold with
+    // moe_slot_combine_bf16 onto a residual that already holds the shared expert
+    int (*nvf4_moe_down_bs_b16)(const void*, const void*, const void*, const void*,
+                                const void*, const void*, const void*, const void*,
+                                const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                                uint32_t, uint32_t, void*);
+    // 759: sam3_text_attn_h (q, k, v, out, prompts, T, H, hd, stream) - causal self-attention
+    // over SAM 3's 32-token prompts, f16 planes [prompts][T][H][hd], q pre-scaled
+    int (*sam3_text_attn_h)(const void*, const void*, const void*, void*, uint32_t, uint32_t,
+                            uint32_t, uint32_t, void*);
+    // 760: sam3_seam_h (x, proj, bias, w, b, pos, out, outq, rows, n, period, npos, eps, flags,
+    // stream) - every detector residual seam: x (+ proj + bias), pre/post LayerNorm or none, f16
+    // out and f16 out + pos[row % period], none past npos
+    int (*sam3_seam_h)(void*, const void*, const void*, const void*, const void*, const void*,
+                       void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, float, uint32_t,
+                       void*);
+    // 761: sam3_box_attn_h (q, k, v, bx, by, out, nq, nk, H, hd, gh, gw, nbias, stream) - the
+    // decoder's image cross-attention with the factorized box bias by[q][y][h] + bx[q][x][h] on its
+    // scores; rows past nbias unbiased
+    int (*sam3_box_attn_h)(const void*, const void*, const void*, const void*, const void*, void*,
+                           uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                           void*);
+    // 762: sam3_rpb_tables (ref, w1x, b1x, w2x, b2x, w1y, b1y, w2y, b2y, tx, ty, nq, gh, gw, hid,
+    // H, stream) - the two box-bias tables (log mode) for the reference boxes, f32
+    int (*sam3_rpb_tables)(const void*, const void*, const void*, const void*, const void*,
+                           const void*, const void*, const void*, const void*, void*, void*,
+                           uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 763: sam3_box_sine (boxes, out, n, npf, mode, ld, temperature, stream) - sine embeddings of
+    // boxes, f16: mode 0 the decoder query position [y|x|w|h], mode 1 the geometry box encoding
+    // [y|x|h|w raw]
+    int (*sam3_box_sine)(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, float, void*);
+    // 764: sam3_box_refine (ref, delta, bias, n, ld, stream) - ref = sigmoid(delta + bias +
+    // inverse_sigmoid(ref)) in place, Meta's inverse sigmoid (eps 1e-3)
+    int (*sam3_box_refine)(void*, const void*, const void*, uint32_t, uint32_t, void*);
+    // 765: sam3_roi_align (feat, boxes, out, n, H, W, C, pooled, stream) - torchvision roi_align,
+    // aligned=False, adaptive sampling, NHWC f32 in, [n][C][p][p] f16 out
+    int (*sam3_roi_align)(const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                          uint32_t, void*);
+    // 766: sam3_gn_relu_f16 (x, xb, w, b, out, part, stat, chips, P, C, G, eps, stream) - slot 613
+    // with ReLU in place of GELU
+    int (*sam3_gn_relu_f16)(const void*, const void*, const void*, const void*, void*, void*, void*,
+                            uint32_t, uint32_t, uint32_t, uint32_t, float, void*);
+    // 767: sam3_up2_add_h (prev, skip, out, pics, h, w, C, stream) - the pixel decoder seam:
+    // f16(skip + nearest x2 (prev))
+    int (*sam3_up2_add_h)(const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                          void*);
+    // 768: sam3_score (hp, pp, presence, logit, prob, nq, d, scale, clamp, stream) - the dot-
+    // product scorer's clamp(scale * hp . pp) and sigmoid(logit) * sigmoid(presence)
+    int (*sam3_score)(const void*, const void*, const void*, void*, void*, uint32_t, uint32_t,
+                      float, float, void*);
+    // 769: f16_gemm_h_bias (w, x, y, bias, in_dim, out_dim, batch, stream) - the f16 landing with
+    // an optional bias added before its round
+    int (*f16_gemm_h_bias)(const void*, const void*, void*, const void*, unsigned int, unsigned int,
+                           unsigned int, void*);
+    // 770: sam3_resize_aa_u8 (src, dst, H, W, OH, OW, C, stream) - torchvision's antialiased
+    // bilinear resize of a u8 HWC picture, to the bit (f32, torch's weights and walk, round half to
+    // even)
+    int (*sam3_resize_aa_u8)(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                             void*);
+    // 771: sam3_mask_up (logits, out, side, nq, q, H, W, stream) - query q's 288^2 mask logits
+    // bilinear to the picture, sigmoid > 0.5, u8 0/1 column-major [W][H]
+    int (*sam3_mask_up)(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                        void*);
+    // 772: sam3_rle (mask, starts, counts, nruns, n, cap, stream) - COCO RLE of a column-major 0/1
+    // mask: zeros first, alternating run lengths; nruns 0xffffffff past cap
+    int (*sam3_rle)(const void*, void*, void*, void*, uint64_t, uint32_t, void*);
+    // 773: bf16_qkv_gemv_mr (bf16_qkv_gemm_mma's arguments) - q|k|v off the fused plane in one
+    // decode-band (2..=8 rows) multi-row GEMV launch, rows routed per segment; -2 outside the band
+    int (*bf16_qkv_gemv_mr)(const void*, const void*, void*, void*, void*, uint32_t, uint32_t,
+                            uint32_t, uint32_t, void*);
+    // 774: sam3_box_attn_mma (q, k, v, bx, by, part, out, nq, H, hd, gh, gw, nbias, nsplit,
+    // stream) - 761 on the tensor cores, keys split across nsplit row-pair runs and folded in
+    // order; part [nsplit][nq][H][hd + 2] f32 scratch, unread at nsplit 1. hd 32, gw 72 only
+    int (*sam3_box_attn_mma)(const void*, const void*, const void*, const void*, const void*,
+                             void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                             uint32_t, uint32_t, void*);
+    // 775: f16_conv3_gemm (w, src, y, bias, chips, H, W, C, out_dim, src_chip_rows, stream) - a
+    // 3x3 / stride 1 / pad 1 conv as one GEMM, the im2row gathered in the stage (bit-identical to
+    // pd_dp_im2row3 + pd_f16_gemm on cc 8.6); src f16 [chips][rows][C], y f32, bias optional
+    int (*f16_conv3_gemm)(const void*, const void*, void*, const void*, uint32_t, uint32_t,
+                          uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 776: f16_gemm_qkv_rope (w, x, q, k, v, bias, cs, sn, in_dim, d, hd, batch, chip_rows,
+    // qscale, stream) - the q|k|v projection landed as three half planes with its three biases,
+    // the rotate-half rope on q/k and q's scale (pd_sam3_qkv_split_rope_h on the accumulator)
+    int (*f16_gemm_qkv_rope)(const void*, const void*, void*, void*, void*, const void*,
+                             const void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                             uint32_t, float, void*);
+    // 777: rmsnorm_add_scale_norm (x, proj, w_post, w_pre, xn, x16, n, eps, s, rows, stream) - a
+    // sandwich post-norm fused with the next norm (+ an optional bf16 copy of xn; xn may be null);
+    // bit-identical to rmsnorm_add_scale + rmsnorm_batch; -2 outside rows >= 256 / vec4
+    int (*rmsnorm_add_scale_norm)(void*, const void*, const void*, const void*, void*, void*,
+                                  uint32_t, float, float, uint32_t, void*);
+    // 778: sam3_point_pe (xy, labels, g, emb, nap, out, n, nf, stream) - random-Fourier point
+    // features + the label's embedding (labels null = the plain pe, the dense image pe)
+    int (*sam3_point_pe)(const void*, const void*, const void*, const void*, const void*, void*,
+                         uint32_t, uint32_t, void*);
+    // 779: sam3_mask_down (in, w, b, lw, lb, out, H, W, cin, cout, in_stride, in_off, clamp, eps,
+    // out16, stream) - one Conv2d k2 s2 -> LayerNorm2d -> GELU stage of the mask prompt
+    int (*sam3_mask_down)(const void*, const void*, const void*, const void*, const void*, void*,
+                          uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, float,
+                          uint32_t, void*);
+    // 780: sam3_up_skip (g, bias, skip, lw, lb, out, h, w, C, eps, out16, stream) - convT 2x2/s2
+    // depth-to-space + bias + skip (+ LayerNorm2d) + GELU, the mask decoder's upscaling seam
+    int (*sam3_up_skip)(const void*, const void*, const void*, const void*, const void*, void*,
+                        uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
+    // 781: sam3_mlp3_rows (x, w1, b1, w2, b2, w3, b3, out, out16, rows, in, hid, od, ws1, ws2,
+    // ws3, wsb, wsb3, sig, stream) - a 3-layer ReLU MLP a row, each row its own weights
+    int (*sam3_mlp3_rows)(const void*, const void*, const void*, const void*, const void*,
+                          const void*, const void*, void*, void*, uint32_t, uint32_t, uint32_t,
+                          uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                          void*);
+    // 782: sam3_mask_stats (m, counts, px, nm, k, delta, stream) - #(v > delta), #(v > -delta)
+    // over column k of a [px][nm] logits plane (the single-mask stability score)
+    int (*sam3_mask_stats)(const void*, void*, uint32_t, uint32_t, uint32_t, float, void*);
+    // 783: sam3_fill_holes (m, lab, area, side, nm, k, max_area, stream) - background components
+    // (8-connected, logit <= 0) of at most max_area pixels become logit 10, in place
+    int (*sam3_fill_holes)(void*, void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 784: sam3_mem_down3 (in, w, b, lw, lb, out, nb, H, W, cin, cout, mode, sh, sw, eps, out16,
+    // stream) - one small Conv2d(k3, s2, p1) -> LayerNorm2d -> GELU stage of the memory
+    // encoder's mask downsampler; modes 1 / 2 read the objects' logits (sigmoid / binarized)
+    int (*sam3_mem_down3)(const void*, const void*, const void*, const void*, const void*, void*,
+                          uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                          uint32_t, float, uint32_t, void*);
+    // 785: f16_conv3s2_gemm (w, src, y, bias, chips, H, W, C, out_dim, src_chip_rows, stream) -
+    // slot 775 at stride 2: H x W the output grid of a 2H x 2W source
+    int (*f16_conv3s2_gemm)(const void*, const void*, void*, const void*, uint32_t, uint32_t,
+                            uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 786: sam3_dwconv7_ln_h (in, w, b, lw, lb, out, nb, H, W, C, eps, stream) - depthwise
+    // Conv2d(k7, p3) + bias -> LayerNorm2d, f32 channel-last in, f16 out
+    int (*sam3_dwconv7_ln_h)(const void*, const void*, const void*, const void*, const void*,
+                             void*, uint32_t, uint32_t, uint32_t, uint32_t, float, void*);
+    // 787: sam3_ln_gelu_h (in, lw, lb, out, rows, n, eps, stream) - LayerNorm2d -> GELU(erf)
+    // over channel-last rows, f32 in, f16 out
+    int (*sam3_ln_gelu_h)(const void*, const void*, const void*, void*, uint32_t, uint32_t, float,
+                          void*);
+    // 788: sam3_rope_rows_h (in, out, cs, sn, rows, in_stride, in_off, d, group, nrope, period,
+    // scale, stream) - f32 rows -> f16 with rotate-half rope on the first nrope rows of each group
+    // (table row (r % group) % period), then * scale; cs null = a plain convert
+    int (*sam3_rope_rows_h)(const void*, void*, const void*, const void*, uint32_t, uint32_t,
+                            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, void*);
+    // 789: sam3_mem_attn_h (q, k, v, out, nq, nk, ngroups, dv, ldv, ldo, stream) - one-head
+    // attention, a 256-wide score (q pre-scaled) and a 64- or 128-wide value, per group
+    int (*sam3_mem_attn_h)(const void*, const void*, const void*, void*, uint32_t, uint32_t,
+                           uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 790: sam3_bank_mem_rows (mem, pos, tpos, kin, v, rows, stream) - a memory frame's bf16
+    // rows [rows][64] to the memory attention's f16 key input m + (pos + tpos) and value m
+    int (*sam3_bank_mem_rows)(const void*, const void*, const void*, void*, void*, uint32_t,
+                              void*);
+    // 791: sam3_bank_ptr_rows (pool, meta, w, b, kin, v, np, tmax, stream) - np object pointers
+    // (pool rows meta[0..np], distances meta[np..2np]) to 4 f16 tokens each, the key input with
+    // Linear(256 -> 64) over the 1-D sine of distance / tmax added
+    int (*sam3_bank_ptr_rows)(const void*, const void*, const void*, const void*, void*, void*,
+                              uint32_t, float, void*);
+    // 792: sam3_mask_bits (planes, bits, area, stride, n, px, stream) - n f32 planes as bitplanes (> 0) and their areas
+    int (*sam3_mask_bits)(const void*, void*, void*, uint64_t, uint32_t, uint32_t, void*);
+    // 793: sam3_mask_pairs (a, b, inter, words, na, nb, stream) - pairwise popcount intersections of two bitplane sets
+    int (*sam3_mask_pairs)(const void*, const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+    // 794: sam3_mask_clean (planes, lab, area, tot, stride, side, n, max_area, hole_val, sprinkle_val, stream) - Meta's fill_holes_in_mask_scores, holes then sprinkles
+    int (*sam3_mask_clean)(void*, void*, void*, void*, uint64_t, uint32_t, uint32_t, uint32_t, float, float, void*);
+    // 795: sam3_mask_set (plane, n, val, mode, stream) - a plane set to val (0) or clamped to at most val (1)
+    int (*sam3_mask_set)(void*, uint64_t, float, uint32_t, void*);
+    // 796: sam3_mask_up2 (logits, out, side, nq, q, H, W, mode, stream) - 771 with a threshold mode: 0 sigmoid > 0.5, 1 logit > 0
+    int (*sam3_mask_up2)(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 797: sam3_mask_owner (masks, scores, n, px, stream) - each pixel kept by the highest-scoring covering mask only
+    int (*sam3_mask_owner)(void*, const void*, uint32_t, uint32_t, void*);
+    // 798: sam3_mask_boxes (masks, out, n, H, W, stream) - each column-major u8 mask's {x0, y0, x1, y1, area}
+    int (*sam3_mask_boxes)(const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+    // 799: sam3_pil_coeffs (bounds, kk, in_size, out_size, ksize, stream) - Pillow's bilinear taps for one axis, 22-bit fixed point
+    int (*sam3_pil_coeffs)(void*, void*, uint32_t, uint32_t, uint32_t, void*);
+    // 800: sam3_pil_pass (src, dst, bounds, kk, rows, in_size, out_size, ch, ksize, axis, stream) - one Pillow resample pass over u8 HWC
+    int (*sam3_pil_pass)(const void*, void*, const void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 801: sam3_patch_rows_norm (pixels, out, pics, side, patch, win, ch, kp, norm, stream) - 751 with a normalization: 0 pictures, 1 Meta's video frames
+    int (*sam3_patch_rows_norm)(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 802: sam3_mask_pick (src, dst, px, nq, q, stream) - column q of a pixel-major plane as a plane of its own
+    int (*sam3_mask_pick)(const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+    // 803: sam3_resize_f32 (src, dst, n, ih, iw, oh, ow, istride, ostride, aa, mode, thr, lo, hi, stream) - torch's bilinear (aa 0) or antialiased bilinear (aa 1), optionally binarized
+    int (*sam3_resize_f32)(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint64_t, uint64_t, uint32_t, uint32_t, float, float, float, void*);
+    // 804: sam3_mask_down4 (src, dst, w, b, n, s, istride, ostride, stream) - Conv2d(1, 1, k4, s4) + bias, 4s -> s
+    int (*sam3_mask_down4)(const void*, void*, const void*, const void*, uint32_t, uint32_t, uint64_t, uint64_t, void*);
+    // 805: sam3_nonoverlap (planes, counts, stride, n, px, write, stream) - pixel-wise argmax across planes: counts before / after, optional clamp of the losers
+    int (*sam3_nonoverlap)(void*, void*, uint64_t, uint32_t, uint32_t, uint32_t, void*);
+    // 806: eg2_rms (x, w, out, yq, n_rows, ple_tokens, scale, eps, stream) - rmsnorm(x * scale)
+    // * w over 512-wide rows into f32 and/or the mmq-quantized layout; ple_tokens > 0 lays the
+    // PLE planes out layer-major
+    int (*eg2_rms)(const void*, const void*, void*, void*, uint32_t, uint32_t, float, float,
+                   void*);
+    // 807: eg2_sandwich (x, proj, wpost, wnext, xn, yq, rows, s, eps, stream) - x = (x +
+    // rmsnorm(proj) * wpost) * s, then xn = rmsnorm(x) * wnext when wnext is set; yq takes the
+    // mmq-quantized xn (or x)
+    int (*eg2_sandwich)(void*, const void*, const void*, const void*, void*, void*, uint32_t,
+                        float, float, void*);
+    // 808: eg2_heads (qkv, pos, qw, kw, q16, k16, v16, rows, stride, head_dim, theta_scale, eps,
+    // stream) - q/k/v RMS norm + split-half rope off the fused landing, f16 out
+    int (*eg2_heads)(const void*, const void*, const void*, const void*, void*, void*, void*,
+                     uint32_t, uint32_t, uint32_t, float, float, void*);
+    // 809: eg2_attn (q16, k16, v16, cu, tiles, n_tiles, out, head_dim, window, stream) -
+    // bidirectional varlen attention, symmetric window, f32 out
+    int (*eg2_attn)(const void*, const void*, const void*, const void*, const void*, uint32_t,
+                    void*, uint32_t, uint32_t, void*);
+    // 810: eg2_pool (tok, cu, n_seq, dims, out, stream) - mean pool + L2 norm over the dims prefix
+    int (*eg2_pool)(const void*, const void*, uint32_t, uint32_t, void*, void*);
+    // 811: eg2_gemm_rows (data, scale, yq, y, in_dim, out_dim, batch, stream) - the small-pass
+    // Q8_0 GEMM, bit-identical per output to the mmq tile
+    int (*eg2_gemm_rows)(const void*, const void*, const void*, void*, uint32_t, uint32_t,
+                         uint32_t, void*);
+    // 812: eg2_geglu_q (gate, up, ld, yq, in_dim, batch, stream) - GEGLU of strided rows into
+    // the mmq layout
+    int (*eg2_geglu_q)(const void*, const void*, uint32_t, void*, uint32_t, uint32_t, void*);
+    // 813: eg2a_mel (pcm, n, window, fb, spans, twiddle, out, frames, llama_floor, stream) - the audio
+    // log-mel frontend
+    int (*eg2a_mel)(const void*, uint32_t, const void*, const void*, const void*, const void*,
+                    void*, uint32_t, uint32_t, void*);
+    // 814: eg2a_sscp (in, w, nw, out, t_in, f_in, c_in, c_out, eps, stream) - conv 3x3 s2 + LayerNorm
+    // + ReLU
+    int (*eg2a_sscp)(const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t,
+                     uint32_t, float, void*);
+    // 815: eg2a_rows (x, y, y_lo, y_hi, post_w, y_scale, out_w, next_norm, next_w, n_lo, n_hi, x16,
+    // rows, eps, stream) - the residual seam
+    int (*eg2a_rows)(void*, const void*, float, float, const void*, float, const void*, uint32_t,
+                     const void*, float, float, void*, uint32_t, float, void*);
+    // 816: eg2a_act (y, out, total, lo, hi, silu, lo2, hi2, stream) - clamp, SiLU, clamp, f16
+    int (*eg2a_act)(const void*, void*, uint64_t, float, float, uint32_t, float, float, void*);
+    // 817: eg2a_attn (qkv, rel, pds, out, rows, lims, q_scale, k_scale, cap, stream) - chunked local
+    // attention
+    int (*eg2a_attn)(const void*, const void*, const void*, void*, uint32_t, const float*, float,
+                     float, float, void*);
+    // 818: eg2a_conv (g, dw, nw, out, rows, g_lo, g_hi, n_lo, n_hi, eps, stream) - GLU + depthwise
+    // conv + norm + SiLU
+    int (*eg2a_conv)(const void*, const void*, const void*, void*, uint32_t, float, float, float,
+                     float, float, void*);
+    // 819: eg2a_out (y, bias, out, rows, n, eps, stream) - bias + weightless RMS norm, f16
+    int (*eg2a_out)(const void*, const void*, void*, uint32_t, uint32_t, float, void*);
 };
 
 } // extern "C"

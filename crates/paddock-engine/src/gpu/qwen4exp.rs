@@ -704,6 +704,12 @@ impl GpuExecutor {
         Ok(true)
     }
 
+    /// The W4A16 SwiGLU NVFP4 MoE pair (gate|up GEMV + the down that
+    /// accumulates) - the floor a SwiGLU NVFP4 MoE build serves on.
+    pub fn has_q4x_moe_gu_swiglu(&self) -> bool {
+        self.kernels.q4x_moe_gu_swiglu.is_some() && self.kernels.nvf4_moe_down_acc.is_some()
+    }
+
     pub fn q4x_moe_gu_swiglu(
         &self,
         gate: &Nvf4MoePlane,

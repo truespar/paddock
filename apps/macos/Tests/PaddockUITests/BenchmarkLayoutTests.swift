@@ -147,6 +147,7 @@ struct BenchmarkLayoutTests {
     let scroll = try #require(allViews(host.view).compactMap { $0 as? NSScrollView }.first)
     #expect((scroll.documentView?.frame.width ?? 0) <= width + 1)
     for control in allViews(host.view).filter({ $0 is NSControl }) {
+      guard !control.isHiddenOrHasHiddenAncestor, !control.bounds.isEmpty else { continue }
       let frame = control.convert(control.bounds, to: host.view)
       #expect(frame.minX >= -1 && frame.maxX <= width + 1, "Control overflow: \(frame)")
     }

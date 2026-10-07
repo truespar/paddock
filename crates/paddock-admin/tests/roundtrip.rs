@@ -27,6 +27,8 @@ fn test_router(port: u16) -> Router {
                     reader: None,
                     tabular: None,
                     diarization: None,
+                    segmenter: None,
+                    masker: None,
                     started_at_unix: 0,
                     instance_id: "itest-instance".into(),
                     capabilities: vec!["stats".into()],

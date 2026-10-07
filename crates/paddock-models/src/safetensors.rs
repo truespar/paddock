@@ -69,6 +69,17 @@ pub struct StTensor {
     pub end: usize,
 }
 
+/// Where a loader's tensors come from - a safetensors set, or a torch zip
+/// checkpoint (`torch_zip`), or a renaming view over either. Every one hands
+/// out the same zero-copy `(StTensor, &[u8])`, the bytes already validated.
+pub trait TensorSource: Send + Sync {
+    /// `name`'s descriptor and bytes, or None if absent.
+    fn tensor(&self, name: &str) -> Option<(&StTensor, &[u8])>;
+    fn tensor_names(&self) -> Vec<String>;
+    /// Mapped bytes behind it, for load budgeting.
+    fn mapped_len(&self) -> u64;
+}
+
 /// A memory-mapped safetensors file with its parsed tensor map.
 pub struct SafetensorsFile {
     map: memmap2::Mmap,
@@ -392,7 +403,21 @@ impl ShardedSafetensors {
     pub fn bytes(&self, name: &str) -> Option<(&StTensor, &[u8])> {
         self.shards[*self.index.get(name)?].bytes(name)
     }
+}
 
+impl TensorSource for ShardedSafetensors {
+    fn tensor(&self, name: &str) -> Option<(&StTensor, &[u8])> {
+        self.bytes(name)
+    }
+    fn tensor_names(&self) -> Vec<String> {
+        self.index.keys().cloned().collect()
+    }
+    fn mapped_len(&self) -> u64 {
+        self.total_len()
+    }
+}
+
+impl ShardedSafetensors {
     /// Hint how `ranges` (byte offset, length inside tensor `name`) are about
     /// to be read - see [`crate::mapped::MapAccess`]. Best effort; `None`
     /// only when the tensor is absent.

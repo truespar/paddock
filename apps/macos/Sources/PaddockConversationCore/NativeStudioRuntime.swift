@@ -21,6 +21,7 @@ public actor NativeStudioRuntime {
   var models: [O] = []
   var caps: [String: O] = [:]
   var history: [O] = []
+  var projectionCache = NativePresentationCache()
   var preferences: O = [:]
   var staged: [String: O] = [:]
   var artifacts: [V] = []
@@ -80,12 +81,17 @@ public actor NativeStudioRuntime {
     self.openPDF = openPDF
   }
   public func start() async throws {
+    try checkOpen()
     let settings = try await transport.api("api/settings")
+    try checkOpen()
     preferences = settings["macos_studio_preferences"]?.object ?? [:]
     history = try await transport.listConversations()
+    try checkOpen()
     try await refreshModels()
+    try checkOpen()
     try newDocument()
     await emit()
+    try checkOpen()
     polling = Task { [weak self] in
       while !Task.isCancelled {
         try? await Task.sleep(for: .seconds(5))
@@ -93,6 +99,14 @@ public actor NativeStudioRuntime {
         await self.poll()
       }
     }
+  }
+  private func checkOpen() throws {
+    try Task.checkCancellation()
+    guard !closed else { throw ConversationFailure.closed }
+  }
+  public func reclaimPresentationCaches() {
+    projectionCache = NativePresentationCache()
+    documentDisplay = NativeOCRDisplayCache()
   }
   func poll() async {
     guard !closed else { return }
@@ -191,8 +205,15 @@ public actor NativeStudioRuntime {
     publication = Task { [weak self] in
       try? await Task.sleep(for: .milliseconds(32))
       guard !Task.isCancelled, let self else { return }
-      await self.emit()
+      await self.emitScheduled()
     }
+  }
+  private func emitScheduled() async {
+    guard !Task.isCancelled else { return }
+    // The timer is now firing, not pending. emit() cancels pending timers;
+    // cancelling this task would also cancel the downstream actor decoder.
+    publication = nil
+    await emit()
   }
   func emit() async {
     publication?.cancel()

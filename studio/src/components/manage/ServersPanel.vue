@@ -19,7 +19,7 @@ import VendorLogo from '@/components/manage/VendorLogo.vue'
 import ReadinessNotice from '@/components/manage/ReadinessNotice.vue'
 import Dialog from '@/components/ui/Dialog.vue'
 import { useReadinessStore } from '@/stores/readiness'
-import { useModelsStore } from '@/stores/models'
+import { cloudVendor, useModelsStore } from '@/stores/models'
 
 const fleet = useFleetStore()
 // The manager's own version, to compare each runner's build.
@@ -161,7 +161,8 @@ function deployVendor(model: string): string | undefined {
   const m = model.toLowerCase()
   return reg.models.find((c) => c.id.toLowerCase() === m)?.vendor
     ?? reg.models.find((c) => m.includes(c.id.toLowerCase()))?.vendor
-    ?? undefined
+    // an uncatalogued model: the same id heuristic its live row will get
+    ?? cloudVendor(model)
 }
 const starting = ref<Record<number, boolean>>({})
 async function startStopped(c: { port: number; model: string | null; display?: string | null }): Promise<void> {

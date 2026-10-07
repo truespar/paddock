@@ -10,16 +10,17 @@ inline float dg_scalar_bf(float x) {
 // MLX's HD256/512 graph rounds QK and normalized probabilities to BF16.
 // Two bounded passes retain that contract without an O(context * canvas)
 // score allocation. Canvas rows share the same retained encoder window.
-template<uint HD,typename KV>
-inline void dg_attention(device float* q,device const KV* k,device const KV* v,
+template<uint HD,typename KV,bool Bidir=false,typename T=float,uint BM=16,uint KT=16,uint Panel=128>
+inline void dg_attention(device T* q,device const KV* k,device const KV* v,
     device const uint* meta,device const uint* pages,device float* out,device const uint* tiles,
     device const uint* limits,constant uint* p,uint2 g,uint tid,
-    threadgroup float* kv,threadgroup float* prob,threadgroup float* scores,
+    threadgroup T* kv,threadgroup T* prob,threadgroup float* scores,
     threadgroup float* highs,threadgroup float* sums) {
-    constexpr uint BM=16,KT=16,Panel=128;
+    constexpr uint G=128/BM;
     uint first=tiles[g.y*2],count=tiles[g.y*2+1],slot=meta[first*2],head=g.x,kh=head/(p[0]/p[1]),width=p[0]*HD;
     uint last=limits[first+count-1],firstpos=meta[first*2+1],low=p[3] && firstpos+1>p[3]?firstpos+1-p[3]:0;
     if(p[5]) low=p[3] && p[7+slot]>p[3]-1?p[7+slot]-(p[3]-1):0;
+    if constexpr(Bidir) {last=p[3]?min(last,meta[(first+count-1)*2+1]+p[3]):last;low=p[3] && firstpos>p[3]?firstpos-p[3]:0;}
     auto tq=tensor(q+ulong(first)*width+head*HD,dextents<int,2>(HD,count),array<int,2>{1,int(width)});
     auto tk=tensor(kv,extents<int,Panel,KT>(),array<int,2>{1,Panel});
     auto tv=tensor(kv,extents<int,KT,Panel>(),array<int,2>{1,KT});
@@ -38,21 +39,22 @@ inline void dg_attention(device float* q,device const KV* k,device const KV* v,
         auto acc=qk.template get_destination_cooperative_tensor<decltype(tq),decltype(tk),float>();
         for(uint i=0;i<acc.get_capacity();++i)acc[i]=0;
         for(uint panel=0;panel<HD/Panel;++panel){
-            for(uint i=tid;i<KT*Panel;i+=128){uint t=base+i/Panel,d=panel*Panel+i%Panel;kv[i]=t<=last?float(k[(ulong(gemma_physical(pages,slot,t,p))*p[1]+kh)*HD+d]):0;}
+            for(uint i=tid;i<KT*Panel;i+=128){uint t=base+i/Panel,d=panel*Panel+i%Panel;kv[i]=t<=last?T(k[(ulong(Bidir?slot+t:gemma_physical(pages,slot,t,p))*p[1]+kh)*HD+d]):T(0);}
             threadgroup_barrier(mem_flags::mem_threadgroup);auto query=tq.slice(panel*Panel,0);qk.run(query,tk,acc);threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         if(p[6])for(uint i=0;i<acc.get_capacity();++i)acc[i]=mlx_bf(acc[i]);acc.store(ts);threadgroup_barrier(mem_flags::mem_threadgroup);
-        uint row=tid/8,lane=tid%8,pos=row<count?meta[(first+row)*2+1]:0;
+        uint row=tid/G,lane=tid%G,pos=row<count?meta[(first+row)*2+1]:0;
         uint floor=p[5]?low:(p[3] && pos+1>p[3]?pos+1-p[3]:0),upper=row<count?limits[first+row]:0;
-        if(pass==0){float high=highs[row];for(uint j=lane;j<KT;j+=8)if(row<count && base+j>=floor && base+j<=upper)high=max(high,scores[row*KT+j]);
-            for(uint s=1;s<8;s*=2)high=max(high,simd_shuffle_xor(high,s));float sum=0;
-            for(uint j=lane;j<KT;j+=8)if(row<count && base+j>=floor && base+j<=upper)sum+=exp(scores[row*KT+j]-high);
-            for(uint s=1;s<8;s*=2)sum+=simd_shuffle_xor(sum,s);
+        if constexpr(Bidir){floor=p[3] && pos>p[3]?pos-p[3]:0;upper=p[3]?min(upper,pos+p[3]):upper;}
+        if(pass==0){float high=highs[row];for(uint j=lane;j<KT;j+=G)if(row<count && base+j>=floor && base+j<=upper)high=max(high,scores[row*KT+j]);
+            for(uint s=1;s<G;s*=2)high=max(high,simd_shuffle_xor(high,s));float sum=0;
+            for(uint j=lane;j<KT;j+=G)if(row<count && base+j>=floor && base+j<=upper)sum+=exp(scores[row*KT+j]-high);
+            for(uint s=1;s<G;s*=2)sum+=simd_shuffle_xor(sum,s);
             if(lane==0){sums[row]=sums[row]*(isfinite(highs[row])?exp(highs[row]-high):0)+sum;highs[row]=high;}
         }else{
-            for(uint j=lane;j<KT;j+=8){float value=row<count && base+j>=floor && base+j<=upper?exp(scores[row*KT+j]-highs[row])/sums[row]:0;prob[row*KT+j]=p[6]?mlx_bf(value):value;}
+            for(uint j=lane;j<KT;j+=G){float value=row<count && base+j>=floor && base+j<=upper?exp(scores[row*KT+j]-highs[row])/sums[row]:0;prob[row*KT+j]=T(p[6]?mlx_bf(value):value);}
             for(uint panel=0;panel<HD/Panel;++panel){
-                for(uint i=tid;i<KT*Panel;i+=128){uint t=base+i%KT,d=panel*Panel+i/KT;kv[i]=t<=last?float(v[(ulong(gemma_physical(pages,slot,t,p))*p[1]+kh)*HD+d]):0;}
+                for(uint i=tid;i<KT*Panel;i+=128){uint t=base+i%KT,d=panel*Panel+i/KT;kv[i]=t<=last?T(v[(ulong(Bidir?slot+t:gemma_physical(pages,slot,t,p))*p[1]+kh)*HD+d]):T(0);}
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if(panel==0)pv.run(tp,tv,a0);else if(panel==1)pv.run(tp,tv,a1);else if(panel==2)pv.run(tp,tv,a2);else pv.run(tp,tv,a3);
                 threadgroup_barrier(mem_flags::mem_threadgroup);

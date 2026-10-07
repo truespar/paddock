@@ -22,6 +22,8 @@ mod ternary_add_tests;
 #[cfg(test)]
 mod ternary_tests;
 use geometry::Geometry;
+#[cfg(test)]
+mod few_bench;
 mod load;
 mod lookup;
 #[cfg(test)]

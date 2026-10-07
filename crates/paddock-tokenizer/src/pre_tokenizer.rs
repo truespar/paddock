@@ -165,7 +165,9 @@ pub fn build(pre: &str) -> Result<PreTokenizerWrapper, TokenizerError> {
         // llama-vocab.cpp: gpt-4o, llama4, minimax-m2 share the GPT4O case)
         "gpt-4o" | "llama4" | "minimax-m2" => O200K,
         "qwen35" => QWEN35,
-        "qwen2" => QWEN2,
+        // Kolibri 1's tokenizer.json split regex is qwen2's verbatim
+        // (`\p{N}{1}` == `\p{N}`); its converter stamps pre="kolibri1"
+        "qwen2" | "kolibri1" => QWEN2,
         // granite 4.1 ships pre="dbrx"; llama.cpp routes dbrx to its llama3
         // case. smaug-bpe shares that case upstream but stays unlisted until a
         // model we serve declares it - an unknown pre must keep erroring.

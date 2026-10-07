@@ -1,7 +1,7 @@
 //! In-file MTP drafter for nemotron (C3) - the GGUF's blk.52
 //! nextn block, DeepSeek-style glue on the trunk: one combined transformer
 //! block `x0 = eh_proj(cat[enorm(embed(tok)), hnorm(h)])`, `x1 = x0 +
-//! attn(attn_norm(x0))` (NoPE, own dense KV), `x2 = x1 +
+//! attn(attn_norm(x0))` (NoPE, own KV as pool stripes), `x2 = x1 +
 //! moe(post_attention_norm(x1))` (the trunk MoE recipe), `h_out =
 //! shared_head_norm(x2)` into the TRUNK lm_head. vLLM's `nemotron_h_mtp.py`
 //! is the vendor reference (NVIDIA's own contributed code): the end norm is
@@ -12,10 +12,16 @@
 //! b9895): the MTP consumes pair `(token at pos i, target h at pos i-1)` at
 //! its own KV position i, `h` = the trunk's POST-final-norm hidden, with
 //! h_{-1} = zeros for row 0 of a fresh sequence. The chain state per slot is
-//! one vector (`pending_h` = h at the last covered position); a prefix-
-//! restore trim below the covered end zeroes it - the one resume row then
-//! pairs with zeros (defined, reproducible, same class as row 0) instead of
-//! a stale vector.
+//! one vector (`pending_h` = h at the last covered position); a prefix
+//! resume zeroes it - the one resume row then pairs with zeros (defined,
+//! reproducible, same class as row 0) instead of a stale vector.
+//!
+//! The block's K/V lives as POOL STRIPES addressed by the trunk's own block
+//! tables (DFlash's layout, dflash.rs): a page the radix hands back carries
+//! the drafter's rows with it, so a resumed prompt - every agent turn after
+//! the first - is drafter-warm through the adopted pages. The dense per-slot
+//! cache this replaced was cleared at admission and could not be re-adopted,
+//! so on a Claude Code session the MTP drafted for the first request only.
 //!
 //! Serving shape follows DFlash, not qwen35's spec_batch machinery: the
 //! block advances on every batched walk (prefill chunks, decode ticks,
@@ -66,13 +72,19 @@ pub(crate) struct MtpDrafter {
 
 /// Serving-time state (built at enable_batch when the MTP is active).
 pub(crate) struct MtpState {
-    /// dense per-slot KV for the single attention sub-layer,
-    /// [n_slots, max_ctx, kv_dim] f16 (DFlash's cache shape)
+    /// the single attention sub-layer's K/V as pool stripes [pool_blocks,
+    /// 16, kv_dim] f16, addressed by the trunk's block tables (see the
+    /// module doc)
     pub kv_k: CudaSlice<u8>,
     pub kv_v: CudaSlice<u8>,
-    /// per-slot contiguous coverage [start, end) - same discipline as
-    /// DFlash's feat
+    /// per-slot coverage [0, end) - the rows whose cells describe the slot's
+    /// current sequence (full attention: only a span from row 0 drafts)
     pub feat: Vec<(u32, u32)>,
+    /// per pool block: the pool generation under which coverage completed
+    /// the block's sixteen rows (0 = never) - DFlash's `page_gen`. A page is
+    /// drafter-valid for whoever adopts it iff this still equals the pool's
+    /// generation.
+    pub page_gen: Vec<u32>,
     /// per-slot h chain: the trunk h at the last covered position,
     /// [n_slots, embd] (zeros = fresh / post-trim)
     pub pending_h: CudaSlice<f32>,
@@ -97,6 +109,17 @@ impl GpuNemotron {
         self.mtp.is_some() && self.dflash.is_none()
     }
 
+    /// Bytes the block's stripes add to every pool block (its one layer's K
+    /// and V over 16 rows, f16) when the MTP is the active drafter - the pool
+    /// plan prices a block with them, as it does DFlash's.
+    pub(crate) fn mtp_stripe_bytes(&self, kv_dim: usize) -> usize {
+        if self.mtp_active() {
+            2 * 16 * kv_dim * 2
+        } else {
+            0
+        }
+    }
+
     /// Build the serving state - called from enable_batch so the walk hooks
     /// are live from the first pass.
     pub(crate) fn mtp_ensure_state(&mut self) -> Result<(), GpuModelError> {
@@ -114,11 +137,14 @@ impl GpuNemotron {
         if mtp.state.is_some() {
             return Ok(());
         }
-        let kv_bytes = n_slots * self.max_ctx * kv_dim * 2;
+        // the plan priced the stripes into every pool block (mtp_stripe_bytes)
+        let pool_blocks = self.batch.as_ref().expect("batch enabled").pool.capacity() as usize;
+        let kv_bytes = pool_blocks * 16 * kv_dim * 2;
         mtp.state = Some(MtpState {
             kv_k: e.alloc_u8(kv_bytes)?,
             kv_v: e.alloc_u8(kv_bytes)?,
             feat: vec![(0, 0); n_slots],
+            page_gen: vec![0; pool_blocks],
             pending_h: e.alloc(n_slots * hp.hidden)?, // alloc = zeroed
             d_h: e.alloc(band * hp.hidden)?,
             d_hin: e.alloc(band * hp.hidden)?,
@@ -147,27 +173,38 @@ impl GpuNemotron {
         Ok(())
     }
 
-    /// Prefix-restore trim: KV cells below `keep` still describe the same
-    /// tokens (coverage survives), but pending_h held h at the old end - the
-    /// chain can't be rebuilt from one vector, so it resets to zeros and the
-    /// single resume row pairs off-distribution once (drafter-quality-only;
-    /// the verify re-judges everything).
-    pub(crate) fn mtp_trim_slot(&mut self, slot: usize, keep: usize) -> Result<(), GpuModelError> {
-        let embd = self.hp.hidden;
-        let exec = self.exec.clone();
-        if let Some(st) = self.mtp.as_mut().and_then(|m| m.state.as_mut())
-            && slot < st.feat.len()
-        {
-            let (s, e) = st.feat[slot];
-            if s == 0 && e > keep as u32 {
-                st.feat[slot] = (0, keep as u32);
-                exec.copy_region(&st.d_zero, 0, &mut st.pending_h, slot * embd, embd)?;
-            } else if s > 0 {
-                st.feat[slot] = (0, 0);
-                exec.copy_region(&st.d_zero, 0, &mut st.pending_h, slot * embd, embd)?;
-            }
+    /// A slot's new sequence resumes at `pos` from the prefix cache over the
+    /// pages the radix just shared into its table (admission already cleared
+    /// the coverage and the chain): coverage is [0, pos) iff every adopted
+    /// page up to `pos` is one a span completed and the pool has not
+    /// re-issued since (`page_gen`) - the whole resume for any page this
+    /// server walked, in whichever slot. Anything short of that stays cold:
+    /// the block attends from row 0, so a hole anywhere is a cold drafter.
+    /// pending_h stays zero - the h at pos-1 is not kept - so the one resume
+    /// row pairs off-distribution once (drafter quality only; the verify
+    /// re-judges everything).
+    pub(crate) fn mtp_adopt_slot(&mut self, slot: usize, pos: usize) {
+        let Some(bs) = self.batch.as_ref() else {
+            return;
+        };
+        let Some(st) = self.mtp.as_mut().and_then(|m| m.state.as_mut()) else {
+            return;
+        };
+        if slot >= st.feat.len() || pos == 0 || !pos.is_multiple_of(16) {
+            return;
         }
-        Ok(())
+        let blocks = bs.tables[slot].blocks();
+        let full = pos / 16;
+        if full > blocks.len() {
+            return;
+        }
+        let live = blocks[..full].iter().all(|&b| {
+            let g = st.page_gen[b as usize];
+            g != 0 && g == bs.pool.generation(b)
+        });
+        if live {
+            st.feat[slot] = (0, pos as u32);
+        }
     }
 
     /// Coverage-warm: the block consumed exactly [0, pos).
@@ -181,7 +218,8 @@ impl GpuNemotron {
     /// Advance one slot after an append: extend coverage to `end` and move
     /// pending_h to the h of pass row `h_row` - GUARDED on actually
     /// extending, so a re-walked stale row (hole-row class) can never
-    /// regress the chain.
+    /// regress the chain. Every page the extension completed is stamped
+    /// with its pool generation (`page_gen`).
     pub(crate) fn mtp_advance(
         &mut self,
         slot: usize,
@@ -198,6 +236,14 @@ impl GpuNemotron {
             if s == 0 && start <= e as usize && end as u32 > e {
                 st.feat[slot] = (0, end as u32);
                 exec.copy_region(&st.d_h, h_row * embd, &mut st.pending_h, slot * embd, embd)?;
+                if let Some(bs) = self.batch.as_ref() {
+                    let blocks = bs.tables[slot].blocks();
+                    let done = (end / 16).min(blocks.len());
+                    let from = (e as usize / 16).min(done);
+                    for &b in &blocks[from..done] {
+                        st.page_gen[b as usize] = bs.pool.generation(b);
+                    }
+                }
             }
         }
         Ok(())
@@ -271,8 +317,10 @@ impl GpuNemotron {
 
     /// One MTP block pass over rows 0..r: inputs are sc.d_tok/d_pos/d_slots
     /// (already staged) + st.d_hin. Reuses the batch scratch except the
-    /// residual (st.d_mx). `head_out` additionally produces the
-    /// post-shared_head_norm row 0 into st.d_hd (the draft chain).
+    /// residual (st.d_mx). `head_out` = a draft pass: the whole block, plus
+    /// the post-shared_head_norm row 0 into st.d_hd (the draft chain).
+    /// Without it the pass is an append and stops once the rows' K/V cells
+    /// are written (see the note at the q/k/v projections).
     fn mtp_block_rows(&mut self, r: usize, head_out: bool) -> Result<(), GpuModelError> {
         let exec = self.exec.clone();
         let hp = self.hp.clone();
@@ -280,13 +328,15 @@ impl GpuNemotron {
         let q_dim = hp.n_heads * hp.head_dim;
         let kv_dim = hp.n_kv_heads * hp.head_dim;
         let scale = 1.0 / (hp.head_dim as f32).sqrt();
-        let max_ctx = self.max_ctx;
         let dec1 = r == 1;
         let tok_embd = &self.tok_embd;
         let mtp = self.mtp.as_mut().expect("mtp weights");
         let m = &mtp.w;
         let st = mtp.state.as_mut().expect("mtp state");
         let bs = self.batch.as_mut().expect("batch enabled");
+        // the trunk's block tables address the stripes (pages back every row
+        // a walk or a draft touches - see mtp_draft)
+        let (bt, bps) = (&bs.d_bt, bs.bps);
         let sc = &mut bs.sc;
 
         // x0 = eh_proj(cat[enorm(embed(tok)), hnorm(h)]) - e first. The
@@ -346,25 +396,39 @@ impl GpuNemotron {
         let AttnWeights::Qw { wq, wk, wv, wo } = &m.attn else {
             unreachable!("in-file MTP is the GGUF lane (Qw planes)");
         };
+        // An append pass (head_out false: prefill chunks, decode ticks,
+        // verify commits) only has to leave this position's K/V behind - a
+        // cell is k/v(attn_norm(x0)), and x0 pairs the token with the TRUNK's
+        // h, never with this block's own output. So the pass stops at the
+        // append: no q, no attention, no wo, no MoE. Before, every prompt row
+        // ran all of it and threw the result away, and the attention was the
+        // one-row decode kernel - each row of a resumed chunk scanned its
+        // whole prefix, so an 11.7K-token append at 130K depth spent ~65 s
+        // here (GB10, Claude Code replay; the trunk's own chunk took ~9 s).
+        // The K/V bytes are unchanged, so drafts are bit-identical.
         if dec1 {
-            gemv_any(&exec, wq, &sc.d_xn, &mut sc.d_q)?;
+            if head_out {
+                gemv_any(&exec, wq, &sc.d_xn, &mut sc.d_q)?;
+            }
             gemv_any(&exec, wk, &sc.d_xn, &mut sc.d_k)?;
             gemv_any(&exec, wv, &sc.d_xn, &mut sc.d_v)?;
         } else {
             let s8 = sc.q8.as_mut().expect("q8 batch scratch");
             prefill_quant(&exec, &mut s8.xq, &mut s8.xs, &mut s8.yq, &sc.d_xn, embd, r)?;
-            prefill_mm_pre_any(
-                &exec,
-                wq,
-                &s8.xq,
-                &s8.xs,
-                &s8.yq,
-                &mut s8.xsums,
-                &mut s8.ssums,
-                &mut s8.skfix,
-                &mut sc.d_q,
-                r,
-            )?;
+            if head_out {
+                prefill_mm_pre_any(
+                    &exec,
+                    wq,
+                    &s8.xq,
+                    &s8.xs,
+                    &s8.yq,
+                    &mut s8.xsums,
+                    &mut s8.ssums,
+                    &mut s8.skfix,
+                    &mut sc.d_q,
+                    r,
+                )?;
+            }
             prefill_mm_pre_any(
                 &exec,
                 wk,
@@ -390,44 +454,100 @@ impl GpuNemotron {
                 r,
             )?;
         }
-        exec.kv_append_batch(
+        exec.kv_append_batch_paged(
             &sc.d_k,
             &mut st.kv_k,
             &sc.d_pos,
             Some(&sc.d_slots),
+            bt,
+            bps,
             kv_dim,
-            max_ctx,
             r,
             KvDtype::Fp16,
         )?;
-        exec.kv_append_batch(
+        exec.kv_append_batch_paged(
             &sc.d_v,
             &mut st.kv_v,
             &sc.d_pos,
             Some(&sc.d_slots),
+            bt,
+            bps,
             kv_dim,
-            max_ctx,
             r,
             KvDtype::Fp16,
         )?;
-        exec.attn_decode_batch(
-            &sc.d_q,
-            &st.kv_k,
-            &st.kv_v,
-            &sc.d_sinks,
-            &mut sc.d_attn,
-            &sc.d_pos,
-            Some(&sc.d_slots),
+        if !head_out {
+            return Ok(());
+        }
+        // The draft row attends as a trunk decode row does (walk.rs): the
+        // split head-packed partial + combine over the stripes. The dense
+        // cache this replaced rode the unsplit decode kernel - 32 CTAs (one
+        // per q head) each walking the whole context with the group's KV
+        // re-read 16 times, the drafter's share of the GGUF lane's
+        // decode-vs-depth slide, paid k times a round.
+        // PADDOCK_NO_MTP_ATTN_SPLIT pins the unsplit walk for the A/B.
+        let (hp16, ns) = super::batch::attn_split_election(
             hp.n_heads,
             hp.n_kv_heads,
             hp.head_dim,
-            max_ctx,
-            kv_dim,
-            0,
+            exec.sm_count(),
             r,
-            scale,
-            KvDtype::Fp16,
-        )?;
+        );
+        if (ns > 1 || hp16)
+            && exec.has_attn_partial_batch_paged()
+            && paddock_models::dev_var_os!("PADDOCK_NO_MTP_ATTN_SPLIT").is_none()
+        {
+            exec.attn_partial_batch_paged(
+                &sc.d_q,
+                &st.kv_k,
+                &st.kv_v,
+                &mut sc.attn_o,
+                &mut sc.attn_ml,
+                &sc.d_pos,
+                Some(&sc.d_slots),
+                bt,
+                bps,
+                hp.n_heads,
+                hp.n_kv_heads,
+                hp.head_dim,
+                kv_dim,
+                0,
+                ns,
+                r,
+                scale,
+                KvDtype::Fp16,
+            )?;
+            exec.attn_combine_batch(
+                &sc.attn_o,
+                &sc.attn_ml,
+                &sc.d_sinks,
+                &mut sc.d_attn,
+                hp.n_heads,
+                hp.head_dim,
+                ns,
+                r,
+            )?;
+        } else {
+            exec.attn_decode_batch_paged(
+                &sc.d_q,
+                &st.kv_k,
+                &st.kv_v,
+                &sc.d_sinks,
+                &mut sc.d_attn,
+                &sc.d_pos,
+                Some(&sc.d_slots),
+                bt,
+                bps,
+                hp.n_heads,
+                hp.n_kv_heads,
+                hp.head_dim,
+                kv_dim,
+                0,
+                r,
+                scale,
+                KvDtype::Fp16,
+            )?;
+        }
         if dec1 {
             gemv_any(&exec, wo, &sc.d_attn, &mut sc.d_proj)?;
         } else {
@@ -606,6 +726,19 @@ impl GpuNemotron {
         k: usize,
     ) -> Result<Vec<u32>, GpuModelError> {
         assert!((1..=MTP_MAX_DRAFT).contains(&k));
+        // the chain writes its cells at pos..pos+k into the slot's pages
+        // before attending, so back them first - the verify round would back
+        // the same rows a moment later. A dry pool drafts nothing rather than
+        // failing the round.
+        let k = k.min(self.max_ctx.saturating_sub(pos));
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        match self.ensure_rows(&[slot as u32], &[(pos + k - 1) as u32]) {
+            Ok(()) => {}
+            Err(GpuModelError::PoolExhausted) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        }
         let exec = self.exec.clone();
         let (embd, vocab) = (self.hp.hidden, self.hp.vocab);
         let drv = |e: cudarc::driver::DriverError| crate::gpu::from_driver(e);

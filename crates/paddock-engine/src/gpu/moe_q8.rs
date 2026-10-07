@@ -1598,6 +1598,54 @@ impl GpuExecutor {
         })
     }
 
+    /// Single-plane relu(up)^2 twin of `q8_0_moe_gate_up_mma` (slot 743,
+    /// nemotron_h_moe): fq/fs straight from the int8 MMA, bitwise vs
+    /// `q8_0_moe_up_relu2_sorted` + `quantize_q8`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn q8_0_moe_up_relu2_mma(
+        &self,
+        up: &RepackedQ8,
+        sorted_row: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<f32>,
+        fq: &mut CudaSlice<i8>,
+        fs: &mut CudaSlice<f32>,
+        max_blocks: usize,
+        bm: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .q8_0_moe_up_relu2_mma
+            .ok_or(GpuError::MissingOp("q8_0_moe_up_relu2_mma"))?;
+        let (in_dim, ff) = (up.dims[0], up.dims[1]);
+        let (ud, _g1) = up.data.device_ptr(&self.stream);
+        let (us, _g2) = up.scale.device_ptr(&self.stream);
+        let (rp, _g3) = sorted_row.device_ptr(&self.stream);
+        let (bp, _g4) = block_expert.device_ptr(&self.stream);
+        let (xp, _g5) = xq.device_ptr(&self.stream);
+        let (sp, _g6) = xs.device_ptr(&self.stream);
+        let (qp, _g7) = fq.device_ptr_mut(&self.stream);
+        let (fp, _g8) = fs.device_ptr_mut(&self.stream);
+        check(unsafe {
+            f(
+                ud as *const _,
+                us as *const _,
+                rp as *const _,
+                bp as *const _,
+                xp as *const _,
+                sp as *const _,
+                qp as *mut _,
+                fp as *mut _,
+                in_dim as u32,
+                ff as u32,
+                max_blocks as u32,
+                bm as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// GEGLU twin of `q8_0_moe_gate_up_mma` (gemma4-A4B sorted expert class).
     #[allow(clippy::too_many_arguments)]
     pub fn q8_0_moe_gate_up_mma_geglu(
@@ -1968,6 +2016,12 @@ impl GpuExecutor {
     pub fn has_q8_moe_qmma2(&self) -> bool {
         self.kernels.q8_0_moe_gate_up_mma2_geglu.is_some()
             && self.kernels.q8_0_moe_down_mma2.is_some()
+    }
+
+    /// True when the pack carries nemotron's int8-MMA sorted MoE pair: the
+    /// relu^2 up twin (slot 743) and the shared mma down.
+    pub fn has_q8_moe_relu2_mma(&self) -> bool {
+        self.kernels.q8_0_moe_up_relu2_mma.is_some() && self.kernels.q8_0_moe_down_mma.is_some()
     }
 
     /// True when the pack carries the gemma4 sorted MoE class (geglu mma

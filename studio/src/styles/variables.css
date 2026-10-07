@@ -55,6 +55,11 @@
      desktop screens - matches Traverse's 960px panel standard. The chat column
      keeps its own reading width, below. */
   --pk-panel-width: 960px;
+  /* The history pages (Reads, Tables, Masks) widen to this once their pane
+     is 1100px wide - all three by the same rule, so moving between them
+     never moves the page's edges. */
+  --pk-panel-width-wide: 1400px;
+  --pk-panel-wide-from: 1100px;
   /* The chat column: thread, composer and any notice inside the composer, all
      of which must agree or the composer stands proud of the messages above it
      A TOKEN for exactly that reason - it

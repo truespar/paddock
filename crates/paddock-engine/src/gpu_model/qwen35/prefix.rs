@@ -1422,7 +1422,7 @@ impl GpuQwen35 {
                         // reads bf16 - else the f32 chain below.
                         static O16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                         let o16 = *O16.get_or_init(|| {
-                            paddock_models::dev_var_os!("PADDOCK_NO_F8W8_TMA").is_none()
+                            std::env::var_os("PADDOCK_NO_F8W8_TMA").is_none()
                                 && paddock_models::dev_var_os!("PADDOCK_NO_O16").is_none()
                         });
                         if o16 && exec.has_f8_o16() {
@@ -2110,7 +2110,7 @@ impl GpuQwen35 {
                         // entry (ABI-247 consumer) reads it back
                         static MO16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                         let mo16 = *MO16.get_or_init(|| {
-                            paddock_models::dev_var_os!("PADDOCK_NO_F8W8_TMA").is_none()
+                            std::env::var_os("PADDOCK_NO_F8W8_TMA").is_none()
                                 && paddock_models::dev_var_os!("PADDOCK_NO_O16").is_none()
                         });
                         if mo16 && exec.has_f8_o16() {
@@ -2417,7 +2417,7 @@ impl GpuQwen35 {
                         }
                         static MO16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                         let mo16 = *MO16.get_or_init(|| {
-                            paddock_models::dev_var_os!("PADDOCK_NO_F8W8_TMA").is_none()
+                            std::env::var_os("PADDOCK_NO_F8W8_TMA").is_none()
                                 && paddock_models::dev_var_os!("PADDOCK_NO_O16").is_none()
                         });
                         if mo16 && exec.has_f8_o16() {
@@ -2566,7 +2566,7 @@ impl GpuQwen35 {
                         // reads bf16 - else the f32 chain below.
                         static O16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                         let o16 = *O16.get_or_init(|| {
-                            paddock_models::dev_var_os!("PADDOCK_NO_F8W8_TMA").is_none()
+                            std::env::var_os("PADDOCK_NO_F8W8_TMA").is_none()
                                 && paddock_models::dev_var_os!("PADDOCK_NO_O16").is_none()
                         });
                         if o16 && exec.has_f8_o16() {

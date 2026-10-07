@@ -390,6 +390,127 @@ impl GpuExecutor {
             && self.kernels.mamba2_scan_step_batch_f16.is_some()
     }
 
+    /// True when the pack carries the snapshot-free verify walk and its
+    /// replay (slots 746-747) - the f16 state class's rollback by replay.
+    pub fn has_mamba2_rescan(&self) -> bool {
+        self.kernels.mamba2_scan_seq_keep_f16.is_some() && self.kernels.mamba2_rescan_f16.is_some()
+    }
+
+    /// Slot 746: the verify walk without per-row snapshots. `state` is read
+    /// only (it stays the pre-round state); y as
+    /// [`Self::mamba2_scan_seq_snap_at_f16`]'s; each row's x | B | raw dt
+    /// lands in `keep` at `keep_off` (rows of [`mamba2_keep_row`] f32) for
+    /// [`Self::mamba2_rescan_upload`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn mamba2_scan_seq_keep_at_f16(
+        &self,
+        state: &CudaSlice<f16>,
+        state_off: usize,
+        xbc: &CudaSlice<f32>,
+        xbc_off: usize,
+        dt: &CudaSlice<f32>,
+        dt_off: usize,
+        dt_stride: usize,
+        a: &CudaSlice<f32>,
+        d: &CudaSlice<f32>,
+        dt_bias: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        y_off: usize,
+        keep: &mut CudaSlice<f32>,
+        keep_off: usize,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        d_state: usize,
+        n_groups: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .mamba2_scan_seq_keep_f16
+            .ok_or(GpuError::MissingOp("mamba2_scan_seq_keep_f16"))?;
+        debug_assert!(state.len() >= state_off + n_heads * head_dim * d_state);
+        debug_assert!(
+            keep.len()
+                >= keep_off + n_tokens * mamba2_keep_row(n_heads, head_dim, d_state, n_groups)
+        );
+        let (sp, _g1) = state.device_ptr(&self.stream);
+        let (xp, _g2) = xbc.device_ptr(&self.stream);
+        let (tp, _g3) = dt.device_ptr(&self.stream);
+        let (ap, _g4) = a.device_ptr(&self.stream);
+        let (dp, _g5) = d.device_ptr(&self.stream);
+        let (bp, _g6) = dt_bias.device_ptr(&self.stream);
+        let (yp, _g7) = y.device_ptr_mut(&self.stream);
+        let (kp, _g8) = keep.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract; offsets are element counts (f16 2 bytes, f32 4).
+        check(unsafe {
+            f(
+                (sp + (state_off * 2) as u64) as *const _,
+                (xp + (xbc_off * 4) as u64) as *const _,
+                (tp + (dt_off * 4) as u64) as *const _,
+                dt_stride as u32,
+                ap as *const _,
+                dp as *const _,
+                bp as *const _,
+                (yp + (y_off * 4) as u64) as *mut _,
+                (kp + (keep_off * 4) as u64) as *mut _,
+                n_tokens as u32,
+                n_heads as u32,
+                head_dim as u32,
+                d_state as u32,
+                n_groups as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// Slot 747: upload `descs` (six words a replay: src f16 state, dst f16
+    /// state, keep rows, A, dt_bias, rows - device addresses) into `scratch`
+    /// and replay them all in one launch. Stream-ordered, so `scratch` may be
+    /// reused by the next call.
+    pub fn mamba2_rescan_upload(
+        &self,
+        scratch: &mut CudaSlice<u64>,
+        descs: &[u64],
+        n_heads: usize,
+        head_dim: usize,
+        d_state: usize,
+        n_groups: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .mamba2_rescan_f16
+            .ok_or(GpuError::MissingOp("mamba2_rescan_f16"))?;
+        let n = descs.len();
+        if n == 0 {
+            return Ok(());
+        }
+        if n > scratch.len() || !n.is_multiple_of(6) {
+            return Err(GpuError::Driver(format!(
+                "rescan needs {n} descriptor words, scratch holds {}",
+                scratch.len()
+            )));
+        }
+        {
+            let mut v = scratch.slice_mut(0..n);
+            self.stream
+                .memcpy_htod(descs, &mut v)
+                .map_err(|e| GpuError::Driver(e.to_string()))?;
+        }
+        let (dp, _g) = scratch.device_ptr(&self.stream);
+        // SAFETY: ABI contract; the descriptors' pointers are live by the caller.
+        check(unsafe {
+            f(
+                dp as *const _,
+                (n / 6) as u32,
+                n_heads as u32,
+                head_dim as u32,
+                d_state as u32,
+                n_groups as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// True when the nemotron bulk-prefill kernel set is loadable: the span
     /// conv plus the batched consumers the chunked path rides (W8A8 f8row
     /// GEMM + activation quantizer, the tiled scalar prefill attention -
@@ -919,4 +1040,10 @@ impl GpuExecutor {
         let scale: CudaSlice<f32> = self.stream.clone_htod(row_scales).map_err(drv)?;
         Ok(F8RowPlane { data, scale })
     }
+}
+
+/// f32 elements of one kept verify row (slot 746): x (H*hd) | B (G*S) | raw
+/// dt (H).
+pub fn mamba2_keep_row(n_heads: usize, head_dim: usize, d_state: usize, n_groups: usize) -> usize {
+    n_heads * head_dim + n_groups * d_state + n_heads
 }

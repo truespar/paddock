@@ -14,6 +14,8 @@ use serde_json::{Value, json};
 
 use crate::routes::AppState;
 
+#[path = "api_mask_history.rs"]
+mod mask_history;
 #[path = "api_table_history.rs"]
 mod table_history;
 
@@ -32,6 +34,7 @@ fn errx(status: StatusCode, kind: &str, msg: impl std::fmt::Display) -> Response
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .merge(table_history::routes())
+        .merge(mask_history::routes())
         .route("/api/conversations", get(list_conversations))
         .route(
             "/api/conversations/{id}",
@@ -66,6 +69,12 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route("/api/settings", get(get_settings).put(put_settings))
         .route("/api/settings/import", put(import_settings))
+        // the Hugging Face token gated downloads carry (registry/gated.rs) -
+        // its own surface: written here, never read back out
+        .route(
+            "/api/huggingface/token",
+            get(get_hf_token).put(put_hf_token).delete(delete_hf_token),
+        )
         .route("/api/export", get(export_db))
         .route(
             "/api/attachments/{id}",
@@ -388,6 +397,97 @@ async fn import_settings(State(s): State<Arc<AppState>>, Json(obj): Json<Value>)
         return prompt_error(e);
     }
     get_settings(State(s)).await
+}
+
+// ── the Hugging Face token ───────────────────────────────────────────────────
+
+/// What the Settings card shows: whether a token is in reach and where it
+/// came from. The token itself never leaves the manager.
+fn hf_token_status(s: &AppState) -> Value {
+    match crate::registry::huggingface_token(Some(&s.db)) {
+        Some((_, source)) => json!({ "configured": true, "source": source }),
+        None => json!({ "configured": false, "source": null }),
+    }
+}
+
+async fn get_hf_token(State(s): State<Arc<AppState>>) -> Response {
+    Json(hf_token_status(&s)).into_response()
+}
+
+/// Ask Hugging Face who a token belongs to. `Ok(None)` = it refused the
+/// token; `Err` = no answer (offline), which does not block saving.
+async fn hf_whoami(token: &str) -> Result<Option<String>, String> {
+    let resp = reqwest::Client::new()
+        .get("https://huggingface.co/api/whoami-v2")
+        .bearer_auth(token)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| e.without_url().to_string())?;
+    if matches!(resp.status().as_u16(), 401 | 403) {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(format!("status {}", resp.status().as_u16()));
+    }
+    let body: Value = resp.json().await.map_err(|e| e.without_url().to_string())?;
+    Ok(Some(
+        body.get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+    ))
+}
+
+/// Save a token. Hugging Face is asked who it belongs to first: a token it
+/// refuses is not saved; no answer at all (offline) saves it unverified.
+async fn put_hf_token(State(s): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
+    let token = body
+        .get("token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if !crate::registry::valid_token(token) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody::new(
+                "invalid_request_error",
+                "that is not a Hugging Face token - copy one from huggingface.co/settings/tokens",
+            )),
+        )
+            .into_response();
+    }
+    let user = match hf_whoami(token).await {
+        Ok(Some(user)) => Some(user),
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody::new(
+                    "invalid_request_error",
+                    "Hugging Face does not accept this token - create a new one at \
+                     huggingface.co/settings/tokens",
+                )),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not reach Hugging Face to check the token; saving it unverified");
+            None
+        }
+    };
+    if let Err(e) = s.db.set_huggingface_token(Some(token)) {
+        return err500(e);
+    }
+    let mut out = hf_token_status(&s);
+    out["user"] = user.map_or(Value::Null, Value::String);
+    Json(out).into_response()
+}
+
+async fn delete_hf_token(State(s): State<Arc<AppState>>) -> Response {
+    if let Err(e) = s.db.set_huggingface_token(None) {
+        return err500(e);
+    }
+    Json(hf_token_status(&s)).into_response()
 }
 
 // NOTE: there is deliberately no web-search or MCP section here.
@@ -816,6 +916,12 @@ pub(crate) fn sanitize_export_file(path: &std::path::Path) -> Result<(), String>
         .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM settings WHERE key = 'web_search'", [])
         .map_err(|e| e.to_string())?;
+    // saved credentials (the Hugging Face token) - never shared
+    conn.execute(
+        "DELETE FROM settings WHERE key LIKE ?1",
+        rusqlite::params![format!("{}%", crate::store::SECRET_PREFIX)],
+    )
+    .map_err(|e| e.to_string())?;
     // Mandatory: a failed compaction must not export deleted credential bytes.
     conn.execute_batch("VACUUM").map_err(|e| e.to_string())?;
     Ok(())

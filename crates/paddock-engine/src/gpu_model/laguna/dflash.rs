@@ -258,6 +258,14 @@ impl GpuLaguna {
     /// splits the fused qkv and the fusion fc at load. Serving behavior is
     /// unchanged until the spec-round integration (stage C) consumes it.
     pub fn attach_dflash(&mut self, path: &Path) -> Result<(), GpuModelError> {
+        // the drafter's layers are laguna's (gated attention, no sandwich
+        // norms); no Kolibri drafter ships in that class
+        if self.hp.flavor != super::Flavor::Laguna {
+            return Err(GpuModelError::Unsupported(format!(
+                "{}: no DFlash drafter class for this family",
+                self.hp.flavor.name()
+            )));
+        }
         let dir = if path.is_dir() {
             path
         } else {
@@ -1266,7 +1274,14 @@ impl GpuLaguna {
         // levers must not add working
         // set; the remaining door is a fused band-GEMV+argmax (drafts
         // need argmax only, never the logit plane).
-        match &self.lm_head {
+        // the drafter attaches to GGUF laguna only (attach_dflash refuses
+        // the other builds), so the head is a quantized plane here
+        let Head::Quant(lm) = &self.lm_head else {
+            return Err(GpuModelError::Unsupported(
+                "dflash: a BF16 head has no drafter".into(),
+            ));
+        };
+        match lm {
             QuantW::Kq(k) => mmq_kq_pre(
                 &exec,
                 k,

@@ -152,9 +152,14 @@ fn mlx_copy_and_neural_sources_preserve_committed_state() {
             .spec_draft_batch(&[(0, 54321)], lookup::MAX_DRAFT)
             .unwrap()
             .unwrap();
-        assert_eq!(neural[0].len(), 1);
-        let raw = model.dflash_draft(&[(0, 54321)], 1).unwrap().unwrap();
-        assert_eq!(neural[0], raw[0][..1]);
+        let cap = if model.device.tensor_accelerated() {
+            3
+        } else {
+            1
+        };
+        assert_eq!(neural[0].len(), cap);
+        let raw = model.dflash_draft(&[(0, 54321)], cap).unwrap().unwrap();
+        assert_eq!(neural[0], raw[0][..cap]);
         let continuation = model.forward(54321).unwrap();
         let committed = [prompt.as_slice(), &sequence[..accepted]].concat();
         fresh(&mut model, 0, &prompt);
@@ -644,6 +649,16 @@ fn mlx_dflash_verification_matches_decode_at_every_rejection_boundary() {
 }
 
 #[test]
+#[ignore = "requires PADDOCK_METAL_MLX_MODEL and PADDOCK_METAL_DFLASH_MODEL; packed candidate rollback gate"]
+fn mlx_packed_dflash_verification_matches_decode_at_every_rejection_boundary() {
+    crate::affine::BASELINE_PACKED_FOR_TEST.with(|v| v.set(false));
+    let path = std::env::var("PADDOCK_METAL_MLX_MODEL").unwrap();
+    let draft = std::env::var("PADDOCK_METAL_DFLASH_MODEL").unwrap();
+    verification_boundaries(&path, &draft, false);
+    crate::affine::BASELINE_PACKED_FOR_TEST.with(|v| v.set(false));
+}
+
+#[test]
 #[ignore = "requires PADDOCK_SPLASH_MODEL; real packed target/draft GPU transactions"]
 fn splash_verification_matches_decode_at_every_rejection_boundary() {
     let path = std::env::var("PADDOCK_SPLASH_MODEL").unwrap();
@@ -831,9 +846,15 @@ fn verification_boundaries(path: &str, draft: &str, splash: bool) {
         let trained = model.dflash_draft(&[(0, 2000)], 1).unwrap().unwrap();
         assert_eq!(
             trained[0].len(),
-            7,
-            "short verification must not shorten the noncausal draft window"
+            if !splash && model.device.tensor_accelerated() {
+                1
+            } else {
+                7
+            }
         );
+        // The hidden-state window remains eight positions even when the
+        // head/selector emits only a prefix; dflash's direct test checks its
+        // hidden states and vocabulary logits against the full-window path.
         assert_eq!(proposals[0].len(), if splash { 7 } else { 1 });
         assert_eq!(proposals[0], trained[0][..proposals[0].len()]);
     }

@@ -48,21 +48,32 @@ const options = computed<SelectOption[]>(() =>
 // functional truth - the vocab either carries the yes/no judge tokens or it
 // doesn't). null = capability not known yet.
 const mode = ref<'rerank' | 'embed' | null>(null)
+// What an item may carry beside text (`embedder_inputs`: EmbeddingGemma 2's
+// towers, as the endpoint built them). Pictures and clips are offered only
+// when the endpoint takes them.
+const inputs = ref<string[]>(['text'])
 watch(
   port,
   async (p) => {
     mode.value = null
+    inputs.value = ['text']
+    media.value = []
     if (!p) return
     try {
       const r = await fetch(`/api/runners/${p}/server`)
-      const j = r.ok ? ((await r.json()) as { reranker?: boolean | null }) : null
+      const j = r.ok
+        ? ((await r.json()) as { reranker?: boolean | null; embedder_inputs?: string[] | null })
+        : null
       mode.value = j?.reranker ? 'rerank' : 'embed'
+      inputs.value = j?.embedder_inputs ?? ['text']
     } catch {
       mode.value = 'embed' // embeddings is the capability every encoder has
     }
   },
   { immediate: true },
 )
+const takesImages = computed(() => inputs.value.includes('image'))
+const takesAudio = computed(() => inputs.value.includes('audio'))
 const title = computed(() =>
   mode.value === 'rerank' ? 'Rerank' : mode.value === 'embed' ? 'Embeddings' : 'Embeddings & rerank',
 )
@@ -79,6 +90,51 @@ const query = ref('')
 const docsText = ref('')
 const embedText = ref('')
 
+/** A picture or clip the user added, embedded as its own item beside the
+ *  text lines - so every pair, text to picture included, is compared. */
+interface MediaItem {
+  kind: 'image' | 'audio'
+  name: string
+  /** the file as a data: URL (a picture's preview, a clip's bytes) */
+  url: string
+}
+const media = ref<MediaItem[]>([])
+const fileInput = ref<HTMLInputElement | null>(null)
+const pickKind = ref<'image' | 'audio'>('image')
+function pick(kind: 'image' | 'audio'): void {
+  pickKind.value = kind
+  if (fileInput.value) {
+    fileInput.value.accept = kind === 'image' ? 'image/*' : 'audio/*'
+    fileInput.value.value = ''
+    fileInput.value.click()
+  }
+}
+function onFiles(e: Event): void {
+  const files = (e.target as HTMLInputElement).files
+  if (!files) return
+  const kind = pickKind.value
+  for (const f of Array.from(files)) {
+    const reader = new FileReader()
+    reader.onload = () => {
+      if (typeof reader.result === 'string')
+        media.value = [...media.value, { kind, name: f.name, url: reader.result }]
+    }
+    reader.readAsDataURL(f)
+  }
+}
+function removeMedia(i: number): void {
+  media.value = media.value.filter((_, j) => j !== i)
+}
+/** The /v1/embeddings item for a picture or clip: the chat content-part
+ *  shape. A clip rides `input_audio` (base64 + the file's extension; the
+ *  server reads the container from the bytes). */
+function mediaItem(m: MediaItem): unknown {
+  if (m.kind === 'image') return { content: [{ type: 'image_url', image_url: { url: m.url } }] }
+  const data = m.url.slice(m.url.indexOf(',') + 1)
+  const format = m.name.includes('.') ? m.name.split('.').pop()!.toLowerCase() : 'wav'
+  return { content: [{ type: 'input_audio', input_audio: { data, format } }] }
+}
+
 interface RankedDoc {
   index: number
   relevance_score: number
@@ -88,7 +144,14 @@ interface RankedDoc {
 // no ranking (the score is the result), one embedded text has no pair (the
 // vector is the result). The tables start meaning something at n >= 2.
 const ranked = ref<RankedDoc[] | null>(null)
-const embedded = ref<{ texts: string[]; vectors: number[][]; dims: number } | null>(null)
+/** `texts` labels every row (a picture or clip by its file name); `kinds`
+ *  says which is which. */
+const embedded = ref<{
+  texts: string[]
+  kinds: ('text' | 'image' | 'audio')[]
+  vectors: number[][]
+  dims: number
+} | null>(null)
 
 const busy = ref(false)
 const error = ref<string | null>(null)
@@ -104,7 +167,7 @@ function lines(s: string): string[] {
 const canRun = computed(() => {
   if (!current.value || busy.value) return false
   if (mode.value === 'rerank') return query.value.trim().length > 0 && lines(docsText.value).length > 0
-  if (mode.value === 'embed') return lines(embedText.value).length > 0
+  if (mode.value === 'embed') return lines(embedText.value).length + media.value.length > 0
   return false
 })
 
@@ -141,12 +204,21 @@ async function run(): Promise<void> {
       lastTokens.value = r.usage?.total_tokens ?? null
     } else {
       const texts = lines(embedText.value)
-      const r = (await post('v1/embeddings', { model: current.value.id, input: texts })) as {
+      const items = media.value
+      const r = (await post('v1/embeddings', {
+        model: current.value.id,
+        input: [...texts, ...items.map(mediaItem)],
+      })) as {
         data: { embedding: number[]; index: number }[]
         usage?: { total_tokens?: number }
       }
       const vectors = [...r.data].sort((a, b) => a.index - b.index).map((d) => d.embedding)
-      embedded.value = { texts, vectors, dims: vectors[0]?.length ?? 0 }
+      embedded.value = {
+        texts: [...texts, ...items.map((m) => m.name)],
+        kinds: [...texts.map(() => 'text' as const), ...items.map((m) => m.kind)],
+        vectors,
+        dims: vectors[0]?.length ?? 0,
+      }
       lastTokens.value = r.usage?.total_tokens ?? null
     }
   } catch (e) {
@@ -213,11 +285,18 @@ const curl = computed(() => {
       `  -d '{"model": "${current.value.id}", "query": "...", "documents": ["...", "..."]}'`,
     ].join('\n')
   }
+  // a picture or clip is a content-part item beside the strings
+  const items = ['"..."']
+  if (media.value.some((m) => m.kind === 'image'))
+    items.push('{"content": [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}]}')
+  if (media.value.some((m) => m.kind === 'audio'))
+    items.push('{"content": [{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}]}')
+  if (items.length === 1) items.push('"..."')
   return [
     `curl ${endpoint}/v1/embeddings \\`,
     `  -H "Content-Type: application/json" \\`,
     `  -H "Authorization: Bearer <api key>" \\`,
-    `  -d '{"model": "${current.value.id}", "input": ["...", "..."]}'`,
+    `  -d '{"model": "${current.value.id}", "input": [${items.join(', ')}]}'`,
   ].join('\n')
 })
 </script>
@@ -268,16 +347,42 @@ const curl = computed(() => {
             />
           </label>
         </template>
-        <label v-else class="pg__field">
-          <span class="pg__label">Texts</span>
-          <textarea
-            v-model="embedText"
-            class="pk-input pg__ta"
-            rows="8"
-            spellcheck="false"
-            placeholder="Paste your texts, one per line - every pair is compared by meaning"
-          />
-        </label>
+        <template v-else>
+          <label class="pg__field">
+            <span class="pg__label">Texts</span>
+            <textarea
+              v-model="embedText"
+              class="pk-input pg__ta"
+              rows="8"
+              spellcheck="false"
+              :placeholder="
+                takesImages || takesAudio
+                  ? 'Paste your texts, one per line - every pair, pictures and clips included, is compared by meaning'
+                  : 'Paste your texts, one per line - every pair is compared by meaning'
+              "
+            />
+          </label>
+          <div v-if="takesImages || takesAudio" class="pg__media">
+            <input ref="fileInput" type="file" multiple hidden @change="onFiles" />
+            <button v-if="takesImages" class="pk-btn" type="button" @click="pick('image')">
+              <Icon name="image" :size="14" /> Add pictures
+            </button>
+            <button v-if="takesAudio" class="pk-btn" type="button" @click="pick('audio')">
+              <Icon name="microphone" :size="14" /> Add audio clips
+            </button>
+            <span v-if="takesAudio" class="pg__runhint">clips up to 30 s</span>
+            <ul v-if="media.length" class="pg__chips">
+              <li v-for="(m, i) in media" :key="i" class="pg__chip">
+                <img v-if="m.kind === 'image'" :src="m.url" alt="" class="pg__thumb" />
+                <Icon v-else name="microphone" :size="14" />
+                <span class="pg__chipname">{{ m.name }}</span>
+                <button class="pg__chipx" type="button" :aria-label="`Remove ${m.name}`" @click="removeMedia(i)">
+                  <Icon name="x" :size="12" />
+                </button>
+              </li>
+            </ul>
+          </div>
+        </template>
         <div class="pg__actions">
           <button class="pk-btn pk-btn--primary" :disabled="!canRun" @click="run">
             <Icon :name="busy ? 'spinner' : 'play'" :size="14" :class="{ spin: busy }" />
@@ -328,10 +433,13 @@ const curl = computed(() => {
 
       <div v-else-if="mode === 'embed' && embedded && embedded.texts.length < 2" class="pg__one">
         <p class="pg__one-line">
-          Embedded <strong>1 text</strong> · {{ embedded.dims }} dimensions
+          Embedded <strong>1 {{ embedded.kinds[0] === 'image' ? 'picture' : embedded.kinds[0] === 'audio' ? 'clip' : 'text' }}</strong>
+          · {{ embedded.dims }} dimensions
         </p>
         <code class="pg__one-vec">[{{ vecPreview }}]</code>
-        <p class="pg__one-hint">Add more lines to compare texts by meaning.</p>
+        <p class="pg__one-hint">
+          Add more {{ takesImages || takesAudio ? 'lines, pictures or clips' : 'lines' }} to compare them by meaning.
+        </p>
       </div>
 
       <div v-else-if="mode === 'embed' && embedded" class="pg__tablewrap">
@@ -340,7 +448,7 @@ const curl = computed(() => {
             <tr>
               <th></th>
               <th v-for="(_, j) in embedded.texts" :key="j" class="c-num">{{ j + 1 }}</th>
-              <th>Text</th>
+              <th>{{ embedded.kinds.some((k) => k !== 'text') ? 'Item' : 'Text' }}</th>
             </tr>
           </thead>
           <tbody>
@@ -355,13 +463,17 @@ const curl = computed(() => {
               >
                 {{ i === j ? '-' : fmtScore(v) }}
               </td>
-              <td class="pg__doc">{{ embedded.texts[i] }}</td>
+              <td class="pg__doc">
+                <Icon v-if="embedded.kinds[i] === 'image'" name="image" :size="13" class="pg__kind" />
+                <Icon v-else-if="embedded.kinds[i] === 'audio'" name="microphone" :size="13" class="pg__kind" />
+                {{ embedded.texts[i] }}
+              </td>
             </tr>
           </tbody>
         </table>
         <p v-if="closest" class="pg__closest">
-          Most similar: <strong>line {{ closest.i + 1 }}</strong> and
-          <strong>line {{ closest.j + 1 }}</strong> ({{ fmtScore(closest.v) }}) ·
+          Most similar: <strong>{{ closest.i + 1 }}</strong> and
+          <strong>{{ closest.j + 1 }}</strong> ({{ fmtScore(closest.v) }}) ·
           {{ embedded.dims }} dimensions per embedding
         </p>
       </div>
@@ -405,6 +517,57 @@ const curl = computed(() => {
   gap: 10px;
   padding: 64px 24px;
   text-align: center;
+}
+.pg__media {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.pg__chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  width: 100%;
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.pg__chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 240px;
+  padding: 3px 4px 3px 6px;
+  border: 1px solid var(--pk-border-default);
+  border-radius: 6px;
+  font-size: var(--pk-font-size-sm);
+  color: var(--pk-text-secondary);
+}
+.pg__thumb {
+  width: 22px;
+  height: 22px;
+  object-fit: cover;
+  border-radius: 3px;
+}
+.pg__chipname {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pg__chipx {
+  display: inline-flex;
+  padding: 2px;
+  border: 0;
+  background: none;
+  color: var(--pk-text-muted);
+  cursor: pointer;
+}
+.pg__kind {
+  vertical-align: -2px;
+  margin-right: 4px;
+  color: var(--pk-text-muted);
 }
 .pg__none-icon {
   color: var(--pk-text-muted);

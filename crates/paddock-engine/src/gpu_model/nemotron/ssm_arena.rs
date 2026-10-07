@@ -17,7 +17,7 @@
 //! f16 arm converts at the boundary instead, which round-trips bit-for-bit
 //! because the blob only ever receives values that came from f16.
 
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, DevicePtr};
 use half::f16;
 
 use crate::gpu::{GpuError, GpuExecutor};
@@ -51,6 +51,22 @@ impl SsmArena {
             SsmDtype::F32 => SsmArena::F32(e.alloc(elems)?),
             SsmDtype::F16 => SsmArena::F16(e.alloc_f16(elems)?),
         })
+    }
+
+    /// Device address of element `off` and the element size in bytes - a
+    /// batched byte copy's descriptor end (the verify rollback). Same stream
+    /// as every other user of the arena, so no cross-stream guard is held.
+    pub fn addr(&self, e: &GpuExecutor, off: usize) -> (u64, usize) {
+        match self {
+            SsmArena::F32(s) => {
+                let (p, _g) = s.device_ptr(&e.stream);
+                (p + (off * 4) as u64, 4)
+            }
+            SsmArena::F16(s) => {
+                let (p, _g) = s.device_ptr(&e.stream);
+                (p + (off * 2) as u64, 2)
+            }
+        }
     }
 
     pub fn zero_region(&mut self, e: &GpuExecutor, off: usize, n: usize) -> Result<(), GpuError> {
@@ -163,6 +179,43 @@ impl SsmArena {
             ),
             _ => Err(GpuError::MissingOp(
                 "ssm snap class differs from the live arena",
+            )),
+        }
+    }
+
+    /// The verify walk without snapshots (f16 class only, slot 746): the
+    /// state is read and left pre-round, each row's scan inputs land in
+    /// `keep` at `keep_off` for the commit's replay.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_seq_keep_at(
+        &self,
+        e: &GpuExecutor,
+        state_off: usize,
+        xbc: &CudaSlice<f32>,
+        xbc_off: usize,
+        dt: &CudaSlice<f32>,
+        dt_off: usize,
+        dt_stride: usize,
+        a: &CudaSlice<f32>,
+        d: &CudaSlice<f32>,
+        dt_bias: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        y_off: usize,
+        keep: &mut CudaSlice<f32>,
+        keep_off: usize,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        d_state: usize,
+        n_groups: usize,
+    ) -> Result<(), GpuError> {
+        match self {
+            SsmArena::F16(s) => e.mamba2_scan_seq_keep_at_f16(
+                s, state_off, xbc, xbc_off, dt, dt_off, dt_stride, a, d, dt_bias, y, y_off, keep,
+                keep_off, n_tokens, n_heads, head_dim, d_state, n_groups,
+            ),
+            SsmArena::F32(_) => Err(GpuError::MissingOp(
+                "rollback by replay is the f16 state class's",
             )),
         }
     }

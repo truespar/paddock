@@ -2143,7 +2143,7 @@ impl GpuQwen35 {
         }
         let live = {
             let sb = self.spec_batch.as_ref().expect("spec batch");
-            (sb.batch, sb.round_k1)
+            super::ops::verify_graph_key(sb.batch, sb.round_k1, sb.max_pos_row)
         };
         if !self
             .spec_batch

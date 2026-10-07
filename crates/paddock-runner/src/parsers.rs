@@ -72,6 +72,9 @@ pub enum Dialect {
     /// The arguments arrive already typed (real JSON), so unlike the two XML
     /// dialects there is nothing to coerce against the request's schema.
     JsonToolCall,
+    /// Kolibri-1: Hermes JSON calls plus a Qwen-shaped thinking region.
+    /// Separate from Granite's JSON dialect, which has no reasoning framing.
+    JsonThinking,
     /// MiniCPM5's attribute-XML calls, the `<think>` region shared with qwen:
     /// `<function name="NAME"><param name="KEY">VALUE</param>...</function>`,
     /// repeated back to back for parallel calls, no `<tool_call>` wrapper, and
@@ -105,6 +108,7 @@ impl Dialect {
             "laguna" => Dialect::Laguna,
             "muse-glimmer" => Dialect::MuseChannel,
             "granite" => Dialect::JsonToolCall,
+            "kolibri1" => Dialect::JsonThinking,
             _ => Dialect::Plain,
         }
     }
@@ -190,6 +194,7 @@ impl Dialect {
         match self {
             Dialect::GemmaChannel => !prompt.ends_with("<channel|>"),
             Dialect::Laguna => prompt.ends_with("<think>"),
+            Dialect::JsonThinking => prompt.trim_end().ends_with("<think>"),
             // granite 4.1's template has no thinking region to open - say so
             // rather than leaning on a `<think>\n` probe that can't match
             Dialect::JsonToolCall | Dialect::Transcript => false,
@@ -236,6 +241,7 @@ impl Dialect {
             // (`bare_lead`); it withholds at most those few bytes, and a turn
             // that merely starts with a `{` resolves on the next delta
             Dialect::JsonToolCall => &["<tool_call>", JSON_BARE_OPEN],
+            Dialect::JsonThinking => &["<tool_call>", JSON_BARE_OPEN, "<think>", "</think>"],
             // atomic special tokens can't split across deltas, but a marker
             // in the running text must still gate what streams as content
             Dialect::GemmaChannel => &["<|channel>"],
@@ -262,7 +268,7 @@ impl Dialect {
         match self {
             Dialect::QwenXml => Some(ToolSyntax::QwenXml),
             Dialect::Laguna => Some(ToolSyntax::LagunaXml),
-            Dialect::JsonToolCall => Some(ToolSyntax::Json),
+            Dialect::JsonToolCall | Dialect::JsonThinking => Some(ToolSyntax::Json),
             Dialect::MuseChannel => Some(ToolSyntax::AtemXml),
             Dialect::MiniCpmXml => Some(ToolSyntax::MiniCpmXml),
             _ => None,
@@ -288,6 +294,9 @@ impl Dialect {
     pub fn effort_kwarg(self) -> Option<(&'static str, &'static [&'static str])> {
         match self {
             Dialect::Harmony => Some(("reasoning_effort", &["low", "medium", "high"])),
+            // Kolibri's published template maps aliases (minimal/xhigh/max)
+            // onto these three distinct prose instructions.
+            Dialect::JsonThinking => Some(("reasoning_effort", &["low", "medium", "high"])),
             Dialect::MuseChannel => {
                 Some(("reasoning_strength", &["low", "medium", "high", "xhigh"]))
             }
@@ -301,6 +310,7 @@ impl Dialect {
     pub fn reasoning_markers(self) -> &'static [&'static str] {
         match self {
             Dialect::QwenXml => &["</think>", "<tool_call>"],
+            Dialect::JsonThinking => &["</think>", "<tool_call>"],
             Dialect::MiniCpmXml => &["</think>", MINICPM_FUNC],
             Dialect::Laguna => &["</think>"],
             Dialect::GemmaChannel => &["<channel|>"],
@@ -336,6 +346,51 @@ impl Dialect {
             Dialect::MiniCpmXml => &[MINICPM_FUNC, "</function>", "<param", "</param>"],
             _ => &[],
         }
+    }
+}
+
+#[cfg(test)]
+mod kolibri_tests {
+    use super::*;
+
+    #[test]
+    fn kolibri_thinking_and_json_tools_remain_separate() {
+        let dialect = Dialect::for_arch_and_template("kolibri1", None);
+        assert_eq!(dialect, Dialect::JsonThinking);
+        assert!(dialect.thinking_open("<|im_start|>assistant\n<think>\n"));
+        let hints = tool_hints(Some(&[
+            serde_json::json!({"function":{"name":"weather","parameters":{}}}),
+        ]));
+        let text = "Check Berlin.</think>\n<tool_call>\n{\"name\":\"weather\",\"arguments\":{\"city\":\"Berlin\"}}\n</tool_call>";
+        let out = parse(dialect, text, true, hints.as_ref());
+        assert_eq!(out.reasoning.as_deref(), Some("Check Berlin."));
+        assert!(out.content.is_none());
+        assert_eq!(out.complete_calls, 1);
+        assert_eq!(out.tool_calls[0].name, "weather");
+        assert!(
+            parse(dialect, text, true, None)
+                .content
+                .unwrap()
+                .contains("<tool_call>")
+        );
+    }
+
+    #[test]
+    fn kolibri_streaming_reasoning_is_not_exposed_as_content() {
+        let out = parse(Dialect::JsonThinking, "<think>Let me check", false, None);
+        assert!(out.content.is_none());
+        assert_eq!(out.reasoning.as_deref(), Some("Let me check"));
+        assert_eq!(
+            parse(
+                Dialect::JsonThinking,
+                "<think>Check.</think>Berlin.",
+                false,
+                None
+            )
+            .content
+            .as_deref(),
+            Some("Berlin.")
+        );
     }
 }
 
@@ -398,6 +453,16 @@ pub fn parse(
         Dialect::Laguna => laguna_parse(text, thinking_open, hints),
         Dialect::MuseChannel => crate::muse::parse(text, thinking_open, hints),
         Dialect::JsonToolCall => json_tool_parse(text, hints),
+        Dialect::JsonThinking => {
+            let split = qwen_parse(text, thinking_open, None);
+            let mut out = json_tool_parse(split.content.as_deref().unwrap_or(""), hints);
+            let mut thinking = json_tool_parse(split.reasoning.as_deref().unwrap_or(""), hints);
+            out.reasoning = thinking.content;
+            thinking.tool_calls.append(&mut out.tool_calls);
+            out.tool_calls = thinking.tool_calls;
+            out.complete_calls += thinking.complete_calls;
+            out
+        }
         Dialect::Plain => {
             let t = text.trim();
             Parsed {

@@ -989,7 +989,12 @@ int pd_nvf4_moe_up_relu2_bs(const void* data, const void* scale,
 // (the shared-expert pass: its own trivial align, slot_off past the routed
 // picks). PAD columns are skipped at scatter, so their garbage accs never
 // land.
-template <uint32_t KB, bool SFOLD>
+// P16 (slot 758): each weighted partial rounds to bf16 at the store - `part`
+// holds bf16, half the plane - and pd_moe_slot_combine_bf16 folds it in f32,
+// fixed slot order, ONTO the residual it is handed (the caller lands the
+// shared expert there first). Same tile, mma and weight; only the store's
+// width differs (the Q4_K down's slot-749 move).
+template <uint32_t KB, bool SFOLD, bool P16 = false>
 __global__ void __launch_bounds__(256, 2) pd_nvf4_moe_down_bs_kernel(  // SFOLD: see the up kernel
     const uint8_t* __restrict__ data, const uint8_t* __restrict__ scale,
     const float* __restrict__ scale2, const uint32_t* __restrict__ sorted_row,
@@ -1154,13 +1159,22 @@ __global__ void __launch_bounds__(256, 2) pd_nvf4_moe_down_bs_kernel(  // SFOLD:
             const uint32_t slt = sorted_slot[(size_t)blk * PD_NV4M_BM + c];
             const float w =
                 (topk_w ? topk_w[(size_t)t * kw + slt] : 1.0f) * s2;
-            float* prow = part + ((size_t)t * np + slt + slot_off) * embd;
+            const size_t pbase = ((size_t)t * np + slt + slot_off) * embd;
             #pragma unroll
             for (uint32_t n = 0; n < 2u; ++n) {
                 const uint32_t r0 = row_base + i0 + n * 16u + g;
                 const uint32_t r8 = r0 + 8u;
-                if (r0 < embd) prow[r0] = acc[(j0 >> 3) + n][qc] * w;
-                if (r8 < embd) prow[r8] = acc[(j0 >> 3) + n][qc + 2u] * w;
+                const float v0 = acc[(j0 >> 3) + n][qc] * w;
+                const float v8 = acc[(j0 >> 3) + n][qc + 2u] * w;
+                if constexpr (P16) {
+                    __nv_bfloat16* prow = reinterpret_cast<__nv_bfloat16*>(part) + pbase;
+                    if (r0 < embd) prow[r0] = __float2bfloat16(v0);
+                    if (r8 < embd) prow[r8] = __float2bfloat16(v8);
+                } else {
+                    float* prow = part + pbase;
+                    if (r0 < embd) prow[r0] = v0;
+                    if (r8 < embd) prow[r8] = v8;
+                }
             }
         }
     }
@@ -1420,6 +1434,49 @@ int pd_nvf4_moe_down_bs(const void* data, const void* scale, const void* scale2,
     else
         pd_nvf4_moe_down_bs_kernel<4u, false><<<grid, 256, PD_NV4M_SMEM(4u),
                                                 (cudaStream_t)stream>>>(
+            (const uint8_t*)data, (const uint8_t*)scale, (const float*)scale2,
+            (const uint32_t*)sorted_row, (const uint32_t*)sorted_slot,
+            (const uint32_t*)block_expert, (const float*)topk_w,
+            (const uint8_t*)fq, (const uint8_t*)fs, (float*)part, ff, embd, kw,
+            np, slot_off);
+    return pd_launch_status();
+#endif
+}
+
+// Slot 758: pd_nvf4_moe_down_bs with bf16 partials (the P16 store above) -
+// half the partial plane's write here and its read in the fold. Kolibri's
+// 384-expert down at 4096 rows lands rows * 6 * 2560 partials a layer (252 MB
+// as f32), against a 283 MB weight sweep. The packed-fp4 tensor-core die
+// only: a die on the weight-only bf16 tile arm keeps the f32 entry
+// (cudaErrorNotSupported here).
+PD_EXPORT
+int pd_nvf4_moe_down_bs_b16(const void* data, const void* scale, const void* scale2,
+                            const void* sorted_row, const void* sorted_slot,
+                            const void* block_expert, const void* topk_w,
+                            const void* fq, const void* fs, void* part, uint32_t ff,
+                            uint32_t embd, uint32_t kw, uint32_t np,
+                            uint32_t slot_off, uint32_t nb, void* stream) {
+#ifndef PD_BS_HOST
+    (void)data; (void)scale; (void)scale2; (void)sorted_row; (void)sorted_slot;
+    (void)block_expert; (void)topk_w; (void)fq; (void)fs; (void)part; (void)ff;
+    (void)embd; (void)kw; (void)np; (void)slot_off; (void)nb; (void)stream;
+    return cudaErrorNotSupported;
+#else
+    if (embd == 0 || nb == 0) return 0;
+    if ((ff & 31u) != 0 || np == 0) return cudaErrorInvalidValue;
+    if (pd_nv4t_arm()) return cudaErrorNotSupported;
+    dim3 grid(nb, (embd + 127u) / 128u);
+    if (pd_nv4m_kb() == 8u)
+        pd_nvf4_moe_down_bs_kernel<8u, false, true><<<grid, 256, PD_NV4M_SMEM(8u),
+                                                      (cudaStream_t)stream>>>(
+            (const uint8_t*)data, (const uint8_t*)scale, (const float*)scale2,
+            (const uint32_t*)sorted_row, (const uint32_t*)sorted_slot,
+            (const uint32_t*)block_expert, (const float*)topk_w,
+            (const uint8_t*)fq, (const uint8_t*)fs, (float*)part, ff, embd, kw,
+            np, slot_off);
+    else
+        pd_nvf4_moe_down_bs_kernel<4u, false, true><<<grid, 256, PD_NV4M_SMEM(4u),
+                                                      (cudaStream_t)stream>>>(
             (const uint8_t*)data, (const uint8_t*)scale, (const float*)scale2,
             (const uint32_t*)sorted_row, (const uint32_t*)sorted_slot,
             (const uint32_t*)block_expert, (const float*)topk_w,

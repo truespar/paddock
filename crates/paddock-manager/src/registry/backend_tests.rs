@@ -504,7 +504,13 @@ fn metal_chat_defaults_are_32k_with_export_caps_and_no_cuda_or_speech_drift() {
         cuda.default_envelope("bonsai-2-27b", Some("ptq1")),
         (4096, 32)
     );
-    assert_eq!(cuda.default_envelope("qwen3.8-27b", Some("q4")), (4096, 32));
+    // qwen3.8's CUDA target is its own election (backend_overrides.cuda,
+    // 2026-10-04): the long agent window, fitted to the card at admission.
+    // It must not leak into Metal, which is what the next check holds.
+    assert_eq!(
+        cuda.default_envelope("qwen3.8-27b", Some("q4")),
+        (262144, 4)
+    );
     let metal = cuda.with_backend("metal");
     assert_eq!(
         metal.default_envelope("qwen3.8-27b", Some("mlx-4bit")),
@@ -1377,7 +1383,7 @@ fn metal_projection_preserves_cuda_contracts_and_is_reversible() {
                 artifact.runtime.supports_backend("cuda"),
                 !matches!(
                     artifact.id.as_str(),
-                    "mlx-4bit" | "mlx-2bit" | "mlx8" | "splash-4bit"
+                    "mlx-4bit" | "mlx-2bit" | "mlx8" | "splash-4bit" | "mlx-mixed-4-8bit"
                 ),
                 "{}/{}",
                 model.id,

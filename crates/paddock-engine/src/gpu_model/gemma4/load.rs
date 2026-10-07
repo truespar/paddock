@@ -1993,7 +1993,7 @@ impl GpuGemma4 {
             && exec.has_f8_gemm_mma_ks() // the r==1 lin routing rides the twin band
             && !fp4
             && paddock_models::dev_var_os!("PADDOCK_NO_F8LIN").is_none()
-            && paddock_models::dev_var_os!("PADDOCK_NO_F8W8_TMA").is_none();
+            && std::env::var_os("PADDOCK_NO_F8W8_TMA").is_none();
         let f8lin_attn = f8lin_base && f8lin_mode != "ffn";
         let f8lin_ffn = f8lin_base && f8lin_mode != "attn";
         let lin = |on: bool,

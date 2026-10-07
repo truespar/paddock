@@ -460,7 +460,7 @@ pub(crate) fn fuse_sh_on() -> bool {
 }
 
 /// tcgen05 decode attention (pack slot 431, <256,6>). Rides only on e4m3
-/// pools (PADDOCK_Q38FN_KV8=1). Default on where eligible;
+/// pools (the KV8 default, forward.rs `KV`). Default on where eligible;
 /// `PADDOCK_Q38FN_ATTN_TC5=0` restores the SIMT fmha walk.
 pub(crate) fn attn_tc5_enabled() -> bool {
     use std::sync::OnceLock;

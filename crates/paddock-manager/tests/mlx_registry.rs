@@ -42,6 +42,53 @@ fn flash_next_spec() -> SpawnSpec {
 }
 
 #[tokio::test]
+async fn kolibri_preview_selects_installed_directory_and_supported_metal_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let metal = supervisor(dir.path(), "metal");
+    let request = SpawnSpec {
+        model: "kolibri-1".into(),
+        ..Default::default()
+    };
+    let raw = metal.preview_config(request.clone()).await.unwrap();
+    let config: toml::Value = toml::from_str(&raw).unwrap();
+    assert_eq!(
+        config["model"].as_str(),
+        dir.path()
+            .join("models/Kolibri-1-MLX-mixed-4-8-bit")
+            .to_str()
+    );
+    assert_eq!(config["device"].as_str(), Some("metal"));
+    assert_eq!(config["max_ctx"].as_integer(), Some(32768));
+    assert_eq!(config["max_batch"].as_integer(), Some(1));
+    assert_eq!(config["kv_cache_dtype"].as_str(), Some("auto"));
+    assert_eq!(config["spec"].as_str(), Some("off"));
+    for field in ["mmproj", "mtp", "fp8_native"] {
+        assert!(config.get(field).is_none(), "{field}");
+    }
+    let projected = metal.project_config_text(&raw).unwrap();
+    assert_eq!(projected.artifact.as_deref(), Some("mlx-mixed-4-8bit"));
+    assert!(!projected.vision);
+    // CUDA elects its own weights (the Q4_K_M GGUF), never the MLX directory
+    let raw = supervisor(dir.path(), "cuda")
+        .preview_config(request)
+        .await
+        .unwrap();
+    let config: toml::Value = toml::from_str(&raw).unwrap();
+    assert_eq!(
+        config["model"].as_str(),
+        dir.path()
+            .join("models/Kolibri-1-GGUF/Kolibri-1-Q4_K_M.gguf")
+            .to_str()
+    );
+    assert_eq!(config["device"].as_str(), Some("cuda"));
+    assert_eq!(config["max_ctx"].as_integer(), Some(262144));
+    assert_eq!(config["max_batch"].as_integer(), Some(4));
+    assert_eq!(config["spec"].as_str(), Some("off"));
+    // no pin: the runner's own KV8 default stands
+    assert!(config.get("kv_cache_dtype").is_none());
+}
+
+#[tokio::test]
 async fn diarization_previews_both_formats_without_chat_defaults() {
     let dir = tempfile::tempdir().unwrap();
     let metal = supervisor(dir.path(), "metal");

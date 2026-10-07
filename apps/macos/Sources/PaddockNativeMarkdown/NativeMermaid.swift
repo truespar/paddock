@@ -39,20 +39,37 @@ struct NativeMermaid: View {
   let source: String
   let streaming: Bool
   @Environment(\.colorScheme) private var colorScheme
+  @Environment(\.nativeMarkdownWork) private var markdownWork
   @State private var graph: PositionedGraph?
   @State private var error: String?
   @State private var sourceVisible = false
+  @State private var pinID = UUID()
   @State private var width: CGFloat = 700
   @State private var renderedSource = ""
+  @State private var geometrySource: String?
+  private struct Measurement: Equatable {
+    let size: CGSize
+    let source: String?
+  }
   private var dark: Bool { colorScheme == .dark }
   private var pending: Bool { renderedSource != source }
   var body: some View {
+    let measuredSource = geometrySource
     VStack(alignment: .leading, spacing: 10) {
       HStack(spacing: 10) {
         Text("Mermaid").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
         if pending && error == nil { Text("Updating…").font(.caption).foregroundStyle(.secondary) }
         Spacer()
-        Button(sourceVisible ? "Diagram" : "Source") { sourceVisible.toggle() }
+        Button(sourceVisible ? "Diagram" : "Source") {
+          // Explicit interaction pins this message's local controls. Do not
+          // destroy a source disclosure just because the user scrolls away.
+          sourceVisible.toggle()
+          if sourceVisible {
+            markdownWork?.pins.insert(pinID)
+          } else {
+            markdownWork?.pins.remove(pinID)
+          }
+        }
         Button("Copy") {
           NSPasteboard.general.clearContents()
           NSPasteboard.general.setString(source, forType: .string)
@@ -87,21 +104,37 @@ struct NativeMermaid: View {
     } action: {
       width = max(1, $0)
     }
+    .onGeometryChange(for: Measurement.self) {
+      Measurement(size: $0.size, source: measuredSource)
+    } action: { measurement in
+      guard measurement.source == source,
+        measurement.size.width > 0, measurement.size.height > 0
+      else { return }
+      // Returning positioned nodes is not the same as installing their view
+      // geometry. Only the latter may authorize the parent's height cache.
+      markdownWork?.laidOut(source)
+    }
     .task(id: source) {
+      markdownWork?.begin(source)
+      defer { markdownWork?.end(source, completed: false) }
       do {
         error = nil
+        geometrySource = nil
         if streaming { try await Task.sleep(for: .milliseconds(180)) }
         let next = try await MermaidLayoutWorker.shared.layout(source)
         try Task.checkCancellation()
         graph = next
         renderedSource = source
+        geometrySource = source
       } catch is CancellationError {
         // Superseded partial syntax never replaces the latest graph.
       } catch {
         guard !Task.isCancelled else { return }
         self.error = error.localizedDescription
+        geometrySource = source
       }
     }
+    .onDisappear { markdownWork?.pins.remove(pinID) }
   }
 }
 

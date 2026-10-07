@@ -851,7 +851,7 @@ impl GpuGptOss {
             layers,
             weights_bytes,
             skip_readback: false,
-            kv_dtype: KvDtype::Fp16,
+            kv_dtype: KvDtype::Fp8E4m3, // KV8 default (2026-10-04); serving.rs may pick f16
             batch: None,
             d_g_pos: None,
             d_pf_tok: None,

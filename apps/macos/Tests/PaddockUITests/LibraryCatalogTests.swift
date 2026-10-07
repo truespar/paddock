@@ -6,6 +6,43 @@ import Testing
 
 @Suite("Native library artifact discovery")
 struct LibraryCatalogTests {
+  @Test(
+    .enabled(
+      if: ProcessInfo.processInfo.environment["PADDOCK_MACOS_CONTRACT_DIR"] != nil,
+      "Run apps/macos/scripts/check.sh for the actual Rust registry projection."))
+  @MainActor func publishedKolibriReachesNativeCatalogWithMakerAndMetalDefaults() throws {
+    let path = try #require(ProcessInfo.processInfo.environment["PADDOCK_MACOS_CONTRACT_DIR"])
+    let catalog = try ManagerWire.decode(
+      ModelCatalog.self,
+      from: Data(contentsOf: URL(fileURLWithPath: path).appending(path: "catalog.json")))
+    for query in ["Kolibri", "Aleph Alpha", "eins78/Kolibri-1-mlx-mixed-4-8-bit"] {
+      let entries = LibraryCatalog.entries(
+        catalog: catalog, backend: "metal", format: .mlx, query: query)
+      let entry = try #require(entries.first { $0.id == "kolibri-1" })
+      #expect(entry.model.vendor == "Aleph Alpha")
+      #expect(entry.publishedAt == "2026-10-03")
+      #expect(entry.artifacts.map(\.id) == ["mlx-mixed-4-8bit"])
+      #expect(entry.initialArtifact == "mlx-mixed-4-8bit")
+      #expect(entry.capabilities == ["chat", "reasoning", "tools"])
+      let artifact = try #require(entry.preferredArtifact)
+      #expect(artifact.runtime?.backends == ["metal"])
+      #expect(artifact.runtime?.defaultMaxCtx == 32768)
+      #expect(artifact.runtime?.defaultMaxBatch == 1)
+      #expect(artifact.runtime?.kvCacheDtype == "auto")
+      #expect(artifact.runtime?.embeddedVision == false)
+      #expect(ProviderArtwork.names[entry.model.vendor ?? ""] == "AlephAlpha")
+    }
+    // This real API fixture is already projected for Metal. Its authoritative
+    // backendSupported field must not be reused to simulate a CUDA server.
+    #expect(
+      LibraryCatalog.entries(catalog: catalog, backend: "metal", format: .gguf, query: "Kolibri")
+        .isEmpty)
+    let entries = LibraryCatalog.entries(catalog: catalog, backend: "metal")
+    let kolibri = try #require(entries.firstIndex { $0.id == "kolibri-1" })
+    let bonsai = try #require(entries.firstIndex { $0.id == "bonsai-2-27b" })
+    #expect(kolibri < bonsai)
+  }
+
   @Test func publicationOrderIsNewestFirstWithStableUndatedFallback() throws {
     let catalog = try orderedCatalog()
     func ids(_ order: LibraryOrder = .newest) -> [String] {

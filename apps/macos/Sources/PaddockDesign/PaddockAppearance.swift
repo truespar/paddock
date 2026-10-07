@@ -20,7 +20,16 @@ public enum PaddockAppearance {
     return try! JSONDecoder().decode(Palette.self, from: Data(contentsOf: url))
   }()
 
-  public static func nsColor(_ role: String, dark: Bool) -> NSColor {
+  public static func nsColor(_ role: String, dark: Bool, increasedContrast: Bool = false) -> NSColor
+  {
+    if increasedContrast {
+      switch role {
+      case "border": return NSColor(white: dark ? 0.62 : 0.38, alpha: 1)
+      case "secondary": return NSColor(white: dark ? 0.9 : 0.15, alpha: 1)
+      case "primary": return NSColor(white: dark ? 1 : 0, alpha: 1)
+      default: break  // Preserve semantic warnings and content colors.
+      }
+    }
     let pair = palette.colors[role]!
     let hex = String((dark ? pair.dark : pair.light).dropFirst())
     let value = UInt32(hex, radix: 16)!
@@ -34,7 +43,14 @@ public enum PaddockAppearance {
   /// The system window background is wallpaper-tinted, even when isOpaque is true.
   public static func nsColor(_ role: String) -> NSColor {
     NSColor(name: nil) { appearance in
-      nsColor(role, dark: appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua)
+      let match = appearance.bestMatch(from: [
+        .aqua, .darkAqua, .accessibilityHighContrastAqua, .accessibilityHighContrastDarkAqua,
+      ])
+      return nsColor(
+        role,
+        dark: match == .darkAqua || match == .accessibilityHighContrastDarkAqua,
+        increasedContrast: match == .accessibilityHighContrastAqua
+          || match == .accessibilityHighContrastDarkAqua)
     }
   }
   private static func color(_ role: String) -> Color { Color(nsColor: nsColor(role)) }

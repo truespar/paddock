@@ -159,6 +159,18 @@ pub fn pack() -> Option<PathBuf> {
 /// is what the hand-rolled versions did: a pack that fails to LOAD (stale ABI,
 /// wrong magic, truncated table) is a defect and fails here. Only an absent or
 /// unusable device is a skip.
+/// Flash-Next (qwen4exp) pools at KV8 by default, and its KV class is one
+/// process-global pick read from the environment at the first load
+/// (gpu_model/qwen4exp/forward.rs `KV`). Its f32-reference gates are stated
+/// at the exact f16 class, so their files call this before loading: it pins
+/// f16 for the whole test process, once, before any load can read the pick.
+pub fn qwen4exp_exact_kv() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: set once, before the first qwen4exp load in this process; the
+    // engine reads it once (OnceLock) and nothing else in the suite reads it
+    ONCE.call_once(|| unsafe { std::env::set_var("PADDOCK_Q38FN_KV8", "0") });
+}
+
 pub fn gpu() -> Option<GpuExecutor> {
     let pack = pack()?;
     match GpuExecutor::new(0, &pack) {
@@ -287,6 +299,27 @@ pub const LAGUNA_XS_Q4: &[&str] = &[
     "Laguna-XS-2.1-GGUF/Laguna-XS-2.1-Q4_K_M.gguf",
     "Laguna-XS-2.1-Q4_K_M.gguf",
 ];
+/// Kolibri 1's Q4_K_M (the laguna body's Kolibri flavor) - a pinned
+/// local-development file; no llama.cpp release reads `kolibri1` yet.
+pub const KOLIBRI_Q4KM: &[&str] = &[
+    "Kolibri-1-GGUF/Kolibri-1-Q4_K_M.gguf",
+    "Kolibri-1-Q4_K_M.gguf",
+];
+/// The compressed-tensors NVFP4 checkpoint directory.
+pub const KOLIBRI_NVFP4: &[&str] = &["Kolibri-1-NVFP4"];
+/// EmbeddingGemma 2's text Q8_0 (unsloth, the CUDA lane's checkpoint).
+pub const EMBEDDINGGEMMA2_Q8: &[&str] = &[
+    "EmbeddingGemma-2-GGUF/embeddinggemma-2-Q8_0.gguf",
+    "embeddinggemma-2-Q8_0.gguf",
+];
+/// Its mmproj (the same repo): the gemma4v picture and gemma4a audio towers.
+pub const EMBEDDINGGEMMA2_MMPROJ: &[&str] = &["EmbeddingGemma-2-GGUF/mmproj-BF16.gguf"];
+/// The catalog's cut of that file: the picture tower and the audio tower,
+/// each its own download.
+pub const EMBEDDINGGEMMA2_MMPROJ_VISION: &[&str] =
+    &["EmbeddingGemma-2-GGUF/embeddinggemma-2-mmproj-vision-BF16.gguf"];
+pub const EMBEDDINGGEMMA2_MMPROJ_AUDIO: &[&str] =
+    &["EmbeddingGemma-2-GGUF/embeddinggemma-2-mmproj-audio-BF16.gguf"];
 /// All three Nordic whisper fine-tunes: KB ships `proj_out` as its own plane,
 /// NB and Røst tie it to the embedding, so loading the set is what covers the
 /// tie fallback.

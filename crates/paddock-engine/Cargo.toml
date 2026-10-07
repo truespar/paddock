@@ -40,6 +40,8 @@ symphonia-adapter-libopus = "0.3.0"
 
 [dev-dependencies]
 paddock-tokenizer = { workspace = true }
+# the SAM 3 gate decodes Meta's asset pictures the way its reference did (libjpeg-turbo)
+paddock-jpeg = { workspace = true }
 # tests/common resolves models through the same data-root resolver the manager
 # and runner use, so a gate and the server it gates never disagree
 # about where models live - see tests/common/mod.rs

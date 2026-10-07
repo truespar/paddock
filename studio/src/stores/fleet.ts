@@ -2,7 +2,7 @@ import { defineStore } from 'pinia'
 import { usePushStore } from '@/stores/push'
 import { computed, ref } from 'vue'
 import { useToastsStore } from '@/stores/toasts'
-import { useModelsStore } from '@/stores/models'
+import { cloudVendor, useModelsStore } from '@/stores/models'
 import { useDownloadsStore } from '@/stores/downloads'
 import { modelLabel } from '@/lib/model-name'
 import { reasonOf } from '@/lib/error-text'
@@ -47,6 +47,10 @@ export interface FleetRow {
   reader?: string | null
   tabular?: string | null
   diarization?: string | null
+  /** dense prediction (DINOv3, /v1/segmentations) and promptable segmentation
+   *  (SAM 3, /v1/masks) serving ids - pictures in, rasters or masks out */
+  segmenter?: string | null
+  masker?: string | null
   /** The catalog's human name ("Qwen 3.5 9B") + maker - what the UI shows;
    *  the technical id stays in `model` for tooltips. Absent for models this
    *  build's catalog doesn't know. */
@@ -199,6 +203,9 @@ export interface DeploySpec {
   fp8_native?: boolean
   /** false = serve text-only (skip the vision tower); absent = attach when installed. */
   vision?: boolean
+  /** A split-tower model's audio tower (EmbeddingGemma 2): true attaches it,
+   *  false leaves it out; absent = the catalog default (off). */
+  audio?: boolean
   port: number
   max_ctx?: number
   max_batch?: number
@@ -304,6 +311,17 @@ const BASE_PORT = 11540
 /** The model a runner serves, whichever serving role it is in. A row carries
  *  only its own role's key, so every role has to be listed - a chain that
  *  stops early renders the rest nameless. */
+/** The manager names a runner's maker from the catalog only, so a model the
+ *  catalog does not carry (a hand-started file, a local-dev checkpoint like
+ *  Kolibri) arrives with none and its row draws no mark. Fall back to the id
+ *  heuristic the reply headers already use, so a fleet row and the chat lane
+ *  for the same model agree. */
+function withVendor<T extends { vendor?: string | null }>(row: T, id: string | null | undefined): T {
+  if (row.vendor || !id) return row
+  const vendor = cloudVendor(id)
+  return vendor ? { ...row, vendor } : row
+}
+
 export function servedId(r: {
   model?: string | null
   embedder?: string | null
@@ -313,8 +331,22 @@ export function servedId(r: {
   reader?: string | null
   tabular?: string | null
   diarization?: string | null
+  segmenter?: string | null
+  masker?: string | null
 }): string | undefined {
-  return r.model ?? r.embedder ?? r.asr ?? r.aligner ?? r.image ?? r.reader ?? r.tabular ?? r.diarization ?? undefined
+  return (
+    r.model ??
+    r.embedder ??
+    r.asr ??
+    r.aligner ??
+    r.image ??
+    r.reader ??
+    r.tabular ??
+    r.diarization ??
+    r.segmenter ??
+    r.masker ??
+    undefined
+  )
 }
 
 export const useFleetStore = defineStore('fleet', () => {
@@ -433,7 +465,7 @@ export const useFleetStore = defineStore('fleet', () => {
    *  status flips, badges, vram - applied immediately. configured/elections/
    *  gpu are cold state and stay on the (relaxed) reconcile poll. */
   function applyRunnerRows(r: FleetRow[]): void {
-    rows.value = r
+    rows.value = r.map((x) => withVendor(x, servedId(x)))
     deploying.value = deploying.value.filter((d) => {
       if (d.phase !== 'starting') return true
       const row = r.find((x) => x.port === d.port)
@@ -461,8 +493,8 @@ export const useFleetStore = defineStore('fleet', () => {
           )
           .catch(() => null),
       ])
-      rows.value = r
-      configured.value = c
+      rows.value = r.map((x) => withVendor(x, servedId(x)))
+      configured.value = c.map((x) => withVendor(x, x.model))
       elections.value = e.elections ?? []
       overcommit.value = g?.reconciliation?.overcommit ?? null
       // The spawn POST holds until the health gate passes, but this poll can

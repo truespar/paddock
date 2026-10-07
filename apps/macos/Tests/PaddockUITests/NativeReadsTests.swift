@@ -560,7 +560,7 @@ struct NativeReadsTests {
     #expect(m.selectedSet?.name == "Submitted" && m.setName == "Newer edit")
     #expect(m.draft.questions[0].instructions == "Keep my newer question" && m.dirty)
   }
-  @Test func historyUsesAGlobalByteLimitAndReleasesTheCurrentSnapshot() async throws {
+  @Test func memoryPressureMustNotDiscardTheCurrentUnsavedResult() async throws {
     let m = model()
     await m.refresh()
     m.draft.state = "Document"
@@ -573,7 +573,46 @@ struct NativeReadsTests {
     await m.settle()
     #expect(m.result != nil)
     m.trimHistory(maxBytes: 1)
-    #expect(m.result == nil && m.runs.isEmpty)
+    #expect(m.result != nil && m.runs.count == 1 && m.historyUnsaved)
+    #expect(!m.canRun)
+  }
+  @Test func rolloverAndCacheReclamationPreserveEveryDurableRun() async throws {
+    let m = model()
+    await m.refresh()
+    m.draft.state = "Document"
+    let response = try value(
+      #"{"model":"diffusion","answers":{"q1":{"type":"noul","noul":0.9,"confidence":0.8,"agreement":1,"outside":0.01}},"diagnostics":{"reads":1,"canvas":16,"questions":[],"timing":{"total_ms":1}}}"#
+    )
+    m.readAPI = { _, _ in response }
+    var stored: [String: String] = [:]
+    m.api = { path, method, body, _ in
+      if path == "api/read-history" { return .array([]) }
+      let id = String(path.split(separator: "/").last!)
+      if method == "PUT" {
+        stored[id] = try #require(body?["doc"]?.string)
+        return .object(["read": .object(["revision": .string("saved")])])
+      }
+      return .object(["doc": .string(try #require(stored[id])), "revision": .string("saved")])
+    }
+    for _ in 0..<21 {
+      #expect(m.canRun)
+      m.run()
+      await m.settle()
+      #expect(!m.historyUnsaved && m.historyError == nil)
+    }
+    #expect(stored.count == 2 && m.runs.count == 1)
+    let prior = try #require(stored.keys.first { $0 != m.activeSession?.id })
+    await m.openSession(prior)
+    #expect(m.runs.count == 20)
+    let selected = m.result?.id
+    m.trimHistory(maxBytes: 1)
+    #expect(m.runs.count == 1 && m.result?.id == selected)
+    #expect(m.activeSession?.runs.count == 20)
+    m.draft.state = "Keep my unsent edit"
+    #expect(m.hasEvictedRuns)
+    await m.reloadCachedRuns()
+    #expect(m.runs.count == 20 && m.historyError == nil)
+    #expect(m.draft.state == "Keep my unsent edit" && m.result?.id == selected)
   }
   @Test func navigationKeepsDraftAndQuitProtectsIt() {
     let workspace = WorkspaceModel()

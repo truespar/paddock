@@ -73,6 +73,7 @@ fn forward_matches_host_reference_top4() {
     }
 
     let stamped = stamped_checkpoint(&dir);
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load(&exec, &dir, 512).expect("load qwen4exp");
     for (name, ids, want) in [
         ("capital-of-sweden", PROMPT_A, TOP4_A),
@@ -154,6 +155,7 @@ fn forward_logits_track_the_reference_dump() {
         .map(|c| f32::from_le_bytes(*c))
         .collect();
 
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load(&exec, &dir, 512).expect("load qwen4exp");
     let got = m.forward_prompt(PROMPT_A).expect("forward");
     assert_eq!(got.len(), want.len(), "vocab width");
@@ -197,6 +199,7 @@ fn decode_continues_prefill_exactly() {
         common::missing("pack has no qwen4exp kernels (rebuild packs/cuda)");
         return;
     }
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load(&exec, &dir, 512).expect("load qwen4exp");
 
     // split the 14-token prompt: prefill 12, then step the last two
@@ -266,6 +269,7 @@ fn continuation_matches_host_reference() {
         17.7683, 17.5311, 14.7101, 14.2866, 14.0679, 13.8832, 13.8455, 13.8403,
     ];
 
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load(&exec, &dir, 512).expect("load qwen4exp");
     let logits = m.forward_prompt(IDS).expect("forward");
     let got = top_k(&logits, 8);
@@ -328,6 +332,7 @@ fn greedy_generation_is_self_consistent() {
         common::missing("pack has no qwen4exp kernels (rebuild packs/cuda)");
         return;
     }
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load(&exec, &dir, 512).expect("load qwen4exp");
     let chain = m.generate_greedy(PROMPT_A, 8).expect("generate");
     eprintln!("greedy: {chain:?}");
@@ -371,6 +376,7 @@ fn decode_graph_matches_eager() {
         common::missing("pack has no qwen4exp kernels (rebuild packs/cuda)");
         return;
     }
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load(&exec, &dir, 512).expect("load qwen4exp");
 
     m.set_graph_capture(false);
@@ -408,6 +414,7 @@ fn batched_slots_match_single_slot_runs() {
         common::missing("pack has no qwen4exp kernels (rebuild packs/cuda)");
         return;
     }
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load_with_slots(&exec, &dir, 512, 2).expect("load qwen4exp x2");
     assert_eq!(m.slot_count(), 2);
 
@@ -522,6 +529,7 @@ fn prefill_wave_matches_serial_prefill() {
         [&PROMPT_B[..7], PROMPT_A].concat(), // 12
         [PROMPT_A, PROMPT_B].concat(),       // 19
     ];
+    common::qwen4exp_exact_kv();
     let mut m =
         Qwen4ExpGpu::load_with_slots(&exec, &dir, 512, prompts.len()).expect("load qwen4exp");
     eprintln!(
@@ -676,6 +684,7 @@ fn spec_rounds_emit_the_decode_stream() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(32768);
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load_with_slots(&exec, &dir, ctx, 2).expect("load qwen4exp");
     if !m.has_in_file_mtp() {
         common::missing("this checkpoint ships no in-file MTP head");
@@ -812,6 +821,7 @@ fn spec_rounds_in_serving_shapes_emit_the_decode_stream() {
     let Some(exec) = common::gpu_arc() else {
         return;
     };
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load_with_slots(&exec, &dir, 32768, 2).expect("load qwen4exp");
     if !m.has_in_file_mtp() {
         common::missing("this checkpoint ships no in-file MTP head");
@@ -936,6 +946,7 @@ fn verify_rows_carry_the_decode_logits() {
     let Some(exec) = common::gpu_arc() else {
         return;
     };
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load_with_slots(&exec, &dir, 32768, 2).expect("load qwen4exp");
     if !m.has_in_file_mtp() {
         common::missing("this checkpoint ships no in-file MTP head");
@@ -1041,6 +1052,7 @@ fn an_exact_resend_repeats_its_first_walk() {
     let Some(exec) = common::gpu_arc() else {
         return;
     };
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load_with_slots(&exec, &dir, 4096, 2).expect("load qwen4exp");
     let p1: Vec<u32> = PROMPT_B.iter().copied().cycle().take(600).collect();
     let mut p2 = p1.clone();
@@ -1083,6 +1095,7 @@ fn a_long_resend_repeats_only_its_last_walk() {
     let Some(exec) = common::gpu_arc() else {
         return;
     };
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load_with_slots(&exec, &dir, 16384, 2).expect("load qwen4exp");
     let n = 4096 + 700;
     let pa: Vec<u32> = PROMPT_B.iter().copied().cycle().take(n).collect();
@@ -1140,6 +1153,7 @@ fn ple_rows_decode_on_the_device_as_on_the_host() {
     let Some(exec) = common::gpu_arc() else {
         return;
     };
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load_with_slots(&exec, &dir, 4096, 1).expect("load qwen4exp");
     if !m.set_ple_host_decode(false) {
         common::missing("the n-gram table is device-resident here - no host lane to compare");

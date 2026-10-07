@@ -19,8 +19,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, mpsc};
 
+mod gated;
 #[cfg(test)]
 mod multimodal_mlx_tests;
+pub(crate) use gated::valid_token;
+pub use gated::{TokenSource, huggingface_token};
 mod recovery;
 mod transfer;
 use transfer::fetch_range;
@@ -65,10 +68,12 @@ pub struct CatalogModel {
     /// KV cache precision this family serves at when nothing overrides it:
     /// "f16" or "fp8_e4m3". Absent = f16.
     ///
-    /// MIRRORS the ENGINE and must be kept in step with it - gemma4 pools its
-    /// KV at fp8-e4m3 (gpu_model/gemma4/batch.rs alloc_kv), every other family
-    /// is f16. It lives here so the Studio can PRESELECT the real value
-    /// instead of offering a vague "auto" that hides which one you get.
+    /// MIRRORS the ENGINE and must be kept in step with it - the family
+    /// default an `auto` runner serves. Since 2026-10-04 that is fp8-e4m3
+    /// (KV8) for every generative family except paddleocr-vl, deepseek-ocr
+    /// and qwen3-asr (each loader states why). The Studio PRESELECTS it and
+    /// admission and `/estimate` PRICE an auto endpoint by it, so a row
+    /// that drifts from its engine misprices every start.
     #[serde(default)]
     pub kv_default: Option<String>,
     /// Vendor-sourced spec sheet, shown when a row is expanded in the Studio.
@@ -290,8 +295,34 @@ impl CatalogModel {
                 && a.default
                 && a.runtime.supports_backend(backend)
                 && w.runtime.allows_companion(&a.id)
+                // a Blackwell-only drafter (nemotron's DSpark) is not pulled
+                // onto a card that cannot run it
+                && a.fits_cc(cc)
         }));
         out
+    }
+
+    /// A picture tower AND an audio tower, each its own artifact: EmbeddingGemma
+    /// 2, whose upstream projector the catalog cuts in two so each tower is
+    /// its own download. The picture tower then rides `mmproj`, the audio
+    /// tower `audio_mmproj` with its own switch; every other model has one
+    /// tower (or none) and keeps the single-`mmproj` rule.
+    pub fn split_towers(&self) -> bool {
+        self.artifacts
+            .iter()
+            .any(|a| a.kind == ArtifactKind::Vision)
+            && self.artifacts.iter().any(|a| a.kind == ArtifactKind::Audio)
+    }
+
+    /// The audio tower of a split-tower model (see [`Self::split_towers`]).
+    pub fn split_audio_tower(&self) -> Option<&CatalogArtifact> {
+        self.split_towers()
+            .then(|| {
+                self.artifacts
+                    .iter()
+                    .find(|a| a.kind == ArtifactKind::Audio)
+            })
+            .flatten()
     }
 
     pub fn weights(&self) -> impl Iterator<Item = &CatalogArtifact> {
@@ -336,11 +367,14 @@ impl CatalogModel {
         if let Some(w) = self.default_weights_for(cc) {
             out.push(w);
         }
-        out.extend(
-            self.artifacts
-                .iter()
-                .filter(|a| a.kind != ArtifactKind::Weights && a.default),
-        );
+        // companions the chosen weights take, on a card that can run them
+        let weights = out.first().copied();
+        out.extend(self.artifacts.iter().filter(|a| {
+            a.kind != ArtifactKind::Weights
+                && a.default
+                && a.fits_cc(cc)
+                && weights.is_none_or(|w| w.runtime.allows_companion(&a.id))
+        }));
         out
     }
 
@@ -448,6 +482,14 @@ pub enum DlError {
     Disk { need: u64, free: u64, dir: String },
     #[error("download cancelled")]
     Cancelled,
+    /// The origin is Hugging Face and it refused: a gated model this account
+    /// has not been granted, or no token at all.
+    #[error(
+        "Hugging Face refused the download: this model is gated. Sign in at huggingface.co, \
+         accept its licence at {page}, then add your Hugging Face token under Manager > \
+         Settings (or sign in with `hf auth login`)"
+    )]
+    Gated { page: String },
 }
 
 /// Map a non-success HTTP status to the right error: a *definitively gone* file
@@ -456,6 +498,13 @@ pub enum DlError {
 /// confuse it with a transient origin hiccup (502/503) that's worth retrying.
 fn classify_status(status: reqwest::StatusCode, url: &str) -> DlError {
     use reqwest::StatusCode;
+    // Hugging Face answers a gated file 401 without a token and 403 with one
+    // that has not been granted access - neither means the file is gone
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+        && let Some(page) = gated::repo_page(url)
+    {
+        return DlError::Gated { page };
+    }
     match status {
         StatusCode::NOT_FOUND | StatusCode::GONE | StatusCode::FORBIDDEN => DlError::NotFound {
             url: url.to_owned(),
@@ -1111,11 +1160,13 @@ impl Registry {
         // manager pulled its speech encoder and then never passed it, so the
         // runner refused with "pass its audio mmproj" for a file already on
         // disk.
+        let split = m.split_towers();
         let mmproj = m
             .artifacts
             .iter()
             .find(|a| {
                 a.kind.is_mmproj()
+                    && (!split || a.kind == ArtifactKind::Vision)
                     && a.default
                     && w.runtime.allows_companion(&a.id)
                     && a.runtime.supports_backend(&self.backend)
@@ -1129,9 +1180,33 @@ impl Registry {
                     && a.default
                     && w.runtime.allows_companion(&a.id)
                     && a.runtime.supports_backend(&self.backend)
+                    && a.fits_cc(self.cc)
             })
             .and_then(dest);
         Some((weights, mmproj, mtp))
+    }
+
+    /// A split-tower model's audio tower for a spawn of `artifact`: where it
+    /// lives (or will, once pulled), whether it is on disk, whether the
+    /// catalog marks it default, and its label. None for every other model.
+    pub fn audio_tower(
+        &self,
+        model_id: &str,
+        artifact: Option<&str>,
+    ) -> Option<(PathBuf, bool, bool, String)> {
+        let m = self.catalog.models.iter().find(|m| m.id == model_id)?;
+        let a = m.split_audio_tower()?;
+        let w = self.weights_for(m, artifact)?;
+        if !w.runtime.allows_companion(&a.id) || !a.runtime.supports_backend(&self.backend) {
+            return None;
+        }
+        let f = a.files.first()?;
+        Some((
+            self.models_dir.join(&f.dest),
+            self.is_artifact_installed(a),
+            a.default,
+            a.label.clone(),
+        ))
     }
 
     /// The mmproj companion this model cannot be served without, if it
@@ -1691,7 +1766,7 @@ impl Registry {
             for f in missing {
                 tracing::info!(model = %name, file = %f.dest, size = f.size, "pulling missing model file");
                 download_file(
-                    &self.client,
+                    &self.client_for(&f.url),
                     &f.url,
                     &self.models_dir.join(&f.dest),
                     &f.sha256,
@@ -1727,12 +1802,16 @@ impl Registry {
         };
         // The mmproj companion, whichever SENSE it serves - see planned_paths
         // for why this is not a Vision-only lookup.
+        // a split-tower model's `mmproj` is its picture tower; the audio
+        // tower is `audio_mmproj`, chosen at render by its own switch
+        let split = model.split_towers();
         let installed_mmproj = || -> Option<PathBuf> {
             model
                 .artifacts
                 .iter()
                 .filter(|a| {
                     a.kind.is_mmproj()
+                        && (!split || a.kind == ArtifactKind::Vision)
                         && chosen.runtime.allows_companion(&a.id)
                         && a.runtime.supports_backend(&self.backend)
                 })
@@ -1756,6 +1835,7 @@ impl Registry {
                 a.kind == ArtifactKind::Drafter
                     && chosen.runtime.allows_companion(&a.id)
                     && a.runtime.supports_backend(&self.backend)
+                    && a.fits_cc(self.cc)
             })
         };
         // The pin's rung is consent for that artifact and nothing else: a pin
@@ -2034,13 +2114,14 @@ impl Registry {
         jobs.insert(job.id.clone(), job.clone());
         drop(jobs);
 
-        let client = self.client.clone();
+        // one client a file: a Hugging Face file's carries the user's token
+        let clients: Vec<reqwest::Client> = files.iter().map(|f| self.client_for(&f.url)).collect();
         let models_dir = self.models_dir.clone();
         let job2 = job.clone();
         let store = self.store.clone();
         tokio::spawn(async move {
             let mut outcome: Result<(), DlError> = Ok(());
-            for f in &files {
+            for (f, client) in files.iter().zip(&clients) {
                 if job2.cancel.load(Ordering::Relaxed) {
                     outcome = Err(DlError::Cancelled);
                     break;
@@ -2077,7 +2158,7 @@ impl Registry {
                     }
                 }
                 if let Err(e) = download_file_staged(
-                    &client,
+                    client,
                     &f.url,
                     &dest,
                     &f.sha256,
@@ -2127,6 +2208,10 @@ mod backend_tests;
 #[cfg(test)]
 mod contract_tests;
 #[cfg(test)]
+mod embeddinggemma2_tests;
+#[cfg(test)]
 mod flash_next_mlx_tests;
 #[cfg(test)]
 mod flash_next_nvfp4_tests;
+#[cfg(test)]
+mod kolibri_tests;

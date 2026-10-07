@@ -44,6 +44,8 @@ fn setup() -> Option<(GpuQwen35, GgufTokenizer)> {
     let map = MappedGguf::open(&model_path).expect("open gguf");
     let tok = GgufTokenizer::from_gguf(map.gguf()).expect("tokenizer");
     let mut m = GpuQwen35::load(exec, &map, 4096).expect("load 27B");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    m.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     let mm = MappedGguf::open(&mmproj_path).expect("open mmproj");
     m.attach_vision(&mm).expect("attach vision");
     Some((m, tok))

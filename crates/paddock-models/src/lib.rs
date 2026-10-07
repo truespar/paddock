@@ -18,6 +18,7 @@ pub mod gpu_support;
 pub mod granite;
 pub mod hadamard;
 pub mod hardening;
+pub mod kolibri;
 pub mod kumo;
 pub mod kv_tier_geom;
 pub mod laya;
@@ -29,11 +30,13 @@ pub mod nemotron;
 pub mod probe;
 pub mod qwen4exp;
 pub mod safetensors;
+pub mod sam3;
 pub mod sampling;
 pub mod splash;
 pub mod split;
 #[cfg(test)]
 pub(crate) mod testutil;
+pub mod torch_zip;
 
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;

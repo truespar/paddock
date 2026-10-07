@@ -295,6 +295,69 @@ impl GpuExecutor {
         })
     }
 
+    /// Whether [`Self::f16_conv3_gemm`] is elected: the pack has slot 775 and
+    /// the die is cc 8.x, where its ring is the f16 GEMM's own and the landing
+    /// is bit-identical to [`Self::dp_im2row3_f16`] + `matvec_batch_f16`. The
+    /// Blackwell f16 entry takes tcgen05 arms the conv entry does not have, so
+    /// those dies keep the explicit form until it is measured there.
+    pub fn f16_conv3_elected(&self) -> bool {
+        self.kernels.f16_conv3_gemm.is_some() && self.compute_capability().0 == 8
+    }
+
+    /// A 3x3 / stride 1 / zero-pad 1 convolution as one GEMM with the im2row
+    /// gathered in the stage (slot 775): `src` f16 `[chips][src_chip_rows][c]`,
+    /// `wt` the im2row weight (`[9 c][out]`, tap-outer), `y` f32
+    /// `[chips * h * w][out]`, `bias` added in the landing when given (the
+    /// `bias_add` pass, folded). `c` a multiple of 8.
+    #[allow(clippy::too_many_arguments)]
+    pub fn f16_conv3_gemm(
+        &self,
+        wt: &HalfTensor,
+        src: &CudaSlice<f16>,
+        y: &mut CudaSlice<f32>,
+        bias: Option<&CudaSlice<f32>>,
+        chips: usize,
+        h: usize,
+        w: usize,
+        c: usize,
+        src_chip_rows: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .f16_conv3_gemm
+            .ok_or(GpuError::MissingOp("f16_conv3_gemm"))?;
+        let out = wt.dims[1];
+        if wt.dims[0] != 9 * c
+            || src_chip_rows < h * w
+            || src.len() < chips * src_chip_rows * c
+            || y.len() < chips * h * w * out
+            || bias.is_some_and(|b| b.len() < out)
+        {
+            return Err(oob("f16_conv3_gemm: buffers under the conv geometry"));
+        }
+        let (wp, _g1) = wt.buf.device_ptr(&self.stream);
+        let (sp, _g2) = src.device_ptr(&self.stream);
+        let (yp, _g3) = y.device_ptr_mut(&self.stream);
+        let bg = bias.map(|b| b.device_ptr(&self.stream));
+        let bp = bg.as_ref().map_or(0, |(p, _)| *p);
+        // SAFETY: ABI contract (slot 775); bounds checked above, null bias = none
+        check(unsafe {
+            f(
+                wp as *const _,
+                sp as *const _,
+                yp as *mut _,
+                bp as *const _,
+                chips as u32,
+                h as u32,
+                w as u32,
+                c as u32,
+                out as u32,
+                src_chip_rows as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// 3x3 / stride 1 / zero-pad 1 im2row off an f32 NHWC plane into the f16
     /// staging `[chips*h*w, 9*c]` its GEMM eats, TAP-outer columns (the weight
     /// is permuted to match at load). `src_chip_rows` is the row stride

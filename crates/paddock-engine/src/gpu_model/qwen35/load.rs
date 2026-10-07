@@ -2774,22 +2774,25 @@ impl GpuQwen35 {
             );
         }
 
-        // The rotated-basis ternary line (Bonsai 2 27B) pools its KV at
-        // fp8-e4m3 unless the config says otherwise - the catalog's
-        // `kv_default` mirrors this. Measured 2026-09-27 on GB10 against f16:
-        // same-weights greedy parity vs PrismML's fork unchanged in kind
-        // (step-0 17/18, the one miss the model's own 0.03-nat near-tie; 4/5
-        // generations byte-identical), teacher-forced perplexity over the
-        // 1024 tokens after a 2K / 16K / 64K prefix within noise (prose
-        // -0.05 / +0.21 / +0.39%, code +0.16 / 0.00 / -0.09%, one run a cell),
-        // while decode at depth runs +17% at 40K and +32% at 89K (the KV read
-        // is what an agent's long turns pay). A runner on a die that cannot store fp8 KV overrides
-        // this back to f16 (serving.rs), and an explicit kv_cache_dtype wins.
-        let kv_dtype = if rot.is_some() {
-            KvDtype::Fp8E4m3
-        } else {
-            KvDtype::Fp16
-        };
+        // Every qwen35 model pools its KV at fp8-e4m3 (KV8) unless the config
+        // says otherwise - the catalog's `kv_default` mirrors this. f16 was
+        // the default here until 2026-10-04 while every board, the Studio's
+        // preselect on Ada+ and the rivals all ran KV8, so an `auto` serve
+        // (a bare runner config, an API-made endpoint) got the slow class:
+        // the shared spec-verify walk (ops.rs attn_verify_dispatch) is fp8
+        // only, and at f16 each verify row walks the whole context alone.
+        // Measured on GB10, Qwen3.8-27B Q8_0 + DFlash2 replaying a Claude
+        // Code session to 212K: wall 743 -> 458 s, a 70K prefill at 141K
+        // depth 209 -> 123 s, decode at 212K 9.3 -> 16.7 tok/s - and a live
+        // agent turn whose compaction ran past Claude Code's 600 s limit at
+        // f16 passes at fp8. Quality: perplexity within noise of f16 to 8K
+        // on sm_86 (the KV8 quality note), and for the rotated-basis line
+        // (Bonsai 2 27B, KV8 since 2026-09-27) greedy parity unchanged in
+        // kind and teacher-forced perplexity after a 2K / 16K / 64K prefix
+        // within noise (prose -0.05 / +0.21 / +0.39%, code +0.16 / 0.00 /
+        // -0.09%). A runner on a die that cannot store fp8 KV overrides this
+        // back to f16 (serving.rs), and an explicit kv_cache_dtype wins.
+        let kv_dtype = KvDtype::Fp8E4m3;
         Ok(Self {
             exec,
             n_layers,

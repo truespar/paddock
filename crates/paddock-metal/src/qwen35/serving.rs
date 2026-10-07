@@ -164,10 +164,9 @@ impl Generator for Qwen35 {
         if self.splash && self.dflash.is_some() {
             return Some(if live <= 4 { spec::BLOCK - 1 } else { 0 });
         }
-        // The specialized two-row verifier wins both goodput and burst
-        // latency on the M5 same-checkpoint depth sweep. Wider 3/4-row passes
-        // were slower and exceeded 66 ms p99 with neural proposals. Keep
-        // that source at one proposal. Strong copy matches can fill a wider
+        // The M5 dense-27B packed loader makes three neural proposals useful
+        // at c=1; keep that source's cap separate from the copy budget below.
+        // Strong copy matches can fill a wider
         // verifier without running the neural drafter; their own measured
         // goodput gates re-election. The neural model keeps eight trained rows.
         // Concurrent MLX verification currently loses useful throughput and
@@ -240,12 +239,19 @@ impl Generator for Qwen35 {
                     return Ok(Some(vec![draft]));
                 }
                 self.lookup.begin(false);
-                let mut result = self.dflash_draft(pendings, k.min(1));
+                // Same-checkpoint depth/rollback qualification is M5-only.
+                // Older devices retain their existing one-proposal policy.
+                let neural_cap = if self.device.tensor_accelerated() {
+                    3
+                } else {
+                    1
+                };
+                let mut result = self.dflash_draft(pendings, k.min(neural_cap));
                 // Its noncausal eight-row training window must not be shrunk;
                 // only the proposals handed to target verification are capped.
                 if let Ok(Some(drafts)) = &mut result {
                     for draft in drafts {
-                        draft.truncate(1);
+                        draft.truncate(neural_cap);
                     }
                 }
                 if !matches!(&result, Ok(Some(d)) if d.iter().any(|r| !r.is_empty())) {

@@ -46,6 +46,655 @@
 
 schema = 3
 
+# User-elected MLX conversion of Aleph Alpha's FP8 release. This is a native
+# Metal loader, not mlx-lm serving. Keep download availability separate from
+# full-generation parity and performance qualification (see runtime.note).
+# CUDA (user-elected 2026-10-07, same terms): Hob-forge's Q4_K_M GGUF and
+# primitive-ai's NVFP4 checkpoint, both pinned by revision and mirrored on R2.
+# No official or unsloth GGUF or NVFP4 exists.
+[[model]]
+id = "kolibri-1"
+# KV8 on CUDA, the laguna body's default; the Metal artifact pins its own
+# checkpoint-native BF16 cache (kv_cache_dtype = "auto")
+kv_default = "fp8_e4m3"
+vendor = "Aleph Alpha"
+display = "Kolibri 1"
+family = "kolibri1"
+capability = ["chat", "reasoning", "tools"]
+license = "apache-2.0"
+revision = "2026-10-07"
+
+  [model.specs]
+  published_at = "2026-10-03"
+  published_source = "https://huggingface.co/Aleph-Alpha/Kolibri-1-BF16"
+  params = "78B total / 3.46B active"
+  context = "262K native; 262K default on CUDA, 32K on Metal"
+  homepage = "https://huggingface.co/Aleph-Alpha/Kolibri-1"
+  about = "Aleph Alpha's German-English mixture-of-experts model for reasoning, retrieval and tool use. Native Metal serves the pinned mixed 4/8-bit MLX conversion with BF16 KV; CUDA serves a Q4_K_M GGUF on any generation, or the NVFP4 checkpoint on Blackwell, with FP8 KV."
+  strengths = ["German and English", "Reasoning and tool calling", "Packed MoE weights"]
+  tradeoffs = ["45-48 GB download; plan for at least 64 GB of GPU or unified memory", "Text only; no speculative decoder", "Metal: full-generation parity and rival performance remain under qualification"]
+
+  [[model.artifact]]
+  id = "mlx-mixed-4-8bit"
+  kind = "weights"
+  format = "safetensors"
+  label = "MLX mixed 4/8-bit"
+  quant = "MLX-AFFINE-4/8-G64"
+  default = true
+  workspace = 268435456
+
+  [model.artifact.source]
+  repo = "eins78/Kolibri-1-mlx-mixed-4-8-bit"
+  revision = "20a42da14e58c0f9de5af5a50b6766874c259b0c"
+  base_model = "Aleph-Alpha/Kolibri-1"
+  license = "apache-2.0"
+  license_url = "https://huggingface.co/eins78/Kolibri-1-mlx-mixed-4-8-bit/blob/20a42da14e58c0f9de5af5a50b6766874c259b0c/LICENSE"
+
+  [model.artifact.runtime]
+  backends = ["metal"]
+  companions = []
+  checkpoint_dir = true
+  kv_cache_dtype = "auto"
+  default_max_ctx = 32768
+  default_max_batch = 1
+  default_spec = "off"
+  note = "Native packed affine 4-bit routed experts and 8-bit attention/shared projections, BF16 KV. Text, reasoning and tools; no vision, speculation or persistent KV offloading. Full-generation numerical parity and rival performance remain under qualification."
+
+  # The loader widens only norms/router to F32, not quantized projections.
+  # All 50 layers retain full paged KV for exact prefix restoration, including
+  # the 40 sliding layers. Reserve one extra sequence as load.rs does; do not
+  # underprice them as 513-token rings. Workspace covers scratch at batch 64.
+  [model.artifact.runtime.memory]
+  weight_bytes = 45381770240
+  source = "measured"
+  max_ctx = 262144
+  max_batch = 64
+  full_paged_kv = true
+  kv_reserve_sequences = 1
+  workspace_bytes = 268435456
+
+  [model.artifact.shape]
+  weight_bytes = 45381770240
+  kind = "generative"
+  vocab = 128000
+  max_ctx = 262144
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = [
+    { k_dim = 512, v_dim = 512, window = 513, count = 40 },
+    { k_dim = 512, v_dim = 512, count = 10 },
+  ]
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/eins78/20a42da14e58c0f9de5af5a50b6766874c259b0c/Kolibri-1-MLX-mixed-4-8-bit/model-00001-of-00009.safetensors"
+    dest = "Kolibri-1-MLX-mixed-4-8-bit/model-00001-of-00009.safetensors"
+    sha256 = "6e86dd3dbd2b46a4379ee1e6389afa805b42cb9dd6baa21b1ca7672096416347"
+    size = 5128085967
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/eins78/20a42da14e58c0f9de5af5a50b6766874c259b0c/Kolibri-1-MLX-mixed-4-8-bit/model-00002-of-00009.safetensors"
+    dest = "Kolibri-1-MLX-mixed-4-8-bit/model-00002-of-00009.safetensors"
+    sha256 = "b35cd35b2fd21131f24a2f4385effbcd1bb242e002533ce5c362f034b9ef8c97"
+    size = 5350357443
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/eins78/20a42da14e58c0f9de5af5a50b6766874c259b0c/Kolibri-1-MLX-mixed-4-8-bit/model-00003-of-00009.safetensors"
+    dest = "Kolibri-1-MLX-mixed-4-8-bit/model-00003-of-00009.safetensors"
+    sha256 = "5dbf8195e97fafe3845ee49bc4708b3b4658b518d9bd1d4e636a6fe323911068"
+    size = 5350357588
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/eins78/20a42da14e58c0f9de5af5a50b6766874c259b0c/Kolibri-1-MLX-mixed-4-8-bit/model-00004-of-00009.safetensors"
+    dest = "Kolibri-1-MLX-mixed-4-8-bit/model-00004-of-00009.safetensors"
+    sha256 = "7a6f32aee727dd9eae3debe7711f34ec0754396625d6d5a93fff8398b9055b55"
+    size = 5350357586
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/eins78/20a42da14e58c0f9de5af5a50b6766874c259b0c/Kolibri-1-MLX-mixed-4-8-bit/model-00005-of-00009.safetensors"
+    dest = "Kolibri-1-MLX-mixed-4-8-bit/model-00005-of-00009.safetensors"
+    sha256 = "8f7b13a66b63c71d046e633af21214b23869889d5d3c2c49558b0a7da4b3820d"
+    size = 5350357620
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/eins78/20a42da14e58c0f9de5af5a50b6766874c259b0c/Kolibri-1-MLX-mixed-4-8-bit/model-00006-of-00009.safetensors"
+    dest = "Kolibri-1-MLX-mixed-4-8-bit/model-00006-of-00009.safetensors"
+    sha256 = "9679fe05dd5dd9387083b5f20cb0c4a4e9bb484e5acff7d19ffab79866576518"
+    size = 5350357528
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/eins78/20a42da14e58c0f9de5af5a50b6766874c259b0c/Kolibri-1-MLX-mixed-4-8-bit/model-00007-of-00009.safetensors"
+    dest = "Kolibri-1-MLX-mixed-4-8-bit/model-00007-of-00009.safetensors"
+    sha256 = "d4a84bc4377717a64951c242733c427163e07bc999b98336fe037f15b20ebe63"
+    size = 5350357532
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/eins78/20a42da14e58c0f9de5af5a50b6766874c259b0c/Kolibri-1-MLX-mixed-4-8-bit/model-00008-of-00009.safetensors"
+    dest = "Kolibri-1-MLX-mixed-4-8-bit/model-00008-of-00009.safetensors"
+    sha256 = "41dc095043a51fac05f1b46511b8babe8b5a62eab8c198db7ba4adda093f3f6b"
+    size = 5350357648
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/eins78/20a42da14e58c0f9de5af5a50b6766874c259b0c/Kolibri-1-MLX-mixed-4-8-bit/model-00009-of-00009.safetensors"
+    dest = "Kolibri-1-MLX-mixed-4-8-bit/model-00009-of-00009.safetensors"
+    sha256 = "70832f4668922e15d9aff59641be49aa78565d19c48715acdc5275392016fe6a"
+    size = 2702049796
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/eins78/20a42da14e58c0f9de5af5a50b6766874c259b0c/Kolibri-1-MLX-mixed-4-8-bit/config.json"
+    dest = "Kolibri-1-MLX-mixed-4-8-bit/config.json"
+    sha256 = "6dc508903bbd44532b0d41f2bec1a3571dea1b6c51bb99afd1d92f373e27e64f"
+    size = 103535
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/eins78/20a42da14e58c0f9de5af5a50b6766874c259b0c/Kolibri-1-MLX-mixed-4-8-bit/generation_config.json"
+    dest = "Kolibri-1-MLX-mixed-4-8-bit/generation_config.json"
+    sha256 = "40e0edd01855fc8abdfd2f7b0d4a54c52cf6dea3c678dc68b32c05f19c464450"
+    size = 152
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/eins78/20a42da14e58c0f9de5af5a50b6766874c259b0c/Kolibri-1-MLX-mixed-4-8-bit/LICENSE"
+    dest = "Kolibri-1-MLX-mixed-4-8-bit/LICENSE"
+    sha256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    size = 11358
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/eins78/20a42da14e58c0f9de5af5a50b6766874c259b0c/Kolibri-1-MLX-mixed-4-8-bit/model.safetensors.index.json"
+    dest = "Kolibri-1-MLX-mixed-4-8-bit/model.safetensors.index.json"
+    sha256 = "d23feedf7ed5bc794ffc5fa0e1c02e9668bbd919233cb337d1547de149bd4e2b"
+    size = 173218
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/eins78/20a42da14e58c0f9de5af5a50b6766874c259b0c/Kolibri-1-MLX-mixed-4-8-bit/README.md"
+    dest = "Kolibri-1-MLX-mixed-4-8-bit/README.md"
+    sha256 = "b9b251572089b64dd430000ac0b41b4e53420339319dcec5d5eff4d03e2aeb8f"
+    size = 7847
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/eins78/20a42da14e58c0f9de5af5a50b6766874c259b0c/Kolibri-1-MLX-mixed-4-8-bit/tokenizer_config.json"
+    dest = "Kolibri-1-MLX-mixed-4-8-bit/tokenizer_config.json"
+    sha256 = "876849ec94a65a6b72e3fd1c8d37cc00db9892d4fd84279eb51602ea06cd1b46"
+    size = 8513
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/eins78/20a42da14e58c0f9de5af5a50b6766874c259b0c/Kolibri-1-MLX-mixed-4-8-bit/tokenizer.json"
+    dest = "Kolibri-1-MLX-mixed-4-8-bit/tokenizer.json"
+    sha256 = "5d4798f2a8c9d598d6dc005614216989d4b6aeffaf9f6f5e136f0ec5fc4a4c13"
+    size = 9454692
+
+  # Hob-forge's Q4_K_M GGUF on CUDA (user-elected 2026-10-07). The default on
+  # every card, Blackwell too: on GB10 it decodes ~1.9x faster than the NVFP4
+  # build below (76 vs 40.5 tok/s at one stream, 138 vs ~104 aggregate at
+  # four), because NVFP4 keeps every non-expert plane BF16; NVFP4 only wins
+  # prompt processing, by ~8% at 10K. No llama.cpp release reads kolibri1 yet:
+  # the file was written by the patched converter the repo ships beside it.
+  # Aleph Alpha's own LICENSE rides along (the repo carries none), mirrored
+  # under its revision of the official release.
+  [[model.artifact]]
+  id = "q4"
+  kind = "weights"
+  format = "gguf"
+  label = "Compact"
+  quant = "Q4_K_M"
+  default = true
+  # The engine's own ledger at 262K x 4 on GB10 (2026-10-07): 50,929,723,336
+  # bytes held before the KV grant, less the 50.37 GB of weights below = 0.56
+  # GB of serving scratch; plus the 0.16 GiB of prefix checkpoints and the 89
+  # MB by which the 40 sliding rings (66 blocks a slot) exceed the window the
+  # shape prices them at.
+  workspace = 820487148
+
+  [model.artifact.source]
+  repo = "Hob-forge/Kolibri-1-GGUF"
+  revision = "47fb91b2420efeaa9c3df1259cd6b0c151a85048"
+  base_model = "Aleph-Alpha/Kolibri-1"
+  license = "apache-2.0"
+  license_url = "https://huggingface.co/Aleph-Alpha/Kolibri-1/blob/35bc4d3be745502227a67247de77d70e691614ee/LICENSE"
+
+  [model.artifact.runtime]
+  backends = ["cuda"]
+  companions = []
+  default_max_ctx = 262144
+  default_max_batch = 4
+  default_spec = "off"
+
+  # weight_bytes is the device-resident count (the fused attention and
+  # shared-expert gate|up planes ride beside their splits), not the file
+  # size. KV is 10
+  # full layers in the paged pool; the 40 sliding layers keep per-slot rings.
+  [model.artifact.shape]
+  weight_bytes = 50370000000
+  kind = "generative"
+  vocab = 128000
+  max_ctx = 262144
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = [
+    { k_dim = 512, v_dim = 512, window = 513, count = 40 },
+    { k_dim = 512, v_dim = 512, count = 10 },
+  ]
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Hob-forge/47fb91b2420efeaa9c3df1259cd6b0c151a85048/Kolibri-1-GGUF/Kolibri-1-Q4_K_M.gguf"
+    dest = "Kolibri-1-GGUF/Kolibri-1-Q4_K_M.gguf"
+    sha256 = "c2ac1301424441ef210b6de50ce25e8ccf69f86494df53d6ba52ed558456062e"
+    size = 47454113472
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Hob-forge/47fb91b2420efeaa9c3df1259cd6b0c151a85048/Kolibri-1-GGUF/README.md"
+    dest = "Kolibri-1-GGUF/README.md"
+    sha256 = "1b6d4a38cddb385eeea2a56055e61eb2ee1a8d830824466b211f379609fea326"
+    size = 6840
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Aleph-Alpha/35bc4d3be745502227a67247de77d70e691614ee/Kolibri-1-GGUF/LICENSE"
+    dest = "Kolibri-1-GGUF/LICENSE"
+    sha256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    size = 11358
+
+  # primitive-ai's NVFP4 checkpoint on CUDA (user-elected 2026-10-07):
+  # compressed-tensors, routed experts W4A4 NVFP4, everything else BF16. The
+  # Blackwell alternative to the GGUF above, not the default: it processes
+  # prompts ~8% faster (10.9K TTFT 2.67 vs 2.91 s on GB10) but decodes ~1.9x
+  # slower, since every non-expert plane stays BF16. sm_120a or better: the
+  # W4A16 decode consumers and the W4A4 block-scaled prefill pair compile
+  # under PD_BS_OK only.
+  [[model.artifact]]
+  id = "nvfp4"
+  kind = "weights"
+  format = "safetensors"
+  label = "Compact (Blackwell)"
+  quant = "NVFP4"
+  default = false
+  min_cc = [12, 0]
+  # The engine's own ledger at 262K x 4 on GB10 (2026-10-07): 49,963,509,832
+  # bytes held before the KV grant, less the 47.88 GB of weights below = 2.08
+  # GB of serving scratch (the 8192-row prefill chunk and its bf16 staging);
+  # plus the 0.16 GiB of prefix checkpoints and the 89 MB by which the 40
+  # sliding rings exceed the window the shape prices them at.
+  workspace = 2344273644
+
+  [model.artifact.source]
+  repo = "primitive-ai/Kolibri-1-NVFP4"
+  revision = "893bda0c210cf48a3f32ba5d40f4b65d1df82a09"
+  base_model = "Aleph-Alpha/Kolibri-1-BF16"
+  license = "apache-2.0"
+  license_url = "https://huggingface.co/primitive-ai/Kolibri-1-NVFP4/blob/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/LICENSE"
+
+  [model.artifact.runtime]
+  backends = ["cuda"]
+  companions = []
+  checkpoint_dir = true
+  default_max_ctx = 262144
+  default_max_batch = 4
+  default_spec = "off"
+
+  [model.artifact.shape]
+  weight_bytes = 47880000000
+  kind = "generative"
+  vocab = 128000
+  max_ctx = 262144
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = [
+    { k_dim = 512, v_dim = 512, window = 513, count = 40 },
+    { k_dim = 512, v_dim = 512, count = 10 },
+  ]
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/carry-bf16-000.safetensors"
+    dest = "Kolibri-1-NVFP4/carry-bf16-000.safetensors"
+    sha256 = "8c51f6f198465e83aad76de40a880c4ba141405dad4ce6c1a067e4e609082912"
+    size = 4353168064
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/carry-bf16-001.safetensors"
+    dest = "Kolibri-1-NVFP4/carry-bf16-001.safetensors"
+    sha256 = "f9119de5e7857fb8ccf6898d46e3a79f9ef455ff4e64fe65752f99f5df6b0ffe"
+    size = 858124512
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer00.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer00.safetensors"
+    sha256 = "243e6e13ce093cc8782f1aeb95fc52f959b53face4161ee3f92023e33505b03a"
+    size = 849917368
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer01.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer01.safetensors"
+    sha256 = "8aaf8c796637ff45c3c5c126173dd0a141020fe0de8c5db669ff0b634a501335"
+    size = 849917368
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer02.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer02.safetensors"
+    sha256 = "f4e1d0c2b3699c0bdd771ba0c8b7aafd7ef2f4e10af7e80976089bbef7cdf37b"
+    size = 849917368
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer03.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer03.safetensors"
+    sha256 = "03c8f3a46c64138b1a41a42fd46293cda10cfba79ab2f61e4576b77bf3a77a97"
+    size = 849917368
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer04.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer04.safetensors"
+    sha256 = "f3f7d27258fde38477b49822ca0c74e6c01c05ab2e50c45de4d2dae16eb1b55c"
+    size = 849917368
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer05.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer05.safetensors"
+    sha256 = "39b703d1e0da4525da257ee94f2cfe54cf83c464c3f2d739f9fc480bfa1f6f5c"
+    size = 849917368
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer06.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer06.safetensors"
+    sha256 = "4c2f69a95bb3111fdfab80c4d08a22974f2f2e68dccc98d9f6dced79f52dbc90"
+    size = 849917368
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer07.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer07.safetensors"
+    sha256 = "e2b28168bdd1dbaff5e02da2a46b335dc2b892e09efcace1b80310c2f58618d5"
+    size = 849917368
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer08.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer08.safetensors"
+    sha256 = "9fabc23892c08519a4778684f44d9f4403c90c19f679d348d514212bb6b81937"
+    size = 849917368
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer09.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer09.safetensors"
+    sha256 = "18138b15adb9c53f3efca7a2b7e69c264db92e9eb9a34705b01ed1fd9cee0b97"
+    size = 849917368
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer10.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer10.safetensors"
+    sha256 = "e9b92a77fbd88a7ca0bd5f67e0dfe69684ee68de9e700f1daf79bdc07d87f1c0"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer11.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer11.safetensors"
+    sha256 = "21c52538356ad63a93a790c9cdbd3da35c3fc4fda5fa498a945acc69ea5c4514"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer12.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer12.safetensors"
+    sha256 = "3186337322a4b8c86fa944f15182c1f9764db54e9cf9a09feb04fa755236a9be"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer13.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer13.safetensors"
+    sha256 = "da156496b02077a02a9f0db0f6884a53f64c7e93f55bdfa44c0c34f9cf2b9a33"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer14.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer14.safetensors"
+    sha256 = "fbbc1bc60ac996c1b6a9a637b767bfb553b51971bfb819041641d359485192a9"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer15.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer15.safetensors"
+    sha256 = "2856296d1cf66632b8af5da1243ff8329cab39944968cce55e23164964ae9bb2"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer16.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer16.safetensors"
+    sha256 = "7de95474d83580990bb833c4ad1e32c5581f5e871e2d1a03373bfa73a6092ac4"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer17.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer17.safetensors"
+    sha256 = "ba9619b6a80d8c5c5046c72d66cfc7aa0a443300d45176b6d2fa24ba0e9b6f0b"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer18.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer18.safetensors"
+    sha256 = "763ce27099349609799f873de81afab4b626411f4d288f86413a4023c257f980"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer19.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer19.safetensors"
+    sha256 = "68bf17e4dbb0f08bebfe87b15550f78be44c7927504ac3f17ef58028ef3dfb0c"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer20.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer20.safetensors"
+    sha256 = "794695cecc2628b0b1af51ce0b6fa6769e32abc1fca2c50d3dd426ffa3b5c38e"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer21.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer21.safetensors"
+    sha256 = "3f06d2eca3503f891feb25856f431346f0308fc6c8549ec0fbc2fd4133b10506"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer22.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer22.safetensors"
+    sha256 = "b9102bc859fdf54d14762b902bcc18fff5a295a2f1da31a21b7e5db62677f854"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer23.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer23.safetensors"
+    sha256 = "0063ca5e7eef034fb48dde66cd7ed6c3e67354797d99d71174046da83035d4f4"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer24.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer24.safetensors"
+    sha256 = "64d95d0782b1a4434810d8a9032da8b3f13c0f99632acdbdda4e9a604023351f"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer25.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer25.safetensors"
+    sha256 = "fff9a03747cc69c6cd8d4d157be734d634f45234a4667c8541bef7dd5dd10089"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer26.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer26.safetensors"
+    sha256 = "96d51341dd90cdf95e480f83f10fcce8a470cba4c3cbfa763541e5b94af9e921"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer27.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer27.safetensors"
+    sha256 = "3713b1265d5f2ce0c5d76b04f75b03481f4f150250fdc4a6509438c22fd89505"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer28.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer28.safetensors"
+    sha256 = "95440e46680be0cac386c4ac2aaff6399f12bff07a07aefeb3a054487e6f0953"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer29.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer29.safetensors"
+    sha256 = "8a9d6209b23317e97855e699fd7b0de67c3a34f6f80ea6b1c30e21e997eea94e"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer30.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer30.safetensors"
+    sha256 = "58052e1babc6a5d9f707e426776770ff2c0b1eede63039329119e52c74f56c5c"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer31.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer31.safetensors"
+    sha256 = "877d9627625a1b511a2d00386eee361709c2b24ae465144d5da9dbe96d847c2e"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer32.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer32.safetensors"
+    sha256 = "102b8aa341002dfeb0f85ac872110300e5de33a263dd35099bd7027093c5a383"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer33.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer33.safetensors"
+    sha256 = "a5ddad7a6b49e413e854d57b83dd85439cc1288c848c3e6a3149857e6f23d6d1"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer34.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer34.safetensors"
+    sha256 = "ba7e5cc9c0a1c47d7cd1d94981ac41f23f55a209da9d34a00c8dce5cd2c51b92"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer35.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer35.safetensors"
+    sha256 = "4cf8193cf45baf8cee00c77a572f5d8c617f99cc30f7f67243700877df92d811"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer36.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer36.safetensors"
+    sha256 = "823329cc6bee76ab347c97c2046732028a15b6a44f34ee610ef99a9f5317f451"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer37.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer37.safetensors"
+    sha256 = "32adfa173d029d49e920152a0cc2323b626d5c32b08282b9e3b85abf4741cb71"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer38.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer38.safetensors"
+    sha256 = "9f9c8d5cd025d6173347685ba2b79eb60dda9ccb1e664c3dc089b2c59a9d3ee4"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer39.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer39.safetensors"
+    sha256 = "78df0fc48a4d1bdc316d9c0aa4e3f96a02a6760046ab0f0e2dacf41a460b7425"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer40.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer40.safetensors"
+    sha256 = "8c1b3421e3a22deef310b28c406a68e14daeb6d1da4920aeadb11c7ce045aa01"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer41.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer41.safetensors"
+    sha256 = "e7fd6ac693679099df884df2337a8fac650f03bce21b4bd6b4cd1fcc291de44d"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer42.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer42.safetensors"
+    sha256 = "e34ec6794f91095847d60f3712416e987e001730c5b9d978452dfff1d17f4184"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer43.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer43.safetensors"
+    sha256 = "aa9fbecd69e860f1566dea152296cfd0ed7c496acadcf41e74e1cc9d2bde7b75"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer44.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer44.safetensors"
+    sha256 = "000c829de287328f4710baa6d33a25c166b9d6bfcc58a3223ecc0c5de2b13124"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer45.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer45.safetensors"
+    sha256 = "ee57ab3a48c46f3f41e8775139028a42d4228aef8d0793bf3e4fc9da0f962ecb"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer46.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer46.safetensors"
+    sha256 = "1774814ea7845794c0039aad253baf520fefb0becd12e99bcaec8c671a70a438"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer47.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer47.safetensors"
+    sha256 = "fc2bdf9cb7a56b8c2ca85bc857acf36bcbc9e4a1c7023b66bcff16909ffffc72"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer48.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer48.safetensors"
+    sha256 = "fa6ecfb0be5fd2a615d2b6de56a8aad0296796dfc62a3612bdf9d7067af9fffc"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/experts-layer49.safetensors"
+    dest = "Kolibri-1-NVFP4/experts-layer49.safetensors"
+    sha256 = "2da461e73108d442520c2c4295a49203a0b9fc42230dd7697af86ded0127c864"
+    size = 849921976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/config.json"
+    dest = "Kolibri-1-NVFP4/config.json"
+    sha256 = "066784d2adf9dbd61c5f351ca9417fac99a2425fdfa3839f6b03dacd24d19535"
+    size = 3028
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/generation_config.json"
+    dest = "Kolibri-1-NVFP4/generation_config.json"
+    sha256 = "40e0edd01855fc8abdfd2f7b0d4a54c52cf6dea3c678dc68b32c05f19c464450"
+    size = 152
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/LICENSE"
+    dest = "Kolibri-1-NVFP4/LICENSE"
+    sha256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    size = 11358
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/model.safetensors.index.json"
+    dest = "Kolibri-1-NVFP4/model.safetensors.index.json"
+    sha256 = "fe490a11e6bddb1f37477c8602eb5732953e01b98a591777b0a1adcb59f7797a"
+    size = 21102485
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/README.md"
+    dest = "Kolibri-1-NVFP4/README.md"
+    sha256 = "07671e2641f4c97c73ba7eee9b9c3c81e7968735b2db2b854fa956036b3ba1e8"
+    size = 11360
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/tokenizer.json"
+    dest = "Kolibri-1-NVFP4/tokenizer.json"
+    sha256 = "5d4798f2a8c9d598d6dc005614216989d4b6aeffaf9f6f5e136f0ec5fc4a4c13"
+    size = 9454692
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/primitive-ai/893bda0c210cf48a3f32ba5d40f4b65d1df82a09/Kolibri-1-NVFP4/tokenizer_config.json"
+    dest = "Kolibri-1-NVFP4/tokenizer_config.json"
+    sha256 = "876849ec94a65a6b72e3fd1c8d37cc00db9892d4fd84279eb51602ea06cd1b46"
+    size = 8513
+
+
 # Speaker activity is a separate API, never transcription/chat. R2 mirrors the
 # exact pinned upstream files, with model cards and OpenMDW-1.1 in each bundle.
 # Both artifacts serve on Metal and CUDA from the same files. weight_bytes is
@@ -211,6 +860,8 @@ revision = "2026-10-01"
 
 [[model]]
 id = "gpt-oss-20b"
+# KV8 by default (2026-10-04): mirrors the engine family default
+kv_default = "fp8_e4m3"
 vendor = "OpenAI"
 display = "GPT-OSS 20B"
 family = "gpt-oss"
@@ -307,6 +958,8 @@ revision = "2026-08-01"
 # the split path an earlier change added is no longer exercised here.
 [[model]]
 id = "gpt-oss-120b"
+# KV8 by default (2026-10-04): mirrors the engine family default
+kv_default = "fp8_e4m3"
 vendor = "OpenAI"
 display = "GPT-OSS 120B"
 family = "gpt-oss"
@@ -425,8 +1078,9 @@ family = "gemma-4"
 capability = ["chat", "vision", "reasoning", "speculative"]
 license = "gemma"
 revision = "2026-08-01"
-# the one family whose KV pool is fp8 by default (gpu_model/gemma4/batch.rs
-# alloc_kv); everything else serves f16. Keep in step with the engine.
+# gemma4 pools its KV at fp8 by default (gpu_model/gemma4/batch.rs alloc_kv),
+# as every generative family does since 2026-10-04 but paddleocr-vl,
+# deepseek-ocr and qwen3-asr. Keep in step with the engine.
 kv_default = "fp8_e4m3"
 
   [model.specs]
@@ -1007,6 +1661,8 @@ kv_default = "fp8_e4m3"
 
 [[model]]
 id = "qwen3.5-9b"
+# KV8 by default (2026-10-04): mirrors the engine family default
+kv_default = "fp8_e4m3"
 mtp_in_file = true
 vendor = "Alibaba"
 display = "Qwen 3.5 9B"
@@ -1113,6 +1769,8 @@ revision = "2026-08-01"
 
 [[model]]
 id = "qwen3.6-27b"
+# KV8 by default (2026-10-04): mirrors the engine family default
+kv_default = "fp8_e4m3"
 mtp_in_file = true
 vendor = "Alibaba"
 display = "Qwen 3.6 27B"
@@ -1219,6 +1877,8 @@ revision = "2026-08-01"
 
 [[model]]
 id = "qwen3.6-35b-a3b"
+# KV8 by default (2026-10-04): mirrors the engine family default
+kv_default = "fp8_e4m3"
 mtp_in_file = true
 vendor = "Alibaba"
 display = "Qwen 3.6 35B A3B"
@@ -1324,6 +1984,8 @@ revision = "2026-08-01"
 
 [[model]]
 id = "qwen3.8-27b"
+# KV8 by default (2026-10-04): mirrors the engine family default
+kv_default = "fp8_e4m3"
 mtp_in_file = true
 vendor = "Alibaba"
 display = "Qwen 3.8 27B"
@@ -1352,7 +2014,11 @@ revision = "2026-08-15"
 
   [[model.artifact]]
   id = "q8"
-  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { default = false, qualification = "qualified", kv_cache_dtype = "f16", companions = ["vision","drafter2"], note = "Metal graph exists, but this Q8 artifact has not completed the Q4 checkpoint's real-model qualification." } } }
+  # CUDA starts that name no window target the model's full 262K at 4 slots
+  # (decided 2026-10-04: agent sessions run 100K+ deep and compact near the top);
+  # admission fits it down to the card's ladder rung, and the Studio form
+  # proposes the same rung. Metal keeps its own 32K personal-chat default.
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { cuda = { default_max_ctx = 262144, default_max_batch = 4 }, metal = { default = false, qualification = "qualified", kv_cache_dtype = "f16", companions = ["vision","drafter2"], note = "Metal graph exists, but this Q8 artifact has not completed the Q4 checkpoint's real-model qualification." } } }
   kind = "weights"
   format = "gguf"
   label = "Full quality"
@@ -1391,7 +2057,8 @@ revision = "2026-08-15"
   # Keeps the nextn block, so spec/MTP survives the quantisation.
   [[model.artifact]]
   id = "q4"
-  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { default = true, qualification = "qualified", kv_cache_dtype = "f16", companions = ["vision","drafter2"], note = "Metal GGUF with F16 KV, canonical vision and nextn MTP/DFlash2. Broader qualification remains open." } } }
+  # Same fit-aware 262K x 4 CUDA target as Q8_0 above.
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { cuda = { default_max_ctx = 262144, default_max_batch = 4 }, metal = { default = true, qualification = "qualified", kv_cache_dtype = "f16", companions = ["vision","drafter2"], note = "Metal GGUF with F16 KV, canonical vision and nextn MTP/DFlash2. Broader qualification remains open." } } }
   kind = "weights"
   format = "gguf"
   label = "Compact"
@@ -1439,6 +2106,9 @@ revision = "2026-08-15"
   format = "gguf"
   label = "Compact (smaller)"
   quant = "UD-Q3_K_XL"
+  # Same fit-aware 262K x 4 target as Q8_0 (CUDA-only artifact); the small
+  # cards this file is for get whatever rung admission finds room for.
+  runtime = { default_max_ctx = 262144, default_max_batch = 4 }
 
   [model.artifact.shape]
   weight_bytes = 14388711520
@@ -2559,6 +3229,8 @@ kv_default = "fp8_e4m3"
 
 [[model]]
 id = "minicpm5-2b"
+# KV8 by default (2026-10-04): mirrors the engine family default
+kv_default = "fp8_e4m3"
 vendor = "OpenBMB"
 display = "MiniCPM5 2B"
 family = "minicpm"
@@ -2761,6 +3433,8 @@ revision = "2026-09-22"
 
 [[model]]
 id = "qwen3.8-flash-next"
+# KV8 by default (2026-10-04): mirrors the engine family default
+kv_default = "fp8_e4m3"
 vendor = "Alibaba"
 display = "Qwen 3.8 Flash Next"
 family = "qwen3.8"
@@ -3608,6 +4282,8 @@ revision = "2026-09-08"
 
 [[model]]
 id = "laguna-xs-2.1"
+# KV8 by default (2026-10-04): mirrors the engine family default
+kv_default = "fp8_e4m3"
 vendor = "Poolside"
 display = "Laguna XS 2.1"
 family = "laguna"
@@ -3737,6 +4413,8 @@ revision = "2026-08-02"
 
 [[model]]
 id = "laguna-s-2.1"
+# KV8 by default (2026-10-04): mirrors the engine family default
+kv_default = "fp8_e4m3"
 vendor = "Poolside"
 display = "Laguna S 2.1"
 family = "laguna"
@@ -3844,6 +4522,8 @@ revision = "2026-08-05"
 
 [[model]]
 id = "granite-4.1-8b"
+# KV8 by default (2026-10-04): mirrors the engine family default
+kv_default = "fp8_e4m3"
 vendor = "IBM"
 display = "Granite 4.1 8B"
 family = "granite"
@@ -3900,6 +4580,8 @@ revision = "2026-08-04"
 
 [[model]]
 id = "granite-4.1-30b"
+# KV8 by default (2026-10-04): mirrors the engine family default
+kv_default = "fp8_e4m3"
 vendor = "IBM"
 display = "Granite 4.1 30B"
 family = "granite"
@@ -3999,6 +4681,8 @@ revision = "2026-08-04"
 
 [[model]]
 id = "granite-4.2-8b"
+# KV8 by default (2026-10-04): mirrors the engine family default
+kv_default = "fp8_e4m3"
 vendor = "IBM"
 display = "Granite 4.2 8B"
 family = "granite"
@@ -4252,6 +4936,8 @@ revision = "2026-08-25"
 
 [[model]]
 id = "granite-4.2-30b"
+# KV8 by default (2026-10-04): mirrors the engine family default
+kv_default = "fp8_e4m3"
 vendor = "IBM"
 display = "Granite 4.2 30B"
 family = "granite"
@@ -4557,6 +5243,8 @@ revision = "2026-08-25"
 
 [[model]]
 id = "granite-vision-4.1-4b"
+# KV8 by default (2026-10-04): mirrors the engine family default
+kv_default = "fp8_e4m3"
 vendor = "IBM"
 display = "Granite 4.1 Vision 4B"
 family = "granite"
@@ -4637,6 +5325,8 @@ revision = "2026-08-05"
 # attribution travel with the row.
 [[model]]
 id = "unlimited-ocr"
+# KV stays f16, the family default (G=1 has no fp8 prefill tile) - the loader says why
+kv_default = "f16"
 vendor = "Baidu"
 display = "Unlimited-OCR"
 family = "deepseek-ocr"
@@ -4750,6 +5440,8 @@ revision = "2026-08-13"
 # model directory.
 [[model]]
 id = "paddleocr-vl-1.6"
+# KV stays f16, the family default (its WMMA prefill gate is f16-only) - the loader says why
+kv_default = "f16"
 vendor = "PaddlePaddle"
 display = "PaddleOCR-VL 1.6"
 family = "paddleocr-vl"
@@ -5165,6 +5857,8 @@ kv_default = "fp8_e4m3"
 # (--model <dir>), not a GGUF conversion.
 [[model]]
 id = "nemotron-3.5-lightning-30b"
+# KV8 by default (2026-10-04): mirrors the engine family default
+kv_default = "fp8_e4m3"
 mtp_in_file = true
 vendor = "NVIDIA"
 display = "Nemotron 3.5 Lightning 30B-A3B"
@@ -5197,7 +5891,12 @@ revision = "2026-08-18"
   format = "gguf"
   label = "Full quality"
   quant = "Q8_0"
-  default = true
+  # The default off Blackwell: NVFP4 (below) is the marked default and
+  # `default_weights_for` falls back to this floorless lane where it cannot
+  # run (decided 2026-10-04 - the granite-4.2 precedent; every agentic board ran
+  # the NVFP4 lane). Its drafter is the in-file MTP head, so `companions = []`
+  # keeps DSpark/DFlash (NVFP4 drafters) off this lane.
+  default = false
   # No min_cc: the Q8_0 lane is the int8 dp4a ladder, which every generation we
   # serve has. Verified live on an RTX A6000 (sm_86) - loads in ~20 s, 33.11
   # GiB resident measured by bracketing nvidia-smi across the run. sm_86
@@ -5213,6 +5912,14 @@ revision = "2026-08-18"
   # below stay unchanged. Independent testing continues.
   [model.artifact.runtime]
   backends = ["cuda", "metal"]
+  companions = []
+  # CUDA starts that name no window target 262K at 4 slots (decided 2026-10-04:
+  # agent sessions run 100K+ deep), fitted to the card at admission like the
+  # Studio form; six attention layers make the window cheap - the slots are
+  # what cost (mamba arenas). Metal keeps its own 32K default.
+  [model.artifact.runtime.backend_overrides.cuda]
+  default_max_ctx = 262144
+  default_max_batch = 4
   [model.artifact.runtime.backend_overrides.metal]
   qualification = "qualified"
   capability = ["chat", "tools", "reasoning"]
@@ -5263,7 +5970,9 @@ revision = "2026-08-18"
   format = "safetensors"
   label = "Compact (Blackwell)"
   quant = "NVFP4"
-  default = false
+  # The default on Blackwell (decided 2026-10-04): the lane every agentic and
+  # rival board ran; Q8_0 above is the default everywhere else.
+  default = true
   # sm_120a or better, same reason as the Qwen3.8 NVFP4 artifact: the W4A16
   # nvf4 consumers compile under PD_BS_OK (__CUDA_ARCH__ >= 1200 && SM120_ALL).
   # The floor is a KERNEL fact, not a format one - NVFP4 is a storage format and
@@ -5279,6 +5988,10 @@ revision = "2026-08-18"
   # KV pool the estimator prices separately is added back). The arenas dominate
   # and scale with SLOTS, not with context - the opposite of a KV cache.
   workspace = 1899342848
+  # Same 262K x 4 CUDA target as Q8_0 above. No published shape to fit with
+  # yet, so admission writes the target as is; at ~3 KB of fp8 KV a token
+  # (six attention layers) it is ~3.75 GiB of pool at 4+1 sequences.
+  runtime = { default_max_ctx = 262144, default_max_batch = 4 }
 
     [[model.artifact.file]]
     url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4/model-00001-of-00052.safetensors"
@@ -5695,9 +6408,11 @@ revision = "2026-08-18"
   # every "the model's drafter" lookup lands here. Measured on GB10 (32K, 1
   # slot, DSpark vs DFlash at their elected depths): tool-carrying sampled
   # 126.5 vs 118.0 tok/s, code 129.7 vs 105.4, 24K code 120.8 vs ~111; and it
-  # keeps paying up to 8 live sessions. Not default, same stance as DFlash
-  # below: speculation is a user toggle and the drafter costs VRAM (its K/V
-  # rides the KV pool). Mirror bytes verified identical to the upstream
+  # keeps paying up to 8 live sessions; a Claude Code replay to 248K decodes
+  # at 105.6 tok/s on it. The DEFAULT drafter on Blackwell (decided 2026-10-04):
+  # pulled and wired with the NVFP4 lane, the way qwen3.8's DFlash2 is - the
+  # min_cc floor keeps it off cards that cannot run its NVFP4 planes, and the
+  # Q8_0 lane's empty companion list keeps it off that lane. Mirror bytes verified identical to the upstream
   # download (weights: the R2 ETag is the file's MD5; the README is the
   # mirror's own revision).
   [[model.artifact]]
@@ -5705,7 +6420,8 @@ revision = "2026-08-18"
   kind = "drafter"
   format = "safetensors"
   label = "Speed boost (draft model)"
-  default = false
+  default = true
+  min_cc = [12, 0]
 
     [[model.artifact.file]]
     url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark/model.safetensors"
@@ -5742,13 +6458,14 @@ revision = "2026-08-18"
   # not carry - so a sideloaded block drafter is the NVFP4 lane's
   # (nemotron/load.rs). Superseded by DSpark above on every measured leg; kept
   # so existing installs and pins still resolve.
-  # Not default: speculation is a user toggle and it costs VRAM.
+  # Not default: DSpark above is the elected drafter.
   [[model.artifact]]
   id = "dflash"
   kind = "drafter"
   format = "safetensors"
   label = "Speed boost (earlier DFlash drafter)"
   default = false
+  min_cc = [12, 0]
 
     [[model.artifact.file]]
     url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DFlash/model.safetensors"
@@ -5934,6 +6651,104 @@ revision = "2026-08-01"
     dest = "Qwen3-Embedding-8B-GGUF/Qwen3-Embedding-8B-Q8_0.gguf"
     sha256 = "d20ddc71e8a5c4344f2343481e242233a997dc5eaff442427a945836c97b4deb"
     size = 8047105824
+
+# EmbeddingGemma 2 (Google DeepMind): text, pictures and audio in one 768-wide
+# vector space. unsloth's Q8_0 GGUF (Google ships none) is the text model;
+# unsloth ships its two media towers in ONE projector (mmproj-BF16.gguf), and
+# the model card's "selectively loadable" towers are the point of this row,
+# so the catalog carries OUR byte-for-byte cut of that file into a picture
+# tower and an audio tower (the EmbeddingGemma 2 mmproj split script: every
+# tensor copied unchanged, verified against the source, only the other
+# tower's clip.* keys dropped) - a named exception to the sourcing rule. Pictures
+# ride the default download, audio is the opt-in one (the bigger file).
+# CUDA only: the Metal lane serves the MLX checkpoint, text only, and is not
+# a catalog artifact. Measured on GB10 (2026-10-07): an 8K-token pass holds
+# ~480 MiB of scratch (the weights' workspace), a picture encode ~162 MiB at
+# the 280-token budget, a 30 s clip ~32 MiB (the towers' workspaces); the
+# towers' resident bytes are their files.
+[[model]]
+id = "embeddinggemma-2"
+vendor = "Google"
+display = "EmbeddingGemma 2"
+family = "embeddinggemma"
+capability = ["embeddings"]
+license = "apache-2.0"
+revision = "2026-10-07"
+
+  [model.specs]
+  params = "740M (270M text, 170M pictures, 300M audio)"
+  context = "8K"
+  dims = "768, down to 128 (Matryoshka)"
+  published_at = "2026-10-06"
+  published_source = "https://blog.google/innovation-and-ai/technology/developers-tools/embeddinggemma-2"
+  homepage = "https://huggingface.co/google/embeddinggemma-2"
+  about = "Turns text, pictures and audio into vectors in one shared space - search photos or recordings with words, or the other way round."
+  strengths = [
+    "Text, pictures and audio in one vector space · 100+ languages and code",
+    "Small - 0.3 GB for text; pictures (+0.4 GB) and audio (+0.6 GB) are optional downloads",
+  ]
+  tradeoffs = [
+    "Audio clips up to 30 seconds each; video is not served yet",
+  ]
+
+  [[model.artifact]]
+  id = "q8"
+  kind = "weights"
+  format = "gguf"
+  label = "Full quality"
+  quant = "Q8_0"
+  default = true
+  workspace = 503316480
+  source = { repo = "unsloth/embeddinggemma-2-GGUF", revision = "ba3888272494be64ed88c9eb536ddc61a1be73d5", base_model = "google/embeddinggemma-2", license = "apache-2.0", license_url = "https://ai.google.dev/gemma/docs/gemma_4_license" }
+
+  [model.artifact.shape]
+  weight_bytes = 294064128
+  kind = "encoder"
+  vocab = 262144
+  max_ctx = 8192
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = [
+    { k_dim = 512, v_dim = 512, window = 1024, count = 20 },
+    { k_dim = 512, v_dim = 512, count = 4 },
+  ]
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/EmbeddingGemma-2-GGUF/embeddinggemma-2-Q8_0.gguf"
+    dest = "EmbeddingGemma-2-GGUF/embeddinggemma-2-Q8_0.gguf"
+    sha256 = "6f1bd4ac6c5df7444f9cca7ca36cafe6cfa34cd6f49fefb1e0b4be8143aed8bc"
+    size = 309855520
+
+  # the picture tower, cut from unsloth's mmproj-BF16.gguf at the same revision
+  [[model.artifact]]
+  id = "vision"
+  kind = "vision"
+  format = "gguf"
+  label = "Pictures (image input)"
+  default = true
+  workspace = 169869312
+  source = { repo = "unsloth/embeddinggemma-2-GGUF", revision = "ba3888272494be64ed88c9eb536ddc61a1be73d5", base_model = "google/embeddinggemma-2", license = "apache-2.0", license_url = "https://ai.google.dev/gemma/docs/gemma_4_license" }
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/EmbeddingGemma-2-GGUF/embeddinggemma-2-mmproj-vision-BF16.gguf"
+    dest = "EmbeddingGemma-2-GGUF/embeddinggemma-2-mmproj-vision-BF16.gguf"
+    sha256 = "0ad80061179c86c867b64fad424d3d81942ce6e27326eeb23e9505d553c23078"
+    size = 368268992
+
+  # the audio tower, the same file's other half - the opt-in download
+  [[model.artifact]]
+  id = "audio"
+  kind = "audio"
+  format = "gguf"
+  label = "Audio input (speech and sound)"
+  workspace = 33554432
+  source = { repo = "unsloth/embeddinggemma-2-GGUF", revision = "ba3888272494be64ed88c9eb536ddc61a1be73d5", base_model = "google/embeddinggemma-2", license = "apache-2.0", license_url = "https://ai.google.dev/gemma/docs/gemma_4_license" }
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/EmbeddingGemma-2-GGUF/embeddinggemma-2-mmproj-audio-BF16.gguf"
+    dest = "EmbeddingGemma-2-GGUF/embeddinggemma-2-mmproj-audio-BF16.gguf"
+    sha256 = "1aec404e75971296c155d9e62a8d0cc1d8efceda54065f7ebb7aacf6a813d0a2"
+    size = 613806752
 
 # ── rerankers ────────────────────────────────────────────────────────────────
 
@@ -6820,6 +7635,8 @@ revision = "2026-10-03"
 
 [[model]]
 id = "qwen3-asr-1.7b"
+# KV stays f16, the family default (no group-2 fp8 prefill tile; f16 measured faster) - the loader says why
+kv_default = "f16"
 vendor = "Alibaba"
 display = "Qwen3-ASR 1.7B"
 family = "qwen3"
@@ -6928,6 +7745,8 @@ revision = "2026-08-09"
 
 [[model]]
 id = "qwen3-forced-aligner-0.6b"
+# KV stays f16, the family default (the qwen3-asr family's class) - the loader says why
+kv_default = "f16"
 vendor = "Alibaba"
 display = "Qwen3 Forced Aligner 0.6B"
 family = "qwen3"
@@ -7039,6 +7858,8 @@ revision = "2026-08-14"
 
 [[model]]
 id = "granite-speech-4.1-2b"
+# KV8 by default (2026-10-04): mirrors the engine family default
+kv_default = "fp8_e4m3"
 vendor = "IBM"
 display = "Granite Speech 4.1 2B"
 family = "granite"
@@ -7138,6 +7959,8 @@ revision = "2026-08-09"
 
 [[model]]
 id = "granite-speech-4.1-2b-plus"
+# KV8 by default (2026-10-04): mirrors the engine family default
+kv_default = "fp8_e4m3"
 vendor = "IBM"
 display = "Granite Speech 4.1 2B Plus"
 family = "granite"
@@ -7235,6 +8058,8 @@ revision = "2026-08-09"
 
 [[model]]
 id = "kb-whisper-large"
+# KV8 by default (2026-10-04): mirrors the engine family default
+kv_default = "fp8_e4m3"
 vendor = "KBLab"
 display = "KB-Whisper Large (Swedish)"
 family = "whisper"
@@ -7308,6 +8133,8 @@ revision = "2026-08-09"
 
 [[model]]
 id = "nb-whisper-large"
+# KV8 by default (2026-10-04): mirrors the engine family default
+kv_default = "fp8_e4m3"
 vendor = "NB AI-Lab"
 display = "NB-Whisper Large (Norwegian)"
 family = "whisper"
@@ -7398,6 +8225,8 @@ revision = "2026-08-09"
 # we first pulled it under.
 [[model]]
 id = "roest-v3-whisper-1.5b"
+# KV8 by default (2026-10-04): mirrors the engine family default
+kv_default = "fp8_e4m3"
 vendor = "CoRal Project"
 display = "Røst v3 Whisper 1.5B (Danish)"
 family = "whisper"
@@ -8225,3 +9054,114 @@ revision = "2026-09-22"
     dest = "Qwen-Image-2.1/LICENSE"
     sha256 = "8dc973f024ff95966bea25866efa443fd16776dcb1001e681e3d467ea572b28d"
     size = 7831
+
+# -- promptable segmentation ---------------------------------------------------
+# SAM 3 (Meta): a picture and a concept in words ("yellow school bus") and/or
+# exemplar boxes in, every matching object's mask, box and score out, served
+# on POST /v1/masks (COCO RLE masks). Never chat: a picture and a prompt are
+# the whole input. CUDA only for now.
+#
+# NOT mirrored. The SAM License lets us use the weights but Meta gates them
+# behind its terms on Hugging Face, so the files download from facebook/sam3
+# itself, with the user's own Hugging Face token, once they have accepted the
+# terms there (`source.gated`, registry/gated.rs). The revision and every hash
+# are pinned exactly as for our mirror. Only what the engine reads is fetched:
+# model.safetensors (F32, byte-identical to Meta's sam3.pt, which is a pickle
+# and never downloaded), config.json and tokenizer.json, with Meta's LICENSE
+# and model card beside them.
+#
+# A single-pass model: nothing is cached between calls except the last
+# picture's encoding and the last prompt's text features (exact reuse, by
+# bytes). weight_bytes is the loader's own count (A6000, 2026-10-06: image
+# encoder 881 + text tower 770 + detector 66 MiB of f16 planes); workspace is
+# the resident planes (1654 MiB) plus the request planes for a 24 MP picture
+# and its run lists (124 MiB).
+[[model]]
+id = "sam3"
+vendor = "Meta"
+display = "SAM 3"
+family = "sam3"
+capability = ["masks"]
+license = "sam-license"
+revision = "2026-10-07"
+
+  [model.specs]
+  published_at = "2025-11-19"
+  published_source = "https://huggingface.co/facebook/sam3"
+  params = "860M"
+  context = "One picture up to 24 MP, a prompt of up to 30 tokens, 16 exemplar boxes"
+  homepage = "https://huggingface.co/facebook/sam3"
+  about = "Finds every object that matches a short description - or that looks like a box you drew - and returns each one's mask, box and score. Ask again about the same picture and only the prompt is new work."
+  strengths = [
+    "Every instance of a concept in one request, not one object per click",
+    "Text, example boxes, or both - negative boxes say what not to include",
+    "A repeated picture skips its encoding: new prompts come back in milliseconds",
+  ]
+  tradeoffs = [
+    "Gated: accept Meta's licence on Hugging Face and use your own token to download",
+    "Short noun phrases, not instructions - it finds things, it does not reason",
+    "CUDA only for now; video tracking and click prompts are still to come",
+  ]
+
+  [[model.artifact]]
+  id = "f32"
+  kind = "weights"
+  format = "safetensors"
+  label = "Official F32 (served as f16)"
+  quant = "F32"
+  default = true
+  workspace = 1863899136
+
+  [model.artifact.source]
+  repo = "facebook/sam3"
+  base_model = "facebook/sam3"
+  license_url = "https://huggingface.co/facebook/sam3/blob/3c879f39826c281e95690f02c7821c4de09afae7/LICENSE"
+  revision = "3c879f39826c281e95690f02c7821c4de09afae7"
+  license = "sam-license"
+  gated = true
+
+  [model.artifact.runtime]
+  backends = ["cuda"]
+  checkpoint_dir = true
+  # one model, one pass: no drafter, no tower, nothing rides along
+  companions = []
+
+  [model.artifact.shape]
+  weight_bytes = 1801453568
+  kind = "encoder"
+  vocab = 0
+  max_ctx = 32
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = []
+
+    [[model.artifact.file]]
+    url = "https://huggingface.co/facebook/sam3/resolve/3c879f39826c281e95690f02c7821c4de09afae7/model.safetensors"
+    dest = "sam3/model.safetensors"
+    sha256 = "6d06f0a5f84e435071fe6603e61d0b4cc7b40e0d39d487cfd4d67d8cc11cc14a"
+    size = 3439938512
+
+    [[model.artifact.file]]
+    url = "https://huggingface.co/facebook/sam3/resolve/3c879f39826c281e95690f02c7821c4de09afae7/config.json"
+    dest = "sam3/config.json"
+    sha256 = "4616385e4b21f2e5e22c875b65679185cbccfa95de42542b9166f7dc3d57160f"
+    size = 25843
+
+    [[model.artifact.file]]
+    url = "https://huggingface.co/facebook/sam3/resolve/3c879f39826c281e95690f02c7821c4de09afae7/tokenizer.json"
+    dest = "sam3/tokenizer.json"
+    sha256 = "6d9109cc838977f3ca94a379eec36aecc7c807e1785cd729660ca2fc0171fb35"
+    size = 3642073
+
+    [[model.artifact.file]]
+    url = "https://huggingface.co/facebook/sam3/resolve/3c879f39826c281e95690f02c7821c4de09afae7/LICENSE"
+    dest = "sam3/LICENSE"
+    sha256 = "bec48f70bd37bf8280a9d1ebf01642d26086f6122ba735baa08fe03c5a6e7448"
+    size = 7352
+
+    # Meta's own model card - the loud-attribution file
+    [[model.artifact.file]]
+    url = "https://huggingface.co/facebook/sam3/resolve/3c879f39826c281e95690f02c7821c4de09afae7/README.md"
+    dest = "sam3/README.md"
+    sha256 = "1ac8a322aa4a797db79cbc334acee7c0cae8635032b71c7d5b23ae63a05f4bd5"
+    size = 26038

@@ -47,26 +47,26 @@ use super::{DensePlane, DenseStage, Embed, ExpertSeats, HcW, KqSeat, MixerW, Ple
 pub(super) use ple::ple_row_bytes;
 use ple::{ple_device_table, warm_ple_table};
 
-/// Attention KV element type. f16 is the narrowest class the pack's attention
-/// lanes take (there is no f32 KV kernel); the rival stores BF16, which carries
-/// three FEWER mantissa bits, so this is not a fairness concession - but it is
-/// the dominant deviation from the f32 host reference, and the full-forward
-/// gate is stated in those terms.
-///
-/// `PADDOCK_Q38FN_KV8=1` stores e4m3 instead: halves KV bytes for every
-/// attention lane AND is the pool class the tcgen05 decode arm (slot 431)
-/// requires - its TMA maps and in-kernel e4m3->bf16 converts assume 1-byte
-/// elements, so f16 pools can never elect it. A numerics CLASS change
-/// (quality-gated, not bit-gated), which is why it is opt-in.
+/// Attention KV element type: fp8-e4m3 (KV8) by default since 2026-10-04 -
+/// half the KV bytes, and the pool class the tcgen05 decode arm (slot 431)
+/// requires; ppl 2.01838 -> 2.02698 against f16, imax +12.3%. The runner's
+/// `kv_cache_dtype` arrives as `PADDOCK_KV_CACHE_DTYPE` (this lane skips
+/// serving.rs's apply_kv_dtype; the pick is process-global because every
+/// pool and graph is sized from it) - before, the catalog's pin was a silent
+/// no-op. `PADDOCK_Q38FN_KV8` (1 fp8, 0 f16) wins; the exact gates pin f16.
 #[allow(non_snake_case)]
 fn KV() -> KvDtype {
     use std::sync::OnceLock;
     static V: OnceLock<KvDtype> = OnceLock::new();
     *V.get_or_init(|| {
-        if matches!(std::env::var("PADDOCK_Q38FN_KV8").as_deref(), Ok("1")) {
-            KvDtype::Fp8E4m3
-        } else {
-            KvDtype::Fp16
+        match std::env::var("PADDOCK_Q38FN_KV8").as_deref() {
+            Ok("1") => return KvDtype::Fp8E4m3,
+            Ok("0") => return KvDtype::Fp16,
+            _ => {}
+        }
+        match std::env::var("PADDOCK_KV_CACHE_DTYPE").as_deref() {
+            Ok("f16") => KvDtype::Fp16,
+            _ => KvDtype::Fp8E4m3,
         }
     })
 }
@@ -1800,14 +1800,14 @@ impl Qwen4ExpGpu {
         let cuts = if self.prefix.is_some() {
             super::prefix::ckpt_cuts(n)
         } else {
-            [0, 0]
+            [0, 0, 0]
         };
         let mut pos = start;
         self.mtp_begin(slot, start);
         // The checkpoints taken inside the one walk: a cut walk on this
         // routed-expert family costs rows, not a weight pass (~290 ms of a
-        // 1024-token prompt as two 16-row walks). The pn recurrence is the
-        // one that can stop at a cut row, so its absence keeps the cut walks.
+        // 1024-token prompt as two 16-row walks), so the cut-walk fallback
+        // (no pn recurrence to stop at a cut row) skips the back-off cut.
         if self.prefix.is_some()
             && super::inwalk_ckpt_enabled()
             && self.exec.has_gated_delta_recurrent_pn()
@@ -1838,7 +1838,7 @@ impl Qwen4ExpGpu {
             self.reply_track_admit(slot);
             return Ok(logits);
         }
-        for c in cuts {
+        for c in cuts.into_iter().skip(1) {
             if c <= pos || c >= n {
                 continue;
             }

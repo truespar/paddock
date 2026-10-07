@@ -466,117 +466,11 @@ int pd_q8_0_moe_gate_up_sorted(const void* gate_data, const void* gate_scale,
     return pd_launch_status();
 }
 
-// Sorted single-plane up + squared-relu (nemotron_h_moe: no gate matrix).
-// Same tile shape/staging as the gate_up kernel above with one weight
-// stream, plus a K-tail guard: nemotron's dims are 32-aligned but not
-// 256-aligned (hidden 2688, moe_ff 1856, shared_ff 3712), so the last BK
-// chunk stages partially - out-of-range words and scales stage as zero
-// (dp4a over zeros adds nothing, and the zero scale keeps 0*x finite),
-// which leaves fully-aligned shapes bit-identical to the unguarded walk.
-__global__ void __launch_bounds__(256) pd_q8_0_moe_up_relu2_sorted_kernel(
-    const int8_t* __restrict__ up_data, const __half* __restrict__ up_scale,
-    const unsigned int* __restrict__ sorted_row, const unsigned int* __restrict__ block_expert,
-    const int8_t* __restrict__ xq, const float* __restrict__ xs,
-    float* __restrict__ fused, uint32_t in_dim, uint32_t ff) {
-    const uint32_t blk = blockIdx.y;
-    const uint32_t e = block_expert[blk];
-    if (e == PD_MOE_PAD) return;
-    const uint32_t o0 = blockIdx.x * PD_QMOE_BN;
-    const uint32_t tid = threadIdx.x;
-    const uint32_t row = tid >> 3, n = tid & 7u;
-    const uint32_t n_blocks = in_dim >> 5;
-    const uint32_t n_words = in_dim >> 2; // int32 words per row
-
-    __shared__ int sx[PD_QMOE_BM * PD_QMOE_XW];
-    __shared__ float sxs[PD_QMOE_BM][PD_QMOE_BK / 32u];
-    __shared__ int swu[PD_QMOE_BN * PD_QMOE_WW];
-    __shared__ float swsu[PD_QMOE_BN][PD_QMOE_BK / 32u];
-
-    const unsigned int srow = sorted_row[blk * PD_QMOE_BM + row];
-    float accu[2] = {0.0f, 0.0f};
-
-    for (uint32_t k0 = 0; k0 < in_dim; k0 += PD_QMOE_BK) {
-        const uint32_t w_base = k0 >> 2, b_base = k0 >> 5;
-        {
-            const uint32_t r = tid >> 3, w0 = (tid & 7u) * 8u;
-            const unsigned int xr = sorted_row[blk * PD_QMOE_BM + r];
-            const bool live_r = xr != PD_MOE_PAD;
-            const int* src = reinterpret_cast<const int*>(xq + (size_t)(live_r ? xr : 0u) * in_dim);
-#pragma unroll
-            for (uint32_t i = 0; i < 8u; ++i) {
-                const uint32_t w = w0 + i;
-                sx[r * PD_QMOE_XW + w] = (live_r && w_base + w < n_words) ? src[w_base + w] : 0;
-            }
-            if ((tid & 7u) == 0) {
-#pragma unroll
-                for (uint32_t b = 0; b < PD_QMOE_BK / 32u; ++b)
-                    sxs[r][b] = (live_r && b_base + b < n_blocks)
-                        ? xs[(size_t)xr * n_blocks + b_base + b]
-                        : 0.0f;
-            }
-        }
-        for (uint32_t i = tid; i < PD_QMOE_BN * 64u; i += 256u) {
-            const uint32_t on = i >> 6, w = i & 63u;
-            const uint32_t o = o0 + on;
-            const int* src = reinterpret_cast<const int*>(
-                up_data + ((size_t)e * ff + (o < ff ? o : ff - 1u)) * in_dim);
-            swu[on * PD_QMOE_WW + w] = (w_base + w < n_words) ? src[w_base + w] : 0;
-        }
-        if (tid < PD_QMOE_BN * (PD_QMOE_BK / 32u)) {
-            const uint32_t on = tid / (PD_QMOE_BK / 32u), b = tid % (PD_QMOE_BK / 32u);
-            const uint32_t o = o0 + on;
-            swsu[on][b] = (b_base + b < n_blocks)
-                ? __half2float(up_scale[((size_t)e * ff + (o < ff ? o : ff - 1u)) * n_blocks + b_base + b])
-                : 0.0f;
-        }
-        __syncthreads();
-#pragma unroll
-        for (uint32_t b = 0; b < PD_QMOE_BK / 32u; ++b) {
-            int iu0 = 0, iu1 = 0;
-#pragma unroll
-            for (uint32_t i = 0; i < 8u; ++i) {
-                const int xv = sx[row * PD_QMOE_XW + b * 8u + i];
-                iu0 = __dp4a(swu[n * PD_QMOE_WW + b * 8u + i], xv, iu0);
-                iu1 = __dp4a(swu[(n + 8u) * PD_QMOE_WW + b * 8u + i], xv, iu1);
-            }
-            const float xsb = sxs[row][b];
-            accu[0] += swsu[n][b] * xsb * (float)iu0;
-            accu[1] += swsu[n + 8u][b] * xsb * (float)iu1;
-        }
-        __syncthreads();
-    }
-#pragma unroll
-    for (uint32_t h = 0; h < 2u; ++h) {
-        const uint32_t o = o0 + n + h * 8u;
-        if (o < ff) {
-            const float v = fmaxf(accu[h], 0.0f);
-            fused[((size_t)blk * PD_QMOE_BM + row) * ff + o] =
-                (srow != PD_MOE_PAD) ? v * v : 0.0f;
-        }
-    }
-}
-
-PD_EXPORT
-int pd_q8_0_moe_up_relu2_sorted(const void* up_data, const void* up_scale,
-                                const void* sorted_row, const void* block_expert,
-                                const void* xq, const void* xs, void* fused,
-                                uint32_t in_dim, uint32_t ff, uint32_t max_blocks,
-                                void* stream) {
-    if (ff == 0 || max_blocks == 0) return 0;
-    if ((in_dim & 31u) != 0) return cudaErrorInvalidValue; // q8 block granularity
-    dim3 grid((ff + PD_QMOE_BN - 1u) / PD_QMOE_BN, max_blocks);
-    pd_q8_0_moe_up_relu2_sorted_kernel<<<grid, 256, 0, (cudaStream_t)stream>>>(
-        (const int8_t*)up_data, (const __half*)up_scale, (const unsigned int*)sorted_row,
-        (const unsigned int*)block_expert, (const int8_t*)xq, (const float*)xs,
-        (float*)fused, in_dim, ff);
-    return pd_launch_status();
-}
-
 // Sorted down + per-(token, slot) weighted partials: same tile shape, one
 // matrix, K = ff. Reads the gate_up kernel's sorted-contiguous quantized
 // output; writes part[(token*n_active + slot)*embd + o] = topk_w * dot for
 // pd_moe_slot_combine to fold (deterministic slot order there).
-// K-tail-guarded like the relu2 kernel above: nemotron's
+// K-tail-guarded like the sorted relu2 up (q8_relu2.cuh): nemotron's
 // moe_ff 1856 / shared_ff 3712 are 32- but not 256-aligned; zero-staged
 // tails leave the previously-supported 256-aligned shapes bit-identical.
 __global__ void __launch_bounds__(256) pd_q8_0_moe_down_sorted_kernel(
@@ -740,8 +634,11 @@ __device__ __forceinline__ void pd_qmma_stage_ws(
 // (single buffer, no K-prefetch overlap) to STAY at 2 CTA/SM. Measured ~1.15x on
 // gate_up at pf-2048 vs (32,true). See.
 // GELU=false is the qwen SwiGLU original; GELU=true is the gemma4-A4B twin
-// (gelu_tanh(gate)*up in the same in-register quantize epilogue).
-template <uint32_t BM, bool DB, bool GELU = false>
+// (gelu_tanh(gate)*up in the same in-register quantize epilogue). RELU2 is
+// nemotron_h_moe's single-plane relu(up)^2: the gate walk is compiled out
+// (gate_data/gate_scale are never read) and the epilogue squares the
+// clamped up accumulator.
+template <uint32_t BM, bool DB, bool GELU = false, bool RELU2 = false>
 __global__ void __launch_bounds__(256, 2) pd_q8_0_moe_gate_up_mma_kernel(
     const int8_t* __restrict__ gate_data, const __half* __restrict__ gate_scale,
     const int8_t* __restrict__ up_data, const __half* __restrict__ up_scale,
@@ -773,7 +670,7 @@ __global__ void __launch_bounds__(256, 2) pd_q8_0_moe_gate_up_mma_kernel(
     float acc_g[NH][2][4] = {}, acc_u[NH][2][4] = {};
     const size_t wrow0 = (size_t)e * ff + row_base;
     #pragma unroll
-    for (uint32_t mat = 0; mat < 2u; ++mat) {
+    for (uint32_t mat = RELU2 ? 1u : 0u; mat < 2u; ++mat) {
         const int8_t* wd = mat ? up_data : gate_data;
         const __half* ws = mat ? up_scale : gate_scale;
         pd_qmma_issue_w(wbuf0, wd, wrow0, row_base, ff, in_dim, 0, tid);
@@ -865,7 +762,11 @@ __global__ void __launch_bounds__(256, 2) pd_q8_0_moe_gate_up_mma_kernel(
                     const uint32_t q = qc + 2u * hq;
                     const uint32_t r = rb + n * 16u + hq * 8u + g;
                     float out = 0.f;
-                    if (!pad && r < ff) {
+                    if (!pad && r < ff && RELU2) {
+                        // the dp4a sorted kernel's exact expression
+                        const float v = fmaxf(acc_u[th][n][q], 0.0f);
+                        out = v * v;
+                    } else if (!pad && r < ff) {
                         const float gv = acc_g[th][n][q];
                         const float uv = acc_u[th][n][q];
                         out = GELU
@@ -1036,7 +937,7 @@ static constexpr uint32_t pd_qmma_smem() {
     return (BM * PD_MMQ_XK + (DB ? 2u : 1u) * PD_QMMA_W_INT32) * 4u;
 }
 
-template <uint32_t BM, bool DB, bool GELU = false>
+template <uint32_t BM, bool DB, bool GELU = false, bool RELU2 = false>
 static int pd_launch_qmma_gu(const int8_t* gd, const __half* gs, const int8_t* ud,
                              const __half* us, const unsigned int* sr,
                              const unsigned int* be, const int8_t* xq, const float* xs,
@@ -1045,12 +946,12 @@ static int pd_launch_qmma_gu(const int8_t* gd, const __half* gs, const int8_t* u
     constexpr uint32_t smem = pd_qmma_smem<BM, DB>();
     static bool attr = false;   // per-instantiation (template statics)
     if (!attr) {
-        cudaFuncSetAttribute((const void*)pd_q8_0_moe_gate_up_mma_kernel<BM, DB, GELU>,
+        cudaFuncSetAttribute((const void*)pd_q8_0_moe_gate_up_mma_kernel<BM, DB, GELU, RELU2>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         attr = true;
     }
     dim3 grid(max_blocks, (ff + PD_QMMA_ROWS - 1u) / PD_QMMA_ROWS);
-    pd_q8_0_moe_gate_up_mma_kernel<BM, DB, GELU><<<grid, 256, smem, stream>>>(
+    pd_q8_0_moe_gate_up_mma_kernel<BM, DB, GELU, RELU2><<<grid, 256, smem, stream>>>(
         gd, gs, ud, us, sr, be, xq, xs, fq, fs, in_dim, ff);
     return pd_launch_status();
 }

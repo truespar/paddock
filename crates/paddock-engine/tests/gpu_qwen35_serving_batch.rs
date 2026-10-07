@@ -34,6 +34,8 @@ fn serving_batch_isolation_and_throughput() {
     };
     let map = MappedGguf::open(&path).expect("open gguf");
     let mut m = GpuQwen35::load(exec.clone(), &map, 4096).expect("load 9B");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    m.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
 
     let prompt: Vec<u32> = vec![760, 6511, 314, 9338, 369]; // "The capital of France is"
     let n_new = 64usize;

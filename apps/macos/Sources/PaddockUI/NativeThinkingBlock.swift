@@ -96,5 +96,8 @@ struct NativeThinkingBlock: View {
   private var reasoning: some View {
     NativeMarkdown(message.reasoning, streaming: active, textSize: 13).equatable()
       .foregroundStyle(.secondary)
+      // An explicitly expanded disclosure remains part of cross-message
+      // selection. Its parent already releases it when the disclosure closes.
+      .environment(\.nativeMarkdownViewportReclamation, false)
   }
 }

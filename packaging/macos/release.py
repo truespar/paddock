@@ -7,6 +7,7 @@ See README.md for the credential boundary and the remaining manual release gates
 """
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -18,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as XML
 
 ROOT = Path(__file__).resolve().parents[2]
 PUBLIC_ORIGINS = {
@@ -27,6 +29,8 @@ PUBLIC_ORIGINS = {
     "ssh://git@github.com/truespar/paddock.git",
 }
 MIN_OS = "26.0"  # The runner compiles Metal Shading Language 4.0 at runtime.
+UPDATE_ACCOUNT = "com.truespar.paddock.sparkle"
+UPDATE_FEED = "https://github.com/truespar/paddock/releases/latest/download/appcast.xml"
 TARGET = "aarch64-apple-darwin"
 SWIFT_TARGET = "arm64-apple-macosx" + MIN_OS
 LICENSES = ("LICENSE", "LICENSE-MIT", "LICENSE-APACHE", "THIRD-PARTY-NOTICES")
@@ -478,6 +482,8 @@ def finalize(args):
         require('"' + identity + '"' in identities, "Missing valid identity/private key: " + identity)
     candidate = args.input.expanduser().resolve()
     manifest = validate_candidate(candidate)
+    update_tools = candidate / "work/source/apps/macos/.build/artifacts/sparkle/Sparkle/bin"
+    validate_update_identity(candidate / "stage/Paddock.app", update_tools, args.update_account)
     release = candidate / "release"
     require(not release.exists(), "Release output already exists; use a fresh candidate to retry.")
     release.mkdir()
@@ -505,10 +511,74 @@ def finalize(args):
     run("spctl", "--assess", "--type", "install", "--verbose=2", pkg)
     run("spctl", "--assess", "--type", "open", "--context", "context:primary-signature", dmg)
     run("pkgutil", "--check-signature", pkg)
+    artifacts.append(signed_appcast(app, dmg, update_tools, args.update_account, manifest))
     checksums(artifacts, release / "artifacts")  # After stapling, never before.
     manifest.update(status="notarized-awaiting-manual-qualification", team=team, stage=inventory(stage))
     write_json(release / "manifest.json", manifest)
     print("Notarized artifacts: " + str(release / "artifacts") + "\nNothing published. Complete the README's manual gates.")
+
+
+def validate_update_identity(app, tools, account):
+    info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+    key = info.get("SUPublicEDKey", "")
+    try:
+        valid = len(base64.b64decode(key, validate=True)) == 32
+    except (ValueError, TypeError):
+        valid = False
+    require(valid and info.get("SUFeedURL") == UPDATE_FEED
+            and info.get("SURequireSignedFeed") is True
+            and info.get("SUVerifyUpdateBeforeExtraction") is True,
+            "Release must embed the public update key and require signed feeds/archives.")
+    for name in ("generate_keys", "generate_appcast", "sign_update"):
+        require((tools / name).is_file(), "Missing pinned Sparkle tool: " + name)
+    public = run(tools / "generate_keys", "--account", account, "-p", capture=True).strip()
+    require(public == key, "The Keychain update signing identity does not match this app. Do not rotate it implicitly.")
+    return info
+
+
+def validate_appcast(path, dmg, manifest):
+    namespace = "{http://www.andymatuschak.org/xml-namespaces/sparkle}"
+    root = XML.parse(path).getroot()
+    items = root.findall("./channel/item")
+    require(len(items) == 1, "Expected exactly one release in the new appcast.")
+    item = items[0]
+    enclosure = item.find("enclosure")
+    require(enclosure is not None, "Missing signed update enclosure.")
+    expected_url = "https://github.com/truespar/paddock/releases/download/v" + manifest["version"] + "/" + dmg.name
+    require(enclosure.get("url") == expected_url, "Update URL must identify the exact public release asset.")
+    require(item.findtext(namespace + "version") == manifest["build_number"]
+            and item.findtext(namespace + "shortVersionString") == manifest["version"],
+            "Appcast version differs from the built release.")
+    require(enclosure.get("length") == str(dmg.stat().st_size), "Appcast size differs from the stapled DMG.")
+    signature = enclosure.get(namespace + "edSignature", "")
+    try:
+        valid = len(base64.b64decode(signature, validate=True)) == 64
+    except ValueError:
+        valid = False
+    require(valid, "Missing or invalid Ed25519 archive signature.")
+    require(item.findtext(namespace + "minimumSystemVersion") == MIN_OS, "Appcast OS floor differs from the release.")
+    return signature
+
+
+def signed_appcast(app, dmg, tools, account, manifest):
+    validate_update_identity(app, tools, account)
+    before = digest(dmg)
+    destination = dmg.parent / "appcast.xml"
+    require(not destination.exists(), "Never overwrite a published/signed appcast implicitly.")
+    # Isolate the archive scanner: the CLI pkg is NOT an app update, and no old
+    # release files may be pruned/moved by generate_appcast.
+    with tempfile.TemporaryDirectory(prefix="paddock-appcast-") as folder:
+        archives = Path(folder)
+        shutil.copy2(dmg, archives / dmg.name)
+        run(tools / "generate_appcast", "--account", account, "--maximum-deltas", "0",
+            "--maximum-versions", "1", "--versions", manifest["build_number"],
+            "--download-url-prefix", "https://github.com/truespar/paddock/releases/download/v" + manifest["version"] + "/",
+            "-o", destination, archives)
+    require(digest(dmg) == before, "Update generation changed the notarized archive.")
+    signature = validate_appcast(destination, dmg, manifest)
+    run(tools / "sign_update", "--account", account, "--verify", dmg, signature)
+    run(tools / "sign_update", "--account", account, "--verify", destination)
+    return destination
 
 
 def main():
@@ -525,6 +595,8 @@ def main():
     final_parser.add_argument("--application-identity", required=True)
     final_parser.add_argument("--installer-identity", required=True)
     final_parser.add_argument("--notary-profile", required=True)
+    final_parser.add_argument("--update-account", default=UPDATE_ACCOUNT,
+                              help="Keychain account holding the Sparkle signing key; never a private key value")
     args = parser.parse_args()
     if args.command == "build":
         valid_build_number(args.build_number)

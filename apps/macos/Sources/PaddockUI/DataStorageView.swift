@@ -52,80 +52,76 @@ struct DataStorageView: View {
   @State private var inventory: StorageInventory?
   @State private var inventoryError: String?
   var body: some View {
-    PaddockScrollView {
-      VStack(alignment: .leading, spacing: 28) {
-        PageHeading(title: "Data & storage") { EmptyView() }
-        SettingsGroup(title: "Conversation backup") {
-          Text(
-            "Conversations, attachments, artifacts and preferences. API keys and connector credentials are excluded."
-          )
-          .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-          HStack {
-            Button(
-              model.exporting ? "Exporting…" : "Export backup…", systemImage: "square.and.arrow.up"
-            ) { model.chooseExport() }.disabled(model.exporting)
-            if model.exporting { ProgressView().controlSize(.small) }
-            if let backupURL = model.backupURL, let receipt = model.receipt {
-              Button("Show in Finder") {
-                NSWorkspace.shared.activateFileViewerSelecting([backupURL])
-              }
-              Text(DisplayFormat.bytes(receipt.bytes)).foregroundStyle(.secondary)
+    SettingsPage(title: "Data & storage") { _ in
+      SettingsGroup(title: "Conversation backup") {
+        Text(
+          "Conversations, attachments, artifacts and preferences. API keys and connector credentials are excluded."
+        )
+        .foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        HStack {
+          Button(
+            model.exporting ? "Exporting…" : "Export backup…", systemImage: "square.and.arrow.up"
+          ) { model.chooseExport() }.disabled(model.exporting)
+          if model.exporting { ProgressView().controlSize(.small) }
+          if let backupURL = model.backupURL, let receipt = model.receipt {
+            Button("Show in Finder") {
+              NSWorkspace.shared.activateFileViewerSelecting([backupURL])
             }
-          }
-          if let error = model.error {
-            Text(error).foregroundStyle(PaddockStyle.caution).textSelection(.enabled)
+            Text(DisplayFormat.bytes(receipt.bytes)).foregroundStyle(.secondary)
           }
         }
-        if let registry = snapshot.identity.registry {
-          SettingsGroup(title: "Models") {
-            HStack {
-              Text("Available storage").foregroundStyle(.secondary)
-              Spacer()
-              Text(DisplayFormat.bytes(registry.diskFree)).monospacedDigit()
-            }
-            Text(registry.modelsDir).font(.caption).textSelection(.enabled).foregroundStyle(
-              .secondary)
-            Button("Open models folder", systemImage: "folder") {
-              NSWorkspace.shared.open(URL(fileURLWithPath: registry.modelsDir, isDirectory: true))
-            }
-          }
-        }
-        if let inventoryError { Text(inventoryError).foregroundStyle(PaddockStyle.caution) }
-        if let inventory {
-          ForEach(inventory.artifacts) { artifact in
-            SettingsGroup(title: artifact.model) {
-              HStack {
-                Text(artifact.artifact)
-                Spacer()
-                Text(DisplayFormat.bytes(artifact.bytes)).monospacedDigit()
-              }
-              if artifact.presentFiles != artifact.totalFiles {
-                Text("\(artifact.presentFiles) of \(artifact.totalFiles) files downloaded")
-                  .foregroundStyle(.secondary)
-              }
-              HStack {
-                if !artifact.configuredPorts.isEmpty {
-                  Text(
-                    "Configured on \(artifact.configuredPorts.map(String.init).joined(separator: ", "))"
-                  ).font(.caption).foregroundStyle(.secondary)
-                }
-                Spacer()
-                if let path = artifact.path {
-                  Button("Show files", systemImage: "folder") {
-                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
-                  }
-                }
-              }
-            }
-          }
-        }
-      }.padding(32).frame(maxWidth: 900).frame(maxWidth: .infinity)
-    }.font(.system(size: 13)).buttonStyle(FlatButtonStyle())
-      .task {
-        do { inventory = try await model.client.inspect(.storage, as: StorageInventory.self) } catch
-        {
-          if !Task.isCancelled { inventoryError = error.localizedDescription }
+        if let error = model.error {
+          Text(error).foregroundStyle(PaddockStyle.caution).textSelection(.enabled)
         }
       }
+      if let registry = snapshot.identity.registry {
+        SettingsGroup(title: "Models") {
+          HStack {
+            Text("Available storage").foregroundStyle(.secondary)
+            Spacer()
+            Text(DisplayFormat.bytes(registry.diskFree)).monospacedDigit()
+          }
+          Text(registry.modelsDir).font(.caption).textSelection(.enabled).foregroundStyle(
+            .secondary)
+          Button("Open models folder", systemImage: "folder") {
+            NSWorkspace.shared.open(URL(fileURLWithPath: registry.modelsDir, isDirectory: true))
+          }
+        }
+      }
+      if let inventoryError { Text(inventoryError).foregroundStyle(PaddockStyle.caution) }
+      if let inventory {
+        ForEach(inventory.artifacts) { artifact in
+          SettingsGroup(title: artifact.model) {
+            HStack {
+              Text(artifact.artifact)
+              Spacer()
+              Text(DisplayFormat.bytes(artifact.bytes)).monospacedDigit()
+            }
+            if artifact.presentFiles != artifact.totalFiles {
+              Text("\(artifact.presentFiles) of \(artifact.totalFiles) files downloaded")
+                .foregroundStyle(.secondary)
+            }
+            HStack {
+              if !artifact.configuredPorts.isEmpty {
+                Text(
+                  "Configured on \(artifact.configuredPorts.map(String.init).joined(separator: ", "))"
+                ).font(.caption).foregroundStyle(.secondary)
+              }
+              Spacer()
+              if let path = artifact.path {
+                Button("Show files", systemImage: "folder") {
+                  NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    .task {
+      do { inventory = try await model.client.inspect(.storage, as: StorageInventory.self) } catch {
+        if !Task.isCancelled { inventoryError = error.localizedDescription }
+      }
+    }
   }
 }

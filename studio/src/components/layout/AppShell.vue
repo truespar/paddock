@@ -149,9 +149,9 @@ router.beforeEach((to) => {
 // The chat surface runs edge-to-edge on all three of its routes (a chat, the
 // start page, and New chat's /chat/new); other panels get the padded,
 // scrollable content area.
-// full-bleed pages: the chat, and Reads - both a history list beside a
-// workspace that scrolls on its own
-const isChat = computed(() => ['chat', 'chat-new', 'home', 'reads', 'tables'].includes(String(route.name)))
+// full-bleed pages: the chat, Reads, Tables and Masks - each a history list
+// beside a workspace that scrolls on its own
+const isChat = computed(() => ['chat', 'chat-new', 'home', 'reads', 'tables', 'masks'].includes(String(route.name)))
 </script>
 
 <template>

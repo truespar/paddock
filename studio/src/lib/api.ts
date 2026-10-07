@@ -5,6 +5,7 @@
 import type { Conversation } from '@/types/chat'
 import type { ReadDoc, ReadSummary } from '@/lib/reads'
 import type { TableSession, TableSummary } from '@/lib/table-history'
+import type { MaskDoc, MaskSummary } from '@/lib/mask-history'
 import { orderedRunQuestions } from '@/lib/reads'
 import { DEFAULT_PARAMS } from '@/types/chat'
 import { useModelsStore } from '@/stores/models'
@@ -71,6 +72,23 @@ export const tableHistoryApi = {
     `/api/table-history/${encodeURIComponent(doc.id)}?revision=${encodeURIComponent(revision)}`, 'PUT', doc),
   remove: (id: string, revision: string) => jbody<void>(
     `/api/table-history/${encodeURIComponent(id)}?revision=${encodeURIComponent(revision)}`, 'DELETE'),
+}
+
+// the Masks page's pictures, the table history's contract (store/mask_history.rs)
+export const maskHistoryApi = {
+  list: () => jget<MaskSummary[]>('/api/mask-history'),
+  async get(id: string): Promise<{ doc: MaskDoc; revision: string }> {
+    const reply = await jget<{ doc: string; revision: string }>(`/api/mask-history/${encodeURIComponent(id)}`)
+    const doc = JSON.parse(reply.doc) as MaskDoc
+    if (doc.version !== 1 || doc.id !== id || !Array.isArray(doc.layers) || !doc.layers.length || !Array.isArray(doc.snapshots)) {
+      throw new Error('Unsupported masks record')
+    }
+    return { doc, revision: reply.revision }
+  },
+  save: (doc: MaskDoc, revision: string) => jbody<MaskSummary>(
+    `/api/mask-history/${encodeURIComponent(doc.id)}?revision=${encodeURIComponent(revision)}`, 'PUT', doc),
+  remove: (id: string, revision: string) => jbody<void>(
+    `/api/mask-history/${encodeURIComponent(id)}?revision=${encodeURIComponent(revision)}`, 'DELETE'),
 }
 
 // ── GPU telemetry (/api/gpu) ────────────────────────────────────────────────
@@ -561,11 +579,12 @@ export interface ModelSpecs {
   tradeoffs?: string[]
 }
 /** One independently downloadable PIECE of a model (schema 3): a weights
- *  alternative (the quality choice) or a companion (vision tower, MTP
- *  drafter, native-FP8 snapshot). */
+ *  alternative (the quality choice) or a companion (vision or audio tower,
+ *  MTP drafter, native-FP8 snapshot, an image lane's text encoder or VAE) -
+ *  the manager's `ArtifactKind`, kebab-cased. */
 export interface CatalogArtifact {
   id: string
-  kind: 'weights' | 'vision' | 'drafter' | 'fp8-snapshot'
+  kind: 'weights' | 'vision' | 'audio' | 'drafter' | 'fp8-snapshot' | 'text-encoder' | 'vae'
   format: 'gguf' | 'safetensors'
   label: string
   /** Export-specific loader contract; absent preserves older managers. */
@@ -590,6 +609,9 @@ export interface CatalogArtifact {
     base_model: string
     license: string
     license_url: string
+    /** downloads from `repo` itself behind its licence gate, with the
+     *  user's own Hugging Face token (SAM 3) */
+    gated?: boolean
   }
   backend_supported?: boolean
   kv_offload_supported?: boolean
@@ -676,6 +698,8 @@ export interface ConfigProjection {
   drafter: string | null
   weights: string | null
   vision: boolean
+  /** The file names a split-tower model's audio tower (`audio_mmproj`). */
+  audio?: boolean
   fp8_native: boolean
   max_ctx: number | null
   max_batch: number | null
@@ -783,15 +807,6 @@ export const readHistoryApi = {
   remove: (id: string, revision: string) => jbody(`/api/read-history/${encodeURIComponent(id)}?revision=${encodeURIComponent(revision)}`, 'DELETE'),
 }
 
-export const readsPreferencesApi = {
-  get: () => jget<{ readsPanelOpen?: boolean }>('/api/settings'),
-  save: (open: boolean) => jbody('/api/settings', 'PUT', { readsPanelOpen: open }),
-}
-
-export const tablesPreferencesApi = {
-  get: () => jget<{ tablesPanelOpen?: boolean }>('/api/settings'),
-  save: (open: boolean) => jbody('/api/settings', 'PUT', { tablesPanelOpen: open }),
-}
 
 // ── MCP tool approvals ──────────────────────────────────────────────────────
 // NOTE: there is no MCP/search CRUD here anymore - web search and

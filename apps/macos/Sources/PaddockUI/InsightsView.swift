@@ -6,61 +6,71 @@ struct InsightsView: View {
   @Bindable var model: InsightsModel
   let endpoints: [ConfiguredEndpoint]
   var body: some View {
-    VStack(spacing: 0) {
+    SettingsPage(title: "Usage & activity") { stacked in
       VStack(alignment: .leading, spacing: 18) {
-        PageHeading(title: "Usage & activity") { EmptyView() }
-        HStack(spacing: 14) {
+        let layout =
+          stacked
+          ? AnyLayout(VStackLayout(alignment: .leading, spacing: 16))
+          : AnyLayout(HStackLayout(spacing: 16))
+        layout {
           Picker("View", selection: $model.page) {
             ForEach(InsightPage.allCases) { Text($0.rawValue).tag($0) }
-          }.pickerStyle(.segmented).frame(maxWidth: 340)
-          Spacer(minLength: 0)
-          Toggle("Live", isOn: $model.live).toggleStyle(.switch).controlSize(.small)
+          }.pickerStyle(.segmented).labelsHidden().frame(maxWidth: stacked ? .infinity : 340)
+            .accessibilityIdentifier("insights-page")
+          if !stacked { Spacer(minLength: 0) }
+          HStack {
+            Toggle("Live", isOn: $model.live).toggleStyle(.switch).controlSize(.small)
+              .accessibilityIdentifier("insights-live")
+            if model.loading && model.sampledAt == nil { ProgressView().controlSize(.small) }
+          }
         }
-        HStack {
+      }
+      SettingsGroup(title: "Filters") {
+        SettingsRow(title: "Instance", stacked: stacked) {
           Dropdown(
             title: "Instance",
-            value: endpoints.first { $0.port == model.port }?.title ?? "All instances"
+            value: endpoints.first { $0.port == model.port }?.title ?? "All instances",
+            fillsWidth: true
           ) {
             Button("All instances") { model.port = nil }
             ForEach(endpoints, id: \.port) { endpoint in
               Button("\(endpoint.title) · \(endpoint.port)") { model.port = endpoint.port }
             }
-          }
-          if model.page == .usage {
+          }.accessibilityIdentifier("insights-instance")
+        }
+        if model.page == .usage {
+          SettingsRow(title: "Time range", stacked: stacked) {
             Dropdown(
               title: "Time range",
-              value: model.days == 1 ? "Last 24 hours" : "Last \(model.days) days"
+              value: model.days == 1 ? "Last 24 hours" : "Last \(model.days) days",
+              fillsWidth: true
             ) {
               ForEach([1, 7, 30, 90, 365], id: \.self) { days in
                 Button(days == 1 ? "Last 24 hours" : "Last \(days) days") { model.days = days }
               }
-            }
+            }.accessibilityIdentifier("insights-range")
           }
-          Spacer()
-          if model.loading && model.sampledAt == nil { ProgressView().controlSize(.small) }
         }
-        if let error = model.error {
-          Text(error).foregroundStyle(PaddockStyle.caution).textSelection(.enabled)
-        }
-      }.padding(24)
-      PaddockScrollView {
-        VStack(alignment: .leading, spacing: 24) {
-          switch model.page {
-          case .usage: if let usage = model.usage { UsageInsights(usage: usage) }
-          case .activity: if let activity = model.activity { ActivityInsights(snapshot: activity) }
-          case .cache:
-            if let cache = model.cache { CacheInsights(snapshot: cache, port: model.port) }
-          }
-        }.padding(24).frame(maxWidth: .infinity, alignment: .leading)
       }
-    }.font(.system(size: 13)).background(PaddockStyle.canvas)
-      .task(id: model.queryID) { await model.observe() }
-      .accessibilityIdentifier("management-insights")
+      if let error = model.error {
+        Text(error).foregroundStyle(PaddockStyle.caution).textSelection(.enabled)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+      switch model.page {
+      case .usage: if let usage = model.usage { UsageInsights(usage: usage, stacked: stacked) }
+      case .activity: if let activity = model.activity { ActivityInsights(snapshot: activity) }
+      case .cache:
+        if let cache = model.cache { CacheInsights(snapshot: cache, port: model.port) }
+      }
+    }
+    .task(id: model.queryID) { await model.observe() }
+    .accessibilityIdentifier("management-insights")
   }
 }
 
 private struct UsageInsights: View {
   let usage: UsageHistorySnapshot
+  let stacked: Bool
   var body: some View {
     if usage.buckets.isEmpty {
       ContentUnavailableView(
@@ -77,7 +87,7 @@ private struct UsageInsights: View {
         if usage.buckets.contains(where: { $0.outputTokens > 0 }) {
           Chart(usage.buckets) { bucket in
             BarMark(x: .value("Time", bucket.date), y: .value("Output tokens", bucket.outputTokens))
-              .foregroundStyle(.primary.opacity(0.65))
+              .foregroundStyle(PaddockStyle.accent.opacity(0.65))
           }.frame(height: 180).accessibilityLabel("Recorded output tokens over time")
         }
       }
@@ -85,12 +95,16 @@ private struct UsageInsights: View {
     if !usage.gaps.isEmpty {
       SettingsGroup(title: "Observation gaps") {
         ForEach(usage.gaps) { gap in
-          HStack {
+          let layout =
+            stacked
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: 6))
+            : AnyLayout(HStackLayout(spacing: 16))
+          layout {
             Text("Port \(gap.port) · \(gap.cause)")
-            Spacer()
+            if !stacked { Spacer(minLength: 0) }
             Text(
-              "\(Date(timeIntervalSince1970: Double(gap.fromTsMs) / 1000).formatted(date: .abbreviated, time: .shortened)) – \(Date(timeIntervalSince1970: Double(gap.toTsMs) / 1000).formatted(date: .abbreviated, time: .shortened))"
-            ).foregroundStyle(.secondary)
+              "\(Date(timeIntervalSince1970: Double(gap.fromTsMs) / 1000).formatted(date: .abbreviated, time: .shortened)) - \(Date(timeIntervalSince1970: Double(gap.toTsMs) / 1000).formatted(date: .abbreviated, time: .shortened))"
+            ).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
           }
         }
       }
@@ -135,7 +149,7 @@ private struct ActivityInsights: View {
                 HStack(alignment: .top) {
                   Text(activityLabel(key)).foregroundStyle(.secondary)
                   Spacer(minLength: 20)
-                  Text(event.fields[key]?.display ?? "—").textSelection(.enabled)
+                  Text(event.fields[key]?.display ?? "-").textSelection(.enabled)
                     .multilineTextAlignment(.trailing)
                 }
               }
@@ -172,7 +186,7 @@ private struct CacheInsights: View {
     if servers.isEmpty {
       ContentUnavailableView(
         "No active KV offloading", systemImage: "internaldrive",
-        description: Text("Enable KV offloading in an instance’s settings to inspect its cache."))
+        description: Text("Enable KV offloading in an instance's settings to inspect its cache."))
     }
     ForEach(servers) { server in
       SettingsGroup(title: "\(server.model ?? "Instance") · \(server.port)") {
@@ -183,7 +197,7 @@ private struct CacheInsights: View {
         HStack {
           Text("Cache hit rate")
           Spacer()
-          Text(server.hitRate.map { $0.formatted(.percent.precision(.fractionLength(1))) } ?? "—")
+          Text(server.hitRate.map { $0.formatted(.percent.precision(.fractionLength(1))) } ?? "-")
         }
         ForEach(
           [("RAM", "ram_ready", "ram_capacity"), ("SSD", "disk_ready", "disk_capacity")], id: \.0
@@ -206,7 +220,7 @@ private struct CacheInsights: View {
                 Text(field.replacingOccurrences(of: "_", with: " ").capitalized).foregroundStyle(
                   .secondary)
                 Spacer()
-                Text(server.tier[field]?.display ?? "—").monospacedDigit()
+                Text(server.tier[field]?.display ?? "-").monospacedDigit()
               }
             }
           }.font(.caption).padding(.top, 12)

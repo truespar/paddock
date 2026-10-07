@@ -29,7 +29,8 @@ use crate::gpu::GpuError;
 use crate::gpu_model::gpt_oss::GpuModelError;
 use crate::kv_pool::BLOCK_TOKENS;
 
-use super::GpuNemotron;
+use super::{GpuNemotron, Mixer};
+use paddock_models::nemotron::NemotronBlock;
 
 /// Don't resume prefixes shorter than this (granite's floor - the restore
 /// here also pays 23 state copies, so trivial prompts aren't worth churn).
@@ -76,6 +77,15 @@ pub(crate) use crate::gpu_model::prefix_cache::reply_ckpt_disabled;
 /// The checkpoint boundaries for a prompt: its last two full page
 /// boundaries, ascending (0 entries collapse when the prompt is short).
 /// Keeps at least one token to prefill, matching the radix matcher.
+///
+/// No back-off cut here (`prefix_cache::backoff_cut`, which qwen35 and
+/// qwen4exp take): the scan PAUSES at every staged cut and resumes from the
+/// slot arena, which is f16 by default, so each cut is one more f16 round
+/// trip of the recurrent state. At the trailing pair that touches the last
+/// page; 256 tokens back it moved the prompt-end logits enough that the
+/// KV8 smoke's fp8-vs-f16 greedy-8 fell 8/8 -> 4/8 (GB10 2026-10-05). The
+/// f32-state families stage without rounding. Nemotron's prefill is also
+/// the cheapest to redo (~8K tok/s on GB10).
 pub(super) fn ckpt_cuts(t_len: usize, step: usize) -> [usize; 2] {
     // `step` = the tier's run span when armed (both boundaries must sit at
     // run granularity or their blobs cannot demote - qwen35's precedent),
@@ -110,11 +120,10 @@ impl GpuNemotron {
         // the drafter's rows came with the adopted pages wherever a live
         // span completed them (see dflash_adopt_slot)
         self.dflash_adopt_slot(slot, pos);
+        // the in-file MTP's rows ride the same pages (see mtp_adopt_slot)
+        self.mtp_adopt_slot(slot, pos);
         if pos > 0 {
             self.last_reused[slot] = pos;
-            // The MTP twin also zeroes its pending_h - the chain vector
-            // belonged to the old end (see mtp_trim_slot).
-            self.mtp_trim_slot(slot, pos)?;
         }
         Ok(pos)
     }
@@ -617,18 +626,70 @@ impl GpuNemotron {
         let Some(idx) = radix.reserve_state_slot_with_pool(&mut bs.pool) else {
             return Ok(());
         };
-        let (Some(sp), Some(vp)) = (bs.d_ckpt_bounce.as_mut(), bs.verify.as_ref()) else {
+        let (Some(sp), Some(vp)) = (bs.d_ckpt_bounce.as_mut(), bs.verify.as_mut()) else {
             radix.recycle_state(idx);
             return Ok(());
         };
         let keep_old = km1.saturating_sub(n_new);
         let take_new = km1 - keep_old;
+        if vp.rescan {
+            // rollback by replay keeps no per-row states: replay the round's
+            // first n_new rows from the (still pre-round) live state into the
+            // replay target, one launch for every mamba layer
+            use cudarc::driver::DevicePtr;
+            let keep_row = crate::gpu::mamba2_keep_row(
+                hp.mamba_heads,
+                hp.mamba_head_dim,
+                hp.d_state,
+                hp.n_groups,
+            );
+            let (tp, _gt) = vp
+                .d_rs_tmp
+                .as_ref()
+                .expect("replay target")
+                .device_ptr(&exec.stream);
+            let mut d = Vec::new();
+            for (li, layer) in self.layers.iter().enumerate() {
+                let Mixer::Mamba(w) = &layer.mixer else {
+                    continue;
+                };
+                let (st, eb) = bs.ssm[li].as_ref().expect("ssm arena").addr(&exec, 0);
+                let (kp, _g1) = vp.keep[li].as_ref().expect("keep").device_ptr(&exec.stream);
+                let (ap, _g2) = w.a.device_ptr(&exec.stream);
+                let (bp, _g3) = w.dt_bias.device_ptr(&exec.stream);
+                let m = (d.len() / 6) as u64;
+                d.extend([
+                    st + (slot * state_elems * eb) as u64,
+                    tp + m * (state_elems * 2) as u64,
+                    kp + ((row + 1 - n_new) * keep_row * 4) as u64,
+                    ap,
+                    bp,
+                    n_new as u64,
+                ]);
+            }
+            exec.mamba2_rescan_upload(
+                &mut vp.d_rs_desc,
+                &d,
+                hp.mamba_heads,
+                hp.mamba_head_dim,
+                hp.d_state,
+                hp.n_groups,
+            )?;
+        }
         let mut boff = 0usize;
+        let mut m = 0usize;
         for li in 0..hp.n_layer {
-            let Some(snap) = vp.snap[li].as_ref() else {
+            if !matches!(hp.blocks[li], NemotronBlock::Mamba) {
                 continue;
-            };
-            snap.save_to_blob(&exec, row * state_elems, sp, boff, state_elems)?;
+            }
+            if vp.rescan {
+                let tmp = vp.d_rs_tmp.as_ref().expect("replay target");
+                exec.ssm_state_widen(tmp, m * state_elems, sp, boff, state_elems)?;
+            } else {
+                let snap = vp.snap[li].as_ref().expect("snap");
+                snap.save_to_blob(&exec, row * state_elems, sp, boff, state_elems)?;
+            }
+            m += 1;
             boff += state_elems;
             let w = bs.conv_win[li].as_ref().expect("mamba layer has window");
             let xbc = vp.xbc[li].as_ref().expect("mamba layer has xbc rows");

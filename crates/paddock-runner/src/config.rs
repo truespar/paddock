@@ -99,6 +99,16 @@ pub struct Config {
     /// discovery; `false` alongside an `mmproj` line is refused as a
     /// contradiction.
     pub vision: Option<bool>,
+    /// An audio tower in a file of its own, beside a picture tower in
+    /// `mmproj` - EmbeddingGemma 2's catalog layout, which cuts the
+    /// upstream projector in two so each tower is its own download. Only
+    /// that model reads it; discovery fills it from the weights' folder.
+    pub audio_mmproj: Option<PathBuf>,
+    /// `false` switches the audio tower OFF (`--no-audio`): neither
+    /// `audio_mmproj` nor discovery nor an audio tower inside `mmproj`
+    /// loads. The manager's Audio switch, mirroring `vision`; `false`
+    /// alongside an `audio_mmproj` line is refused as a contradiction.
+    pub audio: Option<bool>,
     /// MTP drafter GGUF (separate-model speculative drafter, e.g. gemma4's
     /// mtp-*.gguf); enables serving spec rounds with model drafts.
     pub mtp: Option<PathBuf>,
@@ -364,6 +374,8 @@ impl Default for Config {
             max_batch: 32,
             mmproj: None,
             vision: None,
+            audio_mmproj: None,
+            audio: None,
             mtp: None,
             text_encoder: None,
             vae: None,

@@ -346,13 +346,7 @@ pub(crate) fn kq_mm_rows(
             exec.mmq_sums(rows.yq, rows.xsums, in_dim, r)?;
         }
         let xs = needs.then_some(&*rows.xsums);
-        return if exec.has_kquant_gemm_w4a8_pipe2() {
-            exec.kquant_gemm_w4a8_pipe2(w, rows.yq, xs, y, r)
-        } else if exec.has_kquant_gemm_w4a8_pipe() {
-            exec.kquant_gemm_w4a8_pipe(w, rows.yq, xs, y, r)
-        } else {
-            exec.kquant_gemm_w4a8(w, rows.yq, xs, y, r)
-        };
+        return exec.kquant_gemm_w4a8_tile(w, rows.yq, xs, y, r);
     }
     exec.quantize_q8(x, rows.xq, rows.xs, r * in_dim)?;
     if needs {

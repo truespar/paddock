@@ -21,7 +21,9 @@ use crate::kv_pool::BlockId;
 /// at the last two page boundaries) and the reply's. The live turns' working
 /// set, and so the part of the checkpoint demand a plan must back on top of
 /// full context: without it a slot at its full window could not keep the
-/// checkpoint its own next turn resumes from.
+/// checkpoint its own next turn resumes from. A prompt's back-off cut
+/// (`prefix_cache::backoff_cut`) is not counted: an appending next turn never
+/// resumes there, so it rides the evictable want.
 pub const CKPTS_PER_TURN: u64 = 3;
 /// Cap on that mandatory part - and the old flat floor. Until issue #33 each
 /// hybrid family reserved at least this many as a fixed pool whatever the

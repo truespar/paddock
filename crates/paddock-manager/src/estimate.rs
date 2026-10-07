@@ -61,7 +61,8 @@ pub struct EstimateQuery {
     /// trained window. Asking callers to pick it from a list was both
     /// arbitrary and wrong at the edges.
     batch: Option<u64>,
-    /// `f16` (default, and exact) or `fp8_e4m3`.
+    /// `f16` or `fp8_e4m3`. Absent = each model's own default (its catalog
+    /// `kv_default`, what an `auto` runner serves).
     kv: Option<String>,
     /// Price speculative decode: the drafter's resident bytes plus the wider
     /// verify logits plane. Off by default. Per-MODEL, since the drafter (and
@@ -77,6 +78,10 @@ pub struct EstimateQuery {
     /// Some(false)` drops the mmproj), so leaving it out of the estimate
     /// over-charged every vision model by its whole tower.
     vision: Option<bool>,
+    /// Price a split-tower model's audio tower (EmbeddingGemma 2): the start
+    /// form's Audio switch. Absent = the artifact's catalog default (off),
+    /// which is what the supervisor serves for an absent `spec.audio`.
+    audio: Option<bool>,
     /// This device's compute capability as `"major.minor"` (e.g. `"8.6"`), so
     /// the estimate can price the KV width the RUNNER will actually serve
     /// rather than the one that was asked for. Optional: an older Studio
@@ -121,6 +126,7 @@ fn is_single_pass(capability: &str) -> bool {
             | "decision"
             | "tabular"
             | "segmentation"
+            | "masks"
             | "image-generation"
     )
 }
@@ -271,13 +277,6 @@ fn checkpoint_file_bytes(path: &Path) -> Option<u64> {
 /// went into the loaders rather than a per-family multiplier here, which would
 /// have been a magic constant in the wrong crate that went stale the moment
 /// they were fixed.
-pub(crate) fn tower_bytes(
-    m: &crate::registry::CatalogModel,
-    reg: &crate::registry::Registry,
-) -> u64 {
-    tower_bytes_for(m, reg, None)
-}
-
 pub(crate) fn tower_bytes_for(
     m: &crate::registry::CatalogModel,
     reg: &crate::registry::Registry,
@@ -303,6 +302,42 @@ pub(crate) fn tower_bytes_for(
         // are ~950 MiB, more than its weight file; see CatalogArtifact::
         // workspace for why this is a manifest field and not a constant here)
         .map_or(0, |a| a.total_size() + a.workspace.unwrap_or(0))
+}
+
+/// Every tower an endpoint holds resident, by its switches. A model with one
+/// tower charges it when `vision` is on (the old rule, [`tower_bytes_for`]); a
+/// split-tower model (`CatalogModel::split_towers`, EmbeddingGemma 2) charges
+/// its picture tower by `vision` and its audio tower by `audio`, absent =
+/// that artifact's catalog default (off) - the supervisor's own reading of
+/// `spec.audio`, so the estimate and the served endpoint agree.
+pub(crate) fn towers_bytes_for(
+    m: &crate::registry::CatalogModel,
+    reg: &crate::registry::Registry,
+    weights: Option<&crate::registry::CatalogArtifact>,
+    vision: bool,
+    audio: Option<bool>,
+) -> u64 {
+    use crate::registry::ArtifactKind;
+    if !m.split_towers() {
+        return if vision {
+            tower_bytes_for(m, reg, weights)
+        } else {
+            0
+        };
+    }
+    let one = |kind: ArtifactKind| {
+        let of = || {
+            m.artifacts.iter().filter(move |a| {
+                a.kind == kind && weights.is_none_or(|w| w.runtime.allows_companion(&a.id))
+            })
+        };
+        of().find(|a| reg.is_artifact_installed(a))
+            .or_else(|| of().next())
+            .map_or(0, |a| a.total_size() + a.workspace.unwrap_or(0))
+    };
+    let audio = audio.unwrap_or_else(|| m.split_audio_tower().is_some_and(|a| a.default));
+    (if vision { one(ArtifactKind::Vision) } else { 0 })
+        + if audio { one(ArtifactKind::Audio) } else { 0 }
 }
 
 /// The companions an image-generation lane holds resident beside its DiT:
@@ -340,15 +375,12 @@ pub(crate) fn artifact_shape(
     model: &crate::registry::CatalogModel,
     artifact: &crate::registry::CatalogArtifact,
     vision: bool,
+    audio: Option<bool>,
 ) -> Option<ModelShape> {
-    // the mmproj tower follows the vision switch; an image lane's text
-    // encoder and VAE have no switch and are always charged
+    // the towers follow their switches; an image lane's text encoder and
+    // VAE have no switch and are always charged
     let tower = lane_companion_bytes_for(model, &state.registry, Some(artifact))
-        + if vision {
-            tower_bytes_for(model, &state.registry, Some(artifact))
-        } else {
-            0
-        };
+        + towers_bytes_for(model, &state.registry, Some(artifact), vision, audio);
     let path = artifact.entry_path(state.registry.models_dir())?;
     let published = artifact.shape.clone().or_else(|| {
         // Validate the dense Qwen architecture before borrowing its GGUF
@@ -709,20 +741,29 @@ pub async fn handle(
         // keyed on arch - and deliberately only known for a DOWNLOADED model,
         // because the arch is read from the file rather than declared.
         let mut arch: Option<String> = None;
+        // No `kv` asked = the class the runner serves on auto: the row's
+        // family default (`kv_default`, KV8 for every generative family but
+        // three since 2026-10-04), still subject to the die's fp8 gate.
+        let model_kv = if q.kv.is_none()
+            && kv_blocked.is_none()
+            && m.kv_default
+                .as_deref()
+                .is_some_and(|k| matches!(k, "fp8_e4m3" | "fp8"))
+        {
+            KvDtype::Fp8E4m3
+        } else {
+            env.kv_dtype
+        };
         for a in m.weights() {
             let env = Envelope {
-                kv_dtype: a.runtime.estimate_kv_dtype(env.kv_dtype),
+                kv_dtype: a.runtime.estimate_kv_dtype(model_kv),
                 spec: artifact_spec(m, a, want_spec),
                 ..env
             };
-            // the mmproj tower follows the vision switch; an image lane's
-            // text encoder and VAE have no switch and are always charged
+            // the towers follow their switches; an image lane's text
+            // encoder and VAE have no switch and are always charged
             let tower = lane_companion_bytes_for(m, &state.registry, Some(a))
-                + if want_vision {
-                    tower_bytes_for(m, &state.registry, Some(a))
-                } else {
-                    0
-                };
+                + towers_bytes_for(m, &state.registry, Some(a), want_vision, q.audio);
             let weights = a.total_size();
             let published = a.shape.clone();
             // Only an installed file can be probed. Rather than guess geometry
@@ -768,7 +809,7 @@ pub async fn handle(
             // Probe geometry still fills in for an artifact published before
             // this existed, and for a format the generator cannot read.
             let shape_source = published.as_ref().map(|s| s.source);
-            let mut shape = artifact_shape(&state, m, a, want_vision);
+            let mut shape = artifact_shape(&state, m, a, want_vision, q.audio);
             if state.readiness.backend == "metal"
                 && let Some(shape) = &mut shape
             {
@@ -831,7 +872,7 @@ pub async fn handle(
                     "weights": shown,
                     "tower": tower,
                     "weights_source": source,
-                    "kv_bytes_per_token": shape.kv_per_sequence(1, env.kv_dtype),
+                    "kv_bytes_per_token": shape.kv_bytes_per_token(env.kv_dtype),
                     "reason": "no GPU telemetry - cannot judge fit",
                 }),
                 // No published shape and nothing to probe. Today this is the
@@ -903,6 +944,8 @@ pub async fn handle(
             // Whether the vision/audio tower is in these numbers. Mirrors the
             // start form's switch and the supervisor's `spec.vision`.
             "vision": want_vision,
+            // a split-tower model's audio tower, as asked (absent = default)
+            "audio": q.audio,
             // The server's own --max-ctx caps what it will actually serve,
             // independently of what the card could back. A model may report a
             // 262144 window while this server is configured for 32768; the UI
@@ -1203,7 +1246,8 @@ mod tests {
         let reg = Registry::new(std::path::PathBuf::from("./this-dir-does-not-exist"));
         let mut priced = 0;
         for m in &reg.catalog().models {
-            let tower = super::tower_bytes(m, &reg);
+            // every tower switched on
+            let tower = super::towers_bytes_for(m, &reg, None, true, Some(true));
             let has_vision = m.artifacts.iter().any(|a| a.kind == ArtifactKind::Vision);
             let has_audio = m.artifacts.iter().any(|a| a.kind == ArtifactKind::Audio);
             let has_tower = has_vision || has_audio;
@@ -1220,10 +1264,21 @@ mod tests {
             // with no mmproj at all, because its audio encoder ships inside
             // the weights file rather than as a companion. So the implication
             // runs one way only: audio tower => transcription.
+            //
+            // An EMBEDDING row is the other: its towers are embedding inputs -
+            // pictures and audio become vectors, not image chat or speech to
+            // text - so it claims neither (`transcription` would route the
+            // Studio's microphone to it). EmbeddingGemma 2 is the case.
+            let embeds = m.capability.iter().any(|c| c == "embeddings");
             let claims_audio = m.capability.iter().any(|c| c == "transcription");
             assert!(
-                !has_audio || claims_audio,
+                !has_audio || claims_audio || embeds,
                 "{}: an audio mmproj must come with the `transcription` capability",
+                m.id
+            );
+            assert!(
+                !embeds || !claims_audio,
+                "{}: an embedding row's audio tower is not speech to text",
                 m.id
             );
             // the catalog's own two claims about images have to agree, or the
@@ -1251,10 +1306,10 @@ mod tests {
                 .filter(|c| IMAGE_CAPS.contains(&c.as_str()))
                 .count();
             let generates_images = m.capability.iter().any(|c| c == "image-generation");
-            if generates_images {
+            if generates_images || embeds {
                 assert_eq!(
                     claims_images, 0,
-                    "{}: an image-generation row must not also claim image chat input",
+                    "{}: an image-generation or embedding row must not also claim image chat input",
                     m.id
                 );
             } else {
@@ -1274,7 +1329,16 @@ mod tests {
             // A tower's `workspace` bytes ride the same charge as its file
             // bytes - deepseek-ocr's encode slabs are BIGGER than its mmproj
             // file, and a fit that skips them is off by a gigabyte.
-            if let Some(a) = m
+            // (a split-tower model holds both towers, each with its own)
+            if m.split_towers() {
+                let both: u64 = m
+                    .artifacts
+                    .iter()
+                    .filter(|a| a.kind.is_mmproj())
+                    .map(|a| a.total_size() + a.workspace.unwrap_or(0))
+                    .sum();
+                assert_eq!(tower, both, "{}: both towers must be charged", m.id);
+            } else if let Some(a) = m
                 .artifacts
                 .iter()
                 .find(|a| a.kind.is_mmproj() && a.workspace.is_some())

@@ -18,6 +18,7 @@ enum Arithmetic {
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static BASELINE_PACKED_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // Numerical isolation only: fix the reference prefill contraction width.
     // Not a serving election or a performance-qualified implementation.
     pub(crate) static CANONICAL_PREFILL_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -591,6 +592,27 @@ fn project_group(
             "mlx_affine_compact4",
             "mlx_affine_compact5",
         ][vector_rows - 1]
+    };
+    // Read one complete affine group per lane, preserving the fixed F32
+    // contraction. R2 loses to the old loader; narrow gates also stay there.
+    // Election is restricted to the measured M5 dense-27B geometries.
+    let packed = fast_contract
+        && rows >= 3
+        && cmd.tensor_accelerated()
+        && matches!(k, 5120 | 6144 | 17408)
+        && planes.iter().all(|(w, _)| w.n >= 1024)
+        && (3..=5).contains(&vector_rows);
+    #[cfg(test)]
+    let packed = packed && !BASELINE_PACKED_FOR_TEST.with(|v| v.get());
+    let kernel = if packed {
+        match vector_rows {
+            3 => "mlx_affine_packed3",
+            4 => "mlx_affine_packed4",
+            5 => "mlx_affine_packed5",
+            _ => kernel,
+        }
+    } else {
+        kernel
     };
     if prefill
         && planes

@@ -131,11 +131,12 @@ pub(crate) fn is_inference_path(path: &str) -> bool {
             | "/v1/audio/diarizations"
             | "/v1/audio/diarizations/stream"
             | "/v1/segmentations"
+            | "/v1/masks"
             | "/v1/images/generations"
             | "/v1/images/edits"
             | "/v1/tabular/predictions"
             | "/v1/tabular/contexts"
-    )
+    ) || path.starts_with("/v1/masks/sessions")
 }
 
 /// The subset the admission cap refuses: real engine work. count_tokens is a

@@ -18,6 +18,13 @@ the viewBox is cropped to the emblem and native views supply monochrome ink.
 Source: https://cdn.prod.website-files.com/697a3312d33c2cc715ec3899/69961847735f3ec32aafc18e_prism-logo.svg
 The mark remains Prism ML's property.
 
+Aleph Alpha (2026-10-07, the Kolibri models' maker) uses the emblem from the
+official aleph-alpha.com header, shared with `VendorLogo.vue`. Its five paths
+and viewBox are unchanged; the file keeps its original #171717 fill and native
+views supply monochrome ink.
+Source: https://aleph-alpha.com/_astro/logo-bm.C1UmWdTa_ZKMPHl.svg
+The mark remains Aleph Alpha's property.
+
 The following SVGs are copied from Studio's installed simple-icons 16.28.0.
 The package's full license and disclaimer are bundled as
 `SimpleIcons-LICENSE.md` and `SimpleIcons-DISCLAIMER.md`. Package CC0 is not a

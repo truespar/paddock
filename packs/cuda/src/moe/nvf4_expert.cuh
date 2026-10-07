@@ -2187,6 +2187,12 @@ int pd_q4x_moe_gu_swiglu(const void* gdata, const void* gscale,
 // warp reduce - linear, so one reduction covers all k, deterministic).
 // accumulate=1 adds onto y (the shared-expert pass: topk_w=1, k=1, same
 // kernel); accumulate=0 overwrites (the routed pass goes first).
+// RPW > 1: each warp walks RPW consecutive output rows for its pair - the
+// routing / weight loads and the x reads (L1 hits after the first row) are
+// paid once per pair instead of once per row, and RPW weight rows ride in
+// flight. Every row's arithmetic is the RPW = 1 kernel's verbatim (same
+// dot16 calls, same pair order, same reduce), so outputs are bit-identical.
+template <uint32_t RPW = 1u>
 __global__ void pd_nvf4_moe_down_acc_kernel(
     const uint8_t* __restrict__ data, const uint8_t* __restrict__ scale,
     const float* __restrict__ scale2, const uint32_t* __restrict__ idx,
@@ -2196,8 +2202,8 @@ __global__ void pd_nvf4_moe_down_acc_kernel(
     PD_PDL_ARM();  // consumer-safe for early PDL launches (2026-08-31)
 #if PD_NV4_OK
     const uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
-    const uint32_t r = blockIdx.x * (blockDim.x >> 5) + warp;
-    if (r >= embd) return;
+    const uint32_t r0 = (blockIdx.x * (blockDim.x >> 5) + warp) * RPW;
+    if (r0 >= embd) return;
     const uint32_t t = blockIdx.y;
     // z-split (2026-08-31, ncu-guided): warp-per-row supplies only ~17
     // warps/SM (2560 rows / 148 SMs) vs the 40 cap - 26%% achieved
@@ -2206,7 +2212,9 @@ __global__ void pd_nvf4_moe_down_acc_kernel(
     // in ascending z - the serial walk's exact order (bit-identical).
     const uint32_t zj0 = part ? blockIdx.z * 2u : 0u;
     const uint32_t zj1 = part ? (zj0 + 2u < k ? zj0 + 2u : k) : k;
-    float acc = 0.0f;
+    float acc[RPW];
+#pragma unroll
+    for (uint32_t i = 0; i < RPW; ++i) acc[i] = 0.0f;
     // k x2 INTERLEAVE (2026-08-31): the serial per-expert chain was the wall
     // (probe: 24.6us vs a 1.15us floor, unmoved by dot16 - dependent-latency,
     // not load width). Expert dots are independent; pairing them doubles the
@@ -2217,43 +2225,58 @@ __global__ void pd_nvf4_moe_down_acc_kernel(
         const uint32_t e0 = idx[s0], e1 = idx[s1];
         const float w0 = topk_w[s0] * scale2[e0];
         const float w1 = topk_w[s1] * scale2[e1];
-        const uint8_t* row0 = data + ((size_t)e0 * embd + r) * (ff >> 1);
-        const uint8_t* srow0 = scale + ((size_t)e0 * embd + r) * (ff >> 4);
-        const uint8_t* row1 = data + ((size_t)e1 * embd + r) * (ff >> 1);
-        const uint8_t* srow1 = scale + ((size_t)e1 * embd + r) * (ff >> 4);
         const float* x0 = xr + (size_t)s0 * ff;
         const float* x1 = xr + (size_t)s1 * ff;
-        float p0 = 0.0f, p1 = 0.0f;
-        for (uint32_t k0 = 0; k0 < ff; k0 += 512u) {
-            const uint32_t el = k0 + lane * 16u;
-            if (el + 16u <= ff) {
-                p0 += pd_nvf4_dot16(row0, srow0, x0, el);
-                p1 += pd_nvf4_dot16(row1, srow1, x1, el);
+#pragma unroll
+        for (uint32_t i = 0; i < RPW; ++i) {
+            const uint32_t r = r0 + i;
+            if (r >= embd) break;
+            const uint8_t* row0 = data + ((size_t)e0 * embd + r) * (ff >> 1);
+            const uint8_t* srow0 = scale + ((size_t)e0 * embd + r) * (ff >> 4);
+            const uint8_t* row1 = data + ((size_t)e1 * embd + r) * (ff >> 1);
+            const uint8_t* srow1 = scale + ((size_t)e1 * embd + r) * (ff >> 4);
+            float p0 = 0.0f, p1 = 0.0f;
+            for (uint32_t k0 = 0; k0 < ff; k0 += 512u) {
+                const uint32_t el = k0 + lane * 16u;
+                if (el + 16u <= ff) {
+                    p0 += pd_nvf4_dot16(row0, srow0, x0, el);
+                    p1 += pd_nvf4_dot16(row1, srow1, x1, el);
+                }
             }
+            acc[i] += w0 * p0 + w1 * p1;
         }
-        acc += w0 * p0 + w1 * p1;
     }
     for (; j < zj1; ++j) {
         const uint32_t slot = t * k + j;
         const uint32_t e = idx[slot];
         const float w = topk_w[slot] * scale2[e];
-        const uint8_t* row = data + ((size_t)e * embd + r) * (ff >> 1);
-        const uint8_t* srow = scale + ((size_t)e * embd + r) * (ff >> 4);
         const float* xrow = xr + (size_t)slot * ff;
-        float part = 0.0f;
-        for (uint32_t k0 = 0; k0 < ff; k0 += 512u) {
-            const uint32_t el = k0 + lane * 16u;
-            if (el + 16u <= ff) part += pd_nvf4_dot16(row, srow, xrow, el);
+#pragma unroll
+        for (uint32_t i = 0; i < RPW; ++i) {
+            const uint32_t r = r0 + i;
+            if (r >= embd) break;
+            const uint8_t* row = data + ((size_t)e * embd + r) * (ff >> 1);
+            const uint8_t* srow = scale + ((size_t)e * embd + r) * (ff >> 4);
+            float pp = 0.0f;
+            for (uint32_t k0 = 0; k0 < ff; k0 += 512u) {
+                const uint32_t el = k0 + lane * 16u;
+                if (el + 16u <= ff) pp += pd_nvf4_dot16(row, srow, xrow, el);
+            }
+            acc[i] += w * pp;
         }
-        acc += w * part;
     }
-    for (uint32_t s = 16; s > 0; s >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, s);
-    if (lane == 0) {
-        if (part) {
-            part[((size_t)t * gridDim.z + blockIdx.z) * embd + r] = acc;
-        } else {
-            float* out = y + (size_t)t * embd + r;
-            *out = (accumulate ? *out : 0.0f) + acc;
+#pragma unroll
+    for (uint32_t i = 0; i < RPW; ++i) {
+        const uint32_t r = r0 + i;
+        float a = acc[i];
+        for (uint32_t s = 16; s > 0; s >>= 1) a += __shfl_down_sync(0xffffffffu, a, s);
+        if (lane == 0 && r < embd) {
+            if (part) {
+                part[((size_t)t * gridDim.z + blockIdx.z) * embd + r] = a;
+            } else {
+                float* out = y + (size_t)t * embd + r;
+                *out = (accumulate ? *out : 0.0f) + a;
+            }
         }
     }
 #else
@@ -2412,11 +2435,33 @@ int pd_nvf4_moe_down_acc(const void* data, const void* scale,
             (float*)y, ff, embd, k, accumulate);
         return pd_launch_status();
     }
-    pd_nvf4_moe_down_acc_kernel<<<grid, rows_per_cta * 32u, 0,
-                                  (cudaStream_t)stream>>>(
-        (const uint8_t*)data, (const uint8_t*)scale, (const float*)scale2,
-        (const uint32_t*)idx, (const float*)topk_w, (const float*)xr,
-        (float*)y, (float*)part, ff, embd, k, accumulate);
+    // Rows a warp walks (the RPW template): 4 where a row is one 512-element
+    // step (ff <= 512), so a pair's routing loads and x reads stop being
+    // paid per 256-byte row - GB10, Kolibri's 384-expert down (ff 512): the
+    // 4-row decode tick 37.36 -> 36.62 ms, 8 rows 64.07 -> 62.22, 1 row
+    // neutral; RPW 8 no better. Longer rows (nemotron, qwen4exp) already
+    // walk several steps a warp and keep 1. Bit-identical at any RPW.
+    // PADDOCK_NVF4_DOWN_RPW=1|2|4|8 pins it.
+    static int rpw_env = -1;
+    if (rpw_env < 0) {
+        const char* e = pd_env("PADDOCK_NVF4_DOWN_RPW");
+        rpw_env = (e && *e) ? atoi(e) : 0;
+    }
+    const int rpw = rpw_env > 0 ? rpw_env : (ff <= 512u ? 4 : 1);
+#define PD_NVDN_GO(RPW)                                                              \
+    do {                                                                             \
+        grid.x = (embd + rows_per_cta * (RPW) - 1u) / (rows_per_cta * (RPW));        \
+        pd_nvf4_moe_down_acc_kernel<RPW><<<grid, rows_per_cta * 32u, 0,              \
+                                           (cudaStream_t)stream>>>(                  \
+            (const uint8_t*)data, (const uint8_t*)scale, (const float*)scale2,        \
+            (const uint32_t*)idx, (const float*)topk_w, (const float*)xr,            \
+            (float*)y, (float*)part, ff, embd, k, accumulate);                       \
+    } while (0)
+    if (rpw == 8) PD_NVDN_GO(8u);
+    else if (rpw == 4) PD_NVDN_GO(4u);
+    else if (rpw == 2) PD_NVDN_GO(2u);
+    else PD_NVDN_GO(1u);
+#undef PD_NVDN_GO
     return pd_launch_status();
 #endif
 }

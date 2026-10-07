@@ -7,9 +7,11 @@ use std::sync::Arc;
 
 use crate::gpu::{DeviceTensor, GpuError, GpuExecutor, Nvf4MoePlane, QuantTensor};
 use crate::gpu_model::gpt_oss::GpuModelError;
-use crate::gpu_model::st_load::{bf16_bytes, bf16_to_f16_exact, bf16_to_f32, f32_tensor};
+use crate::gpu_model::st_load::{
+    bf16_bytes, bf16_concat_plane, bf16_plane, bf16_to_f16_exact, bf16_to_f32, f32_tensor,
+    nvf4_expert_stack,
+};
 use paddock_models::ggml_type::GgmlType;
-use paddock_models::modelopt::nvfp4_view;
 use paddock_models::qwen4exp::{Qwen4ExpBlock, Qwen4ExpConfig};
 use paddock_models::safetensors::{ShardedSafetensors, StDtype};
 
@@ -24,45 +26,6 @@ pub(super) fn dt(
     Ok(DeviceTensor {
         buf: exec.to_device(&v)?,
         dims,
-    })
-}
-
-/// bf16 plane resident as shipped: checkpoint bytes on device, dims [k, n]
-/// (in_dim-major, the QuantTensor convention the bf16 GEMV/GEMM lanes read).
-fn bf16_plane(
-    exec: &GpuExecutor,
-    st: &ShardedSafetensors,
-    name: &str,
-    n: usize,
-    k: usize,
-) -> Result<QuantTensor, GpuModelError> {
-    let raw = bf16_bytes(st, name, n * k)?;
-    Ok(QuantTensor {
-        bytes: exec.to_device_u8(raw).map_err(GpuModelError::from)?,
-        ty: GgmlType::Bf16,
-        dims: vec![k, n],
-    })
-}
-
-/// Load-time row concat of bf16 planes into one residency - the rival's
-/// MergedColumnParallelLinear layout (qwen3_5.py). Rows stack in `parts`
-/// order; dims stay the QuantTensor [k, n] convention. Byte-exact: the fused
-/// plane is the checkpoint bytes of each part, back to back.
-fn bf16_concat_plane(
-    exec: &GpuExecutor,
-    st: &ShardedSafetensors,
-    parts: &[(&str, usize)],
-    k: usize,
-) -> Result<QuantTensor, GpuModelError> {
-    let n: usize = parts.iter().map(|p| p.1).sum();
-    let mut raw: Vec<u8> = Vec::with_capacity(n * k * 2);
-    for (name, rows) in parts {
-        raw.extend_from_slice(bf16_bytes(st, name, rows * k)?);
-    }
-    Ok(QuantTensor {
-        bytes: exec.to_device_u8(&raw).map_err(GpuModelError::from)?,
-        ty: GgmlType::Bf16,
-        dims: vec![k, n],
     })
 }
 
@@ -382,24 +345,14 @@ fn moe_plane(
     rows: usize,
     in_dim: usize,
 ) -> Result<Nvf4MoePlane, GpuModelError> {
-    let mut cat_p: Vec<u8> = Vec::with_capacity(c.n_expert * rows * in_dim / 2);
-    let mut cat_s: Vec<u8> = Vec::with_capacity(c.n_expert * rows * in_dim / 16);
-    let mut s2 = Vec::with_capacity(c.n_expert);
-    for e in 0..c.n_expert {
-        let v = nvfp4_view(st, &format!("{pfx}.mlp.experts.{e}.{role}"))
-            .map_err(|err| GpuModelError::Unsupported(format!("{pfx} expert {e} {role}: {err}")))?;
-        if (v.n, v.k) != (rows, in_dim) {
-            return Err(GpuModelError::Unsupported(format!(
-                "{pfx} expert {e} {role} is [{}, {}], expected [{rows}, {in_dim}]",
-                v.n, v.k
-            )));
-        }
-        cat_p.extend_from_slice(v.packed);
-        cat_s.extend_from_slice(v.scales);
-        s2.push(v.scale2);
-    }
-    exec.nvf4_moe_upload(&cat_p, &cat_s, &s2, c.n_expert, rows, in_dim)
-        .map_err(GpuModelError::from)
+    nvf4_expert_stack(
+        exec,
+        st,
+        |e| format!("{pfx}.mlp.experts.{e}.{role}"),
+        c.n_expert,
+        rows,
+        in_dim,
+    )
 }
 
 /// bf16 twin of a host f32 plane for the TGV lane (slot 547): built only

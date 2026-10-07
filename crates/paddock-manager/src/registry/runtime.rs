@@ -105,6 +105,11 @@ pub struct BackendRuntime {
     /// Backend-specific launch recommendation, not the concurrency ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_max_batch: Option<usize>,
+    /// Backend-specific target window. A TARGET: a start that leaves max_ctx
+    /// unset is shrunk onto what the card backs at admission (routes.rs
+    /// fit_window), the same rule the Studio form follows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_max_ctx: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,6 +220,9 @@ impl ArtifactRuntime {
             if let Some(batch) = contract.default_max_batch {
                 effective.default_max_batch = Some(batch);
             }
+            if let Some(ctx) = contract.default_max_ctx {
+                effective.default_max_ctx = Some(ctx);
+            }
             if let Some(memory) = &contract.memory {
                 effective.memory = Some(memory.clone());
             }
@@ -272,4 +280,10 @@ pub struct ArtifactSource {
     pub base_model: String,
     pub license: String,
     pub license_url: String,
+    /// The files are downloaded from `repo` itself on Hugging Face, behind
+    /// its licence gate - the user accepts the terms there with their own
+    /// account and the download carries their token (`registry/gated.rs`).
+    /// Set where the licence does not let us mirror the weights.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gated: bool,
 }

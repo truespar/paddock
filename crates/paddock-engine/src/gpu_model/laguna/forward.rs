@@ -116,7 +116,7 @@ impl GpuLaguna {
             .iter()
             .map(|l| match &l.ffn {
                 Ffn::Dense { gate, .. } => gate.dims()[1],
-                Ffn::Moe(_) => m.moe_ff,
+                Ffn::Moe(_) | Ffn::MoeNv(_) => m.moe_ff,
             })
             .max()
             .unwrap_or(m.moe_ff);
@@ -190,15 +190,37 @@ impl GpuLaguna {
         match &self.tok_embd {
             TokEmbd::Q8(t) => exec.embed_gather_batch_q8(t, &ds.d_token, &mut sc.d_x, embd, 1)?,
             TokEmbd::Kq(t) => exec.kquant_gather(t, &ds.d_token, &mut sc.d_x, embd, 1)?,
+            TokEmbd::Bf16(t) => {
+                exec.embed_gather_bf16(t, &ds.d_token, &mut sc.d_x, embd, 1, 1.0)?
+            }
         }
 
         for (li, layer) in self.layers.iter().enumerate() {
             let n_heads = layer.n_heads;
             exec.rmsnorm_batch(&sc.d_x, &layer.attn_norm.buf, &mut sc.d_xn, embd, eps, 1)?;
-            gemv_any(&exec, &layer.wq, &sc.d_xn, &mut sc.d_q)?;
-            gemv_any(&exec, &layer.wk, &sc.d_xn, &mut sc.d_k)?;
-            gemv_any(&exec, &layer.wv, &sc.d_xn, &mut sc.d_v)?;
-            gemv_any(&exec, &layer.g_proj, &sc.d_xn, &mut sc.d_gate_h)?;
+            match &layer.proj {
+                Proj::Quant(q) => {
+                    gemv_any(&exec, &q.wq, &sc.d_xn, &mut sc.d_q)?;
+                    gemv_any(&exec, &q.wk, &sc.d_xn, &mut sc.d_k)?;
+                    gemv_any(&exec, &q.wv, &sc.d_xn, &mut sc.d_v)?;
+                    if let Some(g) = &q.g_proj {
+                        gemv_any(&exec, g, &sc.d_xn, &mut sc.d_gate_h)?;
+                    }
+                }
+                Proj::Bf16 { wqkv, .. } => super::head::bf16_qkv(
+                    &exec,
+                    wqkv,
+                    &sc.d_xn,
+                    None,
+                    false,
+                    &mut sc.d_q,
+                    &mut sc.d_k,
+                    &mut sc.d_v,
+                    n_heads * head_dim,
+                    kv_dim,
+                    1,
+                )?,
+            }
             exec.rmsnorm_batch(
                 &sc.d_q,
                 &layer.q_norm.buf,
@@ -226,7 +248,7 @@ impl GpuLaguna {
                     hp.rope_swa,
                     1,
                 )?;
-            } else {
+            } else if !layer.nope {
                 // partial-rotary YaRN over n_rot of head_dim - the mrope
                 // kernel's n_rot seam with all-equal text positions
                 exec.mrope(
@@ -289,17 +311,28 @@ impl GpuLaguna {
                 scale,
                 kv_dtype,
             )?;
-            exec.mul_softplus_head(&mut sc.d_attn, &sc.d_gate_h, n_heads, head_dim, 1)?;
-            gemv_any(&exec, &layer.wo, &sc.d_attn, &mut sc.d_proj)?;
-            exec.add_rmsnorm_batch(
-                &mut sc.d_x,
-                &sc.d_proj,
-                &layer.ffn_norm.buf,
-                &mut sc.d_xn,
-                embd,
-                eps,
-                1,
-            )?;
+            if layer.has_gate() {
+                exec.mul_softplus_head(&mut sc.d_attn, &sc.d_gate_h, n_heads, head_dim, 1)?;
+            }
+            match &layer.proj {
+                Proj::Quant(q) => gemv_any(&exec, &q.wo, &sc.d_attn, &mut sc.d_proj)?,
+                Proj::Bf16 { wo, .. } => exec.bf16_gemm(wo, None, &sc.d_attn, &mut sc.d_proj, 1)?,
+            }
+            if let Some(post) = &layer.post_attn_norm {
+                // sandwich: x += rmsnorm(attn_out) * post, then the pre-FFN norm
+                exec.rmsnorm_add_scale(&mut sc.d_x, &sc.d_proj, &post.buf, embd, eps, 1.0, 1)?;
+                exec.rmsnorm_batch(&sc.d_x, &layer.ffn_norm.buf, &mut sc.d_xn, embd, eps, 1)?;
+            } else {
+                exec.add_rmsnorm_batch(
+                    &mut sc.d_x,
+                    &sc.d_proj,
+                    &layer.ffn_norm.buf,
+                    &mut sc.d_xn,
+                    embd,
+                    eps,
+                    1,
+                )?;
+            }
 
             match &layer.ffn {
                 Ffn::Dense { gate, up, down } => {
@@ -308,15 +341,51 @@ impl GpuLaguna {
                     exec.swiglu(&mut sc.d_ffn_gate, &sc.d_ffn_up, gate.dims()[1])?;
                     gemv_any(&exec, down, &sc.d_ffn_gate, &mut sc.d_proj)?;
                 }
+                Ffn::MoeNv(w) => {
+                    // W4A16 routed GEMVs off f32 + the BF16 shared expert
+                    exec.matvec_f32_batch(&w.router_w, &sc.d_xn, &mut sc.d_moe_logits, 1)?;
+                    moe_dims.route(
+                        &exec,
+                        &sc.d_moe_logits,
+                        &w.probs_bias,
+                        &mut sc.d_moe_idx,
+                        &mut sc.d_moe_w,
+                        1,
+                    )?;
+                    let k = moe_dims.n_active;
+                    exec.q4x_moe_gu_swiglu(
+                        &w.gate,
+                        &w.up,
+                        &sc.d_moe_idx,
+                        &sc.d_xn,
+                        &mut sc.d_moe_fused,
+                        k,
+                        1,
+                    )?;
+                    exec.nvf4_moe_down_acc(
+                        &w.down,
+                        &sc.d_moe_idx,
+                        &sc.d_moe_w,
+                        &sc.d_moe_fused,
+                        &mut sc.d_proj,
+                        None,
+                        k,
+                        1,
+                        false,
+                    )?;
+                    exec.bf16_gemm(&w.sh_gate, None, &sc.d_xn, &mut sc.d_sh_gate, 1)?;
+                    exec.bf16_gemm(&w.sh_up, None, &sc.d_xn, &mut sc.d_sh_up, 1)?;
+                    exec.swiglu(&mut sc.d_sh_gate, &sc.d_sh_up, moe_dims.shexp_ff)?;
+                    exec.bf16_gemm(&w.sh_down, None, &sc.d_sh_gate, &mut sc.d_sh_out, 1)?;
+                    exec.add(&mut sc.d_proj, &sc.d_sh_out, embd)?;
+                }
                 Ffn::Moe(w) => {
                     exec.quantize_q8(&sc.d_xn, &mut sc.d_moe_xq, &mut sc.d_moe_xs, embd)?;
                     exec.matvec_f32_batch(&w.router_w, &sc.d_xn, &mut sc.d_moe_logits, 1)?;
-                    exec.moe_topk_sigmoid_batch(
+                    moe_dims.route(
+                        &exec,
                         &sc.d_moe_logits,
-                        &w.probs_bias.buf,
-                        moe_dims.routed_scale,
-                        moe_dims.n_expert,
-                        moe_dims.n_active,
+                        &w.probs_bias,
                         &mut sc.d_moe_idx,
                         &mut sc.d_moe_w,
                         1,
@@ -413,11 +482,19 @@ impl GpuLaguna {
                     exec.add(&mut sc.d_proj, &sc.d_sh_out, embd)?;
                 }
             }
-            exec.add(&mut sc.d_x, &sc.d_proj, embd)?;
+            match &layer.post_ffn_norm {
+                Some(post) => {
+                    exec.rmsnorm_add_scale(&mut sc.d_x, &sc.d_proj, &post.buf, embd, eps, 1.0, 1)?
+                }
+                None => exec.add(&mut sc.d_x, &sc.d_proj, embd)?,
+            }
         }
 
         exec.rmsnorm_batch(&sc.d_x, &self.output_norm.buf, &mut sc.d_xn, embd, eps, 1)?;
-        gemv_any(&exec, &self.lm_head, &sc.d_xn, &mut sc.d_logits)?;
+        match &self.lm_head {
+            Head::Quant(q) => gemv_any(&exec, q, &sc.d_xn, &mut sc.d_logits)?,
+            Head::Bf16(w) => exec.bf16_gemm(w, None, &sc.d_xn, &mut sc.d_logits, 1)?,
+        }
         ds.pos += 1;
         let logits = exec.stream.clone_dtoh(&sc.d_logits).map_err(drv)?;
         Ok(logits)
@@ -528,13 +605,36 @@ impl Generator for GpuLaguna {
 
     // plan_chunk's cap under the pass's row capacity (the decode rows share it)
     fn prefill_tick_cap(&self, decode_rows: usize) -> usize {
+        // a pass with no decode band takes the wide chunk (Kolibri); one with
+        // decode rows keeps pf_rows - every band row waits on the whole pass
         self.batch.as_ref().map_or(0, |bs| {
-            super::batch::pf_rows().min(bs.cap.saturating_sub(decode_rows))
+            let rows = if decode_rows == 0 {
+                bs.pf_wide
+            } else {
+                super::batch::pf_rows()
+            };
+            rows.min(bs.cap.saturating_sub(decode_rows))
         })
     }
 
     fn prefill_begin(&mut self, slot: usize, tokens: Vec<u32>) -> Result<(), GenError> {
-        self.prefill_begin_impl(slot, tokens).map_err(gen_err)
+        self.prefill_begin_impl(slot, tokens, &[])
+            .map(|_| ())
+            .map_err(gen_err)
+    }
+
+    fn prefill_begin_hinted(
+        &mut self,
+        slot: usize,
+        tokens: Vec<u32>,
+        hints: &[usize],
+    ) -> Result<usize, GenError> {
+        self.prefill_begin_impl(slot, tokens, hints)
+            .map_err(gen_err)
+    }
+
+    fn prefix_share_floor(&self) -> Option<usize> {
+        self.prefix_share_floor_impl()
     }
 
     fn prefill_abort(&mut self, slot: usize) -> bool {

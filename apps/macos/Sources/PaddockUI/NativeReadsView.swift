@@ -101,6 +101,15 @@ struct NativeReadsView: View {
       .onChange(of: model.current?.images) { _, supported in
         if supported != true { cameraMode = false }
       }
+      .onChange(of: model.draft.questions) { before, after in
+        for old in before {
+          if let next = after.first(where: { $0.id == old.id }), old.kind == next.kind,
+            old.answerNames != next.answerNames
+          {
+            model.draft.followAnswerRename(old.id, before: old.answerNames, after: next.answerNames)
+          }
+        }
+      }
       .onChange(of: model.activeSession?.id) { old, _ in if old != nil { camera.pause(clear: true) }
       }
       .onDisappear { camera.close() }
@@ -152,10 +161,7 @@ struct NativeReadsView: View {
   }
 
   private var modePicker: some View {
-    Picker("What to read", selection: $cameraMode) {
-      Text("Text").tag(false)
-      Text("Camera").tag(true)
-    }.pickerStyle(.segmented).frame(width: 160).accessibilityIdentifier("reads-mode")
+    NativeReadModePicker(cameraMode: $cameraMode)
   }
 
   private var modelPicker: some View {
@@ -186,9 +192,11 @@ struct NativeReadsView: View {
           guard let url = urls.first, url.isFileURL, !model.importing, !model.busy else {
             return false
           }
-          if urls.allSatisfy({
-            UTType(filenameExtension: $0.pathExtension)?.conforms(to: .image) == true
-          }) {
+          if model.current?.images == true,
+            urls.allSatisfy({
+              UTType(filenameExtension: $0.pathExtension)?.conforms(to: .image) == true
+            })
+          {
             Task { await model.addPictures(urls) }
           } else {
             Task { await model.loadFile(url) }
@@ -280,13 +288,15 @@ struct NativeReadsView: View {
             NativeReadQuestionRow(
               question: $question, onDuplicate: { model.duplicate(question.id) },
               onMove: { model.move(question.id, by: $0) },
-              onRemove: { model.draft.questions.removeAll { $0.id == question.id } },
+              onRemove: { model.draft.removeQuestion(question.id) },
               position: model.draft.questions.firstIndex { $0.id == question.id } ?? 0,
               count: model.draft.questions.count,
               supportedTypes: model.current?.types ?? ["noul", "choice", "score"],
               serverError: model.rowErrors[question.questionID],
               onID: { model.editID(question.id, text: $0) },
-              onInstructions: { model.editInstructions(question.id, text: $0) })
+              onInstructions: { model.editInstructions(question.id, text: $0) },
+              conditional: model.current?.conditional == true,
+              others: model.draft.questions.filter { $0.id != question.id })
           }
           HStack(spacing: 8) {
             ForEach(
@@ -326,13 +336,12 @@ struct NativeReadsView: View {
         }
       }
       DisclosureGroup("API request") {
-        let request =
-          (try? model.draft.orderedJSON(model: model.requestModel, includeImageData: false))
-          ?? ""
-        Text("POST /v1/systemone\n\n" + request).font(.system(size: 11, design: .monospaced))
+        let request = (try? model.draft.curl(port: model.port, model: model.requestModel)) ?? ""
+        Text(request).font(.system(size: 11, design: .monospaced))
           .textSelection(.enabled)
           .frame(maxWidth: .infinity, alignment: .leading).padding(.top, 8)
-        Button("Copy request") {
+        Button("Copy curl") { copy(request) }.buttonStyle(QuietButtonStyle())
+        Button("Copy JSON") {
           let draft = model.draft
           let name = model.requestModel
           Task {
@@ -388,7 +397,7 @@ struct NativeReadsView: View {
       if let result = model.result {
         HStack {
           Text(
-            "\(result.response.diagnostics.timing.totalMilliseconds, specifier: "%.0f") ms · \(result.response.diagnostics.reads) reads"
+            "\(result.elapsedMilliseconds, specifier: "%.0f") ms · \(result.response.diagnostics.reads) reads"
           )
           .monospacedDigit().foregroundStyle(.secondary)
           Spacer()
@@ -397,6 +406,10 @@ struct NativeReadsView: View {
               Button(run.at.formatted(date: .abbreviated, time: .standard) + " · " + run.excerpt) {
                 model.selectedRun = run.id
               }
+            }
+            if model.hasEvictedRuns {
+              Button("Load earlier saved runs") { Task { await model.reloadCachedRuns() } }
+                .disabled(model.historyNavigationBlocked)
             }
             Divider()
             Button("Delete read", role: .destructive) { confirmDeleteRead = true }
@@ -420,17 +433,7 @@ struct NativeReadsView: View {
             }
           }
         }
-        ForEach(result.questions) { question in
-          if let answer = result.response.answers[question.questionID] {
-            NativeReadAnswerView(
-              question: question, answer: answer,
-              diagnostic: result.response.diagnostics.questions.first {
-                $0.id == question.questionID
-              }, readCount: result.response.diagnostics.reads)
-          }
-        }
-        NativeReadDiagnostics(
-          response: result.response, elapsedMilliseconds: result.elapsedMilliseconds)
+        NativeReadResult(result: result)
         DisclosureGroup("Response JSON") {
           Text((try? ReadDraft.json(result.raw)) ?? "").font(.system(size: 11, design: .monospaced))
             .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
@@ -483,5 +486,18 @@ struct NativeReadsView: View {
         model.error = error.localizedDescription
       }
     }
+  }
+}
+
+/// A compact input switch; its accessible label must not compete with the
+/// two segments for the header's fixed control width.
+struct NativeReadModePicker: View {
+  @Binding var cameraMode: Bool
+  var body: some View {
+    Picker("What to read", selection: $cameraMode) {
+      Text("Text").tag(false)
+      Text("Camera").tag(true)
+    }.pickerStyle(.segmented).labelsHidden().frame(width: 160)
+      .accessibilityIdentifier("reads-mode")
   }
 }

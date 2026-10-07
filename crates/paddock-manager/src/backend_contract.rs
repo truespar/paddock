@@ -118,6 +118,7 @@ mod tests {
             ("gemma-4-31b", "mlx-4bit", false),
             ("muse-glimmer-30b", "mlx-4bit", false),
             ("qwen3.8-flash-next", "mlx-4bit", false),
+            ("kolibri-1", "mlx-mixed-4-8bit", false),
         ] {
             let model = reg.catalog_of(id).unwrap();
             let a = model.artifact(artifact).unwrap();

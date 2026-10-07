@@ -8,6 +8,21 @@ import Testing
 
 @Suite("Native Reads layout", .serialized) @MainActor
 struct NativeReadsLayoutTests {
+  @Test func inputModePickerFitsOneRowInBothThemes() {
+    for dark in [false, true] {
+      for cameraMode in [false, true] {
+        let host = NSHostingController(
+          rootView: NativeReadModePicker(cameraMode: .constant(cameraMode))
+            .font(.system(size: 13))
+            .environment(\.colorScheme, dark ? .dark : .light))
+        let size = host.sizeThatFits(in: NSSize(width: 160, height: 1000))
+        #expect(
+          size.width <= 160 && size.height <= 28,
+          "The input selector must be a single row, not a wrapped label: \(size)")
+      }
+    }
+  }
+
   @Test func liveCameraAnswersFitBothThemesWithoutCameraAccess() async throws {
     let model = NativeReadsModel(client: NativeManager())
     model.api = { path, _, _, _ in

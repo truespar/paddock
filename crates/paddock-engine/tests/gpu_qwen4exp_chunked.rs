@@ -35,6 +35,7 @@ fn load(
     exec: &std::sync::Arc<paddock_engine::gpu::GpuExecutor>,
     path: &std::path::Path,
 ) -> Qwen4ExpGpu {
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load_gguf_with_slots(exec, path, 4096, 3).expect("load gguf");
     let headroom = exec.vram_headroom().unwrap_or(0);
     m.enable_moe_cache(headroom.saturating_sub(512 << 20))

@@ -58,6 +58,7 @@ fn gguf_sampled_verify_commits_what_the_greedy_round_does() {
 
     // the prefix cache off: both slots walk the prompt cold, in one walk each
     unsafe { std::env::set_var("PADDOCK_NO_PREFIX_CACHE", "1") };
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load_gguf_with_slots(&exec, &path, 4096, 2).expect("load gguf");
     unsafe { std::env::remove_var("PADDOCK_NO_PREFIX_CACHE") };
     let headroom = exec.vram_headroom().unwrap_or(0);
@@ -186,6 +187,7 @@ fn gguf_spec_reply_checkpoint_matches_the_decode_ticks() {
         .encode(" Now add the next courier to the log.")
         .expect("encode");
     let load = |with_mtp: bool| -> Qwen4ExpGpu {
+        common::qwen4exp_exact_kv();
         let mut m = Qwen4ExpGpu::load_gguf_with_slots(&exec, &path, 4096, 1).expect("load gguf");
         let headroom = exec.vram_headroom().unwrap_or(0);
         m.enable_moe_cache(headroom.saturating_sub(3 << 30))

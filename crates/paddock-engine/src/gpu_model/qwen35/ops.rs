@@ -1259,16 +1259,38 @@ pub(crate) fn attn_verify_dispatch(
         || !exec.has_attn_spec_batch_paged()
         || paddock_models::dev_var_os!("PADDOCK_QWEN35_NO_VERIFY_FA").is_some()
     {
+        // engagement witness for the decline too: the engaged line below is
+        // the only other fingerprint, and a silent decline reads like "never
+        // reached" in a serve log
+        static DECLINED: std::sync::Once = std::sync::Once::new();
+        DECLINED.call_once(|| {
+            eprintln!("[verify-fa] declined: rows={rows} k1={k1} kv={kv_dtype:?} hd={head_dim}");
+        });
         return Ok(false);
     }
     let blocks = rows / k1;
     let scalar_fallback = attn_splits(n_heads, rows, exec.sm_count()) == 1;
-    if blocks < 16 && !scalar_fallback {
-        return Ok(false);
-    }
     // partial scratch holds 2*fill*MAX_ATTN_SPLITS (head,row,split) cells
     let sp_cap = (2 * super::attn_fill_blocks(exec.sm_count()) * super::MAX_ATTN_SPLITS)
         / (n_heads * rows).max(1);
+    // Single-session rounds (one slot block, the agent case) used to walk
+    // per row: the decode dispatch gives each of the block's k1 rows its own
+    // pass over the slot's whole KV, so a c1 DFlash round read the fp8
+    // history k1 times over and verify attention was ~1/3 of a 232 ms round
+    // at 212K. The shared walk lost there only on GRID SHAPE: at ~56 KB of
+    // smem (Mp=48) one krs CTA fits an SM, so its kv heads x splits grid
+    // has to fill whole waves - 64 CTAs (16 splits) on 48 SMs is 1.33 waves
+    // and lost to per-row. One CTA per SM (sm_count / n_kv splits) wins at
+    // every depth (verify_c1_gb10_bench, us a layer at 8 rows: 1K 31 vs 40,
+    // 8K 98 vs 204, 32K 403 vs 755, 250K 2734 vs 5750; 4-5 rows the same
+    // story). The count is depth-independent - the kernel's s_eff clamp
+    // trims shallow walks - so the captured verify graph stays valid at any
+    // depth. k1 <= 3 (the MTP chain's rounds) gains nothing (250K: 2773 vs
+    // 2734) and keeps the per-row walk.
+    let single = blocks == 1 && k1 >= 4 && verify_single_shared();
+    if blocks < 16 && !scalar_fallback && !single {
+        return Ok(false);
+    }
     // NOTE (a FALSIFIED idea, kept as the record): this arm launches krs
     // with GV=6, so the kernel's adaptive `s_eff = ceil(n_pos/(TPC*PT))` is
     // live and clamps to whatever count we pass - at 15k ctx it wants ~118
@@ -1279,7 +1301,14 @@ pub(crate) fn attn_verify_dispatch(
     // every (head,row); at 5 it is 120 CTAs walking ~3000 keys with a cheap
     // combine. Filling the die costs more in partial+combine traffic than the
     // shorter walk saves. Keep the conservative host count.
-    let n_splits = spec_verify_splits(ctx_hint).min(sp_cap).max(1);
+    let n_splits = if single {
+        (exec.sm_count() / n_kv_heads.max(1))
+            .clamp(1, super::MAX_ATTN_SPLITS)
+            .min(sp_cap)
+            .max(1)
+    } else {
+        spec_verify_splits(ctx_hint).min(sp_cap).max(1)
+    };
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         eprintln!(
@@ -1340,9 +1369,24 @@ pub(crate) fn attn_verify_dispatch(
     Ok(true)
 }
 
+/// The verify graph's cache key: (live, round k1, split bucket). The verify
+/// pass's recording bakes the split election, so the bucket has to key it.
+pub(super) fn verify_graph_key(live: usize, k1: usize, max_pos: u32) -> (usize, usize, usize) {
+    (live, k1, spec_verify_splits(max_pos as usize))
+}
+
+/// Kill switch for the single-session shared walk in [`attn_verify_dispatch`]
+/// (the A/B off leg): PADDOCK_QWEN35_NO_C1_SHARED=1 restores the per-row
+/// walk for one-block rounds.
+fn verify_single_shared() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_QWEN35_NO_C1_SHARED").is_none())
+}
+
 /// Verify-walk split count for [`attn_verify_dispatch`] - CONTEXT-adaptive:
-/// `ceil(ctx / 2048)`, so it stays 1 (the in-kernel finalize elected at
-/// ~1k ctx) up to two KV pages of depth and grows with the walk beyond.
+/// `ceil(ctx / 2048)` rounded up to a power of two, so it stays 1 (the
+/// in-kernel finalize elected at ~1k ctx) up to two KV pages of depth and
+/// grows with the walk beyond.
 /// Mechanism: the fin election's ladder ran where one split's walk was ~1k
 /// keys and the grid already covered the die; at 8-16k ctx the same fin
 /// launch is 24-32 CTAs each walking the whole context serially, and
@@ -1354,7 +1398,16 @@ pub(crate) fn attn_verify_dispatch(
 /// the same launched count. The scratch cap (sp_cap) still pins wide-row
 /// rounds (c32-class) to fin independently. PADDOCK_QWEN35_VERIFY_SP pins
 /// a fixed count (=1 restores the pure-fin arm - the A/B off leg).
-fn spec_verify_splits(ctx_hint: usize) -> usize {
+///
+/// The count is BUCKETED to a power of two, and the bucket is part of the
+/// verify graph's key (spec.rs graph_verify). The verify pass replays as a
+/// captured graph, so every host decision made while recording it - this
+/// count, and the shared-vs-per-row election above - is frozen at capture.
+/// Keyed only on (live, k1), the graph captured on a session's first round
+/// served every later depth with that round's split count: a session that
+/// started at 8K walked 200K of history with the 8K plan. Power-of-two buckets
+/// keep that to at most six captures per (live, k1).
+pub(super) fn spec_verify_splits(ctx_hint: usize) -> usize {
     static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     if let Some(n) = *V.get_or_init(|| {
         paddock_models::dev_var!("PADDOCK_QWEN35_VERIFY_SP")
@@ -1368,7 +1421,10 @@ fn spec_verify_splits(ctx_hint: usize) -> usize {
     // 15k-ctx cell (518.9 vs 499.3 fin vs 513.4 at the cap - see the
     // dispatch note's rung-2 falsification); the ladder between 2 and 16 is
     // unexplored, so this is "best measured", not "proven optimal".
-    ctx_hint.div_ceil(2048).clamp(1, super::MAX_ATTN_SPLITS)
+    ctx_hint
+        .div_ceil(2048)
+        .next_power_of_two()
+        .clamp(1, super::MAX_ATTN_SPLITS)
 }
 
 /// Routed-expert MoE FFN, token-batched (the qwen3.6-A3B class): router
@@ -2408,17 +2464,7 @@ pub(crate) fn kq_mm_pre(
         if needs {
             exec.mmq_sums(yq, xsums, k.dims[0], batch)?;
         }
-        if exec.has_kquant_gemm_w4a8_pipe2()
-            && paddock_models::dev_var_os!("PADDOCK_NO_KQUANT_PIPE2").is_none()
-        {
-            exec.kquant_gemm_w4a8_pipe2(k, yq, needs.then_some(&*xsums), y, batch)?;
-        } else if exec.has_kquant_gemm_w4a8_pipe()
-            && paddock_models::dev_var_os!("PADDOCK_NO_KQUANT_PIPE").is_none()
-        {
-            exec.kquant_gemm_w4a8_pipe(k, yq, needs.then_some(&*xsums), y, batch)?;
-        } else {
-            exec.kquant_gemm_w4a8(k, yq, needs.then_some(&*xsums), y, batch)?;
-        }
+        exec.kquant_gemm_w4a8_tile(k, yq, needs.then_some(&*xsums), y, batch)?;
     } else {
         if needs {
             exec.q8_sums_strided(xq, ssums, k.dims[0], batch)?;
@@ -2884,7 +2930,7 @@ pub(super) fn prefill_ffn_f8w(
     exec.quantize_e4m3(xn, xq, xs, r * gu8.1)?;
     static O16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let o16 = *O16.get_or_init(|| {
-        paddock_models::dev_var_os!("PADDOCK_NO_F8W8_TMA").is_none()
+        std::env::var_os("PADDOCK_NO_F8W8_TMA").is_none()
             && paddock_models::dev_var_os!("PADDOCK_NO_O16").is_none()
     });
     static O16T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

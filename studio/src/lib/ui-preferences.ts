@@ -11,6 +11,14 @@ export const preferenceKeys = [
 const allowed = new Set<string>(preferenceKeys)
 const prefix = 'studio.'
 
+/** The history pages' side-panel fold, one for all three (usePanelFold), kept
+ *  under each page's top-level settings key (they predate the `studio.` view)
+ *  and read here with everything else before the app mounts, so a page opens
+ *  with its panel as it was left - a page that fetched its own on mount
+ *  showed the panel, then folded it, on every visit. */
+export const panelKeys = ['readsPanelOpen', 'tablesPanelOpen', 'masksPanelOpen'] as const
+export type PanelKey = (typeof panelKeys)[number]
+
 export interface PreferenceAPI {
   load(): Promise<Record<string, unknown>>
   importMissing(patch: Record<string, unknown>): Promise<Record<string, unknown>>
@@ -55,6 +63,7 @@ const api: PreferenceAPI = {
  * A failed write stays dirty and visible, never falls back to browser storage. */
 export function createPreferences(backend: PreferenceAPI) {
   const values = new Map<string, string>()
+  const panels = new Map<PanelKey, boolean>()
   const dirty = new Map<string, string | null>()
   const error = ref('')
   const pending = ref(false)
@@ -69,6 +78,11 @@ export function createPreferences(backend: PreferenceAPI) {
     for (const key of allowed) {
       const value = data[prefix + key]
       if (typeof value === 'string') values.set(key, value)
+    }
+    panels.clear()
+    for (const key of panelKeys) {
+      const value = data[key]
+      if (typeof value === 'boolean') panels.set(key, value)
     }
     loaded = true
     error.value = ''
@@ -109,6 +123,14 @@ export function createPreferences(backend: PreferenceAPI) {
   return {
     error, pending,
     getItem: (key: string): string | null => values.get(key) ?? null,
+    /** a page's panel fold as last saved, or null when it never was */
+    panel: (key: PanelKey): boolean | null => panels.get(key) ?? null,
+    /** remember the fold at once for every page (the next mount reads it)
+     *  and save it, in one write */
+    async setPanels(open: boolean): Promise<void> {
+      for (const key of panelKeys) panels.set(key, open)
+      if (loaded) await backend.save(Object.fromEntries(panelKeys.map((key) => [key, open])))
+    },
     setItem,
     removeItem: (key: string) => setItem(key, null),
     flush,

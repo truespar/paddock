@@ -2320,7 +2320,7 @@ static int pd_attn_prefill_f16_paged_impl(
         && !(head_dim == 128u
              && (n_heads == 4u * n_kv_heads || n_heads == 6u * n_kv_heads
                  || n_heads == 8u * n_kv_heads || n_heads == 9u * n_kv_heads
-                 || n_heads == 16u * n_kv_heads))
+                 || n_heads == 12u * n_kv_heads || n_heads == 16u * n_kv_heads))
         && !(head_dim == 64u && n_heads == 8u * n_kv_heads))
         return cudaErrorInvalidValue;
     static bool carveout_done_p = false;
@@ -3021,7 +3021,7 @@ static int pd_attn_prefill_f16_paged_impl(
     if (head_dim == 128u
         && (n_heads == 4u * n_kv_heads || n_heads == 6u * n_kv_heads
             || n_heads == 8u * n_kv_heads || n_heads == 9u * n_kv_heads
-            || n_heads == 16u * n_kv_heads)) {
+            || n_heads == 12u * n_kv_heads || n_heads == 16u * n_kv_heads)) {
         const bool f8v4n = kv_dtype == PD_KV_FP8_E4M3;
         const uint32_t g_ = n_heads / n_kv_heads;
         // hd128 REPACK-PANE arm (pf7rp) - sits above the pf7
@@ -3042,7 +3042,7 @@ static int pd_attn_prefill_f16_paged_impl(
         // TK=48 not 64: at TK=64 the tile is 51,456 B and misses 2 CTA/SM by
         // 256 BYTES -> 4 warps/SM, and NW=8 already measured what 1 CTA/SM
         // costs this pipeline. Kill: PADDOCK_NO_PF7RP -> the pf7 arm below.
-        // G in {4,6,8,9,16}: the first wiring instantiated only
+        // G in {4,6,8,9,12,16} (12: Kolibri 1's 48q/4kv): the first wiring instantiated only
         // 4/6/8 -- granite's ratio and its neighbours -- and the fleet sweep
         // found the two ratios outside that set were the worst prefill
         // cells by far, because they fell through to v4 and never saw
@@ -3055,7 +3055,7 @@ static int pd_attn_prefill_f16_paged_impl(
         // different, slower kernel. The outer gate already admitted all five.
         static const bool no_rp128 = pd_env("PADDOCK_NO_PF7RP") != nullptr;
         if (f8v4n && !no_rp128 && (g_ == 4u || g_ == 6u || g_ == 8u
-                                   || g_ == 9u || g_ == 16u)) {
+                                   || g_ == 9u || g_ == 12u || g_ == 16u)) {
             constexpr uint32_t RPMR = 64u, RPTK = 48u, RPHD = 128u;
             // Q MR*(HD+8)h | pane TK*(HD+8)h | raw K,V TK*HD B each (the
             // per-row positions ride the pane). Every term carries its own
@@ -3068,7 +3068,8 @@ static int pd_attn_prefill_f16_paged_impl(
                                                            RPTK>, RPSM)
             static const bool rp128_fits = PD_PF7RP_128_FITS(4u)
                 && PD_PF7RP_128_FITS(6u) && PD_PF7RP_128_FITS(8u)
-                && PD_PF7RP_128_FITS(9u) && PD_PF7RP_128_FITS(16u);
+                && PD_PF7RP_128_FITS(9u) && PD_PF7RP_128_FITS(12u)
+                && PD_PF7RP_128_FITS(16u);
 #undef PD_PF7RP_128_FITS
             if (rp128_fits) {
                 const bool multi = pd_pf_runs_offs != nullptr;
@@ -3090,6 +3091,7 @@ static int pd_attn_prefill_f16_paged_impl(
                 else if (g_ == 6u) PD_PF7RP_128_LAUNCH(6u);
                 else if (g_ == 8u) PD_PF7RP_128_LAUNCH(8u);
                 else if (g_ == 9u) PD_PF7RP_128_LAUNCH(9u);
+                else if (g_ == 12u) PD_PF7RP_128_LAUNCH(12u);
                 else PD_PF7RP_128_LAUNCH(16u);
 #undef PD_PF7RP_128_LAUNCH
                 return pd_launch_status();
@@ -3105,7 +3107,7 @@ static int pd_attn_prefill_f16_paged_impl(
         // Same G set as the pf7rp arm above, so PADDOCK_NO_PF7RP lands on
         // pf7 rather than falling all the way to v4 for ratios 9/16.
         if (f8v4n && !no_pf7_128 && (g_ == 4u || g_ == 6u || g_ == 8u
-                                     || g_ == 9u || g_ == 16u)) {
+                                     || g_ == 9u || g_ == 12u || g_ == 16u)) {
             // Q-TILE WIDTH is not the LEVER (two arms, both falsified).
             // Profiling had pf7 at grid 1024 where FlashInfer needs 512 for
             // identical work, with much higher L1/TEX, which read as K/V
@@ -3142,16 +3144,11 @@ static int pd_attn_prefill_f16_paged_impl(
             if (P7SM128 <= (uint32_t)p7c128) {
                 static bool a7_128 = false;
                 if (!a7_128) {
-                    cudaFuncSetAttribute((const void*)pd_attn_prefill_pf7_kernel<128u, 4u>,
-                        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)P7SM128);
-                    cudaFuncSetAttribute((const void*)pd_attn_prefill_pf7_kernel<128u, 6u>,
-                        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)P7SM128);
-                    cudaFuncSetAttribute((const void*)pd_attn_prefill_pf7_kernel<128u, 8u>,
-                        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)P7SM128);
-                    cudaFuncSetAttribute((const void*)pd_attn_prefill_pf7_kernel<128u, 9u>,
-                        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)P7SM128);
-                    cudaFuncSetAttribute((const void*)pd_attn_prefill_pf7_kernel<128u, 16u>,
-                        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)P7SM128);
+#define PD_PF7_128_ATTR(GV) cudaFuncSetAttribute((const void*)pd_attn_prefill_pf7_kernel<128u, GV>, \
+                        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)P7SM128)
+                    PD_PF7_128_ATTR(4u); PD_PF7_128_ATTR(6u); PD_PF7_128_ATTR(8u);
+                    PD_PF7_128_ATTR(9u); PD_PF7_128_ATTR(12u); PD_PF7_128_ATTR(16u);
+#undef PD_PF7_128_ATTR
                     a7_128 = true;
                 }
                 const bool multi = pd_pf_runs_offs != nullptr;
@@ -3169,12 +3166,14 @@ static int pd_attn_prefill_f16_paged_impl(
                 else if (g_ == 6u) PD_PF7_128_LAUNCH(6u);
                 else if (g_ == 8u) PD_PF7_128_LAUNCH(8u);
                 else if (g_ == 9u) PD_PF7_128_LAUNCH(9u);
+                else if (g_ == 12u) PD_PF7_128_LAUNCH(12u);
                 else PD_PF7_128_LAUNCH(16u);
 #undef PD_PF7_128_LAUNCH
                 return pd_launch_status();
             }
         }
-        if (!no_v4s) {
+        // no v4 G=12 (its else is G=16): 12 takes the scalar fp8 / generic f16 tile
+        if (!no_v4s && g_ != 12u) {
         constexpr uint32_t V4TK = 16u;
         // Occupancy fix: v4 at MR=64 uses 51.6 KB smem => 1 CTA/SM
         // (8 warps, latency-bound => ~19 TF, far off the achievable rate).

@@ -35,14 +35,17 @@ drives those kernels.
 | files | Rust side |
 |---|---|
 | `linear` (Q8_0), `kquant`, `iquant` + `iquant_tables`, `mlx_affine` | shared: `weights`, `projection`, `iquant`, `affine` |
+| `mlx_affine_few` | stable small-row packed loading; vector/MMA/occupancy experiments are test-only |
 | `attention`, `moe` (MXFP4), `deltanet`, `spec`, `dflash` | shared across families |
 | `granite`, `granite_attention64`, `granite_prefill`, `granite_speech`, `granite_vision` | `granite/` |
 | `gemma4`, `gemma4_vision`, `gemma_moe`, `gemma_mlx`, `gemma_mlx_vision`, `muse`, `muse_vision` | `gemma4/` |
 | `qwen_attention`, `qwen_projection`, `qwen_moe`, `mlx_qwen`, `vision` | `qwen35/` |
 | `qwen4exp`, `qwen4exp_affine`, `qwen4exp_mlx`, `qwen4exp_moe`, `qwen4exp_qsa` | `qwen4exp/` |
 | `qwen3_encoder`, `qwen3_asr`, `qwen3_aligner` | `qwen3/`, `qwen3_asr/` |
+| `embedding_gemma2`, `embedding_gemma2_attention` | `embedding_gemma2/`: bidirectional text encoder, bounded-slab attention, GPU mean pooling/MRL; multimodal towers not yet connected |
 | `splash`, `splash_attention`, `splash_draft`, `splash_draft_attention` | `splash` (the packed-Q4 package format) |
 | `gpt_oss`, `laguna`, `nemotron`, `paddleocr`, `whisper` | the folder of the same name |
+| `kolibri` | `kolibri/`: mixed affine4/8, raw-logit top-6, sandwich norms and BF16 full/sliding attention |
 | `unlimited_ocr`, `unlimited_vision` | `unlimited_ocr/` |
 | `clef`, `clef_quant`, `clef_attention`, `clef_head`, `clef_vision` | `clef/` |
 

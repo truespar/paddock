@@ -50,6 +50,17 @@ public enum ConversationValue: Codable, Sendable, Equatable {
     return Decimal(i) == n ? i : nil
   }
   public subscript(_ key: String) -> Self? { object?[key] }
+  /// Conservative admission cost, not a claim about the allocator's footprint.
+  /// Avoid serializing/base64 copying cached results on the UI thread.
+  public var estimatedRetainedBytes: Int {
+    switch self {
+    case .string(let value): return 32 + value.utf8.count
+    case .array(let values): return 32 + values.reduce(0) { $0 + $1.estimatedRetainedBytes }
+    case .object(let values):
+      return 64 + values.reduce(0) { $0 + 64 + $1.key.utf8.count + $1.value.estimatedRetainedBytes }
+    default: return 32
+    }
+  }
 }
 
 public enum ConversationFailure: Error, LocalizedError, Sendable, Equatable {

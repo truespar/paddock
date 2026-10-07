@@ -6,12 +6,15 @@ struct NativeReadCameraPanel: View {
   @Bindable var camera: NativeReadCamera
   var close: () -> Void
   @State private var contextOpen = false
+  @State private var pendingSet: NativeReadsModel.SavedSet?
 
   var body: some View {
     VStack(alignment: .leading, spacing: 14) {
       ZStack(alignment: .bottom) {
         Color.black
-        if let capture = camera.capture { NativeReadCameraPreview(capture: capture) }
+        if let capture = camera.capture {
+          NativeReadCameraPreview(capture: capture, camera: camera)
+        }
         if camera.opening { ProgressView().tint(.white).frame(maxHeight: .infinity) }
         ScrollView(.horizontal) {
           HStack(alignment: .bottom, spacing: 8) {
@@ -56,10 +59,10 @@ struct NativeReadCameraPanel: View {
           HStack { measurements }
         }
       }
-      if !model.runs.filter({ $0.excerpt == "camera frame" }).isEmpty {
+      if model.runs.contains(where: \.isCameraFrame) {
         ScrollView(.horizontal) {
           HStack(spacing: 8) {
-            ForEach(model.runs.filter { $0.excerpt == "camera frame" }) { run in
+            ForEach(model.runs.reversed().filter(\.isCameraFrame)) { run in
               if let picture = run.pictures.first {
                 Button {
                   model.selectedRun = run.id
@@ -75,23 +78,25 @@ struct NativeReadCameraPanel: View {
       }
       configuration
       if let result = camera.latest {
-        VStack(alignment: .leading, spacing: 14) {
-          ForEach(result.questions) { question in
-            if let answer = result.response.answers[question.questionID] {
-              NativeReadAnswerView(
-                question: question, answer: answer,
-                diagnostic: result.response.diagnostics.questions.first {
-                  $0.id == question.questionID
-                },
-                readCount: result.response.diagnostics.reads)
-            }
-          }
-          NativeReadDiagnostics(
-            response: result.response, elapsedMilliseconds: result.elapsedMilliseconds)
-        }
-        .accessibilityIdentifier("reads-camera-answers")
+        NativeReadResult(result: result)
+          .accessibilityIdentifier("reads-camera-answers")
       }
     }.accessibilityIdentifier("reads-camera")
+      .confirmationDialog(
+        "Replace unsaved questions?",
+        isPresented: Binding(
+          get: { pendingSet != nil }, set: { if !$0 { pendingSet = nil } }),
+        titleVisibility: .visible
+      ) {
+        if let set = pendingSet {
+          Button("Open \(set.name)") {
+            camera.pause(clear: true)
+            model.open(set)
+            pendingSet = nil
+          }
+        }
+        Button("Cancel", role: .cancel) { pendingSet = nil }
+      }
   }
 
   private var actions: some View {
@@ -145,7 +150,7 @@ struct NativeReadCameraPanel: View {
           ForEach(camera.devices, id: \.id) { device in
             Button(device.name) {
               camera.deviceID = device.id
-              camera.open()
+              camera.open(resume: model)
             }
           }
         }
@@ -157,6 +162,25 @@ struct NativeReadCameraPanel: View {
         }
       }
       if let error = model.validation { Text(error).foregroundStyle(PaddockStyle.caution) }
+      HStack {
+        Text("Questions").font(.headline)
+        Text("\(model.draft.questions.count) of \(model.current?.maxQuestions ?? 64)")
+          .foregroundStyle(.secondary).monospacedDigit()
+        Spacer()
+        Dropdown(title: "Question set", value: model.selectedSet?.name ?? "Unsaved") {
+          ForEach(model.sets) { set in
+            Button(set.name) {
+              if model.dirty {
+                pendingSet = set
+              } else {
+                camera.pause(clear: true)
+                model.open(set)
+              }
+            }
+          }
+        }.disabled(model.historyNavigationBlocked || model.sets.isEmpty)
+          .accessibilityIdentifier("reads-camera-question-set")
+      }
       NativeReadSamples(model: model)
       NativeReadAdvancedOptions(model: model)
       ForEach($model.draft.questions) { $question in
@@ -180,7 +204,7 @@ struct NativeReadCameraPanel: View {
             )
             .textFieldStyle(StudioPopoverFieldStyle())
             Button {
-              model.draft.questions.removeAll { $0.id == question.id }
+              model.draft.removeQuestion(question.id)
             } label: {
               Image(systemName: "xmark")
             }

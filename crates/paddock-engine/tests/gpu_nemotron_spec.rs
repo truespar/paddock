@@ -75,6 +75,8 @@ fn load() -> Option<(GpuNemotron, Vec<u32>)> {
         return None;
     };
     let mut model = GpuNemotron::load_dir(exec, &dir, MAX_CTX).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     assert_eq!(model.batch_enable_probe(4).expect("enable"), 4);
     Some((model, prompt))
 }

@@ -90,8 +90,12 @@ import PaddockClient
     epoch += 1
     for job in jobs.values { job.task.cancel() }
     jobs.removeAll()
-    cache.removeAll()
-    order.removeAll()
+    reclaim()
+  }
+  /// Memory pressure must not cancel visible readers or discard source files.
+  public func reclaim() {
+    cache.removeAll(keepingCapacity: false)
+    order.removeAll(keepingCapacity: false)
   }
   var retainedBytes: Int { cache.values.reduce(0, { $0 + $1.bytesPerRow * $1.height }) }
 }

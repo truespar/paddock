@@ -28,6 +28,8 @@ fn spec_decode_matches_base_and_is_faster() {
     };
     let map = MappedGguf::open(&path).expect("open gguf");
     let mut m = GpuQwen35::load(exec, &map, 4096).expect("load 27B");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    m.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
 
     // "The capital of France is" in the qwen35 vocab (same ids as the 27B gate).
     let prompt: Vec<u32> = vec![760, 6511, 314, 9338, 369];

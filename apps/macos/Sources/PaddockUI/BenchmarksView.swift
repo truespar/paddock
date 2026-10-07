@@ -79,55 +79,49 @@ struct BenchmarksView: View {
     model.selected == nil ? choices.first : choices.first { $0.id == model.selected }
   }
   var body: some View {
-    GeometryReader { geometry in
-      let stacked = geometry.size.width < 600
-      PaddockScrollView {
-        VStack(alignment: .leading, spacing: 28) {
-          PageHeading(title: "Benchmarks") { EmptyView() }
-          SettingsGroup(title: "Text generation") {
-            configuration(stacked: stacked)
-            actions
-            if model.cancelled {
-              Text("Benchmark cancelled.").foregroundStyle(.secondary)
-            }
-            if let error = model.error {
-              Text(error).foregroundStyle(PaddockStyle.caution).textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-                .accessibilityIdentifier("benchmark-error")
-            }
-          }
-          if !model.reports.isEmpty {
-            VStack(alignment: .leading, spacing: 16) {
-              Text("Results").fontWeight(.semibold).accessibilityAddTraits(.isHeader)
-              LazyVStack(spacing: 16) {
-                ForEach(model.reports) { report in
-                  BenchmarkResultCard(report: report, stacked: stacked) { model.export(report) }
-                }
-              }
-            }
-          }
-        }.padding(stacked ? 20 : 32).frame(maxWidth: 820).frame(maxWidth: .infinity)
+    SettingsPage(title: "Benchmarks") { stacked in
+      SettingsGroup(title: "Text generation") {
+        configuration(stacked: stacked)
+        actions
+        if model.cancelled {
+          Text("Benchmark cancelled.").foregroundStyle(.secondary)
+        }
+        if let error = model.error {
+          Text(error).foregroundStyle(PaddockStyle.caution).textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityIdentifier("benchmark-error")
+        }
       }
-    }.font(.system(size: 13)).buttonStyle(FlatButtonStyle()).background(PaddockStyle.canvas)
-      .task { await model.load() }
-      .confirmationDialog(
-        "Run a local benchmark?", isPresented: $confirm, titleVisibility: .visible
-      ) {
-        Button("Run") {
-          // Confirm the same process the user reviewed, never another runner
-          // that happened to take its place while the dialog was open.
-          if let reviewed, let current = choices.first(where: { $0.id == reviewed.id }),
-            current.inFlight == 0
-          {
-            model.start(current)
+      if !model.reports.isEmpty {
+        VStack(alignment: .leading, spacing: 16) {
+          Text("Results").fontWeight(.semibold).accessibilityAddTraits(.isHeader)
+          LazyVStack(spacing: 16) {
+            ForEach(model.reports) { report in
+              BenchmarkResultCard(report: report, stacked: stacked) { model.export(report) }
+            }
           }
         }
-        Button("Cancel", role: .cancel) {}
-      } message: {
-        Text(
-          "One warmup and three measured trials use synthetic text, with up to 128 output tokens per request. Other requests can affect results. Model settings and conversation caches remain unchanged."
-        )
       }
+    }
+    .task { await model.load() }
+    .confirmationDialog(
+      "Run a local benchmark?", isPresented: $confirm, titleVisibility: .visible
+    ) {
+      Button("Run") {
+        // Confirm the same process the user reviewed, never another runner
+        // that happened to take its place while the dialog was open.
+        if let reviewed, let current = choices.first(where: { $0.id == reviewed.id }),
+          current.inFlight == 0
+        {
+          model.start(current)
+        }
+      }
+      Button("Cancel", role: .cancel) {}
+    } message: {
+      Text(
+        "One warmup and three measured trials use synthetic text, with up to 128 output tokens per request. Other requests can affect results. Model settings and conversation caches remain unchanged."
+      )
+    }
   }
 
   private func configuration(stacked: Bool) -> some View {

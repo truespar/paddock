@@ -81,6 +81,15 @@ struct NativeReadDiagnostics: View {
             }
             if let routing = response.routing { metric("Routing", routing.reason) }
             metric("Reads", "\(response.diagnostics.reads)")
+            if response.diagnostics.backend == nil {
+              metric("Steps", "\(response.diagnostics.steps ?? 1)")
+              metric("Stages", "\(response.diagnostics.stages?.count ?? 1)")
+              metric("Canvases", "\(response.diagnostics.chunks?.count ?? 1)")
+              metric("Layout", response.diagnostics.format ?? "lines")
+              if let conditioning = response.diagnostics.conditioning {
+                metric("Earlier answers", conditioning == "prefill" ? "in the prompt" : "restated")
+              }
+            }
             if let input = response.usage?.inputTokens { metric("Prompt tokens", "\(input)") }
             if let output = response.usage?.outputTokens { metric("Output tokens", "\(output)") }
             metric(
@@ -106,6 +115,19 @@ struct NativeReadDiagnostics: View {
                 }
                 Text("Entropy \(row.entropy, specifier: "%.3f")")
               }.font(.caption).foregroundStyle(.secondary).monospacedDigit()
+              if let entropy = row.slotEntropy {
+                Text("Vocabulary entropy \(entropy, specifier: "%.3f")")
+                  .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+              }
+              let tokens = (row.reads ?? []).compactMap(\.argmax)
+              if !tokens.isEmpty {
+                Text(
+                  "Top token "
+                    + Array(NSOrderedSet(array: tokens)).compactMap { $0 as? String }
+                    .map { String(reflecting: $0) }.joined(separator: " ")
+                )
+                .font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+              }
               if let temperature = row.temperature {
                 Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 6) {
                   metric("Temperature", String(format: "%.2f", temperature))

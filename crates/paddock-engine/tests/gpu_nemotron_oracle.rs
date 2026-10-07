@@ -51,6 +51,8 @@ fn nemotron_engine_matches_decoder_oracle() {
 
     let t0 = std::time::Instant::now();
     let mut model = GpuNemotron::load_dir(exec, &dir, 4096).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     println!("loaded in {:.1}s", t0.elapsed().as_secs_f64());
 
     // ---- prefill walk, accumulating per-layer stage sums -------------------

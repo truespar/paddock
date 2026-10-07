@@ -759,6 +759,71 @@ impl GpuExecutor {
             .kernels
             .kquant_gemm_w4a8_pipe2
             .ok_or(GpuError::MissingOp("kquant_gemm_w4a8_pipe2"))?;
+        self.kq_w4a8_rows_with(f, w, yq, xsums, y, y_row0, batch)
+    }
+
+    /// Slot 750: the Q4_K tile with its activation tile on the cp.async ring -
+    /// byte-identical to [`Self::kquant_gemm_w4a8_pipe2`] (the pack hands
+    /// every other type to pipe2), so it can stand in wherever pipe2 does.
+    pub fn kquant_gemm_w4a8_pipe3(
+        &self,
+        w: &RepackedKQ,
+        yq: &CudaSlice<u8>,
+        xsums: Option<&CudaSlice<f32>>,
+        y: &mut CudaSlice<f32>,
+        batch: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .kquant_gemm_w4a8_pipe3
+            .ok_or(GpuError::MissingOp("kquant_gemm_w4a8_pipe3"))?;
+        self.kq_w4a8_rows_with(f, w, yq, xsums, y, 0, batch)
+    }
+
+    pub fn has_kquant_gemm_w4a8_pipe3(&self) -> bool {
+        self.kernels.kquant_gemm_w4a8_pipe3.is_some()
+    }
+
+    /// The >64-row W4A8 tile, best rung the pack carries: pipe3 (Q4_K, its
+    /// activations on the ring) > pipe2 > pipe > v1. Every rung writes the
+    /// same bytes, so the election is pure speed; PADDOCK_NO_KQUANT_PIPE3 /
+    /// _PIPE2 / _PIPE step it down for an A/B.
+    pub fn kquant_gemm_w4a8_tile(
+        &self,
+        w: &RepackedKQ,
+        yq: &CudaSlice<u8>,
+        xsums: Option<&CudaSlice<f32>>,
+        y: &mut CudaSlice<f32>,
+        batch: usize,
+    ) -> Result<(), GpuError> {
+        if self.has_kquant_gemm_w4a8_pipe3()
+            && paddock_models::dev_var_os!("PADDOCK_NO_KQUANT_PIPE3").is_none()
+        {
+            self.kquant_gemm_w4a8_pipe3(w, yq, xsums, y, batch)
+        } else if self.has_kquant_gemm_w4a8_pipe2()
+            && paddock_models::dev_var_os!("PADDOCK_NO_KQUANT_PIPE2").is_none()
+        {
+            self.kquant_gemm_w4a8_pipe2(w, yq, xsums, y, batch)
+        } else if self.has_kquant_gemm_w4a8_pipe()
+            && paddock_models::dev_var_os!("PADDOCK_NO_KQUANT_PIPE").is_none()
+        {
+            self.kquant_gemm_w4a8_pipe(w, yq, xsums, y, batch)
+        } else {
+            self.kquant_gemm_w4a8(w, yq, xsums, y, batch)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn kq_w4a8_rows_with(
+        &self,
+        f: paddock_kernels::abi::KquantGemmW4a8Fn,
+        w: &RepackedKQ,
+        yq: &CudaSlice<u8>,
+        xsums: Option<&CudaSlice<f32>>,
+        y: &mut CudaSlice<f32>,
+        y_row0: usize,
+        batch: usize,
+    ) -> Result<(), GpuError> {
         let (raw_id, _, _) = kq_layout(w.ty).expect("RepackedKQ holds a k-quant type");
         let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
         debug_assert!(y.len() >= out_dim * (y_row0 + batch));
@@ -2049,6 +2114,80 @@ impl GpuExecutor {
             .kernels
             .kquant_moe_down_mma
             .ok_or(GpuError::MissingOp("kquant_moe_down_mma"))?;
+        self.kquant_moe_down_mma_with(
+            f,
+            down,
+            sorted_row,
+            sorted_slot,
+            block_expert,
+            topk_w,
+            fq,
+            fs,
+            fsums,
+            part,
+            n_active,
+            max_blocks,
+        )
+    }
+
+    /// Slot 749: `kquant_moe_down_mma` storing each weighted partial as bf16:
+    /// `part` (an f32 plane) is filled to half its bytes; fold it with
+    /// `moe_slot_combine_bf16`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kquant_moe_down_mma_b16(
+        &self,
+        down: &RepackedKQ,
+        sorted_row: &CudaSlice<u32>,
+        sorted_slot: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        topk_w: &CudaSlice<f32>,
+        fq: &CudaSlice<i8>,
+        fs: &CudaSlice<f32>,
+        fsums: Option<&CudaSlice<f32>>,
+        part: &mut CudaSlice<f32>,
+        n_active: usize,
+        max_blocks: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .kquant_moe_down_mma_b16
+            .ok_or(GpuError::MissingOp("kquant_moe_down_mma_b16"))?;
+        self.kquant_moe_down_mma_with(
+            f,
+            down,
+            sorted_row,
+            sorted_slot,
+            block_expert,
+            topk_w,
+            fq,
+            fs,
+            fsums,
+            part,
+            n_active,
+            max_blocks,
+        )
+    }
+
+    pub fn has_kquant_moe_down_mma_b16(&self) -> bool {
+        self.kernels.kquant_moe_down_mma_b16.is_some()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn kquant_moe_down_mma_with(
+        &self,
+        f: paddock_kernels::abi::KquantMoeDownMmaFn,
+        down: &RepackedKQ,
+        sorted_row: &CudaSlice<u32>,
+        sorted_slot: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        topk_w: &CudaSlice<f32>,
+        fq: &CudaSlice<i8>,
+        fs: &CudaSlice<f32>,
+        fsums: Option<&CudaSlice<f32>>,
+        part: &mut CudaSlice<f32>,
+        n_active: usize,
+        max_blocks: usize,
+    ) -> Result<(), GpuError> {
         let (did, _, _) = kq_layout(down.ty).expect("RepackedKQ holds a k-quant type");
         let (ff, embd) = (down.dims[0], down.dims[1]);
         let (ddp, _g1) = down.data.device_ptr(&self.stream);

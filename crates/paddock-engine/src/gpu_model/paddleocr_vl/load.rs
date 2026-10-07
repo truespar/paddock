@@ -172,6 +172,11 @@ impl GpuPaddleOcrVl {
             exec,
             hp,
             max_ctx,
+            // KV stays f16 - the exception to the KV8 default (2026-10-04):
+            // this family's WMMA prefill gate is f16-only (batch.rs wmma_pf),
+            // so an fp8 cache walks the scalar tile, correct but slower, and
+            // there is no fp8 quality evidence for it yet. The pack's G=8 fp8
+            // tile could take it - widen the gate and measure before flipping.
             kv_dtype: KvDtype::Fp16,
             tok_embd,
             layers,

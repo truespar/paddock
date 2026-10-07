@@ -56,6 +56,8 @@ struct ProviderArtworkTests {
     #expect(ProviderArtwork.usesTemplate(for: "Google"))
     #expect(ProviderArtwork.names["Prism ML"] == "PrismML")
     #expect(ProviderArtwork.usesTemplate(for: "Prism ML"))
+    #expect(ProviderArtwork.names["Aleph Alpha"] == "AlephAlpha")
+    #expect(ProviderArtwork.usesTemplate(for: "Aleph Alpha"))
   }
 
   @Test(

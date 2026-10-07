@@ -151,6 +151,16 @@ function active(name: string): boolean {
           <Icon name="table" :size="20" />
         </button>
       </Tooltip>
+      <!-- a masks model (SAM 3) runs on this box's GPU too: same rule -->
+      <Tooltip v-if="canRunHere" label="Masks" side="right">
+        <button
+          class="activity-bar__btn"
+          :class="{ 'activity-bar__btn--active': active('masks') }"
+          @click="go('masks')"
+        >
+          <Icon name="masks" :size="20" />
+        </button>
+      </Tooltip>
       <Tooltip label="Prompts" side="right">
         <button
           class="activity-bar__btn"

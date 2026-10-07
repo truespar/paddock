@@ -6,6 +6,7 @@
 import { onMounted, ref } from 'vue'
 import Icon from '@/components/Icon.vue'
 import UpdateCard from './UpdateCard.vue'
+import HuggingFaceCard from './HuggingFaceCard.vue'
 
 // Whether this box has a certificate, so the card can say what it is rather
 // than offering a page that would only explain why there is nothing to do.
@@ -25,6 +26,8 @@ onMounted(async () => {
     <h1 class="ms__title">Settings</h1>
 
     <UpdateCard />
+
+    <HuggingFaceCard />
 
     <section class="ms__card">
       <div class="ms__head"><h2>Data</h2></div>

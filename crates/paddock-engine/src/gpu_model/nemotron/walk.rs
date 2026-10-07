@@ -126,7 +126,7 @@ impl GpuNemotron {
         // tile) - an 8-row verify at 24K was 4 CTAs, 2.0 ms a layer (GB10
         // 2026-09-26). The groups upload once per walk. PADDOCK_NO_ATTN_ROWS
         // pins the prefill tile for the A/B.
-        let rows_attn: Option<(usize, usize)> = match cuts {
+        let rows_attn: Option<(usize, usize, usize)> = match cuts {
             Some(c)
                 if verify
                     && hd == 128
@@ -136,8 +136,27 @@ impl GpuNemotron {
                     && exec.has_attn_rows_partial()
                     && paddock_models::dev_var_os!("PADDOCK_NO_ATTN_ROWS").is_none() =>
             {
-                let groups = rows_groups(c.runs.iter().map(|&(off, len, _)| (off, len)));
+                // slot 745 takes six rows a group (two warps each)
+                let cap = if bs.sc.w16_kh {
+                    ROWS_GROUP_KH
+                } else {
+                    ROWS_GROUP
+                };
+                let (law, ns) = (bs.sc.w16_split, bs.sc.w16_ns);
+                let groups = if law == 0 || law & 0xc000_0000 != 0 {
+                    // a key-dependent law (744 pow2, 745 TILE): groups stay
+                    // inside one split-size bucket
+                    let runs = c.runs.iter().zip(&c.run_pos);
+                    rows_groups_law(
+                        runs.map(|(&(o, l, _), &p)| (o, l, p)),
+                        |n| w16_split_size(law, ns, n),
+                        cap,
+                    )
+                } else {
+                    rows_groups_cap(c.runs.iter().map(|&(off, len, _)| (off, len)), cap)
+                };
                 let ng = groups.len() / 2;
+                let gmax = groups.chunks(2).map(|g| g[1] as usize).max().unwrap_or(1);
                 let vp = bs.verify.as_mut().expect("verify planes");
                 let mut v = vp
                     .d_groups
@@ -146,7 +165,7 @@ impl GpuNemotron {
                 exec.stream
                     .memcpy_htod(&groups, &mut v)
                     .map_err(crate::gpu::from_driver)?;
-                Some((ng, rows_split(n_kv, ng, exec.sm_count())))
+                Some((ng, rows_split(n_kv, ng, exec.sm_count()), gmax))
             }
             _ => None,
         };
@@ -333,7 +352,12 @@ impl GpuNemotron {
                                 // snapshotted for the window rebuild
                                 let vp = bs.verify.as_mut().expect("verify planes");
                                 let vw = vp.vwin[li].as_mut().expect("vwin");
-                                let snap = vp.snap[li].as_mut().expect("snap");
+                                let keep_row = crate::gpu::mamba2_keep_row(
+                                    hp.mamba_heads,
+                                    hp.mamba_head_dim,
+                                    hp.d_state,
+                                    hp.n_groups,
+                                );
                                 for &(off, len, slot) in &c.runs {
                                     let s = slot as usize;
                                     exec.copy_region(
@@ -357,6 +381,33 @@ impl GpuNemotron {
                                         hp.d_conv,
                                         len,
                                     )?;
+                                    if vp.rescan {
+                                        // the live state stays pre-round;
+                                        // the commit replays the accepted
+                                        // rows from the kept ones
+                                        ssm.scan_seq_keep_at(
+                                            &exec,
+                                            s * state_elems,
+                                            &sc.d_conv,
+                                            off * conv_dim,
+                                            &sc.d_zxbcdt,
+                                            off * in_rows + d_inner + conv_dim,
+                                            in_rows,
+                                            &w.a,
+                                            &w.d,
+                                            &w.dt_bias,
+                                            &mut sc.d_y,
+                                            off * d_inner,
+                                            vp.keep[li].as_mut().expect("keep"),
+                                            off * keep_row,
+                                            len,
+                                            hp.mamba_heads,
+                                            hp.mamba_head_dim,
+                                            hp.d_state,
+                                            hp.n_groups,
+                                        )?;
+                                        continue;
+                                    }
                                     ssm.scan_seq_snap_at(
                                         &exec,
                                         s * state_elems,
@@ -370,7 +421,7 @@ impl GpuNemotron {
                                         &w.dt_bias,
                                         &mut sc.d_y,
                                         off * d_inner,
-                                        snap,
+                                        vp.snap[li].as_mut().expect("snap"),
                                         off * state_elems,
                                         len,
                                         hp.mamba_heads,
@@ -827,6 +878,7 @@ impl GpuNemotron {
                                 scale,
                                 kv_dtype,
                                 sc.w16_split,
+                                sc.w16_kh.then_some(1),
                             )?;
                             exec.attn_combine_batch(
                                 &sc.d_w16o,
@@ -921,6 +973,7 @@ impl GpuNemotron {
                                     scale,
                                     kv_dtype,
                                     sc.w16_split,
+                                    sc.w16_kh.then_some(1),
                                 )?;
                                 exec.attn_combine_batch(
                                     &sc.d_w16o,
@@ -954,7 +1007,9 @@ impl GpuNemotron {
                                     kv_dtype,
                                 )?;
                             }
-                            if let (Some((ng, _)), true) = (rows_attn, w16 && r <= sc.w16_rows) {
+                            if let (Some((ng, _, gmax)), true) =
+                                (rows_attn, w16 && r <= sc.w16_rows)
+                            {
                                 // the W16 class: the decode ticks' split law
                                 let vp = bs.verify.as_ref().expect("verify planes");
                                 exec.attn_rows_partial_fixed(
@@ -979,6 +1034,7 @@ impl GpuNemotron {
                                     scale,
                                     kv_dtype,
                                     sc.w16_split,
+                                    sc.w16_kh.then_some(gmax),
                                 )?;
                                 exec.attn_combine_batch(
                                     &sc.d_w16o,
@@ -990,7 +1046,7 @@ impl GpuNemotron {
                                     sc.w16_ns,
                                     r,
                                 )?;
-                            } else if let Some((ng, nsr)) = rows_attn {
+                            } else if let Some((ng, nsr, _)) = rows_attn {
                                 let vp = bs.verify.as_mut().expect("verify planes");
                                 exec.attn_rows_partial(
                                     &sc.d_q,
@@ -1414,6 +1470,10 @@ impl GpuNemotron {
                             exec.add(&mut sc.d_proj, &s8.shproj, r * embd)?;
                         } else {
                             exec.quantize_q8(&sc.d_xn, &mut s8.xq, &mut s8.xs, r * embd)?;
+                            // the int8-MMA pair where the pack has it, the
+                            // dp4a pair + quantize otherwise - bitwise either
+                            // way (see nemo_qmma_on)
+                            let qmma = nemo_qmma_on(&exec);
                             let nbr = moe_live_blocks(r, hp.n_active, hp.n_expert, sc.nb_r);
                             exec.moe_align(
                                 &sc.d_idx,
@@ -1425,33 +1485,60 @@ impl GpuNemotron {
                                 hp.n_expert,
                                 nbr,
                             )?;
-                            exec.q8_0_moe_up_relu2_sorted(
-                                up,
-                                &sc.d_srow,
-                                &sc.d_bexp,
-                                &s8.xq,
-                                &s8.xs,
-                                &mut s8.fu_r,
-                                nbr,
-                            )?;
-                            exec.quantize_q8(
-                                &s8.fu_r,
-                                &mut s8.fq_r,
-                                &mut s8.fs_r,
-                                nbr * 32 * hp.moe_ff,
-                            )?;
-                            exec.q8_0_moe_down_sorted(
-                                down,
-                                &sc.d_srow,
-                                &sc.d_sslot,
-                                &sc.d_bexp,
-                                &sc.d_w,
-                                &s8.fq_r,
-                                &s8.fs_r,
-                                &mut sc.d_part,
-                                hp.n_active,
-                                nbr,
-                            )?;
+                            if qmma {
+                                exec.q8_0_moe_up_relu2_mma(
+                                    up,
+                                    &sc.d_srow,
+                                    &sc.d_bexp,
+                                    &s8.xq,
+                                    &s8.xs,
+                                    &mut s8.fq_r,
+                                    &mut s8.fs_r,
+                                    nbr,
+                                    32,
+                                )?;
+                                exec.q8_0_moe_down_mma(
+                                    down,
+                                    &sc.d_srow,
+                                    &sc.d_sslot,
+                                    &sc.d_bexp,
+                                    &sc.d_w,
+                                    &s8.fq_r,
+                                    &s8.fs_r,
+                                    &mut sc.d_part,
+                                    hp.n_active,
+                                    nbr,
+                                    32,
+                                )?;
+                            } else {
+                                exec.q8_0_moe_up_relu2_sorted(
+                                    up,
+                                    &sc.d_srow,
+                                    &sc.d_bexp,
+                                    &s8.xq,
+                                    &s8.xs,
+                                    &mut s8.fu_r,
+                                    nbr,
+                                )?;
+                                exec.quantize_q8(
+                                    &s8.fu_r,
+                                    &mut s8.fq_r,
+                                    &mut s8.fs_r,
+                                    nbr * 32 * hp.moe_ff,
+                                )?;
+                                exec.q8_0_moe_down_sorted(
+                                    down,
+                                    &sc.d_srow,
+                                    &sc.d_sslot,
+                                    &sc.d_bexp,
+                                    &sc.d_w,
+                                    &s8.fq_r,
+                                    &s8.fs_r,
+                                    &mut sc.d_part,
+                                    hp.n_active,
+                                    nbr,
+                                )?;
+                            }
                             exec.moe_slot_combine(&sc.d_part, &mut sc.d_x, embd, hp.n_active, r)?;
                             let nbs = moe_live_blocks(r, 1, 1, sc.nb_s);
                             exec.moe_align(
@@ -1464,33 +1551,63 @@ impl GpuNemotron {
                                 1,
                                 nbs,
                             )?;
-                            exec.q8_0_moe_up_relu2_sorted(
-                                sh_up,
-                                &sc.d_srow_s,
-                                &sc.d_bexp_s,
-                                &s8.xq,
-                                &s8.xs,
-                                &mut s8.fu_s,
-                                nbs,
-                            )?;
-                            exec.quantize_q8(
-                                &s8.fu_s,
-                                &mut s8.fq_s,
-                                &mut s8.fs_s,
-                                nbs * 32 * hp.shared_ff,
-                            )?;
-                            exec.q8_0_moe_down_sorted(
-                                sh_down,
-                                &sc.d_srow_s,
-                                &sc.d_sslot_s,
-                                &sc.d_bexp_s,
-                                &sc.d_sh_w,
-                                &s8.fq_s,
-                                &s8.fs_s,
-                                &mut sc.d_proj,
-                                1,
-                                nbs,
-                            )?;
+                            if qmma {
+                                // one expert, every row: the 32-row blocks
+                                // are full, so this is the dense FFN on the
+                                // tensor cores
+                                exec.q8_0_moe_up_relu2_mma(
+                                    sh_up,
+                                    &sc.d_srow_s,
+                                    &sc.d_bexp_s,
+                                    &s8.xq,
+                                    &s8.xs,
+                                    &mut s8.fq_s,
+                                    &mut s8.fs_s,
+                                    nbs,
+                                    32,
+                                )?;
+                                exec.q8_0_moe_down_mma(
+                                    sh_down,
+                                    &sc.d_srow_s,
+                                    &sc.d_sslot_s,
+                                    &sc.d_bexp_s,
+                                    &sc.d_sh_w,
+                                    &s8.fq_s,
+                                    &s8.fs_s,
+                                    &mut sc.d_proj,
+                                    1,
+                                    nbs,
+                                    32,
+                                )?;
+                            } else {
+                                exec.q8_0_moe_up_relu2_sorted(
+                                    sh_up,
+                                    &sc.d_srow_s,
+                                    &sc.d_bexp_s,
+                                    &s8.xq,
+                                    &s8.xs,
+                                    &mut s8.fu_s,
+                                    nbs,
+                                )?;
+                                exec.quantize_q8(
+                                    &s8.fu_s,
+                                    &mut s8.fq_s,
+                                    &mut s8.fs_s,
+                                    nbs * 32 * hp.shared_ff,
+                                )?;
+                                exec.q8_0_moe_down_sorted(
+                                    sh_down,
+                                    &sc.d_srow_s,
+                                    &sc.d_sslot_s,
+                                    &sc.d_bexp_s,
+                                    &sc.d_sh_w,
+                                    &s8.fq_s,
+                                    &s8.fs_s,
+                                    &mut sc.d_proj,
+                                    1,
+                                    nbs,
+                                )?;
+                            }
                             exec.moe_slot_combine(&sc.d_proj, &mut sc.d_x, embd, 1, r)?;
                             continue;
                         }
@@ -1947,6 +2064,20 @@ fn moe_w16_rows(
     )?;
     exec.moe_slot_combine(&sc.d_part, &mut sc.d_x, embd, k + 1, rows)?;
     Ok(())
+}
+
+/// The GGUF lane's sorted MoE arm on the int8 MMA (slot 743's relu^2 up +
+/// the shared mma down) instead of the dp4a sorted pair + quantize. Bitwise:
+/// the same exact k32 integer dots, the same scale fold in ascending K, the
+/// same relu^2 and per-32 rounding, the same per-(token, slot) partials -
+/// only the math units change. The dp4a pair ran ~4 TOPS here: an 11.7K-row
+/// append at 247K depth spent 6.6 of its 16.2 s in it (GB10, Claude Code
+/// replay), routed and shared expert alike. PADDOCK_NO_NEMO_QMMA pins the
+/// dp4a pair for the A/B; a pack without slot 743 keeps it too.
+fn nemo_qmma_on(exec: &GpuExecutor) -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    exec.has_q8_moe_relu2_mma()
+        && !*OFF.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_NEMO_QMMA").is_some())
 }
 
 fn w16_band_on() -> bool {

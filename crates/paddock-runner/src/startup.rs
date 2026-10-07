@@ -135,6 +135,14 @@ pub struct Cli {
     /// weights (llama.cpp's flag; wins over --mmproj, as it does there)
     #[arg(long = "no-mmproj")]
     pub no_mmproj: bool,
+    /// An audio tower GGUF of its own beside --mmproj's picture tower
+    /// (EmbeddingGemma 2's catalog layout)
+    #[arg(long, value_name = "PATH")]
+    pub audio_mmproj: Option<PathBuf>,
+    /// No audio input: no audio tower, not even one found beside the weights
+    /// (wins over --audio-mmproj)
+    #[arg(long = "no-audio")]
+    pub no_audio: bool,
     /// MTP drafter GGUF (speculative decoding; gemma4's mtp-*.gguf)
     #[arg(long, value_name = "PATH")]
     pub mtp: Option<PathBuf>,
@@ -476,6 +484,13 @@ pub fn resolve(cli: &Cli) -> Result<(Config, Banner), ConfigError> {
     if cli.no_mmproj {
         cfg.vision = Some(false);
         cfg.mmproj = None;
+    }
+    if let Some(a) = &cli.audio_mmproj {
+        cfg.audio_mmproj = Some(a.clone());
+    }
+    if cli.no_audio {
+        cfg.audio = Some(false);
+        cfg.audio_mmproj = None;
     }
     if let Some(mt) = &cli.mtp {
         cfg.mtp = Some(mt.clone());
@@ -1136,6 +1151,23 @@ mod tests {
         let (cfg, _) = resolve(&cli).expect("resolve");
         assert_eq!(cfg.vision, Some(false));
         assert_eq!(cfg.mmproj, None);
+    }
+
+    /// `--no-audio` is the audio tower's `--no-mmproj`: off even beside an
+    /// explicit `--audio-mmproj`, and it reaches discovery as `audio = false`.
+    #[test]
+    fn no_audio_switches_the_audio_tower_off_and_wins_over_audio_mmproj() {
+        let cli = Cli::parse_from([
+            "paddock-runner",
+            "--model",
+            "x.gguf",
+            "--audio-mmproj",
+            "a.gguf",
+            "--no-audio",
+        ]);
+        let (cfg, _) = resolve(&cli).expect("resolve");
+        assert_eq!(cfg.audio, Some(false));
+        assert_eq!(cfg.audio_mmproj, None);
     }
 
     #[test]

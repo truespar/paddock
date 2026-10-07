@@ -65,6 +65,7 @@ struct ManagementUITests {
     let valid: [String: Any] = [
       "SUFeedURL": "https://github.com/truespar/paddock/releases/latest/download/appcast.xml",
       "SUPublicEDKey": Data(repeating: 1, count: 32).base64EncodedString(),
+      "SURequireSignedFeed": true, "SUVerifyUpdateBeforeExtraction": true,
     ]
     #expect(DesktopUpdater.validConfiguration(valid))
     for url in [

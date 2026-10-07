@@ -60,7 +60,8 @@ extension ReadDraft {
   public func orderedJSON(model: String? = nil, includeImageData: Bool = true) throws -> String {
     func quoted(_ text: String) throws -> String { try Self.json(.string(text)) }
     let rows = try questions.map { q in
-      var fields = q.wire.object ?? [:]
+      let wire = q.wire(in: questions)
+      var fields = wire.object ?? [:]
       fields.removeValue(forKey: "criteria")
       var members = try fields.keys.sorted().map { key in
         try quoted(key) + ": " + Self.json(fields[key]!)
@@ -71,7 +72,7 @@ extension ReadDraft {
             + quoted($0.description.trimmingCharacters(in: .whitespacesAndNewlines))
         }
         members.append("\"criteria\": {" + options.joined(separator: ", ") + "}")
-      } else if let criteria = q.wire["criteria"] {
+      } else if let criteria = wire["criteria"] {
         members.append("\"criteria\": " + (try Self.json(criteria)))
       }
       return try "    " + quoted(q.questionID) + ": {" + members.joined(separator: ", ") + "}"

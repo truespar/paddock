@@ -33,6 +33,7 @@ import NumberField from '@/components/ui/NumberField.vue'
 import { CTX_CUSTOM, CTX_MAX, CTX_STEPS, ctxCapOf, ctxFits, ctxLadder } from '@/lib/ctx-ladder'
 import FieldLabel from '@/components/manage/FieldLabel.vue'
 import TextInput from '@/components/ui/TextInput.vue'
+import { getHfToken, type HfTokenStatus } from '@/lib/huggingface'
 import Switch from '@/components/ui/Switch.vue'
 import Tooltip from '@/components/ui/Tooltip.vue'
 import RadioGroup from '@/components/ui/RadioGroup.vue'
@@ -114,6 +115,10 @@ const fp8Native = ref(false)
 // instinct; the switch makes the default visible and
 // gives the VRAM-conscious an explicit text-only serve.
 const withVision = ref(true)
+// A split-tower model's audio tower (EmbeddingGemma 2) is the opt-in one:
+// the switch starts where the catalog's `default` puts it (off), and the
+// download follows the switch like Vision's does.
+const withAudio = ref(false)
 // "Just me" is the default workload: the common first
 // start is one person trying a model, and batch=1 reserves the least VRAM.
 // Scaling up is a visible choice on this same screen.
@@ -367,6 +372,9 @@ const AF_CARDS: { hd: string; fields: AfField[] }[] = [
       { key: 'catalog', kind: 'json', hint: 'which catalog model the weights are · {"model": "qwen3.5-9b", "artifact": "q8", "drafter": "drafter2"}' },
       { key: 'mmproj', kind: 'file', src: 'mmproj', hint: 'image encoder GGUF - enables image input' },
       { key: 'vision', kind: 'bool3', choices: ['true', 'false'], hint: 'false = image input off, even with a tower beside the weights (refused beside mmproj) · unset = load a tower found there' },
+      // EmbeddingGemma 2's audio tower as its own file (config.rs `audio_mmproj` / `audio`)
+      { key: 'audio_mmproj', kind: 'file', src: 'mmproj', hint: 'audio encoder GGUF beside the image one (EmbeddingGemma 2) - enables audio input' },
+      { key: 'audio', kind: 'bool3', choices: ['true', 'false'], hint: 'false = audio input off, even with an audio tower beside the weights (refused beside audio_mmproj) · unset = load one found there' },
       { key: 'mtp', kind: 'file', src: 'mtp', hint: 'drafter GGUF for speculative decode (models without in-file MTP)' },
       // The image lane's two companions (config.rs `text_encoder` / `vae`).
       // The encoder is a GGUF, so the gguf picker suits it; the VAE is a
@@ -919,33 +927,24 @@ const gpuAdvOptions = computed(() => {
 // what you would get. The form now preselects the model's real default (from
 // the catalog's kv_default) and always writes the dtype it chose.
 //
-// 8-bit is GATED on the CARD. E4M3 is a tensor-core format from Ada onward;
-// below that floor the hardware cannot do the conversion and the cache
-// round-trip comes back wrong, not lossy - measured on this A6000 with
-// Qwen3.8-27B. The runner already refuses and serves f16 instead,
-// but a refusal at load is not a control: the setting has to be unreachable
-// where it cannot work, the same way the NVFP4 quality card greys
-// against its `min_cc` a few lines up. The floor itself is
-// `paddock_models::gpu_support::fp8_kv` - one rule the runner, the estimator
-// and this control all read.
-//
-// The hint names the HARDWARE, never a generation to go buy: the literal
-// threshold is Ada, and the engine does not serve Ada, so "get an Ada card"
-// would send someone shopping for silicon we refuse.
+// 8-bit KV is available on every CUDA die we serve, Ampere included: fp8
+// STORAGE is software-emulated and byte-exact below sm_89. The old Ada floor
+// here rested on a mis-diagnosis (the wrong output came from e4m3-mma arms
+// storing zeros, since fixed), and the engine dropped it - the floor is
+// `paddock_models::gpu_support::fp8_kv`, one rule the runner, the estimator
+// and this control all read, and it answers yes on every served die. The
+// computed stays as the seam: if a die ever does need refusing, the reason
+// goes here and the control greys out, the way the NVFP4 quality card greys
+// against its `min_cc`. Metal keeps checkpoint-native precision.
 const fp8KvBlocked = computed<string | null>(() => {
   if (backend.value === 'metal') return 'Metal uses checkpoint-native KV precision'
-  const cc = ready.info?.cc
-  // unrecognised silicon makes no claim - the engine already warns on an
-  // unvalidated arch, so a guess here would be noise
-  if (!cc) return null
-  return cc[0] > 8 || (cc[0] === 8 && cc[1] >= 9) ? null : 'this GPU has no FP8 tensor cores'
+  return null
 })
-/** What a new server gets. 8-bit is the elected default on hardware that has
- * the tensor cores for it (the project's quantization table: f16 on Ampere,
- *  FP8 E4M3 KV on fp8 hardware) - it halves the dominant memory term, so
- *  defaulting to 16-bit there quietly spent twice the cache for nothing. The
- *  catalog's own `kv_default` still wins where a model sets one, because that
- *  is per-model evidence and this is only a hardware read. */
+/** What a new server gets: 8-bit (KV8), the default of every generative
+ * family but three (paddleocr-vl, deepseek-ocr, qwen3-asr) - it halves the
+ * dominant memory term and the KV read every decode step pays. The catalog's
+ * own `kv_default` still wins where a model sets one, because that mirrors
+ * the engine's per-family default. */
 const preferredKv = computed(() => (fp8KvBlocked.value ? 'f16' : 'fp8_e4m3'))
 
 /** How much of the card this endpoint may hold.
@@ -1167,6 +1166,13 @@ const visionArtifact = computed(() =>
 )
 // A required tower gets no switch - turning granite-vision's image reader
 // off would leave a text model with the purpose gone (catalog `required`).
+// an OPTIONAL audio tower beside a picture tower - a speech model's tower is
+// required and gets no switch
+const audioArtifact = computed(() =>
+  catModel.value?.artifacts.find(
+    (a) => a.kind === 'audio' && !a.required && companionAllowed(selectedWeights.value, a),
+  ),
+)
 const visionEmbedded = computed(() => embeddedVision(selectedWeights.value))
 const visionRequired = computed(() => visionEmbedded.value || (visionArtifact.value?.required ?? false))
 // Forensics is VLM-coupled: its findings are injected for the vision tower to
@@ -1224,12 +1230,19 @@ const singlePass = computed(() =>
     // a decision model reads each question in one pass at the checkpoint's
     // own sequence length and packs its own passes, and a tabular predictor
     // reads a whole table in one pass - neither knob exists for either
-    (c) => c === 'image-generation' || c === 'segmentation' || c === 'decision' || c === 'tabular' || c === 'diarization',
+    (c) =>
+      c === 'image-generation' ||
+      c === 'segmentation' ||
+      c === 'masks' ||
+      c === 'decision' ||
+      c === 'tabular' ||
+      c === 'diarization',
   ),
 )
 const canOffload = computed(() => backend.value !== 'metal' || selectedWeights.value?.kv_offload_supported === true)
 watch(selectedWeights, (weights, previous) => {
   if (!isEdit.value && weights !== previous) {
+    withAudio.value = audioArtifact.value?.default ?? false
     specPolicy.value = defaultSpecChoice()
     if (weights?.runtime?.default_max_batch) batch.value = weights.runtime.default_max_batch
     if (!userTouchedCtx.value && weights?.runtime?.default_max_ctx) ctx.value = weights.runtime.default_max_ctx
@@ -1379,6 +1392,23 @@ function thirdPartyExport(a: { source?: { repo: string; base_model: string } }):
   const org = (r: string) => r.split('/')[0].toLowerCase()
   return org(s.repo) !== org(s.base_model)
 }
+/** A gated artifact (SAM 3) downloads from its own Hugging Face repo with
+ *  the user's token: the form says so before the download, and whether a
+ *  token is in reach, instead of letting the pull fail on it. */
+const hfToken = ref<HfTokenStatus | null>(null)
+watch(
+  () => selectedWeights.value?.source?.gated === true,
+  async (gated) => {
+    if (!gated || hfToken.value) return
+    try {
+      hfToken.value = await getHfToken()
+    } catch {
+      hfToken.value = null
+    }
+  },
+  { immediate: true },
+)
+
 /** Per-artifact fit verdict, so a card can warn before it is even picked. */
 function artifactVerdict(id: string): string | null {
   const f = reg.estimates[model.value]?.artifacts?.[id]?.estimate?.fit
@@ -1447,9 +1477,13 @@ const ctxCustomHint = computed(() => {
 })
 
 // Propose a context when the MODEL or the concurrency changes - the two
-// choices that genuinely reset what a sensible window is. Prefer the 32k an
-// agentic workload wants. `userTouchedCtx` stops the re-proposal from stomping
-// an explicit choice (or the edit prefill).
+// choices that genuinely reset what a sensible window is. The catalog names the
+// target (`default_max_ctx`: qwen3.8 and nemotron ask for their full 262K at 4
+// slots on CUDA, 2026-10-04), 32K where it names none, and the proposal is the
+// largest rung under it that this card backs - the same rule the manager
+// applies to a CLI/API start that leaves the window unset (routes.rs
+// fit_window). `userTouchedCtx` stops the re-proposal from stomping an explicit
+// choice (or the edit prefill).
 const userTouchedCtx = ref(false)
 function proposeCtx(): void {
   const opts = ctxOptions.value
@@ -1494,13 +1528,14 @@ watch(ctxCap, (cap) => {
 // estimate by the whole tower (0.9 GB on qwen3.8-27b). `cc` rides
 // along so the server can price the KV width this CARD will serve rather than
 // the one the control asked for.
-watch([batch, kvDtype, specPolicy, withVision, vramBudgetMib, gpuIndex, kvOn, cacheRam, editPort, selectedWeights], () =>
+watch([batch, kvDtype, specPolicy, withVision, withAudio, vramBudgetMib, gpuIndex, kvOn, cacheRam, editPort, selectedWeights], () =>
   void reg.estimate({
     freeingPort: editPort.value,
     batch: batch.value,
     kv: kvDtype.value,
     spec: canSpeculate.value && specPolicy.value !== 'off',
     vision: withVision.value || visionRequired.value,
+    audio: audioArtifact.value ? withAudio.value : undefined,
     cc: ready.info?.cc,
     budget: vramBudgetMib.value,
     gpu: gpuIndex.value ?? undefined,
@@ -1624,6 +1659,7 @@ async function simpleFromToml(text: string): Promise<boolean> {
   // reads the config even for a running endpoint.
   fp8Native.value = p.fp8_native
   withVision.value = p.vision
+  withAudio.value = p.audio ?? false
   // Forensics: the toggle owns `enabled`; keep the file's auto/tool/
   // device so a save round-trips a hand-tuned scope instead of resetting it.
   kvOn.value = p.kv_offload?.enabled ?? false
@@ -1867,7 +1903,10 @@ const missingPieces = computed<{ ids: string[]; bytes: number }>(() => {
         (a.kind !== 'weights' &&
           a.kind !== 'fp8-snapshot' &&
           a.default &&
-          (a.kind !== 'vision' || withVision.value || a.required)) ||
+          (a.kind !== 'vision' || withVision.value || a.required) &&
+          (a.kind !== 'audio' || withAudio.value || a.required)) ||
+        // an optional audio tower downloads when its switch is on, default or not
+        (a.kind === 'audio' && !a.required && withAudio.value) ||
         (a.kind === 'fp8-snapshot' && fp8Native.value)),
   )
   return { ids: need.map((a) => a.id), bytes: need.reduce((s, a) => s + a.total_size, 0) }
@@ -1897,6 +1936,8 @@ function buildSpec(): DeploySpec {
   if (model.value !== '__custom' && drafterId.value) spec.drafter = drafterId.value
   if (fp8Native.value) spec.fp8_native = true
   if (!withVision.value && !visionRequired.value) spec.vision = false
+  // said both ways: absent would follow the catalog default
+  if (audioArtifact.value) spec.audio = withAudio.value
   if (apiKey.value.trim()) spec.api_key = apiKey.value.trim()
   if (gpuIndex.value !== null) spec.gpu = gpuIndex.value
   // Absent = the manager computes a grant, which is what it has always done.
@@ -2382,6 +2423,12 @@ function start(): void {
         <p v-if="selectedWeights?.runtime?.note" class="sf__hint sf__hint--warn">
           {{ selectedWeights.runtime.note }}
         </p>
+        <p v-if="selectedWeights?.source?.gated" class="sf__hint sf__hint--warn">
+          Gated on Hugging Face: accept the licence at
+          <a :href="`https://huggingface.co/${selectedWeights.source.repo}`" target="_blank" rel="noopener noreferrer">{{ selectedWeights.source.repo }}</a>
+          with your account<template v-if="hfToken && !hfToken.configured">, then add your token in
+            <RouterLink :to="{ name: 'manage-settings' }">Settings</RouterLink></template>.
+        </p>
         <p v-if="selectedWeights?.source" class="sf__hint">
           Source:
           <a :href="`https://huggingface.co/${selectedWeights.source.repo}/tree/${selectedWeights.source.revision}`" target="_blank" rel="noopener noreferrer">{{ selectedWeights.source.repo }}</a>
@@ -2408,6 +2455,13 @@ function start(): void {
             Vision - image input
             <span v-if="withVision && !visionArtifact.installed" class="sf__capnote">
               downloads on start ({{ fmtBytes(visionArtifact.total_size) }})
+            </span>
+          </label>
+          <label v-if="audioArtifact" class="sf__check">
+            <Switch v-model="withAudio" label="Audio - audio input" />
+            Audio - audio input
+            <span v-if="withAudio && !audioArtifact.installed" class="sf__capnote">
+              downloads on start ({{ fmtBytes(audioArtifact.total_size) }})
             </span>
           </label>
         </template>

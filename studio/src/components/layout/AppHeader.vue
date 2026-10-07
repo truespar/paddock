@@ -10,6 +10,7 @@ import { useFleetStore } from '@/stores/fleet'
 import { useUpdatesStore } from '@/stores/updates'
 import { useReadsStore } from '@/stores/reads'
 import { useTablesStore } from '@/stores/tables'
+import { useMasksStore } from '@/stores/masks'
 import { predictorLabel } from '@/lib/tables'
 import { modelLabel } from '@/lib/model-name'
 import { selectStudioModel } from '@/lib/select-model'
@@ -164,6 +165,26 @@ const predictorSel = computed<string | number>({
   get: () => tablesStore.port,
   set: (v) => (tablesStore.port = Number(v)),
 })
+
+// Masks, the same again: the picker chooses the MASKER the page sends its
+// pictures and camera frames to.
+const masksStore = useMasksStore()
+const onMasks = computed(() => route.name === 'masks')
+const maskerOptions = computed(() =>
+  models.models
+    .filter((m) => m.kind === 'masker')
+    .map((m) => ({
+      value: m.port ?? 0,
+      label: m.display ?? modelLabel(m.id),
+      hint: `port ${m.port}`,
+      vendor: m.vendor,
+      title: m.id,
+    })),
+)
+const maskerSel = computed<string | number>({
+  get: () => masksStore.port,
+  set: (v) => (masksStore.port = Number(v)),
+})
 </script>
 
 <template>
@@ -197,6 +218,12 @@ const predictorSel = computed<string | number>({
         <template v-if="predictorOptions.length">
           <span class="header__sep">/</span>
           <Select v-model="predictorSel" :options="predictorOptions" ghost />
+        </template>
+      </template>
+      <template v-else-if="onMasks">
+        <template v-if="maskerOptions.length">
+          <span class="header__sep">/</span>
+          <Select v-model="maskerSel" :options="maskerOptions" ghost />
         </template>
       </template>
       <template v-else-if="area === 'studio' && currentModel && pickerOptions.length">

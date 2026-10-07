@@ -6,10 +6,19 @@ use super::*;
 use objc2_metal::MTLBuffer;
 use paddock_models::{gguf::Value, mapped::MappedGguf};
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static FULL_DRAFT_HEAD_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 const DH: usize = 32;
 const DK: usize = 8;
 const DIM: usize = 128;
 const TAPS: [usize; 5] = [6, 20, 34, 48, 62];
+
+#[cfg(test)]
+#[path = "dflash_prefix_tests.rs"]
+mod prefix_tests;
 
 struct Conv {
     base: Weight,
@@ -675,10 +684,32 @@ impl Qwen35 {
             [rows, 1, 1],
             256,
         );
+        // Noncausal hidden states still use all eight trained positions.
+        // Only their output projection may be shortened: selection is a
+        // left-to-right chain, so positions after k cannot affect its prefix.
+        // Keep a full R4 tile: recompiling the legacy contraction at R1/R2/R3
+        // can change rounding even with the same source expression. Retain
+        // its unused seed row too. Concurrent drafting, Splash and older
+        // hardware keep their independently qualified path.
+        let short_head = self.mlx
+            && !self.splash
+            && self.device.tensor_accelerated()
+            && pendings.len() == 1
+            && k <= 3;
+        #[cfg(test)]
+        let short_head = short_head && !FULL_DRAFT_HEAD_FOR_TEST.with(|v| v.get());
+        let head_rows = if short_head { 4 } else { rows };
+        let selected = if short_head { k + 1 } else { block };
         // The drafter borrows the target's head, which may be MLX affine
         // rather than a GGUF tensor. Keep all draft-owned weights unchanged.
         if self.mlx {
-            self.project(&cmd, &[(&self.head, &d.logits)], &d.norm, rows, &d.gemm);
+            self.project(
+                &cmd,
+                &[(&self.head, &d.logits)],
+                &d.norm,
+                head_rows,
+                &d.gemm,
+            );
         } else {
             self.head
                 .linear(&cmd, &d.norm, &d.logits, rows, 1., &d.gemm);
@@ -687,20 +718,24 @@ impl Qwen35 {
             "df_top16",
             &[&d.logits, &d.top_parts],
             &[self.vocab as u32],
-            [self.vocab.div_ceil(4096), rows, 1],
+            [self.vocab.div_ceil(4096), head_rows, 1],
             256,
         );
         cmd.dispatch(
             "df_top16_merge",
             &[&d.top_parts, &d.top],
             &[(self.vocab.div_ceil(4096) * 16) as u32],
-            [rows, 1, 1],
+            [head_rows, 1, 1],
             256,
         );
         d.selector
             .linear(&cmd, &d.norm, &d.selector_h, rows, 1., &d.gemm);
         cmd.dispatch(
-            "df_select",
+            if short_head {
+                "df_select_prefix"
+            } else {
+                "df_select"
+            },
             &[
                 &d.top,
                 &d.pred.buffer,
@@ -709,15 +744,24 @@ impl Qwen35 {
                 &s.ids,
                 &d.out,
             ],
-            &[block as u32, d.pred.ty, d.succ.ty],
+            &[block as u32, d.pred.ty, d.succ.ty, selected as u32],
             [pendings.len(), 1, 1],
             256,
         );
         cmd.finish()?;
-        // SAFETY: complete block chain, one compact token readback.
+        // SAFETY: the requested prefix was written and the command completed.
+        // Never expose stale suffix tokens from an earlier, longer proposal.
         let out = unsafe {
-            std::slice::from_raw_parts(d.out.raw.contents().as_ptr().cast::<u32>(), rows).to_vec()
+            std::slice::from_raw_parts(
+                d.out.raw.contents().as_ptr().cast::<u32>(),
+                if short_head { selected } else { rows },
+            )
+            .to_vec()
         };
-        Ok(Some(out.chunks(block).map(|r| r[1..].to_vec()).collect()))
+        Ok(Some(
+            out.chunks(if short_head { selected } else { block })
+                .map(|r| r[1..].to_vec())
+                .collect(),
+        ))
     }
 }

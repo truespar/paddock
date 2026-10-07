@@ -18,8 +18,13 @@ mod tests;
 /// What an encode job asks the model for.
 pub enum EncodeJob {
     /// L2-normalized last-token embeddings, one per input sequence.
+    /// `media[i]` holds sequence i's pictures and audio clips in the order
+    /// their placeholder runs appear in its ids (empty for text); a backend
+    /// without towers refuses any.
     Embed {
         seqs: Vec<Vec<u32>>,
+        media: Vec<Vec<crate::service::MmChunk>>,
+        dimensions: Option<usize>,
         reply: oneshot::Sender<Result<Vec<Vec<f32>>, String>>,
     },
     /// Relevance scores (P(yes) at the last position), one per input sequence.
@@ -70,6 +75,8 @@ pub enum EncodeJob {
 pub struct Encoder {
     tx: Sender<EncodeJob>,
     block_scale_calibration: bool,
+    /// (pictures, audio) the backend embeds - see `EncoderBackend::media_kinds`.
+    media: (bool, bool),
 }
 
 impl Encoder {
@@ -88,14 +95,14 @@ impl Encoder {
         B: EncoderBackend + 'static,
     {
         let (tx, rx) = channel::<EncodeJob>();
-        let (ready_tx, ready_rx) = channel::<Result<bool, String>>();
+        let (ready_tx, ready_rx) = channel::<Result<(bool, (bool, bool)), String>>();
 
         std::thread::Builder::new()
             .name("paddock-encoder".into())
             .spawn(move || {
                 let mut model = match build() {
                     Ok(m) => {
-                        let _ = ready_tx.send(Ok(m.block_scale_calibration()));
+                        let _ = ready_tx.send(Ok((m.block_scale_calibration(), m.media_kinds())));
                         m
                     }
                     Err(e) => {
@@ -147,14 +154,18 @@ impl Encoder {
                 // Single-client traffic never merged, so it never waits; with
                 // a batch in flight the GPU is busy, so never wait either -
                 // submit immediately and let the pipeline absorb stragglers.
+                // The windows are the backend's call (`burst_windows`); the
+                // default is the 20 / 5 ms above.
                 let mut prev_merged = false;
+                let windows = model.burst_windows();
                 let burst = |merged: bool, got_any: bool| -> Option<std::time::Duration> {
+                    let (first, trailing) = windows?;
                     if !merged {
                         None
                     } else if got_any {
-                        Some(std::time::Duration::from_millis(5))
+                        Some(trailing)
                     } else {
-                        Some(std::time::Duration::from_millis(20))
+                        Some(first)
                     }
                 };
 
@@ -227,6 +238,7 @@ impl Encoder {
                     while inflight.front().is_some_and(|inf| ready(&model, inf)) {
                         let inf = inflight.pop_front().expect("front");
                         collect(&mut model, inf);
+                        stamp(&model);
                     }
                     // Next job: block only when nothing is in flight. With
                     // batches in flight, poll - an arrival submits ahead;
@@ -234,6 +246,17 @@ impl Encoder {
                     let job = if let Some(j) = pending.pop_front() {
                         Some(j)
                     } else if inflight.is_empty() {
+                        if let Some(timeout) = model.idle_reclaim_after() {
+                            match rx.recv_timeout(timeout) {
+                                Ok(j) => pending.push_back(j),
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                    model.reclaim_idle();
+                                    stamp(&model);
+                                }
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                            }
+                            continue;
+                        }
                         match rx.recv() {
                             Ok(j) => Some(j),
                             Err(_) => break,
@@ -259,19 +282,28 @@ impl Encoder {
                     let Some(job) = job else {
                         if let Some(inf) = inflight.pop_front() {
                             collect(&mut model, inf);
+                            stamp(&model);
                         }
                         continue;
                     };
                     match job {
-                        EncodeJob::Embed { seqs, reply } => {
+                        EncodeJob::Embed {
+                            seqs,
+                            media,
+                            dimensions,
+                            reply,
+                        } => {
                             if reply.is_closed() {
                                 continue;
                             }
-                            if let Err(e) = model.validate(&seqs) {
+                            if let Err(e) = model
+                                .validate_media(&seqs, &media)
+                                .and_then(|()| model.validate_dimensions(dimensions))
+                            {
                                 let _ = reply.send(Err(e));
                                 continue;
                             }
-                            let mut parts = vec![(seqs, reply)];
+                            let mut parts = vec![(seqs, media, reply)];
                             let mut rows: usize = parts[0].0.iter().map(Vec::len).sum();
                             // Merge window: with a batch in flight, waiting
                             // for merge partners is free - the GPU is busy -
@@ -305,21 +337,31 @@ impl Encoder {
                                     },
                                 };
                                 match got {
-                                    Some(EncodeJob::Embed { seqs, reply }) => {
+                                    Some(EncodeJob::Embed {
+                                        seqs,
+                                        media,
+                                        dimensions: next_dimensions,
+                                        reply,
+                                    }) if next_dimensions == dimensions => {
                                         if reply.is_closed() {
                                             continue;
                                         }
-                                        if let Err(e) = model.validate(&seqs) {
+                                        if let Err(e) = model.validate_media(&seqs, &media) {
                                             let _ = reply.send(Err(e));
                                             continue;
                                         }
                                         let extra = seqs.iter().map(Vec::len).sum::<usize>();
                                         if extra > coalesce_row_budget.saturating_sub(rows) {
-                                            pending.push_back(EncodeJob::Embed { seqs, reply });
+                                            pending.push_back(EncodeJob::Embed {
+                                                seqs,
+                                                media,
+                                                dimensions,
+                                                reply,
+                                            });
                                             break;
                                         }
                                         rows += seqs.iter().map(Vec::len).sum::<usize>();
-                                        parts.push((seqs, reply));
+                                        parts.push((seqs, media, reply));
                                     }
                                     Some(other) => {
                                         pending.push_back(other);
@@ -337,15 +379,15 @@ impl Encoder {
                             // lanes so the pieces overlap on the GPU.
                             let free = lanes.saturating_sub(inflight.len()).max(1);
                             let ways = free.min(parts.len());
-                            let halves: Vec<Vec<(Vec<Vec<u32>>, _)>> = if ways >= 2 {
+                            let halves: Vec<Vec<(Vec<Vec<u32>>, _, _)>> = if ways >= 2 {
                                 let total: usize = parts
                                     .iter()
-                                    .map(|(s, _)| s.iter().map(Vec::len).sum::<usize>())
+                                    .map(|(s, _, _)| s.iter().map(Vec::len).sum::<usize>())
                                     .sum();
                                 let mut out = Vec::with_capacity(ways);
                                 let mut acc = 0usize;
                                 let mut taken = 0usize;
-                                let mut cur: Vec<(Vec<Vec<u32>>, _)> = Vec::new();
+                                let mut cur: Vec<(Vec<Vec<u32>>, _, _)> = Vec::new();
                                 let n_parts = parts.len();
                                 for (i, part) in parts.into_iter().enumerate() {
                                     acc += part.0.iter().map(Vec::len).sum::<usize>();
@@ -368,17 +410,21 @@ impl Encoder {
                                 vec![parts]
                             };
                             for parts in halves {
-                                let all: Vec<Vec<u32>> =
-                                    parts.iter().flat_map(|(s, _)| s.iter().cloned()).collect();
-                                let counts: Vec<(usize, _)> =
-                                    parts.into_iter().map(|(s, r)| (s.len(), r)).collect();
+                                let mut all: Vec<Vec<u32>> = Vec::new();
+                                let mut all_media = Vec::new();
+                                let mut counts: Vec<(usize, _)> = Vec::with_capacity(parts.len());
+                                for (s, m, r) in parts {
+                                    counts.push((s.len(), r));
+                                    all.extend(s);
+                                    all_media.extend(m);
+                                }
                                 if inflight.len() >= cap {
                                     let inf = inflight.pop_front().expect("front");
                                     collect(&mut model, inf);
                                 }
                                 let lane = lane_seq % lanes;
                                 lane_seq += 1;
-                                match model.embed_submit(&all, lane) {
+                                match model.embed_submit_media(&all, &all_media, lane, dimensions) {
                                     Ok(p) => inflight.push_back(Inflight::Embed(p, counts)),
                                     Err(e) => {
                                         let e = e.to_string();
@@ -603,13 +649,24 @@ impl Encoder {
             .map_err(|e| format!("failed to spawn encoder thread: {e}"))?;
 
         match ready_rx.recv() {
-            Ok(Ok(block_scale_calibration)) => Ok(Self {
+            Ok(Ok((block_scale_calibration, media))) => Ok(Self {
                 tx,
                 block_scale_calibration,
+                media,
             }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err("encoder thread died during startup".into()),
         }
+    }
+
+    /// Whether the backend embeds pictures (an attached picture tower).
+    pub fn serves_images(&self) -> bool {
+        self.media.0
+    }
+
+    /// Whether the backend embeds audio clips (an attached audio tower).
+    pub fn serves_audio(&self) -> bool {
+        self.media.1
     }
 
     /// Device-specific quality calibration is not a generic encoder feature.
@@ -619,9 +676,40 @@ impl Encoder {
 
     /// Embed a batch of tokenized sequences in one weight-amortized pass.
     pub async fn embed(&self, seqs: Vec<Vec<u32>>) -> Result<Vec<Vec<f32>>, String> {
+        self.embed_dimensions(seqs, None).await
+    }
+
+    /// MRL truncation and re-normalization belong to the GPU backend. Jobs
+    /// with different dimensions cannot be coalesced into one output plane.
+    pub async fn embed_dimensions(
+        &self,
+        seqs: Vec<Vec<u32>>,
+        dimensions: Option<usize>,
+    ) -> Result<Vec<Vec<f32>>, String> {
+        let media = seqs.iter().map(|_| Vec::new()).collect();
+        self.embed_media(seqs, media, dimensions).await
+    }
+
+    /// [`Self::embed_dimensions`] with pictures and audio clips: `media[i]`
+    /// fills sequence i's placeholder runs in order (see
+    /// [`EncodeJob::Embed`]). Only a backend with the towers accepts any.
+    pub async fn embed_media(
+        &self,
+        seqs: Vec<Vec<u32>>,
+        media: Vec<Vec<crate::service::MmChunk>>,
+        dimensions: Option<usize>,
+    ) -> Result<Vec<Vec<f32>>, String> {
+        if media.len() != seqs.len() {
+            return Err("one media list per sequence".into());
+        }
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(EncodeJob::Embed { seqs, reply })
+            .send(EncodeJob::Embed {
+                seqs,
+                media,
+                dimensions,
+                reply,
+            })
             .map_err(|_| "encoder thread is gone".to_owned())?;
         rx.await
             .map_err(|_| "encoder dropped the reply".to_owned())?

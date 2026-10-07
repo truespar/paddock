@@ -11,6 +11,7 @@ pub mod completions;
 pub mod embeddings;
 pub mod error;
 pub mod images;
+pub mod masks;
 pub mod messages;
 pub mod models;
 pub mod responses;

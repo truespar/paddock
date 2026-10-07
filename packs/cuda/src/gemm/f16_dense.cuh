@@ -221,14 +221,37 @@ __device__ __forceinline__ void pd_f16_mma(float d[4], const uint32_t a[4],
 //           round instead of two, and no pass over the 2F-wide plane the
 //           unfused form lands and re-reads (the same law as GELU above).
 //           M must be a multiple of 16 - the launcher refuses anything else.
-// Same per-element K order in all four, so they are one accumulation away
+//   GELU_TANH - GELU with bias, the TANH approximation: SAM 3's ViT MLP.
+//           Meta's inference runs that fc1 through cuBLASLt's GELU epilogue
+//           (perflib.fused.addmm_act), which is the tanh form on the f32
+//           accumulator, so this lands the same function at the same point
+//           - only the round differs (f16 here, bf16 there).
+//   BIAS - y = f16(acc + bias[m]), bias optional (null is the plain landing):
+//           a projection whose output feeds an attention directly, where
+//           there is no seam of its own to add the bias in (SAM 3's q/k/v).
+// Same per-element K order in all six, so they are one accumulation away
 // from each other and from the plain landing.
 #define PD_F16_EPI_NONE 0u
 #define PD_F16_EPI_GELU 1u
 #define PD_F16_EPI_RELU 2u
 #define PD_F16_EPI_GEGLU 3u
+#define PD_F16_EPI_GELU_TANH 4u
+#define PD_F16_EPI_BIAS 5u
+// QKV (H16 only, the blocked tile only): the landing IS the q|k|v split - the
+// three projections' biases, the rotate-half rope on q and k, q's scale, and
+// the three [N][d] half planes - SAM 3's ViT (pd_sam3_qkv_split_rope_h's math
+// on the f32 accumulator, one round instead of two). A 128-row tile sits in
+// one of q / k / v (d % 128 == 0) and a warp's 64 rows are one head (hd 64), so
+// dims j and j + 32 of a head are the same lane's m-groups rg and rg + 2: the
+// rotation happens in registers.
+#define PD_F16_EPI_QKV 6u
 __device__ __forceinline__ float pd_f16_gelu_erf(float v) {
     return 0.5f * v * (1.0f + erff(v * 0.70710678118654752440084436210484f));
+}
+// torch's gelu(approximate="tanh"): sqrt(2/pi) * (v + 0.044715 v^3), in f32
+__device__ __forceinline__ float pd_f16_gelu_tanh(float v) {
+    const float u = 0.79788456080286535587989211986876f * (v + 0.044715f * v * v * v);
+    return 0.5f * v * (1.0f + tanhf(u));
 }
 
 // SWZ: the staged rows carry no +8 pad; instead the 16 B chunk index of a row
@@ -258,17 +281,51 @@ __device__ __forceinline__ uint32_t pd_f16_sidx(uint32_t row, uint32_t h) {
     return row * KT + (chunk << 3) + (h & 7u);
 }
 
+// B1: ONE barrier per K-step (wait -> sync -> issue the next stage into the
+// buffer the previous step computed -> compute), where the base ring issues,
+// waits, syncs, computes and syncs again. The top barrier is then both the
+// RAW fence for this step's buffer and the WAR fence for the one being
+// restaged. Same stages, same k order - bit-identical (bench/f16_wide_sweep).
+//
+// CONV3: the activation operand is a 3x3 / pad 1 convolution's im2row
+// plane, gathered in the stage instead of read: X is the SOURCE image,
+// [chips][rows][C] halves (rows >= its pixels apart), H x W is the OUTPUT
+// grid and S the stride (1 or 2; the source is S H x S W), and activation
+// row n = (chip, y, x) reads, at k = tap * C + c, source pixel
+// (S y + tap/3 - 1, S x + tap%3 - 1) channel c, zero past the border -
+// pd_dp_im2row3's layout exactly at S = 1, so the landing is bit-identical
+// to im2row + this GEMM there. C % 8 == 0 keeps a 16 B chunk inside one tap;
+// K is 9 C. The plane the explicit form writes and re-reads (9x the output
+// grid) never exists.
+struct PdF16Conv3 {
+    uint32_t H, W, C, rows, S;
+};
+// EPI_QKV's destination: the three planes, the rope tables ([rows][32], row =
+// token % rows, null = no rope) and q's scale
+struct PdF16Qkv {
+    __half* q;
+    __half* k;
+    __half* v;
+    const float* cs;
+    const float* sn;
+    uint32_t rows, d;
+    float qs;
+};
 template <uint32_t BM, uint32_t BN, uint32_t NWARP, uint32_t ST, uint32_t KT,
           uint32_t RG, uint32_t CG, bool KS = false, bool H16 = false, uint32_t EPI = 0u,
-          bool SWZ = false>
+          bool SWZ = false, bool B1 = false, bool CONV3 = false, uint32_t FRAG = 0u>
 __global__ void __launch_bounds__(NWARP * 32) pd_f16_gemm_mma_kernel(
         const __half* __restrict__ W, const __half* __restrict__ X,
         float* __restrict__ Y, float beta, uint32_t K, uint32_t M, uint32_t N,
         float* __restrict__ Part = nullptr, uint32_t slab = 0u,
         uint32_t gw = 0u, uint32_t gx = 0u, uint32_t nwg = 1u,
-        const float* __restrict__ bias = nullptr) {
+        const float* __restrict__ bias = nullptr, PdF16Conv3 cv = {0u, 0u, 0u, 0u, 1u},
+        PdF16Qkv qv = {nullptr, nullptr, nullptr, nullptr, nullptr, 0u, 0u, 1.0f}) {
 #if PD_MMA_OK
-    static_assert(EPI == PD_F16_EPI_NONE || H16, "the fused epilogues are half-landing features");
+    // the f32 landing takes the bias epilogue too (the conv entry's FPN levels)
+    static_assert(EPI == PD_F16_EPI_NONE || H16 || EPI == PD_F16_EPI_BIAS,
+                  "the fused epilogues are half-landing features");
+    static_assert(!(CONV3 && KS), "the conv entry never K-splits");
     constexpr uint32_t NTH = NWARP * 32u;
     constexpr uint32_t WM = RG * 16u;      // warp tile rows
     constexpr uint32_t WN = CG * 8u;       // warp tile cols
@@ -322,6 +379,25 @@ __global__ void __launch_bounds__(NWARP * 32) pd_f16_gemm_mma_kernel(
     if (!KS && gw != 0u && (row_base >= M || col_base >= N)) return;
     const __half zero = __float2half(0.0f);
 
+    // CONV3: the activation rows this thread stages are the same every stage
+    // (i = tid + j * NTH), so their pixel is decomposed once here
+    constexpr uint32_t XCH = CONV3 ? (BN * H8PR + NTH - 1u) / NTH : 1u;
+    int32_t cv_y[XCH], cv_x[XCH];
+    size_t cv_base[XCH];
+    if (CONV3) {
+        const uint32_t P = cv.H * cv.W;
+        #pragma unroll
+        for (uint32_t j = 0; j < XCH; ++j) {
+            const uint32_t i = tid + j * NTH;
+            const uint32_t n = col_base + i / H8PR;
+            const uint32_t chip = n / P, pix = n - chip * P;
+            const uint32_t y = pix / cv.W;
+            cv_y[j] = (i < BN * H8PR && n < N) ? (int32_t)y : -2;  // -2: never in range
+            cv_x[j] = (int32_t)(pix - y * cv.W);
+            cv_base[j] = (size_t)chip * cv.rows;
+        }
+    }
+
     // stage kt's A/B planes into buffer `buf`. async 16B when ST>=2 (commit at
     // the call site); synchronous int4 stores when ST=1.
     auto stage = [&](uint32_t k0, uint32_t buf) {
@@ -343,22 +419,43 @@ __global__ void __launch_bounds__(NWARP * 32) pd_f16_gemm_mma_kernel(
                     dst[e] = (gk + e < k_hi) ? W[(size_t)(row_base + row) * K + gk + e] : zero;
             }
         }
-        #pragma unroll
-        for (uint32_t i = tid; i < BN * H8PR; i += NTH) {
-            const uint32_t col = i / H8PR, h8 = (i % H8PR) * 8u, gk = k0 + h8;
-            const bool colok = (col_base + col) < N;
-            __half* dst = &sh_b[buf][pd_f16_sidx<KT, SWZ>(col, h8)];
-            const __half* src = X + (size_t)(col_base + col) * K + gk;
-            if (colok && gk + 8u <= k_hi) {
-                if (ST >= 2u) pd_f16_cpa16(dst, src, true);
-                else *reinterpret_cast<int4*>(dst) = *reinterpret_cast<const int4*>(src);
-            } else if (!colok || gk >= k_hi) {
-                if (ST >= 2u) pd_f16_cpa16(dst, src, false);
-                else *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
-            } else {
-                #pragma unroll
-                for (uint32_t e = 0; e < 8u; ++e)
-                    dst[e] = (gk + e < k_hi) ? X[(size_t)(col_base + col) * K + gk + e] : zero;
+        if (CONV3) {
+            // the source grid; S = 1 is the same integer arithmetic as before
+            const int32_t S = (int32_t)cv.S, SH = S * (int32_t)cv.H, SW = S * (int32_t)cv.W;
+            #pragma unroll
+            for (uint32_t j = 0; j < XCH; ++j) {
+                const uint32_t i = tid + j * NTH;
+                if (i >= BN * H8PR) break;
+                const uint32_t col = i / H8PR, h8 = (i % H8PR) * 8u, gk = k0 + h8;
+                const uint32_t tap = gk / cv.C, c = gk - tap * cv.C;
+                const int32_t yy = cv_y[j] * S + (int32_t)(tap / 3u) - 1;
+                const int32_t xx = cv_x[j] * S + (int32_t)(tap % 3u) - 1;
+                const bool ok = gk < k_hi && yy >= 0 && yy < SH && xx >= 0 && xx < SW;
+                __half* dst = &sh_b[buf][pd_f16_sidx<KT, SWZ>(col, h8)];
+                const __half* src =
+                    ok ? X + (cv_base[j] + (size_t)yy * (size_t)SW + (size_t)xx) * cv.C + c : X;
+                if (ST >= 2u) pd_f16_cpa16(dst, src, ok);
+                else *reinterpret_cast<int4*>(dst) =
+                         ok ? *reinterpret_cast<const int4*>(src) : make_int4(0, 0, 0, 0);
+            }
+        } else {
+            #pragma unroll
+            for (uint32_t i = tid; i < BN * H8PR; i += NTH) {
+                const uint32_t col = i / H8PR, h8 = (i % H8PR) * 8u, gk = k0 + h8;
+                const bool colok = (col_base + col) < N;
+                __half* dst = &sh_b[buf][pd_f16_sidx<KT, SWZ>(col, h8)];
+                const __half* src = X + (size_t)(col_base + col) * K + gk;
+                if (colok && gk + 8u <= k_hi) {
+                    if (ST >= 2u) pd_f16_cpa16(dst, src, true);
+                    else *reinterpret_cast<int4*>(dst) = *reinterpret_cast<const int4*>(src);
+                } else if (!colok || gk >= k_hi) {
+                    if (ST >= 2u) pd_f16_cpa16(dst, src, false);
+                    else *reinterpret_cast<int4*>(dst) = make_int4(0, 0, 0, 0);
+                } else {
+                    #pragma unroll
+                    for (uint32_t e = 0; e < 8u; ++e)
+                        dst[e] = (gk + e < k_hi) ? X[(size_t)(col_base + col) * K + gk + e] : zero;
+                }
             }
         }
     };
@@ -373,31 +470,104 @@ __global__ void __launch_bounds__(NWARP * 32) pd_f16_gemm_mma_kernel(
     const uint32_t b_kof = (lane & 8u) ? 8u : 0u;
 
     float acc[RG][CG][4] = {};
-    auto compute = [&](uint32_t buf) {
+    // FRAG (sweep arms, 2026-10-06): bit 0 loads two B column groups per
+    // ldmatrix.x4 (lanes 16+ address the second group) instead of one per
+    // .x2; bit 1 double-buffers the fragments, loading k16 step sk + 1 before
+    // issuing step sk's mmas (the asm is volatile, so the compiler never
+    // interleaves them on its own). The same fragments into the same mmas in
+    // the same order: bit-identical.
+    auto load_frags = [&](uint32_t buf, uint32_t ko, uint32_t (&a)[RG][4], uint32_t (&b)[CG][2]) {
         #pragma unroll
-        for (uint32_t sk = 0; sk < NSUBK; ++sk) {
-            const uint32_t ko = sk * 16u;
-            // load this warp's RG A-fragments and CG B-fragments once...
-            uint32_t a[RG][4];
+        for (uint32_t rg = 0; rg < RG; ++rg)
+            pd_f16_ldm_x4(&sh_a[buf][pd_f16_sidx<KT, SWZ>(wr + rg * 16u + a_roff, ko + a_kof)],
+                          a[rg][0], a[rg][1], a[rg][2], a[rg][3]);
+        if ((FRAG & 1u) && CG % 2u == 0u) {
+            const uint32_t bx_col = ((lane >> 4) & 1u) * 8u + l7;
             #pragma unroll
-            for (uint32_t rg = 0; rg < RG; ++rg)
-                pd_f16_ldm_x4(&sh_a[buf][pd_f16_sidx<KT, SWZ>(wr + rg * 16u + a_roff, ko + a_kof)],
-                              a[rg][0], a[rg][1], a[rg][2], a[rg][3]);
-            uint32_t b[CG][2];
+            for (uint32_t cg = 0; cg < CG; cg += 2u)
+                pd_f16_ldm_x4(&sh_b[buf][pd_f16_sidx<KT, SWZ>(wc + cg * 8u + bx_col, ko + b_kof)],
+                              b[cg][0], b[cg][1], b[cg + 1u][0], b[cg + 1u][1]);
+        } else {
             #pragma unroll
             for (uint32_t cg = 0; cg < CG; ++cg)
                 pd_f16_ldm_x2(&sh_b[buf][pd_f16_sidx<KT, SWZ>(wc + cg * 8u + l7, ko + b_kof)],
                               b[cg][0], b[cg][1]);
-            // ...then the RG*CG outer-product mmas reuse them from registers
+        }
+    };
+    auto compute_db = [&](uint32_t buf) {
+        uint32_t a[2][RG][4], b[2][CG][2];
+        load_frags(buf, 0u, a[0], b[0]);
+        #pragma unroll
+        for (uint32_t sk = 0; sk < NSUBK; ++sk) {
+            if (sk + 1u < NSUBK) load_frags(buf, (sk + 1u) * 16u, a[(sk + 1u) & 1u], b[(sk + 1u) & 1u]);
             #pragma unroll
             for (uint32_t rg = 0; rg < RG; ++rg)
                 #pragma unroll
                 for (uint32_t cg = 0; cg < CG; ++cg)
-                    pd_f16_mma(acc[rg][cg], a[rg], b[cg]);
+                    pd_f16_mma(acc[rg][cg], a[sk & 1u][rg], b[sk & 1u][cg]);
+        }
+    };
+    auto compute = [&](uint32_t buf) {
+        if (FRAG != 0u) {
+            if (FRAG & 2u) {
+                compute_db(buf);
+            } else {
+                #pragma unroll
+                for (uint32_t sk = 0; sk < NSUBK; ++sk) {
+                    uint32_t a[RG][4], b[CG][2];
+                    load_frags(buf, sk * 16u, a, b);
+                    #pragma unroll
+                    for (uint32_t rg = 0; rg < RG; ++rg)
+                        #pragma unroll
+                        for (uint32_t cg = 0; cg < CG; ++cg)
+                            pd_f16_mma(acc[rg][cg], a[rg], b[cg]);
+                }
+            }
+        } else {
+            #pragma unroll
+            for (uint32_t sk = 0; sk < NSUBK; ++sk) {
+                const uint32_t ko = sk * 16u;
+                // load this warp's RG A-fragments and CG B-fragments once...
+                uint32_t a[RG][4];
+                #pragma unroll
+                for (uint32_t rg = 0; rg < RG; ++rg)
+                    pd_f16_ldm_x4(&sh_a[buf][pd_f16_sidx<KT, SWZ>(wr + rg * 16u + a_roff, ko + a_kof)],
+                                  a[rg][0], a[rg][1], a[rg][2], a[rg][3]);
+                uint32_t b[CG][2];
+                #pragma unroll
+                for (uint32_t cg = 0; cg < CG; ++cg)
+                    pd_f16_ldm_x2(&sh_b[buf][pd_f16_sidx<KT, SWZ>(wc + cg * 8u + l7, ko + b_kof)],
+                                  b[cg][0], b[cg][1]);
+                // ...then the RG*CG outer-product mmas reuse them from registers
+                #pragma unroll
+                for (uint32_t rg = 0; rg < RG; ++rg)
+                    #pragma unroll
+                    for (uint32_t cg = 0; cg < CG; ++cg)
+                        pd_f16_mma(acc[rg][cg], a[rg], b[cg]);
+            }
         }
     };
 
-    if (ST >= 2u) {
+    if (ST >= 2u && B1) {
+        #pragma unroll
+        for (uint32_t s = 0; s < ST - 1u; ++s) {
+            const uint32_t k0 = k_lo + s * KT;
+            if (k0 < k_hi) stage(k0, s);
+            pd_f16_cpa_commit();
+        }
+        uint32_t p = 0;
+        for (uint32_t k0 = k_lo; k0 < k_hi; k0 += KT) {
+            // ST-1 groups ahead of this step were committed; this step's is
+            // the oldest, so ST-2 may still fly
+            pd_f16_cpa_waitN<(int)ST - 2>();
+            __syncthreads();
+            const uint32_t pre = k0 + (ST - 1u) * KT;
+            if (pre < k_hi) stage(pre, (p + ST - 1u) % ST);
+            pd_f16_cpa_commit();
+            compute(p);
+            p = (p + 1u) % ST;
+        }
+    } else if (ST >= 2u) {
         // ST-deep ring: buffer p computes while up to ST-1 stages stream in.
         // One commit group per iteration always (empty groups are legal PTX)
         // so the wait immediate stays uniform. Byte-identical to the int8
@@ -438,9 +608,47 @@ __global__ void __launch_bounds__(NWARP * 32) pd_f16_gemm_mma_kernel(
     // In KS mode the destination is this z-slab's own plane and there is
     // nothing to accumulate onto -- beta is applied once, by the combine.
     static_assert(!(KS && H16), "the K-split partials plane is f32");
+    static_assert(EPI != PD_F16_EPI_QKV || (H16 && RG == 4u), "QKV pairs m-groups rg, rg + 2");
     float* __restrict__ out = KS ? (Part + (size_t)blockIdx.z * M * N) : Y;
     const float b = KS ? 0.0f : beta;
-    if (H16) {
+    if (EPI == PD_F16_EPI_QKV) {
+        const uint32_t plane = row_base / qv.d;  // 0 q, 1 k, 2 v
+        __half* __restrict__ dst = plane == 0u ? qv.q : (plane == 1u ? qv.k : qv.v);
+        const bool rope = plane < 2u && qv.cs != nullptr;
+        const float sc = plane == 0u ? qv.qs : 1.0f;
+        #pragma unroll
+        for (uint32_t rg = 0; rg < 2u; ++rg) {
+            // dim j of this head and j + 8 (the fragment's two rows), and
+            // their partners j + 32, j + 40 in m-group rg + 2
+            const uint32_t j = rg * 16u + g;
+            const uint32_t ra = row_base + wr + j;
+            if (ra >= M) continue;
+            const uint32_t fa = ra - plane * qv.d;
+            const float b0 = bias[ra], b8 = bias[ra + 8u];
+            const float b32 = bias[ra + 32u], b40 = bias[ra + 40u];
+            #pragma unroll
+            for (uint32_t cg = 0; cg < CG; ++cg) {
+                #pragma unroll
+                for (uint32_t e1 = 0; e1 < 2u; ++e1) {
+                    const uint32_t cc = col_base + wc + cg * 8u + 2u * t + e1;
+                    if (cc >= N) continue;
+                    const float* cr = rope ? qv.cs + (size_t)(cc % qv.rows) * 32u : nullptr;
+                    const float* sr = rope ? qv.sn + (size_t)(cc % qv.rows) * 32u : nullptr;
+                    __half* o = dst + (size_t)cc * qv.d + fa;
+                    #pragma unroll
+                    for (uint32_t h8 = 0; h8 < 2u; ++h8) {
+                        // the split kernel's arithmetic, on the accumulator
+                        const float x0 = acc[rg][cg][2u * h8 + e1] + (h8 ? b8 : b0);
+                        const float x1 = acc[rg + 2u][cg][2u * h8 + e1] + (h8 ? b40 : b32);
+                        const float c = rope ? cr[j + 8u * h8] : 1.0f;
+                        const float s = rope ? sr[j + 8u * h8] : 0.0f;
+                        o[8u * h8] = __float2half((x0 * c - x1 * s) * sc);
+                        o[8u * h8 + 32u] = __float2half((x1 * c + x0 * s) * sc);
+                    }
+                }
+            }
+        }
+    } else if (H16) {
         __half* __restrict__ o16 = reinterpret_cast<__half*>(Y);
         #pragma unroll
         for (uint32_t rg = 0; rg < RG; ++rg) {
@@ -470,6 +678,20 @@ __global__ void __launch_bounds__(NWARP * 32) pd_f16_gemm_mma_kernel(
                     v01 = pd_f16_gelu_erf(v01 + b0);
                     v10 = pd_f16_gelu_erf(v10 + b8);
                     v11 = pd_f16_gelu_erf(v11 + b8);
+                }
+                if (EPI == PD_F16_EPI_GELU_TANH) {
+                    const float b0 = r0 < M ? bias[r0] : 0.0f;
+                    const float b8 = r8 < M ? bias[r8] : 0.0f;
+                    v00 = pd_f16_gelu_tanh(v00 + b0);
+                    v01 = pd_f16_gelu_tanh(v01 + b0);
+                    v10 = pd_f16_gelu_tanh(v10 + b8);
+                    v11 = pd_f16_gelu_tanh(v11 + b8);
+                }
+                if (EPI == PD_F16_EPI_BIAS && bias != nullptr) {
+                    v00 += r0 < M ? bias[r0] : 0.0f;
+                    v01 += r0 < M ? bias[r0] : 0.0f;
+                    v10 += r8 < M ? bias[r8] : 0.0f;
+                    v11 += r8 < M ? bias[r8] : 0.0f;
                 }
                 if (EPI == PD_F16_EPI_RELU) {
                     const float b0 = (bias != nullptr && r0 < M) ? bias[r0] : 0.0f;
@@ -517,13 +739,22 @@ __global__ void __launch_bounds__(NWARP * 32) pd_f16_gemm_mma_kernel(
             for (uint32_t cg = 0; cg < CG; ++cg) {
                 const uint32_t c0 = col_base + wc + cg * 8u + 2u * t;
                 const uint32_t c1 = c0 + 1u;
+                float v00 = acc[rg][cg][0], v01 = acc[rg][cg][1];
+                float v10 = acc[rg][cg][2], v11 = acc[rg][cg][3];
+                if (EPI == PD_F16_EPI_BIAS && bias != nullptr) {
+                    // the bias_add pass's own f32 add, in the landing
+                    v00 += r0 < M ? bias[r0] : 0.0f;
+                    v01 += r0 < M ? bias[r0] : 0.0f;
+                    v10 += r8 < M ? bias[r8] : 0.0f;
+                    v11 += r8 < M ? bias[r8] : 0.0f;
+                }
                 if (r0 < M) {
-                    if (c0 < N) out[(size_t)c0 * M + r0] = acc[rg][cg][0];
-                    if (c1 < N) out[(size_t)c1 * M + r0] = acc[rg][cg][1];
+                    if (c0 < N) out[(size_t)c0 * M + r0] = v00;
+                    if (c1 < N) out[(size_t)c1 * M + r0] = v01;
                 }
                 if (r8 < M) {
-                    if (c0 < N) out[(size_t)c0 * M + r8] = acc[rg][cg][2];
-                    if (c1 < N) out[(size_t)c1 * M + r8] = acc[rg][cg][3];
+                    if (c0 < N) out[(size_t)c0 * M + r8] = v10;
+                    if (c1 < N) out[(size_t)c1 * M + r8] = v11;
                 }
             }
         }
@@ -2004,6 +2235,17 @@ static bool pd_f16_mma_wide_tile(unsigned int out_dim, unsigned int batch) {
 // is no second block to place, and below half of it the K-split owns the
 // shape. cc 8.6 only - the occupancy arithmetic is this die's (shared memory
 // per SM, 6 MB L2), and an election is measured or it is not made.
+//
+// Re-swept 2026-10-06 on SAM 3's ViT (5184 rows, ffn 4736) with the
+// swizzled stage (SWZ) and one barrier per K-step (B1) as arms: the third
+// stage came back. Swizzled rows drop the +8 pad, so ST=3 is 48 KB a block
+// and both resident blocks stay; one barrier a step instead of two is what
+// lets the third stage pay (padded ST=3 + B1 lost: one block). Per layer,
+// interleaved, every arm byte-identical: SAM 3 1729/1757 -> 1607/1636 us
+// (-7%), ViT-L at 16464 rows 5077/5094 -> 4494/4567 (-10..-12%), 1029 rows
+// equal, the narrow planes -5% summed with none worse. cuBLAS is still
+// 6-7% ahead on the wide shapes, nearly all of it on fc2 (K 4736: 424 vs
+// 547 us), where a 128x128 tile stages 32 MACs a byte through L2.
 #define PD_F16_BLK_GW 4u
 
 // ---- the wide tile on cc 12.0: the two-deep ring, plain raster ----
@@ -2051,16 +2293,21 @@ static bool pd_f16_mma_blocked_elect(unsigned int out_dim, unsigned int batch) {
     return blocks2d >= (uint32_t)nsm;
 }
 
-template <bool H16, uint32_t EPI = 0u>
+template <bool H16, uint32_t EPI = 0u, bool CONV3 = false>
 static int pd_f16_mma_blocked(const __half* w, const __half* x, void* y, float beta,
                               unsigned in_dim, unsigned out_dim, unsigned batch,
-                              cudaStream_t st, const float* bias = nullptr) {
-    constexpr uint32_t BM = 128u, BN = 128u, NW = 8u, ST = 2u, KT = 32u, RG = 4u, CG = 4u;
-    constexpr unsigned smem = 2u * ST * (BM + BN) * (KT + 8u);  // bytes
+                              cudaStream_t st, const float* bias = nullptr,
+                              PdF16Conv3 cv = {0u, 0u, 0u, 0u, 1u},
+                              PdF16Qkv qv = {nullptr, nullptr, nullptr, nullptr, nullptr, 0u, 0u,
+                                             1.0f}) {
+    // three swizzled stages, one barrier a K-step (see above): 48 KB a block
+    constexpr uint32_t BM = 128u, BN = 128u, NW = 8u, ST = 3u, KT = 32u, RG = 4u, CG = 4u;
+    constexpr unsigned smem = 2u * ST * (BM + BN) * KT;  // bytes, no row pad
     static bool set = false;
     if (!set) {
         cudaFuncSetAttribute(
-                pd_f16_gemm_mma_kernel<BM, BN, NW, ST, KT, RG, CG, false, H16, EPI>,
+                pd_f16_gemm_mma_kernel<BM, BN, NW, ST, KT, RG, CG, false, H16, EPI, true, true,
+                                       CONV3>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         set = true;
     }
@@ -2068,10 +2315,10 @@ static int pd_f16_mma_blocked(const __half* w, const __half* x, void* y, float b
     const uint32_t gw = nwt < PD_F16_BLK_GW ? nwt : PD_F16_BLK_GW;
     const uint32_t nwg = (nwt + gw - 1u) / gw;
     dim3 grid(gw, nxt, nwg);
-    pd_f16_gemm_mma_kernel<BM, BN, NW, ST, KT, RG, CG, false, H16, EPI>
+    pd_f16_gemm_mma_kernel<BM, BN, NW, ST, KT, RG, CG, false, H16, EPI, true, true, CONV3>
             <<<grid, NW * 32u, smem, st>>>(w, x, reinterpret_cast<float*>(y),
                                            beta, in_dim, out_dim, batch, nullptr,
-                                           0u, gw, nxt, nwg, bias);
+                                           0u, gw, nxt, nwg, bias, cv, qv);
     return (int)cudaGetLastError();
 }
 
@@ -3060,6 +3307,96 @@ PD_EXPORT int pd_f16_gemm_h_gelu(const void* w, const void* x, void* y, const vo
                                   unsigned int batch, void* stream) {
     if (bias == nullptr) return (int)cudaErrorInvalidValue;
     return pd_f16_gemm_h_route<PD_F16_EPI_GELU>(w, x, y, (const float*)bias, in_dim, out_dim, batch, stream);
+}
+
+// 755: 624 with the tanh-approximate GELU - SAM 3's ViT fc1 (see the EPI note).
+// bias is [out_dim] f32 and required. Same election, same K order as 618.
+PD_EXPORT int pd_f16_gemm_h_gelu_tanh(const void* w, const void* x, void* y, const void* bias,
+                                       unsigned int in_dim, unsigned int out_dim,
+                                       unsigned int batch, void* stream) {
+    if (bias == nullptr) return (int)cudaErrorInvalidValue;
+    return pd_f16_gemm_h_route<PD_F16_EPI_GELU_TANH>(w, x, y, (const float*)bias, in_dim, out_dim, batch, stream);
+}
+
+// 769: the landing with a bias (optional - null is none) added before its one
+// round, no activation. Same election and K order as 618.
+PD_EXPORT int pd_f16_gemm_h_bias(const void* w, const void* x, void* y, const void* bias,
+                                  unsigned int in_dim, unsigned int out_dim,
+                                  unsigned int batch, void* stream) {
+    return pd_f16_gemm_h_route<PD_F16_EPI_BIAS>(w, x, y, (const float*)bias, in_dim, out_dim, batch, stream);
+}
+
+// 775: a 3x3 / stride 1 / pad 1 convolution as one GEMM with the im2row
+// gathered in the stage (CONV3 above): src is [chips][src_chip_rows][C]
+// halves (rows >= H*W), w is [out_dim][9 C] tap-major (pd_dp_im2row3's
+// layout), y is [chips * H * W][out_dim] f32, bias [out_dim] f32 optional
+// (the bias_add pass, folded). The ring is the cc 8.6 blocked election
+// (three swizzled stages, one barrier a K-step) at every grid size and on
+// every die - the same tile and k order as im2row + pd_f16_gemm there, so
+// the landing is bit-identical on cc 8.6; the engine elects it only where it
+// was measured. C % 8 == 0.
+PD_EXPORT int pd_f16_conv3_gemm(const void* w, const void* src, void* y, const void* bias,
+                                uint32_t chips, uint32_t H, uint32_t W, uint32_t C,
+                                uint32_t out_dim, uint32_t src_chip_rows, void* stream) {
+    if (chips == 0u || H == 0u || W == 0u || out_dim == 0u) return 0;
+    if (C == 0u || (C & 7u) != 0u || src_chip_rows < H * W) return (int)cudaErrorInvalidValue;
+    const uint64_t n = (uint64_t)chips * H * W;
+    if (n > 0xffffffffull || 9ull * C > 0xffffffffull) return (int)cudaErrorInvalidValue;
+    const PdF16Conv3 cv = {H, W, C, src_chip_rows, 1u};
+    if (bias != nullptr)
+        return pd_f16_mma_blocked<false, PD_F16_EPI_BIAS, true>(
+            (const __half*)w, (const __half*)src, y, 0.0f, 9u * C, out_dim, (unsigned)n,
+            (cudaStream_t)stream, (const float*)bias, cv);
+    return pd_f16_mma_blocked<false, PD_F16_EPI_NONE, true>(
+        (const __half*)w, (const __half*)src, y, 0.0f, 9u * C, out_dim, (unsigned)n,
+        (cudaStream_t)stream, nullptr, cv);
+}
+
+// 785: slot 775 at stride 2, Conv2d(k3, s2, p1) - SAM 3's memory-encoder
+// downsampler. H x W is the OUTPUT grid; src is [chips][src_chip_rows][C]
+// halves of a 2H x 2W image (src_chip_rows >= 4 H W), output pixel (y, x)
+// reads source (2y + ky - 1, 2x + kx - 1). w [out_dim][9 C] tap-major, y
+// [chips * H * W][out_dim] f32, bias [out_dim] f32 optional. Same ring and k
+// order as 775. C % 8 == 0.
+PD_EXPORT int pd_f16_conv3s2_gemm(const void* w, const void* src, void* y, const void* bias,
+                                  uint32_t chips, uint32_t H, uint32_t W, uint32_t C,
+                                  uint32_t out_dim, uint32_t src_chip_rows, void* stream) {
+    if (chips == 0u || H == 0u || W == 0u || out_dim == 0u) return 0;
+    if (C == 0u || (C & 7u) != 0u || (uint64_t)src_chip_rows < 4ull * H * W)
+        return (int)cudaErrorInvalidValue;
+    const uint64_t n = (uint64_t)chips * H * W;
+    if (n > 0xffffffffull || 9ull * C > 0xffffffffull || 2ull * W > 0x7fffffffull ||
+        2ull * H > 0x7fffffffull)
+        return (int)cudaErrorInvalidValue;
+    const PdF16Conv3 cv = {H, W, C, src_chip_rows, 2u};
+    if (bias != nullptr)
+        return pd_f16_mma_blocked<false, PD_F16_EPI_BIAS, true>(
+            (const __half*)w, (const __half*)src, y, 0.0f, 9u * C, out_dim, (unsigned)n,
+            (cudaStream_t)stream, (const float*)bias, cv);
+    return pd_f16_mma_blocked<false, PD_F16_EPI_NONE, true>(
+        (const __half*)w, (const __half*)src, y, 0.0f, 9u * C, out_dim, (unsigned)n,
+        (cudaStream_t)stream, nullptr, cv);
+}
+
+// 776: the q|k|v projection landed as the three planes pd_vision_attn_h eats
+// (EPI_QKV above): w [3 d][in_dim] rows q | k | v, x [batch][in_dim], q / k / v
+// [batch][d] halves, bias [3 d] f32 (all three), cs / sn [chip_rows][hd / 2]
+// f32 rope tables (row = token % chip_rows; both null = no rope), q scaled
+// by qscale after its rotation. hd 64 and d % 128 == 0 only - a warp's 64
+// rows are one head. The blocked ring at every grid size, like slot 775.
+PD_EXPORT int pd_f16_gemm_qkv_rope(const void* w, const void* x, void* q, void* k, void* v,
+                                   const void* bias, const void* cs, const void* sn,
+                                   uint32_t in_dim, uint32_t d, uint32_t hd, uint32_t batch,
+                                   uint32_t chip_rows, float qscale, void* stream) {
+    if (batch == 0u || d == 0u) return 0;
+    if (hd != 64u || d % 128u != 0u || (in_dim & 7u) != 0u || bias == nullptr ||
+        chip_rows == 0u || ((cs == nullptr) != (sn == nullptr)))
+        return (int)cudaErrorInvalidValue;
+    const PdF16Qkv qv = {(__half*)q, (__half*)k, (__half*)v, (const float*)cs,
+                         (const float*)sn, chip_rows, d, qscale};
+    return pd_f16_mma_blocked<true, PD_F16_EPI_QKV>(
+        (const __half*)w, (const __half*)x, q, 0.0f, in_dim, 3u * d, batch, (cudaStream_t)stream,
+        (const float*)bias, PdF16Conv3{0u, 0u, 0u, 0u, 1u}, qv);
 }
 
 // 671: the landing with bias (optional - null is none) + ReLU in the epilogue:

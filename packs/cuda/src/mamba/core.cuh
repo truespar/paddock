@@ -886,6 +886,182 @@ int pd_mamba2_scan_seq_snap_f16(void* state, const void* xbc,
     return pd_launch_status();
 }
 
+// The verify walk without per-row snapshots, and its replay (slots 746-747).
+// The snap walk above writes a full [H, hd, S] f16 state for every verify
+// row - 1 MiB a row on Nemotron 3.5 - so a 6-row DSpark round dirtied ~7 MiB
+// of L2 per mamba layer, and those lines were written back on the DRAM time
+// of whatever streamed next (GB10 2026-10-06: the q|k|v projection after the
+// last mamba layer of a run read 113 -> 146 us). The keep walk leaves the
+// live state untouched (it IS the pre-round state until the commit) and
+// stores instead what the walk consumed from each row - x, B and the raw
+// dt, ~20 KiB a row; the commit replays the accepted rows from those over
+// the live state in place. Both walks run pd_m2_rows_f16 below, the snap
+// walk's arithmetic verbatim (row t+1 from row t's f16-rounded state, y from
+// the pre-round f32 state), so the replayed state is the snap row bit for
+// bit and y is the snap walk's y.
+//
+// keep row layout [x (H*hd) | B (G*S) | dt_raw (H)], stride H*hd + G*S + H:
+// x and B sit at their conv-row offsets, so the replay reads a keep row
+// through the very indexing a conv row takes.
+template <uint32_t S_, uint32_t HD_, bool Y>
+__device__ __forceinline__ void pd_m2_rows_f16(
+        const __half* __restrict__ st_in, __half* __restrict__ st_out,
+        const float* __restrict__ xbc, uint32_t xbc_stride,
+        const float* __restrict__ dt_raw, uint32_t dt_stride,
+        const float* __restrict__ A, const float* __restrict__ D,
+        const float* __restrict__ dt_bias, float* __restrict__ y,
+        float* __restrict__ keep, uint32_t n_tokens, uint32_t n_heads,
+        uint32_t head_dim_rt, uint32_t n_groups, uint32_t cta) {
+    const uint32_t head_dim = HD_ ? HD_ : head_dim_rt;
+    const uint32_t hpb = blockDim.x / head_dim;
+    const uint32_t h = cta * hpb + threadIdx.x / head_dim;
+    const uint32_t i = threadIdx.x % head_dim;
+    const uint32_t d_inner = n_heads * head_dim;
+    const uint32_t g = h / (n_heads / n_groups);
+    const uint32_t ks = d_inner + n_groups * S_ + n_heads;
+    // one CTA of each group stores the group's B row
+    const bool keep_b = keep != nullptr && (cta * hpb) % (n_heads / n_groups) == 0u;
+    __shared__ float sB[S_], sC[S_];
+
+    float st[S_];
+    const __half* srow = st_in + (size_t)h * head_dim * S_ + i;
+    #pragma unroll
+    for (uint32_t j = 0; j < S_; ++j) st[j] = __half2float(srow[(size_t)j * head_dim]);
+
+    const float a_h = A[h], db_h = dt_bias[h];
+    const float d_h = Y ? D[h] : 0.0f;
+    for (uint32_t t = 0; t < n_tokens; ++t) {
+        const float* row = xbc + (size_t)t * xbc_stride;
+        if (threadIdx.x < S_) {
+            sB[threadIdx.x] = row[d_inner + (size_t)g * S_ + threadIdx.x];
+            if (Y) sC[threadIdx.x] = row[d_inner + (size_t)(n_groups + g) * S_ + threadIdx.x];
+            if (keep_b)
+                keep[(size_t)t * ks + d_inner + (size_t)g * S_ + threadIdx.x] = sB[threadIdx.x];
+        }
+        __syncthreads();
+        const float dtr = dt_raw[(size_t)t * dt_stride + h];
+        float dt = dtr + db_h;
+        dt = (dt <= PD_M2_SOFTPLUS_LIM) ? log1pf(expf(dt)) : dt;
+        const float decay = expf(dt * a_h);
+        const float x_ti = row[(size_t)h * head_dim + i];
+        const float contrib = dt * x_ti;
+        if (keep != nullptr) {
+            keep[(size_t)t * ks + (size_t)h * head_dim + i] = x_ti;
+            if (i == 0u) keep[(size_t)t * ks + d_inner + (size_t)n_groups * S_ + h] = dtr;
+        }
+        float acc = 0.0f;
+        #pragma unroll
+        for (uint32_t j = 0; j < S_; ++j) {
+            const float s = decay * st[j] + contrib * sB[j];
+            const __half sh = __float2half_rn(s);
+            st[j] = __half2float(sh);
+            if (Y) acc += s * sC[j];
+        }
+        if (Y) y[(size_t)t * d_inner + (size_t)h * head_dim + i] = acc + d_h * x_ti;
+        __syncthreads();
+    }
+
+    if (st_out != nullptr) {
+        __half* orow = st_out + (size_t)h * head_dim * S_ + i;
+        #pragma unroll
+        for (uint32_t j = 0; j < S_; ++j)
+            orow[(size_t)j * head_dim] = __float2half_rn(st[j]);
+    }
+}
+
+template <uint32_t S_, uint32_t HD_ = 0u>
+__global__ void __launch_bounds__(128, 1) pd_mamba2_scan_seq_keep_f16_kernel(
+        const __half* __restrict__ state, const float* __restrict__ xbc,
+        const float* __restrict__ dt_raw, uint32_t dt_stride,
+        const float* __restrict__ A, const float* __restrict__ D,
+        const float* __restrict__ dt_bias, float* __restrict__ y,
+        float* __restrict__ keep, uint32_t n_tokens, uint32_t n_heads,
+        uint32_t head_dim_rt, uint32_t n_groups) {
+    const uint32_t d_inner = n_heads * (HD_ ? HD_ : head_dim_rt);
+    pd_m2_rows_f16<S_, HD_, true>(state, nullptr, xbc, d_inner + 2u * n_groups * S_, dt_raw,
+                                  dt_stride, A, D, dt_bias, y, keep, n_tokens, n_heads,
+                                  head_dim_rt, n_groups, blockIdx.x);
+}
+
+// One replay a (descriptor, head block): {src state, dst state, keep rows,
+// A, dt_bias, rows} as six u64 words. src == dst replays in place (each
+// thread reads its own state elements before it writes them).
+template <uint32_t S_, uint32_t HD_ = 0u>
+__global__ void __launch_bounds__(128, 1) pd_mamba2_rescan_f16_kernel(
+        const unsigned long long* __restrict__ descs, uint32_t n_heads,
+        uint32_t head_dim_rt, uint32_t n_groups) {
+    const unsigned long long* d = descs + (size_t)blockIdx.y * 6u;
+    const uint32_t n = (uint32_t)d[5];
+    if (n == 0u) return;
+    const uint32_t d_inner = n_heads * (HD_ ? HD_ : head_dim_rt);
+    const uint32_t ks = d_inner + n_groups * S_ + n_heads;
+    const float* keep = (const float*)(uintptr_t)d[2];
+    pd_m2_rows_f16<S_, HD_, false>(
+        (const __half*)(uintptr_t)d[0], (__half*)(uintptr_t)d[1], keep, ks,
+        keep + d_inner + (size_t)n_groups * S_, ks, (const float*)(uintptr_t)d[3], nullptr,
+        (const float*)(uintptr_t)d[4], nullptr, nullptr, n, n_heads, head_dim_rt, n_groups,
+        blockIdx.x);
+}
+
+static int pd_m2_rows_geometry(uint32_t n_heads, uint32_t head_dim, uint32_t d_state,
+                               uint32_t n_groups) {
+    if (d_state != 128u) return cudaErrorInvalidValue;
+    if (head_dim == 0 || 128u % head_dim != 0) return cudaErrorInvalidValue;
+    const uint32_t hpb = 128u / head_dim;
+    if (n_heads % hpb != 0 || n_groups == 0 || n_heads % n_groups != 0 ||
+        (n_heads / n_groups) % hpb != 0)
+        return cudaErrorInvalidValue;
+    return 0;
+}
+
+// ABI 746. The snap walk's (slot 444) verify without snapshots: `state` is
+// read, never written; y as the snap walk's; `keep` [n_tokens, H*hd + G*S +
+// H] f32 receives each row's x | B | raw dt for the replay (slot 747).
+PD_EXPORT
+int pd_mamba2_scan_seq_keep_f16(const void* state, const void* xbc, const void* dt_raw,
+                                uint32_t dt_stride, const void* A, const void* D,
+                                const void* dt_bias, void* y, void* keep, uint32_t n_tokens,
+                                uint32_t n_heads, uint32_t head_dim, uint32_t d_state,
+                                uint32_t n_groups, void* stream) {
+    if (n_tokens == 0) return 0;
+    if (const int e = pd_m2_rows_geometry(n_heads, head_dim, d_state, n_groups)) return e;
+    if (keep == nullptr) return cudaErrorInvalidValue;
+    const uint32_t hpb = 128u / head_dim;
+    if (head_dim == 64u)
+        pd_mamba2_scan_seq_keep_f16_kernel<128u, 64u>
+            <<<n_heads / hpb, 128u, 0, (cudaStream_t)stream>>>(
+                (const __half*)state, (const float*)xbc, (const float*)dt_raw, dt_stride,
+                (const float*)A, (const float*)D, (const float*)dt_bias, (float*)y,
+                (float*)keep, n_tokens, n_heads, head_dim, n_groups);
+    else
+        pd_mamba2_scan_seq_keep_f16_kernel<128u>
+            <<<n_heads / hpb, 128u, 0, (cudaStream_t)stream>>>(
+                (const __half*)state, (const float*)xbc, (const float*)dt_raw, dt_stride,
+                (const float*)A, (const float*)D, (const float*)dt_bias, (float*)y,
+                (float*)keep, n_tokens, n_heads, head_dim, n_groups);
+    return pd_launch_status();
+}
+
+// ABI 747. Replays `n` descriptors (device, six u64 words each: src f16
+// state, dst f16 state, keep rows from slot 746, A, dt_bias, rows) in one
+// launch: dst <- the state after `rows` keep rows walked from src, the bits
+// slot 444's snap row `rows - 1` holds. rows == 0 leaves dst alone.
+PD_EXPORT
+int pd_mamba2_rescan_f16(const void* descs, uint32_t n, uint32_t n_heads, uint32_t head_dim,
+                         uint32_t d_state, uint32_t n_groups, void* stream) {
+    if (n == 0) return 0;
+    if (const int e = pd_m2_rows_geometry(n_heads, head_dim, d_state, n_groups)) return e;
+    if (n > 65535u) return cudaErrorInvalidValue;
+    const dim3 grid(n_heads / (128u / head_dim), n);
+    if (head_dim == 64u)
+        pd_mamba2_rescan_f16_kernel<128u, 64u><<<grid, 128u, 0, (cudaStream_t)stream>>>(
+            (const unsigned long long*)descs, n_heads, head_dim, n_groups);
+    else
+        pd_mamba2_rescan_f16_kernel<128u><<<grid, 128u, 0, (cudaStream_t)stream>>>(
+            (const unsigned long long*)descs, n_heads, head_dim, n_groups);
+    return pd_launch_status();
+}
+
 // Decode step, f16 arena, __half2-paired along i. One thread owns two
 // consecutive i, so a warp's 32 lanes cover 64 halves = 128 B contiguous at
 // every j - the same transaction width the f32 kernel gets. head_dim must be

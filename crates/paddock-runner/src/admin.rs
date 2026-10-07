@@ -64,6 +64,8 @@ async fn identify(State(s): State<Arc<AdminState>>) -> Response {
             .or_else(|| s.app.clef.as_ref().map(|m| m.id.clone())),
         tabular: s.app.tabular.as_ref().map(|m| m.id.clone()),
         diarization: s.app.diarization.as_ref().map(|m| m.id.clone()),
+        segmenter: s.app.segmenter.as_ref().map(|m| m.id.clone()),
+        masker: s.app.masker.as_ref().map(|m| m.id.clone()),
         started_at_unix: s.started_at_unix,
         instance_id: s.app.instance_id.clone(),
         // the load's own record of what it wired - catalog predictions defer
@@ -137,7 +139,8 @@ fn changed_restart_fields(before: &toml::Value, after: &toml::Value) -> Vec<Stri
                 "kv_cache_dtype" => "KV format",
                 "vram_budget" => "Memory budget",
                 "spec" | "no_spec" | "mtp" => "Speculation",
-                "mmproj" => "Vision",
+                "mmproj" | "vision" => "Vision",
+                "audio_mmproj" | "audio" => "Audio input",
                 "host" | "port" => "Network",
                 "api_key" => "API key",
                 _ => "Runtime settings",

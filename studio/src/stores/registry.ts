@@ -261,6 +261,8 @@ export const useRegistryStore = defineStore('registry', () => {
     kv?: string
     spec?: boolean
     vision?: boolean
+    /** A split-tower model's audio tower, priced by its own switch. */
+    audio?: boolean
     /** This device's compute capability, `[major, minor]`. Sent so the server
      *  can price the KV width the RUNNER will serve: a card with no FP8
      *  tensor cores has fp8 downgraded to f16 at load, which DOUBLES the KV
@@ -298,6 +300,7 @@ export const useRegistryStore = defineStore('registry', () => {
     // server reads absent as "charge the tower" and "honour the kv request",
     // which is the pre-existing behaviour.
     if (over?.vision !== undefined) q.set('vision', String(over.vision))
+    if (over?.audio !== undefined) q.set('audio', String(over.audio))
     if (over?.cc) q.set('cc', `${over.cc[0]}.${over.cc[1]}`)
     if (over?.budget) q.set('budget', String(over.budget))
     if (over?.gpu !== undefined && over.gpu >= 0) q.set('gpu', String(over.gpu))

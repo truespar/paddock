@@ -60,6 +60,7 @@ fn gguf_batch_walks_dump() {
     let map = MappedGguf::open(&path).expect("open gguf");
     let tok = GgufTokenizer::from_gguf(map.gguf()).expect("tokenizer");
     drop(map);
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load_gguf_with_slots(&exec, &path, 32768, 4).expect("load gguf");
     let headroom = exec.vram_headroom().unwrap_or(0);
     m.enable_moe_cache(headroom.saturating_sub(512 << 20))
@@ -272,6 +273,7 @@ fn gguf_served_shape_dump() {
     let map = MappedGguf::open(&path).expect("open gguf");
     let tok = GgufTokenizer::from_gguf(map.gguf()).expect("tokenizer");
     drop(map);
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load_gguf_with_slots(&exec, &path, 32768, 1).expect("load gguf");
     let headroom = exec.vram_headroom().unwrap_or(0);
     m.enable_moe_cache(headroom.saturating_sub(512 << 20))

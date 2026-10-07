@@ -62,6 +62,17 @@ pub struct Identify {
     /// Audio speaker activity, not a chat or transcription model.
     #[serde(default)]
     pub diarization: Option<String>,
+    /// Served dense-prediction model id (DINOv3: chips in, class and height
+    /// rasters out, `/v1/segmentations` only). Optional on the wire for older
+    /// runners - which a manager then reported as serving nothing.
+    #[serde(default)]
+    pub segmenter: Option<String>,
+    /// Served promptable-segmentation model id (SAM 3: a picture and a
+    /// concept or exemplar boxes in, instance masks out, `/v1/masks` only).
+    /// Its own role for the reason the others are: it takes pictures and
+    /// prompts, never a conversation. Optional on the wire for older runners.
+    #[serde(default)]
+    pub masker: Option<String>,
     /// Unix seconds when the runner started. Reset DETECTION only (the
     /// `process_start_time_seconds` job) - never an identity key: it is
     /// second-resolution, and two generations on one port inside the same

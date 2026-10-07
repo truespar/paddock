@@ -1,6 +1,14 @@
 //! Native Metal execution for Paddock. Model state stays on its engine thread;
 //! generation, encoder and Whisper contracts share the native serving boundary.
 #[cfg(target_os = "macos")]
+mod embedding_gemma2;
+#[cfg(target_os = "macos")]
+pub use embedding_gemma2::EmbeddingGemma2;
+#[cfg(target_os = "macos")]
+mod kolibri;
+#[cfg(target_os = "macos")]
+pub use kolibri::Kolibri;
+#[cfg(target_os = "macos")]
 mod clef;
 #[cfg(target_os = "macos")]
 pub use clef::Clef;
@@ -22,6 +30,8 @@ mod whisper;
 pub use whisper::Whisper;
 #[cfg(target_os = "macos")]
 mod affine;
+#[cfg(all(test, target_os = "macos"))]
+mod affine_few_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod affine_stable_tests;
 #[cfg(all(test, target_os = "macos"))]

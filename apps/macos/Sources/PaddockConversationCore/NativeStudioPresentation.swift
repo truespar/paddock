@@ -7,27 +7,8 @@ extension NativeStudioRuntime {
     let id = selected.first ?? ""
     let cap = capability(id)
     let params = fields["params"]?.object ?? Self.defaultParams
-    let modelRows: [V] = models.filter {
-      ["chat", "transcriber", "image"].contains($0["kind"]?.string ?? "")
-    }.map { m in
-      var row = m
-      let id = m["id"]!.string!
-      row["vision"] = .bool(caps[id]?["vision"]?.bool == true)
-      row["audio"] = .bool(canAudio(id))
-      row["chat"] = .bool(canChat(id))
-      row["image"] = .bool(canImagine(id))
-      return .object(row)
-    }
-    let ordered = history.sorted { a, b in
-      // Missing/null/false all mean unpinned, as in Web Studio's !!pinned.
-      // Comparing Optional<Bool> stranded newly admitted chats below loaded ones.
-      if (a["pinned"]?.bool == true) != (b["pinned"]?.bool == true) {
-        return a["pinned"]?.bool == true
-      }
-      let av = a["updatedAt"]?.double ?? 0
-      let bv = b["updatedAt"]?.double ?? 0
-      return av == bv ? (a["id"]?.string ?? "") < (b["id"]?.string ?? "") : av > bv
-    }
+    let (modelRows, options) = projectedModels()
+    let ordered = orderedHistory()
     var matches = ordered.filter {
       search.isEmpty || ($0["title"]?.string ?? "").localizedCaseInsensitiveContains(search)
     }
@@ -122,17 +103,7 @@ extension NativeStudioRuntime {
     let groups = Dictionary(
       grouping: active.filter { $0["group"]?.string != nil }, by: { $0["group"]!.string! })
     let fastest = Set(groups.values.compactMap(NativeComparePresentation.fastest))
-    let transcript = active.map {
-      messageProjection(
-        $0, controls: controls[$0["id"]!.string!], fastest: fastest.contains($0["id"]!.string!))
-    }
-    let options = modelRows.map { value -> V in
-      .object([
-        "value": value["id"]!, "label": value["title"]!, "title": value["title"]!,
-        "vendor": value["vendor"]!,
-        "hint": value["provider"]!, "available": .bool(value["status"]?.string == "ok"),
-      ])
-    }
+    let transcript = projectedMessages(active, controls: controls, fastest: fastest)
     let compare = selected.map { id -> V in
       let model = models.first { $0["id"]?.string == id }
       return .object([

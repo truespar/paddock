@@ -190,13 +190,20 @@ struct ChunkedPrefill {
 }
 
 /// The checkpoint boundaries a chunked prefill lands spans on: `ckpt_cuts`'s
-/// two trailing page boundaries plus every scheduler hint. Ascending, deduped,
-/// each strictly inside the prompt (a cut at the prompt length is just the
-/// finishing span).
+/// two trailing page boundaries, the back-off boundary behind them (a
+/// rewritten tail - same document, new question - resumes there; see
+/// `prefix_cache::backoff_cut`), plus every scheduler hint. Ascending,
+/// deduped, each strictly inside the prompt (a cut at the prompt length is
+/// just the finishing span). The unified tick fuses all three seams into one
+/// pass with CKPT_STAGE_BLOBS staged snapshots; the serial tail
+/// (`prefill_slot_tail_paged`), which SPLITS its pass at every cut, keeps
+/// the trailing two - a third split there is a third weight pass.
 fn chunk_cuts(ch: &ChunkedPrefill, step: usize) -> Vec<usize> {
     let len = ch.tokens.len();
-    let mut v: Vec<usize> = ckpt_cuts(len, step)
+    let pair = ckpt_cuts(len, step);
+    let mut v: Vec<usize> = pair
         .into_iter()
+        .chain(crate::gpu_model::prefix_cache::backoff_cut(pair[1], step))
         .chain(ch.hints.iter().copied())
         .filter(|&c| c > 0 && c < len)
         .collect();
@@ -1144,7 +1151,7 @@ pub(crate) fn nvf4_wide_w4a4(exec: &GpuExecutor) -> bool {
 fn f8lin_enabled(exec: &GpuExecutor) -> bool {
     exec.has_f8_lin()
         && paddock_models::dev_var_os!("PADDOCK_NO_F8LIN").is_none()
-        && paddock_models::dev_var_os!("PADDOCK_NO_F8W8_TMA").is_none()
+        && std::env::var_os("PADDOCK_NO_F8W8_TMA").is_none()
         && paddock_models::dev_var_os!("PADDOCK_F8_ROWSCALE").is_none()
 }
 
@@ -2543,7 +2550,7 @@ fn dn_vb16(exec: &GpuExecutor, r: usize, state_size: usize) -> bool {
 pub(super) fn dn_qkc(exec: &GpuExecutor) -> bool {
     static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let on = *ENV.get_or_init(|| {
-        paddock_models::dev_var_os!("PADDOCK_DNC_QKC").is_some_and(|v| v != "0")
+        std::env::var_os("PADDOCK_DNC_QKC").is_some_and(|v| v != "0")
             && std::env::var_os("PADDOCK_DNC_S1RS").is_none_or(|v| v != "0")
             && std::env::var_os("PADDOCK_DNC_RS").is_none_or(|v| v != "0")
             && std::env::var_os("PADDOCK_DNC_S1MMA").is_none_or(|v| v != "0")
@@ -2853,7 +2860,9 @@ struct SpecBatchState {
     /// drafter (DFlash2 drafts 7, the MTP chain 3) - padding every round to
     /// the alloc k1 would double the MTP rounds' verify rows
     graph_draft: std::collections::HashMap<(usize, usize), SendGraph>,
-    graph_verify: std::collections::HashMap<(usize, usize), SendGraph>,
+    /// keyed (live, round k1, verify split bucket) - the verify attention's
+    /// split count follows the round's depth and is baked at capture
+    graph_verify: std::collections::HashMap<(usize, usize, usize), SendGraph>,
     graph_commit: std::collections::HashMap<(usize, usize), SendGraph>,
 }
 

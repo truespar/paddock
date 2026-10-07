@@ -1,6 +1,7 @@
 import Foundation
 import Observation
 import PaddockClient
+import PaddockNativeMarkdown
 import PaddockStudio
 
 @MainActor @Observable
@@ -17,6 +18,7 @@ public final class WorkspaceModel {
   public private(set) var commandError: String?
   public private(set) var lastReceipt: ManagementJob?
   @ObservationIgnored private var monitor: Task<Void, Never>?
+  @ObservationIgnored private var memoryPressure: NativeMemoryPressure?
   @ObservationIgnored private let client: any ManagerLoading
   var settingsClient: any ManagerLoading { client }
   @ObservationIgnored private var pending: Task<ManagerSnapshot, any Error>?
@@ -104,6 +106,12 @@ public final class WorkspaceModel {
         EndpointRow(port: endpoint.port, runner: nil, configured: endpoint, job: nil))
     }
     downloads.onCompletion = { [weak self] in await self?.refresh() }
+    memoryPressure = NativeMemoryPressure { [weak self] in
+      guard let self else { return }
+      self.reads.trimHistory(maxBytes: 4 * 1024 * 1024)
+      await self.chatStorage?.reclaimCaches()
+      await NativeMarkdown.reclaimCaches()
+    }
     connections.onChange = { [weak self] in
       // Refresh the one retained shared model store, never reload WebContent
       // or replace the user's current conversation/composer draft.
@@ -311,6 +319,9 @@ public final class WorkspaceModel {
   }
 
   public func shutdown() async {
+    memoryPressure?.stop()
+    memoryPressure = nil
+    await reads.shutdown()
     tables.cancel()
     await speech.settle()
     await studioLibrary.settle()

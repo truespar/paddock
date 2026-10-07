@@ -44,7 +44,7 @@ use cudarc::driver::sys::CUstreamCaptureMode;
 
 use crate::gpu::{GpuError, KvDtype};
 use crate::gpu_model::gpt_oss::GpuModelError;
-use crate::gpu_model::qwen35::{gemv_any, mmq_kq_pre, mmq_pre, mmq_pre_any, prefill_mm_pre};
+use crate::gpu_model::qwen35::{gemv_any, mmq_pre_any, prefill_mm_pre};
 use crate::kv_plan;
 use crate::kv_pool::{BlockTable, KvPool};
 
@@ -78,6 +78,31 @@ pub(crate) fn pf_rows() -> usize {
 }
 
 const PF_ROWS_DEFAULT: usize = 1024;
+
+/// Kolibri's chunk for prefill-only work - ticks that carry no decode row
+/// (the serial prefill API, coalesced admission, a mixed tick with an empty
+/// band). Its 384-expert gate/up streams the whole expert set once a pass
+/// (~566 MB a layer at Q4_K), so rows a pass divide straight into that
+/// cost: 2048 measured 2.88 -> 2.56 s on an 8K prompt, 4096 / 8192 no
+/// better. The NVFP4 build (`nv`) takes 8192: once its BF16 bands ran at
+/// vendor class its W4A4 pair's per-pass expert sweep showed (10K of text
+/// 2.88 / 2.68 / 2.62 s at 2048 / 4096 / 8192 rows), and with the norms and
+/// MoE fold fused too, 8192 measured 10,923 tokens 2.62 -> 2.56 s and 30K
+/// 8.25 -> 8.01 against 4096 (6144 between) - for ~2.3 GB of scratch where
+/// 4096 held ~1.1. A tick with decode rows keeps `pf_rows()` - the band waits
+/// on the whole pass. PADDOCK_PF_ROWS_WIDE overrides both (256-multiple,
+/// >= pf_rows()).
+pub(crate) fn pf_rows_wide(nv: bool) -> usize {
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        paddock_models::dev_var!("PADDOCK_PF_ROWS_WIDE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| (256..=8192).contains(&n) && n % 256 == 0)
+    })
+    .unwrap_or(if nv { 8192 } else { 2048 })
+    .max(pf_rows())
+}
 
 /// SWA sub-span: within one chunk, a SWA layer appends+attends at most this
 /// many rows before the next sub-span reuses ring blocks the window has
@@ -284,7 +309,7 @@ fn no_wmma_prefill() -> bool {
     *V.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_WMMA_PREFILL").is_some())
 }
 
-/// Laguna's two shapes (hd128, G=6 full-attn / G=9 SWA) ride the v4
+/// Laguna's two shapes (hd128, G=6 full-attn / G=9 SWA) and Kolibri's G=12 ride the v4
 /// staged-HMMA tile's hd128 arm (same kernel family as
 /// qwen35's hd256 G in {4,6,8}, extended to hd128 G in {4,6,9} for
 /// granite/laguna - G=9 is net-new, MR=144, the largest o_acc register
@@ -302,7 +327,7 @@ fn pf_attn_dtype_ok(kv_dtype: KvDtype, n_heads: usize, n_kv_heads: usize) -> boo
             *ON.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_NPF8").is_none())
                 && n_kv_heads > 0
                 && n_heads.is_multiple_of(n_kv_heads)
-                && matches!(n_heads / n_kv_heads, 4 | 6 | 9)
+                && matches!(n_heads / n_kv_heads, 4 | 6 | 9 | 12)
         }
     }
 }
@@ -361,8 +386,10 @@ fn pf_mm(
 ) -> Result<(), GpuModelError> {
     match w {
         QuantW::Kq(k) => {
+            // every tile rung writes v1's bytes, so the prefill class is the
+            // same at every r whichever the pack elects
             let needs = crate::gpu::kq_needs_sums(k.ty);
-            exec.kquant_gemm_w4a8(k, yq, needs.then_some(xsums), y, r)?;
+            exec.kquant_gemm_w4a8_tile(k, yq, needs.then_some(xsums), y, r)?;
             Ok(())
         }
         QuantW::Q8(q) => prefill_mm_pre(exec, q, xq, xs, yq, skfix, y, r),
@@ -468,7 +495,17 @@ pub(crate) struct BatchScratch {
     pub sslot: CudaSlice<u32>,    // [max_blocks*32] sorted pair -> k-slot
     pub bexp: CudaSlice<u32>,     // [max_blocks] block -> expert
     pub moe_part: CudaSlice<f32>, // [PF, k, embd] down partials
-    pub sh_gate: CudaSlice<f32>,  // [PF, shexp_ff]
+    // the NVFP4 build's W4A4 pair (1-element on the GGUF builds): nvfp4
+    // activations [PF, embd/2] + scales [PF, embd/16], and the pair's sorted
+    // nvfp4 intermediate [sorted rows, ff/2] + scales [sorted rows, ff/16]
+    pub xq4: CudaSlice<i8>,
+    pub xs4: CudaSlice<u8>,
+    pub nfq: CudaSlice<u8>,
+    pub nfs: CudaSlice<u8>,
+    // the BF16-projection builds' rows narrowed to bf16 for the prefill pair
+    // [PF, max(embd, q)] (1-element on the GGUF builds)
+    pub x16: CudaSlice<half::bf16>,
+    pub sh_gate: CudaSlice<f32>, // [PF, shexp_ff]
     pub sh_up: CudaSlice<f32>,
     pub sh_out: CudaSlice<f32>,  // [PF, embd]
     pub d_toks: CudaSlice<u32>,  // [PF]
@@ -506,6 +543,9 @@ pub(crate) struct BatchScratch {
 /// enable/teardown is atomic and the field-borrow splits stay simple.
 pub(crate) struct BatchState {
     pub n_slots: usize,
+    /// rows a prefill-only pass may take (`pf_rows_wide` for Kolibri,
+    /// `pf_rows` otherwise); `cap` is sized for it
+    pub pf_wide: usize,
     /// Row capacity of every scratch plane = `pf_rows()` (the chunk) + one
     /// row per slot (a fused mixed tick's decode band). See the note where
     /// it's computed in `enable_batch_impl` - the band must not eat chunk
@@ -625,7 +665,7 @@ impl GpuLaguna {
             .iter()
             .filter_map(|l| match &l.ffn {
                 Ffn::Dense { gate, .. } => Some(gate.dims()[1]),
-                Ffn::Moe(_) => None,
+                Ffn::Moe(_) | Ffn::MoeNv(_) => None,
             })
             .max()
             .unwrap_or(0);
@@ -636,19 +676,26 @@ impl GpuLaguna {
         // Q8_0 weight plane exists - XS Q4_K_M is all k-quant, so skip the
         // 16 MB plane there (S-2.1 Q8_0's signal path would light it up)
         let q8 = |w: &QuantW| matches!(w, QuantW::Q8(_));
-        let any_q8 = q8(&self.lm_head)
+        let any_q8 = matches!(&self.lm_head, Head::Quant(QuantW::Q8(_)))
             || self.layers.iter().any(|l| {
-                q8(&l.wq)
-                    || q8(&l.wk)
-                    || q8(&l.wv)
-                    || q8(&l.g_proj)
-                    || q8(&l.wo)
-                    || match &l.ffn {
-                        Ffn::Dense { gate, up, down } => q8(gate) || q8(up) || q8(down),
-                        Ffn::Moe(w) => q8(&w.shexp_gate) || q8(&w.shexp_up) || q8(&w.shexp_down),
-                    }
+                l.proj.quant().is_some_and(|p| {
+                    q8(&p.wq)
+                        || q8(&p.wk)
+                        || q8(&p.wv)
+                        || p.g_proj.as_ref().is_some_and(q8)
+                        || q8(&p.wo)
+                }) || match &l.ffn {
+                    Ffn::Dense { gate, up, down } => q8(gate) || q8(up) || q8(down),
+                    Ffn::Moe(w) => q8(&w.shexp_gate) || q8(&w.shexp_up) || q8(&w.shexp_down),
+                    Ffn::MoeNv(_) => false,
+                }
             });
         let fused_len = m.n_active * m.moe_ff;
+        let nv = self.layers.iter().any(|l| matches!(l.ffn, Ffn::MoeNv(_)));
+        let bf16_proj = self
+            .layers
+            .iter()
+            .any(|l| matches!(l.proj, Proj::Bf16 { .. }));
         // ROW CAPACITY of every scratch plane. A fused mixed tick carries the
         // decode band (≤ one row per slot) on TOP of a full pf_rows() chunk,
         // so the planes hold both - sizing them at pf_rows() alone would make
@@ -656,7 +703,11 @@ impl GpuLaguna {
         // divide straight into prefill throughput (a 1024 -> 992 chunk
         // measured -3.2% on 2048×128 c32). Costs slots/pf_rows of the scratch
         // (~3% at the 32-slot / 1024-row default).
-        let cap = pf_rows() + max_batch;
+        let pf_wide = match hp.flavor {
+            Flavor::Kolibri => pf_rows_wide(nv),
+            Flavor::Laguna => pf_rows(),
+        };
+        let cap = pf_wide + max_batch;
         // sorted-MoE worst case: every expert pads its last block
         let sorted_rows = (cap * m.n_active + m.n_expert * 31).div_ceil(32) * 32;
         let sc = BatchScratch {
@@ -694,6 +745,15 @@ impl GpuLaguna {
             sslot: e.alloc_u32(sorted_rows)?,
             bexp: e.alloc_u32(sorted_rows / 32)?,
             moe_part: e.alloc(cap * m.n_active * hp.n_embd)?,
+            xq4: e.alloc_i8(if nv { cap * hp.n_embd / 2 } else { 1 })?,
+            xs4: e.alloc_u8(if nv { cap * hp.n_embd / 16 } else { 1 })?,
+            nfq: e.alloc_u8(if nv { sorted_rows * m.moe_ff / 2 } else { 1 })?,
+            nfs: e.alloc_u8(if nv { sorted_rows * m.moe_ff / 16 } else { 1 })?,
+            x16: e.stream_alloc_bf16(if bf16_proj {
+                cap * hp.n_embd.max(q_max)
+            } else {
+                1
+            })?,
             sh_gate: e.alloc(cap * m.shexp_ff)?,
             sh_up: e.alloc(cap * m.shexp_ff)?,
             sh_out: e.alloc(cap * hp.n_embd)?,
@@ -715,7 +775,8 @@ impl GpuLaguna {
             .map(|(f, _)| f)
             .unwrap_or(0);
         tracing::info!(
-            "laguna VRAM  prefill scratch (cap={cap} rows)      {:>7.2} GB  (in the ledger before the grant)",
+            "{} VRAM  prefill scratch (cap={cap} rows)      {:>7.2} GB  (in the ledger before the grant)",
+            hp.flavor.name(),
             v_scratch0.saturating_sub(v_scratch1) as f64 / 1e9
         );
         // One arbiter sizes the KV store: crate::kv_plan. Laguna's own
@@ -730,7 +791,7 @@ impl GpuLaguna {
         // scratch): the audit at the end adds the plan's charges to it.
         let ledger_at_plan = self.exec.process_mem_used().unwrap_or(0);
         let demand = kv_plan::Demand {
-            family: "laguna",
+            family: hp.flavor.name(),
             max_ctx: self.max_ctx,
             slots: max_batch,
             blocks_per_slot: bps,
@@ -748,7 +809,7 @@ impl GpuLaguna {
             // a pool floor so slots cannot starve the full layers: enough blocks
             // for every slot to hold a PF_ROWS-deep prompt, or admission
             // deadlocks on its own first chunk
-            floor_blocks_per_slot: pf_rows().div_ceil(16),
+            floor_blocks_per_slot: pf_wide.div_ceil(16),
             floor_blocks_min: 256,
             reserves: {
                 let mut r = vec![
@@ -806,6 +867,7 @@ impl GpuLaguna {
 
         self.batch = Some(BatchState {
             n_slots: slots,
+            pf_wide,
             cap,
             swa_bt,
             ring,
@@ -834,8 +896,9 @@ impl GpuLaguna {
         // everything the decode tick touches, as gemma4 does)
         self.build_prefix(slots)?;
         tracing::info!(
-            "laguna batch: {slots} slots, {n_swa} SWA rings ({ring} blocks/slot/layer, \
+            "{} batch: {slots} slots, {n_swa} SWA rings ({ring} blocks/slot/layer, \
              {:.2} GiB/slot) + {n_full}-layer pool {pool_blocks} blocks ({:.2} GiB)",
+            self.hp.flavor.name(),
             per_slot as f64 / (1u64 << 30) as f64,
             (pool_blocks * block_bytes) as f64 / (1u64 << 30) as f64,
         );
@@ -847,7 +910,8 @@ impl GpuLaguna {
             expected_gib = expected as f64 / (1u64 << 30) as f64,
             ledger_gib = actual as f64 / (1u64 << 30) as f64,
             unplanned_mib = actual.saturating_sub(expected) as f64 / (1u64 << 20) as f64,
-            "laguna VRAM plan audit: ledger vs plan after enable_batch"
+            "{} VRAM plan audit: ledger vs plan after enable_batch",
+            self.hp.flavor.name()
         );
         Ok(slots)
     }
@@ -967,16 +1031,17 @@ impl GpuLaguna {
         // windows, then re-prefill only the tail [start..)
         let start = self.prefix_resume(slot, tokens)?;
         self.ensure_full_rows(&[slot as u32], &[(tokens.len() - 1) as u32])?;
-        let cut = self.prefix_cut(tokens.len(), start);
+        let cuts = self.prefix_cuts(tokens.len(), start);
 
         let mut base = start;
         let mut last_len = 0usize;
-        for chunk in tokens[start..].chunks(pf_rows()) {
+        let wide = self.batch.as_ref().map_or(pf_rows(), |b| b.pf_wide);
+        for chunk in tokens[start..].chunks(wide) {
             self.prefill_chunk(slot, chunk, base)?;
             base += chunk.len();
             last_len = chunk.len();
         }
-        self.prefix_insert(slot, tokens, cut)?;
+        self.prefix_insert(slot, tokens, &cuts, &[])?;
         self.head_row(last_len - 1, 1)
     }
 
@@ -1048,7 +1113,8 @@ impl GpuLaguna {
         }
         let mut out: Vec<Vec<f32>> = vec![Vec::new(); items.len()];
         let mut base = 0usize;
-        for chunk in rows.chunks(pf_rows()) {
+        let wide = self.batch.as_ref().map_or(pf_rows(), |b| b.pf_wide);
+        for chunk in rows.chunks(wide) {
             let r = chunk.len();
             // finishers whose last row landed in this chunk read inside the
             // pass (the next chunk's embed overwrites sc.x)
@@ -1065,8 +1131,8 @@ impl GpuLaguna {
         }
         // per-item radix insert + SWA window checkpoint
         for (it, (slot, toks)) in items.iter().enumerate() {
-            let cut = self.prefix_cut(toks.len(), starts[it]);
-            self.prefix_insert(*slot, toks, cut)?;
+            let cuts = self.prefix_cuts(toks.len(), starts[it]);
+            self.prefix_insert(*slot, toks, &cuts, &[])?;
         }
         Ok(out)
     }
@@ -1075,11 +1141,15 @@ impl GpuLaguna {
     /// Algorithm 3). Does the
     /// whole admission prologue now - fresh sequence, prefix resume, block
     /// backing - so a mixed tick only has to move rows.
+    /// Queue `tokens` for chunked prefill on `slot` with the scheduler's
+    /// checkpoint `hints` (see `Generator::prefill_begin_hinted`). Returns the
+    /// resume point (tokens served from the prefix cache).
     pub(crate) fn prefill_begin_impl(
         &mut self,
         slot: usize,
         tokens: Vec<u32>,
-    ) -> Result<(), GpuModelError> {
+        hints: &[usize],
+    ) -> Result<usize, GpuModelError> {
         let n_slots = self.batch.as_ref().expect("batch enabled").n_slots;
         if slot >= n_slots {
             return Err(GpuModelError::Unsupported(format!(
@@ -1099,6 +1169,13 @@ impl GpuLaguna {
         // a queued entry for this slot is STALE (the scheduler keeps one
         // chunk per live slot - a duplicate means the old request died and
         // the slot was reused): evict rather than wedge the slot
+        let stale: Vec<(usize, u32)> = self
+            .chunked
+            .iter()
+            .filter(|c| c.slot == slot)
+            .flat_map(|c| c.staged.iter().copied())
+            .collect();
+        self.recycle_staged(&stale);
         self.chunked.retain(|c| c.slot != slot);
         {
             let bs = self.batch.as_mut().expect("batch enabled");
@@ -1107,18 +1184,43 @@ impl GpuLaguna {
         self.dflash_clear_slot(slot);
         let start = self.prefix_resume(slot, &tokens)?;
         self.ensure_full_rows(&[slot as u32], &[(tokens.len() - 1) as u32])?;
+        // hints are only worth a stop where a window can be staged: page
+        // boundaries strictly inside the tail, past the snapshot floor
+        let mut hints: Vec<usize> = hints
+            .iter()
+            .map(|&c| {
+                c / crate::gpu_model::prefix_cache::BLOCK_TOKENS
+                    * crate::gpu_model::prefix_cache::BLOCK_TOKENS
+            })
+            .filter(|&c| {
+                c > start
+                    && c < tokens.len()
+                    && c >= 4 * crate::gpu_model::prefix_cache::BLOCK_TOKENS
+            })
+            .collect();
+        hints.sort_unstable();
+        hints.dedup();
         self.chunked.push(ChunkedPrefill {
             slot,
             tokens,
             cursor: start,
             start,
+            hints,
+            staged: Vec::new(),
         });
-        Ok(())
+        Ok(start)
     }
 
     /// Drop slot's in-flight prefill (client hung up mid-prompt).
     pub(crate) fn prefill_abort_impl(&mut self, slot: usize) -> bool {
         let n = self.chunked.len();
+        let staged: Vec<(usize, u32)> = self
+            .chunked
+            .iter()
+            .filter(|c| c.slot == slot)
+            .flat_map(|c| c.staged.iter().copied())
+            .collect();
+        self.recycle_staged(&staged);
         self.chunked.retain(|c| c.slot != slot);
         self.chunked.len() != n
     }
@@ -1335,16 +1437,15 @@ impl GpuLaguna {
         // chunk rows; bounding at pf_rows() instead blew `d_toks` on the
         // first fused tick with a live decoder, and capping the chunk to
         // compensate cost 3.2% on 2048×128 c32.
-        let room = self
-            .batch
-            .as_ref()
-            .expect("batch enabled")
-            .cap
-            .saturating_sub(dec_n);
+        let bs = self.batch.as_ref().expect("batch enabled");
+        let room = bs.cap.saturating_sub(dec_n);
+        // a live band keeps the narrow chunk whatever budget arrives - its
+        // rows wait on the whole pass (the wide one is for empty bands)
+        let lim = if dec_n > 0 { pf_rows() } else { bs.pf_wide };
         let (chunk_rows, take) = if room == 0 {
             (Vec::new(), Vec::new())
         } else {
-            self.plan_chunk(budget.min(room))
+            self.plan_chunk(budget.min(room).min(lim))
         };
         rows.extend_from_slice(&chunk_rows);
         let mut fin: Vec<(usize, usize)> = Vec::new();
@@ -1378,13 +1479,19 @@ impl GpuLaguna {
         if self.chunked.is_empty() {
             return (rows, take);
         }
-        let cap = budget.clamp(1, pf_rows());
+        // the scheduler's budget already went through prefill_tick_cap, which
+        // grants the wide chunk only to a tick with no decode band
+        let cap = budget.clamp(1, self.batch.as_ref().map_or(pf_rows(), |b| b.pf_wide));
         for (qi, c) in self.chunked.iter().enumerate() {
             if rows.len() >= cap {
                 break;
             }
             let remaining = c.tokens.len() - c.cursor;
-            let n = remaining.min(cap - rows.len()).max(1);
+            let mut n = remaining.min(cap - rows.len()).max(1);
+            // land on the next checkpoint hint so its window can be staged
+            if let Some(&h) = c.hints.iter().find(|&&h| h > c.cursor) {
+                n = n.min(h - c.cursor);
+            }
             for j in 0..n {
                 let p = c.cursor + j;
                 rows.push((c.slot as u32, p as u32, c.tokens[p]));
@@ -1403,13 +1510,20 @@ impl GpuLaguna {
     ) -> Result<Vec<(usize, Vec<f32>, usize)>, GpuModelError> {
         for &(qi, n, _) in take {
             self.chunked[qi].cursor += n;
+            let (slot, cur) = (self.chunked[qi].slot, self.chunked[qi].cursor);
+            if self.chunked[qi].hints.contains(&cur)
+                && let Some(idx) = self.stage_window(slot, cur)?
+            {
+                self.chunked[qi].staged.push((cur, idx));
+            }
         }
         let mut out = Vec::new();
         for (qi, logits) in finished_raw {
             let c = &self.chunked[qi];
-            let (slot, cut) = (c.slot, self.prefix_cut(c.tokens.len(), c.start));
+            let (slot, cuts) = (c.slot, self.prefix_cuts(c.tokens.len(), c.start));
             let toks = std::mem::take(&mut self.chunked[qi].tokens);
-            self.prefix_insert(slot, &toks, cut)?;
+            let staged = std::mem::take(&mut self.chunked[qi].staged);
+            self.prefix_insert(slot, &toks, &cuts, &staged)?;
             out.push((slot, logits, toks.len()));
         }
         self.chunked.retain(|c| !c.tokens.is_empty());
@@ -1801,7 +1915,7 @@ impl GpuLaguna {
     /// captures. All inputs are device buffers written before replay
     /// (d_toks/d_pos/d_slots/d_mrope + the block tables); all shapes depend
     /// only on r and model constants.
-    fn step_body(&mut self, r: usize) -> Result<(), GpuModelError> {
+    pub(super) fn step_body(&mut self, r: usize) -> Result<(), GpuModelError> {
         self.embed_rows(r)?;
         self.layer_walk(r, None)?;
         self.head_rows(r)
@@ -1903,22 +2017,6 @@ impl GpuLaguna {
         Ok(())
     }
 
-    pub(crate) fn embed_rows(&mut self, r: usize) -> Result<(), GpuModelError> {
-        let bs = self.batch.as_mut().expect("batch enabled");
-        let sc = &mut bs.sc;
-        match &self.tok_embd {
-            TokEmbd::Q8(t) => {
-                self.exec
-                    .embed_gather_batch_q8(t, &sc.d_toks, &mut sc.x, self.hp.n_embd, r)?
-            }
-            TokEmbd::Kq(t) => {
-                self.exec
-                    .kquant_gather(t, &sc.d_toks, &mut sc.x, self.hp.n_embd, r)?
-            }
-        }
-        Ok(())
-    }
-
     /// The 40-layer walk over r rows. `cuts`: Some = prefill mode (SWA
     /// layers append+attend in the `swa` sub-spans; full layers append
     /// whole-chunk and attend per same-slot `run`); None = decode mode
@@ -1994,216 +2092,243 @@ impl GpuLaguna {
             d.state.as_mut().map(|st| (&mut st.aux, ids))
         });
 
+        // Kolibri's sandwich blocks fuse each post-norm with the next norm
+        // (rmsnorm_add_scale_norm, bit-identical to the pair): `pre_normed`
+        // says the previous layer's post-FFN pass already wrote this layer's
+        // attention input, `qkv16` that it landed as the bf16 rows the
+        // q|k|v prefill pair reads (and only those - no f32 xn).
+        let (mut pre_normed, mut qkv16) = (false, false);
         for (li, layer) in self.layers.iter().enumerate() {
             let nh = layer.n_heads;
             let wmma_pf = wmma_pf_base && pf_attn_dtype_ok(kv_dtype, nh, n_kv);
             let q_dim = nh * hd;
             let sc = &mut bs.sc;
-            exec.rmsnorm_batch(&sc.x, &layer.attn_norm.buf, &mut sc.xn, embd, eps, r)?;
+            if !std::mem::take(&mut pre_normed) {
+                exec.rmsnorm_batch(&sc.x, &layer.attn_norm.buf, &mut sc.xn, embd, eps, r)?;
+            }
+            let x16_ready = std::mem::take(&mut qkv16);
             // r==1 with a fused plane: one launch lands [q | k | gate] in
             // sc.q (row 0 spans past q_dim - safe, rows 1.. are unused at
             // r==1); the k-norm and softplus consumers read at offsets.
-            let qk_fused = r1 && layer.qkg.is_some();
-            if g8 {
-                // one quantize serves qkg (or q/k/v/g) - all read xn. SKIPPED
-                // when the whole band is Q8_0: the exact Q8 GEMV reads f32 x
-                // directly, so on an all-Q8_0 file (the S-2.1 UD: every dense
-                // plane is Q8_0) this staged int8 nobody read - a dead launch
-                // per band.
-                let band_kq = layer.qkg.is_some()
-                    || matches!(layer.wq, QuantW::Kq(_))
-                    || matches!(layer.wk, QuantW::Kq(_))
-                    || matches!(layer.wv, QuantW::Kq(_))
-                    || matches!(layer.g_proj, QuantW::Kq(_));
-                if band_kq {
-                    exec.quantize_q8_sums(&sc.xn, &mut sc.xq, &mut sc.xs, &mut sc.ssums, embd)?;
-                }
-            }
-            if qk_fused {
-                let qkg = layer.qkg.as_ref().expect("checked");
+            let qp = layer.proj.quant();
+            let qk_fused = r1 && qp.is_some_and(|q| q.qkg.is_some());
+            if let Proj::Bf16 { wqkv, .. } = &layer.proj {
+                // the NVFP4 build's BF16 attention: q|k|v off one plane
+                super::head::bf16_qkv(
+                    &exec,
+                    wqkv,
+                    &sc.xn,
+                    Some(&mut sc.x16),
+                    x16_ready,
+                    &mut sc.q,
+                    &mut sc.k,
+                    &mut sc.v,
+                    q_dim,
+                    kv_dim,
+                    r,
+                )?;
+            } else if let Some(q) = qp {
                 if g8 {
-                    let needs = crate::gpu::kq_needs_sums(qkg.ty);
-                    exec.kquant_gemv_w4a8(
-                        qkg,
+                    // one quantize serves qkg (or q/k/v/g) - all read xn. SKIPPED
+                    // when the whole band is Q8_0: the exact Q8 GEMV reads f32 x
+                    // directly, so on an all-Q8_0 file (the S-2.1 UD: every dense
+                    // plane is Q8_0) this staged int8 nobody read - a dead launch
+                    // per band.
+                    let band_kq = q.qkg.is_some()
+                        || matches!(q.wq, QuantW::Kq(_))
+                        || matches!(q.wk, QuantW::Kq(_))
+                        || matches!(q.wv, QuantW::Kq(_))
+                        || matches!(q.g_proj, Some(QuantW::Kq(_)));
+                    if band_kq {
+                        exec.quantize_q8_sums(&sc.xn, &mut sc.xq, &mut sc.xs, &mut sc.ssums, embd)?;
+                    }
+                }
+                if qk_fused {
+                    let qkg = q.qkg.as_ref().expect("checked");
+                    if g8 {
+                        let needs = crate::gpu::kq_needs_sums(qkg.ty);
+                        exec.kquant_gemv_w4a8(
+                            qkg,
+                            &sc.xq,
+                            &sc.xs,
+                            needs.then_some(&sc.ssums),
+                            &mut sc.q,
+                        )?;
+                        gemv8_any(&exec, &q.wv, &sc.xn, &sc.xq, &sc.xs, &sc.ssums, &mut sc.v)?;
+                    } else {
+                        exec.kquant_gemv(qkg, &sc.xn, &mut sc.q)?;
+                        gemv_any(&exec, &q.wv, &sc.xn, &mut sc.v)?;
+                    }
+                } else if g8 {
+                    // (q|k) + (v|g): the Q8_0 multi (entry 317) folds the band's
+                    // four same-input planes into two launches, no solo small
+                    // plane left - the split band ran 8 Q8_0 GEMVs/layer at a
+                    // ~6.7us median (launch floor), 43.5% of decode GPU time.
+                    // Bit-identical per row to the splits.
+                    match (&q.wq, &q.wk, &q.wv, &q.g_proj) {
+                        (QuantW::Q8(wq), QuantW::Q8(wk), QuantW::Q8(wv), Some(QuantW::Q8(wg)))
+                            if exec.has_q8_0_gemv_repacked_multi() && !no_gemv_multi() =>
+                        {
+                            exec.q8_0_gemv_repacked_multi(
+                                &mut [(wq, &mut sc.q), (wk, &mut sc.k)],
+                                &sc.xn,
+                            )?;
+                            exec.q8_0_gemv_repacked_multi(
+                                &mut [(wv, &mut sc.v), (wg, &mut sc.gate_h)],
+                                &sc.xn,
+                            )?;
+                        }
+                        _ => {
+                            gemv8_any(&exec, &q.wq, &sc.xn, &sc.xq, &sc.xs, &sc.ssums, &mut sc.q)?;
+                            gemv8_any(&exec, &q.wk, &sc.xn, &sc.xq, &sc.xs, &sc.ssums, &mut sc.k)?;
+                            gemv8_any(&exec, &q.wv, &sc.xn, &sc.xq, &sc.xs, &sc.ssums, &mut sc.v)?;
+                            if let Some(g) = &q.g_proj {
+                                gemv8_any(
+                                    &exec,
+                                    g,
+                                    &sc.xn,
+                                    &sc.xq,
+                                    &sc.xs,
+                                    &sc.ssums,
+                                    &mut sc.gate_h,
+                                )?;
+                            }
+                        }
+                    }
+                } else if r1 {
+                    gemv_any(&exec, &q.wq, &sc.xn, &mut sc.q)?;
+                    gemv_any(&exec, &q.wk, &sc.xn, &mut sc.k)?;
+                    gemv_any(&exec, &q.wv, &sc.xn, &mut sc.v)?;
+                    if let Some(g) = &q.g_proj {
+                        gemv_any(&exec, g, &sc.xn, &mut sc.gate_h)?;
+                    }
+                } else if pf {
+                    // one mmq-layout quantize serves wq/wk/wv/g_proj
+                    pf_quant(
+                        &exec,
+                        &mut sc.xq,
+                        &mut sc.xs,
+                        &mut sc.yq,
+                        &mut sc.xsums,
+                        &sc.xn,
+                        embd,
+                        r,
+                        anyq8,
+                    )?;
+                    pf_mm(
+                        &exec,
+                        &q.wq,
                         &sc.xq,
                         &sc.xs,
-                        needs.then_some(&sc.ssums),
+                        &sc.yq,
+                        &sc.xsums,
+                        &mut sc.skfix,
                         &mut sc.q,
+                        r,
                     )?;
-                    gemv8_any(
-                        &exec, &layer.wv, &sc.xn, &sc.xq, &sc.xs, &sc.ssums, &mut sc.v,
+                    pf_mm(
+                        &exec,
+                        &q.wk,
+                        &sc.xq,
+                        &sc.xs,
+                        &sc.yq,
+                        &sc.xsums,
+                        &mut sc.skfix,
+                        &mut sc.k,
+                        r,
                     )?;
+                    pf_mm(
+                        &exec,
+                        &q.wv,
+                        &sc.xq,
+                        &sc.xs,
+                        &sc.yq,
+                        &sc.xsums,
+                        &mut sc.skfix,
+                        &mut sc.v,
+                        r,
+                    )?;
+                    if let Some(g) = &q.g_proj {
+                        pf_mm(
+                            &exec,
+                            g,
+                            &sc.xq,
+                            &sc.xs,
+                            &sc.yq,
+                            &sc.xsums,
+                            &mut sc.skfix,
+                            &mut sc.gate_h,
+                            r,
+                        )?;
+                    }
                 } else {
-                    exec.kquant_gemv(qkg, &sc.xn, &mut sc.q)?;
-                    gemv_any(&exec, &layer.wv, &sc.xn, &mut sc.v)?;
-                }
-            } else if g8 {
-                // (q|k) + (v|g): the Q8_0 multi (entry 317) folds the band's
-                // four same-input planes into two launches, no solo small
-                // plane left - the split band ran 8 Q8_0 GEMVs/layer at a
-                // ~6.7us median (launch floor), 43.5% of decode GPU time.
-                // Bit-identical per row to the splits.
-                match (&layer.wq, &layer.wk, &layer.wv, &layer.g_proj) {
-                    (QuantW::Q8(wq), QuantW::Q8(wk), QuantW::Q8(wv), QuantW::Q8(wg))
-                        if exec.has_q8_0_gemv_repacked_multi() && !no_gemv_multi() =>
-                    {
-                        exec.q8_0_gemv_repacked_multi(
-                            &mut [(wq, &mut sc.q), (wk, &mut sc.k)],
-                            &sc.xn,
-                        )?;
-                        exec.q8_0_gemv_repacked_multi(
-                            &mut [(wv, &mut sc.v), (wg, &mut sc.gate_h)],
-                            &sc.xn,
-                        )?;
-                    }
-                    _ => {
-                        gemv8_any(
-                            &exec, &layer.wq, &sc.xn, &sc.xq, &sc.xs, &sc.ssums, &mut sc.q,
-                        )?;
-                        gemv8_any(
-                            &exec, &layer.wk, &sc.xn, &sc.xq, &sc.xs, &sc.ssums, &mut sc.k,
-                        )?;
-                        gemv8_any(
-                            &exec, &layer.wv, &sc.xn, &sc.xq, &sc.xs, &sc.ssums, &mut sc.v,
-                        )?;
-                        gemv8_any(
-                            &exec,
-                            &layer.g_proj,
-                            &sc.xn,
-                            &sc.xq,
-                            &sc.xs,
-                            &sc.ssums,
-                            &mut sc.gate_h,
-                        )?;
-                    }
-                }
-            } else if r1 {
-                gemv_any(&exec, &layer.wq, &sc.xn, &mut sc.q)?;
-                gemv_any(&exec, &layer.wk, &sc.xn, &mut sc.k)?;
-                gemv_any(&exec, &layer.wv, &sc.xn, &mut sc.v)?;
-                gemv_any(&exec, &layer.g_proj, &sc.xn, &mut sc.gate_h)?;
-            } else if pf {
-                // one mmq-layout quantize serves wq/wk/wv/g_proj
-                pf_quant(
-                    &exec,
-                    &mut sc.xq,
-                    &mut sc.xs,
-                    &mut sc.yq,
-                    &mut sc.xsums,
-                    &sc.xn,
-                    embd,
-                    r,
-                    anyq8,
-                )?;
-                pf_mm(
-                    &exec,
-                    &layer.wq,
-                    &sc.xq,
-                    &sc.xs,
-                    &sc.yq,
-                    &sc.xsums,
-                    &mut sc.skfix,
-                    &mut sc.q,
-                    r,
-                )?;
-                pf_mm(
-                    &exec,
-                    &layer.wk,
-                    &sc.xq,
-                    &sc.xs,
-                    &sc.yq,
-                    &sc.xsums,
-                    &mut sc.skfix,
-                    &mut sc.k,
-                    r,
-                )?;
-                pf_mm(
-                    &exec,
-                    &layer.wv,
-                    &sc.xq,
-                    &sc.xs,
-                    &sc.yq,
-                    &sc.xsums,
-                    &mut sc.skfix,
-                    &mut sc.v,
-                    r,
-                )?;
-                pf_mm(
-                    &exec,
-                    &layer.g_proj,
-                    &sc.xq,
-                    &sc.xs,
-                    &sc.yq,
-                    &sc.xsums,
-                    &mut sc.skfix,
-                    &mut sc.gate_h,
-                    r,
-                )?;
-            } else {
-                // one quantize serves wq/wk/wv/g_proj (group dedupe)
-                exec.quantize_q8(&sc.xn, &mut sc.xq, &mut sc.xs, r * embd)?;
-                // q|k|v|g as one launch on the r<=4 nc rung (entry 320): the
-                // split band ran 8 nc GEMVs/layer at a ~10.3us avg where the
-                // dense planes' byte floor is ~3us at c4 -
-                // same launch economics as the r1 entry-317 merge above.
-                // r<=4 mirrors mmq_pre's own nc-rung condition exactly.
-                match (&layer.wq, &layer.wk, &layer.wv, &layer.g_proj) {
-                    (QuantW::Q8(wq), QuantW::Q8(wk), QuantW::Q8(wv), QuantW::Q8(wg))
-                        if r <= 4 && exec.has_q8_0_gemv_dp4a_nc_multi() && !no_gemv_multi() =>
-                    {
-                        exec.q8_0_gemv_dp4a_nc_multi(
-                            &mut [
-                                (wq, &mut sc.q),
-                                (wk, &mut sc.k),
-                                (wv, &mut sc.v),
-                                (wg, &mut sc.gate_h),
-                            ],
-                            &sc.xq,
-                            &sc.xs,
-                            r,
-                        )?;
-                    }
-                    _ => {
-                        mmq_pre_any(
-                            &exec,
-                            &layer.wq,
-                            &sc.xq,
-                            &sc.xs,
-                            &mut sc.ssums,
-                            &mut sc.part,
-                            &mut sc.q,
-                            r,
-                        )?;
-                        mmq_pre_any(
-                            &exec,
-                            &layer.wk,
-                            &sc.xq,
-                            &sc.xs,
-                            &mut sc.ssums,
-                            &mut sc.part,
-                            &mut sc.k,
-                            r,
-                        )?;
-                        mmq_pre_any(
-                            &exec,
-                            &layer.wv,
-                            &sc.xq,
-                            &sc.xs,
-                            &mut sc.ssums,
-                            &mut sc.part,
-                            &mut sc.v,
-                            r,
-                        )?;
-                        mmq_pre_any(
-                            &exec,
-                            &layer.g_proj,
-                            &sc.xq,
-                            &sc.xs,
-                            &mut sc.ssums,
-                            &mut sc.part,
-                            &mut sc.gate_h,
-                            r,
-                        )?;
+                    // one quantize serves wq/wk/wv/g_proj (group dedupe)
+                    exec.quantize_q8(&sc.xn, &mut sc.xq, &mut sc.xs, r * embd)?;
+                    // q|k|v|g as one launch on the r<=4 nc rung (entry 320): the
+                    // split band ran 8 nc GEMVs/layer at a ~10.3us avg where the
+                    // dense planes' byte floor is ~3us at c4 -
+                    // same launch economics as the r1 entry-317 merge above.
+                    // r<=4 mirrors mmq_pre's own nc-rung condition exactly.
+                    match (&q.wq, &q.wk, &q.wv, &q.g_proj) {
+                        (QuantW::Q8(wq), QuantW::Q8(wk), QuantW::Q8(wv), Some(QuantW::Q8(wg)))
+                            if r <= 4 && exec.has_q8_0_gemv_dp4a_nc_multi() && !no_gemv_multi() =>
+                        {
+                            exec.q8_0_gemv_dp4a_nc_multi(
+                                &mut [
+                                    (wq, &mut sc.q),
+                                    (wk, &mut sc.k),
+                                    (wv, &mut sc.v),
+                                    (wg, &mut sc.gate_h),
+                                ],
+                                &sc.xq,
+                                &sc.xs,
+                                r,
+                            )?;
+                        }
+                        _ => {
+                            mmq_pre_any(
+                                &exec,
+                                &q.wq,
+                                &sc.xq,
+                                &sc.xs,
+                                &mut sc.ssums,
+                                &mut sc.part,
+                                &mut sc.q,
+                                r,
+                            )?;
+                            mmq_pre_any(
+                                &exec,
+                                &q.wk,
+                                &sc.xq,
+                                &sc.xs,
+                                &mut sc.ssums,
+                                &mut sc.part,
+                                &mut sc.k,
+                                r,
+                            )?;
+                            mmq_pre_any(
+                                &exec,
+                                &q.wv,
+                                &sc.xq,
+                                &sc.xs,
+                                &mut sc.ssums,
+                                &mut sc.part,
+                                &mut sc.v,
+                                r,
+                            )?;
+                            if let Some(g) = &q.g_proj {
+                                mmq_pre_any(
+                                    &exec,
+                                    g,
+                                    &sc.xq,
+                                    &sc.xs,
+                                    &mut sc.ssums,
+                                    &mut sc.part,
+                                    &mut sc.gate_h,
+                                    r,
+                                )?;
+                            }
+                        }
                     }
                 }
             }
@@ -2211,12 +2336,44 @@ impl GpuLaguna {
             // launch (bit-identical to the six-kernel chain - the fold
             // replicates each op's math verbatim). Decode mode only; the
             // prefill band keeps its batch classes (SWA sub-span appends).
+            // NoPE layers take the six-kernel chain without its ropes
             let dec_nra = cuts.is_none()
                 && hd == 128
+                && !layer.nope
                 && (layer.is_swa || hp.n_rot == 64)
                 && exec.has_lag_qk_nra_rows()
                 && !no_qk_nra();
-            if !dec_nra {
+            // Kolibri's prefill epilogue: q/k norms + NEOX rope in one launch
+            // (NoPE layers at freq_scale 0 - cos 1, sin 0, mscale 1: the
+            // rotation is an exact identity); laguna keeps its chain bytes
+            let kolibri_pf = pf
+                && hp.flavor == Flavor::Kolibri
+                && exec.has_qkv_norm_rope_batch()
+                && paddock_models::dev_var_os!("PADDOCK_NO_KOLIBRI_NR").is_none();
+            if !dec_nra && kolibri_pf {
+                let rp = if layer.nope {
+                    let (ts, _, lo, hi, _, _) = hp.rope_swa;
+                    (ts, 0.0, lo, hi, 0.0, 1.0)
+                } else {
+                    hp.rope_swa
+                };
+                exec.qk_norm_rope_batch(
+                    &sc.q,
+                    &sc.k,
+                    &mut sc.v,
+                    &layer.q_norm.buf,
+                    &layer.k_norm.buf,
+                    &mut sc.qn,
+                    &mut sc.kn,
+                    &sc.d_pos,
+                    nh,
+                    n_kv,
+                    hd,
+                    eps,
+                    rp,
+                    r,
+                )?;
+            } else if !dec_nra {
                 exec.rmsnorm_batch(&sc.q, &layer.q_norm.buf, &mut sc.qn, hd, eps, r * nh)?;
                 if qk_fused {
                     // k rows live at offset q_dim inside the fused [q|k|gate] plane
@@ -2235,7 +2392,7 @@ impl GpuLaguna {
                 if layer.is_swa {
                     exec.rope_yarn_batch(&mut sc.qn, &sc.d_pos, nh, hd, hp.rope_swa, r)?;
                     exec.rope_yarn_batch(&mut sc.kn, &sc.d_pos, n_kv, hd, hp.rope_swa, r)?;
-                } else {
+                } else if !layer.nope {
                     exec.mrope(
                         &mut sc.qn,
                         &sc.d_mrope,
@@ -2694,75 +2851,113 @@ impl GpuLaguna {
                     }
                 }
             }
-            if qk_fused {
+            if !layer.has_gate() {
+                // no output gate (Kolibri)
+            } else if qk_fused {
                 // gate rows live after q and k in the fused plane
                 exec.mul_softplus_head_at(&mut sc.attn, &sc.q, q_dim + kv_dim, nh, hd, 1)?;
             } else {
                 exec.mul_softplus_head(&mut sc.attn, &sc.gate_h, nh, hd, r)?;
             }
-            if g8 {
-                // staging only when wo is a k-quant plane - the Q8_0 exact
-                // GEMV reads f32 attn directly (same dead-launch fix as the
-                // qkv band above)
-                if matches!(layer.wo, QuantW::Kq(_)) {
-                    exec.quantize_q8_sums(&sc.attn, &mut sc.xq, &mut sc.xs, &mut sc.ssums, q_dim)?;
+            if let Proj::Bf16 { wo, .. } = &layer.proj {
+                super::head::bf16_rows(&exec, wo, &sc.attn, &mut sc.x16, &mut sc.proj, r)?;
+            } else if let Some(q) = qp {
+                if g8 {
+                    // staging only when wo is a k-quant plane - the Q8_0 exact
+                    // GEMV reads f32 attn directly (same dead-launch fix as the
+                    // qkv band above)
+                    if matches!(q.wo, QuantW::Kq(_)) {
+                        exec.quantize_q8_sums(
+                            &sc.attn,
+                            &mut sc.xq,
+                            &mut sc.xs,
+                            &mut sc.ssums,
+                            q_dim,
+                        )?;
+                    }
+                    gemv8_any(
+                        &exec,
+                        &q.wo,
+                        &sc.attn,
+                        &sc.xq,
+                        &sc.xs,
+                        &sc.ssums,
+                        &mut sc.proj,
+                    )?;
+                } else if r1 {
+                    gemv_any(&exec, &q.wo, &sc.attn, &mut sc.proj)?;
+                } else if pf {
+                    pf_quant(
+                        &exec,
+                        &mut sc.xq,
+                        &mut sc.xs,
+                        &mut sc.yq,
+                        &mut sc.xsums,
+                        &sc.attn,
+                        q_dim,
+                        r,
+                        anyq8,
+                    )?;
+                    pf_mm(
+                        &exec,
+                        &q.wo,
+                        &sc.xq,
+                        &sc.xs,
+                        &sc.yq,
+                        &sc.xsums,
+                        &mut sc.skfix,
+                        &mut sc.proj,
+                        r,
+                    )?;
+                } else {
+                    exec.quantize_q8(&sc.attn, &mut sc.xq, &mut sc.xs, r * q_dim)?;
+                    mmq_pre_any(
+                        &exec,
+                        &q.wo,
+                        &sc.xq,
+                        &sc.xs,
+                        &mut sc.ssums,
+                        &mut sc.part,
+                        &mut sc.proj,
+                        r,
+                    )?;
                 }
-                gemv8_any(
-                    &exec,
-                    &layer.wo,
-                    &sc.attn,
-                    &sc.xq,
-                    &sc.xs,
-                    &sc.ssums,
-                    &mut sc.proj,
-                )?;
-            } else if r1 {
-                gemv_any(&exec, &layer.wo, &sc.attn, &mut sc.proj)?;
-            } else if pf {
-                pf_quant(
-                    &exec,
-                    &mut sc.xq,
-                    &mut sc.xs,
-                    &mut sc.yq,
-                    &mut sc.xsums,
-                    &sc.attn,
-                    q_dim,
-                    r,
-                    anyq8,
-                )?;
-                pf_mm(
-                    &exec,
-                    &layer.wo,
-                    &sc.xq,
-                    &sc.xs,
-                    &sc.yq,
-                    &sc.xsums,
-                    &mut sc.skfix,
-                    &mut sc.proj,
+            }
+            // the shared expert's prefill pair reads a bf16 copy of the FFN
+            // input: the fused post-attention pass lands it beside xn
+            let mut ffn16 = false;
+            if let Some(post) = &layer.post_attn_norm {
+                // sandwich: x += rmsnorm(attn_out) * post, then the pre-FFN norm
+                let sh16 = matches!(layer.ffn, Ffn::MoeNv(_)) && exec.bf16_pf_elect(m.shexp_ff, r);
+                let fused = exec.rmsnorm_add_scale_norm(
+                    &mut sc.x,
+                    &sc.proj,
+                    &post.buf,
+                    &layer.ffn_norm.buf,
+                    Some(&mut sc.xn),
+                    sh16.then_some(&mut sc.x16),
+                    embd,
+                    eps,
+                    1.0,
                     r,
                 )?;
+                if fused {
+                    ffn16 = sh16;
+                } else {
+                    exec.rmsnorm_add_scale(&mut sc.x, &sc.proj, &post.buf, embd, eps, 1.0, r)?;
+                    exec.rmsnorm_batch(&sc.x, &layer.ffn_norm.buf, &mut sc.xn, embd, eps, r)?;
+                }
             } else {
-                exec.quantize_q8(&sc.attn, &mut sc.xq, &mut sc.xs, r * q_dim)?;
-                mmq_pre_any(
-                    &exec,
-                    &layer.wo,
-                    &sc.xq,
-                    &sc.xs,
-                    &mut sc.ssums,
-                    &mut sc.part,
-                    &mut sc.proj,
+                exec.add_rmsnorm_batch(
+                    &mut sc.x,
+                    &sc.proj,
+                    &layer.ffn_norm.buf,
+                    &mut sc.xn,
+                    embd,
+                    eps,
                     r,
                 )?;
             }
-            exec.add_rmsnorm_batch(
-                &mut sc.x,
-                &sc.proj,
-                &layer.ffn_norm.buf,
-                &mut sc.xn,
-                embd,
-                eps,
-                r,
-            )?;
 
             match &layer.ffn {
                 Ffn::Dense { gate, up, down } => {
@@ -2894,6 +3089,12 @@ impl GpuLaguna {
                         )?;
                     }
                 }
+                Ffn::MoeNv(w) => {
+                    // the NVFP4 build: W4A4 sorted pair in prefill mode and
+                    // wide verify rounds, W4A16 GEMVs at decode (moe_nv.rs)
+                    let sorted = pf || (spec && r > 8);
+                    super::moe_nv::moe_nv_rows(&exec, &m, w, sc, embd, r, sorted, ffn16)?;
+                }
                 Ffn::Moe(w) => {
                     // routed experts: token-batched k-quant/Q8 class, batch=r
                     // (the sorted/moe_align class is a follow-up). The Q4/Q5
@@ -2919,12 +3120,10 @@ impl GpuLaguna {
                         exec.quantize_q8(&sc.xn, &mut sc.xq, &mut sc.xs, r * embd)?;
                     }
                     exec.matvec_f32_batch(&w.router_w, &sc.xn, &mut sc.moe_logits, r)?;
-                    exec.moe_topk_sigmoid_batch(
+                    m.route(
+                        &exec,
                         &sc.moe_logits,
-                        &w.probs_bias.buf,
-                        m.routed_scale,
-                        m.n_expert,
-                        m.n_active,
+                        &w.probs_bias,
                         &mut sc.moe_idx,
                         &mut sc.moe_w,
                         r,
@@ -2997,7 +3196,19 @@ impl GpuLaguna {
                                 max_blocks * 32,
                             )?;
                         }
-                        exec.kquant_moe_down_mma(
+                        // Kolibri: bf16 partials (slot 749) - its [rows, 6, 2560]
+                        // f32 plane was the down's largest cost; the fold stays f32
+                        let p16 = hp.flavor == Flavor::Kolibri
+                            && exec.has_kquant_moe_down_mma_b16()
+                            && exec.has_moe_slot_combine_bf16()
+                            && paddock_models::dev_var_os!("PADDOCK_NO_KOLIBRI_P16").is_none();
+                        let down_mma = if p16 {
+                            crate::gpu::GpuExecutor::kquant_moe_down_mma_b16
+                        } else {
+                            crate::gpu::GpuExecutor::kquant_moe_down_mma
+                        };
+                        down_mma(
+                            &exec,
                             d,
                             &sc.srow,
                             &sc.sslot,
@@ -3013,7 +3224,17 @@ impl GpuLaguna {
                         exec.stream
                             .memset_zeros(&mut sc.proj)
                             .map_err(|e| GpuError::Driver(e.to_string()))?;
-                        exec.moe_slot_combine(&sc.moe_part, &mut sc.proj, embd, m.n_active, r)?;
+                        if p16 {
+                            exec.moe_slot_combine_bf16(
+                                &sc.moe_part,
+                                &mut sc.proj,
+                                embd,
+                                m.n_active,
+                                r,
+                            )?;
+                        } else {
+                            exec.moe_slot_combine(&sc.moe_part, &mut sc.proj, embd, m.n_active, r)?;
+                        }
                     } else {
                         match (&w.gate_exps, &w.up_exps) {
                             (ExpW::Kq(g), ExpW::Kq(u)) => {
@@ -3271,7 +3492,35 @@ impl GpuLaguna {
                     exec.add(&mut sc.proj, &sc.sh_out, r * embd)?;
                 }
             }
-            exec.add(&mut sc.x, &sc.proj, r * embd)?;
+            match &layer.post_ffn_norm {
+                Some(post) => {
+                    // fused with the NEXT layer's attention norm; a BF16-q|k|v
+                    // layer on the prefill pair gets its bf16 rows only
+                    let mut fused = false;
+                    if let Some(nl) = self.layers.get(li + 1) {
+                        let pf16 = matches!(nl.proj, Proj::Bf16 { .. })
+                            && exec.bf16_pf_elect(nl.n_heads * hd + 2 * kv_dim, r);
+                        fused = exec.rmsnorm_add_scale_norm(
+                            &mut sc.x,
+                            &sc.proj,
+                            &post.buf,
+                            &nl.attn_norm.buf,
+                            (!pf16).then_some(&mut sc.xn),
+                            pf16.then_some(&mut sc.x16),
+                            embd,
+                            eps,
+                            1.0,
+                            r,
+                        )?;
+                        pre_normed = fused;
+                        qkv16 = fused && pf16;
+                    }
+                    if !fused {
+                        exec.rmsnorm_add_scale(&mut sc.x, &sc.proj, &post.buf, embd, eps, 1.0, r)?
+                    }
+                }
+                None => exec.add(&mut sc.x, &sc.proj, r * embd)?,
+            }
             if let Some((aux, ids)) = dtap.as_mut()
                 && let Some(band) = ids.iter().position(|&t| t == li)
             {
@@ -3285,108 +3534,6 @@ impl GpuLaguna {
             }
         }
         Ok(())
-    }
-
-    /// Final norm + LM head over the first `rows` residual rows into
-    /// head_logits [rows, vocab].
-    fn head_rows(&mut self, rows: usize) -> Result<(), GpuModelError> {
-        let exec = self.exec.clone();
-        let hp = &self.hp;
-        let bs = self.batch.as_mut().expect("batch enabled");
-        let sc = &mut bs.sc;
-        exec.rmsnorm_batch(
-            &sc.x,
-            &self.output_norm.buf,
-            &mut sc.xn,
-            hp.n_embd,
-            hp.eps,
-            rows,
-        )?;
-        if rows == 1 {
-            // the r1 head rides the W4A8 GEMV too (Q6_K head at
-            // out=vocab is the single biggest r1 gemv - 293 us, against the
-            // W4A8 class's ~630 GB/s byte rate). Same latch as the
-            // layer walk; exact-f32 GEMV pinned via PADDOCK_KQ_EXACT_GEMV.
-            if exec.has_kquant_gemv_w4a8()
-                && paddock_models::dev_var_os!("PADDOCK_KQ_EXACT_GEMV").is_none()
-                && let QuantW::Kq(k) = &self.lm_head
-            {
-                exec.quantize_q8_sums(&sc.xn, &mut sc.xq, &mut sc.xs, &mut sc.ssums, hp.n_embd)?;
-                let needs = crate::gpu::kq_needs_sums(k.ty);
-                exec.kquant_gemv_w4a8(
-                    k,
-                    &sc.xq,
-                    &sc.xs,
-                    needs.then_some(&sc.ssums),
-                    &mut sc.head_logits,
-                )?;
-                return Ok(());
-            }
-            return gemv_any(&exec, &self.lm_head, &sc.xn, &mut sc.head_logits);
-        }
-        exec.quantize_q8(&sc.xn, &mut sc.xq, &mut sc.xs, rows * hp.n_embd)?;
-        // vocab-wide out exceeds the mma partial plane -> dp4a rungs
-        match &self.lm_head {
-            QuantW::Kq(k) => mmq_kq_pre(
-                &exec,
-                k,
-                &sc.xq,
-                &sc.xs,
-                &mut sc.ssums,
-                &mut sc.part,
-                &mut sc.head_logits,
-                rows,
-            )?,
-            QuantW::Q8(q) => mmq_pre(
-                &exec,
-                q,
-                &sc.xq,
-                &sc.xs,
-                &mut sc.part,
-                &mut sc.head_logits,
-                rows,
-            )?,
-        }
-        Ok(())
-    }
-
-    /// Prefill tail: head over residual row `row` (of the last chunk),
-    /// returning that one vocab row on the host.
-    fn head_row(&mut self, row: usize, _rows: usize) -> Result<Vec<f32>, GpuModelError> {
-        let exec = self.exec.clone();
-        let (n_embd, n_vocab) = (self.hp.n_embd, self.hp.n_vocab);
-        // norm+head the whole tail up to `row` would waste vocab GEMM rows;
-        // stage the single residual row at row 0 of a fresh pass instead
-        // (bounced through proj - src and dst live in the same buffer)
-        if row > 0 {
-            let bs = self.batch.as_mut().expect("batch enabled");
-            let sc = &mut bs.sc;
-            let src =
-                sc.x.try_slice(row * n_embd..(row + 1) * n_embd)
-                    .ok_or_else(|| GpuError::Driver("x row slice".into()))?;
-            let mut dst = sc
-                .proj
-                .try_slice_mut(0..n_embd)
-                .ok_or_else(|| GpuError::Driver("proj row slice".into()))?;
-            exec.stream.memcpy_dtod(&src, &mut dst).map_err(drv)?;
-            let mut xd =
-                sc.x.try_slice_mut(0..n_embd)
-                    .ok_or_else(|| GpuError::Driver("x dst slice".into()))?;
-            let ps = sc
-                .proj
-                .try_slice(0..n_embd)
-                .ok_or_else(|| GpuError::Driver("proj src slice".into()))?;
-            exec.stream.memcpy_dtod(&ps, &mut xd).map_err(drv)?;
-        }
-        self.head_rows(1)?;
-        let bs = self.batch.as_mut().expect("batch enabled");
-        let v = bs
-            .sc
-            .head_logits
-            .try_slice(0..n_vocab)
-            .ok_or_else(|| GpuError::Driver("head row slice".into()))?;
-        let out = exec.stream.clone_dtoh(&v).map_err(drv)?;
-        Ok(out)
     }
 
     /// Read the [rows, vocab] decode logits back to the host.
@@ -3809,458 +3956,6 @@ impl GpuLaguna {
         }
     }
 
-    /// Phase-split timing probe for the r==1 decode tick (eager, no graph):
-    /// runs each op group of the layer walk in an isolated ×`reps` loop with
-    /// sync fences and prints the per-tick ms split. Activation VALUES are
-    /// garbage in the isolated groups - only shapes/timing matter. Bench
-    /// harness only (tests/gpu_laguna_profile.rs); the serving path never
-    /// calls this. Requires enable_batch + at least one prefilled token in
-    /// slot 0 so position/KV state is sane.
-    pub fn profile_batch_tick(&mut self, pos: u32, reps: usize) -> Result<(), GpuModelError> {
-        let exec = self.exec.clone();
-        let hp_eps = self.hp.eps;
-        let (embd, n_kv, hd) = (self.hp.n_embd, self.hp.n_kv_heads, self.hp.head_dim);
-        let kv_dim = n_kv * hd;
-        let scale = 1.0 / (hd as f32).sqrt();
-        let sections = [self.hp.n_rot as u32 / 2, 0, 0, 0];
-        let rope_full = self.hp.rope_full;
-        let rope_swa = self.hp.rope_swa;
-        let n_rot = self.hp.n_rot;
-        let swa_window = self.hp.swa_window;
-        let m = self.hp.moe;
-        self.upload_rows(&[100], &[pos], &[0])?;
-
-        fn timed(
-            me: &mut GpuLaguna,
-            name: &str,
-            reps: usize,
-            f: &mut dyn FnMut(&mut GpuLaguna) -> Result<(), GpuModelError>,
-        ) -> Result<f64, GpuModelError> {
-            let exec = me.exec.clone();
-            exec.synchronize()?;
-            let t = std::time::Instant::now();
-            for _ in 0..reps {
-                f(me)?;
-            }
-            exec.synchronize()?;
-            let ms = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
-            eprintln!("  {name:<32} {ms:8.3} ms/tick");
-            Ok(ms)
-        }
-
-        eprintln!("laguna r=1 tick phase split ({reps} reps):");
-        let total = timed(self, "FULL step_body", reps, &mut |me| me.step_body(1))?;
-        // under a profiler, run only the real tick so the kernel sums aren't
-        // polluted by the isolated sub-group loops
-        if paddock_models::dev_var_os!("PADDOCK_PROBE_FULL_ONLY").is_some() {
-            return Ok(());
-        }
-        let proj = timed(self, "qkvg GEMVs + norms + rope", reps, &mut |me| {
-            let bs = me.batch.as_mut().expect("batch");
-            for layer in &me.layers {
-                let nh = layer.n_heads;
-                let sc = &mut bs.sc;
-                exec.rmsnorm_batch(&sc.x, &layer.attn_norm.buf, &mut sc.xn, embd, hp_eps, 1)?;
-                gemv_any(&exec, &layer.wq, &sc.xn, &mut sc.q)?;
-                gemv_any(&exec, &layer.wk, &sc.xn, &mut sc.k)?;
-                gemv_any(&exec, &layer.wv, &sc.xn, &mut sc.v)?;
-                gemv_any(&exec, &layer.g_proj, &sc.xn, &mut sc.gate_h)?;
-                exec.rmsnorm_batch(&sc.q, &layer.q_norm.buf, &mut sc.qn, hd, hp_eps, nh)?;
-                exec.rmsnorm_batch(&sc.k, &layer.k_norm.buf, &mut sc.kn, hd, hp_eps, n_kv)?;
-                if layer.is_swa {
-                    exec.rope_yarn_batch(&mut sc.qn, &sc.d_pos, nh, hd, rope_swa, 1)?;
-                    exec.rope_yarn_batch(&mut sc.kn, &sc.d_pos, n_kv, hd, rope_swa, 1)?;
-                } else {
-                    exec.mrope(
-                        &mut sc.qn,
-                        &sc.d_mrope,
-                        1,
-                        nh,
-                        hd,
-                        n_rot,
-                        rope_full,
-                        sections,
-                    )?;
-                    exec.mrope(
-                        &mut sc.kn,
-                        &sc.d_mrope,
-                        1,
-                        n_kv,
-                        hd,
-                        n_rot,
-                        rope_full,
-                        sections,
-                    )?;
-                }
-            }
-            Ok(())
-        })?;
-        let attn = timed(self, "append + attend + wo", reps, &mut |me| {
-            let bs = me.batch.as_mut().expect("batch");
-            let bps = bs.bps;
-            for (li, layer) in me.layers.iter().enumerate() {
-                let nh = layer.n_heads;
-                let (bt, window) = if layer.is_swa {
-                    (&bs.swa_bt, swa_window)
-                } else {
-                    (&bs.d_bt, 0usize)
-                };
-                let kvs = &mut bs.kv[li];
-                let sc = &mut bs.sc;
-                exec.kv_append_batch_paged(
-                    &sc.kn,
-                    &mut kvs.k,
-                    &sc.d_pos,
-                    Some(&sc.d_slots),
-                    bt,
-                    bps,
-                    kv_dim,
-                    1,
-                    me.kv_dtype,
-                )?;
-                exec.kv_append_batch_paged(
-                    &sc.v,
-                    &mut kvs.v,
-                    &sc.d_pos,
-                    Some(&sc.d_slots),
-                    bt,
-                    bps,
-                    kv_dim,
-                    1,
-                    me.kv_dtype,
-                )?;
-                exec.attn_decode_batch_paged(
-                    &sc.qn,
-                    &kvs.k,
-                    &kvs.v,
-                    &sc.sinks,
-                    &mut sc.attn,
-                    &sc.d_pos,
-                    Some(&sc.d_slots),
-                    bt,
-                    bps,
-                    nh,
-                    n_kv,
-                    hd,
-                    kv_dim,
-                    window,
-                    1,
-                    scale,
-                    me.kv_dtype,
-                )?;
-                exec.mul_softplus_head(&mut sc.attn, &sc.gate_h, nh, hd, 1)?;
-                gemv_any(&exec, &layer.wo, &sc.attn, &mut sc.proj)?;
-            }
-            Ok(())
-        })?;
-        let moe = timed(self, "MoE routed (quant+route+experts)", reps, &mut |me| {
-            let bs = me.batch.as_mut().expect("batch");
-            for layer in &me.layers {
-                let Ffn::Moe(w) = &layer.ffn else { continue };
-                let sc = &mut bs.sc;
-                exec.quantize_q8(&sc.xn, &mut sc.xq, &mut sc.xs, embd)?;
-                exec.matvec_f32_batch(&w.router_w, &sc.xn, &mut sc.moe_logits, 1)?;
-                exec.moe_topk_sigmoid_batch(
-                    &sc.moe_logits,
-                    &w.probs_bias.buf,
-                    m.routed_scale,
-                    m.n_expert,
-                    m.n_active,
-                    &mut sc.moe_idx,
-                    &mut sc.moe_w,
-                    1,
-                )?;
-                match (&w.gate_exps, &w.up_exps) {
-                    (ExpW::Kq(g), ExpW::Kq(u)) => {
-                        let needs =
-                            crate::gpu::kq_needs_sums(g.ty) || crate::gpu::kq_needs_sums(u.ty);
-                        if needs {
-                            exec.q8_sums_strided(&sc.xq, &mut sc.ssums, embd, 1)?;
-                        }
-                        exec.kquant_moe_gate_up(
-                            g,
-                            u,
-                            &sc.moe_idx,
-                            &sc.xq,
-                            &sc.xs,
-                            needs.then_some(&sc.ssums),
-                            &mut sc.moe_fused,
-                            m.n_active,
-                            1,
-                        )?;
-                    }
-                    _ => unreachable!("XS election is k-quant experts"),
-                }
-                exec.quantize_q8(
-                    &sc.moe_fused,
-                    &mut sc.moe_fq,
-                    &mut sc.moe_fs,
-                    m.n_active * m.moe_ff,
-                )?;
-                match &w.down_exps {
-                    ExpW::Kq(d) => {
-                        let needs = crate::gpu::kq_needs_sums(d.ty);
-                        if needs {
-                            exec.q8_sums_strided(&sc.moe_fq, &mut sc.ssums, m.moe_ff, m.n_active)?;
-                        }
-                        exec.kquant_moe_down(
-                            d,
-                            &sc.moe_idx,
-                            &sc.moe_w,
-                            &sc.moe_fq,
-                            &sc.moe_fs,
-                            needs.then_some(&sc.ssums),
-                            &mut sc.proj,
-                            m.n_active,
-                            1,
-                        )?;
-                    }
-                    ExpW::Q8(_) => unreachable!("XS election is k-quant experts"),
-                }
-            }
-            Ok(())
-        })?;
-        let shexp = timed(self, "shared expert (GEMV swiglu)", reps, &mut |me| {
-            let bs = me.batch.as_mut().expect("batch");
-            for layer in &me.layers {
-                let Ffn::Moe(w) = &layer.ffn else { continue };
-                let sc = &mut bs.sc;
-                gemv_any(&exec, &w.shexp_gate, &sc.xn, &mut sc.sh_gate)?;
-                gemv_any(&exec, &w.shexp_up, &sc.xn, &mut sc.sh_up)?;
-                exec.swiglu(&mut sc.sh_gate, &sc.sh_up, m.shexp_ff)?;
-                gemv_any(&exec, &w.shexp_down, &sc.sh_gate, &mut sc.sh_out)?;
-            }
-            Ok(())
-        })?;
-        let head = timed(self, "lm head GEMV", reps, &mut |me| me.head_rows(1))?;
-        eprintln!(
-            "  {:<32} {:8.3} ms/tick (groups {:.3})",
-            "sum vs full",
-            total,
-            proj + attn + moe + shexp + head
-        );
-
-        // fine-grained sub-groups (overlapping with the groups above)
-        timed(self, "  · qkvg GEMVs only", reps, &mut |me| {
-            let bs = me.batch.as_mut().expect("batch");
-            for layer in &me.layers {
-                let sc = &mut bs.sc;
-                gemv_any(&exec, &layer.wq, &sc.xn, &mut sc.q)?;
-                gemv_any(&exec, &layer.wk, &sc.xn, &mut sc.k)?;
-                gemv_any(&exec, &layer.wv, &sc.xn, &mut sc.v)?;
-                gemv_any(&exec, &layer.g_proj, &sc.xn, &mut sc.gate_h)?;
-            }
-            Ok(())
-        })?;
-        timed(self, "  · qkg FUSED GEMV (+v)", reps, &mut |me| {
-            let bs = me.batch.as_mut().expect("batch");
-            for layer in &me.layers {
-                let sc = &mut bs.sc;
-                if let Some(qkg) = &layer.qkg {
-                    exec.kquant_gemv(qkg, &sc.xn, &mut sc.q)?;
-                    gemv_any(&exec, &layer.wv, &sc.xn, &mut sc.v)?;
-                }
-            }
-            Ok(())
-        })?;
-        timed(self, "  · shexp FUSED (gu+swiglu+down)", reps, &mut |me| {
-            let bs = me.batch.as_mut().expect("batch");
-            for layer in &me.layers {
-                let Ffn::Moe(w) = &layer.ffn else { continue };
-                let sc = &mut bs.sc;
-                if let Some(gu) = &w.shexp_gateup {
-                    exec.kquant_gemv(gu, &sc.xn, &mut sc.sh_gate)?;
-                    exec.swiglu_fused(&sc.sh_gate, &mut sc.sh_up, m.shexp_ff, 1)?;
-                    gemv_any(&exec, &w.shexp_down, &sc.sh_up, &mut sc.sh_out)?;
-                }
-            }
-            Ok(())
-        })?;
-        timed(self, "  · norms (attn+qk) only", reps, &mut |me| {
-            let bs = me.batch.as_mut().expect("batch");
-            for layer in &me.layers {
-                let nh = layer.n_heads;
-                let sc = &mut bs.sc;
-                exec.rmsnorm_batch(&sc.x, &layer.attn_norm.buf, &mut sc.xn, embd, hp_eps, 1)?;
-                exec.rmsnorm_batch(&sc.q, &layer.q_norm.buf, &mut sc.qn, hd, hp_eps, nh)?;
-                exec.rmsnorm_batch(&sc.k, &layer.k_norm.buf, &mut sc.kn, hd, hp_eps, n_kv)?;
-            }
-            Ok(())
-        })?;
-        timed(self, "  · ropes only", reps, &mut |me| {
-            let bs = me.batch.as_mut().expect("batch");
-            for layer in &me.layers {
-                let nh = layer.n_heads;
-                let sc = &mut bs.sc;
-                if layer.is_swa {
-                    exec.rope_yarn_batch(&mut sc.qn, &sc.d_pos, nh, hd, rope_swa, 1)?;
-                    exec.rope_yarn_batch(&mut sc.kn, &sc.d_pos, n_kv, hd, rope_swa, 1)?;
-                } else {
-                    exec.mrope(
-                        &mut sc.qn,
-                        &sc.d_mrope,
-                        1,
-                        nh,
-                        hd,
-                        n_rot,
-                        rope_full,
-                        sections,
-                    )?;
-                    exec.mrope(
-                        &mut sc.kn,
-                        &sc.d_mrope,
-                        1,
-                        n_kv,
-                        hd,
-                        n_rot,
-                        rope_full,
-                        sections,
-                    )?;
-                }
-            }
-            Ok(())
-        })?;
-        timed(self, "  · appends only", reps, &mut |me| {
-            let bs = me.batch.as_mut().expect("batch");
-            let bps = bs.bps;
-            for (li, layer) in me.layers.iter().enumerate() {
-                let bt = if layer.is_swa { &bs.swa_bt } else { &bs.d_bt };
-                let kvs = &mut bs.kv[li];
-                let sc = &mut bs.sc;
-                exec.kv_append_batch_paged(
-                    &sc.kn,
-                    &mut kvs.k,
-                    &sc.d_pos,
-                    Some(&sc.d_slots),
-                    bt,
-                    bps,
-                    kv_dim,
-                    1,
-                    me.kv_dtype,
-                )?;
-                exec.kv_append_batch_paged(
-                    &sc.v,
-                    &mut kvs.v,
-                    &sc.d_pos,
-                    Some(&sc.d_slots),
-                    bt,
-                    bps,
-                    kv_dim,
-                    1,
-                    me.kv_dtype,
-                )?;
-            }
-            Ok(())
-        })?;
-        timed(self, "  · attn kernels only", reps, &mut |me| {
-            let bs = me.batch.as_mut().expect("batch");
-            let bps = bs.bps;
-            for (li, layer) in me.layers.iter().enumerate() {
-                let nh = layer.n_heads;
-                let (bt, window) = if layer.is_swa {
-                    (&bs.swa_bt, swa_window)
-                } else {
-                    (&bs.d_bt, 0usize)
-                };
-                let kvs = &mut bs.kv[li];
-                let sc = &mut bs.sc;
-                exec.attn_decode_batch_paged(
-                    &sc.qn,
-                    &kvs.k,
-                    &kvs.v,
-                    &sc.sinks,
-                    &mut sc.attn,
-                    &sc.d_pos,
-                    Some(&sc.d_slots),
-                    bt,
-                    bps,
-                    nh,
-                    n_kv,
-                    hd,
-                    kv_dim,
-                    window,
-                    1,
-                    scale,
-                    me.kv_dtype,
-                )?;
-            }
-            Ok(())
-        })?;
-        timed(self, "  · wo GEMVs only", reps, &mut |me| {
-            let bs = me.batch.as_mut().expect("batch");
-            for layer in &me.layers {
-                let sc = &mut bs.sc;
-                gemv_any(&exec, &layer.wo, &sc.attn, &mut sc.proj)?;
-            }
-            Ok(())
-        })?;
-        timed(self, "  · moe expert kernels only", reps, &mut |me| {
-            let bs = me.batch.as_mut().expect("batch");
-            for layer in &me.layers {
-                let Ffn::Moe(w) = &layer.ffn else { continue };
-                let sc = &mut bs.sc;
-                if let (ExpW::Kq(g), ExpW::Kq(u)) = (&w.gate_exps, &w.up_exps) {
-                    let needs = crate::gpu::kq_needs_sums(g.ty) || crate::gpu::kq_needs_sums(u.ty);
-                    exec.kquant_moe_gate_up(
-                        g,
-                        u,
-                        &sc.moe_idx,
-                        &sc.xq,
-                        &sc.xs,
-                        needs.then_some(&sc.ssums),
-                        &mut sc.moe_fused,
-                        m.n_active,
-                        1,
-                    )?;
-                }
-                if let ExpW::Kq(d) = &w.down_exps {
-                    let needs = crate::gpu::kq_needs_sums(d.ty);
-                    exec.kquant_moe_down(
-                        d,
-                        &sc.moe_idx,
-                        &sc.moe_w,
-                        &sc.moe_fq,
-                        &sc.moe_fs,
-                        needs.then_some(&sc.ssums),
-                        &mut sc.proj,
-                        m.n_active,
-                        1,
-                    )?;
-                }
-            }
-            Ok(())
-        })?;
-        timed(self, "  · moe route+quant only", reps, &mut |me| {
-            let bs = me.batch.as_mut().expect("batch");
-            for layer in &me.layers {
-                let Ffn::Moe(w) = &layer.ffn else { continue };
-                let sc = &mut bs.sc;
-                exec.quantize_q8(&sc.xn, &mut sc.xq, &mut sc.xs, embd)?;
-                exec.matvec_f32_batch(&w.router_w, &sc.xn, &mut sc.moe_logits, 1)?;
-                exec.moe_topk_sigmoid_batch(
-                    &sc.moe_logits,
-                    &w.probs_bias.buf,
-                    m.routed_scale,
-                    m.n_expert,
-                    m.n_active,
-                    &mut sc.moe_idx,
-                    &mut sc.moe_w,
-                    1,
-                )?;
-                exec.q8_sums_strided(&sc.xq, &mut sc.ssums, embd, 1)?;
-                exec.quantize_q8(
-                    &sc.moe_fused,
-                    &mut sc.moe_fq,
-                    &mut sc.moe_fs,
-                    m.n_active * m.moe_ff,
-                )?;
-                exec.q8_sums_strided(&sc.moe_fq, &mut sc.ssums, m.moe_ff, m.n_active)?;
-            }
-            Ok(())
-        })?;
-        Ok(())
-    }
-
     pub(crate) fn kv_mem_bytes_impl(&self) -> Option<u64> {
         self.batch.as_ref().map(|b| b.kv_bytes)
     }
@@ -4278,4 +3973,11 @@ pub(crate) struct ChunkedPrefill {
     pub cursor: usize,
     /// prefix-resume point, kept for `prefix_cut` when the prompt finishes
     pub start: usize,
+    /// the scheduler's checkpoint hints (page-floored, ascending, inside
+    /// (start, len)): where prompts it holds back diverge from this one. A
+    /// chunk lands on each so its SWA window can be staged while ring-resident
+    pub hints: Vec<usize>,
+    /// (position, reserved checkpoint slot) staged at the hints so far;
+    /// attached at insert, recycled if the prefill is dropped
+    pub staged: Vec<(usize, u32)>,
 }

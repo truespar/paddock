@@ -51,6 +51,8 @@ fn spec_batch_matches_single_and_compounds() {
     };
     let map = MappedGguf::open(&path).expect("open gguf");
     let mut m = GpuQwen35::load(exec, &map, 4096).expect("load 27B");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    m.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
 
     // four different prompts with different lengths (per-slot positions differ)
     let prompts: Vec<Vec<u32>> = vec![

@@ -111,6 +111,23 @@ struct NativeDocumentMediaTests {
     }
     #expect(image.height == 1536)
   }
+  @Test @MainActor func memoryPressureDoesNotCancelVisibleImageWork() async throws {
+    let media = StudioDocumentMedia()
+    var pending: CheckedContinuation<Void, Never>?
+    let request = Task {
+      try await media.image(.init(attachmentID: "visible", pdfPage: nil)) {
+        await withCheckedContinuation { pending = $0 }
+        return try imageFixture()
+      }
+    }
+    while pending == nil { await Task.yield() }
+    media.reclaim()
+    #expect(media.retainedBytes == 0)
+    pending?.resume()
+    let image = try await request.value
+    media.reclaim()
+    #expect(media.retainedBytes == 0 && image.width > 0)
+  }
 
   @Test @MainActor func cancellingOneCompareReaderDoesNotCancelItsNeighbor() async throws {
     let media = StudioDocumentMedia()

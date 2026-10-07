@@ -262,6 +262,17 @@ pub struct EmbedModel {
     pub no_id: Option<u32>,
     /// whether the GGUF names itself a reranker (diagnostics / model list).
     pub is_reranker: bool,
+    /// EmbeddingGemma 2 uses BOS+EOS, mean pooling and MRL, not Qwen's
+    /// last-token retrieval contract. Never infer this from the serving id.
+    pub embedding_gemma2: bool,
+    /// Effective per-sequence context, including special/task/media tokens.
+    pub max_input_tokens: usize,
+    /// EmbeddingGemma 2 with its mmproj attached: the soft-token budget a
+    /// picture resizes to (None = text only). The runner sizes each
+    /// picture's placeholder run from it before the encoder sees the job.
+    pub image_budget: Option<usize>,
+    /// EmbeddingGemma 2 with its audio tower built: `input_audio` parts.
+    pub audio: bool,
     /// The encoder's memory counters, so `/api/stats` has an `engine`
     /// block on an embedding/rerank runner too. Only the memory rows are
     /// filled - an encoder emits no tokens, so tok/s and phase are
@@ -442,6 +453,86 @@ pub fn load_segmenter(
     })
     .map_err(ServeError::Engine)?;
     Ok(SegmentModel { id, segmenter })
+}
+
+/// The promptable-segmentation served model (Meta's SAM 3): serves
+/// `/v1/masks` only - a picture and a prompt in, every instance's mask out.
+/// The tokenizer lives here, on the request side, as it does for every text
+/// model; the engine thread takes token ids.
+pub struct MaskModel {
+    pub id: String,
+    pub masker: paddock_engine::masks::Masker,
+    pub tokenizer: Arc<paddock_tokenizer::sam3::Sam3Tokenizer>,
+}
+
+/// The SAM 3 checkpoint directory for `path`, if it is one: `facebook/sam3`
+/// or `facebook/sam3.1` as downloaded (their config.json names
+/// `Sam3VideoModel`). The directory, or its weights file - SAM 3's
+/// `model.safetensors`, SAM 3.1's `sam3.1_multiplex.pt` (the manager's spawn
+/// path hands the entry file).
+pub fn sam3_dir(path: &Path) -> Option<std::path::PathBuf> {
+    let dir = if path.is_dir() {
+        path
+    } else if path
+        .extension()
+        .is_some_and(|x| x == "safetensors" || x == "pt")
+    {
+        path.parent()?
+    } else {
+        return None;
+    };
+    paddock_models::sam3::Sam3VisionConfig::is_ours(dir).then(|| dir.to_path_buf())
+}
+
+/// The largest picture `/v1/masks` takes, in pixels: 24 MP covers a phone
+/// camera's full frame and sizes the resident staging and mask planes
+/// (about 100 MB together).
+pub const SAM3_MAX_PIXELS: usize = 24_000_000;
+
+/// Exemplar boxes one prompt may carry.
+pub const SAM3_MAX_BOXES: usize = 16;
+
+/// Load SAM 3 from its checkpoint directory. CUDA only.
+pub fn load_masker(
+    id: String,
+    dir: &Path,
+    device: &str,
+    gpu: usize,
+    pack: Option<&Path>,
+    vram_budget: Option<u64>,
+) -> Result<MaskModel, ServeError> {
+    if device != "cuda" {
+        return Err(ServeError::Engine(format!(
+            "SAM 3 needs cuda (got {device:?})"
+        )));
+    }
+    paddock_models::sam3::Sam3VisionConfig::read(dir)
+        .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
+    let tokenizer = paddock_tokenizer::sam3::Sam3Tokenizer::from_file(&dir.join("tokenizer.json"))
+        .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
+    let pack = pack.map(Path::to_path_buf);
+    let dir_owned = dir.to_path_buf();
+    let masker = paddock_engine::masks::Masker::spawn(move || {
+        let exec = paddock_engine::gpu::GpuExecutor::with_pack(gpu, pack.as_deref())
+            .map_err(|e| e.to_string())?;
+        note_device_cc(&exec);
+        if let Some(b) = vram_budget {
+            exec.set_vram_budget(b);
+        }
+        paddock_engine::gpu_model::sam3::GpuSam3::load_dir(
+            Arc::new(exec),
+            &dir_owned,
+            SAM3_MAX_PIXELS,
+            SAM3_MAX_BOXES,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .map_err(ServeError::Engine)?;
+    Ok(MaskModel {
+        id,
+        masker,
+        tokenizer: Arc::new(tokenizer),
+    })
 }
 
 /// The Clef checkpoint directory for `path`, if it is one: the joint schema
@@ -1092,7 +1183,7 @@ pub fn is_asr_arch(arch: &str) -> bool {
 /// encoder; paired with an AUDIO mmproj it is the Qwen3-ASR generative
 /// family. The caller disambiguates with [`mmproj_is_audio`].
 pub fn is_encoder_arch(arch: &str) -> bool {
-    arch == "qwen3"
+    matches!(arch, "qwen3" | "gemma-embedding2")
 }
 
 /// True when the companion mmproj GGUF carries an audio tower
@@ -1346,6 +1437,18 @@ pub fn load_embedder(
         .architecture()
         .ok_or(ServeError::NoArch)?
         .to_owned();
+    if arch == "gemma-embedding2" {
+        return crate::embedding_gemma2::load(
+            id,
+            path,
+            device,
+            gpu,
+            pack,
+            max_ctx,
+            vram_budget,
+            None,
+        );
+    }
     if !matches!(device, "cuda" | "metal") {
         return Err(ServeError::Engine(format!(
             "{arch} encoder needs cuda or metal (got {device:?})"
@@ -1406,6 +1509,10 @@ pub fn load_embedder(
         yes_id,
         no_id,
         is_reranker,
+        embedding_gemma2: false,
+        max_input_tokens: max_ctx,
+        image_budget: None,
+        audio: false,
         metrics,
     })
 }
@@ -1529,10 +1636,11 @@ pub fn load_aligner(
 /// refusing to serve.
 #[allow(clippy::too_many_arguments)]
 /// --kv-cache-dtype (config-normalized into this env var by lib.rs). Both
-/// directions are explicit: fp8_e4m3 is the lossy opt-in for the families
-/// that still default to f16, and f16 is the way back for the ones that
-/// default to fp8 (gemma4 and both ASR families). Saying nothing leaves each
-/// family on its own default, which it announces in its own load log.
+/// directions are explicit: f16 is the way back to the exact class for the
+/// families that default to fp8 - every generative family since 2026-10-04
+/// (KV8) except paddleocr-vl, deepseek-ocr and qwen3-asr, whose loaders say
+/// why they stay f16 - and fp8_e4m3 is the opt-in for those three. Saying
+/// nothing leaves each family on its own default.
 /// The compute capability this runner serves on, so the fp8-KV gate below can
 /// reach it without threading a device handle through eleven family arms.
 ///
@@ -1600,11 +1708,11 @@ fn apply_kv_dtype(set: impl FnOnce(paddock_engine::gpu::KvDtype)) {
             tracing::info!("kv cache: f16 (--kv-cache-dtype; exact, doubles KV bytes)");
             set(KvDtype::Fp16);
         }
-        // Nothing asked, so the FAMILY default stands - and four of them
-        // default to fp8 (gemma4 both sizes, muse-glimmer, paddleocr-vl, plus
-        // whisper in its own loader).
+        // Nothing asked, so the FAMILY default stands: fp8 (KV8) for every
+        // generative family but paddleocr-vl, deepseek-ocr and qwen3-asr
+        // (each loader states its reason), whisper included in its own loader.
         //
-        // This arm used to force those four back to f16 below sm_89,
+        // This arm used to force the fp8 families back to f16 below sm_89,
         // under the blanket rule "fp8 KV on fp8 hardware, f16 on Ampere". That
         // rule rested on a mis-diagnosis: the garbage it was written for came
         // from the QK8/P8 e4m3-mma arms storing zeros, not from the
@@ -1726,9 +1834,10 @@ pub(crate) fn load_asr_reusing(
             // Whisper's KV is unlike any other family's: the CROSS planes are a
             // full 1500-frame window per slot per layer, static for the decode
             // and never shorter, so at 32 slots a decode step reads ~7.9 GB per
-            // token and that one kernel is ~27% of all GPU time. f16 stays the
-            // default (it is the arbiter's own class); fp8-e4m3 halves those
-            // bytes for callers who ask. Must run before `prepare_batch` sizes
+            // token and that one kernel is ~27% of all GPU time. fp8-e4m3 is
+            // the default (whisper/load.rs) and halves those bytes; f16, the
+            // arbiter's own class, is there for callers who ask. Must run
+            // before `prepare_batch` sizes
             // the pool - `set_kv_dtype` drops a pool sized for the other width.
             apply_kv_dtype(|d| m.set_kv_dtype(d));
             Ok(m)
@@ -2224,6 +2333,18 @@ fn load_hf_dir(
             ServeError::Open(dir.to_path_buf(), "config.json has no model_type".into())
         })?;
     let arch = match model_type.as_str() {
+        "kolibri1" if device == "metal" => {
+            paddock_models::kolibri::KolibriConfig::read(dir)
+                .map_err(|e| ServeError::Open(dir.to_path_buf(), e))?;
+            "kolibri1".to_owned()
+        }
+        // CUDA serves the compressed-tensors NVFP4 build (routed experts
+        // NVFP4, the rest BF16) on the laguna body; the MLX build is Metal's
+        "kolibri1" => {
+            paddock_models::kolibri::KolibriConfig::read_nvfp4(dir)
+                .map_err(|e| ServeError::Open(dir.to_path_buf(), e))?;
+            "kolibri1".to_owned()
+        }
         "diffusion_gemma" if device == "metal" => {
             paddock_models::mlx::DiffusionConfig::read(dir)
                 .map_err(|e| ServeError::Open(dir.to_path_buf(), e))?;
@@ -2555,6 +2676,17 @@ fn build_generator(
                     "Metal KV offload supports Qwen35, Granite/Llama, GPT-OSS and Laguna checkpoints, not {arch}"
                 ));
             }
+            if arch == "kolibri1" && path.is_dir() {
+                if mmproj.is_some() || mtp.is_some() || fp8_native.is_some() || pack.is_some() {
+                    return Err(
+                        "Kolibri MLX is text-only, without speculative companions or CUDA packs"
+                            .into(),
+                    );
+                }
+                return paddock_metal::Kolibri::load(path, max_ctx, max_batch, vram_budget)
+                    .map(|m| Box::new(m) as Box<dyn Generator>)
+                    .map_err(|e| e.to_string());
+            }
             if matches!(arch, "gemma4" | "muse-glimmer") && path.is_dir() {
                 if mmproj.is_some() || mtp.is_some() || fp8_native.is_some() || pack.is_some() {
                     return Err("native Gemma/Muse MLX uses its embedded vision tower; GGUF companions and CUDA packs are not accepted".into());
@@ -2885,6 +3017,14 @@ fn build_generator(
                 }
                 Ok(Box::new(model) as Box<dyn Generator>)
             }
+            "kolibri1" => {
+                let mut model = paddock_engine::gpu_model::laguna::GpuLaguna::load_kolibri_nvfp4(
+                    exec, path, max_ctx,
+                )
+                .map_err(|e| e.to_string())?;
+                apply_kv_dtype(|d| model.set_kv_dtype(d));
+                Ok(Box::new(model) as Box<dyn Generator>)
+            }
             "granite" => {
                 let mut model =
                     paddock_engine::gpu_model::granite::GpuGranite::load_dir(exec, path, max_ctx)
@@ -3134,6 +3274,23 @@ projection floors restored (W8_MIN=64, F8_DEC_MIN=8) - planes resident"
                 Ok(Box::new(model))
             }
             other => Err(format!("laguna needs cuda (got {other:?})")),
+        },
+        // Aleph Alpha's Kolibri 1 GGUF (`kolibri1`): the laguna body's Kolibri
+        // flavor - NoPE full layers, sandwich norms, the sigmoid_logit_add
+        // router (gpu_model/laguna). Text only; no drafter class ships for it.
+        "kolibri1" => match device {
+            "cuda" => {
+                if mtp.is_some() {
+                    return Err("kolibri1 has no drafter class to attach".into());
+                }
+                let exec = make_exec(pack)?;
+                let mut model =
+                    paddock_engine::gpu_model::laguna::GpuLaguna::load(exec, &map, max_ctx)
+                        .map_err(|e| e.to_string())?;
+                apply_kv_dtype(|d| model.set_kv_dtype(d));
+                Ok(Box::new(model))
+            }
+            other => Err(format!("kolibri1 GGUF needs cuda (got {other:?})")),
         },
         // IBM Granite 4.1 (3b/8b/30b share the code - shapes come from the
         // file). Greedy-parity validated against llama.cpp on the identical

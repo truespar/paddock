@@ -81,6 +81,16 @@ impl GpuExecutor {
     }
 
     /// Sync then copy a u32 device buffer to host (decode-loop token readback).
+    /// Sync then copy the first `n` u32 of a device buffer to host - a run
+    /// list read out of a plane sized for the worst case.
+    pub fn to_host_u32_len(&self, buf: &CudaSlice<u32>, n: usize) -> Result<Vec<u32>, GpuError> {
+        let view = buf
+            .try_slice(0..n)
+            .ok_or_else(|| oob("to_host_u32_len: n out of range"))?;
+        self.stream.synchronize().map_err(drv)?;
+        self.stream.clone_dtoh(&view).map_err(drv)
+    }
+
     pub fn to_host_u32(&self, buf: &CudaSlice<u32>) -> Result<Vec<u32>, GpuError> {
         self.stream.synchronize().map_err(drv)?;
         self.stream.clone_dtoh(buf).map_err(drv)

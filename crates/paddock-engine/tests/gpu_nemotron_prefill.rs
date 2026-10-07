@@ -57,6 +57,8 @@ fn bulk_prefill_long_smoke() {
         return;
     };
     let mut model = GpuNemotron::load_dir(exec, &dir, max_ctx).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     let prompt: Vec<u32> = (0..n_tok).map(|i| 1000 + (i % 5000) as u32).collect();
     // replicate the serve's request order: a short serial request (prefill
     // under the bulk threshold + decode) before the long bulk one
@@ -110,6 +112,8 @@ fn bulk_prefill_matches_serial() {
         .collect();
 
     let mut model = GpuNemotron::load_dir(exec, &dir, 4096).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
 
     // ---- serial reference walk + greedy continuation ----------------------
     model.reset();

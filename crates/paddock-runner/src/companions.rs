@@ -43,6 +43,8 @@ struct Shape {
     width_out: Option<u64>,
     /// a projector's `clip.vision.projection_dim` / `clip.audio.projection_dim`
     projection: Vec<u64>,
+    /// a projector's towers: (picture, audio) - which `*.projector_type` it names
+    towers: (bool, bool),
 }
 
 impl Shape {
@@ -64,6 +66,10 @@ impl Shape {
                 .iter()
                 .filter_map(|k| u(k))
                 .collect(),
+            towers: (
+                f.metadata.contains_key("clip.vision.projector_type"),
+                f.metadata.contains_key("clip.audio.projector_type"),
+            ),
             arch,
         }
     }
@@ -228,16 +234,36 @@ pub(crate) fn resolve(cfg: &mut Config, weights: &Path) -> Result<(), String> {
     // A checkpoint DIRECTORY (safetensors-primary lane) carries everything
     // inside itself; scanning its PARENT would treat unrelated sibling
     // models' companions as this model's.
+    if cfg.audio == Some(false)
+        && let Some(p) = &cfg.audio_mmproj
+    {
+        return Err(format!(
+            "`audio = false` switches the audio tower off, but `audio_mmproj` names one ({}) - \
+             remove one of the two",
+            p.display()
+        ));
+    }
     if weights.is_dir() {
         return Ok(());
     }
     let model = Shape::read(weights).unwrap_or_default();
+    // EmbeddingGemma 2's catalog layout cuts its projector in two, a picture
+    // tower and an audio tower, each its own download: both are projectors
+    // of the right width, so the generic pick could seat the audio file in
+    // `mmproj`. Its discovery sorts the candidates by the tower they carry.
+    let split_towers = model.arch.as_deref() == Some("gemma-embedding2");
     for (slot, what, key, check) in [
         (
             &cfg.mmproj,
             "projector",
             "mmproj",
             mmproj_verdict as fn(&Shape, &Shape) -> Verdict,
+        ),
+        (
+            &cfg.audio_mmproj,
+            "audio projector",
+            "audio_mmproj",
+            mmproj_verdict,
         ),
         (&cfg.mtp, "drafter", "mtp", mtp_verdict),
     ] {
@@ -248,7 +274,8 @@ pub(crate) fn resolve(cfg: &mut Config, weights: &Path) -> Result<(), String> {
             check_named(p, what, key, check(&model, &c))?;
         }
     }
-    if cfg.mmproj.is_some() && cfg.mtp.is_some() {
+    let audio_settled = !split_towers || cfg.audio_mmproj.is_some() || cfg.audio == Some(false);
+    if cfg.mmproj.is_some() && cfg.mtp.is_some() && audio_settled {
         return Ok(());
     }
     let Some(dir) = weights.parent() else {
@@ -269,7 +296,16 @@ pub(crate) fn resolve(cfg: &mut Config, weights: &Path) -> Result<(), String> {
             }
             if fname.contains("mmproj") {
                 mmproj.push(e.path());
-            } else if fname.starts_with("mtp") || fname.contains("-mtp.") {
+            } else if fname.starts_with("mtp")
+                || fname.contains("-mtp.")
+                || fname.starts_with("dflash")
+                || fname.contains("-dflash")
+            {
+                // a block drafter (DFlash/DFlash2 GGUF) rides the same `mtp`
+                // seat: qwen3.8's elected default is DFlash2 beside the
+                // in-file MTP head (the catalog's `drafter2`, default on),
+                // and a bare runner used to miss it - only `mtp*` names were
+                // looked for, so it served the MTP chain alone
                 mtp.push(e.path());
             }
         }
@@ -277,6 +313,18 @@ pub(crate) fn resolve(cfg: &mut Config, weights: &Path) -> Result<(), String> {
     let read_or_unknown = |p: &Path, f: fn(&Shape, &Shape) -> Verdict| match Shape::read(p) {
         Some(c) => f(&model, &c),
         None => Verdict::Unknown,
+    };
+    let towers = |p: &Path| Shape::read(p).map(|s| s.towers);
+    // split layout: pictures seat in `mmproj`, an audio-only file in
+    // `audio_mmproj`
+    let audio_only: Vec<PathBuf> = if split_towers {
+        let (audio, rest): (Vec<_>, Vec<_>) = mmproj
+            .into_iter()
+            .partition(|p| towers(p) == Some((false, true)));
+        mmproj = rest;
+        audio
+    } else {
+        Vec::new()
     };
     if cfg.mmproj.is_none()
         && let Some(p) = pick(
@@ -296,6 +344,21 @@ pub(crate) fn resolve(cfg: &mut Config, weights: &Path) -> Result<(), String> {
             cfg.mmproj = Some(p);
         }
     }
+    // an audio tower of its own, unless the picture file already carries one
+    // (the upstream projector holds both)
+    let audio_inside = cfg.mmproj.as_deref().and_then(towers).is_some_and(|t| t.1);
+    if !audio_settled
+        && !audio_inside
+        && let Some(p) = pick(
+            weights,
+            audio_only,
+            |p| read_or_unknown(p, mmproj_verdict),
+            "audio mmproj",
+        )
+    {
+        tracing::info!(audio_mmproj = %p.display(), "companion audio tower discovered beside the weights");
+        cfg.audio_mmproj = Some(p);
+    }
     if cfg.mtp.is_none()
         && let Some(p) = pick(
             weights,
@@ -304,7 +367,7 @@ pub(crate) fn resolve(cfg: &mut Config, weights: &Path) -> Result<(), String> {
             "MTP drafter",
         )
     {
-        tracing::info!(mtp = %p.display(), "companion MTP drafter discovered beside the weights");
+        tracing::info!(mtp = %p.display(), "companion drafter discovered beside the weights");
         cfg.mtp = Some(p);
     }
     Ok(())
@@ -487,6 +550,24 @@ mod tests {
             off.mmproj, None,
             "vision = false must keep the tower unloaded"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// qwen3.8's catalog layout: the elected DFlash2 drafter beside the
+    /// weights (the MTP head rides in-file). A bare runner must wire it the
+    /// way a manager-written config does - only `mtp*` names were looked for.
+    #[test]
+    fn a_dflash_drafter_beside_the_weights_is_discovered() {
+        let dir = std::env::temp_dir().join(format!("pd-dflash-disc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let weights = dir.join("Qwen3.8-27B-Q8_0.gguf");
+        let drafter = dir.join("dflash2-Q4_K_M.gguf");
+        std::fs::write(&weights, b"").expect("weights");
+        std::fs::write(&drafter, b"").expect("drafter");
+        let mut cfg = crate::config::Config::default();
+        resolve(&mut cfg, &weights).expect("resolve");
+        assert_eq!(cfg.mtp.as_deref(), Some(drafter.as_path()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

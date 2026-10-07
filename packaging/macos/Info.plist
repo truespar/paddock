@@ -14,6 +14,9 @@
     <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>SUFeedURL</key><string>https://github.com/truespar/paddock/releases/latest/download/appcast.xml</string>
+    <key>SUPublicEDKey</key><string>9oAQCza6CCHmaRdFv8EhZRWC8VOnEfRccT2voGOhbXA=</string>
+    <key>SURequireSignedFeed</key><true/>
+    <key>SUVerifyUpdateBeforeExtraction</key><true/>
     <key>SUShowReleaseNotes</key><false/>
     <key>SUEnableAutomaticChecks</key><false/>
     <key>SUAllowsAutomaticUpdates</key><false/>

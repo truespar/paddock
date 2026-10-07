@@ -25,6 +25,7 @@ pub mod diarization_live;
 pub mod diarizations;
 pub mod doc;
 pub mod drain;
+mod embedding_gemma2;
 pub mod embeddings;
 pub mod events;
 pub mod extract;
@@ -35,6 +36,8 @@ pub mod generation_residency;
 pub mod harmony;
 pub mod images;
 pub mod language;
+pub mod mask_sessions;
+pub mod masks;
 pub mod messages;
 pub mod messages_system;
 pub mod metrics;
@@ -326,6 +329,7 @@ pub async fn run(
     // are generative and serve chat/completions.
     let (mut serving, mut embedder, mut asr, mut aligner) = (None, None, None, None);
     let mut segmenter = None;
+    let mut masker = None;
     let mut laya = None;
     let mut clef = None;
     let mut tabular = None;
@@ -373,6 +377,16 @@ pub async fn run(
             .ok()
             .and_then(|m| m.gguf().architecture().map(str::to_owned))
             .unwrap_or_default();
+        // discovery fills `audio_mmproj` for EmbeddingGemma 2 only, so here
+        // it is a config line another model would silently ignore
+        if cfg.audio_mmproj.is_some() && arch != "gemma-embedding2" {
+            return Err(serving::ServeError::Engine(
+                "`audio_mmproj` is EmbeddingGemma 2's (its audio tower as a file of its own); \
+                 this model takes its tower in `mmproj`"
+                    .into(),
+            )
+            .into());
+        }
         let diffusion_residency = cfg.device == "metal"
             && (arch == "diffusion-gemma"
                 || (path.is_dir() && paddock_models::mlx::DiffusionConfig::read(path).is_ok()));
@@ -413,8 +427,9 @@ pub async fn run(
             // F32 checkpoint contract. Never transport it to a CUDA kernel.
             "f32" if cfg.device == "metal" => {}
             "f16" => unsafe {
-                // gemma4 and both ASR families default to fp8 - this is the
-                // way back to exact f16. G4_KV16 is gemma4's own historical
+                // every generative family but paddleocr-vl, deepseek-ocr and
+                // qwen3-asr defaults to fp8 (KV8) - this is the way back to
+                // exact f16. G4_KV16 is gemma4's own historical
                 // spelling, kept so existing scripts keep working; the
                 // generic one is what every other family reads.
                 std::env::set_var("PADDOCK_G4_KV16", "1");
@@ -592,6 +607,30 @@ pub async fn run(
                 "decision model ready"
             );
             laya = Some(m);
+        } else if let Some(dir) = serving::sam3_dir(path) {
+            // Promptable segmentation (Meta's SAM 3): a picture and a prompt
+            // in, every instance's mask out - /v1/masks and nothing else. A
+            // checkpoint directory like the dense-prediction family, its id
+            // the directory's name; max_ctx and max_batch mean nothing here.
+            let dir_id = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or(id);
+            let m = serving::load_masker(
+                cfg.served_model_name.clone().unwrap_or(dir_id),
+                &dir,
+                &cfg.device,
+                gpu_ordinal,
+                cfg.kernel_pack.as_deref(),
+                cfg.vram_budget.map(|mib| mib << 20),
+            )?;
+            tracing::info!(
+                model = %m.id,
+                weight_mib = m.masker.info().weight_bytes >> 20,
+                workspace_mib = m.masker.info().workspace_bytes >> 20,
+                "promptable segmentation model ready"
+            );
+            masker = Some(m);
         } else if let Some(dir) = serving::segment_dir(path) {
             // Dense prediction (tic-forestry: DINOv3 + decoder): chips in,
             // rasters out, /v1/segmentations and nothing else. Like the
@@ -668,6 +707,54 @@ pub async fn run(
             )?;
             tracing::info!(model = %m.id, "speech-to-text model ready");
             asr = Some(m);
+        } else if let Some(dir) = embedding_gemma2::directory(path) {
+            let m = embedding_gemma2::load(
+                cfg.served_model_name.clone().unwrap_or(id),
+                &dir,
+                &cfg.device,
+                gpu_ordinal,
+                cfg.kernel_pack.as_deref(),
+                cfg.max_ctx,
+                cfg.vram_budget.map(|mib| mib << 20),
+                None,
+            )?;
+            tracing::info!(model=%m.id,"EmbeddingGemma 2 text embeddings ready");
+            embedder = Some(m);
+        } else if arch == "gemma-embedding2" {
+            // the GGUF lane takes its towers from the companions resolved
+            // above (configured, or beside the weights): the upstream
+            // projector with both, or the catalog's picture and audio cuts;
+            // `vision = false` / `audio = false` leave a tower out
+            let files: Vec<_> = [cfg.mmproj.clone(), cfg.audio_mmproj.clone()]
+                .into_iter()
+                .flatten()
+                .collect();
+            let media = (!files.is_empty())
+                .then(|| -> Result<_, serving::ServeError> {
+                    Ok(embedding_gemma2::Media {
+                        files,
+                        image_budget: embedding_gemma2::image_budget(cfg.max_image_tokens)?,
+                        audio: cfg.audio != Some(false),
+                    })
+                })
+                .transpose()?;
+            let m = embedding_gemma2::load(
+                cfg.served_model_name.clone().unwrap_or(id),
+                path,
+                &cfg.device,
+                gpu_ordinal,
+                cfg.kernel_pack.as_deref(),
+                cfg.max_ctx,
+                cfg.vram_budget.map(|mib| mib << 20),
+                media,
+            )?;
+            tracing::info!(
+                model = %m.id,
+                pictures = m.image_budget.is_some(),
+                audio = m.audio,
+                "EmbeddingGemma 2 embeddings ready"
+            );
+            embedder = Some(m);
         } else if serving::is_encoder_arch(&arch) && !audio_companion {
             let m = serving::load_embedder(
                 id,
@@ -1041,6 +1128,7 @@ pub async fn run(
         asr,
         aligner,
         segmenter,
+        masker,
         laya,
         clef,
         tabular,

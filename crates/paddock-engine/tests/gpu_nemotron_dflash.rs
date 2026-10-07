@@ -75,6 +75,8 @@ fn dflash_spec_loop_matches_greedy() {
         return;
     };
     let mut model = GpuNemotron::load_dir(exec, &dir, 4096).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     model
         .attach_dflash(std::path::Path::new(&df_dir))
         .expect("attach dflash");
@@ -233,6 +235,8 @@ fn dflash_coverage_rides_the_pages() {
         return;
     };
     let mut model = GpuNemotron::load_dir(exec, &dir, 4096).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     model
         .attach_dflash(std::path::Path::new(&df_dir))
         .expect("attach dflash");
@@ -363,6 +367,8 @@ fn dspark_drafts_and_rounds() {
         return;
     };
     let mut model = GpuNemotron::load_dir(exec, &dir, 4096).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     model
         .attach_dflash(std::path::Path::new(&ds_dir))
         .expect("attach dspark");

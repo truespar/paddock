@@ -57,6 +57,49 @@ fn nvfp4_is_the_default_only_where_it_runs() {
         );
     }
 }
+
+/// Nemotron's Blackwell election (decided 2026-10-04): NVFP4 weights plus the
+/// DSpark drafter where sm_120 can run both, the in-file-MTP Q8_0 lane with no
+/// drafter pulled anywhere else. The drafter's min_cc has to gate the bundle
+/// AND the spawn wiring, or an Ampere box downloads 1.3 GB it cannot use.
+#[test]
+fn nemotron_pairs_nvfp4_with_dspark_on_blackwell_only() {
+    let id = "nemotron-3.5-lightning-30b";
+    let reg = Registry::new(std::path::PathBuf::from("./models"));
+    let m = reg.catalog_of(id).unwrap();
+    let ids = |cc: Option<[u32; 2]>| -> Vec<String> {
+        m.default_bundle_for_backend("cuda", cc)
+            .iter()
+            .map(|a| a.id.clone())
+            .collect()
+    };
+    assert_eq!(ids(Some([12, 1])), ["nvfp4", "dspark"]);
+    assert_eq!(ids(Some([8, 6])), ["q8"]);
+    assert_eq!(ids(None), ["q8"]);
+    let plain = |cc: Option<[u32; 2]>| -> Vec<String> {
+        m.default_bundle_for(cc)
+            .iter()
+            .map(|a| a.id.clone())
+            .collect()
+    };
+    assert_eq!(plain(Some([12, 1])), ids(Some([12, 1])));
+    assert_eq!(plain(Some([8, 6])), ids(Some([8, 6])));
+
+    let drafter = |cc: Option<[u32; 2]>| {
+        Registry::new(std::path::PathBuf::from("./models"))
+            .with_cc(cc)
+            .planned_paths(id, None)
+            .expect("nemotron resolves on cuda")
+            .2
+    };
+    let bw = drafter(Some([12, 1])).expect("Blackwell wires the drafter");
+    assert!(bw.to_string_lossy().contains("DSpark"), "{}", bw.display());
+    assert_eq!(
+        drafter(Some([8, 6])),
+        None,
+        "Q8_0 drafts with its in-file head"
+    );
+}
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;

@@ -12,6 +12,16 @@
 //! later read). Attention/MoE/head rows ride the batch walk's own r>1
 //! classes unchanged.
 //!
+//! The f16 state class rolls back by replay instead (slots 746-747,
+//! `VerifyPlanes::rescan`): the verify walk leaves the live state at its
+//! pre-round value and keeps each row's scan inputs (x | B | raw dt, ~20 KiB
+//! a row against a 1 MiB state), and the commit replays every request's
+//! accepted rows over its live state in place - one launch for all mamba
+//! layers, the snap walk's arithmetic, so the state lands on the snapshot's
+//! bits. The snapshot writes cost more than their bytes: ~7 MiB of dirty L2
+//! a mamba layer at a 6-row DSpark round, written back on the DRAM time of
+//! the projections streaming next (GB10 2026-10-06, q|k|v 113 -> 146 us).
+//!
 //! Drafters attach on top: DFlash (the official nvidia checkpoint) and the
 //! in-file MTP block - both consume this verify. Until one is attached,
 //! `spec_capable` stays false and nothing here runs in serving.
@@ -32,12 +42,29 @@ use paddock_models::nemotron::NemotronBlock;
 /// across 23 layers is ~1.5 GiB, allocated lazily at first spec use).
 pub(crate) const SPEC_ROWS_NEMO: usize = 32;
 
+/// Partially-accepted requests one batched-rollback launch pair rebuilds
+/// (each needs a bounce window per mamba layer); more take more pairs.
+const ROLLBACK_REQS: usize = 4;
+
 /// Lazily-allocated verify planes (lives inside `NemoBatch`).
 pub(crate) struct VerifyPlanes {
     /// per-mamba-layer per-row state snapshots [SPEC_ROWS, H*hd*S], in the
     /// same class as the live arena so a partial-accept rollback is a byte
-    /// copy rather than a re-round
+    /// copy rather than a re-round (unallocated when `rescan`)
     pub snap: Vec<Option<SsmArena>>,
+    /// rollback by replay (slots 746-747, the f16 class): the verify walk
+    /// leaves the live state at its pre-round value and keeps each row's
+    /// scan inputs; the commit replays the accepted rows over it in place.
+    /// Per-row snapshots wrote 1 MiB of state a row per mamba layer, and the
+    /// write-back of those dirty L2 lines landed on the next streams' DRAM
+    /// time (~0.4 ms a 6-row DSpark round on GB10).
+    pub rescan: bool,
+    /// per-mamba-layer kept scan rows [SPEC_ROWS, mamba2_keep_row] (replay)
+    pub keep: Vec<Option<CudaSlice<f32>>>,
+    /// replay descriptors, six words a (request, mamba layer)
+    pub d_rs_desc: CudaSlice<u64>,
+    /// a reply checkpoint's replay target inside a round [n_mamba, H*hd*S]
+    pub d_rs_tmp: Option<CudaSlice<half::f16>>,
     /// per-mamba-layer conv-input (xBC) row snapshots [SPEC_ROWS, conv_dim]
     pub xbc: Vec<Option<CudaSlice<f32>>>,
     /// per-mamba-layer per-slot scratch conv windows [n_slots, (k-1)*conv_dim]
@@ -45,6 +72,10 @@ pub(crate) struct VerifyPlanes {
     /// window-rebuild bounce [(k-1), conv_dim] (overlapping same-buffer
     /// shifts are not a safe dtod copy)
     pub d_wbounce: CudaSlice<f32>,
+    /// the batched rollback's bounce [ROLLBACK_REQS x mamba layers, (k-1) *
+    /// conv_dim] and its copy descriptors (see spec_verify_commit_batched)
+    pub d_rb_bounce: CudaSlice<f32>,
+    pub d_rb_desc: CudaSlice<u64>,
     /// verify logits [SPEC_ROWS, vocab] + post-final-norm h [SPEC_ROWS, embd]
     pub d_logits: CudaSlice<f32>,
     pub d_h: CudaSlice<f32>,
@@ -90,29 +121,59 @@ impl GpuNemotron {
         let win_elems = (hp.d_conv - 1) * hp.conv_dim();
         let ssm_dt = self.ssm_dtype;
         let rows_cap = super::batch::rows_partial_cap(hp.n_kv_heads, e.sm_count(), SPEC_ROWS_NEMO);
+        let n_mamba = hp
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, NemotronBlock::Mamba))
+            .count();
+        let rescan = ssm_dt == super::ssm_arena::SsmDtype::F16
+            && e.has_mamba2_rescan()
+            && paddock_models::dev_var_os!("PADDOCK_NO_NEMO_RESCAN").is_none();
+        let keep_row =
+            crate::gpu::mamba2_keep_row(hp.mamba_heads, hp.mamba_head_dim, hp.d_state, hp.n_groups);
         let mut snap = Vec::with_capacity(hp.n_layer);
+        let mut keep = Vec::with_capacity(hp.n_layer);
         let mut xbc = Vec::with_capacity(hp.n_layer);
         let mut vwin = Vec::with_capacity(hp.n_layer);
         for li in 0..hp.n_layer {
             if matches!(hp.blocks[li], NemotronBlock::Mamba) {
-                snap.push(Some(SsmArena::alloc(
-                    &e,
-                    SPEC_ROWS_NEMO * state_elems,
-                    ssm_dt,
-                )?));
+                if rescan {
+                    snap.push(None);
+                    keep.push(Some(e.alloc(SPEC_ROWS_NEMO * keep_row)?));
+                } else {
+                    snap.push(Some(SsmArena::alloc(
+                        &e,
+                        SPEC_ROWS_NEMO * state_elems,
+                        ssm_dt,
+                    )?));
+                    keep.push(None);
+                }
                 xbc.push(Some(e.alloc(SPEC_ROWS_NEMO * hp.conv_dim())?));
                 vwin.push(Some(e.alloc(bs.n_slots * win_elems)?));
             } else {
                 snap.push(None);
+                keep.push(None);
                 xbc.push(None);
                 vwin.push(None);
             }
         }
         bs.verify = Some(VerifyPlanes {
             snap,
+            rescan,
+            keep,
+            d_rs_desc: e.alloc_u64(6 * SPEC_ROWS_NEMO * n_mamba)?,
+            d_rs_tmp: if rescan {
+                Some(e.alloc_f16(n_mamba * state_elems)?)
+            } else {
+                None
+            },
             xbc,
             vwin,
             d_wbounce: e.alloc(win_elems)?,
+            d_rb_bounce: e.alloc(ROLLBACK_REQS * n_mamba * win_elems)?,
+            // per request and mamba layer: a state copy, (k-1) window rows,
+            // the xBC rows and the bounce write-back, three words apiece
+            d_rb_desc: e.alloc_u64(3 * SPEC_ROWS_NEMO * n_mamba * (hp.d_conv + 2))?,
             d_logits: e.alloc(SPEC_ROWS_NEMO * hp.vocab)?,
             d_h: e.alloc(SPEC_ROWS_NEMO * hp.hidden)?,
             d_picks: e.alloc_u32(SPEC_ROWS_NEMO)?,
@@ -123,10 +184,20 @@ impl GpuNemotron {
             attn_o: e.alloc(hp.n_heads * rows_cap * hp.head_dim)?,
             attn_ml: e.alloc(hp.n_heads * rows_cap * 2)?,
         });
+        let rollback = if rescan {
+            (n_mamba * (SPEC_ROWS_NEMO * keep_row * 4 + state_elems * 2)) as f64
+        } else {
+            (n_mamba * SPEC_ROWS_NEMO * state_elems * ssm_dt.bytes()) as f64
+        };
         tracing::info!(
-            "nemotron spec: verify planes up ({} rows, {:.2} GiB snapshots)",
+            "nemotron spec: verify planes up ({} rows, {:.2} GiB {})",
             SPEC_ROWS_NEMO,
-            (23 * SPEC_ROWS_NEMO * state_elems * 4) as f64 / (1u64 << 30) as f64
+            rollback / (1u64 << 30) as f64,
+            if rescan {
+                "kept rows (rollback by replay)"
+            } else {
+                "snapshots"
+            }
         );
         Ok(())
     }
@@ -223,7 +294,7 @@ impl GpuNemotron {
             accepts.push((slot, off, c));
             off += chunk.len();
         }
-        self.spec_round_commit(&reqs, &accepts)
+        self.spec_round_commit(&reqs, &accepts, false)
     }
 
     /// The verify walk every round shares: flatten the ragged chunks, run
@@ -256,8 +327,10 @@ impl GpuNemotron {
         let mut positions = Vec::with_capacity(total);
         let mut slots = Vec::with_capacity(total);
         let mut runs: Vec<(usize, usize, u32)> = Vec::with_capacity(reqs.len());
+        let mut run_pos = Vec::with_capacity(reqs.len());
         for &(slot, pos, ref chunk) in reqs {
             runs.push((toks.len(), chunk.len(), slot as u32));
+            run_pos.push(pos as u32);
             for (i, &t) in chunk.iter().enumerate() {
                 toks.push(t);
                 positions.push((pos + i) as u32);
@@ -269,6 +342,7 @@ impl GpuNemotron {
         self.embed_rows(total)?;
         let cuts = PfCuts {
             runs,
+            run_pos,
             dec: 0,
             breaks: Vec::new(),
         };
@@ -328,7 +402,7 @@ impl GpuNemotron {
         };
         let exec = self.exec.clone();
         let vocab = self.hp.vocab;
-        let picks: Vec<u32> = {
+        {
             let bs = self.batch.as_mut().expect("batch enabled");
             let vp = bs.verify.as_mut().expect("verify planes");
             match pick {
@@ -391,6 +465,19 @@ impl GpuNemotron {
                     }
                 }
             }
+        }
+        // The drafter's fc-band append reads only this walk's taps, never the
+        // accept count, so it goes ahead of the picks readback: its ~50
+        // launches then overlap the verify's tail instead of sitting behind
+        // the host's accept walk and rollback in the round's idle gap.
+        let features_early = self.dflash.as_ref().is_some_and(|d| d.state.is_some())
+            && paddock_models::dev_var_os!("PADDOCK_NO_NEMO_EARLY_FEATURES").is_none();
+        if features_early {
+            self.dflash_append_features(total)?;
+        }
+        let picks: Vec<u32> = {
+            let bs = self.batch.as_mut().expect("batch enabled");
+            let vp = bs.verify.as_mut().expect("verify planes");
             let view = vp
                 .d_picks
                 .try_slice(0..total)
@@ -416,7 +503,7 @@ impl GpuNemotron {
                 (slot, off, a + 1)
             })
             .collect();
-        self.spec_round_commit(reqs, &accepts)?;
+        self.spec_round_commit(reqs, &accepts, features_early)?;
         Ok(Some(picks))
     }
 
@@ -427,6 +514,8 @@ impl GpuNemotron {
         &mut self,
         reqs: &[(usize, usize, Vec<u32>)],
         accepts: &[(usize, usize, usize)],
+        // the drafter's features were appended ahead of the picks readback
+        features_done: bool,
     ) -> Result<(), GpuModelError> {
         self.reply_after_spec(reqs, accepts)?;
         self.spec_verify_commit(reqs, accepts)?;
@@ -435,7 +524,9 @@ impl GpuNemotron {
         // KV cells past that get overwritten by the next round's append
         let total: usize = reqs.iter().map(|r| r.2.len()).sum();
         if self.dflash.as_ref().is_some_and(|d| d.state.is_some()) {
-            self.dflash_append_features(total)?;
+            if !features_done {
+                self.dflash_append_features(total)?;
+            }
             for (&(slot, pos0, _), &(_, _, acc)) in reqs.iter().zip(accepts) {
                 self.dflash_note_rows(slot, pos0, acc);
             }
@@ -468,6 +559,13 @@ impl GpuNemotron {
         reqs: &[(usize, usize, Vec<u32>)],
         accepts: &[(usize, usize, usize)],
     ) -> Result<(), GpuModelError> {
+        if self.exec.has_batched_copy()
+            && paddock_models::dev_var_os!("PADDOCK_NO_NEMO_BATCHED_ROLLBACK").is_none()
+            && self.spec_verify_commit_batched(reqs, accepts)?
+        {
+            return Ok(());
+        }
+        let rescan = self.spec_replay_states(accepts)?;
         let hp = self.hp.clone();
         let exec = self.exec.clone();
         let state_elems = hp.mamba_heads * hp.mamba_head_dim * hp.d_state;
@@ -483,25 +581,28 @@ impl GpuNemotron {
             let ssm = bs.ssm[li].as_mut().expect("ssm arena");
             let vp = bs.verify.as_mut().expect("verify planes");
             let vw = vp.vwin[li].as_ref().expect("vwin");
-            let snap = vp.snap[li].as_ref().expect("snap");
             let xbc = vp.xbc[li].as_ref().expect("xbc");
             for (ri, &(slot, off, acc)) in accepts.iter().enumerate() {
                 let len = reqs[ri].2.len();
                 let s = slot;
                 if acc == len {
-                    // full accept: live state already ended at the last row;
-                    // the advanced scratch window is the new window
+                    // full accept: the state ended at the last row (or was
+                    // replayed there); the advanced scratch window is the new
+                    // window
                     exec.copy_region(vw, s * win_elems, win, s * win_elems, win_elems)?;
                     continue;
                 }
-                // partial: state <- snapshot after the accepted row
-                ssm.copy_region_from(
-                    &exec,
-                    snap,
-                    (off + acc - 1) * state_elems,
-                    s * state_elems,
-                    state_elems,
-                )?;
+                // partial: state <- snapshot after the accepted row (a
+                // replay already put it there)
+                if !rescan {
+                    ssm.copy_region_from(
+                        &exec,
+                        vp.snap[li].as_ref().expect("snap"),
+                        (off + acc - 1) * state_elems,
+                        s * state_elems,
+                        state_elems,
+                    )?;
+                }
                 // window <- last km1 rows of [pre-round window ∥ xBC rows
                 // off..off+acc], assembled in the bounce (the live window is
                 // both a source and the destination)
@@ -527,5 +628,133 @@ impl GpuNemotron {
             }
         }
         Ok(())
+    }
+
+    /// Rollback by replay: each request's live state - still the pre-round
+    /// state - walked in place over its `acc` accepted kept rows, every mamba
+    /// layer in one launch; it lands on the bits the snapshot row `acc - 1`
+    /// held. Ok(false) = the snapshot class (nothing done).
+    fn spec_replay_states(
+        &mut self,
+        accepts: &[(usize, usize, usize)],
+    ) -> Result<bool, GpuModelError> {
+        use cudarc::driver::DevicePtr;
+        let hp = self.hp.clone();
+        let exec = self.exec.clone();
+        let bs = self.batch.as_mut().expect("batch enabled");
+        let vp = bs.verify.as_mut().expect("verify planes");
+        if !vp.rescan {
+            return Ok(false);
+        }
+        let state_elems = hp.mamba_heads * hp.mamba_head_dim * hp.d_state;
+        let keep_row =
+            crate::gpu::mamba2_keep_row(hp.mamba_heads, hp.mamba_head_dim, hp.d_state, hp.n_groups);
+        let mut d = Vec::with_capacity(6 * accepts.len() * hp.n_layer);
+        for (li, layer) in self.layers.iter().enumerate() {
+            let Mixer::Mamba(w) = &layer.mixer else {
+                continue;
+            };
+            let (st, eb) = bs.ssm[li].as_ref().expect("ssm arena").addr(&exec, 0);
+            let (kp, _g1) = vp.keep[li].as_ref().expect("keep").device_ptr(&exec.stream);
+            let (ap, _g2) = w.a.device_ptr(&exec.stream);
+            let (bp, _g3) = w.dt_bias.device_ptr(&exec.stream);
+            for &(s, off, acc) in accepts {
+                let sp = st + (s * state_elems * eb) as u64;
+                d.extend([sp, sp, kp + (off * keep_row * 4) as u64, ap, bp, acc as u64]);
+            }
+        }
+        exec.mamba2_rescan_upload(
+            &mut vp.d_rs_desc,
+            &d,
+            hp.mamba_heads,
+            hp.mamba_head_dim,
+            hp.d_state,
+            hp.n_groups,
+        )?;
+        Ok(true)
+    }
+
+    /// [`Self::spec_verify_commit`] as batched-copy launches instead of one
+    /// memcpy per copy. The rollback was 23 copies a round at a full accept
+    /// and up to ~115 at a partial one, each its own host submit while the
+    /// GPU sat idle between the verify's argmax and the next launch (~370 us
+    /// a DSpark round on GB10). Phase A carries every independent copy - the
+    /// full-accept windows, the state snapshots, and each partial window's
+    /// kept rows and xBC rows into a per-(request, layer) bounce; phase B
+    /// writes the bounces back (the window is both a source and the target,
+    /// so the two cannot share a launch). Byte-for-byte the same copies.
+    /// Ok(false) = a geometry the 16-byte copy cannot take; the caller runs
+    /// the per-copy path.
+    fn spec_verify_commit_batched(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+        accepts: &[(usize, usize, usize)],
+    ) -> Result<bool, GpuModelError> {
+        use cudarc::driver::DevicePtr;
+        let hp = self.hp.clone();
+        let exec = self.exec.clone();
+        let state_elems = hp.mamba_heads * hp.mamba_head_dim * hp.d_state;
+        let conv_dim = hp.conv_dim();
+        let km1 = hp.d_conv - 1;
+        let win_elems = km1 * conv_dim;
+        if !(conv_dim * 4).is_multiple_of(16) || !(state_elems * 2).is_multiple_of(16) {
+            return Ok(false);
+        }
+        let rescan = self.spec_replay_states(accepts)?;
+        let bs = self.batch.as_mut().expect("batch enabled");
+        let vp = bs.verify.as_mut().expect("verify planes");
+        let (bounce, _gb) = vp.d_rb_bounce.device_ptr(&exec.stream);
+        let mamba: Vec<usize> = (0..hp.n_layer)
+            .filter(|&li| matches!(hp.blocks[li], NemotronBlock::Mamba))
+            .collect();
+        let row = (conv_dim * 4) as u64;
+        let partial: Vec<usize> = (0..accepts.len())
+            .filter(|&ri| accepts[ri].2 != reqs[ri].2.len())
+            .collect();
+        // full accepts ride the first chunk's phase A
+        let chunks = partial.chunks(ROLLBACK_REQS).count().max(1);
+        for ci in 0..chunks {
+            let part = partial.chunks(ROLLBACK_REQS).nth(ci).unwrap_or(&[]);
+            let (mut a, mut b): (Vec<u64>, Vec<u64>) = (Vec::new(), Vec::new());
+            for (m, &li) in mamba.iter().enumerate() {
+                let (win, _g1) = bs.conv_win[li]
+                    .as_ref()
+                    .expect("conv arena")
+                    .device_ptr(&exec.stream);
+                let ssm = bs.ssm[li].as_ref().expect("ssm arena");
+                let (vw, _g2) = vp.vwin[li].as_ref().expect("vwin").device_ptr(&exec.stream);
+                let (xbc, _g3) = vp.xbc[li].as_ref().expect("xbc").device_ptr(&exec.stream);
+                if ci == 0 {
+                    for (ri, &(s, _, acc)) in accepts.iter().enumerate() {
+                        if acc == reqs[ri].2.len() {
+                            let o = (s * win_elems * 4) as u64;
+                            a.extend([vw + o, win + o, (win_elems * 4) as u64]);
+                        }
+                    }
+                }
+                for (q, &ri) in part.iter().enumerate() {
+                    let (s, off, acc) = accepts[ri];
+                    if !rescan {
+                        let snap = vp.snap[li].as_ref().expect("snap");
+                        let (dst, eb) = ssm.addr(&exec, s * state_elems);
+                        let (src, _) = snap.addr(&exec, (off + acc - 1) * state_elems);
+                        a.extend([src, dst, (state_elems * eb) as u64]);
+                    }
+                    let bw = bounce + (((m * ROLLBACK_REQS + q) * win_elems) * 4) as u64;
+                    let keep_old = km1.saturating_sub(acc);
+                    let take_new = km1 - keep_old;
+                    let sw = win + (s * win_elems * 4) as u64;
+                    for j in 0..keep_old {
+                        a.extend([sw + (acc + j) as u64 * row, bw + j as u64 * row, row]);
+                    }
+                    let xs = xbc + ((off + acc - take_new) as u64) * row;
+                    a.extend([xs, bw + keep_old as u64 * row, take_new as u64 * row]);
+                    b.extend([bw, sw, (win_elems * 4) as u64]);
+                }
+            }
+            exec.batched_copy_upload(&mut vp.d_rb_desc, &a)?;
+            exec.batched_copy_upload(&mut vp.d_rb_desc, &b)?;
+        }
+        Ok(true)
     }
 }

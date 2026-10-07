@@ -30,6 +30,54 @@ class ReleaseTests(unittest.TestCase):
                 with self.assertRaises(release.ReleaseError):
                     release.public_source(self.root)
 
+    def update_fixture(self):
+        app = self.root / "Paddock.app"
+        (app / "Contents/MacOS").mkdir(parents=True)
+        info = plistlib.loads((release.ROOT / "packaging/macos/Info.plist").read_bytes())
+        info.update(CFBundleShortVersionString="9.9.9", CFBundleVersion="9999",
+                    LSMinimumSystemVersion=release.MIN_OS)
+        (app / "Contents/Info.plist").write_bytes(plistlib.dumps(info))
+        return app, info
+
+    def test_update_requires_matching_key_and_signed_feed(self):
+        app, info = self.update_fixture()
+        tools = self.root / "tools"
+        tools.mkdir()
+        for name in ("generate_keys", "generate_appcast", "sign_update"):
+            (tools / name).touch()
+        with patch.object(release, "run", return_value=info["SUPublicEDKey"]):
+            self.assertEqual(release.validate_update_identity(app, tools, "test"), info)
+        with patch.object(release, "run", return_value="another-key"):
+            with self.assertRaises(release.ReleaseError):
+                release.validate_update_identity(app, tools, "test")
+        info.pop("SUPublicEDKey")
+        (app / "Contents/Info.plist").write_bytes(plistlib.dumps(info))
+        with self.assertRaises(release.ReleaseError):
+            release.validate_update_identity(app, tools, "test")
+
+    @unittest.skipUnless(os.environ.get("PADDOCK_TEST_SPARKLE_SIGNING") == "1",
+                         "Opt-in local Keychain signing diagnostic; never uploads or launches an app")
+    def test_real_signed_feed_and_archive_reject_tampering(self):
+        import shutil
+        app, _ = self.update_fixture()
+        shutil.copyfile("/usr/bin/true", app / "Contents/MacOS/Paddock")
+        (app / "Contents/MacOS/Paddock").chmod(0o755)
+        release.run("codesign", "--force", "--sign", "-", app)
+        archive = self.root / "Paddock-9.9.9-macos-arm64.zip"
+        release.run("ditto", "-c", "-k", "--keepParent", app, archive)
+        tools = release.ROOT / "apps/macos/.build/artifacts/sparkle/Sparkle/bin"
+        manifest = {"version": "9.9.9", "build_number": "9999"}
+        feed = release.signed_appcast(app, archive, tools, release.UPDATE_ACCOUNT, manifest)
+        signature = release.validate_appcast(feed, archive, manifest)
+        archive.write_bytes(archive.read_bytes() + b"tampered")
+        with self.assertRaises(release.subprocess.CalledProcessError):
+            release.run(tools / "sign_update", "--account", release.UPDATE_ACCOUNT,
+                        "--verify", archive, signature)
+        feed.write_bytes(feed.read_bytes().replace(b"9.9.9", b"9.9.8"))
+        with self.assertRaises(release.subprocess.CalledProcessError):
+            release.run(tools / "sign_update", "--account", release.UPDATE_ACCOUNT,
+                        "--verify", feed)
+
     def test_private_catalog_blocks_even_when_untracked(self):
         private = self.root / "crates/paddock-manager/models.private.toml"
         private.parent.mkdir(parents=True)

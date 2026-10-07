@@ -137,6 +137,16 @@ impl Elected {
 /// to remove - they keep the wire defaults, and the runner says so out loud.
 pub fn elected(arch: &str) -> Option<Elected> {
     Some(match arch {
+        "kolibri1" => Elected {
+            thinking: Knobs {
+                temperature: 1.0,
+                top_k: 128,
+                top_p: 0.97,
+                min_p: 0.0,
+            },
+            instruct: None,
+            source: "Aleph-Alpha/Kolibri-1 generation_config.json; eins78/Kolibri-1-mlx-mixed-4-8-bit preserves the same sampling defaults",
+        },
         // Qwen3.5 / Qwen3.6, dense and MoE. Both cards publish the same four
         // rows; the two we can act on are the general-task rows for each mode.
         // Qwen3.6's generation_config.json ships the thinking row verbatim

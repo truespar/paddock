@@ -1738,7 +1738,12 @@ impl Generator for GpuNemotron {
         // token spans instead of one full forward per prompt token. Serial
         // fallback for tiny prompts, packs missing the kernel set, or a
         // non-f16 KV dtype (the f16 prefill-attention arm is the only one
-        // wired so far - revisit at the fp8-KV flip).
+        // this serial lane wires). Since the fp8 default (2026-10-04) that
+        // means an fp8 serial stream walks token by token - acceptable
+        // because serving never lands here: the service enables the batch
+        // lane at every width, max_batch 1 included, and the batch lane
+        // prefills fp8 through its own G=16 tile. This lane is the reference
+        // walk the tests drive, and they pin f16.
         // Per-lane kernel set: the GGUF class prefills through the int8 mmq
         // ladder and never touches the fp8 pair, so asking it for f8row_gemm
         // used to send Q8_0 nemotron down the token-at-a-time fallback below

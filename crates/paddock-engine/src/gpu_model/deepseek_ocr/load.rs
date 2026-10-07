@@ -299,6 +299,10 @@ impl GpuDeepseekOcr {
             lm_head,
             max_ctx: max_ctx.min(hp.n_ctx_train),
             weights_bytes,
+            // KV stays f16 - the exception to the KV8 default (2026-10-04):
+            // the model is G=1 and the pack has no G=1 fp8 prefill tile, so an
+            // fp8 cache falls to the tiled/decode-class walk (batch.rs wmma_pf),
+            // correct but slower, with no fp8 quality evidence.
             kv_dtype: KvDtype::Fp16,
             decode: None,
             scratch: None,

@@ -78,7 +78,9 @@ fn engine_scheduler_specs_gpt_oss() {
         Engine::spawn(4, move || {
             let exec = Arc::new(GpuExecutor::new(0, &pack).map_err(|e| e.to_string())?);
             let map = MappedGguf::open(&path).map_err(|e| e.to_string())?;
-            let m = GpuGptOss::load(exec, &map, 2048).map_err(|e| e.to_string())?;
+            let mut m = GpuGptOss::load(exec, &map, 2048).map_err(|e| e.to_string())?;
+            // the exact class this test is stated in (the KV8 default is lossy)
+            m.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
             Ok(Box::new(m) as Box<dyn paddock_engine::generator::Generator>)
         })
         .expect("spawn engine")

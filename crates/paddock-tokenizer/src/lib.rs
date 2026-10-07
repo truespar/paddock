@@ -12,6 +12,7 @@
 //! id shows up as a logit mismatch on the first forward pass.
 
 mod pre_tokenizer;
+pub mod sam3;
 
 use paddock_models::gguf::{GgufFile, Value};
 use tokenizers::models::bpe::BPE;
@@ -156,11 +157,22 @@ impl GgufTokenizer {
             .and_then(Value::as_str)
             .map(str::to_owned);
 
+        // Kolibri 1's generation_config stops on <|im_end|> (the GGUF eos)
+        // AND <|endoftext|>; its converter carries only the first
+        let extra_eos_ids = match f.metadata.get("tokenizer.ggml.pre").and_then(Value::as_str) {
+            Some("kolibri1") => tokens
+                .iter()
+                .position(|t| *t == "<|endoftext|>")
+                .map(|i| vec![i as u32])
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+
         Ok(Self {
             inner,
             bos_id: id_meta("tokenizer.ggml.bos_token_id"),
             eos_id: id_meta("tokenizer.ggml.eos_token_id"),
-            extra_eos_ids: Vec::new(),
+            extra_eos_ids,
             eot_id: id_meta("tokenizer.ggml.eot_token_id"),
             pad_id: id_meta("tokenizer.ggml.padding_token_id"),
             add_bos,

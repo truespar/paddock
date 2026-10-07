@@ -28,6 +28,9 @@ extension EnvironmentValues {
     readingDisclosure = true
     pinned = false
   }
+  func retainRows(_ ids: Set<String>) {
+    measuredRows = measuredRows.filter { ids.contains($0.key) || $0.key == "native-bottom" }
+  }
 }
 
 /// Native presentation of the shared tree, not a second store or stream consumer.
@@ -130,6 +133,10 @@ struct NativeStudioTranscript: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .environment(\.transcriptDisclosure, scrollIntent)
+        .environment(\.nativeMarkdownViewportReclamation, true)
+        .onChange(of: transcript.blocks.map(\.id), initial: true) { _, ids in
+          scrollIntent.retainRows(Set(ids))
+        }
       }.background(PaddockStyle.canvas).accessibilityIdentifier("native-studio-transcript")
     }
   }

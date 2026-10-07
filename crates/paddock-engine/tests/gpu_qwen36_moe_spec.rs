@@ -35,6 +35,8 @@ fn moe_spec_deterministic_prefix_and_faster() {
     };
     let map = MappedGguf::open(&path).expect("open gguf");
     let mut m = GpuQwen35::load(exec, &map, 4096).expect("load moe");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    m.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     let vocab = m.vocab;
 
     let prompt: Vec<u32> = vec![760, 6511, 314, 9338, 369];

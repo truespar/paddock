@@ -19,10 +19,13 @@ import PaddockConversationCore
   @ObservationIgnored private var task: Task<Void, Never>?
   @ObservationIgnored private var openingTask: Task<Void, Never>?
   @ObservationIgnored private var inFlight = false
+  @ObservationIgnored weak var window: NSWindow?
 
-  func open() {
+  func open(resume model: NativeReadsModel? = nil) {
+    let resume = live ? model : nil
     close()
     let epoch = captureGeneration
+    let resumeEpoch = generation
     opening = true
     openingTask = Task {
       var allowed = AVCaptureDevice.authorizationStatus(for: .video) == .authorized
@@ -51,6 +54,7 @@ import PaddockConversationCore
         capture = nil
       }
       opening = false
+      if let resume, capture != nil, resumeEpoch == generation { start(model: resume) }
     }
   }
   func pause(clear: Bool = false) {
@@ -75,7 +79,15 @@ import PaddockConversationCore
     guard !live, !opening, let source = capture, model.canReadCamera else { return }
     startLoop(
       model: model, frame: { try await source.jpeg(longSide: $0) },
-      visible: { NSApplication.shared.isActive })
+      visible: { [weak self] in
+        Self.canReadVisibleWindow(
+          visible: self?.window?.occlusionState.contains(.visible) == true,
+          minimized: self?.window?.isMiniaturized ?? true,
+          appHidden: NSApplication.shared.isHidden)
+      })
+  }
+  static func canReadVisibleWindow(visible: Bool, minimized: Bool, appHidden: Bool) -> Bool {
+    visible && !minimized && !appHidden
   }
   /// Capture/visibility seams keep cancellation and single-flight tests fully
   /// deterministic without opening a camera or requesting TCC permission.

@@ -38,6 +38,8 @@ fn iq2_dense_file_serves_at_llama_parity() {
     let tok = GgufTokenizer::from_gguf(map.gguf()).expect("tokenizer");
     let t0 = Instant::now();
     let mut m = GpuQwen35::load(exec.clone(), &map, 2048).expect("load dense i-quant file");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    m.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     eprintln!("load {:.1}s", t0.elapsed().as_secs_f64());
     let prompt = tok.encode(PROMPT).expect("encode");
     let n = 24usize;

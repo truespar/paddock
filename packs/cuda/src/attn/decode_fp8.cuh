@@ -1694,6 +1694,109 @@ int pd_moe_topk_sigmoid_batch_sh(const void* logits, const void* bias,
     return (int)cudaGetLastError();
 }
 
+// ---- Kolibri 1 sigmoid_logit_add MoE router --------------------------------
+// Aleph Alpha's vLLM plugin (`sigmoid_logit_add_routing`) is the reference:
+// expert SELECTION runs on the raw f32 logits + the selection bias
+// (`exp_probs_b`), and the output weights are sigmoid of the selected RAW
+// logits, NOT renormalized, times routed_scale (1 on the shipped files). The
+// Laguna router above selects on sigmoid(logits) + bias, which picks a
+// different expert set whenever the bias is not negligible - fluent and
+// silently wrong if the two are conflated. Same xor-butterfly round as
+// pd_moe_topk_sigmoid_warp (strict >, lower index wins a tie); VJ experts a
+// lane, so one warp covers 32 * VJ (Kolibri's 384 rides VJ = 12).
+template <uint32_t VJ>
+__device__ __forceinline__ void pd_moe_topk_logit_sigmoid_warp(
+    const float* __restrict__ logits, const float* __restrict__ bias,
+    float routed_scale, uint32_t n_expert, uint32_t k,
+    uint32_t* __restrict__ out_idx, float* __restrict__ out_w) {
+    const uint32_t lane = threadIdx.x & 31u;
+    float sel[VJ];  // logit + bias (the selection score)
+    float raw[VJ];  // the raw logit (the weight source)
+    #pragma unroll
+    for (uint32_t j = 0; j < VJ; ++j) {
+        const uint32_t i = lane + 32u * j;
+        if (i < n_expert) {
+            const float l = logits[i];
+            raw[j] = l;
+            sel[j] = l + (bias ? bias[i] : 0.0f);
+        } else {
+            raw[j] = 0.0f;
+            sel[j] = -1e30f;
+        }
+    }
+    float myl = 0.0f;   // selection `lane`'s raw logit
+    uint32_t myi = 0u;  // selection `lane`'s expert index
+    for (uint32_t s = 0; s < k; ++s) {
+        float best = -1e30f, braw = 0.0f;
+        uint32_t bi = 0;
+        #pragma unroll
+        for (uint32_t j = 0; j < VJ; ++j) {
+            const uint32_t i = lane + 32u * j;
+            if (sel[j] > best) { best = sel[j]; braw = raw[j]; bi = i; }
+        }
+        #pragma unroll
+        for (uint32_t off = 16u; off > 0u; off >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, best, off);
+            const float orw = __shfl_xor_sync(0xffffffffu, braw, off);
+            const uint32_t oi = __shfl_xor_sync(0xffffffffu, bi, off);
+            if (ov > best || (ov == best && oi < bi)) {
+                best = ov; braw = orw; bi = oi;
+            }
+        }
+        #pragma unroll
+        for (uint32_t j = 0; j < VJ; ++j)
+            if ((bi >> 5) == j && (bi & 31u) == lane) sel[j] = -1e30f;
+        if (lane == s) { myl = braw; myi = bi; }
+    }
+    if (lane < k) {
+        out_idx[lane] = myi;
+        out_w[lane] = (1.0f / (1.0f + expf(-myl))) * routed_scale;
+    }
+}
+
+template <uint32_t VJ>
+__launch_bounds__(128, 1)
+__global__ void pd_moe_topk_logit_sigmoid_batch_kernel(
+    const float* __restrict__ logits, const float* __restrict__ bias,
+    float routed_scale, uint32_t n_expert, uint32_t k,
+    uint32_t* __restrict__ out_idx, float* __restrict__ out_w,
+    uint32_t batch) {
+    PD_PDL_ARM();
+    const uint32_t b = blockIdx.x * blockDim.y + threadIdx.y;
+    if (b >= batch) return;
+    pd_moe_topk_logit_sigmoid_warp<VJ>(logits + (size_t)b * n_expert, bias,
+                                       routed_scale, n_expert, k,
+                                       out_idx + (size_t)b * k,
+                                       out_w + (size_t)b * k);
+}
+
+// slot 748: [batch, n_expert] f32 logits -> idx/w [batch, k]. Refuses past
+// 512 experts or k > 16 rather than truncating the expert set.
+PD_EXPORT
+int pd_moe_topk_logit_sigmoid_batch(const void* logits, const void* bias,
+                                    float routed_scale, uint32_t n_expert,
+                                    uint32_t k, void* out_idx, void* out_w,
+                                    uint32_t batch, void* stream) {
+    if (batch == 0) return 0;
+    if (n_expert == 0 || n_expert > 512u || k == 0 || k > 16u || k > n_expert)
+        return cudaErrorInvalidValue;
+    const dim3 grid((batch + 3u) / 4u), block(32, 4);
+    const cudaStream_t st = (cudaStream_t)stream;
+    if (n_expert <= 256u)
+        pd_pdl_go(pd_moe_topk_logit_sigmoid_batch_kernel<8u>, grid, block, 0u, st,
+            (const float*)logits, (const float*)bias, routed_scale, n_expert, k,
+            (uint32_t*)out_idx, (float*)out_w, batch);
+    else if (n_expert <= 384u)
+        pd_pdl_go(pd_moe_topk_logit_sigmoid_batch_kernel<12u>, grid, block, 0u, st,
+            (const float*)logits, (const float*)bias, routed_scale, n_expert, k,
+            (uint32_t*)out_idx, (float*)out_w, batch);
+    else
+        pd_pdl_go(pd_moe_topk_logit_sigmoid_batch_kernel<16u>, grid, block, 0u, st,
+            (const float*)logits, (const float*)bias, routed_scale, n_expert, k,
+            (uint32_t*)out_idx, (float*)out_w, batch);
+    return (int)cudaGetLastError();
+}
+
 // DeepSeek-greedy router epilogue: same top-k SELECTION as
 // pd_moe_topk_warp, but the weights are the full softmax probabilities -
 // w_s = exp(l_s - m_all) / Σ_{all n_expert} exp(l_i - m_all), no

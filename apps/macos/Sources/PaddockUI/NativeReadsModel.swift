@@ -9,13 +9,22 @@ import UniformTypeIdentifiers
 private actor ReadsConnection {
   let client: any ManagerLoading
   var transport: NativeConversationTransport?
+  private var closed = false
   init(client: any ManagerLoading) { self.client = client }
   private func connection() async throws -> NativeConversationTransport {
+    guard !closed else { throw ConversationFailure.closed }
     if let transport { return transport }
     let host = try await client.nativeConversationHost()
+    try Task.checkCancellation()
+    guard !closed else { throw ConversationFailure.closed }
     let next = try NativeConversationTransport(host: host)
     transport = next
     return next
+  }
+  func close() async {
+    closed = true
+    await transport?.close()
+    transport = nil
   }
   func read(_ port: UInt16, _ body: Data) async throws -> ConversationValue {
     let transport = try await connection()
@@ -54,6 +63,7 @@ private actor ReadsConnection {
     var think = false
     var backend: String?
     var checkpoints: [String] = []
+    var conditional = false
     var id: UInt16 { port }
   }
   struct SavedSet: Decodable, Identifiable, Equatable {
@@ -62,7 +72,7 @@ private actor ReadsConnection {
     let body: String
     let revision: String
   }
-  struct Run: Identifiable, Codable {
+  struct Run: Identifiable, Codable, Sendable {
     var id = UUID()
     var at = Date()
     let fingerprint: String
@@ -80,6 +90,9 @@ private actor ReadsConnection {
     var steps = 1
     var think = 0
     var checkpoint: String?
+    var isCameraFrame: Bool {
+      pictures.first?.name.hasPrefix("camera") == true || excerpt == "camera frame"
+    }
     enum CodingKeys: String, CodingKey {
       case id, at, fingerprint, excerpt, characters, questions, raw, port, elapsedMilliseconds,
         state, fileName, samples, pictures, steps, think, checkpoint
@@ -87,9 +100,8 @@ private actor ReadsConnection {
     var retainedBytes: Int {
       // Never base64-encode multi-megabyte pictures on the main actor during
       // memory-pressure trimming. Count their existing storage directly.
-      var metadata = self
-      metadata.pictures = []
-      return ((try? JSONEncoder().encode(metadata).count) ?? 0)
+      return raw.estimatedRetainedBytes * 2 + (state?.utf8.count ?? 0) + excerpt.utf8.count
+        + questions.reduce(0) { $0 + $1.instructions.utf8.count + 256 }
         + pictures.reduce(0) { $0 + $1.url.utf8.count + $1.name.utf8.count }
     }
     nonisolated static func fingerprint(_ bytes: Data) -> String {
@@ -131,12 +143,15 @@ private actor ReadsConnection {
   private(set) var activeSession: ReadHistoryDocument?
   private var sessionRevision = ""
   private var sessionEpoch = 0
+  private var closed = false
+  @ObservationIgnored private let historyLoader = NativeReadHistoryLoader()
   private(set) var openingSession = false
   private(set) var historyUnsaved = false
   @ObservationIgnored var api: API
   // Inference takes authored JSON bytes, never an unordered dictionary.
   @ObservationIgnored var readAPI: @MainActor (UInt16, Data) async throws -> ConversationValue
   @ObservationIgnored private var task: Task<Void, Never>?
+  @ObservationIgnored private var closeConnection: () async -> Void
   @ObservationIgnored private var refreshError: String?
   @ObservationIgnored private var latestRequest: ConversationValue?
   @ObservationIgnored private var latestOrdering: [[String]]?
@@ -161,7 +176,7 @@ private actor ReadsConnection {
     dirty || busy || saving || importing || historyUnsaved || !draft.state.isEmpty
       || !draft.images.isEmpty
   }
-  var historyNavigationBlocked: Bool { busy || saving || importing || openingSession }
+  var historyNavigationBlocked: Bool { closed || busy || saving || importing || openingSession }
   /// A completed, saved read can be reopened without a discard prompt. Only
   /// input edits or results that have not reached SQLite need confirmation.
   var unsavedRead: Bool {
@@ -186,6 +201,9 @@ private actor ReadsConnection {
       .sorted { $0.updatedAt == $1.updatedAt ? $0.id < $1.id : $0.updatedAt > $1.updatedAt }
   }
   var validation: String? {
+    if draft.questions.contains(where: \.conditional), current?.conditional != true {
+      return "This model reads every question at once; choose a reader that supports conditions."
+    }
     if let checkpoint = draft.checkpoint, current?.checkpoints.contains(checkpoint) != true {
       return
         "The selected checkpoint is not available on this reader. Choose automatic routing or a Laya instance."
@@ -207,7 +225,8 @@ private actor ReadsConnection {
         ? "This runner does not support one of these question types." : nil)
   }
   var canRun: Bool {
-    current != nil && !busy && !saving && !importing && !openingSession && validation == nil
+    current != nil && !historyNavigationBlocked && !historyUnsaved
+      && validation == nil
       && (!draft.state.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         || !draft.images.isEmpty)
   }
@@ -222,16 +241,22 @@ private actor ReadsConnection {
     let connection = ReadsConnection(client: client)
     api = { path, method, body, query in try await connection.call(path, method, body, query) }
     readAPI = { port, body in try await connection.read(port, body) }
+    closeConnection = { await connection.close() }
   }
   private func decode<T: Decodable>(_ type: T.Type, _ v: ConversationValue) throws -> T {
-    try JSONDecoder().decode(type, from: JSONEncoder().encode(v))
+    try ConversationValueDecoder().decode(type, from: v)
+  }
+  private func checkOpen() throws {
+    try Task.checkCancellation()
+    guard !closed else { throw ConversationFailure.closed }
   }
   func refresh() async {
-    guard !loading else { return }
+    guard !closed, !loading else { return }
     loading = true
     defer { loading = false }
     do {
       let fleet = try await api("api/runners", "GET", nil, [:]).array ?? []
+      try checkOpen()
       var next: [Reader] = []
       for runner in fleet {
         try Task.checkCancellation()
@@ -240,6 +265,7 @@ private actor ReadsConnection {
         else { continue }
         do {
           let info = try await api("api/runners/\(port)/server", "GET", nil, [:])
+          try checkOpen()
           guard let caps = info["structured_read"],
             (caps["canvas_width"]?.integer ?? 0) > 0
               || ["laya", "clef"].contains(caps["backend"]?.string ?? "")
@@ -257,23 +283,27 @@ private actor ReadsConnection {
               maxSteps: min(8, max(1, caps["max_steps"]?.integer ?? 1)),
               think: caps["think"] == .bool(true),
               backend: caps["backend"]?.string,
-              checkpoints: caps["checkpoints"]?.array?.compactMap { $0["name"]?.string } ?? []))
+              checkpoints: caps["checkpoints"]?.array?.compactMap { $0["name"]?.string } ?? [],
+              conditional: caps["conditional"] == .bool(true)))
         } catch is CancellationError { throw CancellationError() } catch {
           if let previous = readers.first(where: { $0.port == port && $0.model == id }) {
             next.append(previous)
           }
         }
       }
-      try Task.checkCancellation()
+      try checkOpen()
       readers = next
       if !readers.contains(where: { $0.port == port }) { port = readers.first?.port ?? 0 }
       let epoch = setsEpoch
       let saved = try await api("api/reads", "GET", nil, [:])
+      try checkOpen()
       if epoch == setsEpoch { sets = try decode([SavedSet].self, saved) }
       await refreshHistory()
+      try checkOpen()
       if error == refreshError { error = nil }
       refreshError = nil
     } catch is CancellationError {} catch {
+      guard !closed else { return }
       refreshError = error.localizedDescription
       self.error = refreshError
     }
@@ -470,12 +500,19 @@ private actor ReadsConnection {
     error = nil
     clearRunErrors()
     task = Task {
-      defer { busy = false }
+      defer {
+        busy = false
+        trimHistory()
+      }
       do {
         let started = ContinuousClock.now
         let bytes = try await Task.detached(priority: .userInitiated) {
           try input.requestData(model: name)
         }.value
+        guard bytes.count <= ReadHistoryAdmission.requestLimit else {
+          throw ConversationFailure.invalid(
+            "This read is too large to save safely. Use fewer images or a smaller text section.")
+        }
         try Task.checkCancellation()
         let raw = try await readAPI(reader.port, bytes)
         try Task.checkCancellation()
@@ -501,7 +538,7 @@ private actor ReadsConnection {
         latestRequest = request
         latestOrdering = input.ordering
         latestRunID = result.id
-        runs = Array(([result] + runs).prefix(20))
+        runs.insert(result, at: 0)
         selectedRun = result.id
         await keepRun(result)
       } catch is CancellationError {} catch { routeError(error.localizedDescription) }
@@ -509,7 +546,7 @@ private actor ReadsConnection {
   }
   func cancel() { task?.cancel() }
   var canReadCamera: Bool {
-    current?.images == true && !historyNavigationBlocked && validation == nil
+    current?.images == true && !historyNavigationBlocked && !historyUnsaved && validation == nil
       && draft.state.utf8.count <= 4 * 1024 * 1024
   }
   /// Same transport and response validation as a text read, but no automatic
@@ -556,10 +593,10 @@ private actor ReadsConnection {
       steps: input.steps, think: input.think, checkpoint: input.checkpoint)
   }
   func keepCameraFrame(_ frame: Run) async {
-    guard !historyNavigationBlocked else { return }
+    guard !historyNavigationBlocked, !historyUnsaved else { return }
     var saved = frame
     saved.id = UUID()
-    runs = Array(([saved] + runs).prefix(20))
+    runs.insert(saved, at: 0)
     selectedRun = saved.id
     await keepRun(saved)
   }
@@ -575,12 +612,22 @@ private actor ReadsConnection {
   }
   // Bound in-memory results. Durable history is the shared SQLite document.
   func trimHistory(maxBytes: Int = 16 * 1024 * 1024) {
+    // Never reclaim unacknowledged results, or the one the user is reading.
+    guard !historyUnsaved, !busy, !saving, !openingSession else { return }
     var used = 0
-    let keep = Set(
-      runs.sorted { $0.at > $1.at }.prefix { run in
-        used += run.retainedBytes
-        return used <= maxBytes
-      }.map(\.id))
+    let selected = result?.id
+    var keep = Set<UUID>()
+    for run in runs where run.id == selected || run.id == latestRunID {
+      keep.insert(run.id)
+      used += run.retainedBytes
+    }
+    for run in runs where !keep.contains(run.id) {
+      let bytes = run.retainedBytes
+      if used + bytes <= maxBytes {
+        keep.insert(run.id)
+        used += bytes
+      }
+    }
     runs = runs.filter { keep.contains($0.id) }
     if let latestRunID, !keep.contains(latestRunID) {
       latestRequest = nil
@@ -591,6 +638,35 @@ private actor ReadsConnection {
   func settle() async {
     await task?.value
     await imageImportTask?.value
+  }
+  var hasEvictedRuns: Bool { (activeSession?.runs.count ?? 0) > runs.count && !historyUnsaved }
+  func reloadCachedRuns() async {
+    guard !closed, !historyNavigationBlocked, !historyUnsaved, let doc = activeSession else {
+      return
+    }
+    let epoch = sessionEpoch
+    openingSession = true
+    defer { if epoch == sessionEpoch { openingSession = false } }
+    do {
+      let loaded = try await historyLoader.hydrate(doc)
+      guard !closed, epoch == sessionEpoch, activeSession?.id == doc.id, !Task.isCancelled else {
+        return
+      }
+      runs = loaded.runs.reversed()
+      // This is cache refill, not navigation: keep the draft and selection.
+    } catch is CancellationError {} catch {
+      guard !closed, epoch == sessionEpoch else { return }
+      historyError = error.localizedDescription
+    }
+  }
+  func shutdown() async {
+    guard !closed else { return }
+    closed = true
+    task?.cancel()
+    imageImportTask?.cancel()
+    sessionEpoch += 1
+    await closeConnection()
+    await settle()
   }
   func clearRunErrors() {
     stateError = nil
@@ -624,6 +700,7 @@ private actor ReadsConnection {
     }
   }
   func refreshHistory() async {
+    guard !closed else { return }
     let epoch = sessionEpoch
     historyGeneration += 1
     let generation = historyGeneration
@@ -641,6 +718,7 @@ private actor ReadsConnection {
   }
 
   private func keepRun(_ run: Run) async {
+    guard !closed else { return }
     let at = (run.at.timeIntervalSince1970 * 1000).rounded()
     var fields: [String: ConversationValue] = [
       "id": .string(run.id.uuidString), "at": .number(Decimal(at)),
@@ -650,7 +728,8 @@ private actor ReadsConnection {
       "fileName": .string(run.fileName),
       "questions": .object(
         Dictionary(
-          run.questions.map { ($0.questionID, $0.wire) }, uniquingKeysWith: { _, b in b })),
+          run.questions.map { ($0.questionID, $0.wire(in: run.questions)) },
+          uniquingKeysWith: { _, b in b })),
       "questionOrder": .array(
         run.questions.map { q in
           .array(
@@ -673,34 +752,45 @@ private actor ReadsConnection {
         (run.state ?? "").split(separator: "\n").first.map(String.init)?.prefix(60)
           ?? run.pictures.first?.name.prefix(60) ?? "Untitled read")
       : run.fileName
-    var doc =
-      activeSession?.value.object ?? [
-        "id": .string(UUID().uuidString), "title": .string(title),
-        "createdAt": .number(Decimal(at)),
-      ]
-    doc["updatedAt"] = .number(Decimal(at))
-    doc["model"] = value["model"]
-    doc["runs"] = .array(Array(((doc["runs"]?.array ?? []) + [value]).suffix(20)))
-    var pictures = doc["images"]?.object ?? [:]
-    for picture in run.pictures { pictures[picture.ref] = .string(picture.url) }
-    let retained = Set(
-      (doc["runs"]?.array ?? []).flatMap {
-        ($0["images"]?.array ?? []).compactMap { $0["ref"]?.string }
-      })
-    pictures = pictures.filter { retained.contains($0.key) }
-    doc["images"] = pictures.isEmpty ? nil : .object(pictures)
-    activeSession = ReadHistoryDocument(value: .object(doc))
-    historyUnsaved = true
-    await saveHistory()
+    let previous = activeSession
+    do {
+      let admission = try await Task.detached(priority: .utility) {
+        try ReadHistoryAdmission.append(value, pictures: run.pictures, title: title, to: previous)
+      }.value
+      guard !closed else { return }
+      if admission.rolledOver {
+        sessionRevision = ""
+        // Older results remain in their original SQLite history entry.
+        runs = [run]
+      }
+      activeSession = admission.document
+      historyUnsaved = true
+      await saveHistory()
+    } catch let overflow as ReadHistoryAdmission.Overflow {
+      guard !closed else { return }
+      activeSession = overflow.document
+      sessionRevision = ""
+      historyUnsaved = true
+      historyError =
+        "This result is retained in memory but exceeds the history limit. Export it before starting another read."
+    } catch {
+      guard !closed else { return }
+      historyUnsaved = true
+      historyError = error.localizedDescription
+    }
   }
 
   func saveHistory() async {
-    guard !saving, let doc = activeSession else { return }
+    guard !closed, !saving, let doc = activeSession else { return }
     saving = true
-    defer { saving = false }
+    defer {
+      saving = false
+      trimHistory()
+    }
     let epoch = sessionEpoch
     do {
       let json = try await Task.detached(priority: .utility) { try doc.json }.value
+      try checkOpen()
       guard json.utf8.count <= 16 * 1024 * 1024 else { throw ConversationFailure.tooLarge }
       let reply = try await api(
         "api/read-history/\(doc.id)", "PUT",
@@ -714,13 +804,14 @@ private actor ReadsConnection {
       historyError = nil
       await refreshHistory()
     } catch is CancellationError {} catch {
+      guard !closed, epoch == sessionEpoch else { return }
       historyError =
         "The result is available, but history could not be saved: \(error.localizedDescription)"
     }
   }
 
   func openSession(_ id: String) async {
-    guard !busy, !saving, !importing, ConversationDocument.validID(id) else { return }
+    guard !closed, !busy, !saving, !importing, ConversationDocument.validID(id) else { return }
     sessionEpoch += 1
     let epoch = sessionEpoch
     let before = draft
@@ -731,50 +822,20 @@ private actor ReadsConnection {
       guard let text = snapshot["doc"]?.string, let revision = snapshot["revision"]?.string else {
         throw ConversationFailure.invalid("Invalid read history response.")
       }
-      let doc = try await Task.detached(priority: .userInitiated) {
-        try ReadHistoryDocument(json: text)
-      }.value
+      let loaded = try await historyLoader.load(text)
+      let doc = loaded.document
       guard doc.id == id else {
         throw ConversationFailure.invalid("The read identity does not match its address.")
       }
-      guard epoch == sessionEpoch, draft == before else { return }
-      var restored: [Run] = []
-      for (index, value) in doc.runs.enumerated() {
-        var input = try ReadHistoryDocument.draft(value)
-        let imageTable = doc.value["images"]
-        input.images = try await Task.detached(priority: .userInitiated) {
-          try ReadPicture.restore(value, table: imageTable)
-        }.value
-        guard epoch == sessionEpoch, draft == before, !Task.isCancelled else { return }
-        let raw = value["response"] ?? .null
-        let response = try decode(ReadResponse.self, raw)
-        try response.validate(for: input.questions)
-        guard let p = value["port"]?.integer, let runPort = UInt16(exactly: p), runPort > 0 else {
-          throw ConversationFailure.invalid("Invalid saved reader port.")
-        }
-        var run = Run(
-          fingerprint: "", excerpt: value["excerpt"]?.string ?? "",
-          characters: value["chars"]?.integer ?? 0, questions: input.questions, raw: raw,
-          port: runPort, elapsedMilliseconds: try decode(Double.self, value["ms"] ?? .number(0)),
-          response: response,
-          state: value["stateMissing"] == .bool(true) ? nil : input.state,
-          fileName: value["fileName"]?.string ?? "", samples: input.samples,
-          pictures: input.images, steps: input.steps, think: input.think,
-          checkpoint: input.checkpoint)
-        // Legacy web runs have no UUID. Stable within this loaded document.
-        run.id = value["id"]?.string.flatMap(UUID.init(uuidString:)) ?? UUID()
-        run.at = Date(
-          timeIntervalSince1970: try decode(Double.self, value["at"] ?? .number(0)) / 1000)
-        restored.append(run)
-        if index == doc.runs.count - 1 {
-          draft = input
-          fileName = run.fileName
-          if readers.contains(where: { $0.port == runPort }) { port = runPort }
-        }
+      guard !closed, epoch == sessionEpoch, draft == before, !Task.isCancelled else { return }
+      if let input = loaded.draft, let last = loaded.runs.last {
+        draft = input
+        fileName = last.fileName
+        if readers.contains(where: { $0.port == last.port }) { port = last.port }
       }
       activeSession = doc
       sessionRevision = revision
-      runs = restored.reversed()
+      runs = loaded.runs.reversed()
       selectedRun = runs.first?.id
       latestRunID = runs.first?.id
       latestRequest = draft.request(
@@ -791,7 +852,10 @@ private actor ReadsConnection {
       historyUnsaved = false
       historyError = nil
       clearRunErrors()
-    } catch is CancellationError {} catch { historyError = error.localizedDescription }
+    } catch is CancellationError {} catch {
+      guard !closed, epoch == sessionEpoch else { return }
+      historyError = error.localizedDescription
+    }
   }
 
   func clearHistory() async {
@@ -945,10 +1009,8 @@ private actor ReadsConnection {
     return work
   }
   func loadFile(_ url: URL, asJSON: Bool = false) async {
-    if !asJSON, UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) == true {
-      await addPictures([url])
-      return
-    }
+    // "Load a file" is extraction, like web Reads. Images reach the vision
+    // attachment path only through Add images, paste, or a vision-aware drop.
     guard !importing && !busy else { return }
     importing = true
     defer { importing = false }

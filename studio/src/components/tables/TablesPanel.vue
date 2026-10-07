@@ -13,7 +13,7 @@ import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter, type Loca
 import { storeToRefs } from 'pinia'
 import { useTablesStore } from '@/stores/tables'
 import { useToastsStore } from '@/stores/toasts'
-import { tablesPreferencesApi } from '@/lib/api'
+import { usePanelFold } from '@/composables/usePanelFold'
 import { datasetKey, type TableInput, type TableRun, type TableSession } from '@/lib/table-history'
 import { uuid } from '@/lib/uuid'
 import ReadsSidebar from '@/components/reads/ReadsSidebar.vue'
@@ -480,30 +480,8 @@ watch(
   { immediate: true },
 )
 
-// the side panel folds like the chat list and remembers it, as Reads does; a
-// narrow window starts folded
-const panelOpen = ref(window.innerWidth >= 1100)
-let panelEdited = false
-let restoringPanel = false
-onMounted(async () => {
-  try {
-    const saved = await tablesPreferencesApi.get()
-    if (!panelEdited && typeof saved.tablesPanelOpen === 'boolean') {
-      restoringPanel = true
-      panelOpen.value = saved.tablesPanelOpen
-    }
-  } catch (e) {
-    toasts.push({ tone: 'bad', title: 'Layout could not be loaded', description: String(e) })
-  } finally { restoringPanel = false }
-})
-let panelSave: Promise<unknown> = Promise.resolve()
-watch(panelOpen, (v) => {
-  if (restoringPanel) return
-  panelEdited = true
-  panelSave = panelSave.catch(() => {}).then(() => tablesPreferencesApi.save(v)).catch((e) => {
-    toasts.push({ tone: 'bad', title: 'Layout was not saved', description: String(e) })
-  })
-}, { flush: 'sync' })
+// the side panel folds like the chat list and remembers it, as Reads does
+const panelOpen = usePanelFold('tablesPanelOpen')
 </script>
 
 <template>
@@ -535,7 +513,7 @@ watch(panelOpen, (v) => {
       </div>
     </div>
 
-    <div v-if="!predictors.length && !models.loading" class="tb__none">
+    <div v-if="!predictors.length && !models.loading && !history.document" class="tb__none">
       <Icon name="table" :size="32" class="tb__none-icon" />
       <p class="tb__none-title">No table model is running</p>
       <p class="tb__none-txt">
@@ -546,6 +524,11 @@ watch(panelOpen, (v) => {
       </RouterLink>
     </div>
 
+    <template v-else>
+    <p v-if="!predictors.length && !models.loading" class="tb__nomodel">
+      No table model is running, so this table cannot run again until Kumo Tabular is started in
+      the Manager.
+    </p>
     <p v-if="history.error" class="tb__error" role="alert">{{ history.error }} <button class="pk-btn" :disabled="navigationBlocked" @click="saveDraft">Retry save</button> <button class="pk-btn" :disabled="navigationBlocked" @click="saveCopy">Save a copy</button></p>
     <fieldset class="tb__fields" :disabled="busy || restoring || switching">
       <div class="tb__card">
@@ -695,6 +678,7 @@ watch(panelOpen, (v) => {
         <pre>{{ curl }}</pre>
       </Collapsible>
     </fieldset>
+    </template>
   </div>
   </main>
   </div>
@@ -705,7 +689,7 @@ watch(panelOpen, (v) => {
    (without width it shrank to its content and the column sat narrow at the
    left), the pane scrolls, and a folded list leaves a rail behind */
 .tables-workspace { display: flex; width: 100%; height: 100%; min-height: 0; overflow: hidden; }
-.tables-workspace__main { flex: 1; min-width: 0; overflow: auto; padding: 32px 32px 0; }
+.tables-workspace__main { flex: 1; min-width: 0; overflow: auto; padding: 32px 32px 0; container-type: inline-size; }
 .tables-workspace__rail {
   flex: none;
   width: 48px;
@@ -729,6 +713,8 @@ watch(panelOpen, (v) => {
   margin: 0 auto;
   padding-bottom: 32px;
 }
+/* the history pages' one width rule (variables.css): Reads, Tables, Masks */
+@container (min-width: 1100px) { .tb { max-width: var(--pk-panel-width-wide); } }
 .tb__head {
   display: flex;
   align-items: flex-start;
@@ -746,6 +732,15 @@ watch(panelOpen, (v) => {
 .tb__lead {
   margin: 0;
   color: var(--pk-text-muted);
+  font-size: var(--pk-font-size-sm);
+}
+.tb__nomodel {
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border-radius: var(--pk-radius-md);
+  background: var(--pk-bg-surface);
+  border: 1px solid var(--pk-border-default);
+  color: var(--pk-text-secondary);
   font-size: var(--pk-font-size-sm);
 }
 .tb__none {

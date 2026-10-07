@@ -58,6 +58,8 @@ fn batched_prefill_matches_serial_step() {
     let map = MappedGguf::open(&path).expect("open gguf");
     let tok = GgufTokenizer::from_gguf(map.gguf()).expect("tokenizer");
     let mut m = GpuQwen35::load(exec, &map, 2048).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    m.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
 
     let short = tok.encode(SHORT).expect("encode");
     let long: Vec<u32> = {
@@ -136,6 +138,8 @@ fn prefill_rate_bench() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(2048usize);
     let mut m = GpuQwen35::load(exec, &map, n.max(2048)).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    m.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     let unit = tok.encode(LONG_UNIT).expect("encode");
     let prompt: Vec<u32> = unit.iter().cycle().take(n).copied().collect();
     let mut best = f64::MAX;

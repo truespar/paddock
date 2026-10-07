@@ -154,6 +154,10 @@ private final class AudioSource: Sendable {
     for job in analyses.values { job.task.cancel() }
     sourceJobs.removeAll()
     analyses.removeAll()
+    reclaim()
+  }
+  public func reclaim() {
+    // Active decoders/playback hold their own leases on source files.
     sources.removeAll()
     sourceOrder.removeAll()
     peaks.removeAll()

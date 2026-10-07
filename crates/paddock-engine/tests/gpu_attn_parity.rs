@@ -2959,6 +2959,129 @@ fn spec_verify_attention_matches_decode_batch_on_fp8() {
     eprintln!("spec verify attention agrees with per-row decode on e4m3; worst {worst:.2e}");
 }
 
+/// The single-session verify election (qwen35 attn_verify_dispatch): one slot
+/// block of k1 rows takes the block-shared krs walk at one CTA per SM instead
+/// of the per-row decode walk. Both are the GV=6 krs kernel in the same e4m3
+/// class; what differs is only where the splits fall - the shared walk cuts
+/// the BLOCK's span (its deepest row), the per-row walk each row's own, so
+/// rows whose span rounds to another chunk land other bits (at 4K / 12
+/// splits, rows 4088-4091 cut at 341 keys and 4092-4095 at 342). The gate:
+/// the shared walk writes every row, and every row agrees with the per-row
+/// walk inside the spec class.
+#[test]
+fn spec_verify_single_block_shared_walk_matches_per_row() {
+    let Some(exec) = common::gpu() else {
+        return;
+    };
+    if !exec.has_paged_kv()
+        || !exec.has_attn_spec_batch_paged()
+        || !exec.has_attn_partial_batch_paged()
+    {
+        eprintln!("pack has no spec / paged partial attention - skipping");
+        return;
+    }
+    let (n_heads, n_kv_heads, head_dim) = (24usize, 4usize, 256usize);
+    let kv_dim = n_kv_heads * head_dim;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let max_ctx = 4096usize;
+    let bps = max_ctx / 16;
+    let qdim = n_heads * head_dim;
+    let dt = KvDtype::Fp8E4m3;
+    let n_splits = 12usize; // the GB10 election: 48 SMs / 4 kv heads
+    let d_k = e4m3_dev_u8(&exec, &det(max_ctx * kv_dim, 301));
+    let d_v = e4m3_dev_u8(&exec, &det(max_ctx * kv_dim, 302));
+    let bt_host: Vec<u32> = (0..bps as u32).collect();
+    let d_bt = exec.stream.clone_htod(&bt_host).expect("bt");
+    let d_nosink = exec
+        .to_device(&vec![f32::NEG_INFINITY; n_heads])
+        .expect("neg-inf sinks");
+    for k1 in [4usize, 8] {
+        let positions: Vec<u32> = (0..k1).map(|j| (max_ctx - k1 + j) as u32).collect();
+        let slots = vec![0u32; k1];
+        let d_q = exec.to_device(&det(k1 * qdim, 303 + k1 as u64)).expect("q");
+        let d_pos = exec.stream.clone_htod(&positions).expect("pos");
+        let d_slots = exec.stream.clone_htod(&slots).expect("slots");
+        let cells = n_heads * k1 * n_splits;
+        let run = |shared: bool| -> Vec<f32> {
+            let mut d_o = exec.alloc(cells * head_dim).expect("o");
+            let mut d_ml = exec.alloc(cells * 2).expect("ml");
+            let mut d_out = exec.alloc(k1 * qdim).expect("out");
+            if shared {
+                exec.attn_spec_batch_paged(
+                    &d_q,
+                    &d_k,
+                    &d_v,
+                    &mut d_o,
+                    &mut d_ml,
+                    &d_pos,
+                    Some(&d_slots),
+                    &d_bt,
+                    bps,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    kv_dim,
+                    0,
+                    n_splits,
+                    k1,
+                    k1,
+                    scale,
+                    dt,
+                )
+                .expect("shared walk");
+            } else {
+                exec.attn_partial_batch_paged(
+                    &d_q,
+                    &d_k,
+                    &d_v,
+                    &mut d_o,
+                    &mut d_ml,
+                    &d_pos,
+                    Some(&d_slots),
+                    &d_bt,
+                    bps,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    kv_dim,
+                    0,
+                    n_splits,
+                    k1,
+                    scale,
+                    dt,
+                )
+                .expect("per-row walk");
+            }
+            exec.attn_combine_batch(
+                &d_o, &d_ml, &d_nosink, &mut d_out, n_heads, head_dim, n_splits, k1,
+            )
+            .expect("combine");
+            exec.to_host(&d_out).expect("dtoh")
+        };
+        let per_row = run(false);
+        let shared = run(true);
+        for (what, out) in [("per-row", &per_row), ("shared", &shared)] {
+            for (row, cells) in out.chunks(qdim).enumerate() {
+                assert!(
+                    cells.iter().any(|v| *v != 0.0),
+                    "k1 {k1}: {what} wrote nothing for row {row}"
+                );
+            }
+        }
+        let maxd = per_row
+            .iter()
+            .zip(&shared)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("k1 {k1}: shared vs per-row max_abs_diff {maxd:.2e}");
+        // NaN must fail too, hence not `maxd >= SPEC_CLASS`
+        assert!(
+            maxd.partial_cmp(&SPEC_CLASS) == Some(std::cmp::Ordering::Less),
+            "k1 {k1}: shared walk {maxd:.3e} off the per-row walk"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The family-specific KV WRITERS at fp8
 //
@@ -2968,7 +3091,7 @@ fn spec_verify_attention_matches_decode_batch_on_fp8() {
 // for an ARCH rather than for one family:
 //
 //   gemma4    kv_nra_rows, kv_nra_rows_i16      <- covered here
-//   granite   rope_norm_qk_append_paged         <- covered here
+//   granite   rope_norm_qk_append_paged         <- its own test (fp8 vs its f16)
 //   qwen35    q36_qkg_nra_rows                  ruled out live (PADDOCK_NO_QNF
 //                                               changes nothing), dflash_cond_
 //                                               append is f16 by design
@@ -3184,15 +3307,162 @@ fn fused_kv_writers_match_the_chain_at_both_dtypes() {
             );
         }
 
-        // ---- granite's rope_norm_qk_append_paged is not covered here, and
-        // deliberately so. Its name says "norm" but it takes no weight tensor
-        // and no eps, so a rope-only chain is the obvious reading - and that
-        // reading is wrong: it lands worst-rel 2.0 against the fused kernel at
-        // FP16, which is a different computation, not a rounding gap. Writing a
-        // reference I cannot justify would produce a test that passes or fails
-        // for reasons unrelated to fp8. Someone who knows that kernel's
-        // contract should supply the chain; until then granite's writer is the
-        // one KV writer with no fp8 evidence either way (task filed).
+        // ---- granite's rope_norm_qk_append_paged has its own test below
+        // (granite_fused_writer_stores_its_f16_values_at_fp8): its contract
+        // has no unfused chain to compare against, so that test holds the fp8
+        // store to the kernel's own f16 store instead.
+    }
+}
+
+/// Granite's fused K/V writer (`rope_norm_qk_append_paged`) at fp8 stores, at
+/// e4m3 precision, exactly what it stores at f16 - the class every granite
+/// board validated. Its contract has no unfused chain to stand beside it (its
+/// "norm" takes no weight and no eps; a rope-only chain is a different
+/// computation, 2.0 worst-rel off at f16), so the reference is the kernel
+/// itself: run it into an f16 pool and an fp8 pool from the same inputs, and
+/// every fp8 cell must decode to within one e4m3 quantum of its f16 cell (the
+/// double rounding f32 -> f16 -> e4m3 against the writer's f32 -> e4m3).
+/// Poisoned pools keep "wrote nothing" from passing; q must come out of both
+/// runs identical, since the cache width cannot touch the query path.
+#[test]
+fn granite_fused_writer_stores_its_f16_values_at_fp8() {
+    let Some(exec) = common::gpu() else {
+        return;
+    };
+    if !exec.has_paged_kv() || !exec.has_rope_norm_qk_append_paged() {
+        return;
+    }
+    let (n_heads, n_kv, hd, bps, n_blocks) = (16usize, 4usize, 128usize, 8usize, 8usize);
+    let kv_dim = n_kv * hd;
+    let q_dim = n_heads * hd;
+    let rope = (
+        10000f32.powf(-2.0 / hd as f32),
+        1.0f32,
+        0.0f32,
+        1.0f32,
+        0.0f32,
+        1.0f32,
+    );
+    let rows = 24usize;
+    // two slots, the second crossing a 16-position block boundary
+    let (mut pos, mut slots) = (Vec::new(), Vec::new());
+    for i in 0..rows {
+        if i < rows / 2 {
+            slots.push(0u32);
+            pos.push(3 + i as u32);
+        } else {
+            slots.push(1u32);
+            pos.push(10 + (i - rows / 2) as u32);
+        }
+    }
+    let mut bt = vec![0u32; 2 * bps];
+    bt[0] = 2;
+    bt[1] = 3;
+    bt[bps] = 5;
+    bt[bps + 1] = 7;
+    let d_pos = exec.to_device_u32(&pos).expect("pos");
+    let d_slots = exec.to_device_u32(&slots).expect("slots");
+    let d_bt = exec.to_device_u32(&bt).expect("bt");
+    let q0 = det(rows * q_dim, 21);
+    let k0 = det(rows * kv_dim, 22);
+    let v0 = det(rows * kv_dim, 23);
+    let d_v = exec.to_device(&v0).expect("v");
+
+    // one fused write at `dt` into poisoned pools: (k pool, v pool, q after)
+    let write = |dt: KvDtype| {
+        let bytes = n_blocks * 16 * kv_dim * dt.bytes();
+        let mut q = exec.to_device(&q0).expect("q");
+        let mut k = exec.to_device(&k0).expect("k");
+        let mut pk = exec.to_device_u8(&vec![0xABu8; bytes]).expect("pk");
+        let mut pv = exec.to_device_u8(&vec![0xABu8; bytes]).expect("pv");
+        exec.rope_norm_qk_append_paged(
+            &mut q,
+            &mut k,
+            &d_v,
+            &mut pk,
+            &mut pv,
+            &d_pos,
+            Some(&d_slots),
+            &d_bt,
+            bps,
+            n_heads,
+            n_kv,
+            hd,
+            rope,
+            rows,
+            dt,
+        )
+        .expect("rope_norm_qk_append_paged");
+        (
+            exec.to_host_range_u8(&pk, 0, bytes).expect("pk back"),
+            exec.to_host_range_u8(&pv, 0, bytes).expect("pv back"),
+            exec.to_host(&q).expect("q back"),
+        )
+    };
+    let (k16, v16, q16) = write(KvDtype::Fp16);
+    let (k8, v8, q8) = write(KvDtype::Fp8E4m3);
+    assert_eq!(q16, q8, "the cache width changed the query path");
+
+    // the f16 store's rows, gathered back out of the pool by (slot, position)
+    let gather = |pool: &[u8]| -> Vec<f32> {
+        let mut out = vec![0f32; rows * kv_dim];
+        for r in 0..rows {
+            let (s, p) = (slots[r] as usize, pos[r] as usize);
+            let blk = bt[s * bps + p / 16] as usize;
+            let base = (blk * 16 + p % 16) * kv_dim * 2;
+            for d in 0..kv_dim {
+                let o = base + 2 * d;
+                out[r * kv_dim + d] = f16::from_le_bytes([pool[o], pool[o + 1]]).to_f32();
+            }
+        }
+        out
+    };
+    // Per written cell: the fp8 byte must decode to within ONE e4m3 quantum of
+    // the f16 store's value at that magnitude. The writer rounds f32 -> e4m3
+    // once; the f16 store already rounded to f16, so f16 -> e4m3 can land the
+    // other neighbour (double rounding) - never further. The quantum is
+    // absolute, 2^(e-3) for a normal e4m3 and 2^-9 under 2^-6: a relative bar
+    // calls a one-step subnormal flip (4 -> 5 x 2^-9) a 20% error.
+    let bytes8 = n_blocks * 16 * kv_dim;
+    let quantum = |x: f32| -> f32 {
+        let a = x.abs();
+        if a < 2f32.powi(-6) {
+            2f32.powi(-9)
+        } else {
+            2f32.powi(a.log2().floor() as i32 - 3)
+        }
+    };
+    for (name, pool16, pool8) in [("k", &k16, &k8), ("v", &v16, &v8)] {
+        assert_ne!(
+            pool8,
+            &vec![0xABu8; bytes8],
+            "{name}: fp8 pool untouched - wrote NOTHING"
+        );
+        let want = gather(pool16);
+        let (mut off, mut worst_q) = (0usize, 0f32);
+        for r in 0..rows {
+            let (s, p) = (slots[r] as usize, pos[r] as usize);
+            let blk = bt[s * bps + p / 16] as usize;
+            let base = (blk * 16 + p % 16) * kv_dim;
+            for d in 0..kv_dim {
+                let x = want[r * kv_dim + d];
+                let y = e4m3_decode(pool8[base + d]);
+                let q = (x - y).abs() / quantum(x);
+                if x != y {
+                    off += 1;
+                }
+                worst_q = worst_q.max(q);
+            }
+        }
+        let frac = 100.0 * off as f64 / (rows * kv_dim) as f64;
+        eprintln!(
+            "granite writer {name} fp8 vs its f16 store: worst {worst_q:.3} quanta, \
+             {frac:.1}% of cells not equal to the f16 value (e4m3 rounding)"
+        );
+        assert!(
+            worst_q <= 1.0,
+            "{name}: fp8 store {worst_q:.3} e4m3 quanta off its f16 store"
+        );
     }
 }
 

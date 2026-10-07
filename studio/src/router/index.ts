@@ -15,6 +15,7 @@ import PromptsPanel from '@/components/prompts/PromptsPanel.vue'
 import EmbeddingsPanel from '@/components/embeddings/EmbeddingsPanel.vue'
 import ReadsPanel from '@/components/reads/ReadsPanel.vue'
 import TablesPanel from '@/components/tables/TablesPanel.vue'
+import MasksPanel from '@/components/masks/MasksPanel.vue'
 import CloudPanel from '@/components/cloud/CloudPanel.vue'
 import ConnectorsPanel from '@/components/connectors/ConnectorsPanel.vue'
 import SettingsPanel from '@/components/settings/SettingsPanel.vue'
@@ -121,6 +122,11 @@ const router = createRouter({
         // ?port= picks the endpoint (the model page's "open in Studio").
         // /studio/tables/<id> names the session on screen, as reads/<id> does
         { path: 'tables/:id?', name: 'tables', component: TablesPanel },
+        // Masks: a picture and a few words or example boxes in, every
+        // matching object's mask out (SAM 3, POST /v1/masks). A picture in
+        // and masks out, so a page beside Tables, never a chat lane.
+        // ?port= picks the endpoint (the model page's "open in Studio").
+        { path: 'masks/:id?', name: 'masks', component: MasksPanel },
         // Pictures are made in a CONVERSATION: an image model holds a lane in
         // the chat like a speech model does, the prompt is the turn and the
         // picture the reply, with its seed and settings on the record. The

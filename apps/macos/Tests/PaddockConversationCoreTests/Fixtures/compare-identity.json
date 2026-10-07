@@ -164,5 +164,16 @@
     "id": "openrouter/model",
     "name": "openrouter/model",
     "vendor": "OpenRouter"
+  },
+  {
+    "id": "aleph-alpha/kolibri-1",
+    "display": "Aleph Alpha: Kolibri 1",
+    "name": "Kolibri 1",
+    "vendor": "Aleph Alpha"
+  },
+  {
+    "id": "Kolibri-1-NVFP4",
+    "name": "Kolibri-1-NVFP4",
+    "vendor": "Aleph Alpha"
   }
 ]

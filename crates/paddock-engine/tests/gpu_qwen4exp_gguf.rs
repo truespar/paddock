@@ -49,6 +49,7 @@ fn gguf_greedy_continuation() {
     let tok = GgufTokenizer::from_gguf(map.gguf()).expect("tokenizer");
     drop(map);
     let t0 = Instant::now();
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load_gguf_with_slots(&exec, &path, 4096, 1).expect("load gguf");
     let load_s = t0.elapsed().as_secs_f64();
     let headroom = exec.vram_headroom().unwrap_or(0);
@@ -142,6 +143,7 @@ fn gguf_incremental_matches_prefill() {
     let map = MappedGguf::open(&path).expect("open gguf");
     let tok = GgufTokenizer::from_gguf(map.gguf()).expect("tokenizer");
     drop(map);
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load_gguf_with_slots(&exec, &path, 4096, 1).expect("load gguf");
     let headroom = exec.vram_headroom().unwrap_or(0);
     m.enable_moe_cache(headroom.saturating_sub(512 << 20))
@@ -285,6 +287,7 @@ fn gguf_dump_prefill() {
     let map = MappedGguf::open(&path).expect("open gguf");
     let tok = GgufTokenizer::from_gguf(map.gguf()).expect("tokenizer");
     drop(map);
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load_gguf_with_slots(&exec, &path, 4096, 1).expect("load gguf");
     let headroom = exec.vram_headroom().unwrap_or(0);
     m.enable_moe_cache(headroom.saturating_sub(512 << 20))
@@ -479,6 +482,7 @@ fn gguf_teacher_forced_agreement() {
     let map = MappedGguf::open(&path).expect("open gguf");
     let tok = GgufTokenizer::from_gguf(map.gguf()).expect("tokenizer");
     drop(map);
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load_gguf_with_slots(&exec, &path, 4096, 1).expect("load gguf");
     let headroom = exec.vram_headroom().unwrap_or(0);
     m.enable_moe_cache(headroom.saturating_sub(512 << 20))
@@ -711,6 +715,7 @@ fn gguf_prefix_cache_resumes_and_matches_cold() {
     // and the cold reference for the multi-turn prompt
     unsafe { std::env::set_var("PADDOCK_NO_PREFIX_CACHE", "1") };
     let (reply, reference, c) = {
+        common::qwen4exp_exact_kv();
         let mut m = Qwen4ExpGpu::load_gguf_with_slots(&exec, &path, 4096, 2).expect("load gguf");
         let headroom = exec.vram_headroom().unwrap_or(0);
         m.enable_moe_cache(headroom.saturating_sub(512 << 20))
@@ -733,6 +738,7 @@ fn gguf_prefix_cache_resumes_and_matches_cold() {
     unsafe { std::env::remove_var("PADDOCK_NO_PREFIX_CACHE") };
 
     // --- instance B, cache on
+    common::qwen4exp_exact_kv();
     let mut m = Qwen4ExpGpu::load_gguf_with_slots(&exec, &path, 4096, 2).expect("load gguf");
     let headroom = exec.vram_headroom().unwrap_or(0);
     m.enable_moe_cache(headroom.saturating_sub(512 << 20))

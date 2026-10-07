@@ -159,11 +159,6 @@ struct DesktopSettingsSurface<Content: View>: View {
   }
 
   private var page: some View {
-    PaddockScrollView {
-      VStack(alignment: .leading, spacing: 28) {
-        PageHeading(title: "Application") { EmptyView() }
-        content
-      }.padding(32).frame(maxWidth: 820).frame(maxWidth: .infinity)
-    }.font(.system(size: 13)).tint(PaddockStyle.accent).buttonStyle(FlatButtonStyle())
+    SettingsPage(title: "Application") { _ in content }
   }
 }

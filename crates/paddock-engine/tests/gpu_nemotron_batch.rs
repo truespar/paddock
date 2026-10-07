@@ -72,6 +72,8 @@ fn enable_batch_builds_pool_and_arenas() {
         return;
     };
     let mut model = GpuNemotron::load_dir(exec, &dir, MAX_CTX).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
 
     let slots = model.batch_enable_probe(4).expect("enable_batch");
     assert_eq!(slots, 4, "20 GiB model on this card must seat 4 slots");
@@ -148,6 +150,8 @@ fn batch_lane_c1_matches_serial() {
         return;
     };
     let mut model = GpuNemotron::load_dir(exec, &dir, MAX_CTX).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
 
     // ---- serial reference: token-by-token walk + greedy continuation -----
     model.reset();
@@ -338,6 +342,8 @@ fn prefix_cache_resumes_with_state_snapshot() {
         return;
     };
     let mut model = GpuNemotron::load_dir(exec, &dir, MAX_CTX).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     assert_eq!(model.batch_enable_probe(4).expect("enable"), 4);
 
     // 8 decode ticks on `slot` from PROMPT_LEN: fed `feed` when given (the
@@ -501,6 +507,8 @@ fn prefix_cache_resumes_a_conversation_past_half_the_pool() {
     };
     const CTX: usize = 16384;
     let mut model = GpuNemotron::load_dir(exec, &dir, CTX).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     assert_eq!(model.batch_enable_probe(1).expect("enable"), 1);
     // the KV share of the pool: its checkpoint pages (issue #33) are not
     // context a conversation can fill
@@ -566,6 +574,8 @@ fn fp8_kv_batch_lane_smoke() {
         return;
     };
     let mut model = GpuNemotron::load_dir(exec, &dir, MAX_CTX).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
 
     // f16 reference on the same batch lane
     assert_eq!(model.batch_enable_probe(4).expect("enable f16"), 4);
@@ -655,6 +665,8 @@ fn batch_lane_c8_matches_serial() {
         return;
     };
     let mut model = GpuNemotron::load_dir(exec, &dir, MAX_CTX).expect("load");
+    // the exact class this test is stated in (the KV8 default is lossy)
+    model.set_kv_dtype(paddock_engine::gpu::KvDtype::Fp16);
     model.reset();
     let mut l = Vec::new();
     for &t in &prompt {

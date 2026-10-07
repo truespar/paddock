@@ -8,7 +8,17 @@ import { isHarmony, isVisionModel } from '@/lib/model-caps'
 import { realtimeEnrichment, type RealtimeTranscriptionCaps } from '@/lib/audio-policy'
 import { DEFAULT_MAX_QUESTIONS, DEFAULT_MAX_SAMPLES, type StructuredReadCaps } from '@/lib/reads'
 
-export type ModelKind = 'chat' | 'encoder' | 'transcriber' | 'aligner' | 'image' | 'reader' | 'tabular' | 'diarizer'
+export type ModelKind =
+  | 'chat'
+  | 'encoder'
+  | 'transcriber'
+  | 'aligner'
+  | 'image'
+  | 'reader'
+  | 'tabular'
+  | 'diarizer'
+  | 'segmenter'
+  | 'masker'
 
 /** Can this kind hold a lane in the chat surface - i.e. does it ANSWER a user
  *  turn? Chat models reply in text, transcribers reply with a transcript; both
@@ -154,6 +164,7 @@ const CLOUD_ORGS: Record<string, string> = {
   cohere: 'Cohere',
   huggingface: 'Hugging Face',
   openrouter: 'OpenRouter',
+  'aleph-alpha': 'Aleph Alpha',
 }
 export function cloudVendor(id: string): string | undefined {
   const s = id.toLowerCase()
@@ -173,6 +184,7 @@ export function cloudVendor(id: string): string | undefined {
   if (s.includes('glm')) return 'Z.ai'
   if (s.includes('deepseek')) return 'DeepSeek'
   if (s.includes('mistral') || s.includes('mixtral')) return 'Mistral'
+  if (s.includes('kolibri')) return 'Aleph Alpha'
   return undefined
 }
 
@@ -485,6 +497,11 @@ interface RunnerRow {
    *  labelled rows in, the missing column out; it never chats */
   tabular?: string | null
   diarization?: string | null
+  /** dense-prediction runner (DINOv3): /v1/segmentations and nothing else */
+  segmenter?: string | null
+  /** promptable-segmentation runner (SAM 3): /v1/masks and nothing else - a
+   *  picture and a prompt in, masks out; it never chats */
+  masker?: string | null
   display?: string | null
   vendor?: string | null
   status?: string
@@ -492,7 +509,19 @@ interface RunnerRow {
 
 /** The model a runner row serves, whichever role it is in (null: none yet). */
 function rowId(r: RunnerRow): string | null {
-  return r.model ?? r.embedder ?? r.asr ?? r.aligner ?? r.reader ?? r.tabular ?? r.diarization ?? r.image ?? null
+  return (
+    r.model ??
+    r.embedder ??
+    r.asr ??
+    r.aligner ??
+    r.reader ??
+    r.tabular ??
+    r.diarization ??
+    r.segmenter ??
+    r.masker ??
+    r.image ??
+    null
+  )
 }
 
 /** A runner row as a picker entry. `prev` is the entry this id had before the
@@ -504,7 +533,10 @@ function rowModel(r: RunnerRow, prev: ModelInfo | undefined): ModelInfo {
     id: rowId(r) as string,
     ownedBy: 'paddock',
     display: r.display ?? undefined,
-    vendor: r.vendor ?? undefined,
+    // the manager names makers from the catalog only; an uncatalogued model
+    // (a hand-started file, a local-dev checkpoint) gets the id heuristic the
+    // reply headers already use, so the picker and the lane agree on the mark
+    vendor: r.vendor ?? cloudVendor(rowId(r) ?? ''),
     port: r.port,
     kind: r.model
       ? 'chat'
@@ -518,7 +550,13 @@ function rowModel(r: RunnerRow, prev: ModelInfo | undefined): ModelInfo {
               ? 'reader'
               : r.tabular
                 ? 'tabular'
-                : r.diarization ? 'diarizer' : 'image',
+                : r.diarization
+                  ? 'diarizer'
+                  : r.segmenter
+                    ? 'segmenter'
+                    : r.masker
+                      ? 'masker'
+                      : 'image',
     status: raw === 'unreachable' && prev?.status ? prev.status : raw,
     vision: prev?.vision,
     spec: r.spec ?? undefined,
@@ -713,6 +751,9 @@ export const useModelsStore = defineStore('models', () => {
         /** a tabular predictor (Kumo): tables in, predictions out */
         tabular?: { model: string } | null
         diarization?: { model: string } | null
+        /** dense prediction (DINOv3) and promptable segmentation (SAM 3) */
+        segmenter?: string | null
+        masker?: string | null
       }
       const c = parseCaps(body)
       // A runner answers /server before its model attaches, and caching that
@@ -732,7 +773,10 @@ export const useModelsStore = defineStore('models', () => {
           body.aligner ||
           body.image_model ||
           body.reader ||
-          body.tabular || body.diarization
+          body.tabular ||
+          body.diarization ||
+          body.segmenter ||
+          body.masker
         )
       ) {
         retry()
@@ -924,10 +968,19 @@ export const useModelsStore = defineStore('models', () => {
    *  a refusal. An aligner cannot either: it annotates transcripts, full stop.
    *  Nor can an image model: it answers a prompt with a picture, on its own
    *  page - and a tabular predictor takes rows, never a turn (the Tables
-   *  page). */
+   *  page), nor do the two segmentation roles (pictures in, rasters or masks
+   *  out - SAM 3 has the Masks page). */
   function canChat(id: string): boolean {
     const kind = models.value.find((m) => m.id === id)?.kind
-    return kind !== 'transcriber' && kind !== 'aligner' && kind !== 'image' && kind !== 'tabular' && kind !== 'diarizer'
+    return (
+      kind !== 'transcriber' &&
+      kind !== 'aligner' &&
+      kind !== 'image' &&
+      kind !== 'tabular' &&
+      kind !== 'diarizer' &&
+      kind !== 'segmenter' &&
+      kind !== 'masker'
+    )
   }
 
   /** Whether this model makes pictures from a prompt: the endpoint's fetched

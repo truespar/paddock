@@ -282,6 +282,8 @@ pub struct AppState {
     /// The loaded dense-prediction model (tic-forestry: DINOv3 + decoder), if
     /// one was configured - serves `/v1/segmentations` only.
     pub segmenter: Option<crate::serving::SegmentModel>,
+    /// Promptable segmentation (SAM 3): `/v1/masks`.
+    pub masker: Option<crate::serving::MaskModel>,
     /// The loaded decision model (a Laya bundle), if one was configured -
     /// serves `POST /v1/systemone` only.
     pub laya: Option<crate::systemone::laya::LayaModel>,
@@ -423,6 +425,7 @@ impl AppState {
             asr: None,
             aligner: None,
             segmenter: None,
+            masker: None,
             laya: None,
             clef: None,
             tabular: None,
@@ -543,6 +546,20 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .layer(axum::extract::DefaultBodyLimit::max(25 * 1024 * 1024)),
         )
         .route("/v1/segmentations", post(crate::segmentations::handle))
+        .route("/v1/masks", post(crate::masks::handle))
+        .route("/v1/masks/sessions", post(crate::mask_sessions::create))
+        .route(
+            "/v1/masks/sessions/{id}/frames",
+            post(crate::mask_sessions::frame),
+        )
+        .route(
+            "/v1/masks/sessions/{id}/finish",
+            post(crate::mask_sessions::finish),
+        )
+        .route(
+            "/v1/masks/sessions/{id}",
+            axum::routing::delete(crate::mask_sessions::delete),
+        )
         .route("/v1/images/generations", post(crate::images::generations))
         .route("/v1/images/edits", post(crate::images::edits))
         .route("/v1/systemone", post(crate::systemone::handle))
@@ -836,6 +853,19 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
         // Embeddings page picks its MODE from this - without it every encoder
         // read as an embedder, and a reranker landed on the wrong page.
         "reranker": state.embedder.as_ref().map(|e| e.yes_id.is_some() && e.no_id.is_some()),
+        // what an /v1/embeddings item may carry beside text - EmbeddingGemma
+        // 2's towers, as built (the Embeddings page offers pictures / clips
+        // only when the endpoint takes them)
+        "embedder_inputs": state.embedder.as_ref().map(|e| {
+            let mut kinds = vec!["text"];
+            if e.image_budget.is_some() {
+                kinds.push("image");
+            }
+            if e.audio {
+                kinds.push("audio");
+            }
+            kinds
+        }),
         "reasoning": reasoning,
         "reasoning_levels": caps.map(|c| c.levels.clone()),
         "reasoning_default": caps.and_then(|c| c.default_level.clone()),
@@ -935,6 +965,34 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
                 },
                 "epsg": c.epsg,
                 "chips_per_pass": i.max_batch,
+            })
+        }),
+        // Promptable segmentation (SAM 3): POST /v1/masks works iff this is
+        // set, and `masks` is what a valid request looks like - the picture
+        // ceiling, the exemplar-box cap, the prompt-token cap (Meta's tower
+        // reads 32 with its start and end markers), whether click prompts are
+        // served and how many clicks one takes, and the mask encoding.
+        "masker": state.masker.as_ref().map(|m| m.id.clone()),
+        "masks": state.masker.as_ref().map(|m| {
+            let i = m.masker.info();
+            serde_json::json!({
+                "max_pixels": i.max_pixels,
+                "max_boxes": i.max_boxes,
+                "max_prompt_tokens": paddock_tokenizer::sam3::SAM3_CONTEXT - 2,
+                "clicks": i.clicks,
+                "max_points": if i.clicks {
+                    paddock_engine::gpu_model::sam3::PVS_MAX_POINTS
+                } else {
+                    0
+                },
+                "mask_format": "coco_rle",
+                // video sessions (/v1/masks/sessions): served or why not,
+                // how many frames an output is held, the live-session cap
+                "video": i.video_off.is_none(),
+                "video_unavailable": i.video_off,
+                "hold_frames": paddock_engine::gpu_model::sam3::HOTSTART_DELAY,
+                "max_sessions": paddock_engine::masks::MAX_SESSIONS,
+                "max_concepts": paddock_engine::gpu_model::sam3::MAX_CONCEPTS,
             })
         }),
         // Image generation: the served model and what a valid request looks
@@ -1365,17 +1423,32 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
             // relevance tokens, not what the file names itself
             "reranker": e.yes_id.is_some() && e.no_id.is_some(),
         });
+        let mut inputs = vec!["text"];
+        if e.image_budget.is_some() {
+            inputs.push("image");
+        }
+        if e.audio {
+            inputs.push("audio");
+        }
         let architecture = serde_json::json!({
-            "input_modalities": ["text"],
+            "input_modalities": inputs,
             "output_modalities": [],
-            "modality": "text->embedding",
+            "modality": format!("{}->embedding", inputs.join("+")),
         });
         data.push(
             ModelObject::new(e.id.clone(), 0, "paddock").with_listing_meta(
                 architecture,
                 capabilities,
-                vec!["dimensions".to_owned(), "encoding_format".to_owned()],
-                state.max_ctx,
+                if e.embedding_gemma2 {
+                    vec![
+                        "dimensions".to_owned(),
+                        "encoding_format".to_owned(),
+                        "task".to_owned(),
+                    ]
+                } else {
+                    vec!["encoding_format".to_owned()]
+                },
+                e.max_input_tokens,
             ),
         );
     }
@@ -1458,6 +1531,32 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
                     "segmentation_regression": c.regression_name,
                 }),
                 vec!["response_format".to_owned(), "logits".to_owned()],
+                0,
+            ),
+        );
+    }
+    if let Some(mk) = &state.masker {
+        // promptable segmentation only: a picture and a prompt in, every
+        // instance's mask out (or one clicked object's) - /v1/masks and
+        // nothing else
+        let mut params: Vec<String> = ["text", "boxes", "threshold", "max_instances"]
+            .map(str::to_owned)
+            .into();
+        if mk.masker.info().clicks {
+            params.extend(["points", "object_box", "multimask", "refine"].map(str::to_owned));
+        }
+        data.push(
+            ModelObject::new(mk.id.clone(), 0, "paddock").with_listing_meta(
+                serde_json::json!({
+                    "input_modalities": ["image", "text"],
+                    "output_modalities": ["mask"],
+                    "modality": "image+text->mask",
+                }),
+                serde_json::json!({
+                    "masks": true,
+                    "mask_sessions": mk.masker.info().video_off.is_none(),
+                }),
+                params,
                 0,
             ),
         );

@@ -8,44 +8,39 @@ struct StudioPreferencesView: View {
   @State private var microphoneOptions = false
   @State private var confirmReload = false
   var body: some View {
-    GeometryReader { geometry in
-      PaddockScrollView {
-        VStack(alignment: .leading, spacing: 22) {
-          PageHeading(title: "Conversation") { EmptyView() }
-          if let error = model.error {
-            Text(error).foregroundStyle(PaddockStyle.caution).textSelection(.enabled)
-          }
-          if let notice = model.notice { Text(notice).foregroundStyle(.secondary) }
-          if model.loading { ProgressView().controlSize(.small) }
-          if model.loaded, let layout = model.layout {
-            VStack(alignment: .leading, spacing: 22) {
-              ForEach(layout.sections) { section in
-                settingRow(section, layout: layout, stacked: geometry.size.width < 600)
-                  .accessibilityElement(children: .contain)
-                  .accessibilityIdentifier("studio-setting-\(section.id)")
-                if section.id != layout.sections.last?.id { WorkspaceRule() }
-              }
-            }.disabled(model.saving || model.loading)
-            if let validation = model.validation, validation != model.reply.validation {
-              Text(validation).foregroundStyle(PaddockStyle.caution)
-            }
-          }
-          HStack {
-            Button("Reload saved settings") {
-              if model.dirty { confirmReload = true } else { Task { await model.load() } }
-            }.disabled(model.saving || model.loading)
-            Spacer()
-            Button(model.saving ? "Saving…" : "Apply") { model.save() }
-              .buttonStyle(FlatButtonStyle(primary: true)).disabled(
-                !model.dirty || model.validation != nil || model.saving || model.loading || busy)
-          }.buttonStyle(FlatButtonStyle())
-          if busy {
-            Text("Finish the response before applying preferences.").font(.caption).foregroundStyle(
-              .secondary)
-          }
-        }.font(.system(size: 13)).padding(32).frame(maxWidth: 820).frame(maxWidth: .infinity)
+    SettingsPage(title: "Conversation") { stacked in
+      if let error = model.error {
+        Text(error).foregroundStyle(PaddockStyle.caution).textSelection(.enabled)
       }
-    }.background(PaddockStyle.canvas).tint(PaddockStyle.accent).task { await model.load() }
+      if let notice = model.notice { Text(notice).foregroundStyle(.secondary) }
+      if model.loading { ProgressView().controlSize(.small) }
+      if model.loaded, let layout = model.layout {
+        VStack(alignment: .leading, spacing: 22) {
+          ForEach(layout.sections) { section in
+            settingRow(section, layout: layout, stacked: stacked)
+              .accessibilityElement(children: .contain)
+              .accessibilityIdentifier("studio-setting-\(section.id)")
+            if section.id != layout.sections.last?.id { WorkspaceRule() }
+          }
+        }.disabled(model.saving || model.loading)
+        if let validation = model.validation, validation != model.reply.validation {
+          Text(validation).foregroundStyle(PaddockStyle.caution)
+        }
+      }
+      HStack {
+        Button("Reload saved settings") {
+          if model.dirty { confirmReload = true } else { Task { await model.load() } }
+        }.disabled(model.saving || model.loading)
+        Spacer()
+        Button(model.saving ? "Saving…" : "Apply") { model.save() }
+          .buttonStyle(FlatButtonStyle(primary: true)).disabled(
+            !model.dirty || model.validation != nil || model.saving || model.loading || busy)
+      }.buttonStyle(FlatButtonStyle())
+      if busy {
+        Text("Finish the response before applying preferences.").font(.caption).foregroundStyle(
+          .secondary)
+      }
+    }.task { await model.load() }
       .confirmationDialog(
         "Discard your settings draft and reload?", isPresented: $confirmReload,
         titleVisibility: .visible

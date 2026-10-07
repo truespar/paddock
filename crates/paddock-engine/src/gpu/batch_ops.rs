@@ -130,6 +130,117 @@ impl GpuExecutor {
         })
     }
 
+    /// Kolibri 1 router (slot 748): selection = top-k over the RAW logits +
+    /// `bias`; `out_w` = sigmoid of each selected raw logit * `routed_scale`,
+    /// never renormalized. Same planes as `moe_topk_sigmoid_batch`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_topk_logit_sigmoid_batch(
+        &self,
+        logits: &CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        routed_scale: f32,
+        n_expert: usize,
+        k: usize,
+        out_idx: &mut CudaSlice<u32>,
+        out_w: &mut CudaSlice<f32>,
+        batch: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .moe_topk_logit_sigmoid_batch
+            .ok_or(GpuError::MissingOp("moe_topk_logit_sigmoid_batch"))?;
+        let (lp, _g1) = logits.device_ptr(&self.stream);
+        let (bp, _g2) = bias.device_ptr(&self.stream);
+        let (ip, _g3) = out_idx.device_ptr_mut(&self.stream);
+        let (wp, _g4) = out_w.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract; logits [batch, n_expert]
+        check(unsafe {
+            f(
+                lp as *const _,
+                bp as *const _,
+                routed_scale,
+                n_expert as u32,
+                k as u32,
+                ip as *mut _,
+                wp as *mut _,
+                batch as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    pub fn has_moe_topk_logit_sigmoid(&self) -> bool {
+        self.kernels.moe_topk_logit_sigmoid_batch.is_some()
+    }
+
+    /// `qkv_norm_rope_batch` over q/k only, `v` passed through IN PLACE: with
+    /// `vnorm` false the kernel stores each V element back exactly as it read
+    /// it (same lane, same index), so the V plane doubles as its own output
+    /// and no scratch copy is written. NEOX rope; `params` as rope_yarn's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_norm_rope_batch(
+        &self,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &mut CudaSlice<f32>,
+        qw: &CudaSlice<f32>,
+        kw: &CudaSlice<f32>,
+        qn: &mut CudaSlice<f32>,
+        kn: &mut CudaSlice<f32>,
+        positions: &CudaSlice<u32>,
+        n_head: usize,
+        n_kv: usize,
+        head_dim: usize,
+        eps: f32,
+        params: (f32, f32, f32, f32, f32, f32),
+        rows: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .qkv_norm_rope_batch5
+            .ok_or(GpuError::MissingOp("qkv_norm_rope_batch5"))?;
+        let (theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale) = params;
+        let (qp, _g1) = q.device_ptr(&self.stream);
+        let (kp, _g2) = k.device_ptr(&self.stream);
+        let (vp, _g3) = v.device_ptr_mut(&self.stream);
+        let (qwp, _g4) = qw.device_ptr(&self.stream);
+        let (kwp, _g5) = kw.device_ptr(&self.stream);
+        let (qnp, _g6) = qn.device_ptr_mut(&self.stream);
+        let (knp, _g7) = kn.device_ptr_mut(&self.stream);
+        let (pp, _g8) = positions.device_ptr(&self.stream);
+        // SAFETY: ABI contract; v == vn is the documented in-place pass-through
+        check(unsafe {
+            f(
+                qp as *const _,
+                kp as *const _,
+                vp as *const _,
+                qwp as *const _,
+                kwp as *const _,
+                qnp as *mut _,
+                knp as *mut _,
+                vp as *mut _,
+                pp as *const _,
+                std::ptr::null(),
+                n_head as u32,
+                n_kv as u32,
+                head_dim as u32,
+                eps,
+                theta_scale,
+                freq_scale,
+                corr_low,
+                corr_high,
+                ext_factor,
+                mscale,
+                rows as u32,
+                0u32,
+                0u32,
+                1u32,
+                0u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// `moe_topk_sigmoid_batch` with the shared-expert fold-:
     /// each output row is `k + ns` wide, the trailing `ns` picks are the
     /// shared PSEUDO-expert ids `sh0..sh0+ns` with weight 1.0. One moe_align

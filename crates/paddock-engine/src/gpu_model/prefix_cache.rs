@@ -13,6 +13,33 @@
 /// partial page (< this) is never cached, and re-prefilled (cheap).
 pub const BLOCK_TOKENS: usize = 16;
 
+/// How far behind a prompt's trailing checkpoint pair the hybrids' BACK-OFF
+/// checkpoint sits. The trailing pair catches a re-rendered history, whose
+/// divergence sits in the generation header; nothing caught a prompt whose
+/// TAIL was rewritten - the same document with another question, an edited
+/// last instruction - and a recurrent state can only resume at a snapshot, so
+/// every such prompt re-prefilled whole: a 31K ledger asked a new question
+/// took 24 s on Qwen3.8-27B (GB10), where vLLM and SGLang resume at an
+/// aligned block. One boundary ~256 tokens back covers a rewritten tail of
+/// that size for one more staged snapshot a prompt.
+pub const BACKOFF_TOKENS: usize = 256;
+
+/// The back-off boundary for a prompt whose last checkpoint boundary is `b1`
+/// on a `step` grid (`step` >= BLOCK_TOKENS; the KV tier's run span when
+/// armed): `BACKOFF_TOKENS` behind it - at least two steps - rounded down to
+/// the grid. None when that would not sit strictly below the trailing pair
+/// (`b1 - step`, `b1`), or would itself sit under BACKOFF_TOKENS - a prompt
+/// that short re-prefills cheaply, and a checkpoint that shallow is under
+/// every family's resume floor anyway.
+pub fn backoff_cut(b1: usize, step: usize) -> Option<usize> {
+    if paddock_models::dev_var_os!("PADDOCK_NO_CKPT_BACKOFF").is_some() {
+        return None;
+    }
+    let step = step.max(BLOCK_TOKENS);
+    let c = b1.checked_sub(BACKOFF_TOKENS.max(2 * step))? / step * step;
+    (c >= BACKOFF_TOKENS && c + step < b1).then_some(c)
+}
+
 /// Stage F (the reply checkpoint) off switch, shared by every family that
 /// snapshots its recurrent state during decode (nemotron, qwen35): with it
 /// set the next turn resumes at the previous PROMPT's last boundary and
@@ -432,5 +459,23 @@ mod pass_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+
+    #[test]
+    fn backoff_sits_strictly_below_the_trailing_pair() {
+        // a ~31K prompt on the page grid: 256 tokens behind its last boundary
+        assert_eq!(backoff_cut(31744, BLOCK_TOKENS), Some(31488));
+        // a prompt under ~512 tokens keeps its two (cheap to re-prefill)
+        assert_eq!(backoff_cut(256, BLOCK_TOKENS), None);
+        assert_eq!(backoff_cut(496, BLOCK_TOKENS), None);
+        assert_eq!(backoff_cut(512, BLOCK_TOKENS), Some(256));
+        // a coarse tier grid keeps it at least two steps back, on the grid
+        assert_eq!(backoff_cut(4096, 512), Some(3072));
+        assert_eq!(backoff_cut(1024, 512), None);
     }
 }
