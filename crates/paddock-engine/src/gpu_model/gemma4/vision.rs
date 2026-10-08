@@ -109,10 +109,41 @@ struct VBlock {
     wo: HalfTensor,
     attn_post: CudaSlice<f32>,
     ln2: CudaSlice<f32>,
-    gate: HalfTensor,
-    up: HalfTensor,
+    gate_up: GateUp,
     down: HalfTensor,
     ffn_post: CudaSlice<f32>,
+}
+
+/// The FFN's gate and up planes: the file's two, or - when the pack carries
+/// the GEGLU landing (slot 826) - one plane re-laid in 16-row blocks (gate
+/// features 8b..8b+7 in rows 16b.., their ups in the next 8), which that
+/// landing reads with the GEGLU in its epilogue. Never both: same bytes.
+enum GateUp {
+    Split { gate: HalfTensor, up: HalfTensor },
+    Relaid(HalfTensor),
+}
+
+impl GateUp {
+    fn bytes(&self) -> usize {
+        match self {
+            GateUp::Split { gate, up } => gate.bytes() + up.bytes(),
+            GateUp::Relaid(w) => w.bytes(),
+        }
+    }
+
+    /// The FFN width (gate features).
+    fn ffn(&self) -> usize {
+        match self {
+            GateUp::Split { gate, .. } => gate.dims[1],
+            GateUp::Relaid(w) => w.dims[1] / 2,
+        }
+    }
+}
+
+/// A picture at its target size, wherever it already is.
+pub enum Resized<'a> {
+    Host(&'a [u8]),
+    Device(&'a CudaSlice<u8>),
 }
 
 /// Encoded image: [n_tokens, llm_embd] embeddings ready for splice.
@@ -142,8 +173,85 @@ pub struct VisionModel {
     /// mmprojs carry it; EmbeddingGemma 2's tower (the E2B/E4B geometry)
     /// does not, and llama.cpp's gemma4v graph skips the step when absent.
     std: Option<(Vec<f32>, Vec<f32>)>,
+    /// The same on the device, for the fused tail.
+    std_dev: Option<(CudaSlice<f32>, CudaSlice<f32>)>,
     mm_proj: HalfTensor, // [embd, llm_embd]
     ones_hd: CudaSlice<f32>,
+    /// The fused pass's scratch, kept between pictures when the owner asks
+    /// ([`Self::keep_scratch`]). The engine trims the stream pool to zero at
+    /// every sync, so a pass that allocates afresh re-maps its whole working
+    /// set each picture - 6.3 ms of a 50 ms EmbeddingGemma 2 picture on GB10.
+    scratch: std::sync::Mutex<Option<TowerScratch>>,
+    keep_scratch: std::sync::atomic::AtomicBool,
+}
+
+/// The fused pass's working planes for up to `rows` patches and a `side`
+/// (gw + gh) position slice; every byte is written before it is read.
+struct TowerScratch {
+    rows: usize,
+    side: usize,
+    s16: CudaSlice<half::f16>,
+    x: CudaSlice<f32>,
+    q: CudaSlice<f32>,
+    k: CudaSlice<f32>,
+    v: CudaSlice<f32>,
+    q16: CudaSlice<half::f16>,
+    k16: CudaSlice<half::f16>,
+    v16: CudaSlice<half::f16>,
+    a16: CudaSlice<half::f16>,
+    proj: CudaSlice<f32>,
+    gate: CudaSlice<f32>,
+    up: CudaSlice<f32>,
+    /// the GEGLU landing's f16 output (the down GEMM's input)
+    h16: CudaSlice<half::f16>,
+    tab: CudaSlice<f32>,
+    pos_x: CudaSlice<u32>,
+    pos_y: CudaSlice<u32>,
+    /// the rope's (cos, sin) per (row, pair): `rows * hd` floats
+    rope: CudaSlice<f32>,
+}
+
+impl TowerScratch {
+    /// `relaid`: the FFN lands through slot 826, so the f32 gate / up planes
+    /// are never written and only the f16 landing is kept.
+    fn new(
+        exec: &GpuExecutor,
+        rows: usize,
+        side: usize,
+        embd: usize,
+        wide: usize,
+        ffn: usize,
+        hd: usize,
+        relaid: bool,
+    ) -> Result<Self, GpuError> {
+        // SAFETY: uninitialised device planes; the fused pass writes each
+        // before reading it (a GEMM, the patchify, a fused kernel, an upload)
+        unsafe {
+            let f = |n: usize| exec.stream.alloc::<f32>(n).map_err(gerr);
+            let h = |n: usize| exec.stream.alloc::<half::f16>(n).map_err(gerr);
+            Ok(Self {
+                rows,
+                side,
+                s16: h(rows * wide)?,
+                x: f(rows * embd)?,
+                q: f(rows * embd)?,
+                k: f(rows * embd)?,
+                v: f(rows * embd)?,
+                q16: h(rows * embd)?,
+                k16: h(rows * embd)?,
+                v16: h(rows * embd)?,
+                a16: h(rows * embd)?,
+                proj: f(rows * embd)?,
+                gate: f(if relaid { 1 } else { rows * ffn })?,
+                up: f(if relaid { 1 } else { rows * ffn })?,
+                h16: h(if relaid { rows * ffn } else { 1 })?,
+                tab: f(side * embd)?,
+                pos_x: exec.stream.alloc::<u32>(rows).map_err(gerr)?,
+                pos_y: exec.stream.alloc::<u32>(rows).map_err(gerr)?,
+                rope: f(rows * hd)?,
+            })
+        }
+    }
 }
 
 fn key_u32(map: &MappedGguf, key: &str) -> Result<usize, GpuError> {
@@ -247,6 +355,12 @@ impl VisionModel {
         let dt = |name: String| -> Result<HalfTensor, GpuError> { exec.upload_f16(map, &name) };
         let vf =
             |name: String| -> Result<CudaSlice<f32>, GpuError> { Ok(exec.upload(map, &name)?.buf) };
+        // the re-laid gate|up plane when the pack can land the GEGLU in a
+        // GEMM epilogue (and the FFN width is whole 8-row halves of a block)
+        let relay = exec.has_g4v_geglu()
+            && map
+                .tensor_info("v.blk.0.ffn_gate.weight")
+                .is_some_and(|t| t.dims.get(1).is_some_and(|&d| d % 8 == 0));
         let mut blocks = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             blocks.push(VBlock {
@@ -259,13 +373,36 @@ impl VisionModel {
                 wo: dt(format!("v.blk.{i}.attn_out.weight"))?,
                 attn_post: vf(format!("v.blk.{i}.attn_post_norm.weight"))?,
                 ln2: vf(format!("v.blk.{i}.ln2.weight"))?,
-                gate: dt(format!("v.blk.{i}.ffn_gate.weight"))?,
-                up: dt(format!("v.blk.{i}.ffn_up.weight"))?,
+                gate_up: if relay {
+                    // the landing's 16-row blocks: 8 gate rows, their 8 ups
+                    let (g, gd) = host_f32(map, &format!("v.blk.{i}.ffn_gate.weight"))?;
+                    let (u, _) = host_f32(map, &format!("v.blk.{i}.ffn_up.weight"))?;
+                    let (k, ffn) = (gd[0], gd[1]);
+                    let mut flat = vec![0f32; 2 * ffn * k];
+                    for f in 0..ffn {
+                        let r = (f / 8) * 16 + f % 8;
+                        flat[r * k..(r + 1) * k].copy_from_slice(&g[f * k..(f + 1) * k]);
+                        flat[(r + 8) * k..(r + 9) * k].copy_from_slice(&u[f * k..(f + 1) * k]);
+                    }
+                    GateUp::Relaid(HalfTensor {
+                        buf: exec.to_device_f16(&flat, "v.blk.ffn_gate_up (re-laid)")?,
+                        dims: vec![k, 2 * ffn],
+                    })
+                } else {
+                    GateUp::Split {
+                        gate: dt(format!("v.blk.{i}.ffn_gate.weight"))?,
+                        up: dt(format!("v.blk.{i}.ffn_up.weight"))?,
+                    }
+                },
                 down: dt(format!("v.blk.{i}.ffn_down.weight"))?,
                 ffn_post: vf(format!("v.blk.{i}.ffn_post_norm.weight"))?,
             });
         }
         let mm_proj = dt("mm.input_projection.weight".to_owned())?;
+        let std_dev = match &std {
+            Some((b, s)) => Some((exec.to_device(b)?, exec.to_device(s)?)),
+            None => None,
+        };
         let ones_hd = exec.to_device(&vec![1.0f32; head_dim])?;
 
         let me = Self {
@@ -282,8 +419,11 @@ impl VisionModel {
             conv,
             blocks,
             std,
+            std_dev,
             mm_proj,
             ones_hd,
+            scratch: std::sync::Mutex::new(None),
+            keep_scratch: std::sync::atomic::AtomicBool::new(false),
         };
         tracing::info!(
             weight_mib = me.weight_bytes() / (1 << 20),
@@ -305,8 +445,7 @@ impl VisionModel {
                     + b.wk.bytes()
                     + b.wv.bytes()
                     + b.wo.bytes()
-                    + b.gate.bytes()
-                    + b.up.bytes()
+                    + b.gate_up.bytes()
                     + b.down.bytes()
             })
             .sum();
@@ -366,6 +505,257 @@ impl VisionModel {
         (tw / self.patch / N_MERGE) * (th / self.patch / N_MERGE)
     }
 
+    /// The bilinear resize to the smart target alone: (RGB8, tw, th).
+    pub fn resize_rgb(&self, rgb: &[u8], w: usize, h: usize) -> (Vec<u8>, usize, usize) {
+        let (tw, th) = self.resize_target(w, h);
+        (resize_bilinear_u8(rgb, w, h, tw, th), tw, th)
+    }
+
+    /// One picture already at its target size -> projected rows: the fused
+    /// pass when the pack carries it (slots 820-825; bit-identical to the
+    /// unfused chain, see below), else the unfused chain on host patches.
+    pub fn encode_resized(
+        &self,
+        img: Resized<'_>,
+        tw: usize,
+        th: usize,
+    ) -> Result<VisionOutput, GpuError> {
+        if self.exec.has_g4v()
+            && let Some(out) = self.encode_fused(&img, tw, th)?
+        {
+            return Ok(out);
+        }
+        let host = match img {
+            Resized::Host(b) => std::borrow::Cow::Borrowed(b),
+            Resized::Device(d) => {
+                std::borrow::Cow::Owned(self.exec.to_host_u8_len(d, tw * th * 3)?)
+            }
+        };
+        let (patches, gw, gh) = self.patches_from_rgb(&host, tw, th);
+        self.encode(&patches, gw, gh)
+    }
+
+    /// The unfused chain on the same picture - the reference the fused pass
+    /// is held to (bit for bit) by the engine tests.
+    pub fn encode_resized_unfused(
+        &self,
+        img: Resized<'_>,
+        tw: usize,
+        th: usize,
+    ) -> Result<VisionOutput, GpuError> {
+        let host = match img {
+            Resized::Host(b) => std::borrow::Cow::Borrowed(b),
+            Resized::Device(d) => {
+                std::borrow::Cow::Owned(self.exec.to_host_u8_len(d, tw * th * 3)?)
+            }
+        };
+        let (patches, gw, gh) = self.patches_from_rgb(&host, tw, th);
+        self.encode(&patches, gw, gh)
+    }
+
+    /// The fused pass: the picture patchified on the device, every norm,
+    /// add, rope, GEGLU and convert of [`Self::encode`] folded into five
+    /// kernels around the same GEMMs (slots 820-825) - bit-identical, since
+    /// each kernel repeats the chain's arithmetic (gemma4v.cuh). The patches,
+    /// the position sum and the pooled tail no longer cross to the host, and
+    /// the attention takes f16 q / k / v straight from the head kernel (the
+    /// half entry rounds them exactly as the f32 entry's staging did).
+    /// `None` when the pack declines (a non-default norm accumulate mode).
+    fn encode_fused(
+        &self,
+        img: &Resized<'_>,
+        tw: usize,
+        th: usize,
+    ) -> Result<Option<VisionOutput>, GpuError> {
+        let exec = &self.exec;
+        let (gw, gh) = (tw / self.patch, th / self.patch);
+        let n = gw * gh;
+        let embd = self.embd;
+        let ffn_dim = self.blocks[0].gate_up.ffn();
+        let up_rgb;
+        let rgb = match img {
+            Resized::Device(d) => *d,
+            Resized::Host(b) => {
+                up_rgb = exec.to_device_u8(b)?;
+                &up_rgb
+            }
+        };
+        let wide = ffn_dim.max(embd).max(self.conv.dims[0]);
+        let keep = self.keep_scratch.load(std::sync::atomic::Ordering::Relaxed);
+        let cached = if keep {
+            self.scratch
+                .lock()
+                .map_err(|_| GpuError::Driver("tower scratch poisoned".into()))?
+                .take()
+        } else {
+            None
+        };
+        let mut sc = match cached {
+            Some(sc) if sc.rows >= n && sc.side >= gw + gh => sc,
+            _ => TowerScratch::new(
+                exec,
+                n,
+                gw + gh,
+                embd,
+                wide,
+                ffn_dim,
+                self.head_dim,
+                matches!(self.blocks[0].gate_up, GateUp::Relaid(_)),
+            )?,
+        };
+        let out = self.encode_fused_in(&mut sc, rgb, tw, th);
+        if keep {
+            *self
+                .scratch
+                .lock()
+                .map_err(|_| GpuError::Driver("tower scratch poisoned".into()))? = Some(sc);
+        }
+        out
+    }
+
+    /// Keep the fused pass's scratch between pictures (until
+    /// [`Self::release_scratch`]) - for an owner that encodes back to back
+    /// and has its own idle release (EmbeddingGemma 2). Off by default: the
+    /// chat lanes plan a tower pass's memory as transient.
+    pub fn keep_scratch(&self, on: bool) {
+        self.keep_scratch
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+        if !on {
+            self.release_scratch();
+        }
+    }
+
+    /// Drop the kept scratch (an idle owner's release).
+    pub fn release_scratch(&self) {
+        if let Ok(mut g) = self.scratch.lock() {
+            *g = None;
+        }
+    }
+
+    fn encode_fused_in(
+        &self,
+        sc: &mut TowerScratch,
+        rgb: &CudaSlice<u8>,
+        tw: usize,
+        th: usize,
+    ) -> Result<Option<VisionOutput>, GpuError> {
+        let exec = &self.exec;
+        let (gw, gh) = (tw / self.patch, th / self.patch);
+        let n = gw * gh;
+        let (embd, heads, hd, eps) = (self.embd, self.n_heads, self.head_dim, self.eps);
+        let ffn_dim = self.blocks[0].gate_up.ffn();
+        let TowerScratch {
+            s16,
+            x,
+            q,
+            k,
+            v,
+            q16,
+            k16,
+            v16,
+            a16,
+            proj,
+            gate,
+            up,
+            h16,
+            tab,
+            pos_x,
+            pos_y,
+            rope,
+            ..
+        } = sc;
+        exec.g4v_patchify(rgb, s16, tw, th, self.patch)?;
+        exec.matvec_batch_f16(&self.conv, s16, x, n)?;
+        // the picture's own rows of the position table: its gw x-rows, then
+        // its gh y-rows (a copy, no arithmetic - the sum is on the device)
+        let mut host_tab = Vec::with_capacity((gw + gh) * embd);
+        for cx in 0..gw {
+            host_tab.extend_from_slice(&self.pos_tbl[cx * embd..(cx + 1) * embd]);
+        }
+        for cy in 0..gh {
+            host_tab.extend_from_slice(&self.pos_tbl[(self.pos_size + cy) * embd..][..embd]);
+        }
+        exec.stream
+            .memcpy_htod(&host_tab, &mut tab.slice_mut(0..host_tab.len()))
+            .map_err(gerr)?;
+        if !exec.g4v_pos_norm(x, tab, &self.blocks[0].ln1, s16, gw, n, embd, eps)? {
+            return Ok(None);
+        }
+        let px: Vec<u32> = (0..n).map(|i| (i % gw) as u32).collect();
+        let py: Vec<u32> = (0..n).map(|i| (i / gw) as u32).collect();
+        exec.stream
+            .memcpy_htod(&px, &mut pos_x.slice_mut(0..n))
+            .map_err(gerr)?;
+        exec.stream
+            .memcpy_htod(&py, &mut pos_y.slice_mut(0..n))
+            .map_err(gerr)?;
+        let ts = ROPE_THETA.powf(-2.0 / (hd / 2) as f32);
+        exec.g4v_rope_table((&*pos_x, &*pos_y), rope, n, hd, ts)?;
+        for (i, b) in self.blocks.iter().enumerate() {
+            exec.matvec_batch_f16(&b.wq, s16, q, n)?;
+            exec.matvec_batch_f16(&b.wk, s16, k, n)?;
+            exec.matvec_batch_f16(&b.wv, s16, v, n)?;
+            if !exec.g4v_heads(
+                q,
+                k,
+                v,
+                embd,
+                &b.q_norm,
+                &b.k_norm,
+                rope,
+                (&mut *q16, &mut *k16, &mut *v16),
+                n,
+                heads,
+                hd,
+                eps,
+            )? {
+                return Ok(None);
+            }
+            exec.vision_attn_h(q16, k16, v16, a16, n, n, heads, hd, 1)?;
+            exec.matvec_batch_f16(&b.wo, a16, proj, n)?;
+            exec.g4v_post(
+                x,
+                proj,
+                &b.attn_post,
+                Some((&b.ln2, &mut *s16)),
+                n,
+                embd,
+                eps,
+            )?;
+            match &b.gate_up {
+                // the GEGLU in the landing's epilogue: the f32 gate and up
+                // never land
+                GateUp::Relaid(w) => {
+                    exec.f16_gemm_h_geglu_g4(w, s16, h16, n)?;
+                    exec.matvec_batch_f16(&b.down, h16, proj, n)?;
+                }
+                GateUp::Split { gate: wg, up: wu } => {
+                    exec.matvec_batch_f16(wg, s16, gate, n)?;
+                    exec.matvec_batch_f16(wu, s16, up, n)?;
+                    exec.g4v_geglu(gate, up, ffn_dim, s16, ffn_dim, n, false)?;
+                    exec.matvec_batch_f16(&b.down, s16, proj, n)?;
+                }
+            }
+            // the FFN's post-norm and the next block's ln1 in one pass
+            let next = self.blocks.get(i + 1).map(|nb| (&nb.ln1, &mut *s16));
+            exec.g4v_post(x, proj, &b.ffn_post, next, n, embd, eps)?;
+        }
+        // the tail: 3x3 pool x sqrt(embd) -> std -> weightless RMS -> f16
+        let (ow, oh) = (gw / N_MERGE, gh / N_MERGE);
+        let n_out = ow * oh;
+        let scale = (embd as f32).sqrt();
+        let inv = scale / (N_MERGE * N_MERGE) as f32;
+        let std = self.std_dev.as_ref().map(|(b, s)| (b, s));
+        exec.g4v_pool(x, std, s16, gw, gh, embd, inv, eps)?;
+        // SAFETY: the projection GEMM writes every element
+        let mut out = unsafe { exec.stream.alloc::<f32>(n_out * self.llm_embd()) }.map_err(gerr)?;
+        exec.matvec_batch_f16(&self.mm_proj, s16, &mut out, n_out)?;
+        Ok(Some(VisionOutput {
+            embd: out,
+            n_tokens: n_out,
+        }))
+    }
+
     /// Full preprocessing: bilinear resize to the smart target, then im2row
     /// patches with the graph's ×2-1 scaling folded in. Returns (patches
     /// [n_patches, 3·patch²], grid_w, grid_h).
@@ -418,7 +808,7 @@ impl VisionModel {
         // The conversions are the price of an f32 elementwise chain driving
         // f16 tensor-core GEMMs: each is one streaming pass over rows the GEMM
         // then reads `out_dim` times over.
-        let ffn_dim = self.blocks[0].gate.dims[1];
+        let ffn_dim = self.blocks[0].gate_up.ffn();
         let stage = n * ffn_dim.max(embd).max(self.conv.dims[0]);
         let mut s16 = exec.alloc_f16(stage)?;
 
@@ -454,7 +844,12 @@ impl VisionModel {
         let mut kn = exec.stream.alloc_zeros::<f32>(n * embd).map_err(gerr)?;
         let mut vn = exec.stream.alloc_zeros::<f32>(n * embd).map_err(gerr)?;
         let mut attn = exec.stream.alloc_zeros::<f32>(n * embd).map_err(gerr)?;
-        let mut gate = exec.stream.alloc_zeros::<f32>(n * ffn_dim).map_err(gerr)?;
+        // a re-laid gate|up plane lands both halves in one [n][2 * ffn] plane
+        let relaid = matches!(self.blocks[0].gate_up, GateUp::Relaid(_));
+        let mut gate = exec
+            .stream
+            .alloc_zeros::<f32>(n * ffn_dim * if relaid { 2 } else { 1 })
+            .map_err(gerr)?;
         let mut up = exec.stream.alloc_zeros::<f32>(n * ffn_dim).map_err(gerr)?;
         let mut proj = exec.stream.alloc_zeros::<f32>(n * embd).map_err(gerr)?;
 
@@ -478,14 +873,24 @@ impl VisionModel {
 
             exec.rmsnorm_batch(&x, &b.ln2, &mut normed, embd, eps, n)?;
             exec.convert_f32_f16(&normed, &mut s16, n * embd)?;
-            exec.matvec_batch_f16(&b.gate, &s16, &mut gate, n)?;
-            exec.matvec_batch_f16(&b.up, &s16, &mut up, n)?;
             // GELU is the TOWER's activation, not the decoder's - deliberately
             // not Hparams::glu_act. gemma4's SigLIP tower is GELU; muse-
             // glimmer's ViT-G/14 Perception Encoder states its own,
             // and reading it off the text FFN would be a category error.
-            exec.geglu(&mut gate, &up, n * ffn_dim)?;
-            exec.convert_f32_f16(&gate, &mut s16, n * ffn_dim)?;
+            match &b.gate_up {
+                GateUp::Split { gate: wg, up: wu } => {
+                    exec.matvec_batch_f16(wg, &s16, &mut gate, n)?;
+                    exec.matvec_batch_f16(wu, &s16, &mut up, n)?;
+                    exec.geglu(&mut gate, &up, n * ffn_dim)?;
+                    exec.convert_f32_f16(&gate, &mut s16, n * ffn_dim)?;
+                }
+                // the same arithmetic over the re-laid landing - the
+                // reference slot 826's epilogue is held to
+                GateUp::Relaid(w) => {
+                    exec.matvec_batch_f16(w, &s16, &mut gate, n)?;
+                    exec.g4v_geglu(&gate, &up, 2 * ffn_dim, &mut s16, ffn_dim, n, true)?;
+                }
+            }
             exec.matvec_batch_f16(&b.down, &s16, &mut proj, n)?;
             exec.rmsnorm_batch(&proj, &b.ffn_post, &mut normed, embd, eps, n)?;
             exec.add(&mut x, &normed, n * embd)?;

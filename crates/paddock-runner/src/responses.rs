@@ -399,7 +399,7 @@ fn prepare(
     // with a 200.
     chat_template::validate_content_parts(messages)?;
     // system/developer items past the opening run render in place, as on chat
-    let inlined = chat_template::inline_late_system_messages(messages)?;
+    let inlined = chat_template::inline_late_system_messages(messages, model.late_system_native)?;
     // arguments-strings -> objects, or templates drop them from history
     let mut messages = chat_template::normalize_messages(&inlined);
     if let Some(marker) = model.audio_inline_marker.as_deref() {

@@ -302,10 +302,27 @@ fn embeddinggemma2_operations() {
 #[test]
 #[ignore = "real same-checkpoint GPU reference; PADDOCK_EG2_MODEL and PADDOCK_EG2_FIXTURE"]
 fn embeddinggemma2_reference() {
+    check_reference(false);
+}
+
+#[test]
+#[ignore = "same-checkpoint single-input MLX GPU reference; PADDOCK_EG2_MODEL and PADDOCK_EG2_FIXTURE"]
+fn embeddinggemma2_request_reference() {
+    check_reference(true);
+}
+
+// Keep both contracts visible. The original batched upstream gate is not
+// replaced by this diagnostic of the unmodified single-input upstream graph.
+fn check_reference(single_request: bool) {
     let path = std::env::var("PADDOCK_EG2_MODEL").expect("model");
     let fixture = std::env::var("PADDOCK_EG2_FIXTURE").expect("fixture");
     let data: serde_json::Value =
         serde_json::from_slice(&std::fs::read(fixture).expect("read fixture")).expect("json");
+    assert_ne!(
+        data["diagnostic_f32_projections"].as_bool(),
+        Some(true),
+        "counterfactual arithmetic fixtures cannot qualify reference parity"
+    );
     let mut m = EmbeddingGemma2::load(Path::new(&path), 8192, None).expect("load");
     assert!(m.validate(&[]).is_err());
     assert!(m.validate(&[vec![]]).is_err());
@@ -317,13 +334,20 @@ fn embeddinggemma2_reference() {
             .is_err()
     );
     let mut failures = Vec::new();
+    let mut compared = 0;
     for case in data["cases"].as_array().expect("cases") {
         if std::env::var("PADDOCK_EG2_CASE").is_ok_and(|v| case["name"] != v) {
             continue;
         }
         let ids: Vec<Vec<u32>> = serde_json::from_value(case["ids"].clone()).expect("ids");
+        let reference_key = if single_request && ids.len() > 1 {
+            "serial_embeddings"
+        } else {
+            "embeddings"
+        };
         let refs: Vec<Vec<f32>> =
-            serde_json::from_value(case["embeddings"].clone()).expect("embeddings");
+            serde_json::from_value(case[reference_key].clone()).expect("reference embeddings");
+        compared += refs.len();
         let start = std::time::Instant::now();
         let p = m.embed_submit(&ids, 0).expect("submit");
         p.completion.wait().expect("completion");
@@ -376,8 +400,8 @@ fn embeddinggemma2_reference() {
                     .zip(serial)
                     .map(|(a, b)| *a as f64 * b.as_f64().unwrap())
                     .sum();
-                let norm: f64 = serial.iter().map(|v| v.as_f64().unwrap().powi(2)).sum();
-                eprintln!("vs MLX serial: {:.9}", dot / norm.sqrt());
+                let serial_norm: f64 = serial.iter().map(|v| v.as_f64().unwrap().powi(2)).sum();
+                eprintln!("vs MLX serial: {:.9}", dot / (norm * serial_norm).sqrt());
             }
             assert!((norm - 1.).abs() < 1e-4);
             if cos <= 0.9999 || err >= 0.004 {
@@ -385,14 +409,18 @@ fn embeddinggemma2_reference() {
             }
         }
         for (i, ids) in ids.iter().enumerate() {
-            if ids.len() > 32 {
-                continue;
-            }
             let p = m
                 .embed_submit(std::slice::from_ref(ids), 0)
                 .expect("serial submit");
             let single = m.embed_collect(&p).expect("serial collect");
             assert_eq!(&single[0], &values[i], "batch changed the native embedding");
+        }
+        if ids.len() > 1 {
+            let reversed: Vec<_> = ids.iter().rev().cloned().collect();
+            let p = m.embed_submit(&reversed, 0).expect("reverse submit");
+            let mut result = m.embed_collect(&p).expect("reverse collect");
+            result.reverse();
+            assert_eq!(result, values, "arrival order changed the native embedding");
         }
         if case["name"] == "short" {
             for dim in [128, 256, 512, 768] {
@@ -416,6 +444,7 @@ fn embeddinggemma2_reference() {
             }
         }
     }
+    assert!(compared > 0, "no reference vectors were compared");
     assert!(
         failures.is_empty(),
         "same-weight comparison failures: {failures:?}"

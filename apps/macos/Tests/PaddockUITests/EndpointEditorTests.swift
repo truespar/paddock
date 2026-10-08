@@ -8,6 +8,59 @@ import Testing
 
 @Suite("Acknowledged native endpoint editing", .timeLimit(.minutes(1))) @MainActor
 struct EndpointEditorTests {
+  @Test func embeddingGemmaMLXUsesBundledTowersNotGGUFDownloads() throws {
+    let catalog = try ManagerWire.decode(
+      ModelCatalog.self,
+      from: Data(
+        #"{"schema":3,"models":[{"id":"embeddinggemma-2","display":"EmbeddingGemma 2","vendor":"Google","capability":["embeddings"],"installed":true,"total_size":1234000000,"artifacts":[{"id":"mlx8","kind":"weights","format":"safetensors","label":"MLX 8-bit","quant":"MLX-AFFINE-8-G64","installed":true,"total_size":1234000000,"backend_supported":true,"runtime":{"checkpoint_dir":true,"kv_cache_dtype":"auto","default_max_ctx":8192,"default_max_batch":1,"companions":[],"optional_towers":{"vision":{"weight_bytes":300,"workspace_bytes":30,"default":true},"audio":{"weight_bytes":600,"workspace_bytes":60,"default":false}}}},{"id":"vision","kind":"vision","format":"gguf","label":"Pictures","installed":false,"total_size":300},{"id":"audio","kind":"audio","format":"gguf","label":"Audio","installed":false,"total_size":600}]}]}"#
+          .utf8))
+    let editor = EndpointEditor(
+      client: EndpointEditFixture(), endpoint: try editEndpoint(), pid: nil)
+    editor.catalog = catalog.models
+    editor.modelID = "embeddinggemma-2"
+    editor.artifactID = "mlx8"
+    editor.selectArtifact(try #require(editor.selectedArtifact), newModel: true)
+    #expect(editor.isMLX && editor.splitMediaTowers && editor.bundledVision && editor.bundledAudio)
+    #expect(editor.vision && !editor.audio && !editor.embeddedVision)
+    #expect(editor.visionArtifact == nil && editor.audioArtifact == nil)
+    #expect(editor.validation == nil && !editor.canSpeculate && !editor.forensicsPossible)
+    editor.vision = false
+    editor.audio = true
+    #expect(!editor.visionServed && editor.validation == nil)
+    let changes = try #require(
+      JSONSerialization.jsonObject(with: JSONEncoder().encode(editor.changes)) as? [[String: Any]])
+    let composition = try #require(
+      changes.first { $0["field"] as? String == "composition" }?["value"] as? [String: Any])
+    #expect(composition["vision"] as? Bool == false && composition["audio"] as? Bool == true)
+    editor.vision = true
+    #expect(editor.visionServed && editor.validation == nil)
+  }
+  @Test func embeddingGemmaTowersAreIndependentAndUseTheSameCompositionAsWeb() throws {
+    let catalog = try ManagerWire.decode(
+      ModelCatalog.self,
+      from: Data(
+        #"{"schema":3,"models":[{"id":"embeddinggemma-2","display":"EmbeddingGemma 2","vendor":"Google","capability":["embeddings"],"installed":true,"total_size":1291931264,"artifacts":[{"id":"q8","kind":"weights","format":"gguf","label":"Q8_0","installed":true,"total_size":309855520,"backend_supported":true,"runtime":{"default_max_ctx":8192,"default_max_batch":1,"companions":["vision","audio"]}},{"id":"vision","kind":"vision","format":"gguf","label":"Pictures","installed":true,"default":true,"total_size":368268992,"backend_supported":true},{"id":"audio","kind":"audio","format":"gguf","label":"Audio","installed":true,"default":false,"total_size":613806752,"backend_supported":true}]}]}"#
+          .utf8))
+    let editor = EndpointEditor(
+      client: EndpointEditFixture(), endpoint: try editEndpoint(), pid: nil)
+    editor.catalog = catalog.models
+    editor.modelID = "embeddinggemma-2"
+    editor.artifactID = "q8"
+    editor.selectArtifact(try #require(editor.selectedArtifact), newModel: true)
+    #expect(editor.splitMediaTowers && editor.vision && !editor.audio)
+    #expect(editor.visionServed && !editor.forensicsPossible && !editor.canSpeculate)
+    #expect(editor.recommendedContext == 8192)
+    editor.vision = false
+    editor.audio = true
+    #expect(!editor.visionServed && editor.validation == nil)
+    let changes = try #require(
+      JSONSerialization.jsonObject(with: JSONEncoder().encode(editor.changes)) as? [[String: Any]])
+    let composition = try #require(
+      changes.first { $0["field"] as? String == "composition" }?["value"] as? [String: Any])
+    #expect(composition["vision"] as? Bool == false && composition["audio"] as? Bool == true)
+    editor.vision = true
+    #expect(editor.visionServed && editor.audio)
+  }
   @Test func quantizedClefShowsItsArtifactPrecisionWithoutChatOrVisionControls() throws {
     let catalog = try ManagerWire.decode(
       ModelCatalog.self,

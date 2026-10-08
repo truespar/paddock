@@ -817,6 +817,13 @@ impl Generator for GpuLaguna {
         self.release_inactive_slots_impl(occupied);
     }
 
+    fn reply_pin_at(&mut self, slot: usize, history: &[u32], pos: u32) {
+        // a failed copy costs the next turn its resume, never this reply
+        if let Err(e) = self.reply_pin_impl(slot, history, pos) {
+            tracing::warn!(slot, err = %e, "laguna reply checkpoint not taken");
+        }
+    }
+
     fn take_prefill_reused(&mut self, slot: usize) -> usize {
         self.batch
             .as_mut()

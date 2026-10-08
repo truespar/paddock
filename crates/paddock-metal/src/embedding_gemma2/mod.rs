@@ -3,19 +3,30 @@
 //! padded-token pooling or host model math. Multimodal towers feed this same
 //! graph; a text-only load deliberately does not allocate their weights.
 //!
-//! Bring-up status: same-Q8 GGUF text checks pass; the strict MLX reference
-//! gate still fails. Image/audio/video adapters, retrieval-quality benchmarks
-//! and rival performance qualification remain open. Do not advertise those
-//! modalities or call this complete multimodal/SOTA support yet.
+//! Bring-up status: same-Q8 GGUF text checks pass. Affine8 MLX text passes the
+//! strict single-input reference through 8K; native batching is bit-stable.
+//! The separately retained upstream batched-reference gate still fails:
+//! upstream changes its own arithmetic with batch shape. GGUF picture/audio
+//! towers pass the same-weight media
+//! references (audio compares the HF frontend separately from llama.cpp's
+//! different log floor). MLX image/audio and sampled-video checks pass the
+//! media tolerance, not bit parity. Retrieval-quality benchmarks and broad
+//! hardware/rival qualification remain open.
+mod audio;
 mod forward;
 mod load;
+mod media;
+mod media_mlx;
 mod scratch;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_attention;
 #[cfg(test)]
+mod tests_media;
+#[cfg(test)]
 mod tests_projection;
+mod vision;
 
 use crate::device::{Buffer, Completion, MetalDevice, MetalError, Result};
 use crate::weights::Weight;
@@ -81,6 +92,8 @@ pub struct EmbeddingGemma2 {
     capacity: usize,
     mlx: bool,
     weight_bytes: u64,
+    vision: Option<vision::Vision>,
+    audio: Option<audio::Audio>,
 }
 pub struct PendingEmbedding {
     // Fence before freeing result/input allocations even on cancellation.
@@ -106,12 +119,60 @@ impl EncoderBackend for EmbeddingGemma2 {
         Some(self.device.allocated_bytes())
     }
     fn idle_reclaim_after(&self) -> Option<std::time::Duration> {
-        self.scratch
-            .as_ref()
-            .map(|_| std::time::Duration::from_secs(2))
+        (self.scratch.is_some()
+            || self
+                .vision
+                .as_ref()
+                .is_some_and(vision::Vision::has_workspace))
+        .then(|| std::time::Duration::from_secs(2))
     }
     fn reclaim_idle(&mut self) {
         self.scratch = None;
+        if let Some(v) = &mut self.vision {
+            v.reclaim();
+        }
+    }
+    fn media_kinds(&self) -> (bool, bool, bool) {
+        (
+            self.vision.is_some(),
+            self.audio.is_some(),
+            self.vision.is_some(),
+        )
+    }
+    fn validate_media(
+        &self,
+        seqs: &[Vec<u32>],
+        media: &[Vec<paddock_engine::service::MmChunk>],
+    ) -> std::result::Result<(), String> {
+        self.check_media(seqs, media)
+    }
+    fn embed_submit_media(
+        &mut self,
+        seqs: &[Vec<u32>],
+        media: &[Vec<paddock_engine::service::MmChunk>],
+        lane: usize,
+        dim: Option<usize>,
+    ) -> std::result::Result<Self::Pending, String> {
+        self.check_media(seqs, media)?;
+        self.validate_dimensions(dim)?;
+        if lane != 0 {
+            return Err("invalid embedding lane".into());
+        }
+        // Media need no text workspace until their features are ready.
+        // Small generations already fit beside the tower, but drop
+        // a large text cache before the media stage. At <=3072 rows the
+        // <=282 MiB cache + the largest 1120-token tower/resize + retained
+        // media features fit the catalog's workspace envelope. Audio groups
+        // are bounded at 4096 projection rows and reuse frontend scratch. In-flight
+        // work still owns its generation through PendingEmbedding.
+        if self.scratch.as_ref().is_some_and(|s| s.rows > 3072)
+            && media.iter().any(|m| !m.is_empty())
+        {
+            self.scratch = None;
+        }
+        let inputs = self.encode_media(seqs, media).map_err(|e| e.to_string())?;
+        self.submit_with_media(seqs, dim.unwrap_or(DIM), inputs)
+            .map_err(|e| e.to_string())
     }
     fn coalesce_row_budget(&self) -> usize {
         self.capacity

@@ -112,6 +112,25 @@ pub struct BackendRuntime {
     pub default_max_ctx: Option<usize>,
 }
 
+/// Independently loadable towers stored inside a directory checkpoint. Unlike
+/// `embedded_vision`, these are optional resident allocations, not companions
+/// to download or paths to pass as mmproj. Bytes exclude the text backbone.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OptionalTowers {
+    pub vision: Option<TowerMemory>,
+    pub audio: Option<TowerMemory>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TowerMemory {
+    pub weight_bytes: u64,
+    pub workspace_bytes: u64,
+    #[serde(default)]
+    pub default: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactRuntime {
     /// Legacy entries mean CUDA; an explicit empty list allows no backend.
@@ -130,6 +149,8 @@ pub struct ArtifactRuntime {
     /// The weights bundle contains its tower; no optional mmproj is involved.
     #[serde(default)]
     pub embedded_vision: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optional_towers: Option<OptionalTowers>,
     /// Fixed loader contract, e.g. auto selects checkpoint-native BF16 KV.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_cache_dtype: Option<String>,
@@ -164,6 +185,7 @@ impl Default for ArtifactRuntime {
             companions: None,
             checkpoint_dir: false,
             embedded_vision: false,
+            optional_towers: None,
             kv_cache_dtype: None,
             experimental: false,
             note: None,

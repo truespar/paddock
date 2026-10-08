@@ -87,8 +87,20 @@ struct NativeReadImportTests {
     await model.importSelection(.success([first, second]), kind: .images)
     #expect(model.draft.images.map(\.name) == ["first.png", "second.png"])
     #expect(model.draft.state == "Classify these pictures" && model.stateError == nil)
-    await model.importSelection(.success([first]), kind: .state)
+    await model.importSelection(.success([first]), kind: .images)
     #expect(model.draft.images.count == 3 && model.draft.state == "Classify these pictures")
+    var extracted = false
+    model.api = { path, method, body, _ in
+      #expect(path == "api/runners/1234/extract" && method == "POST")
+      #expect(body?["filename"] == .string("first.png"))
+      #expect(body?["file_metadata"] == .string("off"))
+      extracted = true
+      return .object(["text": .string("Extracted image text")])
+    }
+    await model.importSelection(.success([first]), kind: .state)
+    #expect(extracted && model.draft.state == "Extracted image text")
+    #expect(model.draft.images.map(\.name) == ["first.png", "second.png", "first.png"])
+    #expect(model.error == nil && !model.importing)
   }
 
   private func directory() throws -> URL {

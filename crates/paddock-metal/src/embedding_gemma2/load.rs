@@ -305,6 +305,8 @@ impl EmbeddingGemma2 {
             capacity,
             mlx,
             weight_bytes,
+            vision: None,
+            audio: None,
         })
     }
 }

@@ -52,6 +52,7 @@ public final class WorkspaceModel {
   let studioLibrary = StudioLibraryModel()
   let reads: NativeReadsModel
   let tables: NativeTablesModel
+  let embeddings: NativeEmbeddingsModel
   let studioPreferences = StudioPreferencesModel()
   public var desktopRequest: DesktopRequest?
   public var desktopError: String?
@@ -60,7 +61,8 @@ public final class WorkspaceModel {
   @ObservationIgnored public var onSnapshot: ((ManagerSnapshot) -> Void)?
   @ObservationIgnored public var onStudioState: ((StudioState) -> Void)?
   public var studioNeedsQuitConfirmation: Bool {
-    reads.hasWork || tables.hasWork || connections.hasDraft || integrations.hasDraft
+    reads.hasWork || tables.hasWork || embeddings.hasWork || connections.hasDraft
+      || integrations.hasDraft
       || endpointEditor?.dirty == true
       || studioLibrary.hasWork || studioLibrary.instructions.hasWork || studioPreferences.hasWork
       || draft.hasContent || chatStorage?.busy == true
@@ -86,6 +88,7 @@ public final class WorkspaceModel {
     self.client = client
     reads = NativeReadsModel(client: client)
     tables = NativeTablesModel(client: client)
+    embeddings = NativeEmbeddingsModel(client: client)
     insights = InsightsModel(client: client)
     benchmarks = BenchmarksModel(client: client)
     dataStorage = DataStorageModel(client: client)
@@ -323,6 +326,7 @@ public final class WorkspaceModel {
     memoryPressure = nil
     await reads.shutdown()
     tables.cancel()
+    embeddings.cancel()
     await speech.settle()
     await studioLibrary.settle()
     await studioPreferences.settle()

@@ -8,7 +8,7 @@
 //!
 //! One message shape carries four things, and they land in two places:
 //!
-//! - TEXT is transcript: rendered where it sits (see [`append_system_reminder`]),
+//! - TEXT is transcript: rendered where it sits (see [`place_system_text`]),
 //!   and dropped once cleared when it is turn-scoped (`clear_at`).
 //! - `output_config.effort` and `tool_addition` / `tool_removal` blocks are
 //!   REQUEST controls: they change the effort rung and the rendered tool set
@@ -16,7 +16,7 @@
 //!
 //! Placement follows Anthropic's rule (a system message with text or a tool
 //! change follows a user turn and is last or followed by an assistant turn;
-//! an effort-only one may sit anywhere) - the rendering relies on the first
+//! an effort-only one may sit anywhere) - the user-turn fold relies on the first
 //! half, since the text joins the user turn it follows.
 
 use serde_json::{Value, json};
@@ -170,11 +170,22 @@ pub(crate) fn render_text(messages: &[Value], i: usize) -> Result<Option<String>
     Ok(Some(sm.text))
 }
 
-/// Render a mid-conversation system message where it sits.
-///
-/// No template we serve can do that natively: most allow a system turn only
-/// first (Qwen's raises "System message must be at the beginning"), and gemma
-/// has no system turn at all. Folding the text into the leading system prompt
+/// Render a mid-conversation system message where it sits: as the template's
+/// own system turn when it renders one there itself (`native`, probed at
+/// load; Kolibri's does, and keeps an assistant turn's reasoning only after
+/// the last USER message, so a reminder folded into a user turn would drop
+/// the model's reasoning mid tool loop), else [`append_system_reminder`].
+pub(crate) fn place_system_text(msgs: &mut Vec<Value>, text: &str, native: bool) {
+    if native {
+        msgs.push(json!({"role": "system", "content": text}));
+    } else {
+        append_system_reminder(msgs, text);
+    }
+}
+
+/// The fold for templates that cannot render a system turn mid-conversation:
+/// most allow one only first (Qwen's raises "System message must be at the
+/// beginning"), and gemma has no system turn at all. Folding the text into the leading system prompt
 /// would render everywhere, but it moves the text to the FRONT - rewriting the
 /// prefix of every cached turn, which is exactly the cost Anthropic's feature
 /// exists to avoid. Claude Code sends one of these on every request, so that
@@ -487,5 +498,17 @@ mod tests {
         append_system_reminder(&mut tools, "x");
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[1]["role"], "user");
+    }
+
+    #[test]
+    fn a_native_template_gets_the_system_turn_itself() {
+        // after tool results too: no user turn is invented to carry it
+        let mut msgs = vec![json!({"role": "tool", "content": "42", "tool_call_id": "t1"})];
+        place_system_text(&mut msgs, "keep going", true);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1], json!({"role": "system", "content": "keep going"}));
+        let mut folded = vec![json!({"role": "user", "content": "hi"})];
+        place_system_text(&mut folded, "x", false);
+        assert_eq!(folded.len(), 1);
     }
 }

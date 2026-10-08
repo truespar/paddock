@@ -3024,79 +3024,13 @@ static int pd_attn_prefill_f16_paged_impl(
             || n_heads == 12u * n_kv_heads || n_heads == 16u * n_kv_heads)) {
         const bool f8v4n = kv_dtype == PD_KV_FP8_E4M3;
         const uint32_t g_ = n_heads / n_kv_heads;
-        // hd128 REPACK-PANE arm (pf7rp) - sits above the pf7
-        // convert-in-register arm below because it wins the long spans that
-        // arm loses. Measured against FlashInfer's own prefill kernel, pf7
-        // held a FLAT deficit
-        // from 1536 rows on, and reading their kernel named the cause:
-        // USE_KV_REPACK is true for this config, so their mainloop does
-        // repack_fp8_tile_to_bf16() once per tile and then runs native b16
-        // ldmatrix. pf7 converts per FRAGMENT LOAD -- pd_pf7_swz is 2 shfl +
-        // 2 prmt and pd_pf7_swzt is 3+3, inside the mma loop, so all four
-        // warps re-swizzle and re-convert the whole K tile (~640 warp
-        // shuffles per KV tile per CTA). Two q-tile-WIDTH arms were
-        // falsified first (NW=8 +30%, SUB=2 +15% at FlashInfer's exact launch
-        // config) -- the tile was never the lever; the per-fragment convert
-        // is. pf7rp already was this structure at hd256 (door 2,
-        // bit-identical there, -5..-21%); this is the hd128 generalization.
-        // TK=48 not 64: at TK=64 the tile is 51,456 B and misses 2 CTA/SM by
-        // 256 BYTES -> 4 warps/SM, and NW=8 already measured what 1 CTA/SM
-        // costs this pipeline. Kill: PADDOCK_NO_PF7RP -> the pf7 arm below.
-        // G in {4,6,8,9,12,16} (12: Kolibri 1's 48q/4kv): the first wiring instantiated only
-        // 4/6/8 -- granite's ratio and its neighbours -- and the fleet sweep
-        // found the two ratios outside that set were the worst prefill
-        // cells by far, because they fell through to v4 and never saw
-        // the repack pane at all (laguna-s 72q/8kv G=9 and nemotron-3.5
-        // 32q/2kv G=16), while a G=8 model on the same kernel was fine.
-        // G only ever indexes the
-        // row->head map (R / G, R % G) and need not divide MR -- the
-        // R < Rtot guard covers the tail -- so this set is a pure
-        // instantiation list, and a ratio missing from it is silently a
-        // different, slower kernel. The outer gate already admitted all five.
-        static const bool no_rp128 = pd_env("PADDOCK_NO_PF7RP") != nullptr;
-        if (f8v4n && !no_rp128 && (g_ == 4u || g_ == 6u || g_ == 8u
-                                   || g_ == 9u || g_ == 12u || g_ == 16u)) {
-            constexpr uint32_t RPMR = 64u, RPTK = 48u, RPHD = 128u;
-            // Q MR*(HD+8)h | pane TK*(HD+8)h | raw K,V TK*HD B each (the
-            // per-row positions ride the pane). Every term carries its own
-            // shape factor.
-            constexpr uint32_t RPSM =
-                RPMR * (RPHD + 8u) * 2u + RPTK * (RPHD + 8u) * 2u
-                + 2u * RPTK * RPHD;                         // 42,752 -> 2 CTA/SM
-#define PD_PF7RP_128_FITS(GV)                                                  \
-    pd_smem_fits((const void*)pd_attn_prefill_pf7rp_kernel<GV, false, RPHD,    \
-                                                           RPTK>, RPSM)
-            static const bool rp128_fits = PD_PF7RP_128_FITS(4u)
-                && PD_PF7RP_128_FITS(6u) && PD_PF7RP_128_FITS(8u)
-                && PD_PF7RP_128_FITS(9u) && PD_PF7RP_128_FITS(12u)
-                && PD_PF7RP_128_FITS(16u);
-#undef PD_PF7RP_128_FITS
-            if (rp128_fits) {
-                const bool multi = pd_pf_runs_offs != nullptr;
-                const dim3 gr = multi
-                    ? dim3(n_kv_heads, (pd_pf_runs_maxn * g_ + RPMR - 1u) / RPMR,
-                           pd_pf_runs_n)
-                    : dim3(n_kv_heads, (batch * g_ + RPMR - 1u) / RPMR);
-                const uint32_t* ro = multi ? (const uint32_t*)pd_pf_runs_offs : nullptr;
-#define PD_PF7RP_128_LAUNCH(GV)                                                \
-    pd_attn_prefill_pf7rp_kernel<GV, false, RPHD, RPTK>                        \
-        <<<gr, 128, RPSM, (cudaStream_t)stream>>>(                             \
-        (const float*)q, (const unsigned char*)pool_k,                         \
-        (const unsigned char*)pool_v,                                          \
-        (const float*)sinks, (float*)out, (const unsigned int*)positions,      \
-        (const uint32_t*)block_tables, blocks_per_slot,                        \
-        (const unsigned int*)slots, n_heads, kv_dim, swa_window, batch, scale, \
-        nullptr, ro, wp)
-                if (g_ == 4u) PD_PF7RP_128_LAUNCH(4u);
-                else if (g_ == 6u) PD_PF7RP_128_LAUNCH(6u);
-                else if (g_ == 8u) PD_PF7RP_128_LAUNCH(8u);
-                else if (g_ == 9u) PD_PF7RP_128_LAUNCH(9u);
-                else if (g_ == 12u) PD_PF7RP_128_LAUNCH(12u);
-                else PD_PF7RP_128_LAUNCH(16u);
-#undef PD_PF7RP_128_LAUNCH
-                return pd_launch_status();
-            }
-        }
+        // the hd128 repack-pane arms (pf7rp, wide rung first) live beside
+        // their kernel: pd_pf7rp128_go in prefill_fa2.cuh
+        int rc128 = 0;
+        if (pd_pf7rp128_go(&rc128, f8v4n, g_, q, pool_k, pool_v, sinks, out, positions,
+                           block_tables, blocks_per_slot, slots, n_heads, n_kv_heads, kv_dim,
+                           swa_window, batch, scale, wp, stream))
+            return rc128;
         // hd128 convert-in-register arm: the pf7 raw-fp8-resident
         // FA2 tile generalized from hd256 to hd128 (granite imax). Raw e4m3 KV
         // stays in smem (no f16 expand pass, no barrier), TK=64, ~44 KB smem

@@ -8,6 +8,7 @@
 
 pub mod api;
 pub mod artifacts;
+mod automatic_budget;
 pub mod backend_contract;
 pub mod cloud;
 pub mod cloud_loop;

@@ -245,6 +245,17 @@ __device__ __forceinline__ void pd_f16_mma(float d[4], const uint32_t a[4],
 // dims j and j + 32 of a head are the same lane's m-groups rg and rg + 2: the
 // rotation happens in registers.
 #define PD_F16_EPI_QKV 6u
+// GEGLU_G4 (H16): Gemma 4's vision tower FFN - f16(gelu_tanh(gate) * up) in
+// pd_geglu_kernel's own form (its constants and operation order, so the
+// landing is bit-for-bit that kernel + convert_f32_f16 over this GEMM's f32
+// output), off GEGLU's 16-row block re-lay with the GATE in rows 0-7 and the
+// UP in rows 8-15. The two [N][F] f32 planes never land.
+#define PD_F16_EPI_GEGLU_G4 7u
+__device__ __forceinline__ float pd_f16_geglu_g4(float g, float u) {
+    float gelu = 0.5f * g * (1.0f + tanhf(0.79788456080286535587989211986876f * g
+                                          * (1.0f + 0.044715f * g * g)));
+    return gelu * u;
+}
 __device__ __forceinline__ float pd_f16_gelu_erf(float v) {
     return 0.5f * v * (1.0f + erff(v * 0.70710678118654752440084436210484f));
 }
@@ -668,6 +679,16 @@ __global__ void __launch_bounds__(NWARP * 32) pd_f16_gemm_mma_kernel(
                         const uint32_t f = ((r0 >> 4) << 3) + (r0 & 7u);
                         if (c0 < N) o16[(size_t)c0 * F + f] = __float2half(pd_f16_gelu_erf(v00) * v10);
                         if (c1 < N) o16[(size_t)c1 * F + f] = __float2half(pd_f16_gelu_erf(v01) * v11);
+                    }
+                    continue;
+                }
+                if (EPI == PD_F16_EPI_GEGLU_G4) {
+                    // v0x = gate feature f (activated), v1x = its up
+                    if (r0 < M) {
+                        const uint32_t F = M >> 1;
+                        const uint32_t f = ((r0 >> 4) << 3) + (r0 & 7u);
+                        if (c0 < N) o16[(size_t)c0 * F + f] = __float2half(pd_f16_geglu_g4(v00, v10));
+                        if (c1 < N) o16[(size_t)c1 * F + f] = __float2half(pd_f16_geglu_g4(v01, v11));
                     }
                     continue;
                 }
@@ -2277,6 +2298,46 @@ static bool pd_f16_mma_ring2_elect(unsigned int out_dim, unsigned int batch) {
     return blocks2d >= (uint32_t)nsm;
 }
 
+// ---- the blocked tile on cc 12.1 (GB10): elected, with a raster per shape ----
+// The occupancy argument holds here too: 100 KB of shared memory an SM, so
+// the padded ST=3 ring (61 KB) is one resident block and the swizzled one
+// (48 KB) two. Swept on the box (bench/f16_wide_sweep, PD_D / PD_FFN /
+// PD_GLU for Gemma 4's vision towers), every arm byte-identical to the
+// production landing: with the raster below, the blocked tuple takes a
+// layer of the 768-wide tower at 2394 rows -26% (1024 rows -17%, 9576 -22%),
+// the 1152-wide one -47% (its 8608-wide gate|up 1700 -> 679 us), ViT-L at
+// 1029 / 4116 / 16464 rows -27 / -23 / -21%, the narrow planes -9%.
+// The raster is NOT cc 8.6's. This die's L2 is 24 MB, which holds one of the
+// two planes but rarely both, and which one it should hold is the shape's:
+// the plain raster (weight tiles fastest) re-reads the weight plane for every
+// activation tile row, the grouped one re-reads the activation plane for
+// every weight group - so keep the SMALLER plane resident. Both planes are
+// K wide, so that is out_dim against batch: grouped only when out_dim > batch.
+// Groups of four everywhere (768-wide tower, 9576 rows: +0.5% against the
+// plain raster's -21.6%; ViT-L at 16464 rows -5.5% against -21.2%) and the
+// plain raster everywhere (the 1152-wide gate|up -8% against -60%) both lose
+// big somewhere; the rule lands within 5% of the best of the two on every
+// shape swept, conv64 (+5%, a 60 us plane) the one shape it is behind the
+// production tuple on.
+static bool pd_f16_blk_gb10() {
+    static int on = -1;
+    if (on < 0) {
+        int dev = 0, ccM = 0, ccm = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&ccM, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&ccm, cudaDevAttrComputeCapabilityMinor, dev);
+        on = ccM == 12 && ccm == 1;
+    }
+    return on != 0;
+}
+
+// weight tiles a grid.z group walks: nwt (one group, the plain raster) or
+// PD_F16_BLK_GW, per the rule above on cc 12.1, PD_F16_BLK_GW elsewhere
+static uint32_t pd_f16_blk_gw(uint32_t nwt, uint32_t out_dim, uint32_t batch) {
+    if (pd_f16_blk_gb10() && out_dim <= batch) return nwt;
+    return nwt < PD_F16_BLK_GW ? nwt : PD_F16_BLK_GW;
+}
+
 static bool pd_f16_mma_blocked_elect(unsigned int out_dim, unsigned int batch) {
     static int nsm = -1;
     if (nsm < 0) {
@@ -2286,7 +2347,8 @@ static bool pd_f16_mma_blocked_elect(unsigned int out_dim, unsigned int batch) {
         cudaDeviceGetAttribute(&ccm, cudaDevAttrComputeCapabilityMinor, dev);
         cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
         static const bool off = pd_env("PADDOCK_NO_F16_BLOCKED") != nullptr;
-        nsm = (ccM == 8 && ccm == 6 && n > 0 && !off) ? n : 0;
+        const bool die = (ccM == 8 && ccm == 6) || (ccM == 12 && ccm == 1);
+        nsm = (die && n > 0 && !off) ? n : 0;
     }
     if (nsm == 0) return false;
     const uint32_t blocks2d = ((out_dim + 127u) / 128u) * ((batch + 127u) / 128u);
@@ -2312,7 +2374,7 @@ static int pd_f16_mma_blocked(const __half* w, const __half* x, void* y, float b
         set = true;
     }
     const uint32_t nwt = (out_dim + BM - 1u) / BM, nxt = (batch + BN - 1u) / BN;
-    const uint32_t gw = nwt < PD_F16_BLK_GW ? nwt : PD_F16_BLK_GW;
+    const uint32_t gw = pd_f16_blk_gw(nwt, out_dim, batch);
     const uint32_t nwg = (nwt + gw - 1u) / gw;
     dim3 grid(gw, nxt, nwg);
     pd_f16_gemm_mma_kernel<BM, BN, NW, ST, KT, RG, CG, false, H16, EPI, true, true, CONV3>
@@ -3415,6 +3477,16 @@ PD_EXPORT int pd_f16_gemm_h_geglu(const void* w, const void* x, void* y,
                                    unsigned int batch, void* stream) {
     if ((out_dim & 15u) != 0u) return (int)cudaErrorInvalidValue;
     return pd_f16_gemm_h_route<PD_F16_EPI_GEGLU>(w, x, y, nullptr, in_dim, out_dim, batch, stream);
+}
+
+// 826: Gemma 4's vision GEGLU landing - y is [batch][out_dim / 2] halves,
+// gelu_tanh(gate) * up per feature (pd_geglu_kernel's form) off a weight
+// re-laid in 16-row blocks, gate rows first. out_dim a multiple of 16.
+PD_EXPORT int pd_f16_gemm_h_geglu_g4(const void* w, const void* x, void* y,
+                                      unsigned int in_dim, unsigned int out_dim,
+                                      unsigned int batch, void* stream) {
+    if ((out_dim & 15u) != 0u) return (int)cudaErrorInvalidValue;
+    return pd_f16_gemm_h_route<PD_F16_EPI_GEGLU_G4>(w, x, y, nullptr, in_dim, out_dim, batch, stream);
 }
 
 // 1 when the f16 landing is this device's elected wide-batch route, 0 when the

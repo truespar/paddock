@@ -21,9 +21,9 @@
 //! > right after `message_start`, like the live API.
 //!
 //! Mid-conversation `role: "system"` messages (Claude Code ends every request
-//! with one) render in place, as a `<system-reminder>` in the user turn they
-//! follow; their `output_config.effort` and tool changes apply to the request.
-//! See `messages_system`.
+//! with one) render in place - the template's own system turn where it has
+//! one there, else a `<system-reminder>` in the user turn they follow; their
+//! `output_config.effort` and tool changes apply to the request (`messages_system`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -150,11 +150,7 @@ fn image_part(source: &Value) -> Result<Value, String> {
 /// instruction merge further down and responses.rs's own.
 fn merge_system(system: Option<Value>, block: &str) -> Value {
     match system {
-        Some(Value::String(s)) if !s.trim().is_empty() => Value::String(format!(
-            "{block}
-
-{s}"
-        )),
+        Some(Value::String(s)) if !s.trim().is_empty() => Value::String(format!("{block}\n\n{s}")),
         Some(Value::Array(parts)) => {
             let mut out = vec![json!({"type": "text", "text": block})];
             out.extend(parts);
@@ -164,7 +160,11 @@ fn merge_system(system: Option<Value>, block: &str) -> Value {
     }
 }
 
-fn convert_messages(system: Option<&Value>, messages: &[Value]) -> Result<Vec<Value>, String> {
+fn convert_messages(
+    system: Option<&Value>,
+    messages: &[Value],
+    native: bool,
+) -> Result<Vec<Value>, String> {
     let mut msgs = Vec::new();
     if let Some(sys) = system {
         msgs.push(json!({"role": "system", "content": block_text(sys)}));
@@ -174,12 +174,12 @@ fn convert_messages(system: Option<&Value>, messages: &[Value]) -> Result<Vec<Va
             .get("role")
             .and_then(Value::as_str)
             .ok_or("message needs a role")?;
-        // Mid-conversation system messages: the text renders in place, riding
-        // the user turn it follows; their effort and tool changes are request
+        // Mid-conversation system messages: the text renders in place (see
+        // `place_system_text`); their effort and tool changes are request
         // controls, applied by the callers through `system_controls`.
         if role == "system" {
             if let Some(text) = crate::messages_system::render_text(messages, i)? {
-                crate::messages_system::append_system_reminder(&mut msgs, &text);
+                crate::messages_system::place_system_text(&mut msgs, &text, native);
             }
             continue;
         }
@@ -513,7 +513,7 @@ fn render_prompt(
         .chat_template
         .as_deref()
         .ok_or("this model has no chat template")?;
-    let msgs = convert_messages(system, messages)?;
+    let msgs = convert_messages(system, messages, model.late_system_native)?;
     // Extract before normalize_messages: convert_messages turns an
     // Anthropic `{"type":"image","source":{base64,media_type,data}}` block
     // into a chat image part, and normalize then rewrites every image part
@@ -944,16 +944,15 @@ fn prepare(
     })
 }
 
-/// `thinking.display`: `summarized` is the upstream default - locally the
-/// full thinking text is the returned block, since there is no separate
-/// summarizer; `omitted` returns thinking blocks with an empty `thinking`
-/// field and no thinking deltas. Unknown values are a 400.
+/// `thinking.display`: `summarized` (upstream default) and `updates` (beta; its progress
+/// notes do not exist locally, and an unsigned emptied block would drop the reasoning
+/// from the next turn) return the full thinking text; `omitted` empty blocks; else a 400.
 fn thinking_omitted(thinking: Option<&Value>) -> Result<bool, String> {
     match thinking
         .and_then(|t| t.get("display"))
         .and_then(Value::as_str)
     {
-        None | Some("summarized") => Ok(false),
+        None | Some("summarized" | "updates") => Ok(false),
         Some("omitted") => Ok(true),
         Some(other) => Err(format!("invalid thinking.display {other:?}")),
     }
@@ -2716,7 +2715,7 @@ enum AnthAction {
         limit: usize,
     },
     Invoke {
-        cfg: paddock_mcp::ServerConfig,
+        cfg: Box<paddock_mcp::ServerConfig>, // boxed: JSON maps that keep key order
         real_name: String,
         real_args: Value,
     },
@@ -2934,7 +2933,7 @@ fn plan_anthropic_call(
         crate::loop_budget::Verdict::Fresh => match routed {
             Some((cfg, _)) => (
                 AnthAction::Invoke {
-                    cfg,
+                    cfg: Box::new(cfg),
                     real_name: real_name.clone(),
                     real_args: real_args.clone(),
                 },
@@ -4514,7 +4513,7 @@ mod tests {
     #[test]
     fn anthropic_thinking_renders_on_qwen38_like_chat_reasoning_content() {
         let qwen = include_str!("../tests/fixtures/qwen38_chat_template.jinja");
-        let converted = convert_messages(None, &tool_loop_history()).expect("convert");
+        let converted = convert_messages(None, &tool_loop_history(), false).expect("convert");
         let msgs = crate::chat_template::normalize_messages(&converted);
         let out = crate::chat_template::render(qwen, &msgs, None, None).expect("render");
         assert!(
@@ -4550,7 +4549,7 @@ mod tests {
     #[test]
     fn anthropic_tool_loop_renders_on_gpt_oss() {
         let gptoss = include_str!("../tests/fixtures/gptoss_chat_template.jinja");
-        let converted = convert_messages(None, &tool_loop_history()).expect("convert");
+        let converted = convert_messages(None, &tool_loop_history(), false).expect("convert");
         let msgs = crate::chat_template::normalize_messages(&converted);
         let out = crate::chat_template::render(gptoss, &msgs, None, None).expect("render");
         assert!(
@@ -4560,7 +4559,7 @@ mod tests {
 
         let mut quiet = tool_loop_history();
         quiet[1]["content"].as_array_mut().unwrap().remove(1); // drop the text block
-        let converted = convert_messages(None, &quiet).expect("convert");
+        let converted = convert_messages(None, &quiet, false).expect("convert");
         let msgs = crate::chat_template::normalize_messages(&converted);
         let out = crate::chat_template::render(gptoss, &msgs, None, None).expect("render");
         assert!(
@@ -4601,7 +4600,7 @@ mod tests {
                 {"type": "text", "text": "What is this?"}
             ]
         })];
-        let converted = convert_messages(None, &anthropic).expect("convert");
+        let converted = convert_messages(None, &anthropic, false).expect("convert");
         // the pixels have to still be reachable after conversion - this is the
         // ordering the surface got wrong (convert -> extract -> normalize)
         let urls = crate::chat::find_images(&converted).expect("find");
@@ -4646,7 +4645,7 @@ mod tests {
                 {"type": "text", "text": "<chart2csv>"}
             ]
         })];
-        let converted = convert_messages(None, &anthropic).expect("convert");
+        let converted = convert_messages(None, &anthropic, false).expect("convert");
         let msgs = crate::chat_template::normalize_messages(&converted);
         let out =
             crate::chat_template::render(granite_template(), &msgs, None, None).expect("render");
@@ -4666,6 +4665,7 @@ mod tests {
         assert!(!thinking_omitted(Some(&json!({"type": "enabled"}))).unwrap());
         assert!(!thinking_omitted(Some(&json!({"display": "summarized"}))).unwrap());
         assert!(thinking_omitted(Some(&json!({"display": "omitted"}))).unwrap());
+        assert!(!thinking_omitted(Some(&json!({"display": "updates"}))).unwrap());
         assert!(thinking_omitted(Some(&json!({"display": "raw"}))).is_err());
     }
 
@@ -4725,7 +4725,7 @@ mod tests {
                 {"type": "text", "text": "thanks"},
             ]}),
         ];
-        let out = convert_messages(Some(&json!("sys")), &messages).unwrap();
+        let out = convert_messages(Some(&json!("sys")), &messages, false).unwrap();
         assert_eq!(out[0]["role"], "system");
         assert_eq!(out[1]["content"], "hi");
         assert_eq!(out[2]["role"], "assistant");
@@ -4750,7 +4750,7 @@ mod tests {
                 {"type": "text", "text": "# Environment", "cache_control": {"type": "ephemeral"}},
             ]}),
         ];
-        let out = convert_messages(Some(&json!("sys")), &messages).unwrap();
+        let out = convert_messages(Some(&json!("sys")), &messages, false).unwrap();
         assert_eq!(out.len(), 2, "no system turn past the first");
         assert_eq!(out[0]["content"], "sys");
         assert_eq!(out[1]["role"], "user");
@@ -4776,8 +4776,8 @@ mod tests {
         ];
         let mut with = head.clone();
         with.push(json!({"role": "system", "content": "tests are flaky here"}));
-        let base = convert_messages(None, &head).unwrap();
-        let out = convert_messages(None, &with).unwrap();
+        let base = convert_messages(None, &head, false).unwrap();
+        let out = convert_messages(None, &with, false).unwrap();
         assert_eq!(out[..base.len()], base[..]);
         assert_eq!(out.len(), base.len() + 1);
         assert_eq!(out[base.len()]["role"], "user");
@@ -4802,7 +4802,7 @@ mod tests {
             json!({"role": "system", "content": "x"}),
             json!({"role": "user", "content": "hi"}),
         ];
-        let e = convert_messages(None, &first).unwrap_err();
+        let e = convert_messages(None, &first, false).unwrap_err();
         assert!(e.contains("must follow a user message"), "{e}");
     }
 
@@ -4812,7 +4812,7 @@ mod tests {
             {"type": "text", "text": "what is this?"},
             {"type": "image", "source": {"type": "base64", "media_type": "image/bmp", "data": "AAAA"}},
         ]})];
-        let out = convert_messages(None, &messages).unwrap();
+        let out = convert_messages(None, &messages, false).unwrap();
         assert!(out[0]["content"].is_array());
         let urls = crate::chat::find_images(&out).unwrap();
         assert_eq!(

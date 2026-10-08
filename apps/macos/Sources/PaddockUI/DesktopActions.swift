@@ -106,6 +106,25 @@ extension WorkspaceModel {
     default: break
     }
     if case .chat(let port) = request.action,
+      snapshot?.runners.contains(where: { $0.port == port && $0.embedder != nil }) == true
+    {
+      guard !embeddings.busy, !embeddings.importing else {
+        desktopError = "Finish or cancel the current embedding request before switching models."
+        return
+      }
+      desktopTransition = true
+      defer { desktopTransition = false }
+      await embeddings.refresh()
+      guard embeddings.endpoints.contains(where: { $0.port == port }) else {
+        desktopError = "This embedding model is not ready. Check Settings > Instances."
+        return
+      }
+      embeddings.port = port
+      navigation.mode = .studio
+      navigation.studio = .embeddings
+      return
+    }
+    if case .chat(let port) = request.action,
       snapshot?.runners.contains(where: { $0.port == port && $0.tabular != nil }) == true
     {
       guard !tables.busy else {

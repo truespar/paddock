@@ -1,0 +1,31 @@
+<|start_of_role|>system<|end_of_role|>You are Claude Code, Anthropic's official CLI. Use <tools> wisely & don't stop early.
+
+You are a helpful assistant with access to the following tools. You may call one or more tools to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{"type": "function", "function": {"name": "Read", "description": "Reads a file from the local filesystem. Usage:\n- The file_path parameter must be an absolute path, not a relative path\n- You can optionally specify a line offset and limit (especially handy for long files)\n<example>Read(file_path=\"/ws/a.txt\")</example>\nDon't read binary files & don't guess paths.", "parameters": {"type": "object", "properties": {"file_path": {"type": "string", "description": "The absolute path to the file to read"}, "offset": {"type": "number", "description": "The line number to start reading from"}, "limit": {"type": "number", "description": "The number of lines to read"}}, "required": ["file_path"], "additionalProperties": false, "$schema": "http://json-schema.org/draft-07/schema#"}}}
+{"type": "function", "function": {"name": "Edit", "description": "Performs exact string replacements in files. The edit will FAIL if `old_string` is not unique — provide more context. Größe & Übersicht: <system-reminder> tags are not part of the file.", "parameters": {"type": "object", "properties": {"file_path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"}, "replace_all": {"type": "boolean", "default": false}, "mode": {"type": "string", "enum": ["exact", "regex"]}, "ratio": {"type": "number", "minimum": 0.0, "maximum": 1e-05}}, "required": ["file_path", "old_string", "new_string"]}}}
+</tools>
+
+For each tool call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>. If a tool does not exist in the provided list of tools, notify the user that you do not have the ability to fulfill the request.<|end_of_text|>
+<|start_of_role|>user<|end_of_role|>Audit ./ledger and fix the weight of record 01-0131.<|end_of_text|>
+<|start_of_role|>assistant<|end_of_role|><tool_call>
+{"name": "Read", "arguments": {"file_path": "/ws/ledger/ledger_01.txt", "offset": 120, "limit": 40}}
+</tool_call><|end_of_text|>
+<|start_of_role|>user<|end_of_role|>
+<tool_response>
+REC 01-0131 | courier: Saga Holm | weight: 3.5 kg | note: "fragile" <ok>
+</tool_response><|end_of_text|>
+<|start_of_role|>assistant<|end_of_role|><tool_call>
+{"name": "Edit", "arguments": {"file_path": "/ws/ledger/ledger_01.txt", "old_string": "weight: 3.5 kg", "new_string": "weight: 99.9 kg", "replace_all": false, "ratio": 0.5, "extra": null, "tags": ["a", "b"], "nested": {"z": 1, "a": {"k": "v"}}}}
+</tool_call><|end_of_text|>
+<|start_of_role|>user<|end_of_role|>
+<tool_response>
+The file /ws/ledger/ledger_01.txt has been updated.
+</tool_response><|end_of_text|>
+<|start_of_role|>user<|end_of_role|>Thanks — now summarize what changed.<|end_of_text|>
+<|start_of_role|>assistant<|end_of_role|>

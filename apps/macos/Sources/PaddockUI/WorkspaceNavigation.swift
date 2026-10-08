@@ -13,6 +13,7 @@ enum StudioDestination: String, CaseIterable, Identifiable {
   case prompts = "Prompts"
   case reads = "Reads"
   case tables = "Tables"
+  case embeddings = "Embeddings"
   case settings = "Settings"
   // The native shell puts these destinations at the sidebar bottom, unlike
   // the web's separate ActivityBar.
@@ -25,6 +26,7 @@ enum StudioDestination: String, CaseIterable, Identifiable {
     case .prompts: "text.alignleft"
     case .reads: "list.bullet.clipboard"
     case .tables: "tablecells"
+    case .embeddings: "point.3.connected.trianglepath.dotted"
     case .settings: "gearshape"
     }
   }

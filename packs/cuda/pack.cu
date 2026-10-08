@@ -38,6 +38,7 @@
 #include "src/mamba/core.cuh"       // Mamba-2 SSD lane (nemotron_h_moe): conv step w/ bias, seq scan, grouped gated norm, f8r GEMV (needs deltanet core's PD_CONV_K_MAX)
 #include"src/mamba/ssd.cuh"        // chunked SSD prefill scan: defines pd_mamba2_ssd_run, elected by core.cuh's seq launchers for long segments
 #include "src/gemm/mmq.cuh"
+#include "src/gemm/mmq_small.cuh"  // the mmq tile at smaller output footprints for medium row counts, bit-identical to it (needs mmq's PD_MMQ_XK/YK)
 #include "src/moe/mmq.cuh"
 #include "src/attn/prefill.cuh"
 #include "src/attn/prefill_fa2.cuh"  // FA-2 prefill tile, f16 v4, pf7/pf7rp (split from prefill.cuh); also carries the shared CK macro
@@ -95,4 +96,5 @@
 #include "src/sam3/video.cuh"     // SAM 3's video path around the tracker: Pillow's frame resample, mask bitplanes + overlaps, hole/sprinkle fill, the birth and memory chains' resamplings and non-overlap, the output masks (needs tracker's union-find, f32_qkv's pd_launch_status)
 #include "src/embedding_gemma2.cuh"  // EmbeddingGemma 2 text encoder: batch-invariant row norms + sandwich seam, q/k/v head transform, bidirectional varlen attention at hd 256/512, pooling (needs decode_spec's pd_fa_mma16, f32_qkv's pd_launch_status)
 #include "src/embedding_gemma2_audio.cuh"  // EmbeddingGemma 2 audio tower: log-mel frontend, conv subsampling, the clipped Conformer's seams, chunked rel-pos attention, light conv (needs f32_qkv's pd_launch_status)
+#include "src/gemma4v.cuh"  // Gemma 4 vision tower fused glue: device patchify, pos + norm, head norms + 2-D rope (angle table once a picture), post + next norm, GEGLU, pooled tail (bit-identical to the unfused chain; needs abi pd_df + elementwise PD_ACC_*)
 #include "src/exports.cuh"

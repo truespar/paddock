@@ -13,6 +13,7 @@ struct StudioSidebarFooter: View {
         destination(.reads, title: "Reads")
       }
       if navigation.studio != .tables { destination(.tables, title: "Tables") }
+      destination(.embeddings, title: "Embeddings")
       destination(.prompts, title: "Prompt library")
       HStack(spacing: 2) {
         destination(.settings, title: "Settings")

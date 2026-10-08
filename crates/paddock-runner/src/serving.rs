@@ -60,6 +60,11 @@ pub struct ServingModel {
     /// friends) - extracted once at load, empty for every other model. A
     /// client can't reach them without knowing they exist.
     pub task_tags: Vec<crate::chat_template::TaskTag>,
+    /// The template renders a `system` turn past the opening run in place
+    /// itself (Kolibri's), so such turns reach it as they are instead of the
+    /// `<system-reminder>` fold - probed once at load,
+    /// `chat_template::renders_late_system`.
+    pub late_system_native: bool,
     /// which assistant-output syntax to parse (tool calls, reasoning)
     pub dialect: crate::parsers::Dialect,
     /// what reasoning control this checkpoint's own template implements -
@@ -2149,6 +2154,9 @@ pub(crate) fn load_with_residency(
         .as_deref()
         .map(crate::chat_template::task_tags)
         .unwrap_or_default();
+    let late_system_native = chat_template
+        .as_deref()
+        .is_some_and(crate::chat_template::renders_late_system);
     // What reasoning control this checkpoint implements, read off its own
     // template once at load - see `crate::reasoning` for why it cannot be a
     // table keyed on `arch` or `dialect`.
@@ -2233,6 +2241,7 @@ pub(crate) fn load_with_residency(
         stop_tokens,
         chat_template,
         task_tags,
+        late_system_native,
         dialect,
         reasoning,
         // An attached mmproj is the whole test: every arm below fails the load
@@ -2432,6 +2441,9 @@ fn load_hf_dir(
         .as_deref()
         .map(crate::chat_template::task_tags)
         .unwrap_or_default();
+    let late_system_native = chat_template
+        .as_deref()
+        .is_some_and(crate::chat_template::renders_late_system);
     // What reasoning control this checkpoint implements, read off its own
     // template once at load - see `crate::reasoning` for why it cannot be a
     // table keyed on `arch` or `dialect`.
@@ -2502,6 +2514,7 @@ fn load_hf_dir(
         stop_tokens,
         chat_template,
         task_tags,
+        late_system_native,
         dialect,
         reasoning,
         supports_vision,

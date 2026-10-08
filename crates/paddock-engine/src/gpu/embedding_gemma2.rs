@@ -219,7 +219,9 @@ impl GpuExecutor {
 
     /// Bidirectional varlen attention, f32 out `[rows][4][hd]`. `tiles` holds
     /// `(seq << 12) | tile` per [`EG2_ATTN_ROWS`] query rows of each sequence;
-    /// `window` 0 = full, else |i - j| <= window.
+    /// `window` 0 = full, else |i - j| <= window. `split` 2 or 4 spreads each
+    /// tile's warps over that many blocks (slot 829, bit-identical per row);
+    /// 1 is slot 809's grid.
     #[allow(clippy::too_many_arguments)]
     pub fn eg2_attn(
         &self,
@@ -233,11 +235,15 @@ impl GpuExecutor {
         rows: usize,
         head_dim: usize,
         window: usize,
+        split: usize,
     ) -> Result<(), GpuError> {
         let f = self
             .kernels
             .eg2_attn
             .ok_or(GpuError::MissingOp("eg2_attn"))?;
+        if !matches!(split, 1 | 2 | 4) || (split > 1 && self.kernels.eg2_attn_s.is_none()) {
+            return Err(oob("eg2_attn: split must be 1, or 2 / 4 with slot 829"));
+        }
         if !matches!(head_dim, 256 | 512)
             || q16.len() < rows * 4 * head_dim
             || k16.len() < rows * 512
@@ -253,6 +259,25 @@ impl GpuExecutor {
         let (cp, _g4) = cu.device_ptr(&self.stream);
         let (tp, _g5) = tiles.device_ptr(&self.stream);
         let (op, _g6) = out.device_ptr_mut(&self.stream);
+        if let (true, Some(fs)) = (split > 1, self.kernels.eg2_attn_s) {
+            // SAFETY: ABI contract (slot 829); bounds checked above; the
+            // caller builds cu/tiles for these rows
+            return check(unsafe {
+                fs(
+                    qp as *const _,
+                    kp as *const _,
+                    vp as *const _,
+                    cp as *const _,
+                    tp as *const _,
+                    n_tiles as u32,
+                    op as *mut _,
+                    head_dim as u32,
+                    window as u32,
+                    split as u32,
+                    self.stream_ptr(),
+                )
+            });
+        }
         // SAFETY: ABI contract (slot 809); bounds checked above; the caller
         // builds cu/tiles for these rows
         check(unsafe {
@@ -269,6 +294,11 @@ impl GpuExecutor {
                 self.stream_ptr(),
             )
         })
+    }
+
+    /// True when the pack carries the split attention grid (slot 829).
+    pub fn has_eg2_attn_s(&self) -> bool {
+        self.kernels.eg2_attn_s.is_some()
     }
 
     /// The small-pass Q8_0 GEMM (slot 811): `y [batch][out] = W . X` over

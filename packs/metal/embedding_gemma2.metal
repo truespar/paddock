@@ -28,6 +28,7 @@ inline void eg2_project(device const uchar* w,device const float* x,device float
 kernel void NAME(device const uchar* w [[buffer(0)]],device const float* x [[buffer(1)]],device float* out [[buffer(2)]],constant uint* p [[buffer(3)]],uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) { \
 threadgroup T a[32*64],b[64*64];eg2_project<TY,T,BF>(w,x,out,p,g,tid,a,b);}
 EG2_PROJECT(eg2_project_a8,0x108,bfloat,true)
+EG2_PROJECT(eg2_project_a8_f32,0x108,float,false)
 EG2_PROJECT(eg2_project_a4,0x100,bfloat,true)
 EG2_PROJECT(eg2_project_bf16,30,bfloat,true)
 EG2_PROJECT(eg2_project_q8,8,half,false)
@@ -43,6 +44,71 @@ threadgroup T a[16*64],b[16*64];eg2_project<TY,T,BF,16,16>(w,x,out,p,g,tid,a,b);
 EG2_NARROW(eg2_project_a8_narrow,0x108,bfloat,true)
 EG2_NARROW(eg2_project_q8_narrow,8,half,false)
 #undef EG2_NARROW
+
+// BF16-rounded partition sums with an eight-lane logical fold. A 16-part
+// contraction combines (0+8), (1+9), ... before adding the eight totals.
+// SIMD matrix contractions retain the reference's eight-product order; a
+// wider tensor contraction differs at BF16 ties. Storage stays tile-bounded.
+kernel void eg2_project_a8_partition(device const uchar* w [[buffer(0)]],
+    device const float* x [[buffer(1)]],device float* out [[buffer(2)]],
+    constant uint* p [[buffer(3)]],uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float a[16*64],b[16*64];
+    uint sg=tid/32,lane=tid%32,partitions=p[0]/p[3],fold=max(1u,partitions/8);
+    float2 total=0,subtotal=0;
+    for(uint ordinal=0;ordinal<partitions;++ordinal){
+        uint part=ordinal%fold*8+ordinal/fold;
+        auto acc=make_filled_simdgroup_matrix<float,8>(0.0f);
+        for(uint base=part*p[3];base<(part+1)*p[3];base+=64){
+            for(uint i=tid;i<16*64;i+=128){uint r=g.y*16+i/64,n=g.x*16+i/64,k=base+i%64;
+                a[i]=r<p[2]?x[ulong(r)*p[0]+k]:0;
+                b[i]=n<p[1]?mlx_bf(dg_weight(w,p[0],p[1],0x108,ulong(n)*p[0]+k)):0;}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for(uint k=0;k<64;k+=8){simdgroup_float8x8 left,right;
+                simdgroup_load(left,a+(sg/2)*8*64+k,64);
+                simdgroup_load(right,b+(sg%2)*8*64+k,64,ulong2(0),true);
+                simdgroup_multiply_accumulate(acc,left,right,acc);}
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        for(uint j=0;j<2;++j)subtotal[j]=mlx_bf(subtotal[j]+mlx_bf(acc.thread_elements()[j]));
+        if((ordinal+1)%fold==0){for(uint j=0;j<2;++j)total[j]=mlx_bf(total[j]+subtotal[j]);subtotal=0;}
+    }
+    uint r=g.y*16+(sg/2)*8+((lane&16)>>2)+((lane&6)>>1);
+    uint n=g.x*16+(sg%2)*8+((lane&8)>>1)+((lane&1)<<1);
+    if(r<p[2])for(uint j=0;j<2;++j)if(n+j<p[1])out[ulong(r)*p[1]+n+j]=total[j];
+}
+
+// Short-request affine contraction keeps decoded weights F32. Eight lanes
+// own disjoint 64-weight groups of a channel, reducing eight-element partials
+// before a fixed lane tree. Studied MLX 0.32.3's arithmetic, not its code.
+kernel void eg2_affine_vector(device const uchar* w [[buffer(0)]],
+    device const float* x [[buffer(1)]],device float* y [[buffer(2)]],
+    constant uint* p [[buffer(3)]],uint2 g [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+    #pragma clang fp contract(off)
+    #pragma clang fp reassociate(off)
+    uint lane=tid%8,n=g.x*16+tid/8,kdim=p[0],ndim=p[1];
+    if(n>=ndim)return;
+    device const bfloat* scale=reinterpret_cast<device const bfloat*>(w+ulong(kdim)*ndim);
+    device const bfloat* bias=scale+ulong(kdim)*ndim/64;
+    float result=0;
+    for(uint base=lane*64;base<kdim;base+=512){
+        ulong group=(ulong(n)*kdim+base)/64;
+        float s=float(scale[group]),b=float(bias[group]);
+        #pragma unroll
+        for(uint chunk=0;chunk<64;chunk+=8){
+            float dot=0;
+            #pragma unroll
+            for(uint j=0;j<8;++j){uint k=base+chunk+j;
+                float weight=s*float(w[ulong(n)*kdim+k])+b;
+                dot+=x[ulong(g.y)*kdim+k]*weight;}
+            result+=dot;
+        }
+    }
+    result+=simd_shuffle_down(result,4);
+    result+=simd_shuffle_down(result,2);
+    result+=simd_shuffle_down(result,1);
+    if(lane==0)y[ulong(g.y)*ndim+n]=mlx_bf(result);
+}
 
 kernel void eg2_embed(device const uchar* w [[buffer(0)]],device const uint* ids [[buffer(1)]],device float* out [[buffer(2)]],constant uint* p [[buffer(3)]],uint i [[thread_position_in_grid]]) {
     if(i>=p[0]*p[1])return;ulong at=ulong(ids[i/p[0]])*p[0]+i%p[0];float v;
@@ -61,6 +127,16 @@ gemma_prefill<D,16,32,float,false,false,float,false,true>(q,k,v,meta,ends,out,p,
 EG2_ATTN(256)
 EG2_ATTN(512)
 #undef EG2_ATTN
+// GGUF attention's operand cut is F16, like its tensor projection lane.
+// Keep online maxima, probabilities and accumulation F32. KT32 amortizes
+// the score/softmax barriers without growing a quadratic attention buffer.
+#define EG2_HALF_ATTN(D) \
+kernel void eg2_half_attention##D(device half* q [[buffer(0)]],device const half* k [[buffer(1)]],device const half* v [[buffer(2)]],device const uint* meta [[buffer(3)]],device const uint* ends [[buffer(4)]],device float* out [[buffer(5)]],device const uint* tiles [[buffer(6)]],constant uint* p [[buffer(7)]],uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) { \
+threadgroup half kv[32*128];threadgroup float pr[32*32],scores[32*32],hi[32],den[32],corr[32]; \
+gemma_prefill<D,32,32,half,false,false,half,false,true,float,false,128>(q,k,v,meta,ends,out,p,g.x,tiles[2*g.y],tiles[2*g.y+1],tid,kv,pr,scores,hi,den,corr,ends); }
+EG2_HALF_ATTN(256)
+EG2_HALF_ATTN(512)
+#undef EG2_HALF_ATTN
 // Shader validation adds compiler staging to explicit threadgroup arrays.
 // Stream 128-channel panels to stay below 32 KiB even with that staging.
 // In the F32-probability arm, each row subgroup owns the same score/probability
@@ -95,7 +171,8 @@ kernel void eg2_norm(device const float* x [[buffer(0)]],device const uchar* w [
 
 // Separate q/k/v head normalization; full split-half RoPE. Unlike generative
 // Gemma 4, global heads rotate ALL dimensions. No K=V projection shortcut.
-// p: head count, head width, weight dtype, BF16, rope base bits (zero for V).
+// p: head count, head width, weight dtype, BF16 arithmetic, rope base bits
+// (zero for V), output storage (0 F32, 1 BF16, 2 F16).
 kernel void eg2_heads(device const float* x [[buffer(0)]],device const uchar* w [[buffer(1)]],device const uint* meta [[buffer(2)]],device float* out [[buffer(3)]],constant uint* p [[buffer(4)]],uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
     #pragma clang fp contract(off)
     #pragma clang fp reassociate(off)
@@ -117,7 +194,8 @@ kernel void eg2_heads(device const float* x [[buffer(0)]],device const uchar* w 
             float c=p[3]?precise::cos(angle):cos(angle),s=p[3]?precise::sin(angle):sin(angle);
             if(p[3]){c=mlx_bf(c);s=mlx_bf(s);float ac=mlx_bf(a*c),bs=mlx_bf(bv*s),as=mlx_bf(a*s),bc=mlx_bf(bv*c);a=mlx_bf(ac-bs);bv=mlx_bf(as+bc);}
             else {float next=a*c-bv*s;bv=a*s+bv*c;a=next;}}
-        if(p[5]){device bfloat* dst=reinterpret_cast<device bfloat*>(out);dst[b+j]=bfloat(a);dst[b+j+hd/2]=bfloat(bv);}
+        if(p[5]==2){device half* dst=reinterpret_cast<device half*>(out);dst[b+j]=half(a);dst[b+j+hd/2]=half(bv);}
+        else if(p[5]){device bfloat* dst=reinterpret_cast<device bfloat*>(out);dst[b+j]=bfloat(a);dst[b+j+hd/2]=bfloat(bv);}
         else {out[b+j]=p[3]?mlx_bf(a):a;out[b+j+hd/2]=p[3]?mlx_bf(bv):bv;}}
 }
 

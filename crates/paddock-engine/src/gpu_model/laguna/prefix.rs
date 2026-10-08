@@ -365,6 +365,66 @@ impl GpuLaguna {
         Ok(())
     }
 
+    /// The reply's first tool call just opened (`Generator::reply_pin_at`),
+    /// and `history[..pos]` is what the slot's cache holds: the prompt and
+    /// the reply so far - its reasoning. File that under the radix up to the
+    /// last page boundary at or before `pos` and land the SWA window ending
+    /// there straight from the slot's ring (written within the last 15
+    /// tokens; the ring keeps a whole window of slack), so the next agentic
+    /// turn - which re-sends this reasoning ahead of the call and its result -
+    /// resumes past it instead of re-prefilling it from this prompt's end.
+    /// The call itself stays out: a client re-serializes tool calls, so the
+    /// bytes past its opening token are not the model's. Laguna caches no
+    /// rolling reply checkpoint (qwen35's per-page snapshots): a Kolibri-class
+    /// template drops a turn's reasoning once a new user message follows, so
+    /// the end of a final answer is never re-sent as generated - the opening
+    /// of a call is the one boundary a next request shares. One checkpoint a
+    /// reply; the radix's LRU owns it afterwards.
+    pub(crate) fn reply_pin_impl(
+        &mut self,
+        slot: usize,
+        history: &[u32],
+        pos: u32,
+    ) -> Result<(), GpuModelError> {
+        // Laguna's own template renders every earlier assistant turn with an
+        // empty think block - a reply's reasoning never comes back, so its pin
+        // could only take a window slot from prompts that do resume
+        if self.hp.flavor != super::Flavor::Kolibri {
+            return Ok(());
+        }
+        let cut = pos as usize / BLOCK_TOKENS * BLOCK_TOKENS;
+        let idx = {
+            let Some(bs) = self.batch.as_mut() else {
+                return Ok(());
+            };
+            let Some(pf) = bs.prefix.as_mut() else {
+                return Ok(());
+            };
+            if cut < MIN_SNAPSHOT_LEN
+                || history.len() < cut
+                || bs
+                    .tables
+                    .get(slot)
+                    .is_none_or(|t| t.blocks().len() < cut / BLOCK_TOKENS)
+            {
+                return Ok(());
+            }
+            let blocks = bs.tables[slot].blocks()[..cut / BLOCK_TOKENS].to_vec();
+            pf.radix.insert(&history[..cut], &blocks, &mut bs.pool);
+            // None: the boundary is already checkpointed (a prompt cut) or
+            // the state pool is off - nothing to add
+            let Some(idx) = pf.radix.attach_state(&history[..cut], cut) else {
+                return Ok(());
+            };
+            idx
+        };
+        if paddock_models::dev_var_os!("PADDOCK_PREFIX_STATS").is_some() {
+            tracing::info!("laguna-reply-pin: slot {slot} pos {pos} cut {cut} idx {idx}");
+        }
+        self.land_window(slot, cut, idx)?;
+        Ok(())
+    }
+
     /// Copy the SWA window ending at `pos` (block-aligned) out of `slot`'s
     /// rings into checkpoint slot `cidx`, stream-ordered after the walk that
     /// wrote it. The caller keeps the window ring-resident: the ring holds

@@ -10,6 +10,7 @@ use std::sync::mpsc::{Sender, channel};
 use tokio::sync::oneshot;
 
 mod backend;
+pub mod embedding_gemma2;
 use crate::metrics::EngineMetrics;
 pub use backend::EncoderBackend;
 #[cfg(test)]
@@ -75,8 +76,8 @@ pub enum EncodeJob {
 pub struct Encoder {
     tx: Sender<EncodeJob>,
     block_scale_calibration: bool,
-    /// (pictures, audio) the backend embeds - see `EncoderBackend::media_kinds`.
-    media: (bool, bool),
+    /// (pictures, audio, video frames) - see `EncoderBackend::media_kinds`.
+    media: (bool, bool, bool),
 }
 
 impl Encoder {
@@ -95,7 +96,7 @@ impl Encoder {
         B: EncoderBackend + 'static,
     {
         let (tx, rx) = channel::<EncodeJob>();
-        let (ready_tx, ready_rx) = channel::<Result<(bool, (bool, bool)), String>>();
+        let (ready_tx, ready_rx) = channel::<Result<(bool, (bool, bool, bool)), String>>();
 
         std::thread::Builder::new()
             .name("paddock-encoder".into())
@@ -667,6 +668,11 @@ impl Encoder {
     /// Whether the backend embeds audio clips (an attached audio tower).
     pub fn serves_audio(&self) -> bool {
         self.media.1
+    }
+
+    /// A frame sequence is not a still-image album: it has its own processor.
+    pub fn serves_video(&self) -> bool {
+        self.media.2
     }
 
     /// Device-specific quality calibration is not a generic encoder feature.

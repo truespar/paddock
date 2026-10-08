@@ -162,6 +162,11 @@ fn api_allowed(method: &Method, path: &str) -> bool {
         ["api", "runners", port, "v1", "systemone"] if port.parse::<u16>().is_ok() => {
             *method == Method::POST
         }
+        ["api", "runners", port, "v1", "embeddings" | "rerank"]
+            if port.parse::<u16>().is_ok_and(|p| p != 0) =>
+        {
+            *method == Method::POST
+        }
         [
             "api",
             "runners",
@@ -204,8 +209,6 @@ fn api_allowed(method: &Method, path: &str) -> bool {
             tail,
             ["server"]
                 | ["v1", "responses"]
-                | ["v1", "embeddings"]
-                | ["v1", "rerank"]
                 | ["v1", "realtime"]
                 | ["v1", "audio", "transcriptions" | "alignments"]
                 | ["v1", "images", "generations" | "edits"]
@@ -622,6 +625,8 @@ mod tests {
             (Method::PUT, "/api/reads/set-1"),
             (Method::DELETE, "/api/reads/set-1"),
             (Method::POST, "/api/runners/12587/v1/systemone"),
+            (Method::POST, "/api/runners/12587/v1/embeddings"),
+            (Method::POST, "/api/runners/12587/v1/rerank"),
             (Method::POST, "/api/runners/12587/v1/tabular/predictions"),
             (Method::POST, "/api/runners/12587/v1/audio/diarizations"),
             (
@@ -657,6 +662,9 @@ mod tests {
             (Method::POST, "/api/reads/set-1"),
             (Method::GET, "/api/reads/set-1/secret"),
             (Method::GET, "/api/runners/12587/v1/systemone"),
+            (Method::GET, "/api/runners/12587/v1/embeddings"),
+            (Method::POST, "/api/runners/0/v1/embeddings"),
+            (Method::POST, "/api/runners/invalid/v1/rerank"),
             (Method::POST, "/api/runners/invalid/v1/systemone"),
             (Method::POST, "/api/runners/12587/stop"),
             (Method::GET, "/api/runners/12587/v1/tabular/predictions"),

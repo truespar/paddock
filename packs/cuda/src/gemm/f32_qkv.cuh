@@ -3370,11 +3370,6 @@ static inline int pd_attn_lagd_f16() {
     if (m < 0) m = pd_env("PADDOCK_LAGD_F16") ? 1 : 0;
     return m;
 }
-#define PD_LAGD_SMEM_SPLIT \
-    (2u * 16u * 136u * 2u + 3u * 16u * 40u * 2u + 2u * 2u * 32u * 136u * 2u)
-#define PD_LAGD_SMEM_F16 \
-    (16u * 136u * 2u + 16u * 40u * 2u + 2u * 2u * 32u * 136u * 2u)
-
 PD_EXPORT
 int pd_attn_decode_batch_partial(const void* q, const void* kc, const void* vc, void* out_o,
                                  void* out_ml, const void* positions, const void* slots,
@@ -4074,58 +4069,8 @@ int pd_attn_decode_batch_partial_paged(const void* q, const void* pool_k, const 
             blocks_per_slot, n_heads, n_kv_heads, head_dim, kv_dim,
             swa_window, n_splits, batch, 1u, scale, 16u, fa_fill);
     }
-    // head-packed lagd (later WIDENED): the fp8
-    // KV hd128 arm. Started as nemotron's full-attention shape (G=16, no
-    // window), which rode vec8's scalar per-q-head walk - profiled at 4.7%
-    // DRAM, latency-bound, where a head-packed mma kernel (FlashInfer's
-    // shape) streams KV once per group. lagd is that structure and G=16
-    // fills its m16 tile exactly.
-    //
-    // The original gate said `group >= 9 && swa_window == 0`, and that cost
-    // real ground: decode performance sorts by ARM, not by model. Every mma
-    // arm lands within ~5% of the best kernel available; every shape falling
-    // through to a scalar walk is 2-5x behind, and G=8 plus every windowed
-    // shape had no mma arm at all.
-    //
-    // Both clauses were conservatism, not capability, and the kernel says so:
-    //   - WINDOW: lagd computes `first_pos` from swa_window with the same
-    //     expression as every other arm and stages from it. A decode row's
-    //     window is a contiguous RANGE, not a mask, so there is no masking to
-    //     add. The f16 KV lagd arm below has served laguna's windowed layers
-    //     for a long time - the windowed path is production-proven, it was only
-    //     the fp8 twin that was fenced off.
-    //   - G=8: the base (WIDE=false) build is the G<=8 build - q rows pad to
-    //     16 mma rows and every store guards `rr < G`. It only ever lacked
-    //     the fp8 instantiation, because nemotron did not need one.
-    // So this is an instantiation + gate widening, the same class of change
-    // that lifted the equivalent prefill shapes out of the scalar band.
-    //
-    // WIDE is picked by group: >8 uses the frag half-1 rows as real heads,
-    // ==8 fills half 0 exactly and leaves half 1 zero-padded (running WIDE
-    // at G=8 would be correct but would double the mma work on dead rows).
-    // pd_pdl_go, not a plain launch: the arms this replaces (vec8, the
-    // GQA-fused walk) ride the decode cascade and the laguna chain law
-    // stands - arm + launcher are one change. The engine mirrors this
-    // election in its split budget (n_kv-based, not nh-based).
-    // Kill: PADDOCK_NO_ATTN_HP16 (falls back to vec8 / the GQA walk).
-    // batch >= 1 since GB10 2026-09-11 (was >= 2, the width the arm was
-    // built for): at one row the head-packed walk is faster at every context
-    // on the small die - bench/nemo_dec_attn_bench.cu B=1: ctx 128 5.7 vs
-    // vec8's 6.2 us, 1024 9.9 vs 15.5, 4096 28.3 vs 54.1, 7680 52.9 vs 147.6
-    // - and the long-prompt board had lost the c1 cell at 7.5k tokens on the
-    // vec8 walk's 327 us per layer (GB10, 2026-09-11). The r = 1
-    // lane thereby joins the r >= 2 class (the NXQ2/NXP3 split-f16 walk);
-    // its gates are the class gates, not bit-identity.
-    //
-    // f16 KV at G 9..16 joined on GB10 2026-09-25. f16 G<=8 was always lagd
-    // (the GQA branch below); past 8 the GQA gate dropped it onto the plain
-    // per-(q-head, split) walk, where each of the group's heads re-reads the
-    // group's KV: ~24 GB/s, nemotron's whole decode-vs-depth cliff (67.9 ->
-    // 12.5 tok/s from 10K to 259K). bench/nemo_dec_attn_long_gb10_bench.cu,
-    // 32q/2kv: 256K 11.2 ms -> 1.38 ms a layer (~193 GB/s); laguna's G9
-    // window-512 shape 43 -> 9-10 us at one row, 394 -> 94 at r 8. Class:
-    // the lagd split-f16 walk (rel 1e-6..7e-5 vs the exact-f32 walk, the
-    // same class the G<=8 f16 lane and every fp8 hp16 row already serve).
+    // head-packed lagd (later WIDENED): the hd128 arm for fp8 G 8..16 and
+    // f16 G 9..16 - its history and gates are lagd.cuh's "head-packed arm" note.
     const bool hp_f8 = kv_dtype == PD_KV_FP8_E4M3 && group >= 8u;
     const bool hp_f16 = kv_dtype == PD_KV_FP16 && group > 8u;
     static int no_hp16 = -1;
@@ -4140,9 +4085,37 @@ int pd_attn_decode_batch_partial_paged(const void* q, const void* pool_k, const 
             pd_prefer_max_shared(
                 pd_attn_decode_lagd_kernel<32u, 2u, 3u, true, __nv_fp8_e4m3, false>);
             pd_prefer_max_shared(pd_attn_decode_lagd_kernel<32u, 2u, 3u, true, __half, true>);
+            pd_prefer_max_shared(
+                pd_attn_decode_lagd_kernel<32u, 2u, 3u, true, __nv_fp8_e4m3, true, true>);
+            pd_prefer_max_shared(
+                pd_attn_decode_lagd_kernel<32u, 2u, 3u, true, __nv_fp8_e4m3, false, true>);
             hp16_set_p = 1;
         }
         dim3 hgrid(n_kv_heads, batch, n_splits);
+        // fp8 rows take the raw-ring build (lagd.cuh RR: two tiles in flight,
+        // paired converts, one barrier less a tile; bit-identical).
+        // Kill: PADDOCK_NO_LAGD_RR -> the in-place expand.
+        static int no_lagd_rr = -1;
+        if (no_lagd_rr < 0) no_lagd_rr = pd_env("PADDOCK_NO_LAGD_RR") ? 1 : 0;
+        if (hp_f8 && !no_lagd_rr) {
+            if (group > 8u)
+                pd_pdl_go(pd_attn_decode_lagd_kernel<32u, 2u, 3u, true, __nv_fp8_e4m3, true, true>,
+                          hgrid, 256u, PD_LAGD_SMEM_RR, (cudaStream_t)stream,
+                          (const float*)q, (const __nv_fp8_e4m3*)pool_k,
+                          (const __nv_fp8_e4m3*)pool_v, (float*)out_o, (float*)out_ml,
+                          (const unsigned int*)positions, (const unsigned int*)slots,
+                          (const uint32_t*)block_tables, blocks_per_slot, 0u, n_heads,
+                          n_kv_heads, kv_dim, swa_window, n_splits, scale);
+            else
+                pd_pdl_go(pd_attn_decode_lagd_kernel<32u, 2u, 3u, true, __nv_fp8_e4m3, false, true>,
+                          hgrid, 256u, PD_LAGD_SMEM_RR, (cudaStream_t)stream,
+                          (const float*)q, (const __nv_fp8_e4m3*)pool_k,
+                          (const __nv_fp8_e4m3*)pool_v, (float*)out_o, (float*)out_ml,
+                          (const unsigned int*)positions, (const unsigned int*)slots,
+                          (const uint32_t*)block_tables, blocks_per_slot, 0u, n_heads,
+                          n_kv_heads, kv_dim, swa_window, n_splits, scale);
+            return pd_launch_status();
+        }
         if (hp_f16)
             pd_pdl_go(pd_attn_decode_lagd_kernel<32u, 2u, 3u, true, __half, true>,
                       hgrid, 256u, PD_LAGD_SMEM_SPLIT, (cudaStream_t)stream,

@@ -18,13 +18,23 @@ fn installed_model_supervisor_on(
     default_spec: Option<&str>,
     backend: &str,
 ) -> Supervisor {
-    let models = dir.join("models");
-    let source = crate::registry::Registry::new(models.clone()).with_backend(backend);
+    let source = crate::registry::Registry::new(dir.join("models")).with_backend(backend);
     let mut model = source.catalog_of(model_id).unwrap().clone();
     for artifact in &mut model.artifacts {
         if let Some(policy) = default_spec {
             artifact.runtime.default_spec = Some(policy.into());
         }
+    }
+    installed_catalog_supervisor(dir, model, backend)
+}
+
+fn installed_catalog_supervisor(
+    dir: &Path,
+    mut model: crate::registry::CatalogModel,
+    backend: &str,
+) -> Supervisor {
+    let models = dir.join("models");
+    for artifact in &mut model.artifacts {
         for file in &mut artifact.files {
             file.size = 1;
             let path = models.join(&file.dest);
@@ -56,6 +66,108 @@ fn installed_model_supervisor_on(
         None,
         None,
     )
+}
+
+#[tokio::test]
+async fn automatic_memory_is_reserved_but_not_projected_as_a_user_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let sup = installed_model_supervisor(dir.path(), "embeddinggemma-2", None);
+    let spec = SpawnSpec {
+        model: "embeddinggemma-2".into(),
+        artifact: Some("mlx8".into()),
+        vram_budget: Some(2048),
+        automatic_budget: Some(2048),
+        ..Default::default()
+    };
+    let config = sup.preview_config(spec).await.unwrap();
+    assert!(crate::automatic_budget::is_automatic(&config));
+    sup.write_config_file_deferred(18100, &config, None)
+        .unwrap();
+    assert_eq!(sup.config_vram_budget(18100), Some(2048));
+    assert_eq!(sup.project_config_text(&config).unwrap().vram_budget, None);
+    let native = crate::native_endpoints::projection(&sup, 18100).unwrap();
+    assert!(native["settings"]["vram_budget"].is_null());
+    // Editing the number invalidates the marker; explicit limits survive.
+    let explicit = config.replace("vram_budget = 2048", "vram_budget = 3072");
+    sup.write_config_file_deferred(18100, &explicit, None)
+        .unwrap();
+    assert_eq!(
+        sup.project_config_text(&explicit).unwrap().vram_budget,
+        Some(3072)
+    );
+    let native = crate::native_endpoints::projection(&sup, 18100).unwrap();
+    assert_eq!(native["settings"]["vram_budget"], 3072);
+}
+
+#[tokio::test]
+async fn optional_bundled_towers_round_trip_without_foreign_companions() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = crate::registry::Registry::new(dir.path().join("models")).with_backend("metal");
+    let mut model = registry.catalog_of("embeddinggemma-2").unwrap().clone();
+    let weights = model.artifacts.iter_mut().find(|a| a.id == "q8").unwrap();
+    weights.runtime = serde_json::from_value(serde_json::json!({
+        "backends": ["metal"], "checkpoint_dir": true, "companions": [],
+        "default_max_ctx": 8192, "default_max_batch": 1,
+        "optional_towers": {
+            "vision": {"weight_bytes": 300, "workspace_bytes": 30, "default": true},
+            "audio": {"weight_bytes": 600, "workspace_bytes": 60, "default": false}
+        }
+    }))
+    .unwrap();
+    let sup = installed_catalog_supervisor(dir.path(), model, "metal");
+    for (vision, audio, expected_vision, expected_audio) in [
+        (None, None, true, false),
+        (Some(false), Some(false), false, false),
+        (Some(true), Some(false), true, false),
+        (Some(false), Some(true), false, true),
+        (Some(true), Some(true), true, true),
+    ] {
+        let spec = SpawnSpec {
+            model: "embeddinggemma-2".into(),
+            artifact: Some("q8".into()),
+            vision,
+            audio,
+            ..Default::default()
+        };
+        let config = sup.preview_config(spec).await.unwrap();
+        let parsed: toml::Value = toml::from_str(&config).unwrap();
+        assert!(parsed.get("mmproj").is_none() && parsed.get("audio_mmproj").is_none());
+        assert_eq!(parsed["vision"].as_bool(), Some(expected_vision));
+        assert_eq!(parsed["audio"].as_bool(), Some(expected_audio));
+        let projected = sup.project_config_text(&config).unwrap();
+        assert_eq!(
+            (projected.vision, projected.audio),
+            (expected_vision, expected_audio)
+        );
+        // Native saved settings must consume the same projection, not infer
+        // vision from mmproj presence (bundled towers deliberately have none).
+        sup.write_config_file_deferred(18100, &config, None)
+            .unwrap();
+        let native = crate::native_endpoints::projection(&sup, 18100).unwrap();
+        assert_eq!(native["settings"]["vision"], expected_vision);
+        assert_eq!(native["settings"]["audio"], expected_audio);
+        let model = sup.registry.catalog_of("embeddinggemma-2").unwrap();
+        let bytes = crate::estimate::towers_bytes_for(
+            model,
+            &sup.registry,
+            model.artifact("q8"),
+            expected_vision,
+            audio,
+        );
+        assert_eq!(
+            bytes,
+            u64::from(expected_vision) * 330 + u64::from(expected_audio) * 660
+        );
+        let repeated = sup
+            .preview_config(sup.spec_from_config_text(&config).unwrap())
+            .await
+            .unwrap();
+        let reread = sup.project_config_text(&repeated).unwrap();
+        assert_eq!(
+            (reread.vision, reread.audio),
+            (expected_vision, expected_audio)
+        );
+    }
 }
 
 #[tokio::test]

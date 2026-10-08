@@ -83,16 +83,32 @@ struct EndpointModelWorkload: View {
     if editor.embeddedVision {
       Label("Vision included", systemImage: "photo")
         .font(.system(size: 12)).foregroundStyle(.secondary)
+    } else if editor.bundledVision {
+      Toggle("Vision · image input", isOn: $editor.vision).toggleStyle(.switch).controlSize(.small)
+        .accessibilityIdentifier("endpoint-vision-input")
     } else if let vision = editor.visionArtifact {
       Toggle("Vision · image input", isOn: $editor.vision).toggleStyle(.switch).controlSize(.small)
         .disabled(vision.required == true || !vision.installed)
       if !vision.installed {
         if let onDownload {
-          Button("Download vision", systemImage: "arrow.down") { onDownload(editor.artifactID) }
-            .buttonStyle(QuietButtonStyle()).accessibilityIdentifier("endpoint-download-vision")
+          Button("Download vision", systemImage: "arrow.down") {
+            onDownload(editor.splitMediaTowers ? vision.id : editor.artifactID)
+          }
+          .buttonStyle(QuietButtonStyle()).accessibilityIdentifier("endpoint-download-vision")
         } else {
           hint("Download the vision companion in Catalog to enable image input.")
         }
+      }
+    }
+    if editor.bundledAudio {
+      Toggle("Audio input", isOn: $editor.audio).toggleStyle(.switch).controlSize(.small)
+        .accessibilityIdentifier("endpoint-audio-input")
+    } else if editor.splitMediaTowers, let audio = editor.audioArtifact {
+      Toggle("Audio input", isOn: $editor.audio).toggleStyle(.switch).controlSize(.small)
+        .disabled(!audio.installed).accessibilityIdentifier("endpoint-audio-input")
+      if !audio.installed, let onDownload {
+        Button("Download audio", systemImage: "arrow.down") { onDownload(audio.id) }
+          .buttonStyle(QuietButtonStyle()).accessibilityIdentifier("endpoint-download-audio")
       }
     }
     if !editor.isImageGeneration && !editor.capabilities.contains("decision")
@@ -129,10 +145,13 @@ struct EndpointModelWorkload: View {
         }
       }
       EndpointFormField(
-        editor.capabilities.contains("asr") ? "Decoder context" : "Context per conversation"
+        editor.capabilities.contains("asr")
+          ? "Decoder context"
+          : editor.capabilities.contains("embeddings") || editor.capabilities.contains("rerank")
+            ? "Context per item" : "Context per conversation"
       ) {
         Dropdown(
-          title: "Context per conversation",
+          title: "Context",
           value: editor.context.isEmpty
             ? "Runner default · \(contextLabel(editor.effectiveContext))"
             : editor.customContext ? "Custom" : contextLabel(editor.effectiveContext),

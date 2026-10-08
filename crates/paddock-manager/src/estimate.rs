@@ -318,6 +318,23 @@ pub(crate) fn towers_bytes_for(
     audio: Option<bool>,
 ) -> u64 {
     use crate::registry::ArtifactKind;
+    if let Some(towers) = weights.and_then(|w| w.runtime.optional_towers.as_ref()) {
+        let price = |tower: &crate::registry::TowerMemory| {
+            tower.weight_bytes.saturating_add(tower.workspace_bytes)
+        };
+        return towers
+            .vision
+            .as_ref()
+            .filter(|_| vision)
+            .map_or(0, price)
+            .saturating_add(
+                towers
+                    .audio
+                    .as_ref()
+                    .filter(|tower| audio.unwrap_or(tower.default))
+                    .map_or(0, price),
+            );
+    }
     if !m.split_towers() {
         return if vision {
             tower_bytes_for(m, reg, weights)

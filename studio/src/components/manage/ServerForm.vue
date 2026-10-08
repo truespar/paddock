@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { backendAdvancedFields, defaultSpeculation, nativeKvOption } from '@/lib/backend-settings'
+import { artifactAt, choiceAxesFor, qualityBlurb } from '@/lib/weight-choices'
 // Configure / edit - one full page, two modes (route-decided):
 //
 //   /manage/models/start/:model  the workload step: the model was picked on
@@ -1161,6 +1162,30 @@ const qualityKey = computed<string>({
     }
   },
 })
+/** A model whose weights are not quality levels (Kumo Tabular: Size x Task)
+ *  is asked one question per axis instead of one list of cards. Each card
+ *  leads to the artifact at its option with the other axes held where the
+ *  current pick has them. */
+const choiceAxes = computed(() => choiceAxesFor(catModel.value?.specs?.choices, weightChoices.value))
+const choiceAt = computed<Record<string, string>>(
+  () => (selectedWeights.value ?? weightChoices.value.find((a) => a.default) ?? weightChoices.value[0])?.choice ?? {},
+)
+function choiceTarget(axis: string, value: string) {
+  return artifactAt(choiceAxes.value, weightChoices.value, { ...choiceAt.value, [axis]: value })
+}
+const choiceCards = computed(() =>
+  choiceAxes.value.map((x) => ({
+    name: x.name,
+    cards: x.options.map((o) => {
+      const artifact = choiceTarget(x.name, o.value)
+      return { value: o.value, note: o.note ?? '', artifact, blocked: artifact ? archBlock(artifact) : 'Not published' }
+    }),
+  })),
+)
+function pickChoice(axis: string, value: string): void {
+  const a = choiceTarget(axis, value)
+  if (a) qualityKey.value = a.id
+}
 const visionArtifact = computed(() =>
   catModel.value?.artifacts.find((a) => a.kind === 'vision' && companionAllowed(selectedWeights.value, a)),
 )
@@ -1174,13 +1199,15 @@ const audioArtifact = computed(() =>
   ),
 )
 const visionEmbedded = computed(() => embeddedVision(selectedWeights.value))
+const bundledTowers = computed(() => selectedWeights.value?.runtime?.optional_towers)
+const hasOptionalAudio = computed(() => !!audioArtifact.value || !!bundledTowers.value?.audio)
 const visionRequired = computed(() => visionEmbedded.value || (visionArtifact.value?.required ?? false))
 // Forensics is VLM-coupled: its findings are injected for the vision tower to
 // examine (confirm/contradict pixels, read a receipt's sum/VAT). So the toggle
 // is only usable when this endpoint actually serves vision - a built-in tower,
 // or an optional one left switched on.
 const visionServed = computed(
-  () => visionRequired.value || (!!visionArtifact.value && withVision.value),
+  () => visionRequired.value || ((!!visionArtifact.value || !!bundledTowers.value?.vision) && withVision.value),
 )
 // Whether this endpoint could ever run forensics at all - a vision-capable
 // catalog model (or a hand-typed one, where we can't tell, so we allow it and
@@ -1242,7 +1269,7 @@ const singlePass = computed(() =>
 const canOffload = computed(() => backend.value !== 'metal' || selectedWeights.value?.kv_offload_supported === true)
 watch(selectedWeights, (weights, previous) => {
   if (!isEdit.value && weights !== previous) {
-    withAudio.value = audioArtifact.value?.default ?? false
+    withAudio.value = bundledTowers.value?.audio?.default ?? audioArtifact.value?.default ?? false
     specPolicy.value = defaultSpecChoice()
     if (weights?.runtime?.default_max_batch) batch.value = weights.runtime.default_max_batch
     if (!userTouchedCtx.value && weights?.runtime?.default_max_ctx) ctx.value = weights.runtime.default_max_ctx
@@ -1259,7 +1286,7 @@ watch(selectedWeights, (weights, previous) => {
   // models keep the existing form's choices, including during hydration.
   if (weights?.runtime?.capability && !canSpeculate.value) specPolicy.value = 'off'
   if (weights?.runtime?.companions !== undefined) {
-    if (!visionArtifact.value) withVision.value = visionEmbedded.value
+    if (!visionArtifact.value) withVision.value = visionEmbedded.value || (bundledTowers.value?.vision?.default ?? false)
     if (!fp8Artifact.value) fp8Native.value = false
   }
   if (weights?.runtime?.companions?.length === 0) drafterId.value = ''
@@ -1348,49 +1375,6 @@ const est = computed(() => reg.estimates[model.value]?.artifacts?.[artifactId.va
 function qualityTitle(a: { label?: string; min_cc?: [number, number] }): string {
   const label = a.label ?? ''
   return archBlock(a) ? label.replace(/\s*\([^()]*\)\s*$/, '') : label
-}
-/** Plain-language meaning of a weights choice, keyed off the quant class -
- *  the tag itself ("Q8_0") stays a footnote for the people who know it. */
-/** One line, because these sit side by side and are read by COMPARISON: three
- *  two-line paragraphs are read as prose, three short lines are read as a
- *  choice. Everything cut here was a qualification ("that most work never
- *  notices") that says the same thing on two of the three cards, so it
- *  distinguishes nothing - which is the only job a blurb on a card has. */
-function qualityBlurb(a: { quant?: string; source?: { repo: string; base_model: string } }): string {
-  const q = (a.quant ?? '').toUpperCase()
-  // the 8-bit class: Q8_0 and MLX's affine 8-bit (a scale and a bias per
-  // group) - which fell through to "a smaller build" below, beside a Q8_0
-  // card it is in fact a little larger than
-  if (q.startsWith('Q8') || q.startsWith('MLX-AFFINE-8')) return 'Practically identical to the original.'
-  // NVFP4 before the Q4 test: it is four-bit too, but read from a published
-  // low-bit checkpoint rather than converted from a bigger file. WHOSE
-  // checkpoint is not something the quant tag knows - this line said "the
-  // official checkpoint" for every NVFP4 row, which became a false claim the
-  // day a community export joined the catalog (qwen3.8-flash-next's NVFP4 is
-  // a third party's conversion of Qwen's weights). `source` names the
-  // producer, so ask it instead of assuming.
-  if (q.includes('NVFP4')) {
-    return thirdPartyExport(a)
-      ? 'Four-bit, from a community build of the official weights.'
-      : 'Four-bit, straight from the official checkpoint.'
-  }
-  if (q.includes('Q4')) return 'Half the memory, slight quality cost.'
-  if (q.includes('MXFP4')) return 'The format it was trained in - nothing is higher.'
-  // Prism ML's ternary packings: the model ships in nothing else
-  if (q.startsWith('PTQ') || q.startsWith('PQ2')) return 'Ternary weights - the only build it ships in.'
-  // a float build is the unquantized one - beside a Q8_0 it is the LARGER
-  // card, and "a smaller build" (the fallback) said the opposite
-  if (q === 'BF16' || q === 'F16' || q === 'F32') return 'Full precision - no quantization.'
-  return 'A smaller build - some quality for memory.'
-}
-/** Somebody else's conversion, rather than a low-bit file the model's own
- *  authors published. A registry row only carries `source` when the producing
- *  repo differs from the obvious one, so no `source` reads as "official". */
-function thirdPartyExport(a: { source?: { repo: string; base_model: string } }): boolean {
-  const s = a.source
-  if (!s?.repo || !s?.base_model) return false
-  const org = (r: string) => r.split('/')[0].toLowerCase()
-  return org(s.repo) !== org(s.base_model)
 }
 /** A gated artifact (SAM 3) downloads from its own Hugging Face repo with
  *  the user's token: the form says so before the download, and whether a
@@ -1535,7 +1519,7 @@ watch([batch, kvDtype, specPolicy, withVision, withAudio, vramBudgetMib, gpuInde
     kv: kvDtype.value,
     spec: canSpeculate.value && specPolicy.value !== 'off',
     vision: withVision.value || visionRequired.value,
-    audio: audioArtifact.value ? withAudio.value : undefined,
+    audio: hasOptionalAudio.value ? withAudio.value : undefined,
     cc: ready.info?.cc,
     budget: vramBudgetMib.value,
     gpu: gpuIndex.value ?? undefined,
@@ -1937,7 +1921,7 @@ function buildSpec(): DeploySpec {
   if (fp8Native.value) spec.fp8_native = true
   if (!withVision.value && !visionRequired.value) spec.vision = false
   // said both ways: absent would follow the catalog default
-  if (audioArtifact.value) spec.audio = withAudio.value
+  if (hasOptionalAudio.value) spec.audio = withAudio.value
   if (apiKey.value.trim()) spec.api_key = apiKey.value.trim()
   if (gpuIndex.value !== null) spec.gpu = gpuIndex.value
   // Absent = the manager computes a grant, which is what it has always done.
@@ -2359,7 +2343,44 @@ function start(): void {
              pick just downloads on start. Cards that say what the choice MEANS
              - the quant tag is a footnote, not the headline (most people
              picking a model have never met "Q8_0") -->
-        <template v-if="qualityCards.length > 1">
+        <template v-if="choiceCards.length">
+          <template v-for="g in choiceCards" :key="g.name">
+            <label class="sf__lbl">{{ g.name }}</label>
+            <RadioGroup
+              :model-value="choiceAt[g.name] ?? ''"
+              class="sf__qcards"
+              :label="g.name"
+              :style="{ '--qc': Math.min(3, g.cards.length) }"
+              @update:model-value="(v: string) => pickChoice(g.name, v)"
+            >
+              <RadioItem
+                v-for="c in g.cards"
+                :key="c.value"
+                :value="c.value"
+                class="sf__qcard"
+                :class="{ 'sf__qcard--blocked': !!c.blocked }"
+                :disabled="!!c.blocked"
+              >
+                <span class="sf__qcard-title">{{ c.value }}</span>
+                <span v-if="c.artifact" class="sf__qcard-meta">
+                  <b class="sf__qcard-size">{{ fmtBytes(c.artifact.total_size) }}</b>
+                  <span class="sf__qcard-quant">{{ c.artifact.quant }}</span>
+                </span>
+                <span class="sf__qcard-blurb">{{ c.note }}</span>
+                <span v-if="c.artifact && !c.artifact.installed && !c.blocked" class="sf__qcard-note">
+                  <Icon name="arrow-down" :size="10" /> downloads when you start it
+                </span>
+                <span v-if="c.artifact && artifactVerdict(c.artifact.id) === 'does_not_fit'" class="sf__qcard-warn">
+                  Won't fit on this GPU
+                </span>
+                <span v-if="c.blocked" class="sf__qcard-veil">
+                  <span class="sf__qcard-veil-txt">{{ c.blocked }}</span>
+                </span>
+              </RadioItem>
+            </RadioGroup>
+          </template>
+        </template>
+        <template v-else-if="qualityCards.length > 1">
           <label class="sf__lbl">Quality</label>
           <RadioGroup
             v-model="qualityKey"
@@ -2440,6 +2461,17 @@ function start(): void {
         <template v-if="visionEmbedded">
           <label class="sf__lbl">Capabilities</label>
           <p class="sf__capline"><Icon name="image" :size="14" /> Vision - included in the MLX checkpoint</p>
+        </template>
+        <template v-else-if="bundledTowers">
+          <label class="sf__lbl">Capabilities</label>
+          <label v-if="bundledTowers.vision" class="sf__check">
+            <Switch v-model="withVision" label="Vision - image input" />
+            Vision - image input
+          </label>
+          <label v-if="bundledTowers.audio" class="sf__check">
+            <Switch v-model="withAudio" label="Audio - audio input" />
+            Audio - audio input
+          </label>
         </template>
         <template v-else-if="visionArtifact">
           <label class="sf__lbl">Capabilities</label>

@@ -85,7 +85,7 @@ pub struct Cli {
     /// Directory to scan for GGUF models (repeatable)
     #[arg(long = "model-dir", value_name = "PATH")]
     pub model_dir: Vec<PathBuf>,
-    /// Compute device; only "cuda" exists
+    /// Compute device: "cuda" or "metal" (requires that backend in this build)
     #[arg(long, value_name = "DEVICE")]
     pub device: Option<String>,
     /// Which GPU to serve on: a CUDA ordinal ("1") or a device UUID

@@ -42,7 +42,7 @@ drives those kernels.
 | `qwen_attention`, `qwen_projection`, `qwen_moe`, `mlx_qwen`, `vision` | `qwen35/` |
 | `qwen4exp`, `qwen4exp_affine`, `qwen4exp_mlx`, `qwen4exp_moe`, `qwen4exp_qsa` | `qwen4exp/` |
 | `qwen3_encoder`, `qwen3_asr`, `qwen3_aligner` | `qwen3/`, `qwen3_asr/` |
-| `embedding_gemma2`, `embedding_gemma2_attention` | `embedding_gemma2/`: bidirectional text encoder, bounded-slab attention, GPU mean pooling/MRL; multimodal towers not yet connected |
+| `embedding_gemma2`, `embedding_gemma2_attention`, `embedding_gemma2_vision`, `embedding_gemma2_audio` | `embedding_gemma2/`: bidirectional encoder, request-local affine8 projection reductions, bounded-slab BF16 attention/softmax (GGUF F16 QKV/F32 softmax and accumulation, KT32), GPU mean pooling/MRL; GGUF and MLX image/audio towers, sampled video, grouped image projections, packed causal-isolated audio, GPU resize and compensated FFT; 128-row media-projection candidates are diagnostic-only |
 | `splash`, `splash_attention`, `splash_draft`, `splash_draft_attention` | `splash` (the packed-Q4 package format) |
 | `gpt_oss`, `laguna`, `nemotron`, `paddleocr`, `whisper` | the folder of the same name |
 | `kolibri` | `kolibri/`: mixed affine4/8, raw-logit top-6, sandwich norms and BF16 full/sliding attention |

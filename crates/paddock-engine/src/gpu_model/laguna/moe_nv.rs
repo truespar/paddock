@@ -9,11 +9,13 @@
 //!   (`kind::mxf4nvf4`) - the rows quantize to nvfp4 (amax / 6 per 16, no
 //!   global scale: the checkpoint's `input_global_scale` is not read, as in
 //!   every NVFP4 lane here), moe_align sorts the (token, slot) pairs into
-//!   32-row expert blocks, the sorted gate|up pair's epilogue re-quantizes
-//!   silu(g) * u to nvfp4, the sorted down lands per-pair partials (bf16,
-//!   slot 758), and the fold adds the routed sum onto the shared expert's
-//!   output. Every op is per token, so the class keys on MODE, never on rows
-//!   - a warm-resume tail rides the same pair.
+//!   64-row expert blocks, the sorted gate|up ring (slot 830) re-quantizes
+//!   silu(g) * u to nvfp4, the sorted down ring (slot 831) lands per-pair
+//!   partials (bf16), and the fold adds the routed sum onto the shared
+//!   expert's output. Every op is per token, so the class keys on MODE, never
+//!   on rows - a warm-resume tail rides the same pair. The ring pair lands
+//!   the bytes the 32-row pair (slots 631 / 758) lands; a pack without it,
+//!   a shape outside its laws, or PADDOCK_NO_NV4M_MS=1 keeps that pair.
 //!
 //! Router: `MoeDims::route` (Kolibri's sigmoid_logit_add, slot 748) over the
 //! f32-widened BF16 router. The shared expert's three BF16 planes ride the
@@ -25,6 +27,18 @@ use crate::gpu_model::gpt_oss::GpuModelError;
 
 use super::batch::BatchScratch;
 use super::{MoeDims, MoeNv};
+
+/// Whether the ring pair (slots 830 / 831) takes this layer's experts: the
+/// pack carries it, the planes meet its shape laws (gate|up in_dim % 128,
+/// down K = expert ff % 256 and <= 1024), and PADDOCK_NO_NV4M_MS is unset.
+fn ring_pair(exec: &GpuExecutor, w: &MoeNv) -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let off = *OFF.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_NV4M_MS").is_some());
+    !off && exec.has_nvf4_moe_ms()
+        && w.gate.in_dim.is_multiple_of(128)
+        && w.down.in_dim.is_multiple_of(256)
+        && w.down.in_dim <= 1024
+}
 
 /// Sorted blocks for `pairs` (token, slot) pairs over `n_expert` experts at
 /// block `bm` - every expert can pad its last block.
@@ -68,6 +82,8 @@ pub(super) fn moe_nv_rows(
     let sorted = sorted && exec.has_nvf4_moe_gu_swiglu_bs() && exec.has_nvf4_moe_bs();
     // bf16 partials (slot 758) at the sorted widths
     let b16 = sorted && exec.has_nvf4_moe_down_bs_b16() && exec.has_moe_slot_combine_bf16();
+    // the ring pair (slots 830 / 831) over 64-row blocks
+    let ms = b16 && ring_pair(exec, w);
     // Where the routed fold can ADD onto proj (the bf16 fold; the z-split
     // decode fold) the shared expert lands there first: shared + routed is
     // the routed + shared order bit for bit (two operands commute), and the
@@ -78,19 +94,39 @@ pub(super) fn moe_nv_rows(
     }
     if sorted {
         exec.quantize_nvf4(&sc.xn, &mut sc.xq4, &mut sc.xs4, r * embd)?;
-        let nb = align_blocks(r * k, m.n_expert, 32);
-        exec.moe_align_at(
-            &sc.moe_idx,
-            0,
-            &mut sc.srow,
-            &mut sc.sslot,
-            &mut sc.bexp,
-            r,
-            k,
-            m.n_expert,
-            nb,
-        )?;
-        exec.nvf4_moe_gu_swiglu_bs(
+        let nb = align_blocks(r * k, m.n_expert, if ms { 64 } else { 32 });
+        if ms {
+            exec.moe_align_bm(
+                &sc.moe_idx,
+                &mut sc.srow,
+                &mut sc.sslot,
+                &mut sc.bexp,
+                r,
+                k,
+                m.n_expert,
+                64,
+                nb,
+            )?;
+        } else {
+            exec.moe_align_at(
+                &sc.moe_idx,
+                0,
+                &mut sc.srow,
+                &mut sc.sslot,
+                &mut sc.bexp,
+                r,
+                k,
+                m.n_expert,
+                nb,
+            )?;
+        }
+        let gu = if ms {
+            GpuExecutor::nvf4_moe_gu_swiglu_ms
+        } else {
+            GpuExecutor::nvf4_moe_gu_swiglu_bs
+        };
+        gu(
+            exec,
             &w.gate,
             &w.up,
             &sc.srow,
@@ -104,7 +140,9 @@ pub(super) fn moe_nv_rows(
         )?;
         // np = k: every pair slot is written (qwen4exp's k + 1 carries a
         // shared pseudo-slot this lane does not have)
-        let down = if b16 {
+        let down = if ms {
+            GpuExecutor::nvf4_moe_down_ms_b16_at
+        } else if b16 {
             GpuExecutor::nvf4_moe_down_bs_b16_at
         } else {
             GpuExecutor::nvf4_moe_down_bs_at

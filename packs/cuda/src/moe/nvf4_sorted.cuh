@@ -321,6 +321,76 @@ __global__ void __launch_bounds__(256, 2) pd_nvf4_moe_up_relu2_bs_kernel(
 #define PD_NV4M_GU_SMEM(KB) \
     (4u * 128u * PD_NV4M_WROW(KB) + 2u * PD_NV4M_BM * PD_NV4M_YROW(KB))
 
+// The gate|up epilogue, shared by both kernels below: v = silu(g) * u (or
+// the relu2 twin's math under MODE 0/2), then the relu2 kernel's nvf4
+// quantize per 16 ALONG ff, verbatim (same shuffle scheme, same
+// pd_nvf4_scale pick). row0 = this warp's first output row, col0 = its first
+// token column (pair offset included); its n8 tiles sit 16 apart from col0.
+template <uint32_t MODE, uint32_t WN>
+__device__ __forceinline__ void pd_nv4m_gu_epilogue(
+    const float (&accg)[WN / 4u][4], const float (&accu)[WN / 4u][4],
+    const uint32_t* tok, float s2g, float s2u, uint8_t* __restrict__ fq,
+    uint8_t* __restrict__ fs, size_t srow0, uint32_t row0, uint32_t col0, uint32_t ff) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t g = lane >> 2, tq = lane & 3u;
+    const uint32_t tmask = 0x11111111u << tq;
+    #pragma unroll
+    for (uint32_t j0 = 0; j0 < 2u * WN; j0 += 16u) {
+        #pragma unroll
+        for (uint32_t n = 0; n < 2u; ++n) {
+            const uint32_t rb = row0 + n * 16u;
+            #pragma unroll
+            for (uint32_t qc = 0; qc < 2u; ++qc) {
+                const uint32_t c = col0 + j0 + 2u * tq + qc;
+                const bool pad = tok[c] == PD_MOE_PAD;
+                const float g0 = accg[(j0 >> 3) + n][qc] * s2g;
+                const float g1 = accg[(j0 >> 3) + n][qc + 2u] * s2g;
+                const float u0 = accu[(j0 >> 3) + n][qc] * s2u;
+                const float u1 = accu[(j0 >> 3) + n][qc + 2u] * s2u;
+                float v0, v1;
+                if (MODE == 1u) {
+                    v0 = pad ? 0.0f : g0 * (1.0f / (1.0f + __expf(-g0))) * u0;
+                    v1 = pad ? 0.0f : g1 * (1.0f / (1.0f + __expf(-g1))) * u1;
+                } else {
+                    // the relu2 twin's epilogue verbatim, on ONE plane: mode 0
+                    // exercises accg, mode 2 exercises accu. The plumbing gate
+                    // at mode 0 passed byte-identical while never touching
+                    // accu at all, so mode 2 is what isolates the up half.
+                    const float x0 = (MODE == 0u) ? g0 : u0;
+                    const float x1 = (MODE == 0u) ? g1 : u1;
+                    const float r0 = fmaxf(x0, 0.0f), r1 = fmaxf(x1, 0.0f);
+                    v0 = pad ? 0.0f : r0 * r0;
+                    v1 = pad ? 0.0f : r1 * r1;
+                }
+                // SwiGLU is signed, relu^2 is not - the twin takes the raw
+                // max, so match it exactly under the gate
+                float a = (MODE == 1u) ? fmaxf(fabsf(v0), fabsf(v1)) : fmaxf(v0, v1);
+                a = fmaxf(a, __shfl_xor_sync(tmask, a, 4));
+                a = fmaxf(a, __shfl_xor_sync(tmask, a, 8));
+                a = fmaxf(a, __shfl_xor_sync(tmask, a, 16));
+                float inv;
+                const unsigned sbyte = pd_nvf4_scale(a, &inv);
+                const uint32_t n0 = pd_e2m1_rn(v0 * inv);
+                const uint32_t n1 = pd_e2m1_rn(v1 * inv);
+                const uint32_t m = (g & 3u) * 2u;
+                const uint32_t lo0 = __shfl_sync(0xffffffffu, n0, m * 4u + tq);
+                const uint32_t hi0 = __shfl_sync(0xffffffffu, n0, (m + 1u) * 4u + tq);
+                const uint32_t lo1 = __shfl_sync(0xffffffffu, n1, m * 4u + tq);
+                const uint32_t hi1 = __shfl_sync(0xffffffffu, n1, (m + 1u) * 4u + tq);
+                const uint32_t lo = (g < 4u) ? lo0 : lo1;
+                const uint32_t hi = (g < 4u) ? hi0 : hi1;
+                if (rb < ff) {
+                    const size_t srow = srow0 + c;
+                    fq[srow * (ff >> 1) + (rb >> 1) + g] =
+                        (unsigned char)(lo | (hi << 4));
+                    if (g == 0)
+                        fs[srow * (ff >> 4) + (rb >> 4)] = (unsigned char)sbyte;
+                }
+            }
+        }
+    }
+}
+
 // GATE: with SWIGLU=false the epilogue computes relu(gate)^2 and IGNORES the
 // up plane, which is exactly `pd_nvf4_moe_up_relu2_bs_kernel`'s math over the
 // same staging, mma and quantize. A byte-compare of fq/fs against that kernel
@@ -471,65 +541,242 @@ __global__ void __launch_bounds__(256, 2) pd_nvf4_moe_gu_swiglu_bs_kernel(
     #undef PD_GU_ISSUE_W
     #undef PD_GU_ISSUE_Y
 
-    // epilogue: v = silu(g) * u, then the relu2 kernel's nvf4 quantize per 16
-    // ALONG ff, verbatim (same shuffle scheme, same pd_nvf4_scale pick).
-    const float s2g = gscale2[e], s2u = uscale2[e];
-    const uint32_t tmask = 0x11111111u << tq;
-    #pragma unroll
-    for (uint32_t j0 = 0; j0 < PD_NV4M_BM; j0 += 16u) {
+    pd_nv4m_gu_epilogue<MODE, 16u>(accg, accu, tok, gscale2[e], uscale2[e], fq, fs,
+                                   (size_t)blk * PD_NV4M_BM, row_base + i0, joff, ff);
+#else
+    (void)gdata; (void)gscale; (void)gscale2; (void)udata; (void)uscale;
+    (void)uscale2; (void)sorted_row; (void)block_expert; (void)xq; (void)xs;
+    (void)fq; (void)fs; (void)in_dim; (void)ff;
+#endif
+}
+
+// The gate|up pair on an ST-deep ring over BT-token blocks: the kernel
+// above's mma sequence a column and its epilogue, so every (token, slot)
+// lands the bytes the kernel above lands at 32-token blocks.
+// A chunk's scales ride the ring with its packed planes (one KB*2-byte copy a
+// row, so in_dim % (KB*32) == 0 is required - every chunk is whole), and a chunk
+// costs ONE barrier: wait for chunk kt, barrier (which also retires everyone's
+// reads of the buffer chunk kt + ST - 1 lands in), issue it, compute kt.
+#define PD_NV4M_GU_MS_SMEM(KB, BT, ST) \
+    ((ST) * (2u * 128u * PD_NV4M_WROW(KB) + (BT) * PD_NV4M_YROW(KB)))
+template <uint32_t KB, uint32_t BT, uint32_t WN, uint32_t ST, uint32_t PFW = 128u,
+          uint32_t LA = 2u>
+__global__ void __launch_bounds__(4u * BT / WN * 32u,
+                                  PD_NV4M_GU_MS_SMEM(KB, BT, ST) <= 46080u ? 2 : 1)
+pd_nvf4_moe_gu_swiglu_ms_kernel(
+    const uint8_t* __restrict__ gdata, const uint8_t* __restrict__ gscale,
+    const float* __restrict__ gscale2, const uint8_t* __restrict__ udata,
+    const uint8_t* __restrict__ uscale, const float* __restrict__ uscale2,
+    const uint32_t* __restrict__ sorted_row,
+    const uint32_t* __restrict__ block_expert, const uint8_t* __restrict__ xq,
+    const uint8_t* __restrict__ xs, uint8_t* __restrict__ fq,
+    uint8_t* __restrict__ fs, uint32_t in_dim, uint32_t ff) {
+#if PD_BS_OK
+    constexpr uint32_t WROW = PD_NV4M_WROW(KB);
+    constexpr uint32_t YROW = PD_NV4M_YROW(KB);
+    constexpr uint32_t NT = 4u * BT / WN * 32u;
+    constexpr uint32_t SS = 2u * 128u * WROW + BT * YROW;
+    // 1-D grid, row tile fastest: the tiles of one token block run side by
+    // side (its gathered rows are read from DRAM once, not once a tile) and
+    // the blocks of one expert stay a few CTAs apart (its strip stays in L2)
+    const uint32_t n_rt = (ff + 127u) / 128u;
+    const uint32_t blk = blockIdx.x / n_rt;
+    const uint32_t e = block_expert[blk];
+    if (e == PD_MOE_PAD) return;
+    const uint32_t row_base = (blockIdx.x % n_rt) * 128u;
+
+    extern __shared__ unsigned char pd_bs_sh[];
+    __shared__ uint32_t tok[BT];
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u, warp = tid >> 5;
+    const uint32_t g = lane >> 2, tq = lane & 3u;
+    const uint32_t i0 = ((warp >> 1) & 3u) * 32u;
+    const uint32_t joff = (warp & 1u) * 8u;
+    const uint32_t tb = (warp >> 3) * (2u * WN);
+    const uint32_t n_kb = in_dim >> 5;
+    const uint32_t n_k16 = in_dim >> 4;
+    const uint32_t nk = (in_dim + KB * 32u - 1u) / (KB * 32u);
+    const size_t wrow0 = (size_t)e * ff + row_base;
+
+    if (tid < BT) tok[tid] = sorted_row[(size_t)blk * BT + tid];
+
+    // DRAM sees what is PREFETCHED, not what the ring copies: 64 B of each
+    // 1280 B row a chunk streams ~200 GB/s on GB10, whole lines a window
+    // ahead ~250. So the CTA's scale rows (contiguous, 128 x n_k16 B a plane)
+    // go to L2 whole now, and each weight row PFW bytes at a time, LA windows
+    // ahead of the ring; the ring's copies then hit L2.
+    const uint32_t nrow = ff - row_base < 128u ? ff - row_base : 128u;
+    {
+        const uint8_t* s0 = gscale + wrow0 * n_k16;
+        const uint8_t* s1 = uscale + wrow0 * n_k16;
+        const uint32_t bytes = nrow * n_k16;
+        for (uint32_t o = tid * 128u; o < bytes + 127u; o += NT * 128u) {
+            const uint32_t oc = o < bytes ? o : bytes - 1u;
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(s0 + oc));
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(s1 + oc));
+        }
+    }
+    const uint32_t rowb = in_dim >> 1;
+    auto prefetch_w = [&](uint32_t byte0) {
+        constexpr uint32_t L = PFW ? PFW / 128u : 1u;   // lines a row a window
+        for (uint32_t q = tid; q < nrow * L; q += NT) {
+            const uint32_t row = q / L, l = q % L;
+            if (byte0 + l * 128u >= rowb) continue;   // a row's tail window
+            const size_t o = (wrow0 + row) * (size_t)rowb + byte0 + l * 128u;
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(gdata + o));
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(udata + o));
+        }
+    };
+    if constexpr (PFW != 0u) {
         #pragma unroll
-        for (uint32_t n = 0; n < 2u; ++n) {
-            const uint32_t rb = row_base + i0 + n * 16u;
+        for (uint32_t w = 0; w < LA; ++w)
+            if (w * PFW < rowb) prefetch_w(w * PFW);
+    }
+    __syncthreads();
+
+    // Fixed issue slots, resolved once: the K loop only advances them by kt.
+    // The token gather and the PAD tests read tok[] HERE, never in the loop -
+    // an LDS there queues behind the chunk's ldmatrix and stalls the issue.
+    // Scales go KB*2 bytes (one 8 or 16 B copy) a row a chunk; the launcher
+    // guarantees in_dim % (KB*32) == 0. Work splits so no warp carries the whole tail:
+    // W scales on threads [0, 128), Y scales on [128, 128 + BT), the Y rows
+    // from NT/2 up, W rows on all.
+    static_assert(KB == 4u || KB == 8u, "scale slots are one 8 or 16 B copy");
+    constexpr uint32_t WI = 128u * KB / NT, YI = (BT * KB + NT - 1u) / NT;
+    size_t woff[WI];
+    uint32_t wdst[WI], wseg[WI];
+    bool wrow_ok[WI];
+    #pragma unroll
+    for (uint32_t i = 0; i < WI; ++i) {
+        const uint32_t u = tid + i * NT, row = u / KB;
+        wseg[i] = u % KB;
+        wdst[i] = row * WROW + wseg[i] * 16u;
+        woff[i] = (wrow0 + row) * (size_t)(in_dim >> 1) + wseg[i] * 16u;
+        wrow_ok[i] = row_base + row < ff;
+    }
+    const bool ws_on = tid < 128u && row_base + tid < ff;
+    const size_t wsoff = (wrow0 + tid) * (size_t)n_k16;
+    const uint32_t ysrow = tid - 128u;
+    const bool ys_on = tid >= 128u && ysrow < BT && tok[ysrow < BT ? ysrow : 0u] != PD_MOE_PAD;
+    const size_t ysoff = ys_on ? (size_t)tok[ysrow] * n_k16 : 0u;
+    size_t yoff[YI];
+    uint32_t ydst[YI], yseg[YI];
+    bool y_on[YI];
+    #pragma unroll
+    for (uint32_t i = 0; i < YI; ++i) {
+        const uint32_t u = (tid + NT / 2u) % NT + i * NT, col = u / KB;
+        const uint32_t r = u < BT * KB ? tok[col] : PD_MOE_PAD;
+        yseg[i] = u % KB;
+        ydst[i] = col * YROW + 16u + yseg[i] * 16u;
+        y_on[i] = r != PD_MOE_PAD;
+        yoff[i] = y_on[i] ? (size_t)r * (in_dim >> 1) + yseg[i] * 16u : 0u;
+        // a slot past the tile copies nothing and zero-fills nothing
+        if (u >= BT * KB) ydst[i] = ~0u;
+    }
+    // n8 tiles that hold a live column (align fills a block's live rows first)
+    bool tlive[2u * WN / 16u];
+    #pragma unroll
+    for (uint32_t j = 0; j < 2u * WN / 16u; ++j) tlive[j] = tok[tb + j * 16u + joff] != PD_MOE_PAD;
+
+    // chunk kt -> its ring slot; PAD and out-of-range zero-fill
+    auto issue = [&](uint32_t kt) {
+        unsigned char* wg = pd_bs_sh + (kt % ST) * SS;
+        unsigned char* wu = wg + 128u * WROW;
+        unsigned char* yb = wu + 128u * WROW;
+        #pragma unroll
+        for (uint32_t i = 0; i < WI; ++i) {
+            const bool ok = wrow_ok[i] && kt * KB + wseg[i] < n_kb;
+            const size_t o = woff[i] + kt * (KB * 16u);
+            pd_cp_async16((int*)(wg + wdst[i]), gdata + o, ok);
+            pd_cp_async16((int*)(wu + wdst[i]), udata + o, ok);
+        }
+        auto scopy = [](unsigned char* d, const uint8_t* src, bool ok) {
+            if constexpr (KB == 4u) pd_cpa8p(d, src, ok);
+            else pd_cp_async16((int*)d, src, ok);
+        };
+        if (tid < 128u) {
+            const size_t o = wsoff + kt * (KB * 2u);
+            scopy(wg + tid * WROW + KB * 16u, gscale + o, ws_on);
+            scopy(wu + tid * WROW + KB * 16u, uscale + o, ws_on);
+        } else if (ysrow < BT) {
+            scopy(yb + ysrow * YROW, xs + ysoff + kt * (KB * 2u), ys_on);
+        }
+        #pragma unroll
+        for (uint32_t i = 0; i < YI; ++i) {
+            if (ydst[i] == ~0u) continue;
+            const bool ok = y_on[i] && kt * KB + yseg[i] < n_kb;
+            pd_cp_async16((int*)(yb + ydst[i]), xq + yoff[i] + kt * (KB * 16u), ok);
+        }
+    };
+
+    float accg[WN / 4u][4] = {};
+    float accu[WN / 4u][4] = {};
+    #pragma unroll
+    for (uint32_t s = 0; s + 1u < ST; ++s) {
+        if (s < nk) issue(s);
+        asm volatile("cp.async.commit_group;");
+    }
+    for (uint32_t kt = 0; kt < nk; ++kt) {
+        asm volatile("cp.async.wait_group %0;" ::"n"(ST - 2u));
+        __syncthreads();
+        if constexpr (PFW != 0u) {
+            const uint32_t b0 = kt * (KB * 16u);
+            if (b0 % PFW == 0u && b0 + LA * PFW < rowb) prefetch_w(b0 + LA * PFW);
+        }
+        if (kt + ST - 1u < nk) issue(kt + ST - 1u);
+        asm volatile("cp.async.commit_group;");
+        const unsigned char* tg = pd_bs_sh + (kt % ST) * SS;
+        const unsigned char* tu = tg + 128u * WROW;
+        const unsigned char* ty = tu + 128u * WROW;
+
+        // k64 PAIRS outermost (one B ldmatrix covers a pair): an
+        // accumulator still sees k64 ascending, and only one pair's A
+        // fragments are live - what lets KB=8 fit
+        #pragma unroll
+        for (uint32_t kp = 0; kp < KB / 4u; ++kp) {
+            uint32_t amg[2][2][4], amu[2][2][4];
+            uint2 sag[2], sau[2];
             #pragma unroll
-            for (uint32_t qc = 0; qc < 2u; ++qc) {
-                const uint32_t c = j0 + joff + 2u * tq + qc;
-                const bool pad = tok[c] == PD_MOE_PAD;
-                const float g0 = accg[(j0 >> 3) + n][qc] * s2g;
-                const float g1 = accg[(j0 >> 3) + n][qc + 2u] * s2g;
-                const float u0 = accu[(j0 >> 3) + n][qc] * s2u;
-                const float u1 = accu[(j0 >> 3) + n][qc + 2u] * s2u;
-                float v0, v1;
-                if (MODE == 1u) {
-                    v0 = pad ? 0.0f : g0 * (1.0f / (1.0f + __expf(-g0))) * u0;
-                    v1 = pad ? 0.0f : g1 * (1.0f / (1.0f + __expf(-g1))) * u1;
-                } else {
-                    // the relu2 twin's epilogue verbatim, on ONE plane: mode 0
-                    // exercises accg, mode 2 exercises accu. The plumbing gate
-                    // at mode 0 passed byte-identical while never touching
-                    // accu at all, so mode 2 is what isolates the up half.
-                    const float x0 = (MODE == 0u) ? g0 : u0;
-                    const float x1 = (MODE == 0u) ? g1 : u1;
-                    const float r0 = fmaxf(x0, 0.0f), r1 = fmaxf(x1, 0.0f);
-                    v0 = pad ? 0.0f : r0 * r0;
-                    v1 = pad ? 0.0f : r1 * r1;
+            for (uint32_t n = 0; n < 2u; ++n) {
+                const uint32_t r0 = i0 + n * 16u + g;
+                const uint32_t rs = (tq & 1u) ? r0 + 8u : r0;
+                const uint32_t wo =
+                    (i0 + n * 16u + ((lane >> 3) & 1u) * 8u + (lane & 7u)) * WROW;
+                #pragma unroll
+                for (uint32_t h = 0; h < 2u; ++h) {
+                    const uint32_t k64 = kp * 2u + h;
+                    pd_ldm_x4(amg[n][h], tg + wo + k64 * 32u + (lane >> 4) * 16u);
+                    pd_ldm_x4(amu[n][h], tu + wo + k64 * 32u + (lane >> 4) * 16u);
                 }
-                // SwiGLU is signed, relu^2 is not - the twin takes the raw
-                // max, so match it exactly under the gate
-                float a = (MODE == 1u) ? fmaxf(fabsf(v0), fabsf(v1)) : fmaxf(v0, v1);
-                a = fmaxf(a, __shfl_xor_sync(tmask, a, 4));
-                a = fmaxf(a, __shfl_xor_sync(tmask, a, 8));
-                a = fmaxf(a, __shfl_xor_sync(tmask, a, 16));
-                float inv;
-                const unsigned sbyte = pd_nvf4_scale(a, &inv);
-                const uint32_t n0 = pd_e2m1_rn(v0 * inv);
-                const uint32_t n1 = pd_e2m1_rn(v1 * inv);
-                const uint32_t m = (g & 3u) * 2u;
-                const uint32_t lo0 = __shfl_sync(0xffffffffu, n0, m * 4u + tq);
-                const uint32_t hi0 = __shfl_sync(0xffffffffu, n0, (m + 1u) * 4u + tq);
-                const uint32_t lo1 = __shfl_sync(0xffffffffu, n1, m * 4u + tq);
-                const uint32_t hi1 = __shfl_sync(0xffffffffu, n1, (m + 1u) * 4u + tq);
-                const uint32_t lo = (g < 4u) ? lo0 : lo1;
-                const uint32_t hi = (g < 4u) ? hi0 : hi1;
-                if (rb < ff) {
-                    const size_t srow = (size_t)blk * PD_NV4M_BM + c;
-                    fq[srow * (ff >> 1) + (rb >> 1) + g] =
-                        (unsigned char)(lo | (hi << 4));
-                    if (g == 0)
-                        fs[srow * (ff >> 4) + (rb >> 4)] = (unsigned char)sbyte;
+                sag[n] = *(const uint2*)(tg + rs * WROW + KB * 16u + kp * 8u);
+                sau[n] = *(const uint2*)(tu + rs * WROW + KB * 16u + kp * 8u);
+            }
+            #pragma unroll
+            for (uint32_t j0 = 0; j0 < 2u * WN; j0 += 16u) {
+                if (!tlive[j0 / 16u]) continue;
+                uint32_t bm[4];
+                pd_ldm_x4(bm, ty + (tb + j0 + joff + (lane & 7u)) * YROW + 16u + kp * 64u +
+                                  (lane >> 3) * 16u);
+                const uint2 sbp = *(const uint2*)(ty + (tb + j0 + joff + g) * YROW + kp * 8u);
+                #pragma unroll
+                for (uint32_t h = 0; h < 2u; ++h) {
+                    const uint32_t sb = h ? sbp.y : sbp.x;
+                    #pragma unroll
+                    for (uint32_t n = 0; n < 2u; ++n) {
+                        pd_nv4_mma(accg[(j0 >> 3) + n], amg[n][h][0], amg[n][h][1],
+                                   amg[n][h][2], amg[n][h][3], bm[h * 2u], bm[h * 2u + 1u],
+                                   h ? sag[n].y : sag[n].x, sb);
+                        pd_nv4_mma(accu[(j0 >> 3) + n], amu[n][h][0], amu[n][h][1],
+                                   amu[n][h][2], amu[n][h][3], bm[h * 2u], bm[h * 2u + 1u],
+                                   h ? sau[n].y : sau[n].x, sb);
+                    }
                 }
             }
         }
     }
+    pd_nv4m_gu_epilogue<1u, WN>(accg, accu, tok, gscale2[e], uscale2[e], fq, fs,
+                                (size_t)blk * BT, row_base + i0, tb + joff, ff);
 #else
     (void)gdata; (void)gscale; (void)gscale2; (void)udata; (void)uscale;
     (void)uscale2; (void)sorted_row; (void)block_expert; (void)xq; (void)xs;
@@ -1185,6 +1432,194 @@ __global__ void __launch_bounds__(256, 2) pd_nvf4_moe_down_bs_kernel(  // SFOLD:
 #endif
 }
 
+// The down on a resident activation tile: a CTA holds its BT sorted
+// columns' whole K (fq/fs, ff/2 + ff/16 bytes a column) in shared memory and
+// streams RPC row tiles of the expert's down strip through an ST-deep ring,
+// one (row tile, K chunk) a step. The bs kernel above re-stages the columns
+// for every 128-row tile and runs two K chunks a CTA at ff 512 - all
+// pipeline fill. Same tile, same per-accumulator mma order, same bf16
+// scatter: bit-identical part rows. ff % (KB*32) == 0 required.
+#define PD_NV4M_DN_MS_SMEM(KB, BT, ST, ff) \
+    ((ST) * 128u * PD_NV4M_WROW(KB) + ((ff) / ((KB) * 32u)) * (BT) * PD_NV4M_YROW(KB))
+template <uint32_t KB, uint32_t BT, uint32_t WN, uint32_t ST, uint32_t RPC>
+__global__ void __launch_bounds__(4u * BT / WN * 32u, 1) pd_nvf4_moe_down_ms_kernel(
+    const uint8_t* __restrict__ data, const uint8_t* __restrict__ scale,
+    const float* __restrict__ scale2, const uint32_t* __restrict__ sorted_row,
+    const uint32_t* __restrict__ sorted_slot,
+    const uint32_t* __restrict__ block_expert, const float* __restrict__ topk_w,
+    const uint8_t* __restrict__ fq, const uint8_t* __restrict__ fs,
+    __nv_bfloat16* __restrict__ part, uint32_t ff, uint32_t embd, uint32_t kw,
+    uint32_t np, uint32_t slot_off) {
+#if PD_BS_OK
+    static_assert(KB == 8u, "16-byte scale slots: KB*2 == 16");
+    constexpr uint32_t WROW = PD_NV4M_WROW(KB);
+    constexpr uint32_t YROW = PD_NV4M_YROW(KB);
+    constexpr uint32_t NT = 4u * BT / WN * 32u;
+    // grid: row-tile group fastest (see the gate|up ring kernel)
+    const uint32_t n_rt = (embd + 127u) / 128u;
+    const uint32_t n_grp = (n_rt + RPC - 1u) / RPC;
+    const uint32_t blk = blockIdx.x / n_grp;
+    const uint32_t e = block_expert[blk];
+    if (e == PD_MOE_PAD) return;
+    const uint32_t rt0 = (blockIdx.x % n_grp) * RPC;
+    const uint32_t nrt = n_rt - rt0 < RPC ? n_rt - rt0 : RPC;
+    const uint32_t nk = ff / (KB * 32u);
+    const uint32_t steps = nrt * nk;
+
+    extern __shared__ unsigned char pd_bs_sh[];
+    unsigned char* yres = pd_bs_sh + ST * 128u * WROW;   // [nk][BT][YROW]
+    __shared__ float colw[BT];
+    __shared__ size_t colp[BT];
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u, warp = tid >> 5;
+    const uint32_t g = lane >> 2, tq = lane & 3u;
+    const uint32_t i0 = ((warp >> 1) & 3u) * 32u;
+    const uint32_t joff = (warp & 1u) * 8u;
+    const uint32_t tb = (warp >> 3) * (2u * WN);
+    const uint32_t n_k16 = ff >> 4;
+    const uint32_t rowb = ff >> 1;
+    const size_t srow0 = (size_t)blk * BT;
+    const float s2 = scale2[e];
+
+    // the columns, whole K: chunk kt of column c at yres + (kt*BT + c)*YROW
+    for (uint32_t u = tid; u < BT * nk * KB; u += NT) {
+        const uint32_t c = u / (nk * KB), r = u % (nk * KB), kt = r / KB, seg = r % KB;
+        pd_cp_async16((int*)(yres + (kt * BT + c) * YROW + 16u + seg * 16u),
+                      fq + (srow0 + c) * (size_t)rowb + kt * (KB * 16u) + seg * 16u, true);
+    }
+    for (uint32_t u = tid; u < BT * nk; u += NT) {
+        const uint32_t c = u / nk, kt = u % nk;
+        pd_cp_async16((int*)(yres + (kt * BT + c) * YROW),
+                      fs + (srow0 + c) * (size_t)n_k16 + kt * (KB * 2u), true);
+    }
+    if (tid < BT) {
+        const uint32_t t = sorted_row[srow0 + tid];
+        if (t == PD_MOE_PAD) {
+            colw[tid] = 0.0f;
+            colp[tid] = ~(size_t)0;
+        } else {
+            const uint32_t slt = sorted_slot[srow0 + tid];
+            colw[tid] = (topk_w ? topk_w[(size_t)t * kw + slt] : 1.0f) * s2;
+            colp[tid] = ((size_t)t * np + slt + slot_off) * embd;
+        }
+    }
+
+    // ring step st -> (row tile rt0 + st / nk, chunk st % nk)
+    auto issue = [&](uint32_t st) {
+        unsigned char* wb = pd_bs_sh + (st % ST) * (128u * WROW);
+        const uint32_t rb = (rt0 + st / nk) * 128u, kt = st % nk;
+        const size_t wrow = (size_t)e * embd + rb;
+        for (uint32_t u = tid; u < 128u * KB; u += NT) {
+            const uint32_t row = u / KB, seg = u % KB;
+            pd_cp_async16((int*)(wb + row * WROW + seg * 16u),
+                          data + (wrow + row) * (size_t)rowb + kt * (KB * 16u) + seg * 16u,
+                          rb + row < embd);
+        }
+        if (tid < 128u)
+            pd_cp_async16((int*)(wb + tid * WROW + KB * 16u),
+                          scale + (wrow + tid) * (size_t)n_k16 + kt * (KB * 2u),
+                          rb + tid < embd);
+    };
+    // the next row tile's strip (contiguous: 128 rows x ff/2, then its
+    // scales) goes to L2 a tile ahead of the ring
+    auto prefetch_rt = [&](uint32_t rt) {
+        const size_t wrow = (size_t)e * embd + rt * 128u;
+        const uint32_t nrow = embd - rt * 128u < 128u ? embd - rt * 128u : 128u;
+        const uint32_t db = nrow * rowb, sb = nrow * n_k16;
+        for (uint32_t o = tid * 128u; o < db + sb; o += NT * 128u) {
+            const uint8_t* p = o < db ? data + wrow * rowb + o : scale + wrow * n_k16 + (o - db);
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
+        }
+    };
+    if (nrt > 1u) prefetch_rt(rt0 + 1u);
+    #pragma unroll
+    for (uint32_t s = 0; s + 1u < ST; ++s) {
+        if (s < steps) issue(s);
+        asm volatile("cp.async.commit_group;");
+    }
+    // n8 tiles holding a live column (align fills a block's live rows first)
+    __syncthreads();   // colw/colp
+    bool tlive[2u * WN / 16u];
+    #pragma unroll
+    for (uint32_t j = 0; j < 2u * WN / 16u; ++j)
+        tlive[j] = colp[tb + j * 16u + joff] != ~(size_t)0;
+
+    float acc[WN / 4u][4] = {};
+    for (uint32_t st = 0; st < steps; ++st) {
+        asm volatile("cp.async.wait_group %0;" ::"n"(ST - 2u));
+        __syncthreads();
+        const uint32_t kt = st % nk, rt = rt0 + st / nk;
+        if (kt == 0u && st / nk + 2u < nrt) prefetch_rt(rt + 2u);
+        if (st + ST - 1u < steps) issue(st + ST - 1u);
+        asm volatile("cp.async.commit_group;");
+        const unsigned char* tw = pd_bs_sh + (st % ST) * (128u * WROW);
+        const unsigned char* ty = yres + kt * BT * YROW;
+
+        #pragma unroll
+        for (uint32_t kp = 0; kp < KB / 4u; ++kp) {
+            uint32_t am[2][2][4];
+            uint2 sa[2];
+            #pragma unroll
+            for (uint32_t n = 0; n < 2u; ++n) {
+                const uint32_t r0 = i0 + n * 16u + g;
+                const uint32_t rs = (tq & 1u) ? r0 + 8u : r0;
+                const uint32_t wo =
+                    (i0 + n * 16u + ((lane >> 3) & 1u) * 8u + (lane & 7u)) * WROW;
+                #pragma unroll
+                for (uint32_t h = 0; h < 2u; ++h)
+                    pd_ldm_x4(am[n][h], tw + wo + (kp * 2u + h) * 32u + (lane >> 4) * 16u);
+                sa[n] = *(const uint2*)(tw + rs * WROW + KB * 16u + kp * 8u);
+            }
+            #pragma unroll
+            for (uint32_t j0 = 0; j0 < 2u * WN; j0 += 16u) {
+                if (!tlive[j0 / 16u]) continue;
+                uint32_t bm[4];
+                pd_ldm_x4(bm, ty + (tb + j0 + joff + (lane & 7u)) * YROW + 16u + kp * 64u +
+                                  (lane >> 3) * 16u);
+                const uint2 sbp = *(const uint2*)(ty + (tb + j0 + joff + g) * YROW + kp * 8u);
+                #pragma unroll
+                for (uint32_t h = 0; h < 2u; ++h) {
+                    #pragma unroll
+                    for (uint32_t n = 0; n < 2u; ++n)
+                        pd_nv4_mma(acc[(j0 >> 3) + n], am[n][h][0], am[n][h][1], am[n][h][2],
+                                   am[n][h][3], bm[h * 2u], bm[h * 2u + 1u],
+                                   h ? sa[n].y : sa[n].x, h ? sbp.y : sbp.x);
+                }
+            }
+        }
+        if (kt + 1u == nk) {
+            // the row tile is whole: the bs kernel's weighted bf16 scatter
+            #pragma unroll
+            for (uint32_t j0 = 0; j0 < 2u * WN; j0 += 16u) {
+                #pragma unroll
+                for (uint32_t qc = 0; qc < 2u; ++qc) {
+                    const uint32_t c = tb + j0 + joff + 2u * tq + qc;
+                    const size_t pb = colp[c];
+                    if (pb == ~(size_t)0) continue;
+                    const float w = colw[c];
+                    #pragma unroll
+                    for (uint32_t n = 0; n < 2u; ++n) {
+                        const uint32_t r0 = rt * 128u + i0 + n * 16u + g;
+                        const uint32_t r8 = r0 + 8u;
+                        if (r0 < embd) part[pb + r0] = __float2bfloat16(acc[(j0 >> 3) + n][qc] * w);
+                        if (r8 < embd)
+                            part[pb + r8] = __float2bfloat16(acc[(j0 >> 3) + n][qc + 2u] * w);
+                    }
+                }
+            }
+            #pragma unroll
+            for (uint32_t j = 0; j < WN / 4u; ++j)
+                acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.0f;
+        }
+    }
+#else
+    (void)data; (void)scale; (void)scale2; (void)sorted_row; (void)sorted_slot;
+    (void)block_expert; (void)topk_w; (void)fq; (void)fs; (void)part; (void)ff;
+    (void)embd; (void)kw; (void)np; (void)slot_off;
+#endif
+}
+
 // sm_100 weight-only twin of the down half - see the up kernel's header for
 // why this die gets a bf16 arm at all. Same tile geometry and same acc[4][4]
 // fragment layout; the differences are only which planes feed the operands:
@@ -1482,6 +1917,101 @@ int pd_nvf4_moe_down_bs_b16(const void* data, const void* scale, const void* sca
             (const uint32_t*)block_expert, (const float*)topk_w,
             (const uint8_t*)fq, (const uint8_t*)fs, (float*)part, ff, embd, kw,
             np, slot_off);
+    return pd_launch_status();
+#endif
+}
+
+// Slots 830 / 831: the sorted W4A4 pair over pd_moe_align_bm(64) blocks -
+// the ring kernels (gate|up: 64-token tile, 3-deep ring, scale rows and
+// weight lines prefetched to L2; down: the 64 columns' whole K resident,
+// the expert's row tiles streamed through one ring). Arguments as slots 631
+// and 758, `nb` counting 64-row blocks. Every fq/fs byte and every bf16
+// partial equals what the BM=32 pair lands for the same (token, slot).
+// Shape laws (the caller keeps the BM=32 pair otherwise): gate|up
+// in_dim % 128 == 0 and ff % 16 == 0; down ff % 256 == 0 with the resident
+// columns in shared memory (ff <= 1024).
+#ifdef PD_BS_HOST
+static uint32_t pd_nv4m_ms_sms() {
+    static const uint32_t v = [] {
+        int dev = 0, n = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+        return n > 0 ? (uint32_t)n : 48u;
+    }();
+    return v;
+}
+#endif
+
+PD_EXPORT
+int pd_nvf4_moe_gu_swiglu_ms(const void* gdata, const void* gscale,
+                             const void* gscale2, const void* udata,
+                             const void* uscale, const void* uscale2,
+                             const void* sorted_row, const void* block_expert,
+                             const void* xq, const void* xs, void* fq, void* fs,
+                             uint32_t in_dim, uint32_t ff, uint32_t nblocks,
+                             void* stream) {
+#ifndef PD_BS_HOST
+    (void)gdata; (void)gscale; (void)gscale2; (void)udata; (void)uscale;
+    (void)uscale2; (void)sorted_row; (void)block_expert; (void)xq; (void)xs;
+    (void)fq; (void)fs; (void)in_dim; (void)ff; (void)nblocks; (void)stream;
+    return cudaErrorNotSupported;
+#else
+    if (nblocks == 0 || ff == 0) return 0;
+    if (pd_nv4t_arm()) return cudaErrorNotSupported;
+    if ((in_dim & 127u) != 0 || (ff & 15u) != 0) return cudaErrorInvalidValue;
+    auto k = pd_nvf4_moe_gu_swiglu_ms_kernel<4u, 64u, 16u, 3u>;
+    constexpr uint32_t smem = PD_NV4M_GU_MS_SMEM(4u, 64u, 3u);
+    static const bool attr =
+        cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem) ==
+        cudaSuccess;
+    if (!attr) return cudaErrorInvalidConfiguration;
+    k<<<nblocks * ((ff + 127u) / 128u), 512, smem, (cudaStream_t)stream>>>(
+        (const uint8_t*)gdata, (const uint8_t*)gscale, (const float*)gscale2,
+        (const uint8_t*)udata, (const uint8_t*)uscale, (const float*)uscale2,
+        (const uint32_t*)sorted_row, (const uint32_t*)block_expert,
+        (const uint8_t*)xq, (const uint8_t*)xs, (uint8_t*)fq, (uint8_t*)fs,
+        in_dim, ff);
+    return pd_launch_status();
+#endif
+}
+
+PD_EXPORT
+int pd_nvf4_moe_down_ms_b16(const void* data, const void* scale, const void* scale2,
+                            const void* sorted_row, const void* sorted_slot,
+                            const void* block_expert, const void* topk_w,
+                            const void* fq, const void* fs, void* part, uint32_t ff,
+                            uint32_t embd, uint32_t kw, uint32_t np,
+                            uint32_t slot_off, uint32_t nb, void* stream) {
+#ifndef PD_BS_HOST
+    (void)data; (void)scale; (void)scale2; (void)sorted_row; (void)sorted_slot;
+    (void)block_expert; (void)topk_w; (void)fq; (void)fs; (void)part; (void)ff;
+    (void)embd; (void)kw; (void)np; (void)slot_off; (void)nb; (void)stream;
+    return cudaErrorNotSupported;
+#else
+    if (embd == 0 || nb == 0) return 0;
+    if ((ff & 255u) != 0 || ff > 1024u || np == 0) return cudaErrorInvalidValue;
+    if (pd_nv4t_arm()) return cudaErrorNotSupported;
+    const uint32_t smem = PD_NV4M_DN_MS_SMEM(8u, 64u, 3u, ff);
+    const uint32_t n_rt = (embd + 127u) / 128u;
+    // a CTA walks every row tile of its block once the blocks alone fill the
+    // die four times over; short launches split the strip five tiles a CTA
+    const bool whole = nb >= 4u * pd_nv4m_ms_sms();
+    auto k = whole ? pd_nvf4_moe_down_ms_kernel<8u, 64u, 16u, 3u, 20u>
+                   : pd_nvf4_moe_down_ms_kernel<8u, 64u, 16u, 3u, 5u>;
+    const uint32_t rpc = whole ? 20u : 5u;
+    static const bool attr =
+        cudaFuncSetAttribute(pd_nvf4_moe_down_ms_kernel<8u, 64u, 16u, 3u, 20u>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)PD_NV4M_DN_MS_SMEM(8u, 64u, 3u, 1024u)) == cudaSuccess &&
+        cudaFuncSetAttribute(pd_nvf4_moe_down_ms_kernel<8u, 64u, 16u, 3u, 5u>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)PD_NV4M_DN_MS_SMEM(8u, 64u, 3u, 1024u)) == cudaSuccess;
+    if (!attr) return cudaErrorInvalidConfiguration;
+    k<<<nb * ((n_rt + rpc - 1u) / rpc), 512, smem, (cudaStream_t)stream>>>(
+        (const uint8_t*)data, (const uint8_t*)scale, (const float*)scale2,
+        (const uint32_t*)sorted_row, (const uint32_t*)sorted_slot,
+        (const uint32_t*)block_expert, (const float*)topk_w, (const uint8_t*)fq,
+        (const uint8_t*)fs, (__nv_bfloat16*)part, ff, embd, kw, np, slot_off);
     return pd_launch_status();
 #endif
 }

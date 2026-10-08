@@ -47,31 +47,47 @@ fn embeddinggemma2_attention_reference() {
             let y = device.alloc(rows * 4 * hd * 4).unwrap();
             let scores = device.alloc(128 * rows.div_ceil(64) * 64 * 4 * 2).unwrap();
             let c = device.begin().unwrap();
-            if hd == 512 {
+            if hd == 512 || lengths.iter().all(|&n| n < 1024) {
                 let mut start = 0;
                 for &length in &lengths {
                     for offset in (0..length).step_by(128) {
                         let count = (length - offset).min(128);
                         let p = [start, length, offset, count];
                         c.dispatch(
-                            "eg2_global_qk",
+                            if hd == 512 {
+                                "eg2_global_qk"
+                            } else {
+                                "eg2_local_qk"
+                            },
                             &[&q, &k, &scores],
                             &p,
                             [length.div_ceil(64) as usize, count.div_ceil(32) as usize, 4],
                             128,
                         );
                         c.dispatch(
-                            "eg2_global_softmax",
+                            if length > 4096 {
+                                "eg2_global_softmax"
+                            } else {
+                                "eg2_block_softmax"
+                            },
                             &[&scores],
                             &p,
                             [count as usize, 4, 1],
-                            256,
+                            if length > 4096 {
+                                256
+                            } else {
+                                length.div_ceil(128) as usize * 32
+                            },
                         );
                         c.dispatch(
-                            "eg2_global_pv",
+                            if hd == 512 {
+                                "eg2_global_pv"
+                            } else {
+                                "eg2_local_pv"
+                            },
                             &[&scores, &v, &y],
                             &p,
-                            [8, count.div_ceil(32) as usize, 4],
+                            [hd / 64, count.div_ceil(32) as usize, 4],
                             128,
                         );
                     }

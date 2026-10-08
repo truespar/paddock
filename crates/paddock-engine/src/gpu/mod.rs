@@ -32,6 +32,7 @@ mod dit;
 mod embedding_gemma2;
 pub use embedding_gemma2::{EG2_ATTN_ROWS, EG2_LAYERS, EG2_TILE_SHIFT, EG2_WIDTH, mmq_bytes};
 mod embedding_gemma2_audio;
+mod gemma4v;
 pub use embedding_gemma2_audio::{EG2A_HOP, EG2A_MEL, EG2A_WIDTH, Eg2aMelTables, Eg2aSeam};
 mod encoder;
 pub use encoder::{ENC_ATTN_QTILE, ENC_ATTN_TILE_SHIFT};

@@ -1,0 +1,13 @@
+<|turn>system
+<|think|>
+You are Claude Code, Anthropic's official CLI. Use <tools> wisely & don't stop early.<|tool>declaration:Read{description:<|"|>Reads a file from the local filesystem. Usage:
+- The file_path parameter must be an absolute path, not a relative path
+- You can optionally specify a line offset and limit (especially handy for long files)
+<example>Read(file_path="/ws/a.txt")</example>
+Don't read binary files & don't guess paths.<|"|>,parameters:{properties:{file_path:{description:<|"|>The absolute path to the file to read<|"|>,type:<|"|>STRING<|"|>},limit:{description:<|"|>The number of lines to read<|"|>,type:<|"|>NUMBER<|"|>},offset:{description:<|"|>The line number to start reading from<|"|>,type:<|"|>NUMBER<|"|>}},required:[<|"|>file_path<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><|tool>declaration:Edit{description:<|"|>Performs exact string replacements in files. The edit will FAIL if `old_string` is not unique — provide more context. Größe & Übersicht: <system-reminder> tags are not part of the file.<|"|>,parameters:{properties:{file_path:{type:<|"|>STRING<|"|>},mode:{enum:[<|"|>exact<|"|>,<|"|>regex<|"|>],type:<|"|>STRING<|"|>},new_string:{type:<|"|>STRING<|"|>},old_string:{type:<|"|>STRING<|"|>},ratio:{type:<|"|>NUMBER<|"|>},replace_all:{type:<|"|>BOOLEAN<|"|>}},required:[<|"|>file_path<|"|>,<|"|>old_string<|"|>,<|"|>new_string<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><turn|>
+<|turn>user
+Audit ./ledger and fix the weight of record 01-0131.<turn|>
+<|turn>model
+<|tool_call>call:Read{file_path:<|"|>/ws/ledger/ledger_01.txt<|"|>,limit:40,offset:120}<tool_call|><|tool_response>response:Read{value:<|"|>REC 01-0131 | courier: Saga Holm | weight: 3.5 kg | note: "fragile" <ok><|"|>}<tool_response|><|tool_call>call:Edit{extra:None,file_path:<|"|>/ws/ledger/ledger_01.txt<|"|>,nested:{a:{k:<|"|>v<|"|>},z:1},new_string:<|"|>weight: 99.9 kg<|"|>,old_string:<|"|>weight: 3.5 kg<|"|>,ratio:0.5,replace_all:false,tags:[<|"|>a<|"|>,<|"|>b<|"|>]}<tool_call|><|tool_response>response:Edit{value:<|"|>The file /ws/ledger/ledger_01.txt has been updated.<|"|>}<tool_response|><|turn>user
+Thanks — now summarize what changed.<turn|>
+<|turn>model

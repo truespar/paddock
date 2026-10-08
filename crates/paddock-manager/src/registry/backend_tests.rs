@@ -1357,16 +1357,20 @@ fn metal_projection_preserves_cuda_contracts_and_is_reversible() {
                 Some(if model.id == "bonsai-2-27b" && a.id == "mlx-2bit" {
                     "f32"
                 } else if a.runtime.checkpoint_dir
+                    || model.id == "embeddinggemma-2"
                     || model
                         .capability
                         .iter()
                         .any(|c| c == "diarization" || c == "decision")
                 {
-                    // Single-pass audio/decision graphs have no decode KV.
+                    // Single-pass audio/decision/embedding graphs have no decode KV.
                     "auto"
                 } else {
                     "f16"
-                })
+                }),
+                "{}/{}",
+                model.id,
+                a.id
             );
             assert!(a.runtime.companions.is_some(), "{}/{}", model.id, a.id);
         }

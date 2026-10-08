@@ -41,7 +41,6 @@ use crate::gpu_model::qwen35::vision::host_f32;
 pub const AUDIO_RATE: usize = 16_000;
 /// The longest clip served: 30 s, the processor's `max_length`.
 pub const AUDIO_MAX_SAMPLES: usize = 30 * AUDIO_RATE;
-const HOP: usize = 160;
 const WIN: usize = 320;
 const BLOCKS: usize = 12;
 const FF: usize = 4 * EG2A_WIDTH;
@@ -49,28 +48,7 @@ const OUT: usize = 1536;
 const TEXT: usize = 512;
 const EPS: f32 = 1e-6;
 
-/// Frontend frames of an `n`-sample clip: the processor's unfold of 321
-/// samples every 160 over the clip left-padded by 160.
-pub fn audio_frames(n: usize) -> Result<usize, String> {
-    if n > AUDIO_MAX_SAMPLES {
-        return Err(format!(
-            "an audio clip is at most 30 s ({AUDIO_MAX_SAMPLES} samples at 16 kHz); this one has {n} - split it into several parts"
-        ));
-    }
-    if n + HOP < WIN + 1 {
-        return Err(format!(
-            "an audio clip of {n} samples is shorter than one 20 ms frame"
-        ));
-    }
-    Ok((n + HOP - (WIN + 1)) / HOP + 1)
-}
-
-/// Soft tokens an `n`-sample clip takes: the frames through two stride-2
-/// convs (`ceil` twice) - the processor's `replace_audio_token`.
-pub fn audio_tokens(n: usize) -> Result<usize, String> {
-    let f = audio_frames(n)?;
-    Ok(((f - 1) / 2) / 2 + 1)
-}
+pub use crate::encoder::embedding_gemma2::{audio_frames, audio_tokens};
 
 /// A clipped linear: the f16 plane `[in, out]` and its clamp bounds.
 struct Lin {

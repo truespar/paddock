@@ -577,6 +577,14 @@ export interface ModelSpecs {
   /** comparison-card bullets - factual, both sides (never just an ad). */
   strengths?: string[]
   tradeoffs?: string[]
+  /** the questions a model's weights answer when they are not quality levels
+   *  (Kumo Tabular: Size x Task), in display order; each weights artifact
+   *  names its value on every axis in `choice`. */
+  choices?: ChoiceAxis[]
+}
+export interface ChoiceAxis {
+  name: string
+  options: { value: string; note?: string }[]
 }
 /** One independently downloadable PIECE of a model (schema 3): a weights
  *  alternative (the quality choice) or a companion (vision or audio tower,
@@ -587,6 +595,9 @@ export interface CatalogArtifact {
   kind: 'weights' | 'vision' | 'audio' | 'drafter' | 'fp8-snapshot' | 'text-encoder' | 'vae'
   format: 'gguf' | 'safetensors'
   label: string
+  /** where this weights artifact sits on the model's `specs.choices`, by
+   *  axis name ({ Size: 'Large', Task: 'Classification' }) */
+  choice?: Record<string, string>
   /** Export-specific loader contract; absent preserves older managers. */
   runtime?: {
     backends?: string[]
@@ -594,6 +605,11 @@ export interface CatalogArtifact {
     companions?: string[]
     checkpoint_dir?: boolean
     embedded_vision?: boolean
+    /** Independently loadable towers within these weights; no companion download. */
+    optional_towers?: {
+      vision?: { weight_bytes: number; workspace_bytes: number; default: boolean } | null
+      audio?: { weight_bytes: number; workspace_bytes: number; default: boolean } | null
+    }
     kv_cache_dtype?: string
     experimental?: boolean
     qualification?: 'unqualified' | 'experimental' | 'qualified'

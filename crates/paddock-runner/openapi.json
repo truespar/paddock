@@ -202,7 +202,7 @@
       "post": {
         "tags": ["openai"],
         "summary": "Embeddings (OpenAI-conformant)",
-        "description": "Served by encoder models (embeddings/reranker checkpoints). Supports `dimensions` (Matryoshka truncation) and `encoding_format`.",
+        "description": "Served by encoder models (embeddings/reranker checkpoints). Supports `dimensions` (Matryoshka truncation) and `encoding_format`. Functional media inputs are advertised by `/api/server.embedder_inputs`, not inferred from model names. EmbeddingGemma 2 accepts interleaved content parts for enabled image/audio towers. Its Metal video path accepts `input_video: {frames: [{image_url: data_url, timestamp: seconds}], add_timestamps: false}` in a `type: input_video` content part: 1–32 sampled, equally sized frames, at most 70 soft tokens per frame. Timestamps are optional, but if supplied must be present on every frame and strictly increasing; `add_timestamps: true` also inserts them into the model input. This is visual-frame embedding, not audio extraction or a remote movie URL fetch. Native macOS samples local movies with AVFoundation at 1 fps, uniformly capped at 32 frames.",
         "operationId": "embeddings",
         "externalDocs": { "description": "OpenAI reference", "url": "https://platform.openai.com/docs/api-reference/embeddings" },
         "responses": {

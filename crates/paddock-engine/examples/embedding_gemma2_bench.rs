@@ -45,8 +45,22 @@ fn main() {
     };
     let query = case("short");
     let docs = case("ragged");
+    // the small-pass band: a query cut to 4 and 8 tokens, and two queries
+    // packed to 32 rows
+    let q0 = &query[0];
     let mut runs: Vec<(String, Vec<Vec<u32>>)> = vec![
+        ("4 tokens".into(), vec![q0[..4.min(q0.len())].to_vec()]),
+        ("8 tokens".into(), vec![q0[..8.min(q0.len())].to_vec()]),
+        ("12 tokens".into(), vec![q0[..12.min(q0.len())].to_vec()]),
+        ("16 tokens".into(), vec![q0[..16.min(q0.len())].to_vec()]),
         ("1 query".into(), query.clone()),
+        (
+            "32 rows".into(),
+            vec![
+                q0.clone(),
+                q0[..(32 - q0.len().min(32)).min(q0.len())].to_vec(),
+            ],
+        ),
         ("5 docs".into(), docs.clone()),
     ];
     for n in [8usize, 32, 128] {

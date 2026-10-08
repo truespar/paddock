@@ -708,8 +708,10 @@ impl GpuLaguna {
             Flavor::Laguna => pf_rows(),
         };
         let cap = pf_wide + max_batch;
-        // sorted-MoE worst case: every expert pads its last block
-        let sorted_rows = (cap * m.n_active + m.n_expert * 31).div_ceil(32) * 32;
+        // sorted-MoE worst case: every expert pads its last block - of 64
+        // rows on the NVFP4 build (the ring pair's blocks), else 32
+        let bmw = if nv { 64 } else { 32 };
+        let sorted_rows = (cap * m.n_active + m.n_expert * (bmw - 1)).div_ceil(bmw) * bmw;
         let sc = BatchScratch {
             x: e.alloc(cap * hp.n_embd)?,
             xn: e.alloc(cap * hp.n_embd)?,

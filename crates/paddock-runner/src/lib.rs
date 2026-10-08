@@ -716,9 +716,14 @@ pub async fn run(
                 cfg.kernel_pack.as_deref(),
                 cfg.max_ctx,
                 cfg.vram_budget.map(|mib| mib << 20),
-                None,
+                Some(embedding_gemma2::Media {
+                    files: vec![],
+                    image_budget: embedding_gemma2::image_budget(cfg.max_image_tokens)?,
+                    image: cfg.vision != Some(false),
+                    audio: cfg.audio == Some(true),
+                }),
             )?;
-            tracing::info!(model=%m.id,"EmbeddingGemma 2 text embeddings ready");
+            tracing::info!(model=%m.id,"EmbeddingGemma 2 embeddings ready");
             embedder = Some(m);
         } else if arch == "gemma-embedding2" {
             // the GGUF lane takes its towers from the companions resolved
@@ -733,6 +738,7 @@ pub async fn run(
                 .then(|| -> Result<_, serving::ServeError> {
                     Ok(embedding_gemma2::Media {
                         files,
+                        image: cfg.vision != Some(false),
                         image_budget: embedding_gemma2::image_budget(cfg.max_image_tokens)?,
                         audio: cfg.audio != Some(false),
                     })

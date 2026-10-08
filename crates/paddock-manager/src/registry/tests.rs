@@ -266,6 +266,7 @@ fn two_model_registry() -> Registry {
         quant: None,
         default: id == "q8",
         required: false,
+        choice: Default::default(),
         min_cc: None,
         workspace: None,
         shape: None,
@@ -434,6 +435,7 @@ async fn registry_pull_from_manifest_downloads_to_dest() {
                 quant: Some("Q8_0".into()),
                 default: true,
                 required: false,
+                choice: Default::default(),
                 min_cc: None,
                 workspace: None,
                 shape: None,
@@ -527,6 +529,7 @@ async fn resolve_pulls_missing_files_and_splits_weights_from_mmproj() {
                     quant: Some("Q8_0".into()),
                     default: true,
                     required: false,
+                    choice: Default::default(),
                     min_cc: None,
                     workspace: None,
                     shape: None,
@@ -547,6 +550,7 @@ async fn resolve_pulls_missing_files_and_splits_weights_from_mmproj() {
                     quant: None,
                     default: true,
                     required: false,
+                    choice: Default::default(),
                     min_cc: None,
                     workspace: None,
                     shape: None,
@@ -622,6 +626,7 @@ async fn drafter_election_prefers_the_pin_then_the_default() {
         quant: None,
         default,
         required: false,
+        choice: Default::default(),
         min_cc: None,
         workspace: None,
         shape: None,
@@ -656,6 +661,7 @@ async fn drafter_election_prefers_the_pin_then_the_default() {
                     quant: Some("Q8_0".into()),
                     default: true,
                     required: false,
+                    choice: Default::default(),
                     min_cc: None,
                     workspace: None,
                     shape: None,
@@ -746,6 +752,7 @@ async fn a_dead_pin_falls_back_and_the_fallback_is_named() {
         quant: None,
         default,
         required: false,
+        choice: Default::default(),
         min_cc: None,
         workspace: None,
         shape: None,
@@ -780,6 +787,7 @@ async fn a_dead_pin_falls_back_and_the_fallback_is_named() {
                     quant: Some("Q8_0".into()),
                     default: true,
                     required: false,
+                    choice: Default::default(),
                     min_cc: None,
                     workspace: None,
                     shape: None,
@@ -1057,4 +1065,75 @@ fn embedded_manifest_parses_and_is_well_formed() {
         v["models"][0]["artifacts"][0]["installed"].is_boolean(),
         "piece-level install state"
     );
+}
+
+/// A model that declares choice axes is answered one question per axis, so
+/// every weights artifact must sit at exactly one point of the grid: each axis
+/// named, each value one the axis offers, no two artifacts at the same point.
+/// A gap here is a card the Studio cannot select; a duplicate is two downloads
+/// behind one card.
+#[test]
+fn choice_axes_place_every_weights_artifact_once() {
+    let reg = Registry::new(std::path::PathBuf::from("./models"));
+    let mut with_axes = 0;
+    for m in &reg.catalog().models {
+        let axes = &m.specs.choices;
+        if axes.is_empty() {
+            for a in m.weights() {
+                assert!(
+                    a.choice.is_empty(),
+                    "{}/{}: a choice without axes",
+                    m.id,
+                    a.id
+                );
+            }
+            continue;
+        }
+        with_axes += 1;
+        let mut seen = std::collections::BTreeSet::new();
+        for a in m.weights() {
+            assert_eq!(
+                a.choice.len(),
+                axes.len(),
+                "{}/{}: one value per axis",
+                m.id,
+                a.id
+            );
+            for x in axes {
+                let v = a
+                    .choice
+                    .get(&x.name)
+                    .unwrap_or_else(|| panic!("{}/{}: no value on axis {:?}", m.id, a.id, x.name));
+                assert!(
+                    x.options.iter().any(|o| &o.value == v),
+                    "{}/{}: {v:?} is not an option of {:?}",
+                    m.id,
+                    a.id,
+                    x.name
+                );
+            }
+            assert!(
+                seen.insert(a.choice.clone()),
+                "{}/{}: a second artifact at one point",
+                m.id,
+                a.id
+            );
+        }
+        // the cards an axis offers must each lead somewhere from the default
+        let default = m.default_weights().expect("a default").choice.clone();
+        for x in axes {
+            for o in &x.options {
+                let mut at = default.clone();
+                at.insert(x.name.clone(), o.value.clone());
+                assert!(
+                    seen.contains(&at),
+                    "{}: {} = {:?} has no artifact",
+                    m.id,
+                    x.name,
+                    o.value
+                );
+            }
+        }
+    }
+    assert!(with_axes >= 1, "kumo-tabular declares Size x Task");
 }

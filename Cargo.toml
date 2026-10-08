@@ -53,7 +53,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 # Word timestamps and confidence pass through the runner, relay and persisted
 # Studio metadata. Best-effort float parsing loses one ULP on valid JSON and
 # breaks lossless transcript attribution; preserve f64 across every hop.
-serde_json = { version = "1.0.151", features = ["float_roundtrip"] }
+serde_json = { version = "1.0.151", features = ["float_roundtrip", "preserve_order"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 toml = "1.1.4"
@@ -99,7 +99,7 @@ uuid = { version = "1.25.0", features = ["v4"] }
 futures = "0.3.34"
 async-stream = "0.3.6"
 futures-util = "0.3"
-minijinja = { version = "2.24.0", features = ["loop_controls", "builtins", "json"] }
+minijinja = { version = "2.24.0", features = ["loop_controls", "builtins", "json", "preserve_order"] }
 minijinja-contrib = { version = "2.24.0", features = ["pycompat"] }
 base64 = "0.23"
 # zlib, for whisper's `compression_ratio` - OpenAI defines that segment field

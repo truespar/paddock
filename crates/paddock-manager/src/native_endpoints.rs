@@ -128,6 +128,7 @@ pub struct Composition {
     model: String,
     artifact: String,
     vision: bool,
+    audio: Option<bool>,
     drafter: Option<String>,
 }
 impl Change {
@@ -163,10 +164,13 @@ pub fn projection(supervisor: &Supervisor, port: u16) -> Result<Value, String> {
         .read_config_file(port)
         .map_err(|_| "Saved endpoint settings are unavailable.")?;
     let doc = parse(&raw, port)?;
+    let media = supervisor.project_config_text(&raw)?;
     Ok(settings_projection(
         &doc,
         Some(&revision),
         supervisor.kv_offload_supported(&doc),
+        (media.vision, media.audio),
+        media.vram_budget,
     ))
 }
 
@@ -174,6 +178,8 @@ fn settings_projection(
     doc: &toml::Value,
     revision: Option<&str>,
     offload_supported: bool,
+    media: (bool, bool),
+    memory_limit: Option<u64>,
 ) -> Value {
     let host = doc
         .get("host")
@@ -196,11 +202,12 @@ fn settings_projection(
             "residency_supported": residency_supported(doc),
             "kv_cache_dtype":doc.get("kv_cache_dtype").and_then(toml::Value::as_str),
             "has_api_key":doc.get("api_key").and_then(toml::Value::as_str).is_some_and(|v|!v.is_empty()),
-            "vision":doc.get("mmproj").is_some(),
+            "vision":media.0,
+            "audio":media.1,
             "forensics":doc.get("forensics").and_then(|v|v.get("enabled")).and_then(toml::Value::as_bool).unwrap_or(false),
             "device":doc.get("device").and_then(toml::Value::as_str).unwrap_or("auto"),
             "drafter":doc.get("catalog").and_then(|v| v.get("drafter")).and_then(toml::Value::as_str),
-            "vram_budget":doc.get("vram_budget").and_then(toml::Value::as_integer),
+            "vram_budget":memory_limit,
         }
     })
 }
@@ -244,7 +251,14 @@ async fn initial_config(state: &AppState, model: &str, artifact: &str) -> Result
 pub async fn prepare(state: &AppState, model: &str, artifact: &str) -> Result<Value, String> {
     let text = initial_config(state, model, artifact).await?;
     let doc = parse(&text, 0)?;
-    let mut value = settings_projection(&doc, None, state.supervisor.kv_offload_supported(&doc));
+    let media = state.supervisor.project_config_text(&text)?;
+    let mut value = settings_projection(
+        &doc,
+        None,
+        state.supervisor.kv_offload_supported(&doc),
+        (media.vision, media.audio),
+        media.vram_budget,
+    );
     let object = value
         .as_object_mut()
         .expect("the settings projection is a JSON object");

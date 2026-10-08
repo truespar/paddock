@@ -18,6 +18,9 @@ import { datasetKey, type TableInput, type TableRun, type TableSession } from '@
 import { uuid } from '@/lib/uuid'
 import ReadsSidebar from '@/components/reads/ReadsSidebar.vue'
 import { useModelsStore } from '@/stores/models'
+import { useFleetStore } from '@/stores/fleet'
+import { useRegistryStore } from '@/stores/registry'
+import { artifactAt } from '@/lib/weight-choices'
 import { copyText } from '@/lib/clipboard'
 import {
   buildPlan,
@@ -48,6 +51,8 @@ import ToggleGroup from '@/components/ui/ToggleGroup.vue'
 import ToggleGroupItem from '@/components/ui/ToggleGroupItem.vue'
 
 const models = useModelsStore()
+const fleet = useFleetStore()
+const reg = useRegistryStore()
 const route = useRoute()
 const router = useRouter()
 const toasts = useToastsStore()
@@ -61,12 +66,18 @@ const showSource = ref(false)
 // keep the list fresh while the page is open (a model started or stopped in
 // the Manager appears without a reload)
 let timer: number | undefined
+let releaseFleet: (() => void) | null = null
 onMounted(() => {
   void history.refresh()
   void models.refresh()
   timer = window.setInterval(() => void models.refresh(), 5000)
+  releaseFleet = fleet.hold()
+  if (!reg.models.length) void reg.refresh()
 })
-onUnmounted(() => clearInterval(timer))
+onUnmounted(() => {
+  clearInterval(timer)
+  releaseFleet?.()
+})
 
 const predictors = computed(() => models.models.filter((m) => m.kind === 'tabular'))
 // ?port= (the model page's "open in Studio") names the endpoint; it wins once
@@ -112,6 +123,49 @@ watch(
   { immediate: true },
 )
 const task = computed(() => limits.value?.task ?? null)
+
+// The other task, one click away. A runner answers one task, so a table whose
+// target is the other kind needs the other checkpoint: switch to a running one
+// when there is one, else start the same size's other-task checkpoint (the
+// start form preselects it). Each runner's task is its own /server answer.
+const taskOf = ref<Record<number, string>>({})
+watch(
+  predictors,
+  async (list) => {
+    for (const { port: p } of list) {
+      if (!p || p in taskOf.value) continue
+      try {
+        const r = await fetch(`/api/runners/${p}/server`)
+        const l = r.ok ? limitsFrom(await r.json()) : null
+        if (l) taskOf.value = { ...taskOf.value, [p]: l.task }
+      } catch {
+        // not answering yet - the next refresh asks again
+      }
+    }
+  },
+  { immediate: true },
+)
+const otherTask = computed(() =>
+  task.value === 'classification' ? 'regression' : task.value === 'regression' ? 'classification' : null,
+)
+const otherRunner = computed(() =>
+  otherTask.value ? predictors.value.find((m) => !!m.port && taskOf.value[m.port] === otherTask.value) : undefined,
+)
+const otherStart = computed(() => {
+  const want = otherTask.value
+  if (!want || otherRunner.value) return null
+  const cfg = fleet.rows.find((r) => r.port === port.value)?.config
+  const cat = reg.models.find((m) => m.id === cfg?.model) ?? reg.models.find((m) => m.capability.includes('tabular'))
+  const axes = cat?.specs?.choices ?? []
+  const taskAxis = axes.find((x) => x.options.some((o) => o.value.toLowerCase() === want))
+  if (!cat || !taskAxis) return null
+  const weights = cat.artifacts.filter((a) => a.kind === 'weights')
+  const now = weights.find((a) => a.id === cfg?.artifact) ?? weights.find((a) => a.default)
+  const value = taskAxis.options.find((o) => o.value.toLowerCase() === want)!.value
+  const to = artifactAt(axes, weights, { ...(now?.choice ?? {}), [taskAxis.name]: value })
+  return to ? { name: 'server-new-config', params: { model: cat.id }, query: { artifact: to.id } } : null
+})
+const otherLabel = computed(() => (otherTask.value === 'regression' ? 'Predict numbers instead' : 'Predict classes instead'))
 
 // -- the user's table ------------------------------------------------------------
 const text = ref('')
@@ -535,6 +589,12 @@ const panelOpen = usePanelFold('tablesPanelOpen')
         <div class="tb__row">
           <span class="tb__label">Your table</span>
           <span class="tb__hint">{{ taskLine }}</span>
+          <button v-if="otherRunner" class="pk-btn pk-btn--sm pk-btn--ghost tb__right" @click="port = otherRunner.port ?? port">
+            {{ otherLabel }}
+          </button>
+          <RouterLink v-else-if="otherStart" class="pk-btn pk-btn--sm pk-btn--ghost tb__right" :to="otherStart">
+            {{ otherLabel }}
+          </RouterLink>
         </div>
         <textarea v-if="showSource || !text"
           v-model="text"

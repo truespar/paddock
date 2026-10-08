@@ -864,8 +864,13 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
             if e.audio {
                 kinds.push("audio");
             }
+            if e.encoder.serves_video() {
+                kinds.push("video");
+            }
             kinds
         }),
+        "embedder_dimensions": state.embedder.as_ref().filter(|e| e.embedding_gemma2).map(|_| [128,256,512,768]),
+        "embedder_tasks": state.embedder.as_ref().filter(|e| e.embedding_gemma2).map(|_| ["query","document","classification","clustering","code_retrieval","fact_checking","question_answering","sentence_similarity"]),
         "reasoning": reasoning,
         "reasoning_levels": caps.map(|c| c.levels.clone()),
         "reasoning_default": caps.and_then(|c| c.default_level.clone()),

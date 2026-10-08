@@ -77,6 +77,13 @@ const PLE_UPFRONT_ROWS: usize = 256;
 /// 4.23 / 4.31 / 4.77 ms, GEMV to 32 rows 2.97 / 4.28 / 4.73, to 128 rows
 /// 2.74 / 6.05 / 4.69).
 const GEMV_ROWS: usize = 32;
+/// The same band when the pack carries the medium-row mmq tile (slot 828):
+/// that tile's pass time is flat across the band while the GEMV's grows with
+/// the rows (GB10 pass times, 4 / 8 / 12 / 16 / 18 / 32 rows: GEMV 2.31 /
+/// 2.38 / 2.50-2.61 / 2.60-2.64 / 2.84-2.96 / 3.49-3.61 ms, the tile 2.63 /
+/// 2.68 / 2.68-2.73 / 2.65-2.69 / 2.73 / 2.73), so the GEMV keeps the
+/// passes up to 16 rows.
+const GEMV_ROWS_WITH_TILE: usize = 16;
 /// Seconds of complete idleness before the scratch is dropped.
 const IDLE_RECLAIM: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -224,6 +231,11 @@ impl GpuEmbeddingGemma2 {
     pub fn reclaim_idle(&mut self) {
         self.scratch = None;
         self.pool = [None, None];
+        // the picture tower's kept scratch goes with it (a picture pass
+        // always builds `scratch`, so this runs after any picture)
+        if let Some(t) = &mut self.images {
+            t.release();
+        }
     }
 
     /// The idle-burst merge windows (see `EncoderBackend::burst_windows`):

@@ -35,6 +35,20 @@ fn selection(registry: &Registry, model: &str, artifact: &str) -> Result<Vec<Str
     let weights = entry
         .artifact(artifact)
         .ok_or("Select a weights option from the library")?;
+    // Split encoder towers can be fetched independently from native model
+    // settings. Only catalog-reviewed companions of a Metal weights artifact
+    // qualify; this never accepts a URL, path or a CUDA-only companion.
+    if entry.split_towers()
+        && matches!(weights.kind, ArtifactKind::Vision | ArtifactKind::Audio)
+        && weights.runtime.supports_backend("metal")
+        && entry.artifacts.iter().any(|a| {
+            a.kind == ArtifactKind::Weights
+                && a.runtime.supports_backend("metal")
+                && a.runtime.allows_companion(&weights.id)
+        })
+    {
+        return Ok(vec![weights.id.clone()]);
+    }
     if weights.kind != ArtifactKind::Weights || !weights.runtime.supports_backend("metal") {
         return Err("These weights cannot run on Metal".into());
     }
@@ -179,6 +193,37 @@ fn validate_job(registry: &Registry, id: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn embeddinggemma2_native_downloads_separate_optional_audio_from_picture_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::new(dir.path().into()).with_backend("metal");
+        assert_eq!(
+            selection(&registry, "embeddinggemma-2", "q8").unwrap(),
+            ["q8", "vision"]
+        );
+        for tower in ["vision", "audio"] {
+            assert_eq!(
+                selection(&registry, "embeddinggemma-2", tower).unwrap(),
+                [tower]
+            );
+            let reply: Value = serde_json::from_str(
+                &execute(
+                    &registry,
+                    Command::Plan {
+                        model: "embeddinggemma-2".into(),
+                        artifact: tower.into(),
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(reply["plan"]["file_count"], 1);
+            assert_eq!(reply["plan"]["selection"], json!([tower]));
+            assert!(reply["jobs"].as_array().unwrap().is_empty());
+        }
+        assert!(selection(&registry, "embeddinggemma-2", "video").is_err());
+        assert!(std::fs::read_dir(dir.path()).unwrap().next().is_none());
+    }
     #[test]
     fn qwen_image_mlx_native_plan_contains_the_complete_pipeline_without_gguf_companions() {
         let dir = tempfile::tempdir().unwrap();

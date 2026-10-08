@@ -3,6 +3,7 @@
 //! the shared ragged encoder scheduler.
 use crate::serving::{EmbedModel, ServeError};
 use std::path::{Path, PathBuf};
+mod video;
 
 pub(crate) fn directory(path: &Path) -> Option<PathBuf> {
     let dir = if path.is_dir() {
@@ -39,12 +40,16 @@ pub(crate) fn image_budget(configured: Option<u32>) -> Result<usize, ServeError>
     }
 }
 
-/// The media towers of the GGUF lane (CUDA only): the projector files - the
+/// The media towers of the GGUF lane (CUDA and Metal): the projector files - the
 /// upstream one carrying both towers, or the catalog's picture and audio
 /// cuts - the picture soft-token budget, and whether to load an audio tower.
 pub(crate) struct Media {
     pub files: Vec<PathBuf>,
     pub image_budget: usize,
+    // Only the Metal MLX package reads this: its one bundle holds both towers.
+    // The GGUF lanes already pick towers by which files are in `files`.
+    #[cfg_attr(not(all(feature = "metal", target_os = "macos")), allow(dead_code))]
+    pub image: bool,
     pub audio: bool,
 }
 
@@ -80,12 +85,7 @@ pub(crate) fn load(
     let image_budget = media.as_ref().map(|m| m.image_budget);
     let encoder = match device {
         "cuda" => cuda_encoder(path, gpu, pack, context, budget, media, &metrics)?,
-        "metal" if media.is_some() => {
-            return Err(ServeError::Engine(
-                "EmbeddingGemma 2 on Metal serves text only; drop `mmproj`".into(),
-            ));
-        }
-        "metal" => metal_encoder(path, gpu, pack, context, budget, &metrics)?,
+        "metal" => metal_encoder(path, gpu, pack, context, budget, media, &metrics)?,
         other => {
             return Err(ServeError::Engine(format!(
                 "EmbeddingGemma 2 needs cuda or metal (got {other:?})"
@@ -169,6 +169,7 @@ fn metal_encoder(
     pack: Option<&Path>,
     context: usize,
     budget: Option<u64>,
+    media: Option<Media>,
     metrics: &std::sync::Arc<paddock_engine::metrics::EngineMetrics>,
 ) -> Result<paddock_engine::encoder::Encoder, ServeError> {
     if gpu != 0 || pack.is_some() {
@@ -179,7 +180,22 @@ fn metal_encoder(
     let path = path.to_path_buf();
     paddock_engine::encoder::Encoder::spawn(
         move || {
-            paddock_metal::EmbeddingGemma2::load(&path, context, budget).map_err(|e| e.to_string())
+            let mut model = paddock_metal::EmbeddingGemma2::load(&path, context, budget)
+                .map_err(|e| e.to_string())?;
+            if let Some(media) = media {
+                if path.is_dir() {
+                    model
+                        .attach_mlx_media(&path, media.image_budget, media.image, media.audio)
+                        .map_err(|e| e.to_string())?;
+                } else {
+                    for file in media.files {
+                        model
+                            .attach_mmproj(&file, media.image_budget, media.audio)
+                            .map_err(|e| format!("{}: {e}", file.display()))?;
+                    }
+                }
+            }
+            Ok(model)
         },
         Some(metrics.clone()),
     )
@@ -193,6 +209,7 @@ fn metal_encoder(
     _: Option<&Path>,
     _: usize,
     _: Option<u64>,
+    _: Option<Media>,
     _: &std::sync::Arc<paddock_engine::metrics::EngineMetrics>,
 ) -> Result<paddock_engine::encoder::Encoder, ServeError> {
     Err(ServeError::Engine(
@@ -245,10 +262,7 @@ pub(crate) fn media_inputs(
     m: &EmbedModel,
     prefix: &str,
 ) -> Result<(Vec<Vec<u32>>, Vec<Vec<paddock_engine::service::MmChunk>>), String> {
-    use paddock_engine::gpu_model::embedding_gemma2::audio::audio_tokens;
-    use paddock_engine::gpu_model::embedding_gemma2::media::{
-        AUDIO_TOKEN, BOA_TOKEN, BOI_TOKEN, EOA_TOKEN, EOI_TOKEN, IMAGE_TOKEN, image_tokens,
-    };
+    use paddock_engine::encoder::embedding_gemma2::*;
     use serde_json::Value;
     let items: Vec<&Value> = match input {
         Value::Array(items) if items.is_empty() => return Err("input is empty".into()),
@@ -275,7 +289,7 @@ pub(crate) fn media_inputs(
                 // adjacent text parts form one run; a medium closes it
                 let mut run = String::new();
                 let mut text_only = true;
-                let mut runs: Vec<(String, Option<paddock_engine::service::MmChunk>)> = Vec::new();
+                let mut runs = Vec::new();
                 for part in parts {
                     if let Value::String(s) = part {
                         run.push_str(s);
@@ -314,18 +328,32 @@ pub(crate) fn media_inputs(
                             pixels_left = pixels_left.saturating_sub((w * h) as u64);
                             text_only = false;
                             let chunk = paddock_engine::service::MmChunk::Image { rgb, w, h };
-                            runs.push((std::mem::take(&mut run), Some(chunk)));
+                            runs.push((std::mem::take(&mut run), Some((IMAGE_TOKEN, chunk))));
                         }
                         "input_audio" | "audio_url" => {
                             if !m.audio {
                                 return Err(at("this endpoint serves no audio (its mmproj or kernel pack has no audio tower)".into()));
                             }
                             text_only = false;
-                            runs.push((std::mem::take(&mut run), Some(clip(part).map_err(at)?)));
+                            runs.push((
+                                std::mem::take(&mut run),
+                                Some((AUDIO_TOKEN, clip(part).map_err(at)?)),
+                            ));
+                        }
+                        "input_video" => {
+                            if !m.encoder.serves_video() {
+                                return Err(at("this endpoint does not serve video frames".into()));
+                            }
+                            let frames = video::decode(part, &mut pixels_left).map_err(at)?;
+                            text_only = false;
+                            for (before, frame) in frames {
+                                run.push_str(&before);
+                                runs.push((std::mem::take(&mut run), Some((VIDEO_TOKEN, frame))));
+                            }
                         }
                         other => {
                             return Err(at(format!(
-                                "content part type {other:?} is not served (text, image_url, input_audio)"
+                                "content part type {other:?} is not served (text, image_url, input_audio, input_video)"
                             )));
                         }
                     }
@@ -340,14 +368,21 @@ pub(crate) fn media_inputs(
                         if !text.is_empty() {
                             seq.extend(tok(&text).map_err(at)?);
                         }
-                        let Some(chunk) = chunk else { continue };
+                        let Some((soft_token, chunk)) = chunk else {
+                            continue;
+                        };
                         let (open, soft, close, n) = match &chunk {
                             paddock_engine::service::MmChunk::Image { w, h, .. } => {
                                 let budget = m.image_budget.ok_or_else(|| {
                                     at("this endpoint serves no pictures (no picture tower)".into())
                                 })?;
+                                let budget = if soft_token == VIDEO_TOKEN {
+                                    VIDEO_FRAME_TOKENS
+                                } else {
+                                    budget
+                                };
                                 let n = image_tokens(*w, *h, budget).map_err(at)?;
-                                (BOI_TOKEN, IMAGE_TOKEN, EOI_TOKEN, n)
+                                (BOI_TOKEN, soft_token, EOI_TOKEN, n)
                             }
                             paddock_engine::service::MmChunk::Audio { samples, .. } => (
                                 BOA_TOKEN,

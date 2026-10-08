@@ -8811,6 +8811,188 @@ pub struct KernelTableV1 {
             *mut core::ffi::c_void,
         ) -> i32,
     >,
+    /// Slot 820: `pd_g4v_patchify` - the gemma4v tower's patchify on the
+    /// device: a resized u8 RGB picture into f16 im2row patches (`2 * (u8 /
+    /// 255) - 1`, the host's arithmetic). (rgb, out, tw, th, patch, stream)
+    pub g4v_patchify: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 821: `pd_g4v_pos_norm` - `x += pos_x[cx] + pos_y[cy]` (the
+    /// picture's own table rows), then ln1(x) as f16 - bit-identical to the
+    /// unfused add + rmsnorm_batch + convert. -2 outside the double-float norm
+    /// mode. (x, pos, w, out16, gw, rows, n, eps, stream)
+    pub g4v_pos_norm: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 822: `pd_g4v_heads` - per (row, head): q / k / v RMS norms (q, k
+    /// weighted), the 2-D NEOX rope on q and k (angles from slot 827's table),
+    /// f16 for the half attention entry - bit-identical to the unfused chain.
+    /// (q, k, v, ld, qw, kw, tab, q16, k16, v16, rows, heads, hd, eps, stream)
+    pub g4v_heads: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 823: `pd_g4v_post` - `x += rmsnorm(proj) * w_post`, then (with
+    /// `wnext`) the next norm of x as f16 - bit-identical to the unfused
+    /// rmsnorm + add + rmsnorm + convert. (x, proj, wpost, wnext, out16, rows,
+    /// n, eps, stream)
+    pub g4v_post: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 824: `pd_g4v_geglu` - `gelu_tanh(gate) * up` as f16 over row-
+    /// strided gate / up (two planes or one landing's halves), or with
+    /// `relaid` over one landing of slot 826's re-laid weight (the reference
+    /// its epilogue is held to). (gate, up, ld, out, ffn, rows, relaid,
+    /// stream)
+    pub g4v_geglu: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 825: `pd_g4v_pool` - the tower's tail on the device: 3x3 average
+    /// pool times `inv`, optional standardize, weightless RMS norm, f16 - the
+    /// host tail's order and rounding. (x, bias, scale, out, gw, gh, embd, inv,
+    /// eps, stream)
+    pub g4v_pool: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            f32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 826: `pd_f16_gemm_h_geglu_g4` - the f16 landing with Gemma 4's
+    /// vision GEGLU in the epilogue: y is `[batch][out_dim / 2]` halves of
+    /// `gelu_tanh(gate) * up` (pd_geglu_kernel's form) off a weight re-laid
+    /// in 16-row blocks, gate rows first. Same election and K order as 618.
+    /// (w, x, y, in_dim, out_dim, batch, stream)
+    pub f16_gemm_h_geglu_g4: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 827: `pd_g4v_rope_table` - the 2-D NEOX rope's `(cos, sin)` per
+    /// (row, pair) as `[rows][hd / 2]` float pairs, pd_rope2d_kernel's angle
+    /// expression verbatim; built once a picture for slot 822. (pos_x, pos_y,
+    /// tab, rows, hd, theta_scale, stream)
+    pub g4v_rope_table: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 828: `pd_q8_0_gemm_mmq_s` - `q8_0_gemm_mmq`'s Q8_0 tile at a
+    /// smaller output footprint, elected by grid fill for medium row counts;
+    /// every output bit-identical to the 128 x 128 tile's plain tiling. No K
+    /// split, no bias. (data, scale, yq, y, in_dim, out_dim, batch, stream)
+    pub q8_0_gemm_mmq_s: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 829: `pd_eg2_attn_s` - slot 809's attention with each tile's
+    /// warps spread over `split` blocks (1, 2 or 4), bit-identical to 809 per
+    /// row; for short passes whose tile grid leaves the die idle. (q16, k16,
+    /// v16, cu, tiles, n_tiles, out, head_dim, window, split, stream)
+    pub eg2_attn_s: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 830: `pd_nvf4_moe_gu_swiglu_ms` - slot 631 over `moe_align_bm(64)`
+    /// blocks (`nb` counts 64-row blocks): the sorted NVFP4 gate|up on a
+    /// 3-deep ring whose weight lines and scale rows are prefetched to L2,
+    /// every fq/fs byte equal to slot 631's for the same (token, slot).
+    /// in_dim % 128 == 0, ff % 16 == 0. Arguments as slot 631.
+    pub nvf4_moe_gu_swiglu_ms: Option<Nvf4MoeGuSwigluFn>,
+    /// Slot 831: `pd_nvf4_moe_down_ms_b16` - slot 758 over `moe_align_bm(64)`
+    /// blocks: each block's columns stay resident over the whole K while the
+    /// expert's row tiles stream through one ring; every bf16 partial equal
+    /// to slot 758's. ff % 256 == 0, ff <= 1024. Arguments as slot 758.
+    pub nvf4_moe_down_ms_b16: Option<Nvf4MoeDownBsFn>,
 }
 
 /// See [`KernelTableV1::rmsnorm_add_scale_norm`].
@@ -10736,7 +10918,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 805;
+pub const KERNEL_TABLE_SLOTS: usize = 817;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,
@@ -11015,6 +11197,27 @@ pub type Nvf4MoeUpRelu2BsFn = unsafe extern "C" fn(
 
 /// Sorted-tile NVFP4 expert down -> per-(token, slot) partials (see
 /// `KernelTableV1::nvf4_moe_down_bs`).
+/// See [`KernelTableV1::nvf4_moe_gu_swiglu_bs`] (and its ring twin
+/// [`KernelTableV1::nvf4_moe_gu_swiglu_ms`]).
+pub type Nvf4MoeGuSwigluFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> i32;
+
 pub type Nvf4MoeDownBsFn = unsafe extern "C" fn(
     data: *const core::ffi::c_void,
     scale: *const core::ffi::c_void,

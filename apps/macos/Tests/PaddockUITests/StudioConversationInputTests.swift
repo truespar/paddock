@@ -13,8 +13,9 @@ struct StudioConversationInputTests {
   @Test func wheelInputReachesTranscriptThroughActualConversationChrome() async throws {
     _ = NSApplication.shared
     let workspace = StudioWorkspace(client: NoInputCore())
-    // Render a snapshot without booting a server or touching the user library.
-    await workspace.shutdown()
+    // A closed workspace intentionally rejects all later presentations. Keep
+    // this fixture live; its client refuses host creation without any I/O.
+    defer { Task { await workspace.shutdown() } }
     let descriptor = try JSONDecoder().decode(
       StudioHost.self,
       from: JSONEncoder().encode([
@@ -286,6 +287,9 @@ private struct ConversationInputFixture: View {
 }
 
 private struct NoInputCore: ManagerLoading {
+  func nativeConversationHost() async throws -> StudioHost {
+    throw CancellationError()
+  }
   func snapshot() async throws -> ManagerSnapshot {
     Issue.record("The input fixture must not access a backend")
     throw CancellationError()

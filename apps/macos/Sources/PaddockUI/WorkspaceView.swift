@@ -198,6 +198,10 @@ public struct WorkspaceView: View {
       NativeTablesView(model: model.tables) {
         navigation.showModelLibrary(purpose: .tables)
       }
+    case .embeddings:
+      NativeEmbeddingsView(model: model.embeddings) {
+        navigation.showModelLibrary(purpose: .embeddings)
+      }
     case .settings:
       StudioPreferencesView(model: model.studioPreferences, busy: model.chat.busy, chat: model.chat)
     }

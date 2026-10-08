@@ -2700,19 +2700,97 @@ impl GpuExecutor {
             .kernels
             .nvf4_moe_gu_swiglu_bs
             .ok_or(GpuError::MissingOp("nvf4_moe_gu_swiglu_bs"))?;
+        self.nvf4_moe_gu_swiglu_with(
+            f,
+            "nvf4_moe_gu_swiglu_bs",
+            32,
+            gate,
+            up,
+            sorted_row,
+            block_expert,
+            xq,
+            xs,
+            fq,
+            fs,
+            nb,
+            tok_off,
+        )
+    }
+
+    /// [`Self::nvf4_moe_gu_swiglu_bs`] over `moe_align_bm(64)` blocks (slot
+    /// 830, the ring kernel): `nb` counts 64-row blocks; in_dim a multiple of
+    /// 128. Pairs with [`Self::nvf4_moe_down_ms_b16_at`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn nvf4_moe_gu_swiglu_ms(
+        &self,
+        gate: &Nvf4MoePlane,
+        up: &Nvf4MoePlane,
+        sorted_row: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<u8>,
+        fq: &mut CudaSlice<u8>,
+        fs: &mut CudaSlice<u8>,
+        nb: usize,
+        tok_off: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .nvf4_moe_gu_swiglu_ms
+            .ok_or(GpuError::MissingOp("nvf4_moe_gu_swiglu_ms"))?;
+        if !gate.in_dim.is_multiple_of(128) {
+            return Err(GpuError::Unsupported(format!(
+                "nvf4_moe_gu_swiglu_ms: in_dim {} is not a multiple of 128",
+                gate.in_dim
+            )));
+        }
+        self.nvf4_moe_gu_swiglu_with(
+            f,
+            "nvf4_moe_gu_swiglu_ms",
+            64,
+            gate,
+            up,
+            sorted_row,
+            block_expert,
+            xq,
+            xs,
+            fq,
+            fs,
+            nb,
+            tok_off,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn nvf4_moe_gu_swiglu_with(
+        &self,
+        f: paddock_kernels::abi::Nvf4MoeGuSwigluFn,
+        name: &'static str,
+        bm: usize,
+        gate: &Nvf4MoePlane,
+        up: &Nvf4MoePlane,
+        sorted_row: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<u8>,
+        fq: &mut CudaSlice<u8>,
+        fs: &mut CudaSlice<u8>,
+        nb: usize,
+        tok_off: usize,
+    ) -> Result<(), GpuError> {
         // both planes are read by ONE kernel, so a mixed layout is not a
         // degraded case - it is garbage. Check each.
-        Self::moe_layout_ok(gate, Nvf4MoeLayout::Row, "nvf4_moe_gu_swiglu_bs")?;
-        Self::moe_layout_ok(up, Nvf4MoeLayout::Row, "nvf4_moe_gu_swiglu_bs")?;
+        Self::moe_layout_ok(gate, Nvf4MoeLayout::Row, name)?;
+        Self::moe_layout_ok(up, Nvf4MoeLayout::Row, name)?;
         if gate.ff != up.ff || gate.in_dim != up.in_dim {
-            return Err(GpuError::Unsupported(
-                "nvf4_moe_gu_swiglu_bs: gate and up planes differ in shape".into(),
-            ));
+            return Err(GpuError::Unsupported(format!(
+                "{name}: gate and up planes differ in shape"
+            )));
         }
-        debug_assert!(sorted_row.len() >= nb * 32);
+        debug_assert!(sorted_row.len() >= nb * bm);
         debug_assert!(block_expert.len() >= nb);
-        debug_assert!(fq.len() >= nb * 32 * (gate.ff / 2));
-        debug_assert!(fs.len() >= nb * 32 * (gate.ff / 16));
+        debug_assert!(fq.len() >= nb * bm * (gate.ff / 2));
+        debug_assert!(fs.len() >= nb * bm * (gate.ff / 16));
         let (gd, _a1) = gate.data.device_ptr(&self.stream);
         let (gs, _a2) = gate.scale.device_ptr(&self.stream);
         let (g2, _a3) = gate.scale2.device_ptr(&self.stream);
@@ -2723,9 +2801,9 @@ impl GpuExecutor {
         let (bp, _a8) = block_expert.device_ptr(&self.stream);
         // nvfp4 activations: in_dim/2 packed bytes and in_dim/16 scales a row
         if tok_off * (gate.in_dim / 2) > xq.len() || tok_off * (gate.in_dim / 16) > xs.len() {
-            return Err(GpuError::Unsupported(
-                "nvf4_moe_gu_swiglu_bs: token offset past the activation pair".into(),
-            ));
+            return Err(GpuError::Unsupported(format!(
+                "{name}: token offset past the activation pair"
+            )));
         }
         let (xqp, _a9) = xq.device_ptr(&self.stream);
         let xqp = xqp + (tok_off * (gate.in_dim / 2)) as u64;
@@ -2881,6 +2959,7 @@ impl GpuExecutor {
             np,
             slot_off,
             nb,
+            32,
             tok_off,
         )
     }
@@ -2923,12 +3002,71 @@ impl GpuExecutor {
             np,
             slot_off,
             nb,
+            32,
             tok_off,
         )
     }
 
     pub fn has_nvf4_moe_down_bs_b16(&self) -> bool {
         self.kernels.nvf4_moe_down_bs_b16.is_some()
+    }
+
+    /// The ring pair over `moe_align_bm(64)` blocks (slots 830 / 831) -
+    /// [`Self::nvf4_moe_gu_swiglu_ms`] and [`Self::nvf4_moe_down_ms_b16_at`],
+    /// bit-identical to the BM=32 pair per (token, slot).
+    pub fn has_nvf4_moe_ms(&self) -> bool {
+        self.kernels.nvf4_moe_gu_swiglu_ms.is_some()
+            && self.kernels.nvf4_moe_down_ms_b16.is_some()
+            && self.kernels.moe_align_bm.is_some()
+    }
+
+    /// [`Self::nvf4_moe_down_bs_b16_at`] over `moe_align_bm(64)` blocks (slot
+    /// 831): `nb` counts 64-row blocks; down `w.in_dim` (the expert ff) a
+    /// multiple of 256, at most 1024.
+    #[allow(clippy::too_many_arguments)]
+    pub fn nvf4_moe_down_ms_b16_at(
+        &self,
+        w: &Nvf4MoePlane,
+        sorted_row: &CudaSlice<u32>,
+        sorted_slot: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        topk_w: Option<&CudaSlice<f32>>,
+        fq: &CudaSlice<u8>,
+        fs: &CudaSlice<u8>,
+        part: &mut CudaSlice<f32>,
+        kw: usize,
+        np: usize,
+        slot_off: usize,
+        nb: usize,
+        tok_off: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .nvf4_moe_down_ms_b16
+            .ok_or(GpuError::MissingOp("nvf4_moe_down_ms_b16"))?;
+        if !w.in_dim.is_multiple_of(256) || w.in_dim > 1024 {
+            return Err(GpuError::Unsupported(format!(
+                "nvf4_moe_down_ms_b16: expert ff {} is not a multiple of 256 up to 1024",
+                w.in_dim
+            )));
+        }
+        self.nvf4_moe_down_bs_with(
+            f,
+            w,
+            sorted_row,
+            sorted_slot,
+            block_expert,
+            topk_w,
+            fq,
+            fs,
+            part,
+            kw,
+            np,
+            slot_off,
+            nb,
+            64,
+            tok_off,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2947,14 +3085,15 @@ impl GpuExecutor {
         np: usize,
         slot_off: usize,
         nb: usize,
+        bm: usize,
         tok_off: usize,
     ) -> Result<(), GpuError> {
         Self::moe_layout_ok(w, Nvf4MoeLayout::Row, "nvf4_moe_down_bs")?;
-        debug_assert!(sorted_row.len() >= nb * 32);
-        debug_assert!(sorted_slot.len() >= nb * 32);
+        debug_assert!(sorted_row.len() >= nb * bm);
+        debug_assert!(sorted_slot.len() >= nb * bm);
         debug_assert!(block_expert.len() >= nb);
-        debug_assert!(fq.len() >= nb * 32 * (w.in_dim / 2));
-        debug_assert!(fs.len() >= nb * 32 * (w.in_dim / 16));
+        debug_assert!(fq.len() >= nb * bm * (w.in_dim / 2));
+        debug_assert!(fs.len() >= nb * bm * (w.in_dim / 16));
         debug_assert!(slot_off < np);
         let (dp, _g1) = w.data.device_ptr(&self.stream);
         let (sp, _g2) = w.scale.device_ptr(&self.stream);

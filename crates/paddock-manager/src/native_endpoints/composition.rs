@@ -48,10 +48,20 @@ pub(super) async fn resolve(
             && a.runtime.supports_backend("metal")
             && artifact.runtime.allows_companion(&a.id)
     });
-    spec.vision = if runtime.embedded_vision || audio_companion {
+    spec.vision = if runtime.embedded_vision || (audio_companion && !model.split_towers()) {
         None
     } else {
         Some(choice.vision)
+    };
+    spec.audio = if model.split_towers()
+        || runtime
+            .optional_towers
+            .as_ref()
+            .is_some_and(|t| t.audio.is_some())
+    {
+        choice.audio.or(spec.audio)
+    } else {
+        None
     };
     spec.fp8_native = false;
     let rendered = state
@@ -80,6 +90,8 @@ fn overlay(content: &str, rendered: &str, port: u16) -> Result<String, String> {
         // Vision OFF is a key of its own: without it the runner loads the
         // tower it finds beside the weights, switch or no switch
         "vision",
+        "audio",
+        "audio_mmproj",
         "mtp",
         "fp8_native",
         "text_encoder",
@@ -103,7 +115,9 @@ fn overlay(content: &str, rendered: &str, port: u16) -> Result<String, String> {
     if toml::from_str::<toml::Value>(&text).ok().as_ref() == Some(&expected) {
         Ok(text)
     } else {
-        toml::to_string(&expected).map_err(|_| "Cannot serialize the model composition.".into())
+        toml::to_string(&expected)
+            .map(|text| crate::automatic_budget::preserve(content, text))
+            .map_err(|_| "Cannot serialize the model composition.".into())
     }
 }
 

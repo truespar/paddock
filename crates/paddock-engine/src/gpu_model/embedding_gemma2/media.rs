@@ -22,97 +22,12 @@
 use std::sync::Arc;
 
 use crate::gpu::{ClefPlanMem, GpuError, GpuExecutor};
-use crate::gpu_model::gemma4::vision::{VisionModel, VisionOutput};
+use crate::gpu_model::gemma4::vision::{Resized, VisionModel, VisionOutput};
 
-/// `<|image|>`: a picture's soft token.
-pub const IMAGE_TOKEN: u32 = 258880;
-/// `<|audio|>`: an audio clip's soft token.
-pub const AUDIO_TOKEN: u32 = 258881;
-/// `<image|>`: closes a picture.
-pub const EOI_TOKEN: u32 = 258882;
-/// `<audio|>`: closes a clip.
-pub const EOA_TOKEN: u32 = 258883;
-/// `<|video|>`: a video frame's soft token (frames are not served yet).
-pub const VIDEO_TOKEN: u32 = 258884;
-/// `<|image>`: opens a picture.
-pub const BOI_TOKEN: u32 = 255999;
-/// `<|audio>`: opens a clip.
-pub const BOA_TOKEN: u32 = 256000;
-
-/// The soft-token budgets the processor supports (`_SUPPORTED_SOFT_TOKENS`).
-pub const IMAGE_TOKEN_BUDGETS: [usize; 5] = [70, 140, 280, 560, 1120];
-/// The checkpoint's own (`vision_soft_tokens_per_image`).
-pub const DEFAULT_IMAGE_TOKENS: usize = 280;
-const PATCH: usize = 16;
-const POOL: usize = 3;
-
-/// One run of soft tokens in a sequence: where it starts, how long it is,
-/// and which medium's token it repeats.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Run {
-    pub token: u32,
-    pub start: usize,
-    pub len: usize,
-}
-
-/// The sequence's media soft-token runs in order (`<|image|>`, `<|audio|>`
-/// and `<|video|>` repeats). Two media never touch - each run sits between
-/// its medium's open and close tokens - so a run is a maximal repeat.
-pub fn placeholder_runs(seq: &[u32]) -> Vec<Run> {
-    let mut out: Vec<Run> = Vec::new();
-    for (i, &t) in seq.iter().enumerate() {
-        if !matches!(t, IMAGE_TOKEN | AUDIO_TOKEN | VIDEO_TOKEN) {
-            continue;
-        }
-        match out.last_mut() {
-            Some(r) if r.token == t && r.start + r.len == i => r.len += 1,
-            _ => out.push(Run {
-                token: t,
-                start: i,
-                len: 1,
-            }),
-        }
-    }
-    out
-}
-
-/// The processor's resize target for a `w` x `h` picture at a soft-token
-/// budget, as (width, height) - `get_aspect_ratio_preserving_size`, ported
-/// line for line (its float math in f64, as Python's).
-pub fn image_target(w: usize, h: usize, budget: usize) -> Result<(usize, usize), String> {
-    if w == 0 || h == 0 {
-        return Err("an empty picture".into());
-    }
-    let max_patches = budget * POOL * POOL;
-    let target_px = (max_patches * PATCH * PATCH) as f64;
-    let factor = (target_px / (h * w) as f64).sqrt();
-    let side = PATCH * POOL;
-    let mut th = (factor * h as f64 / side as f64).floor() as usize * side;
-    let mut tw = (factor * w as f64 / side as f64).floor() as usize * side;
-    if th == 0 && tw == 0 {
-        return Err("the picture is too small to resize to whole tokens".into());
-    }
-    let max_side = (max_patches / (POOL * POOL)) * side;
-    if th == 0 {
-        th = side;
-        tw = ((w as f64 / h as f64).floor() as usize * side).min(max_side);
-    } else if tw == 0 {
-        tw = side;
-        th = ((h as f64 / w as f64).floor() as usize * side).min(max_side);
-    }
-    if (th * tw) as f64 > target_px {
-        return Err(format!(
-            "a {w} x {h} picture resizes past the {budget}-token budget"
-        ));
-    }
-    Ok((tw, th))
-}
-
-/// Soft tokens a `w` x `h` picture takes at `budget`.
-pub fn image_tokens(w: usize, h: usize, budget: usize) -> Result<usize, String> {
-    let (tw, th) = image_target(w, h, budget)?;
-    Ok((tw / PATCH) * (th / PATCH) / (POOL * POOL))
-}
+pub use crate::encoder::embedding_gemma2::{
+    AUDIO_TOKEN, BOA_TOKEN, BOI_TOKEN, DEFAULT_IMAGE_TOKENS, EOA_TOKEN, EOI_TOKEN, IMAGE_TOKEN,
+    IMAGE_TOKEN_BUDGETS, Run, VIDEO_TOKEN, image_target, image_tokens, placeholder_runs,
+};
 
 /// The picture tower plus its resize: plan memory for the two resample axes
 /// and the device staging for one picture's three planes (raw, width-resized,
@@ -151,6 +66,9 @@ impl ImageTower {
             })
         };
         let plans = [plan()?, plan()?];
+        // an encoder embeds pictures back to back: keep the tower's scratch
+        // between them (released with the rest on idle, `release`)
+        tower.keep_scratch(true);
         let stage = [exec.alloc_u8(1)?, exec.alloc_u8(1)?, exec.alloc_u8(1)?];
         Ok(Self {
             exec,
@@ -159,6 +77,11 @@ impl ImageTower {
             plans,
             stage,
         })
+    }
+
+    /// Drop what is kept between pictures (the owner's idle release).
+    pub fn release(&mut self) {
+        self.tower.release_scratch();
     }
 
     /// Soft tokens a `w` x `h` picture takes on this endpoint.
@@ -179,21 +102,51 @@ impl ImageTower {
     }
 
     /// One picture (interleaved RGB8) -> its [tokens][512] input rows: the
-    /// processor's resize, patchify, the tower.
+    /// processor's resize, then the tower from the resized plane where it
+    /// lies on the device (the fused tower patchifies it there).
     pub fn encode(&mut self, rgb: &[u8], w: usize, h: usize) -> Result<VisionOutput, GpuError> {
-        let (resized, tw, th) = self.resize(rgb, w, h)?;
-        let (patches, gw, gh) = self.tower.patches_from_rgb(&resized, tw, th);
-        self.tower.encode(&patches, gw, gh)
+        let (at, tw, th) = self.resize_on_device(rgb, w, h)?;
+        self.tower
+            .encode_resized(Resized::Device(&self.stage[at]), tw, th)
     }
 
-    /// The processor's resize on the device - width pass, then height, each
-    /// only when that side changes (torchvision's order) - as (RGB8, w, h).
+    /// [`Self::encode`] through the tower's unfused chain - the reference the
+    /// fused pass is held to.
+    pub fn encode_unfused(
+        &mut self,
+        rgb: &[u8],
+        w: usize,
+        h: usize,
+    ) -> Result<VisionOutput, GpuError> {
+        let (at, tw, th) = self.resize_on_device(rgb, w, h)?;
+        self.tower
+            .encode_resized_unfused(Resized::Device(&self.stage[at]), tw, th)
+    }
+
+    /// The processor's resize, downloaded: (RGB8, w, h).
     pub fn resize(
         &mut self,
         rgb: &[u8],
         w: usize,
         h: usize,
     ) -> Result<(Vec<u8>, usize, usize), GpuError> {
+        let (at, tw, th) = self.resize_on_device(rgb, w, h)?;
+        Ok((
+            self.exec.to_host_u8_len(&self.stage[at], th * tw * 3)?,
+            tw,
+            th,
+        ))
+    }
+
+    /// The processor's resize on the device - width pass, then height, each
+    /// only when that side changes (torchvision's order). Returns which stage
+    /// plane holds the result, and its size.
+    fn resize_on_device(
+        &mut self,
+        rgb: &[u8],
+        w: usize,
+        h: usize,
+    ) -> Result<(usize, usize, usize), GpuError> {
         let bad = |m: String| GpuError::Driver(m);
         if rgb.len() != w * h * 3 {
             return Err(bad(format!("a {w} x {h} picture with {} bytes", rgb.len())));
@@ -230,11 +183,6 @@ impl ImageTower {
             }
             at = 2;
         }
-        let plane = match at {
-            0 => &self.stage[0],
-            1 => &self.stage[1],
-            _ => &self.stage[2],
-        };
-        Ok((e.to_host_u8_len(plane, th * tw * 3)?, tw, th))
+        Ok((at as usize, tw, th))
     }
 }

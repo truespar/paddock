@@ -65,10 +65,10 @@ pub trait EncoderBackend {
         }
         self.validate(seqs)
     }
-    /// The media this backend embeds: (pictures, audio). Known once built
+    /// The media this backend embeds: (pictures, audio, video frames). Known once built
     /// (an mmproj may carry a tower the pack cannot run).
-    fn media_kinds(&self) -> (bool, bool) {
-        (false, false)
+    fn media_kinds(&self) -> (bool, bool, bool) {
+        (false, false, false)
     }
     /// Submit with media; a text-only backend takes the text path.
     fn embed_submit_media(
@@ -135,8 +135,8 @@ impl EncoderBackend for crate::gpu_model::embedding_gemma2::GpuEmbeddingGemma2 {
     fn burst_windows(&self) -> Option<(std::time::Duration, std::time::Duration)> {
         self.burst_windows()
     }
-    fn media_kinds(&self) -> (bool, bool) {
-        (self.serves_images(), self.serves_audio())
+    fn media_kinds(&self) -> (bool, bool, bool) {
+        (self.serves_images(), self.serves_audio(), false)
     }
     fn weights_mem_bytes(&self) -> Option<u64> {
         self.weights_mem_bytes()

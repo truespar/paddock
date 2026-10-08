@@ -1545,9 +1545,9 @@ fn prepare(
     // validate_content_parts for why a template is the wrong place to find out.
     chat_template::validate_roles(&req.messages)?;
     chat_template::validate_content_parts(&req.messages)?;
-    // system/developer turns past the opening run render in place - no
-    // template we serve takes one there
-    let inlined = chat_template::inline_late_system_messages(&req.messages)?;
+    // late system/developer turns render in place (chat_template docs)
+    let inlined =
+        chat_template::inline_late_system_messages(&req.messages, model.late_system_native)?;
     let mut messages = chat_template::normalize_messages(&inlined);
     if let Some(marker) = model.audio_inline_marker.as_deref() {
         chat_template::inline_audio_content(&mut messages, marker);

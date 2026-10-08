@@ -1,6 +1,25 @@
 use super::*;
 
 #[test]
+fn editing_a_memory_limit_explicitly_clears_automatic_provenance() {
+    let raw = crate::automatic_budget::pin(RAW, 2048);
+    assert!(crate::automatic_budget::is_automatic(&raw));
+    let unrelated = patch(&raw, 13493, &[Change::MaxCtx(Some(8192))], false).unwrap();
+    assert!(crate::automatic_budget::is_automatic(&unrelated));
+    // Even the same number becomes a hard limit when deliberately selected.
+    let fixed = patch(&raw, 13493, &[Change::VramBudget(Some(2048))], false).unwrap();
+    assert!(!crate::automatic_budget::is_automatic(&fixed));
+    assert_eq!(crate::automatic_budget::pin(&fixed, 4096), fixed);
+    let automatic = patch(&fixed, 13493, &[Change::VramBudget(None)], false).unwrap();
+    assert!(
+        toml::from_str::<toml::Value>(&automatic)
+            .unwrap()
+            .get("vram_budget")
+            .is_none()
+    );
+}
+
+#[test]
 fn residency_is_strict_and_unsupported_models_cannot_claim_lazy_start() {
     assert!(!on_demand_config(RAW));
     for policy in [
@@ -95,6 +114,14 @@ fn creation_state() -> (tempfile::TempDir, Arc<AppState>) {
 }
 
 fn creation_state_with_tower(embedded: bool, audio: bool) -> (tempfile::TempDir, Arc<AppState>) {
+    creation_state_with_media(embedded, audio, false)
+}
+
+fn creation_state_with_media(
+    embedded: bool,
+    audio: bool,
+    split: bool,
+) -> (tempfile::TempDir, Arc<AppState>) {
     let dir = tempfile::tempdir().unwrap();
     let models = dir.path().join("models");
     std::fs::create_dir(&models).unwrap();
@@ -116,6 +143,17 @@ fn creation_state_with_tower(embedded: bool, audio: bool) -> (tempfile::TempDir,
             "id":"audio","kind":"audio","format":"gguf","label":"Speech encoder", "default":true,"required":true,
             "runtime":{"backends":["metal"]},
             "file":[{"dest":"audio.gguf","size":7,"sha256":"","url":"https://example.invalid/no-download"}]
+        }));
+    }
+    if split {
+        catalog["model"][0]["capability"] = json!(["embeddings"]);
+        catalog["model"][0]["artifact"][1]["required"] = json!(false);
+        catalog["model"][0]["artifact"][1]["default"] = json!(false);
+        std::fs::write(models.join("vision.gguf"), b"fixture").unwrap();
+        catalog["model"][0]["artifact"].as_array_mut().unwrap().push(json!({
+            "id":"vision","kind":"vision","format":"gguf","label":"Pictures", "default":true,
+            "runtime":{"backends":["metal"]},
+            "file":[{"dest":"vision.gguf","size":7,"sha256":"","url":"https://example.invalid/no-download"}]
         }));
     }
     let catalog = serde_json::from_value(catalog).unwrap();
@@ -141,6 +179,51 @@ fn creation_state_with_tower(embedded: bool, audio: bool) -> (tempfile::TempDir,
         None,
     ));
     (dir, Arc::new(state))
+}
+
+#[tokio::test]
+async fn native_embedding_split_towers_follow_independent_switches_and_survive_edit() {
+    let (_dir, state) = creation_state_with_media(false, true, true);
+    for vision in [false, true] {
+        for audio in [false, true] {
+            let choice: Composition = serde_json::from_value(json!({
+                "model":"fixture", "artifact":"q4", "vision":vision,"audio":audio
+            }))
+            .unwrap();
+            let port = create_config(
+                &state,
+                "fixture",
+                "q4",
+                None,
+                &[Change::Composition(choice)],
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+            let (raw, _) = state.supervisor.read_config_file(port).unwrap();
+            let doc = parse(&raw, port).unwrap();
+            assert_eq!(
+                doc.get("mmproj").is_some(),
+                vision,
+                "{vision}/{audio}: {doc:?}"
+            );
+            assert_eq!(
+                doc.get("audio_mmproj").is_some(),
+                audio,
+                "{vision}/{audio}: {doc:?}"
+            );
+            let off: Composition = serde_json::from_value(json!({
+                "model":"fixture", "artifact":"q4", "vision":false,"audio":false
+            }))
+            .unwrap();
+            let edited = composition::resolve(&state, port, &raw, &off)
+                .await
+                .unwrap();
+            let doc = parse(&edited, port).unwrap();
+            assert!(doc.get("mmproj").is_none() && doc.get("audio_mmproj").is_none());
+        }
+    }
 }
 
 #[tokio::test]

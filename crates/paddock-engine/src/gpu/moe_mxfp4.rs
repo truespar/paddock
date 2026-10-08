@@ -242,6 +242,17 @@ impl GpuExecutor {
             .kernels
             .moe_align_bm
             .ok_or(GpuError::MissingOp("moe_align_bm"))?;
+        // what the kernel always touches: every block's expert slot and every
+        // routing pick (the sorted rows it writes stop at the blocks routing
+        // fills, which the caller sizes for)
+        if block_expert.len() < max_blocks || idx.len() < rows * n_active {
+            return Err(GpuError::Unsupported(format!(
+                "moe_align_bm: {max_blocks} blocks over {rows} x {n_active} picks overrun \
+                 block_expert ({}) or idx ({})",
+                block_expert.len(),
+                idx.len()
+            )));
+        }
         let (ip, _g1) = idx.device_ptr(&self.stream);
         let (rp, _g2) = sorted_row.device_ptr_mut(&self.stream);
         let (sp, _g3) = sorted_slot.device_ptr_mut(&self.stream);

@@ -78,8 +78,8 @@ impl VisionTower {
     fn encode_rgb(&self, rgb: &[u8], w: usize, h: usize) -> Result<EncodedImage, GpuError> {
         match self {
             VisionTower::Gemma4(v) => {
-                let (patches, gw, gh) = v.preprocess_rgb(rgb, w, h);
-                let o = v.encode(&patches, gw, gh)?;
+                let (resized, tw, th) = v.resize_rgb(rgb, w, h);
+                let o = v.encode_resized(super::vision::Resized::Host(&resized), tw, th)?;
                 Ok(EncodedImage {
                     embd: o.embd,
                     n_tokens: o.n_tokens,

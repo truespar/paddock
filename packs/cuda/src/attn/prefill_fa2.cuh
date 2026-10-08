@@ -1100,7 +1100,21 @@ __global__ void __launch_bounds__(NW * 32u) pd_attn_prefill_pf7_kernel(
 // at 43,008 B and holds 2 CTA/SM. TK moves the online-softmax tile boundary,
 // so hd128 is a NUMERICS-CLASS change vs pf7 (hd256's port was bit-identical
 // because it kept TK=64).
-template <uint32_t G, bool VL = false, uint32_t HD = 256u, uint32_t TK = 64u>
+// compile-time tag for pf7rp's interior/boundary softmax instances
+template <bool B> struct PdPfIn { static constexpr bool value = B; };
+//
+// SUB (row sub-tiles per warp, the wide rung): SUB=2 gives each warp two
+// 16-row m-tiles - a 128-row CTA tile, FlashInfer's own hd128 config for this
+// class (CTA_TILE_Q 128 = 4 warps x 2 m-tiles, a 32-key KV tile, one bf16
+// repack pane, 2 CTA/SM). Every K/V tile is then staged, repacked and
+// ldmatrix'd once for 128 rows instead of 64: each B-frag feeds two mma rows
+// of work. The 128-row Q tile only fits two CTAs per SM unpadded, so SUB=2
+// stores Q XOR-swizzled (16-byte chunk c of row r at c ^ (r & 7): the 8 rows
+// one ldmatrix 8x8 reads sit in 8 distinct bank groups) where SUB=1 keeps
+// the +8-half pad. SUB=1 is this kernel as it was, op for op; SUB=2 at TK=32
+// moves the online-softmax tile boundary, a numerics-class change.
+template <uint32_t G, bool VL = false, uint32_t HD = 256u, uint32_t TK = 64u,
+          uint32_t SUB = 1u>
 __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
     const float* __restrict__ q, const unsigned char* __restrict__ pool_k,
     const unsigned char* __restrict__ pool_v, const float* __restrict__ sinks,
@@ -1111,8 +1125,28 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
     const uint32_t* __restrict__ vl_items, const uint32_t* __restrict__ run_offs,
     const unsigned int* __restrict__ win_pos) {
 #if PD_FA_OK
-    constexpr uint32_t MR = 64u, NKC = TK / 16u;
-    constexpr uint32_t QROW = HD + 8u;   // sh_q/pane halves per row (+8 pad)
+    constexpr uint32_t MR = 64u * SUB, NKC = TK / 16u;
+    constexpr uint32_t QROW = HD + 8u;   // pane (and SUB=1 sh_q) halves per row (+8 pad)
+    constexpr bool QSW = SUB > 1u;       // swizzled, unpadded sh_q (see header)
+    constexpr uint32_t QROWQ = QSW ? HD : QROW;
+    static_assert(SUB == 1u || SUB == 2u, "one or two m-tiles a warp");
+    static_assert(!(VL && SUB > 1u), "the varlen items tile 64 rows");
+    // SUB=2 runs the softmax in the log2 domain (FlashInfer's form): log2(e)
+    // rides the Q scale, so every score's exp is one ex2 - __expf is ex2 of
+    // x * log2(e), a multiply an element. Running max/sum stay consistent
+    // (sum of 2^(s2 - m2) == sum of e^(s - m)); the sink merge converts.
+    constexpr bool L2D = SUB > 1u;
+    constexpr float LOG2E = 1.4426950408889634f;
+    auto ex = [](float x) -> float {
+        if constexpr (L2D) {
+            float y;
+            asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+            return y;
+        } else {
+            return __expf(x);
+        }
+    };
+    const float qscale = L2D ? scale * LOG2E : scale;
     constexpr uint32_t RROW = HD;        // raw row bytes: repack-only reads,
                                          // no ldmatrix on raw -> no pad
     const uint32_t kvh = blockIdx.x;
@@ -1138,7 +1172,7 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
 
     extern __shared__ __align__(16) unsigned char pf7_sm[];
     __half* sh_q = (__half*)pf7_sm;
-    __half* pane = sh_q + (size_t)MR * QROW;
+    __half* pane = sh_q + (size_t)MR * QROWQ;
     unsigned char* kraw = (unsigned char*)(pane + (size_t)TK * QROW);
     unsigned char* vraw = kraw + (size_t)TK * RROW;
     // per-row positions and true positions (floors) live in the head of the
@@ -1163,11 +1197,18 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
     __syncthreads();
 
     uint32_t hi = 0, lo = 0xFFFFFFFFu;
+    // pmin / fmax: the lowest live row position and the highest window
+    // floor - a KV tile inside [fmax, pmin] is visible to every row of the
+    // CTA, so it needs no mask (the SUB=2 interior path below)
+    uint32_t pmin = 0xFFFFFFFFu, fmax = 0u;
     for (uint32_t r = 0; r < MR; ++r) {
         const uint32_t p = sh_rpos[r];
         if (p != 0xFFFFFFFFu) {
             hi = max(hi, p + 1u);
-            lo = min(lo, pd_pf_floor(sh_rwin[r], swa_window));
+            const uint32_t f = pd_pf_floor(sh_rwin[r], swa_window);
+            lo = min(lo, f);
+            pmin = min(pmin, p);
+            fmax = max(fmax, f);
         }
     }
     if (hi == 0u) return;
@@ -1179,9 +1220,17 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
                                          : (slots ? slots[0] : 0u));
     const uint32_t* bt = block_tables + (size_t)slot * blocks_per_slot;
 
-    const uint32_t r_lo = warp * 16u + (lane >> 2), r_hi = r_lo + 8u;
-    const uint32_t pos_lo = sh_rpos[r_lo], pos_hi = sh_rpos[r_hi];
-    const uint32_t win_lo = sh_rwin[r_lo], win_hi = sh_rwin[r_hi];
+    // warp w owns rows [16*SUB*w, 16*SUB*(w+1)), as SUB m16 sub-tiles
+    uint32_t r_lo[SUB], r_hi[SUB], pos_lo[SUB], pos_hi[SUB], win_lo[SUB], win_hi[SUB];
+    #pragma unroll
+    for (uint32_t sb = 0; sb < SUB; ++sb) {
+        r_lo[sb] = (warp * SUB + sb) * 16u + (lane >> 2);
+        r_hi[sb] = r_lo[sb] + 8u;
+        pos_lo[sb] = sh_rpos[r_lo[sb]];
+        pos_hi[sb] = sh_rpos[r_hi[sb]];
+        win_lo[sb] = sh_rwin[r_lo[sb]];
+        win_hi[sb] = sh_rwin[r_hi[sb]];
+    }
     const uint32_t c2 = 2u * (lane & 3u);
 
     // raw K/V tile stage: cp.async 16B lines; rows past hi zero-fill
@@ -1264,12 +1313,24 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
         }
     };
 
-    float m_lo = -1e30f, m_hi = -1e30f, l_lo = 0.f, l_hi = 0.f;
-    float o_acc[HD / 16u][8];
+    float m_lo[SUB], m_hi[SUB], l_lo[SUB], l_hi[SUB];
+    float o_acc[SUB][HD / 16u][8];
     #pragma unroll
-    for (uint32_t dc = 0; dc < HD / 16u; ++dc)
+    for (uint32_t sb = 0; sb < SUB; ++sb) {
+        m_lo[sb] = -1e30f; m_hi[sb] = -1e30f; l_lo[sb] = 0.f; l_hi[sb] = 0.f;
         #pragma unroll
-        for (uint32_t i = 0; i < 8u; ++i) o_acc[dc][i] = 0.f;
+        for (uint32_t dc = 0; dc < HD / 16u; ++dc)
+            #pragma unroll
+            for (uint32_t i = 0; i < 8u; ++i) o_acc[sb][dc][i] = 0.f;
+    }
+    // sh_q half index of (row, col): the +8 pad at SUB=1, the chunk swizzle
+    // at SUB=2 (col's 8-half chunk XOR row & 7; within-chunk order kept)
+    auto qix = [&](uint32_t r, uint32_t c) -> size_t {
+        if constexpr (QSW)
+            return (size_t)r * QROWQ + ((((c >> 3) ^ (r & 7u)) << 3) | (c & 7u));
+        else
+            return (size_t)r * QROWQ + c;
+    };
 
     // K0/V0 fly while Q stages
     stage_one(kraw, pool_k, lo_t);
@@ -1303,16 +1364,18 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
             const uint32_t r = u / (HD / 4u), c4 = (u % (HD / 4u)) * 4u;
             __half2 h0 = __float2half2_rn(0.f), h1 = h0;
             if (row0 + r < Rtot) {
-                h0 = __floats2half2_rn(x[j].x * scale, x[j].y * scale);
-                h1 = __floats2half2_rn(x[j].z * scale, x[j].w * scale);
+                h0 = __floats2half2_rn(x[j].x * qscale, x[j].y * qscale);
+                h1 = __floats2half2_rn(x[j].z * qscale, x[j].w * qscale);
             }
-            *reinterpret_cast<__half2*>(sh_q + (size_t)r * QROW + c4) = h0;
-            *reinterpret_cast<__half2*>(sh_q + (size_t)r * QROW + c4 + 2u) = h1;
+            *reinterpret_cast<__half2*>(sh_q + qix(r, c4)) = h0;
+            *reinterpret_cast<__half2*>(sh_q + qix(r, c4 + 2u)) = h1;
         }
     }
-    if (d < MR)  // zero the +8 pad halves so ldmatrix never sees junk
-        *reinterpret_cast<uint4*>(sh_q + (size_t)d * QROW + HD) =
-            make_uint4(0u, 0u, 0u, 0u);
+    if constexpr (!QSW) {
+        if (d < MR)  // zero the +8 pad halves so ldmatrix never sees junk
+            *reinterpret_cast<uint4*>(sh_q + (size_t)d * QROW + HD) =
+                make_uint4(0u, 0u, 0u, 0u);
+    }
 
     for (uint32_t t0 = lo_t; t0 < hi; t0 += TK) {
         const bool more = t0 + TK < hi;
@@ -1333,21 +1396,28 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
         // dc's A-frag) one step ahead of the consuming mma pair. Loads are
         // pure reads on panes nobody writes during the phase and the mma
         // issue order/operands are untouched -> bit-identical.
-        float s[NKC][8];
+        float s[SUB][NKC][8];
         #pragma unroll
-        for (uint32_t kc = 0; kc < NKC; ++kc)
+        for (uint32_t sb = 0; sb < SUB; ++sb)
             #pragma unroll
-            for (uint32_t i = 0; i < 8u; ++i) s[kc][i] = 0.f;
+            for (uint32_t kc = 0; kc < NKC; ++kc)
+                #pragma unroll
+                for (uint32_t i = 0; i < 8u; ++i) s[sb][kc][i] = 0.f;
         // lanes 0-7: keys 0-7 cols 0-7 | 8-15: keys 0-7 cols 8-15 |
         // 16-23: keys 8-15 cols 0-7 | 24-31: keys 8-15 cols 8-15
-        const unsigned char* qk_a0 = (const unsigned char*)(sh_q
-            + (size_t)(warp * 16u + (lane & 15u)) * QROW
-            + ((lane >> 4) ? 8u : 0u));
+        // A-frag of sub-tile sb at head-dim chunk dc (16 halves): at SUB=1
+        // exactly the old qk_a0 + dc * 32 B
+        auto qk_a = [&](uint32_t sb, uint32_t dc) -> const unsigned char* {
+            return (const unsigned char*)(sh_q
+                + qix((warp * SUB + sb) * 16u + (lane & 15u),
+                      dc * 16u + ((lane >> 4) ? 8u : 0u)));
+        };
         const unsigned char* qk_b0 = (const unsigned char*)(pane
             + (size_t)(((lane >> 4) ? 8u : 0u) + (lane & 7u)) * QROW
             + (((lane >> 3) & 1u) ? 8u : 0u));
-        uint32_t af[2][4], bf[2][4];
-        pd_ldm_x4(af[0], qk_a0);
+        uint32_t af[SUB][2][4], bf[2][4];
+        #pragma unroll
+        for (uint32_t sb = 0; sb < SUB; ++sb) pd_ldm_x4(af[sb][0], qk_a(sb, 0u));
         pd_ldm_x4(bf[0], qk_b0);
         #pragma unroll
         for (uint32_t u = 0; u < HD / 16u * NKC; ++u) {
@@ -1356,14 +1426,21 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
                 pd_ldm_x4(bf[(u + 1u) & 1u], qk_b0
                     + (size_t)(((u + 1u) % NKC) * 16u) * QROW * 2u
                     + ((u + 1u) / NKC) * 32u);
-            if (kc == 0u && dc + 1u < HD / 16u)
-                pd_ldm_x4(af[(dc + 1u) & 1u], qk_a0 + (dc + 1u) * 32u);
-            pd_fa_mma16(&s[kc][0], af[dc & 1u][0], af[dc & 1u][1],
-                        af[dc & 1u][2], af[dc & 1u][3],
-                        bf[u & 1u][0], bf[u & 1u][1]);
-            pd_fa_mma16(&s[kc][4], af[dc & 1u][0], af[dc & 1u][1],
-                        af[dc & 1u][2], af[dc & 1u][3],
-                        bf[u & 1u][2], bf[u & 1u][3]);
+            if (kc == 0u && dc + 1u < HD / 16u) {
+                #pragma unroll
+                for (uint32_t sb = 0; sb < SUB; ++sb)
+                    pd_ldm_x4(af[sb][(dc + 1u) & 1u], qk_a(sb, dc + 1u));
+            }
+            // one B-frag pair, SUB sub-tiles of mma (the wide rung's reuse)
+            #pragma unroll
+            for (uint32_t sb = 0; sb < SUB; ++sb) {
+                pd_fa_mma16(&s[sb][kc][0], af[sb][dc & 1u][0], af[sb][dc & 1u][1],
+                            af[sb][dc & 1u][2], af[sb][dc & 1u][3],
+                            bf[u & 1u][0], bf[u & 1u][1]);
+                pd_fa_mma16(&s[sb][kc][4], af[sb][dc & 1u][0], af[sb][dc & 1u][1],
+                            af[sb][dc & 1u][2], af[sb][dc & 1u][3],
+                            bf[u & 1u][2], bf[u & 1u][3]);
+            }
         }
 
         // mask + online softmax, in registers (same VALUES as pf7). Max
@@ -1371,80 +1448,101 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
         // the single-accumulator form was a serial 16-deep FMNMX chain; max
         // over the same set is order-independent (exact, no rounding), so
         // the tree is bit-identical with dependency depth 4+2.
-        float mxl[NKC], mxh[NKC];
-        #pragma unroll
-        for (uint32_t kc = 0; kc < NKC; ++kc) {
-            mxl[kc] = -1e30f; mxh[kc] = -1e30f;
-            const uint32_t k0 = t0 + kc * 16u;
+        // per sub-tile (SUB=1: the single-tile code, unchanged)
+        float corr_lo[SUB], corr_hi[SUB];
+        uint32_t pf[SUB][NKC][4];
+        // INTERIOR (SUB=2 only): a KV tile every row of the CTA sees in full
+        // - all keys at or below the lowest row position and at or above the
+        // highest window floor - skips the per-element mask and the dead-key
+        // guard. On such a tile the masked path keeps every score and every
+        // guard passes, so the two instances compute the same bits; the mask
+        // was ~7 ALU ops an element, a third of the kernel's issue at depth.
+        const bool interior = SUB > 1u && t0 + TK <= pmin + 1u && t0 >= fmax;
+        auto softmax_tile = [&](auto in_tag) {
+            constexpr bool IN = decltype(in_tag)::value;
             #pragma unroll
-            for (uint32_t i = 0; i < 8u; ++i) {
-                const uint32_t p = k0 + c2 + (i & 1u) + ((i >> 2) ? 8u : 0u);
-                const bool hirow = (i & 2u) != 0u;
-                const uint32_t pos = hirow ? pos_hi : pos_lo;
-                const uint32_t wpos = hirow ? win_hi : win_lo;
-                const bool valid = p < hi && p <= pos
-                    && (!swa_window || p + swa_window > wpos);
-                const float v = valid ? s[kc][i] : -1e30f;
-                s[kc][i] = v;
-                if (hirow) mxh[kc] = fmaxf(mxh[kc], v);
-                else mxl[kc] = fmaxf(mxl[kc], v);
+            for (uint32_t sb = 0; sb < SUB; ++sb) {
+                float mxl[NKC], mxh[NKC];
+                #pragma unroll
+                for (uint32_t kc = 0; kc < NKC; ++kc) {
+                    mxl[kc] = -1e30f; mxh[kc] = -1e30f;
+                    const uint32_t k0 = t0 + kc * 16u;
+                    (void)k0;
+                    #pragma unroll
+                    for (uint32_t i = 0; i < 8u; ++i) {
+                        const bool hirow = (i & 2u) != 0u;
+                        float v = s[sb][kc][i];
+                        if constexpr (!IN) {
+                            const uint32_t p = k0 + c2 + (i & 1u) + ((i >> 2) ? 8u : 0u);
+                            const uint32_t pos = hirow ? pos_hi[sb] : pos_lo[sb];
+                            const uint32_t wpos = hirow ? win_hi[sb] : win_lo[sb];
+                            const bool valid = p < hi && p <= pos
+                                && (!swa_window || p + swa_window > wpos);
+                            v = valid ? v : -1e30f;
+                            s[sb][kc][i] = v;
+                        }
+                        if (hirow) mxh[kc] = fmaxf(mxh[kc], v);
+                        else mxl[kc] = fmaxf(mxl[kc], v);
+                    }
+                }
+                // max over the same set is exact and order-independent, so the shape
+                // of this combine is free; keep the depth-2 4-way tree where NKC==4
+                // (hd256) and fall to a generic fold otherwise (hd128/TK=48 has
+                // NKC=3, where the old literal indices read mxl[3] out of bounds).
+                float mx_lo, mx_hi;
+                if constexpr (NKC == 4u) {
+                    mx_lo = fmaxf(fmaxf(mxl[0], mxl[1]), fmaxf(mxl[2], mxl[3]));
+                    mx_hi = fmaxf(fmaxf(mxh[0], mxh[1]), fmaxf(mxh[2], mxh[3]));
+                } else {
+                    mx_lo = mxl[0]; mx_hi = mxh[0];
+                    #pragma unroll
+                    for (uint32_t kc = 1u; kc < NKC; ++kc) {
+                        mx_lo = fmaxf(mx_lo, mxl[kc]);
+                        mx_hi = fmaxf(mx_hi, mxh[kc]);
+                    }
+                }
+                #pragma unroll
+                for (uint32_t off = 1; off <= 2; off <<= 1) {
+                    mx_lo = fmaxf(mx_lo, __shfl_xor_sync(0xffffffffu, mx_lo, off));
+                    mx_hi = fmaxf(mx_hi, __shfl_xor_sync(0xffffffffu, mx_hi, off));
+                }
+                const float mn_lo = fmaxf(m_lo[sb], mx_lo), mn_hi = fmaxf(m_hi[sb], mx_hi);
+                corr_lo[sb] = (m_lo[sb] > -1e29f) ? ex(m_lo[sb] - mn_lo) : 0.f;
+                corr_hi[sb] = (m_hi[sb] > -1e29f) ? ex(m_hi[sb] - mn_hi) : 0.f;
+                float ps_lo = 0.f, ps_hi = 0.f;
+                #pragma unroll
+                for (uint32_t kc = 0; kc < NKC; ++kc) {
+                    #pragma unroll
+                    for (uint32_t i = 0; i < 8u; ++i) {
+                        const bool hirow = (i & 2u) != 0u;
+                        const float w = (IN || s[sb][kc][i] > -1e29f)
+                            ? ex(s[sb][kc][i] - (hirow ? mn_hi : mn_lo)) : 0.f;
+                        s[sb][kc][i] = w;
+                        if (hirow) ps_hi += w; else ps_lo += w;
+                    }
+                    // paired F2FP.PACK (mma-pipeline door): identical
+                    // RN rounding to the old per-half cvt+shift+or, one op per word
+                    // instead of three (word-gated bit-identical)
+                    const __half2 pk0 = __floats2half2_rn(s[sb][kc][0], s[sb][kc][1]);
+                    const __half2 pk1 = __floats2half2_rn(s[sb][kc][2], s[sb][kc][3]);
+                    const __half2 pk2 = __floats2half2_rn(s[sb][kc][4], s[sb][kc][5]);
+                    const __half2 pk3 = __floats2half2_rn(s[sb][kc][6], s[sb][kc][7]);
+                    pf[sb][kc][0] = *reinterpret_cast<const uint32_t*>(&pk0);
+                    pf[sb][kc][1] = *reinterpret_cast<const uint32_t*>(&pk1);
+                    pf[sb][kc][2] = *reinterpret_cast<const uint32_t*>(&pk2);
+                    pf[sb][kc][3] = *reinterpret_cast<const uint32_t*>(&pk3);
+                }
+                #pragma unroll
+                for (uint32_t off = 1; off <= 2; off <<= 1) {
+                    ps_lo += __shfl_xor_sync(0xffffffffu, ps_lo, off);
+                    ps_hi += __shfl_xor_sync(0xffffffffu, ps_hi, off);
+                }
+                l_lo[sb] = l_lo[sb] * corr_lo[sb] + ps_lo; m_lo[sb] = mn_lo;
+                l_hi[sb] = l_hi[sb] * corr_hi[sb] + ps_hi; m_hi[sb] = mn_hi;
             }
-        }
-        // max over the same set is exact and order-independent, so the shape
-        // of this combine is free; keep the depth-2 4-way tree where NKC==4
-        // (hd256) and fall to a generic fold otherwise (hd128/TK=48 has
-        // NKC=3, where the old literal indices read mxl[3] out of bounds).
-        float mx_lo, mx_hi;
-        if constexpr (NKC == 4u) {
-            mx_lo = fmaxf(fmaxf(mxl[0], mxl[1]), fmaxf(mxl[2], mxl[3]));
-            mx_hi = fmaxf(fmaxf(mxh[0], mxh[1]), fmaxf(mxh[2], mxh[3]));
-        } else {
-            mx_lo = mxl[0]; mx_hi = mxh[0];
-            #pragma unroll
-            for (uint32_t kc = 1u; kc < NKC; ++kc) {
-                mx_lo = fmaxf(mx_lo, mxl[kc]);
-                mx_hi = fmaxf(mx_hi, mxh[kc]);
-            }
-        }
-        #pragma unroll
-        for (uint32_t off = 1; off <= 2; off <<= 1) {
-            mx_lo = fmaxf(mx_lo, __shfl_xor_sync(0xffffffffu, mx_lo, off));
-            mx_hi = fmaxf(mx_hi, __shfl_xor_sync(0xffffffffu, mx_hi, off));
-        }
-        const float mn_lo = fmaxf(m_lo, mx_lo), mn_hi = fmaxf(m_hi, mx_hi);
-        const float corr_lo = (m_lo > -1e29f) ? __expf(m_lo - mn_lo) : 0.f;
-        const float corr_hi = (m_hi > -1e29f) ? __expf(m_hi - mn_hi) : 0.f;
-        float ps_lo = 0.f, ps_hi = 0.f;
-        uint32_t pf[NKC][4];
-        #pragma unroll
-        for (uint32_t kc = 0; kc < NKC; ++kc) {
-            #pragma unroll
-            for (uint32_t i = 0; i < 8u; ++i) {
-                const bool hirow = (i & 2u) != 0u;
-                const float w = s[kc][i] > -1e29f
-                    ? __expf(s[kc][i] - (hirow ? mn_hi : mn_lo)) : 0.f;
-                s[kc][i] = w;
-                if (hirow) ps_hi += w; else ps_lo += w;
-            }
-            // paired F2FP.PACK (mma-pipeline door): identical
-            // RN rounding to the old per-half cvt+shift+or, one op per word
-            // instead of three (word-gated bit-identical)
-            const __half2 pk0 = __floats2half2_rn(s[kc][0], s[kc][1]);
-            const __half2 pk1 = __floats2half2_rn(s[kc][2], s[kc][3]);
-            const __half2 pk2 = __floats2half2_rn(s[kc][4], s[kc][5]);
-            const __half2 pk3 = __floats2half2_rn(s[kc][6], s[kc][7]);
-            pf[kc][0] = *reinterpret_cast<const uint32_t*>(&pk0);
-            pf[kc][1] = *reinterpret_cast<const uint32_t*>(&pk1);
-            pf[kc][2] = *reinterpret_cast<const uint32_t*>(&pk2);
-            pf[kc][3] = *reinterpret_cast<const uint32_t*>(&pk3);
-        }
-        #pragma unroll
-        for (uint32_t off = 1; off <= 2; off <<= 1) {
-            ps_lo += __shfl_xor_sync(0xffffffffu, ps_lo, off);
-            ps_hi += __shfl_xor_sync(0xffffffffu, ps_hi, off);
-        }
-        l_lo = l_lo * corr_lo + ps_lo; m_lo = mn_lo;
-        l_hi = l_hi * corr_hi + ps_hi; m_hi = mn_hi;
+        };
+        if (interior) softmax_tile(PdPfIn<true>{});
+        else softmax_tile(PdPfIn<false>{});
 
         __syncthreads();           // pane K consumed by all warps
         pd_attn_cpa_wait1();       // V[i] arrived (K[i+1] may fly);
@@ -1464,12 +1562,14 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
         // kc terms in the same 0..NKC-1 order with identical operands ->
         // bit-identical.
         #pragma unroll
-        for (uint32_t dc = 0; dc < HD / 16u; ++dc) {
-            o_acc[dc][0] *= corr_lo; o_acc[dc][1] *= corr_lo;
-            o_acc[dc][2] *= corr_hi; o_acc[dc][3] *= corr_hi;
-            o_acc[dc][4] *= corr_lo; o_acc[dc][5] *= corr_lo;
-            o_acc[dc][6] *= corr_hi; o_acc[dc][7] *= corr_hi;
-        }
+        for (uint32_t sb = 0; sb < SUB; ++sb)
+            #pragma unroll
+            for (uint32_t dc = 0; dc < HD / 16u; ++dc) {
+                o_acc[sb][dc][0] *= corr_lo[sb]; o_acc[sb][dc][1] *= corr_lo[sb];
+                o_acc[sb][dc][2] *= corr_hi[sb]; o_acc[sb][dc][3] *= corr_hi[sb];
+                o_acc[sb][dc][4] *= corr_lo[sb]; o_acc[sb][dc][5] *= corr_lo[sb];
+                o_acc[sb][dc][6] *= corr_hi[sb]; o_acc[sb][dc][7] *= corr_hi[sb];
+            }
         // lanes 0-7: keys 0-7 cols 0-7 | 8-15: keys 8-15 cols 0-7 |
         // 16-23: keys 0-7 cols 8-15 | 24-31: keys 8-15 cols 8-15
         const __half* pv_b0 = pane
@@ -1484,23 +1584,30 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
                 pd_pf7_ldmt(bt2[(u + 1u) & 1u], pv_b0
                     + (size_t)(((u + 1u) / (HD / 16u)) * 16u) * QROW
                     + ((u + 1u) % (HD / 16u)) * 16u);
-            pd_fa_mma16(&o_acc[dc][0], pf[kc][0], pf[kc][1], pf[kc][2],
-                        pf[kc][3], bt2[u & 1u][0], bt2[u & 1u][1]);
-            pd_fa_mma16(&o_acc[dc][4], pf[kc][0], pf[kc][1], pf[kc][2],
-                        pf[kc][3], bt2[u & 1u][2], bt2[u & 1u][3]);
+            #pragma unroll
+            for (uint32_t sb = 0; sb < SUB; ++sb) {
+                pd_fa_mma16(&o_acc[sb][dc][0], pf[sb][kc][0], pf[sb][kc][1],
+                            pf[sb][kc][2], pf[sb][kc][3],
+                            bt2[u & 1u][0], bt2[u & 1u][1]);
+                pd_fa_mma16(&o_acc[sb][dc][4], pf[sb][kc][0], pf[sb][kc][1],
+                            pf[sb][kc][2], pf[sb][kc][3],
+                            bt2[u & 1u][2], bt2[u & 1u][3]);
+            }
         }
     }
 
     // epilogue: sink merge + normalize + direct f32 stores (identical)
     #pragma unroll
+    for (uint32_t sb = 0; sb < SUB; ++sb)
+    #pragma unroll
     for (uint32_t half = 0; half < 2u; ++half) {
-        const uint32_t R = row0 + (half ? r_hi : r_lo);
+        const uint32_t R = row0 + (half ? r_hi[sb] : r_lo[sb]);
         if (R >= Rtot) continue;
         const uint32_t h = kvh * G + R % G;
-        const float mm = half ? m_hi : m_lo, ll = half ? l_hi : l_lo;
-        const float sv = sinks[h];
+        const float mm = half ? m_hi[sb] : m_lo[sb], ll = half ? l_hi[sb] : l_lo[sb];
+        const float sv = L2D ? sinks[h] * LOG2E : sinks[h];
         const float mtot = fmaxf(mm, sv);
-        const float cm = __expf(mm - mtot), cs2 = __expf(sv - mtot);
+        const float cm = ex(mm - mtot), cs2 = ex(sv - mtot);
         const float l = ll * cm + cs2;
         const float nrm = l > 0.f ? cm / l : 0.f;
         float* op = out + ((size_t)(qr0 + R / G) * n_heads + h) * HD;
@@ -1508,9 +1615,9 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
         for (uint32_t dc = 0; dc < HD / 16u; ++dc) {
             const uint32_t i0 = half ? 2u : 0u;
             *reinterpret_cast<float2*>(op + dc * 16u + c2) =
-                make_float2(o_acc[dc][i0] * nrm, o_acc[dc][i0 + 1u] * nrm);
+                make_float2(o_acc[sb][dc][i0] * nrm, o_acc[sb][dc][i0 + 1u] * nrm);
             *reinterpret_cast<float2*>(op + dc * 16u + 8u + c2) =
-                make_float2(o_acc[dc][i0 + 4u] * nrm, o_acc[dc][i0 + 5u] * nrm);
+                make_float2(o_acc[sb][dc][i0 + 4u] * nrm, o_acc[sb][dc][i0 + 5u] * nrm);
         }
     }
 #else
@@ -1519,6 +1626,149 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
     (void)n_heads; (void)kv_dim; (void)swa_window; (void)n_rows; (void)scale;
     (void)vl_items; (void)run_offs;
 #endif
+}
+
+// hd128 fp8 launches of pf7rp for pd_attn_prefill_f16_paged (attn/prefill_pf5.cuh):
+// the wide rung, then the 64-row arm. True when one launched (its status in
+// *rc); false sends the caller on to the pf7 / v4 arms.
+static inline bool pd_pf7rp128_go(int* rc, bool f8v4n, uint32_t g_, const void* q,
+                                  const void* pool_k, const void* pool_v, const void* sinks,
+                                  void* out, const void* positions, const void* block_tables,
+                                  uint32_t blocks_per_slot, const void* slots,
+                                  uint32_t n_heads, uint32_t n_kv_heads, uint32_t kv_dim,
+                                  uint32_t swa_window, uint32_t batch, float scale,
+                                  const unsigned int* wp, void* stream) {
+    // hd128 REPACK-PANE arm (pf7rp) - sits above the pf7
+    // convert-in-register arm below because it wins the long spans that
+    // arm loses. Measured against FlashInfer's own prefill kernel, pf7
+    // held a FLAT deficit
+    // from 1536 rows on, and reading their kernel named the cause:
+    // USE_KV_REPACK is true for this config, so their mainloop does
+    // repack_fp8_tile_to_bf16() once per tile and then runs native b16
+    // ldmatrix. pf7 converts per FRAGMENT LOAD -- pd_pf7_swz is 2 shfl +
+    // 2 prmt and pd_pf7_swzt is 3+3, inside the mma loop, so all four
+    // warps re-swizzle and re-convert the whole K tile (~640 warp
+    // shuffles per KV tile per CTA). Two q-tile-WIDTH arms of pf7 were
+    // falsified first (NW=8 +30%, SUB=2 +15% at FlashInfer's exact launch
+    // config): there the per-fragment convert scales with the math, so the
+    // tile could not be the lever. pf7rp already was the repack structure at
+    // hd256 (door 2, bit-identical there, -5..-21%); this is the hd128
+    // generalization - and with the convert out of the mma loop, the 128-row
+    // tile IS the next lever (the wide rung, first below). The 64-row arm
+    // runs TK=48 not 64: at TK=64 its tile is 51,456 B and misses 2 CTA/SM by
+    // 256 BYTES -> 4 warps/SM, and NW=8 already measured what 1 CTA/SM
+    // costs this pipeline. Kill: PADDOCK_NO_PF7RP -> the caller's pf7 arm.
+    // G in {4,6,8,9,12,16} (12: Kolibri 1's 48q/4kv): the first wiring instantiated only
+    // 4/6/8 -- granite's ratio and its neighbours -- and the fleet sweep
+    // found the two ratios outside that set were the worst prefill
+    // cells by far, because they fell through to v4 and never saw
+    // the repack pane at all (laguna-s 72q/8kv G=9 and nemotron-3.5
+    // 32q/2kv G=16), while a G=8 model on the same kernel was fine.
+    // G only ever indexes the
+    // row->head map (R / G, R % G) and need not divide MR -- the
+    // R < Rtot guard covers the tail -- so this set is a pure
+    // instantiation list, and a ratio missing from it is silently a
+    // different, slower kernel. The outer gate already admitted all five.
+    static const bool no_rp128 = pd_env("PADDOCK_NO_PF7RP") != nullptr;
+    // the wide rung (pf7rp SUB=2): FlashInfer's own hd128 config - a
+    // 128-row CTA tile (two m-tiles a warp), a 32-key KV tile, Q
+    // XOR-swizzled to keep 2 CTA/SM - plus an unmasked instance for KV
+    // tiles every row sees in full and the softmax in the log2 domain.
+    // GB10, same KV bytes as FlashInfer 0.7 (bench/rival_flashinfer_attn.py):
+    // 8192-row prompts 64-65 -> 83-89 TF/s on every hd128 shape (0.81x ->
+    // 1.06-1.10x theirs; Kolibri G12 chunks at 32K-262K depth 1.06-1.07x),
+    // 2048 rows 1.01-1.04x, 512 rows still behind (launch-bound there).
+    // Numerics class: TK 48 -> 32 moves the softmax tile boundary and
+    // log2(e) rides the f16 Q scale; agreement with FlashInfer's bf16
+    // output is unchanged (relRMS 1.9e-3..2.4e-3, both arms).
+    // Kill: PADDOCK_NO_PF7RP_SUB2 -> the 64-row arm below.
+    static const bool rp128w = pd_env("PADDOCK_NO_PF7RP_SUB2") == nullptr;
+    if (f8v4n && !no_rp128 && rp128w && (g_ == 4u || g_ == 6u || g_ == 8u
+                                         || g_ == 9u || g_ == 12u || g_ == 16u)) {
+        constexpr uint32_t WMR = 128u, WTK = 32u, WHD = 128u;
+        // Q MR*HD h (swizzled, unpadded) | pane TK*(HD+8) h | raw K,V
+        // TK*HD B each: 49,664 -> 2 CTA/SM with the 1 KB reserve each
+        constexpr uint32_t WSM =
+            WMR * WHD * 2u + WTK * (WHD + 8u) * 2u + 2u * WTK * WHD;
+#define PD_PF7RPW_FITS(GV)                                                     \
+pd_smem_fits((const void*)pd_attn_prefill_pf7rp_kernel<GV, false, WHD,     \
+                                                       WTK, 2u>, WSM)
+        static const bool w_fits = PD_PF7RPW_FITS(4u) && PD_PF7RPW_FITS(6u)
+            && PD_PF7RPW_FITS(8u) && PD_PF7RPW_FITS(9u) && PD_PF7RPW_FITS(12u)
+            && PD_PF7RPW_FITS(16u);
+#undef PD_PF7RPW_FITS
+        if (w_fits) {
+            const bool multi = pd_pf_runs_offs != nullptr;
+            const dim3 gr = multi
+                ? dim3(n_kv_heads, (pd_pf_runs_maxn * g_ + WMR - 1u) / WMR,
+                       pd_pf_runs_n)
+                : dim3(n_kv_heads, (batch * g_ + WMR - 1u) / WMR);
+            const uint32_t* ro = multi ? (const uint32_t*)pd_pf_runs_offs : nullptr;
+#define PD_PF7RPW_LAUNCH(GV)                                                   \
+pd_attn_prefill_pf7rp_kernel<GV, false, WHD, WTK, 2u>                      \
+    <<<gr, 128, WSM, (cudaStream_t)stream>>>(                              \
+    (const float*)q, (const unsigned char*)pool_k,                         \
+    (const unsigned char*)pool_v,                                          \
+    (const float*)sinks, (float*)out, (const unsigned int*)positions,      \
+    (const uint32_t*)block_tables, blocks_per_slot,                        \
+    (const unsigned int*)slots, n_heads, kv_dim, swa_window, batch, scale, \
+    nullptr, ro, wp)
+            if (g_ == 4u) PD_PF7RPW_LAUNCH(4u);
+            else if (g_ == 6u) PD_PF7RPW_LAUNCH(6u);
+            else if (g_ == 8u) PD_PF7RPW_LAUNCH(8u);
+            else if (g_ == 9u) PD_PF7RPW_LAUNCH(9u);
+            else if (g_ == 12u) PD_PF7RPW_LAUNCH(12u);
+            else PD_PF7RPW_LAUNCH(16u);
+#undef PD_PF7RPW_LAUNCH
+            *rc = pd_launch_status();
+            return true;
+        }
+    }
+    if (f8v4n && !no_rp128 && (g_ == 4u || g_ == 6u || g_ == 8u
+                               || g_ == 9u || g_ == 12u || g_ == 16u)) {
+        constexpr uint32_t RPMR = 64u, RPTK = 48u, RPHD = 128u;
+        // Q MR*(HD+8)h | pane TK*(HD+8)h | raw K,V TK*HD B each (the
+        // per-row positions ride the pane). Every term carries its own
+        // shape factor.
+        constexpr uint32_t RPSM =
+            RPMR * (RPHD + 8u) * 2u + RPTK * (RPHD + 8u) * 2u
+            + 2u * RPTK * RPHD;                         // 42,752 -> 2 CTA/SM
+#define PD_PF7RP_128_FITS(GV)                                                  \
+pd_smem_fits((const void*)pd_attn_prefill_pf7rp_kernel<GV, false, RPHD,    \
+                                                       RPTK>, RPSM)
+        static const bool rp128_fits = PD_PF7RP_128_FITS(4u)
+            && PD_PF7RP_128_FITS(6u) && PD_PF7RP_128_FITS(8u)
+            && PD_PF7RP_128_FITS(9u) && PD_PF7RP_128_FITS(12u)
+            && PD_PF7RP_128_FITS(16u);
+#undef PD_PF7RP_128_FITS
+        if (rp128_fits) {
+            const bool multi = pd_pf_runs_offs != nullptr;
+            const dim3 gr = multi
+                ? dim3(n_kv_heads, (pd_pf_runs_maxn * g_ + RPMR - 1u) / RPMR,
+                       pd_pf_runs_n)
+                : dim3(n_kv_heads, (batch * g_ + RPMR - 1u) / RPMR);
+            const uint32_t* ro = multi ? (const uint32_t*)pd_pf_runs_offs : nullptr;
+#define PD_PF7RP_128_LAUNCH(GV)                                                \
+pd_attn_prefill_pf7rp_kernel<GV, false, RPHD, RPTK>                        \
+    <<<gr, 128, RPSM, (cudaStream_t)stream>>>(                             \
+    (const float*)q, (const unsigned char*)pool_k,                         \
+    (const unsigned char*)pool_v,                                          \
+    (const float*)sinks, (float*)out, (const unsigned int*)positions,      \
+    (const uint32_t*)block_tables, blocks_per_slot,                        \
+    (const unsigned int*)slots, n_heads, kv_dim, swa_window, batch, scale, \
+    nullptr, ro, wp)
+            if (g_ == 4u) PD_PF7RP_128_LAUNCH(4u);
+            else if (g_ == 6u) PD_PF7RP_128_LAUNCH(6u);
+            else if (g_ == 8u) PD_PF7RP_128_LAUNCH(8u);
+            else if (g_ == 9u) PD_PF7RP_128_LAUNCH(9u);
+            else if (g_ == 12u) PD_PF7RP_128_LAUNCH(12u);
+            else PD_PF7RP_128_LAUNCH(16u);
+#undef PD_PF7RP_128_LAUNCH
+            *rc = pd_launch_status();
+            return true;
+        }
+    }
+    return false;
 }
 
 // pf7 varlen launcher (AF3, ABI 322): one launch per layer covering

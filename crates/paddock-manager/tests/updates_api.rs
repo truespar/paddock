@@ -15,6 +15,12 @@ use axum::http::{Request, StatusCode};
 use paddock_manager::routes::{AppState, router};
 use tower::ServiceExt;
 
+/// Both tests point `PADDOCK_API_BASE` at a dead port and unset it when done,
+/// and the harness runs them on parallel threads: whichever finished first
+/// unset the variable under the other, which then asked the REAL release
+/// server and read `current`. One holds the variable at a time.
+static API_BASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn get(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
     let resp = app
         .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
@@ -32,6 +38,7 @@ async fn get(app: axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
 /// an honest `unknown`, rather than propagating a transport error to the UI.
 #[tokio::test]
 async fn an_unreachable_release_server_is_reported_not_thrown() {
+    let _env = API_BASE.lock().await;
     // 127.0.0.1:1 - reserved, nothing listens, connection refused immediately.
     // Better than a bogus hostname: no DNS wait, so the test stays fast.
     unsafe { std::env::set_var("PADDOCK_API_BASE", "http://127.0.0.1:1") };
@@ -67,6 +74,7 @@ async fn an_unreachable_release_server_is_reported_not_thrown() {
 /// leaving a half-built job in state that the UI then polls forever.
 #[tokio::test]
 async fn a_download_with_no_reachable_server_refuses_and_starts_nothing() {
+    let _env = API_BASE.lock().await;
     unsafe { std::env::set_var("PADDOCK_API_BASE", "http://127.0.0.1:1") };
 
     let state = Arc::new(AppState::for_tests());

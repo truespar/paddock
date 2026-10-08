@@ -786,6 +786,15 @@ pub trait Generator: Send {
     /// checkpoints, nothing to hold.
     fn reply_pin(&mut self, _slot: usize) {}
 
+    /// [`Self::reply_pin`] with what the slot's cache holds: `history[..pos]`,
+    /// the prompt and every reply token fed so far. A backend that files the
+    /// reply at the pin itself needs those tokens (laguna lands its SWA
+    /// window checkpoint from the slot's ring there); the default forwards,
+    /// for the backends that tracked the sequence on the way.
+    fn reply_pin_at(&mut self, slot: usize, _history: &[u32], _pos: u32) {
+        self.reply_pin(slot);
+    }
+
     /// Prompt tokens the last prefill of `slot` served from a prefix cache
     /// (usage reporting; taken - resets to 0). 0 = no cache / no reuse.
     fn take_prefill_reused(&mut self, _slot: usize) -> usize {

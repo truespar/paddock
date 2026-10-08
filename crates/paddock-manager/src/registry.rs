@@ -11,6 +11,7 @@
 //! with Range support works; a non-Range origin falls back to a single stream. The
 //! browser never downloads - the server pulls to disk, where models load from.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,7 +31,7 @@ use transfer::fetch_range;
 #[cfg(test)]
 mod recovery_tests;
 mod runtime;
-pub use runtime::{ArtifactRuntime, ArtifactSource, Qualification};
+pub use runtime::{ArtifactRuntime, ArtifactSource, Qualification, TowerMemory};
 
 // ─── the embedded manifest (models.toml, compiled into the binary) ──────────
 
@@ -166,6 +167,12 @@ pub struct CatalogArtifact {
     /// its tower is a plain text model with the purpose gone).
     #[serde(default)]
     pub required: bool,
+    /// Where this weights artifact sits on the model's choice axes
+    /// (`ModelSpecs::choices`), by axis name: Kumo Tabular's
+    /// `{ Size = "Large", Task = "Classification" }`. Empty for every model
+    /// whose weights are one list of quality levels.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub choice: BTreeMap<String, String>,
     /// Minimum compute capability this artifact can be SERVED on, as
     /// `[major, minor]` - absent means every GPU the engine supports.
     ///
@@ -433,6 +440,36 @@ pub struct ModelSpecs {
     /// A catalog that only lists strengths is an ad, not a comparison.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tradeoffs: Vec<String>,
+    /// The axes this model's weights vary along when they are not quality
+    /// levels. Kumo Tabular ships six checkpoints that are a Size times a
+    /// Task; laid out as one list of six "Quality" cards, the one real
+    /// question (how big, which task) was hidden in the labels. Declared here
+    /// in display order, with each artifact naming its value on every axis
+    /// (`CatalogArtifact::choice`), so the Studio asks one small question per
+    /// axis. TOML spells it `[[model.specs.choice]]`.
+    #[serde(
+        rename(serialize = "choices", deserialize = "choice"),
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub choices: Vec<ChoiceAxis>,
+}
+
+/// One question a model's weights answer: its heading (also the key every
+/// artifact's `choice` uses) and its options in display order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChoiceAxis {
+    pub name: String,
+    pub options: Vec<ChoiceOption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChoiceOption {
+    pub value: String,
+    /// One line that tells this option from its neighbours - sourced, like
+    /// the strengths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

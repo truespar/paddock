@@ -2586,6 +2586,100 @@ fn paged_f16_prefill_fp8_matches_decode_batch() {
     }
 }
 
+/// The hd128 fp8 paged prefill arm (pf7rp: Granite G4, PaddleOCR G8, Laguna
+/// G9, Kolibri G12, Nemotron/Muse G16) against the same per-row decode-walk
+/// oracle - this arm had no parity check of its own (the test above is hd256,
+/// the varlen gate's shape). Prompts from position 0 (the causal diagonal in
+/// every q tile) and a continuation chunk deep in the context (positions
+/// [ctx - t, ctx): most KV tiles are seen in full by every row, the arm's
+/// unmasked instance), with and without a window.
+#[test]
+fn paged_f16_prefill_fp8_hd128_matches_decode_batch() {
+    let Some(exec) = common::gpu() else {
+        return;
+    };
+    if !exec.has_paged_kv() || !exec.has_attn_prefill_f16_paged() {
+        eprintln!("pack has no paged f16 prefill - skipping");
+        return;
+    }
+    let head_dim = 128usize;
+    let max_ctx = 512usize;
+    let bps = max_ctx / 16;
+    let dt = KvDtype::Fp8E4m3;
+    for (n_heads, n_kv_heads) in [(16usize, 4usize), (32, 4), (48, 4), (32, 2)] {
+        let attn_g = n_heads / n_kv_heads;
+        let kv_dim = n_kv_heads * head_dim;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let qdim = n_heads * head_dim;
+        // (rows, first position): from 0, and a chunk ending at 480
+        for &(t_len, p0) in &[
+            (33usize, 0usize),
+            (100, 0),
+            (300, 0),
+            (100, 380),
+            (257, 223),
+        ] {
+            let q = det(t_len * qdim, 11);
+            let kc = det(max_ctx * kv_dim, 110);
+            let vc = det(max_ctx * kv_dim, 210);
+            let sinks = det(n_heads, 14);
+            let positions: Vec<u32> = (p0 as u32..(p0 + t_len) as u32).collect();
+            let d_q = exec.to_device(&q).expect("q");
+            let d_k = e4m3_dev_u8(&exec, &kc);
+            let d_v = e4m3_dev_u8(&exec, &vc);
+            let d_s = exec.to_device(&sinks).expect("sinks");
+            let d_pos = exec.stream.clone_htod(&positions).expect("pos");
+            let d_slots = exec.stream.clone_htod(&vec![0u32; t_len]).expect("slots");
+            let bt_host: Vec<u32> = (0..bps as u32).collect();
+            let d_bt = exec.stream.clone_htod(&bt_host).expect("bt");
+            for &swa in &[0usize, 128] {
+                let mut d_ref = exec.alloc(t_len * qdim).expect("ref");
+                exec.attn_decode_batch(
+                    &d_q,
+                    &d_k,
+                    &d_v,
+                    &d_s,
+                    &mut d_ref,
+                    &d_pos,
+                    Some(&d_slots),
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_ctx,
+                    kv_dim,
+                    swa,
+                    t_len,
+                    scale,
+                    dt,
+                )
+                .expect("decode_batch oracle");
+                let r = exec.to_host(&d_ref).expect("dtoh ref");
+                let mut d_pf = exec.alloc(t_len * qdim).expect("pf");
+                exec.attn_prefill_f16_paged(
+                    &d_q, &d_k, &d_v, &d_s, &mut d_pf, &d_pos, &d_slots, &d_bt, bps, n_heads,
+                    n_kv_heads, head_dim, kv_dim, swa, t_len, scale, dt,
+                )
+                .expect("paged f16 prefill (fp8, hd128)");
+                let got = exec.to_host(&d_pf).expect("dtoh pf");
+                let maxd = r
+                    .iter()
+                    .zip(&got)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                eprintln!(
+                    "fp8 paged f16 prefill G={attn_g} hd=128 T={t_len} p0={p0} swa={swa}: \
+                     max_abs_diff {maxd:.2e}"
+                );
+                assert!(
+                    maxd < 8e-3,
+                    "fp8 paged f16 prefill G={attn_g} hd=128 T={t_len} p0={p0} swa={swa}: {maxd} \
+                     exceeds the f16-class gate"
+                );
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Spec-verify attention
 //

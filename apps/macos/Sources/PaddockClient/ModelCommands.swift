@@ -153,6 +153,7 @@ public struct EndpointSettings: Decodable, Sendable, Equatable {
   public let kvCacheDtype: String?
   public let hasApiKey: Bool
   public let vision: Bool
+  public let audio: Bool?
   public let forensics: Bool
   public let device: String
   public let drafter: String?
@@ -192,12 +193,14 @@ public struct EndpointComposition: Encodable, Sendable {
   public let model: String
   public let artifact: String
   public let vision: Bool
+  public let audio: Bool?
   public let drafter: String?
 
-  public init(model: String, artifact: String, vision: Bool, drafter: String?) {
+  public init(model: String, artifact: String, vision: Bool, drafter: String?, audio: Bool? = nil) {
     self.model = model
     self.artifact = artifact
     self.vision = vision
+    self.audio = audio
     self.drafter = drafter
   }
 }

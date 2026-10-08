@@ -1889,6 +1889,18 @@ static const KernelTableV1 PD_KERNELS = {
     pd_eg2a_attn,
     pd_eg2a_conv,
     pd_eg2a_out,
+    pd_g4v_patchify,
+    pd_g4v_pos_norm,
+    pd_g4v_heads,
+    pd_g4v_post,
+    pd_g4v_geglu,
+    pd_g4v_pool,
+    pd_f16_gemm_h_geglu_g4,
+    pd_g4v_rope_table,
+    pd_q8_0_gemm_mmq_s,
+    pd_eg2_attn_s,
+    pd_nvf4_moe_gu_swiglu_ms,
+    pd_nvf4_moe_down_ms_b16,
 };
 
 PD_EXPORT const PackInfo* paddock_pack_info(void) {

@@ -81,9 +81,36 @@ impl GpuEmbeddingGemma2 {
         exec.upload_u32(&cu, &mut sc.cu)?;
         exec.upload_u32(&tiles[0], &mut sc.tiles[0])?;
         exec.upload_u32(&tiles[1], &mut sc.tiles[1])?;
+        // three kernels, one arithmetic: every output bit-identical whichever
+        // runs it, so the pick by row count cannot move a vector
+        let small_tile = exec.has_q8_0_gemm_mmq_s();
+        let attn_split = |n_tiles: usize, hd: usize| -> usize {
+            // PADDOCK_DEV_EG2_SPLIT pins the split (1, 2 or 4) for measuring
+            if let Some(v) = paddock_models::dev_var_os!("PADDOCK_DEV_EG2_SPLIT") {
+                return v.to_str().and_then(|s| s.parse().ok()).unwrap_or(1);
+            }
+            if !exec.has_eg2_attn_s() {
+                return 1;
+            }
+            // two blocks a tile once the plain grid leaves SMs idle (GB10, a
+            // picture's 270 rows: hd 256 34.6 -> 24.7 us a layer, hd 512 44.5
+            // -> 40.9). Never four: each block stages the tile's whole key
+            // span, and at four the restaging costs more than the fill buys
+            // (hd 512 44.5 -> 89.6 us; the 982- and 2,882-token passes +25%
+            // and +48% when forced)
+            let blocks = n_tiles * if hd == 256 { 2 } else { 1 };
+            if blocks < exec.sm_count() { 2 } else { 1 }
+        };
+        let gemv_rows = if small_tile {
+            GEMV_ROWS_WITH_TILE
+        } else {
+            GEMV_ROWS
+        };
         let gemm = |w: &RepackedQ8, yq: &CudaSlice<u8>, y: &mut CudaSlice<f32>| {
-            if pad <= GEMV_ROWS {
+            if pad <= gemv_rows {
                 exec.eg2_gemm_rows(w, yq, y, pad)
+            } else if small_tile {
+                exec.q8_0_gemm_mmq_s(w, yq, y, pad)
             } else {
                 exec.q8_0_gemm_mmq(w, yq, None, y, pad)
             }
@@ -221,6 +248,7 @@ impl GpuEmbeddingGemma2 {
                 pad,
                 hd,
                 if full { 0 } else { self.window },
+                attn_split(tiles[full as usize].len(), hd),
             )?;
             exec.quantize_q8_mmq(&sc.attn, &mut sc.yq, 4 * hd, pad)?;
             gemm(&l.o, &sc.yq, &mut sc.delta)?;

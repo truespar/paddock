@@ -134,6 +134,16 @@ function pick(vendor: string): void {
   void router.replace({ query: { vendor } })
 }
 
+/** The Hugging Face repo a row downloads from behind its maker's licence gate
+ *  (SAM 3, TIC Forestry), or null. Said on the row, so a model that needs the
+ *  user's own licence click and token reads as supported rather than missing;
+ *  the start form then links the licence page and Settings. */
+function gatedRepo(m: CatalogModel): string | null {
+  const weights = m.artifacts.filter((a) => a.kind === 'weights')
+  const a = weights.find((w) => w.default) ?? weights[0]
+  return a?.source?.gated ? a.source.repo : null
+}
+
 /** Table rows with a thin section header when a vendor spans model kinds. */
 type Row = { kind: 'head'; label: string } | { kind: 'model'; m: CatalogModel }
 function sectionOf(m: CatalogModel): string {
@@ -345,6 +355,14 @@ function configure(m: CatalogModel): void {
                 </Tooltip>
                 <span v-if="!r.m.installed" class="c-name__get">
                   {{ fmtBytes(r.m.total_size) }} download
+                  <Tooltip
+                    v-if="gatedRepo(r.m)"
+                    :label="`Accept the licence at huggingface.co/${gatedRepo(r.m)}, then the download uses your Hugging Face token`"
+                  >
+                    <span class="c-name__gated">
+                      · <Icon name="lock" :size="11" /> licence on Hugging Face
+                    </span>
+                  </Tooltip>
                 </span>
               </td>
               <td class="c-why">
@@ -569,6 +587,11 @@ function configure(m: CatalogModel): void {
   margin-top: 2px;
   font-size: var(--pk-font-size-xs);
   color: var(--pk-text-muted);
+}
+.c-name__gated {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
 }
 .c-about {
   display: block;

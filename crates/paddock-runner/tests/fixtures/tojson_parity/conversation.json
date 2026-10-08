@@ -1,0 +1,36 @@
+{
+  "tools": [
+    {"type": "function", "function": {
+      "name": "Read",
+      "description": "Reads a file from the local filesystem. Usage:\n- The file_path parameter must be an absolute path, not a relative path\n- You can optionally specify a line offset and limit (especially handy for long files)\n<example>Read(file_path=\"/ws/a.txt\")</example>\nDon't read binary files & don't guess paths.",
+      "parameters": {"type": "object", "properties": {
+        "file_path": {"type": "string", "description": "The absolute path to the file to read"},
+        "offset": {"type": "number", "description": "The line number to start reading from"},
+        "limit": {"type": "number", "description": "The number of lines to read"}},
+        "required": ["file_path"], "additionalProperties": false, "$schema": "http://json-schema.org/draft-07/schema#"}}},
+    {"type": "function", "function": {
+      "name": "Edit",
+      "description": "Performs exact string replacements in files. The edit will FAIL if `old_string` is not unique — provide more context. Größe & Übersicht: <system-reminder> tags are not part of the file.",
+      "parameters": {"type": "object", "properties": {
+        "file_path": {"type": "string"},
+        "old_string": {"type": "string"},
+        "new_string": {"type": "string"},
+        "replace_all": {"type": "boolean", "default": false},
+        "mode": {"type": "string", "enum": ["exact", "regex"]},
+        "ratio": {"type": "number", "minimum": 0.0, "maximum": 1e-5}},
+        "required": ["file_path", "old_string", "new_string"]}}}
+  ],
+  "messages": [
+    {"role": "system", "content": "You are Claude Code, Anthropic's official CLI. Use <tools> wisely & don't stop early."},
+    {"role": "user", "content": "Audit ./ledger and fix the weight of record 01-0131."},
+    {"role": "assistant", "content": "", "reasoning_content": "I'll read the ledger first; it's at /ws/ledger.",
+     "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "Read",
+        "arguments": {"file_path": "/ws/ledger/ledger_01.txt", "offset": 120, "limit": 40}}}]},
+    {"role": "tool", "tool_call_id": "call_1", "content": "REC 01-0131 | courier: Saga Holm | weight: 3.5 kg | note: \"fragile\" <ok>"},
+    {"role": "assistant", "content": "", "reasoning_content": "Now the edit: 3.5 -> 99.9.",
+     "tool_calls": [{"id": "call_2", "type": "function", "function": {"name": "Edit",
+        "arguments": {"file_path": "/ws/ledger/ledger_01.txt", "old_string": "weight: 3.5 kg", "new_string": "weight: 99.9 kg", "replace_all": false, "ratio": 0.5, "extra": null, "tags": ["a", "b"], "nested": {"z": 1, "a": {"k": "v"}}}}}]},
+    {"role": "tool", "tool_call_id": "call_2", "content": "The file /ws/ledger/ledger_01.txt has been updated."},
+    {"role": "user", "content": "Thanks — now summarize what changed."}
+  ]
+}

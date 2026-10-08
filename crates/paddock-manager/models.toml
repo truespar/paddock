@@ -6661,8 +6661,8 @@ revision = "2026-08-01"
 # tensor copied unchanged, verified against the source, only the other
 # tower's clip.* keys dropped) - a named exception to the sourcing rule. Pictures
 # ride the default download, audio is the opt-in one (the bigger file).
-# CUDA only: the Metal lane serves the MLX checkpoint, text only, and is not
-# a catalog artifact. Measured on GB10 (2026-10-07): an 8K-token pass holds
+# GGUF serves CUDA and Metal; the optional MLX 8-bit package serves Metal
+# with its own bundled towers. Measured on GB10 (2026-10-07): an 8K-token pass holds
 # ~480 MiB of scratch (the weights' workspace), a picture encode ~162 MiB at
 # the 280-token budget, a 30 s clip ~32 MiB (the towers' workspaces); the
 # towers' resident bytes are their files.
@@ -6673,7 +6673,7 @@ display = "EmbeddingGemma 2"
 family = "embeddinggemma"
 capability = ["embeddings"]
 license = "apache-2.0"
-revision = "2026-10-07"
+revision = "2026-10-08"
 
   [model.specs]
   params = "740M (270M text, 170M pictures, 300M audio)"
@@ -6685,10 +6685,10 @@ revision = "2026-10-07"
   about = "Turns text, pictures and audio into vectors in one shared space - search photos or recordings with words, or the other way round."
   strengths = [
     "Text, pictures and audio in one vector space · 100+ languages and code",
-    "Small - 0.3 GB for text; pictures (+0.4 GB) and audio (+0.6 GB) are optional downloads",
+    "GGUF: 0.3 GB text with optional picture/audio downloads; MLX: 1.27 GB package with both towers",
   ]
   tradeoffs = [
-    "Audio clips up to 30 seconds each; video is not served yet",
+    "Audio clips up to 30 seconds each; Metal video inputs use sampled visual frames, without a soundtrack",
   ]
 
   [[model.artifact]]
@@ -6700,6 +6700,7 @@ revision = "2026-10-07"
   default = true
   workspace = 503316480
   source = { repo = "unsloth/embeddinggemma-2-GGUF", revision = "ba3888272494be64ed88c9eb536ddc61a1be73d5", base_model = "google/embeddinggemma-2", license = "apache-2.0", license_url = "https://ai.google.dev/gemma/docs/gemma_4_license" }
+  runtime = { backends = ["cuda", "metal"], backend_overrides = { metal = { qualification = "qualified", kv_cache_dtype = "auto", companions = ["vision", "audio"], default_max_ctx = 8192, default_max_batch = 1, memory = { weight_bytes = 294064224, source = "measured", max_ctx = 8192, max_batch = 32, full_paged_kv = false, kv_reserve_sequences = 0, workspace_bytes = 805306368 }, note = "Native Q8 text encoder with optional BF16 picture and audio towers; no generative KV cache. Audio clips are limited to 30 seconds. Video uses sampled visual frames, without a soundtrack." } } }
 
   [model.artifact.shape]
   weight_bytes = 294064128
@@ -6727,6 +6728,7 @@ revision = "2026-10-07"
   label = "Pictures (image input)"
   default = true
   workspace = 169869312
+  runtime = { backends = ["cuda", "metal"] }
   source = { repo = "unsloth/embeddinggemma-2-GGUF", revision = "ba3888272494be64ed88c9eb536ddc61a1be73d5", base_model = "google/embeddinggemma-2", license = "apache-2.0", license_url = "https://ai.google.dev/gemma/docs/gemma_4_license" }
 
     [[model.artifact.file]]
@@ -6742,6 +6744,7 @@ revision = "2026-10-07"
   format = "gguf"
   label = "Audio input (speech and sound)"
   workspace = 33554432
+  runtime = { backends = ["cuda", "metal"] }
   source = { repo = "unsloth/embeddinggemma-2-GGUF", revision = "ba3888272494be64ed88c9eb536ddc61a1be73d5", base_model = "google/embeddinggemma-2", license = "apache-2.0", license_url = "https://ai.google.dev/gemma/docs/gemma_4_license" }
 
     [[model.artifact.file]]
@@ -6749,6 +6752,166 @@ revision = "2026-10-07"
     dest = "EmbeddingGemma-2-GGUF/embeddinggemma-2-mmproj-audio-BF16.gguf"
     sha256 = "1aec404e75971296c155d9e62a8d0cc1d8efceda54065f7ebb7aacf6a813d0a2"
     size = 613806752
+
+
+  # Unchanged mlx-community affine-8/group-64 bundle. Its image/audio towers
+  # are optional resident allocations within these weights, never GGUF companions.
+  [[model.artifact]]
+  id = "mlx8"
+  kind = "weights"
+  format = "safetensors"
+  label = "MLX 8-bit"
+  quant = "MLX-AFFINE-8-G64"
+  default = false
+  workspace = 805306368
+
+  [model.artifact.source]
+  repo = "mlx-community/embeddinggemma-2-8bit"
+  revision = "7505ef2f8ddef45efef6d060865f27989b3c9cec"
+  base_model = "google/embeddinggemma-2"
+  license = "apache-2.0"
+  license_url = "https://ai.google.dev/gemma/apache_2"
+
+  [model.artifact.runtime]
+  backends = ["metal"]
+  checkpoint_dir = true
+  companions = []
+  kv_cache_dtype = "auto"
+  qualification = "qualified"
+  default_max_ctx = 8192
+  default_max_batch = 1
+  default_spec = "off"
+  note = "Native MLX 8-bit embeddings with independently enabled bundled image/audio towers and visual-video frames. Text follows the pinned single-input MLX reference, independent of request batching. Audio clips are limited to 30 seconds."
+
+  [model.artifact.runtime.memory]
+  weight_bytes = 288165984
+  workspace_bytes = 805306368
+  source = "measured"
+  max_ctx = 8192
+  max_batch = 32
+  full_paged_kv = false
+  kv_reserve_sequences = 0
+
+  [model.artifact.runtime.optional_towers.vision]
+  weight_bytes = 367075328
+  workspace_bytes = 169869312
+  default = true
+
+  [model.artifact.runtime.optional_towers.audio]
+  weight_bytes = 588618624
+  workspace_bytes = 33554432
+  default = false
+
+  [model.artifact.shape]
+  weight_bytes = 288165984
+  kind = "encoder"
+  vocab = 262144
+  max_ctx = 8192
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = []
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/7505ef2f8ddef45efef6d060865f27989b3c9cec/EmbeddingGemma-2-MLX-8bit/model.safetensors"
+    dest = "EmbeddingGemma-2-MLX-8bit/model.safetensors"
+    sha256 = "6b7e97f9687ad422ab3625a1cdf6002892187d7dd04d01b2a09253fa1e5d4cfd"
+    size = 1234238431
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/7505ef2f8ddef45efef6d060865f27989b3c9cec/EmbeddingGemma-2-MLX-8bit/1_Pooling/config.json"
+    dest = "EmbeddingGemma-2-MLX-8bit/1_Pooling/config.json"
+    sha256 = "8759bdf7c77efc7df7723f64856a593c8943b71ee38baf2a88771fbaf78438f9"
+    size = 90
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/7505ef2f8ddef45efef6d060865f27989b3c9cec/EmbeddingGemma-2-MLX-8bit/2_Normalize/config.json"
+    dest = "EmbeddingGemma-2-MLX-8bit/2_Normalize/config.json"
+    sha256 = "cdb09dfca347a56aa2d691744e38d5ad3c7cbc2834e7181272b9a15328b82524"
+    size = 97
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/7505ef2f8ddef45efef6d060865f27989b3c9cec/EmbeddingGemma-2-MLX-8bit/chat_template.jinja"
+    dest = "EmbeddingGemma-2-MLX-8bit/chat_template.jinja"
+    sha256 = "4b852efc0b9960283e735363331e6f325b33bc74bdbaa076f595bc4e9b94d85e"
+    size = 1016
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/7505ef2f8ddef45efef6d060865f27989b3c9cec/EmbeddingGemma-2-MLX-8bit/config_sentence_transformers.json"
+    dest = "EmbeddingGemma-2-MLX-8bit/config_sentence_transformers.json"
+    sha256 = "031e56a498d33c349ab489a21885bcfe25b4fcba841149dc99e1e90d4a7c28f5"
+    size = 1565
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/7505ef2f8ddef45efef6d060865f27989b3c9cec/EmbeddingGemma-2-MLX-8bit/config.json"
+    dest = "EmbeddingGemma-2-MLX-8bit/config.json"
+    sha256 = "35e55812554bf172f9321f5c6a25d58810432db9eeeb38094723a04e8d3dd9af"
+    size = 5463
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/7505ef2f8ddef45efef6d060865f27989b3c9cec/EmbeddingGemma-2-MLX-8bit/LICENSE"
+    dest = "EmbeddingGemma-2-MLX-8bit/LICENSE"
+    sha256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    size = 11358
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/7505ef2f8ddef45efef6d060865f27989b3c9cec/EmbeddingGemma-2-MLX-8bit/model.safetensors.index.json"
+    dest = "EmbeddingGemma-2-MLX-8bit/model.safetensors.index.json"
+    sha256 = "f7244e4a2294cec8281fd884ab93e0a1df53a24bd4de8ac9e5882743bd1c502c"
+    size = 153721
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/7505ef2f8ddef45efef6d060865f27989b3c9cec/EmbeddingGemma-2-MLX-8bit/modules.json"
+    dest = "EmbeddingGemma-2-MLX-8bit/modules.json"
+    sha256 = "3d02572a0455b832de67fb8e63a54981bc7e8b46e337c95e917bd8122a533bfd"
+    size = 413
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/7505ef2f8ddef45efef6d060865f27989b3c9cec/EmbeddingGemma-2-MLX-8bit/PADDOCK-PROVENANCE.txt"
+    dest = "EmbeddingGemma-2-MLX-8bit/PADDOCK-PROVENANCE.txt"
+    sha256 = "cf403361ebc7195d4252e7ae733a83ff43f0b0f0c94bbef5e6b4c2c3df6f4d9e"
+    size = 854
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/7505ef2f8ddef45efef6d060865f27989b3c9cec/EmbeddingGemma-2-MLX-8bit/preprocessor_config.json"
+    dest = "EmbeddingGemma-2-MLX-8bit/preprocessor_config.json"
+    sha256 = "ea2ae257e901064abdd98dceb19f2b0da06af600bed15e0f99f5c85c37ee9d78"
+    size = 511
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/7505ef2f8ddef45efef6d060865f27989b3c9cec/EmbeddingGemma-2-MLX-8bit/processor_config.json"
+    dest = "EmbeddingGemma-2-MLX-8bit/processor_config.json"
+    sha256 = "168f6a08522f3ce5dea596d94d003af2fd691742d4f41fe1f9d8cce76bfbf69c"
+    size = 1788
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/7505ef2f8ddef45efef6d060865f27989b3c9cec/EmbeddingGemma-2-MLX-8bit/README.md"
+    dest = "EmbeddingGemma-2-MLX-8bit/README.md"
+    sha256 = "4e36f109f3614c4a089c3e6871c69cc314a7e580e0c7b11ab2a9037c9402ef6e"
+    size = 4624
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/7505ef2f8ddef45efef6d060865f27989b3c9cec/EmbeddingGemma-2-MLX-8bit/sentence_bert_config.json"
+    dest = "EmbeddingGemma-2-MLX-8bit/sentence_bert_config.json"
+    sha256 = "b1bcd9f2dce3ae863b359e87d0710b5dbc3314a59ecb4e2f97c7778fc8e4b228"
+    size = 747
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/7505ef2f8ddef45efef6d060865f27989b3c9cec/EmbeddingGemma-2-MLX-8bit/tokenizer_config.json"
+    dest = "EmbeddingGemma-2-MLX-8bit/tokenizer_config.json"
+    sha256 = "17bd5d6e9364ca49a534e1502076593317c298d4a663623091ed45388f004874"
+    size = 1599
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/7505ef2f8ddef45efef6d060865f27989b3c9cec/EmbeddingGemma-2-MLX-8bit/tokenizer.json"
+    dest = "EmbeddingGemma-2-MLX-8bit/tokenizer.json"
+    sha256 = "4d777ef5bdc1aa36227abdfb77c3e49e7b9c892d16e1b6bda41c393504828be4"
+    size = 32170510
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/mlx-community/7505ef2f8ddef45efef6d060865f27989b3c9cec/EmbeddingGemma-2-MLX-8bit/validation.json"
+    dest = "EmbeddingGemma-2-MLX-8bit/validation.json"
+    sha256 = "7d8681a0a27d61cbad9b25bf788bc553a1345f153860c4b31c98b10906bbcac1"
+    size = 2417
 
 # ── rerankers ────────────────────────────────────────────────────────────────
 
@@ -8355,6 +8518,27 @@ revision = "2026-09-30"
     "One task per endpoint: classification and regression are separate checkpoints",
   ]
 
+  # Six checkpoints are two questions, not one list: how big, and which task.
+  # The notes are what tells the options apart: the parameter counts in
+  # specs.params, and this engine's own speed - small against large, warm
+  # medians, 2.3x (Metal, cached context, 513 rows) up to 5.1x (CUDA on GB10,
+  # direct, 257 rows) across every table both lanes measured.
+  [[model.specs.choice]]
+  name = "Size"
+  options = [
+    { value = "Large", note = "214M parameters" },
+    { value = "Medium", note = "62M parameters" },
+    { value = "Small", note = "27M parameters - two to five times faster than Large" },
+  ]
+
+  [[model.specs.choice]]
+  name = "Task"
+  options = [
+    { value = "Classification", note = "Picks a class for each row, with its confidence - up to ten classes" },
+    { value = "Regression", note = "Predicts a number for each row, with its whole distribution" },
+  ]
+
+
   [[model.artifact]]
   id = "large-classification"
   kind = "weights"
@@ -8362,6 +8546,7 @@ revision = "2026-09-30"
   label = "Large - classification (official F32)"
   quant = "F32"
   default = true
+  choice = { Size = "Large", Task = "Classification" }
   workspace = 4087631776
 
   [model.artifact.runtime]
@@ -8414,6 +8599,7 @@ revision = "2026-09-30"
   label = "Large - regression (official F32)"
   quant = "F32"
   default = false
+  choice = { Size = "Large", Task = "Regression" }
   workspace = 4087631776
 
   [model.artifact.runtime]
@@ -8466,6 +8652,7 @@ revision = "2026-09-30"
   label = "Medium - classification (official F32)"
   quant = "F32"
   default = false
+  choice = { Size = "Medium", Task = "Classification" }
   workspace = 4087631776
 
   [model.artifact.runtime]
@@ -8518,6 +8705,7 @@ revision = "2026-09-30"
   label = "Medium - regression (official F32)"
   quant = "F32"
   default = false
+  choice = { Size = "Medium", Task = "Regression" }
   workspace = 4087631776
 
   [model.artifact.runtime]
@@ -8570,6 +8758,7 @@ revision = "2026-09-30"
   label = "Small - classification (official F32)"
   quant = "F32"
   default = false
+  choice = { Size = "Small", Task = "Classification" }
   workspace = 2631290784
 
   [model.artifact.runtime]
@@ -8622,6 +8811,7 @@ revision = "2026-09-30"
   label = "Small - regression (official F32)"
   quant = "F32"
   default = false
+  choice = { Size = "Small", Task = "Regression" }
   workspace = 2631290784
 
   [model.artifact.runtime]
@@ -9165,3 +9355,115 @@ revision = "2026-10-07"
     dest = "sam3/README.md"
     sha256 = "1ac8a322aa4a797db79cbc334acee7c0cae8635032b71c7d5b23ae63a05f4bd5"
     size = 26038
+
+# -- geospatial (dense prediction) ---------------------------------------------
+# TIC Forestry v1 (The Intelligence Company): a DINOv3 ViT-L/16 backbone
+# (Meta's satellite pretrain) with a multi-scale conv decoder, served by
+# gpu_model/dinov3 over POST /v1/segmentations: 512 x 512 four-band aerial
+# chips in, a land-cover class raster and a canopy-height raster out. No
+# tokens, no context, no sampling - priced as a single-pass model (weights + a
+# resident workspace, no KV).
+#
+# NOT mirrored, like SAM 3: it is a fine-tune of a DINOv3 checkpoint, so it
+# carries Meta's DINOv3 License, and its repo gates the download behind those
+# terms (approval is automatic). The files come from tic-oss/tic-forestry-v1
+# itself with the user's own Hugging Face token (`source.gated`), at a pinned
+# revision with every hash pinned. The weights and config are the same bytes
+# the engine was ported and gated against.
+#
+# The repo also carries golden vectors under fixtures/ (manifest.json indexes
+# them): twelve chips spanning all eight classes the held-out counties
+# contain, each as the raw 512x512x4 uint8 block the model consumes and a
+# georeferenced 4-band GeoTIFF in SWEREF 99 TM, with the reference class
+# argmax, height raster, and full logits for the first three. They are a test
+# set, not part of a serve, so the download leaves them out. Compare logits
+# with a tolerance rather than for equality - bf16 accumulation order differs
+# between implementations - and check the logits, not only the argmax, which
+# can agree while the logits drift.
+[[model]]
+id = "tic-forestry-v1"
+vendor = "The Intelligence Company"
+display = "TIC Forestry v1"
+family = "tic-forestry"
+capability = ["segmentation"]
+license = "dinov3-license"
+revision = "2026-10-08"
+
+  [model.specs]
+  published_at = "2026-09-20"
+  published_source = "https://huggingface.co/tic-oss/tic-forestry-v1"
+  params = "306M"
+  dims = "1024"
+  homepage = "https://huggingface.co/tic-oss/tic-forestry-v1"
+  about = "Reads Swedish aerial photography and returns, for every square metre, what the ground is and how tall the trees are."
+  strengths = [
+    "Trained on all of Sweden - 2 743 cells of 10 km across 17 counties, scored on four counties it never saw",
+    "Land cover and canopy height from one pass, both at 1 m",
+    "Uses the near-infrared band, not just RGB",
+  ]
+  tradeoffs = [
+    "Gated: accept the DINOv3 licence on Hugging Face and use your own token to download",
+    "Deciduous forest and open land are its weak classes (IoU 0.55 and 0.58, against 0.81-0.93 elsewhere)",
+    "Swedish imagery at 0.5 m in SWEREF 99 TM - not a general-purpose aerial model",
+    "Built for sweeps over an area: images are processed sixteen at a time, so one image alone takes as long as sixteen",
+  ]
+
+  [[model.artifact]]
+  id = "bf16"
+  kind = "weights"
+  format = "safetensors"
+  label = "Full quality"
+  quant = "BF16"
+  default = true
+  # the resident forward-pass workspace at the elected pass width of 16 chips
+  # (the widest any die serves; consumer Blackwell caps at 8 and holds half of it)
+  # (102 979 200 bytes a chip: every plane a pass touches, allocated once; the
+  # backbone's planes are f16 since the half activation interface)
+  workspace = 1647667200
+
+  [model.artifact.source]
+  repo = "tic-oss/tic-forestry-v1"
+  base_model = "facebook/dinov3-vitl16-pretrain-sat493m"
+  license_url = "https://huggingface.co/tic-oss/tic-forestry-v1/blob/3edfd6a2088a8fbbf5b53e02d83a1f35d14661c8/LICENSE"
+  revision = "3edfd6a2088a8fbbf5b53e02d83a1f35d14661c8"
+  license = "dinov3-license"
+  gated = true
+
+  # resident bytes as the loader ledgers them: the bf16 GEMM planes held as
+  # f16 (exact), norms / biases / LayerScale widened to f32, plus the token
+  # table and the rope table, which are not in the file
+  [model.artifact.shape]
+  weight_bytes = 616404844
+  kind = "encoder"
+  source = "measured"
+
+    # file[0] is what the runner is handed, so the weights lead and the
+    # geometry follows - alphabetical order would put config.json first.
+    [[model.artifact.file]]
+    url = "https://huggingface.co/tic-oss/tic-forestry-v1/resolve/3edfd6a2088a8fbbf5b53e02d83a1f35d14661c8/model.safetensors"
+    dest = "tic-forestry-v1/model.safetensors"
+    sha256 = "00a361cb850d538a7e795d13c4c9fcdd65293272533921c4638e827f33bc6513"
+    size = 611304470
+
+    # the backbone geometry, the decoder's stage depths and widths, the band
+    # normalisation the chips were trained under, and the class names in code
+    # order. The engine rebuilds the graph from this; it is not optional.
+    [[model.artifact.file]]
+    url = "https://huggingface.co/tic-oss/tic-forestry-v1/resolve/3edfd6a2088a8fbbf5b53e02d83a1f35d14661c8/config.json"
+    dest = "tic-forestry-v1/config.json"
+    sha256 = "95b55e063bcd07f81e35da14d2d9716751b5e6e3e5835d560a52abddc2c38e31"
+    size = 1371
+
+    # the DINOv3 License the weights carry, which says it must travel with them
+    [[model.artifact.file]]
+    url = "https://huggingface.co/tic-oss/tic-forestry-v1/resolve/3edfd6a2088a8fbbf5b53e02d83a1f35d14661c8/LICENSE"
+    dest = "tic-forestry-v1/LICENSE"
+    sha256 = "25d122eb8f5b880fd23c736fb6ea8018ee45c12237e00b8a86d14c653904999e"
+    size = 7503
+
+    # the model card - the loud-attribution file
+    [[model.artifact.file]]
+    url = "https://huggingface.co/tic-oss/tic-forestry-v1/resolve/3edfd6a2088a8fbbf5b53e02d83a1f35d14661c8/README.md"
+    dest = "tic-forestry-v1/README.md"
+    sha256 = "7c2fe664a72bd601e520b8b475a64f093fe3ee4bffdf73afe64b4c9948e81d1a"
+    size = 17750

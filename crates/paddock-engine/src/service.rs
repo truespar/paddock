@@ -1525,7 +1525,7 @@ fn drain_reply_pins(generator: &mut dyn Generator, slots: &mut [Option<Slot>]) {
         if let Some(s) = s.as_mut()
             && std::mem::take(&mut s.reply_pin_due)
         {
-            generator.reply_pin(k);
+            generator.reply_pin_at(k, &s.history, s.pos);
         }
     }
 }

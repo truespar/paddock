@@ -16,6 +16,7 @@ mod quant;
 #[cfg(test)]
 mod tests;
 mod vision;
+pub(crate) use vision::resize::Cache as ImageResizeCache;
 #[cfg(test)]
 mod vision_tests;
 mod workspace;

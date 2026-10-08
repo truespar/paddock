@@ -349,7 +349,18 @@ __global__ void __launch_bounds__(HD / 2u) pd_eg2_heads_kernel(
 // tile's key span is [q0 - w, q_last + w] clipped to the sequence. Numeric
 // class: f16 q/k/v/P operands, f32 S/O and online softmax (FTZ at e^-20) -
 // the varlen kernel's.
-template <uint32_t HD>
+//
+// SPLIT (slot 829): the same tile's eight warps spread over SPLIT blocks of
+// 8 / SPLIT warps (grid.z), each block staging the tile's whole key span for
+// its own warps - at hd 256 one 16-row strip and both query heads, at hd 512
+// one query head and its two D halves (the pane swap stays in the block).
+// The span, the key steps and every warp's arithmetic are the tile's, so a
+// row lands the same bits whichever form ran it; what moves is only how many
+// blocks a short pass puts on the die (a picture's 270 rows: 10 blocks at hd
+// 256, 20 at split 2 - 34.6 -> 24.7 us a layer on GB10). Each block restages
+// the tile's whole key span, so 4 loses again (hd 512 44.5 -> 89.6 us); the
+// engine elects 2 for grids under one block an SM.
+template <uint32_t HD, uint32_t SPLIT = 1u>
 struct PdEg2Geo {
     static constexpr uint32_t DS = HD / 256u;              // D slices a head
     static constexpr uint32_t G = HD / 128u;               // q heads a kv head
@@ -357,20 +368,22 @@ struct PdEg2Geo {
     static constexpr uint32_t STRIPS = 8u / (G * DS);      // 16-row strips a block
     static constexpr uint32_t ROWS = STRIPS * 16u;         // query rows a block
     static constexpr uint32_t DPD = HD + 8u;               // padded smem row
+    static constexpr uint32_t WARPS = 8u / SPLIT;          // warps a block
     static constexpr uint32_t SMEM = 2u * PD_EG2_KT * DPD * 2u
-                                     + (DS > 1u ? 8u * 16u * PD_EG2_KT * 4u : 0u);
+                                     + (DS > 1u ? WARPS * 16u * PD_EG2_KT * 4u : 0u);
 };
 
 #define PD_EG2_TILE_SHIFT 12u   // a tile descriptor is (sequence << 12) | tile index
 
-template <uint32_t HD>
-__global__ void __launch_bounds__(256, 1) pd_eg2_attn_kernel(
+template <uint32_t HD, uint32_t SPLIT = 1u>
+__global__ void __launch_bounds__(256u / SPLIT, 1) pd_eg2_attn_kernel(
     const __half* __restrict__ q16, const __half* __restrict__ k16,
     const __half* __restrict__ v16, const uint32_t* __restrict__ cu,
     const uint32_t* __restrict__ tiles, float* __restrict__ out, uint32_t window) {
 #if PD_FA_OK
-    using Geo = PdEg2Geo<HD>;
+    using Geo = PdEg2Geo<HD, SPLIT>;
     constexpr uint32_t KT = PD_EG2_KT, DPD = Geo::DPD, DS = Geo::DS, G = Geo::G;
+    constexpr uint32_t NT = 32u * Geo::WARPS;
     constexpr uint32_t KH = Geo::KH;
     const uint32_t tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u;
     const uint32_t g8 = lane >> 2, t4 = lane & 3u, lg = lane >> 3;
@@ -379,7 +392,9 @@ __global__ void __launch_bounds__(256, 1) pd_eg2_attn_kernel(
     const uint32_t sq = td >> PD_EG2_TILE_SHIFT;
     const uint32_t q0 = (td & ((1u << PD_EG2_TILE_SHIFT) - 1u)) * Geo::ROWS;
     const uint32_t base = cu[sq], L = cu[sq + 1u] - base;
-    const uint32_t strip = warp / (G * DS), gi = (warp / DS) % G, ds = warp % DS;
+    // the warp's role in the 8-warp tile (grid.z picks the split block's share)
+    const uint32_t vw = SPLIT > 1u ? blockIdx.z * Geo::WARPS + warp : warp;
+    const uint32_t strip = vw / (G * DS), gi = (vw / DS) % G, ds = vw % DS;
     const uint32_t h = kvh * G + gi;                // this warp's query head
     const uint32_t dcol = ds * 256u;                // this warp's D slice
     const uint32_t wq0 = q0 + strip * 16u;
@@ -419,7 +434,7 @@ __global__ void __launch_bounds__(256, 1) pd_eg2_attn_kernel(
     for (uint32_t t0 = lo; t0 < hi; t0 += KT) {
         // stage K and V (rows of this kv head), zero past the span
         constexpr uint32_t U = KT * (HD / 8u);
-        for (uint32_t u = tid; u < U; u += 256u) {
+        for (uint32_t u = tid; u < U; u += NT) {
             const uint32_t kk = u / (HD / 8u), d8 = (u % (HD / 8u)) * 8u;
             const uint32_t ks = t0 + kk;
             uint4 kv = make_uint4(0u, 0u, 0u, 0u), vv = kv;
@@ -701,6 +716,52 @@ int pd_eg2_attn(const void* q16, const void* k16, const void* v16, const void* c
         return cudaErrorInvalidValue;
     }
     return pd_launch_status();
+}
+
+// 829: 809's attention with each tile's warps spread over `split` blocks
+// (1, 2 or 4; see the kernel note) - bit-identical to 809 per row, for short
+// passes whose tile grid leaves most of the die idle.
+template <uint32_t HD, uint32_t SPLIT>
+static int pd_eg2_attn_split(const __half* q, const __half* k, const __half* v,
+                             const uint32_t* c, const uint32_t* t, uint32_t n_tiles, float* out,
+                             uint32_t window, cudaStream_t st) {
+    using Geo = PdEg2Geo<HD, SPLIT>;
+    static cudaError_t attr = cudaFuncSetAttribute(
+        pd_eg2_attn_kernel<HD, SPLIT>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        (int)Geo::SMEM);
+    if (attr != cudaSuccess) return attr;
+    pd_eg2_attn_kernel<HD, SPLIT><<<dim3(n_tiles, Geo::KH, SPLIT), 32u * Geo::WARPS, Geo::SMEM,
+                                    st>>>(q, k, v, c, t, out, window);
+    return pd_launch_status();
+}
+
+PD_EXPORT
+int pd_eg2_attn_s(const void* q16, const void* k16, const void* v16, const void* cu,
+                  const void* tiles, uint32_t n_tiles, void* out, uint32_t head_dim,
+                  uint32_t window, uint32_t split, void* stream) {
+    if (n_tiles == 0) return 0;
+    int dev = 0, cc = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&cc, cudaDevAttrComputeCapabilityMajor, dev);
+    if (cc < 8) return cudaErrorInvalidValue;
+    const __half* q = (const __half*)q16;
+    const __half* k = (const __half*)k16;
+    const __half* v = (const __half*)v16;
+    const uint32_t* c = (const uint32_t*)cu;
+    const uint32_t* t = (const uint32_t*)tiles;
+    float* o = (float*)out;
+    cudaStream_t st = (cudaStream_t)stream;
+#define PD_EG2_SPLIT(HD)                                                              \
+    switch (split) {                                                                  \
+        case 1u: return pd_eg2_attn_split<HD, 1u>(q, k, v, c, t, n_tiles, o, window, st); \
+        case 2u: return pd_eg2_attn_split<HD, 2u>(q, k, v, c, t, n_tiles, o, window, st); \
+        case 4u: return pd_eg2_attn_split<HD, 4u>(q, k, v, c, t, n_tiles, o, window, st); \
+        default: return cudaErrorInvalidValue;                                        \
+    }
+    if (head_dim == 256u) PD_EG2_SPLIT(256u)
+    if (head_dim == 512u) PD_EG2_SPLIT(512u)
+#undef PD_EG2_SPLIT
+    return cudaErrorInvalidValue;
 }
 
 // 810: mean-pool + L2-normalize [rows][768] token outputs into [n_seq][dims],

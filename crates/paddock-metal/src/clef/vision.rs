@@ -6,7 +6,7 @@ use paddock_models::{
     clef::ClefVisionConfig,
     safetensors::{ShardedSafetensors, StDtype},
 };
-pub(super) mod resize;
+pub(crate) mod resize;
 const E: usize = 1152;
 const W: usize = 4608;
 const P: usize = 1536;

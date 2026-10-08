@@ -35,6 +35,16 @@
 //    the wordmark beside it left off. Monochrome in the source (#171717), so
 //    currentColor like OpenAI/IBM; path geometry and viewBox unchanged. Source:
 //    https://aleph-alpha.com/_astro/logo-bm.C1UmWdTa_ZKMPHl.svg
+//  - The Intelligence Company (TIC Forestry): the company's own mark, from
+//    its BIMI logo (the verified-mark SVG its website serves under
+//    /vmc/). Monochrome black in the source, so currentColor like
+//    OpenAI/IBM; the white BIMI backdrop is dropped and the viewBox is the
+//    glyph's own 52:20 box, fit to HEIGHT like IBM's - letterboxed into a
+//    square it would be 5px tall at the inline call sites.
+//  - OpenBMB (MiniCPM): the official two-tone mark, openbmb.cn's own
+//    favicon.svg, path geometry and viewBox unchanged. Its blue is lifted on
+//    dark like Qwen's; the cyan reads on both grounds as shipped. Source:
+//    https://www.openbmb.cn/favicon.svg
 //  - Everyone else (the cloud-model makers): official marks from
 //    simple-icons, drawn in currentColor so they read in both themes -
 //    same treatment as OpenAI/IBM. Brands simple-icons doesn't carry
@@ -140,6 +150,46 @@ const SI: Record<string, { path: string; title: string }> = {
     <path d="M907.12,843.47l-78.12-59.94c-5.27-4.04-12.78-3.17-16.98,1.97-16.39,20.05-34.76,38.42-54.81,54.81-5.14,4.2-6.01,11.72-1.97,16.98l59.94,78.12c4.22,5.5,12.14,6.43,17.53,2.07,28.12-22.71,53.78-48.36,76.48-76.48,4.35-5.39,3.43-13.32-2.07-17.53Z" />
     <path d="M1337.73,702.72c2.66-5.97.13-12.88-5.63-15.95-52.36-27.92-88.01-83.04-88.01-146.52s35.65-118.6,88.01-146.52c5.77-3.07,8.29-9.98,5.63-15.95l-40.16-90.2c-2.84-6.37-10.42-9.17-16.66-6.05-94.84,47.43-159.96,145.47-159.96,258.72s65.12,211.28,159.96,258.72c6.23,3.12,13.82.31,16.66-6.05l40.16-90.2Z" />
     <path d="M583.27,702.72c-2.66-5.97-.13-12.88,5.63-15.95,52.36-27.92,88.01-83.04,88.01-146.52,0-63.48-35.65-118.6-88.01-146.52-5.77-3.07-8.29-9.98-5.63-15.95l40.16-90.2c2.84-6.37,10.42-9.17,16.66-6.05,94.84,47.43,159.96,145.47,159.96,258.72s-65.12,211.28-159.96,258.72c-6.23,3.12-13.82.31-16.66-6.05l-40.16-90.2Z" />
+  </svg>
+  <svg
+    v-else-if="vendor === 'The Intelligence Company'"
+    :width="(size * 52) / 20"
+    :height="size"
+    viewBox="0 0 52 20"
+    preserveAspectRatio="xMidYMid meet"
+    fill="currentColor"
+    role="img"
+    aria-label="The Intelligence Company"
+  >
+    <path d="m 22.6348,6.66667 h 6.7288 V 0 h -6.7288 z" />
+    <path
+      fill-rule="evenodd"
+      d="M 38.542,0 H 51.9996 V 6.66667 H 38.542 Z M 31.8125,19.9991 V 6.66577 h 6.7288 v 6.66663 h 13.4576 v 6.6667 z"
+    />
+    <path
+      d="M 9.76562e-4,13.3333 H 6.72979 V 20 h 6.72881 v -6.6667 h 6.7288 V 6.66667 H 13.4586 V 0 H 6.72979 V 6.66667 H 9.76562e-4 Z"
+    />
+  </svg>
+  <svg
+    v-else-if="vendor === 'OpenBMB'"
+    :width="size"
+    :height="size"
+    viewBox="0 0 28 28"
+    role="img"
+    aria-label="OpenBMB"
+  >
+    <path
+      class="vl__obmb"
+      fill-rule="evenodd"
+      clip-rule="evenodd"
+      d="M0 0.192747C0 0.0863655 0.0863568 2.67029e-05 0.192761 2.67029e-05H10.1965C10.3031 2.67029e-05 10.3892 0.0863655 10.3892 0.192747V4.32333C10.3892 4.4299 10.3031 4.51605 10.1965 4.51605H0.192761C0.0863568 4.51605 0 4.4299 0 4.32333V0.192747ZM0 11.9346C0 11.8282 0.0863568 11.7419 0.192761 11.7419H10.1965C10.3031 11.7419 10.3892 11.8282 10.3892 11.9346V16.0654C10.3892 16.1718 10.3031 16.2581 10.1965 16.2581H0.192761C0.0863568 16.2581 0 16.1718 0 16.0654V11.9346ZM0.192761 23.484C0.0863568 23.484 0 23.5701 0 23.6767V27.8073C0 27.9137 0.0863568 28 0.192761 28H10.1965C10.3031 28 10.3892 27.9137 10.3892 27.8073V23.6767C10.3892 23.5701 10.3031 23.484 10.1965 23.484H0.192761ZM5.87226 6.06359C5.87226 5.95721 5.95843 5.87087 6.06502 5.87087H16.0687C16.1751 5.87087 16.2615 5.95721 16.2615 6.06359V10.1944C16.2615 10.3007 16.1751 10.3871 16.0687 10.3871H6.06502C5.95843 10.3871 5.87226 10.3007 5.87226 10.1944V6.06359ZM6.06502 17.6129C5.95843 17.6129 5.87226 17.6993 5.87226 17.8057V21.9362C5.87226 22.0428 5.95843 22.129 6.06502 22.129H16.0687C16.1751 22.129 16.2615 22.0428 16.2615 21.9362V17.8057C16.2615 17.6993 16.1751 17.6129 16.0687 17.6129H6.06502Z"
+    />
+    <path
+      fill="#00D3ED"
+      fill-rule="evenodd"
+      clip-rule="evenodd"
+      d="M11.7385 0.19272C11.7385 0.0863388 11.8249 0 11.9313 0H21.9352C22.0416 0 22.1279 0.0863388 22.1279 0.19272V4.3233C22.1279 4.42988 22.0416 4.51602 21.9352 4.51602H11.9313C11.8249 4.51602 11.7385 4.42988 11.7385 4.3233V0.19272ZM11.7385 11.9346C11.7385 11.8282 11.8249 11.7419 11.9313 11.7419H21.9352C22.0416 11.7419 22.1279 11.8282 22.1279 11.9346V16.0654C22.1279 16.1718 22.0416 16.2581 21.9352 16.2581H11.9313C11.8249 16.2581 11.7385 16.1718 11.7385 16.0654V11.9346ZM11.9313 23.484C11.8249 23.484 11.7385 23.5701 11.7385 23.6767V27.8073C11.7385 27.9136 11.8249 28 11.9313 28H21.9352C22.0416 28 22.1279 27.9136 22.1279 27.8073V23.6767C22.1279 23.5701 22.0416 23.484 21.9352 23.484H11.9313ZM17.6108 6.06357C17.6108 5.95718 17.6971 5.87085 17.8035 5.87085H27.8073C27.9139 5.87085 28 5.95718 28 6.06357V10.1943C28 10.3007 27.9139 10.3871 27.8073 10.3871H17.8035C17.6971 10.3871 17.6108 10.3007 17.6108 10.1943V6.06357ZM17.8035 17.6129C17.6971 17.6129 17.6108 17.6993 17.6108 17.8056V21.9362C17.6108 22.0428 17.6971 22.1289 17.8035 22.1289H27.8073C27.9139 22.1289 28 22.0428 28 21.9362V17.8056C28 17.6993 27.9139 17.6129 27.8073 17.6129H17.8035Z"
+    />
   </svg>
   <img
     v-else-if="vendor === 'Google'"
@@ -318,6 +368,13 @@ const SI: Record<string, { path: string; title: string }> = {
 }
 [data-theme='dark'] .vl__nb {
   fill: #e6455f;
+}
+/* OpenBMB's blue, same story again: lifted on dark so it holds at 14px. */
+.vl__obmb {
+  fill: #315efe;
+}
+[data-theme='dark'] .vl__obmb {
+  fill: #6b8bff;
 }
 .vl__fallback {
   display: inline-flex;

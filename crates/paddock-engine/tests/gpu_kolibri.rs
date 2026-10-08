@@ -9,8 +9,10 @@
 //!   tracks the serial exact-f32 lane's (a divergence must sit on a near-tie
 //!   of the serial logits - the two lanes are different numeric classes).
 //! - `kolibri_nvfp4_*` (heavy + the `primitive-ai/Kolibri-1-NVFP4` dir): the
-//!   same two gates on the compressed-tensors NVFP4 build, and the SWA prefix
-//!   cache's back-off resume (a rewritten tail resumes behind the cut).
+//!   same two gates on the compressed-tensors NVFP4 build, the SWA prefix
+//!   cache's back-off resume (a rewritten tail resumes behind the cut), and
+//!   the reply checkpoint a tool call pins (the next turn resumes past the
+//!   reply).
 //!
 //! No llama.cpp release reads `kolibri1` yet, so there is no same-weights
 //! black-box reference for this family; the architecture cross-check is the
@@ -461,4 +463,123 @@ fn kolibri_nvfp4_prefix_backoff_resumes() {
         "resumed b picks differently (serial margin {gap:.3})"
     );
     assert!(dmax < 3.0, "resumed logits part by {dmax}");
+}
+
+/// The reply checkpoint (`Generator::reply_pin_at`): a reply that opens a
+/// tool call files itself under the prefix cache at the call, so the next
+/// turn - this prompt, the reply, then the tool's result - resumes past the
+/// reply instead of at the prompt's last page. The reply is the serial
+/// lane's greedy one (the exact-f32 reference), teacher-forced through the
+/// batched lane; b ends inside the next reasoning block, where the next
+/// token's distribution is broad, and the resumed logits must match the
+/// serial lane's as closely as a cold batched prefill does.
+#[test]
+fn kolibri_nvfp4_reply_pin_resumes_past_the_reply() {
+    if !common::heavy() {
+        return;
+    }
+    let Some(dir) = common::model("KOLIBRI_NVFP4", common::KOLIBRI_NVFP4) else {
+        return;
+    };
+    let Some(exec) = common::gpu_arc() else {
+        return;
+    };
+    let tok = GgufTokenizer::from_hf_dir(&dir).expect("tokenizer");
+    let mut text = String::from("<|im_start|>user\nHier ist ein Protokoll:\n");
+    for i in 0..60 {
+        text.push_str(&format!(
+            "Eintrag {i}: Paket P-{} von Ulm nach Kiel, Gewicht {} kg.\n",
+            1000 + 37 * i,
+            1 + i % 17
+        ));
+    }
+    text.push_str("Fasse das Protokoll kurz zusammen.<|im_end|>\n<|im_start|>assistant\n");
+    let a = tok.encode(&text).expect("encode");
+    let mut m = GpuLaguna::load_kolibri_nvfp4(exec, &dir, 4096).expect("load");
+    // serial: the prompt, a greedy reply of 70 tokens fed, then a tool result
+    let mut logits = Vec::new();
+    for &t in &a {
+        logits = m.forward(t).expect("serial a");
+    }
+    let mut history = a.clone();
+    for _ in 0..70 {
+        let t = top2(&logits).0;
+        history.push(t);
+        logits = m.forward(t).expect("serial reply");
+    }
+    let pos = history.len() as u32; // every reply token fed
+    let mut b = history.clone();
+    b.extend(
+        tok.encode("<|im_end|>\n<|im_start|>user\n<tool_response>\n42\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n")
+            .expect("encode"),
+    );
+    let mut serial = logits;
+    for &t in &b[history.len()..] {
+        serial = m.forward(t).expect("serial b");
+    }
+    // batched: prefill the prompt in slot 0, teacher-force the reply, pin
+    m.enable_batch(2).expect("enable_batch");
+    m.forward_prefill(0, &a).expect("prefill a");
+    for (p, &t) in history.iter().enumerate().skip(a.len()) {
+        m.forward_batch(&[t], &[p as u32]).expect("reply row");
+    }
+    m.reply_pin_at(0, &history, pos);
+    let warm = m.forward_prefill(1, &b).expect("warm b");
+    let reused = m.take_prefill_reused(1);
+    let prompt_cut = (a.len() - 1) / 16 * 16;
+    let pin_cut = pos as usize / 16 * 16;
+    println!(
+        "a {} tokens (last cut {prompt_cut}), reply to {pos} (pin cut {pin_cut}), b {}: resumed at {reused}",
+        a.len(),
+        b.len()
+    );
+    let (ts, gap) = top2(&serial);
+    let (tw, _) = top2(&warm);
+    let dmax = serial
+        .iter()
+        .zip(&warm)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    let (kl, top5) = kl_top5(&serial, &warm);
+    println!(
+        "serial top1 {ts} (margin {gap:.3}) resumed top1 {tw}, max |diff| {dmax:.4}, \
+         KL {kl:.2e}, top-5 shared {top5}"
+    );
+    assert_eq!(
+        reused, pin_cut,
+        "b must resume at the reply's pin, past the prompt"
+    );
+    // the class the cold batched prefill of b sits in against the serial
+    // lane (GB10, 2026-10-08: KL 3.4e-2, max |diff| 1.13; resumed 3.7e-2, 1.35)
+    assert!(
+        ts == tw || gap < 0.3,
+        "resumed b picks differently (serial margin {gap:.3})"
+    );
+    assert!(kl < 0.1, "resumed distribution parts by KL {kl:.3e}");
+    assert!(dmax < 3.0, "resumed logits part by {dmax}");
+}
+
+/// KL(p || q) of two logit rows' softmaxes, and how many of p's top 5 are q's.
+fn kl_top5(p: &[f32], q: &[f32]) -> (f64, usize) {
+    let sm = |l: &[f32]| {
+        let m = l.iter().copied().fold(f32::MIN, f32::max) as f64;
+        let e: Vec<f64> = l.iter().map(|&x| (x as f64 - m).exp()).collect();
+        let z: f64 = e.iter().sum();
+        e.into_iter().map(|x| x / z).collect::<Vec<f64>>()
+    };
+    let (pp, qq) = (sm(p), sm(q));
+    let kl = pp
+        .iter()
+        .zip(&qq)
+        .filter(|(a, _)| **a > 0.0)
+        .map(|(a, b)| a * (a / b.max(1e-300)).ln())
+        .sum();
+    let top = |v: &[f32]| {
+        let mut i: Vec<usize> = (0..v.len()).collect();
+        i.sort_by(|&a, &b| v[b].total_cmp(&v[a]));
+        i.truncate(5);
+        i
+    };
+    let (tp, tq) = (top(p), top(q));
+    (kl, tp.iter().filter(|i| tq.contains(i)).count())
 }

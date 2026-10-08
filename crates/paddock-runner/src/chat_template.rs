@@ -5,6 +5,8 @@
 
 use minijinja::{Environment, Error, ErrorKind, Value};
 
+mod py_json;
+
 /// Render `messages`/`tools` through `template`, ready for tokenization.
 /// `kwargs` (request `chat_template_kwargs`, vLLM-style) overlays the default
 /// context - `enable_thinking` for qwen3.5, `reasoning_effort` for gpt-oss.
@@ -88,6 +90,11 @@ pub fn render_with_specials(
         minijinja_contrib::pycompat::unknown_method_callback(state, value, method, args)
     });
 
+    // `tojson` is Python's json.dumps, the filter transformers renders with
+    // (and llama.cpp reproduces) - minijinja's own is compact and
+    // HTML-escapes `<>&'`; see `py_json`
+    env.add_filter("tojson", py_json::tojson);
+
     // helpers HF chat templates commonly call
     env.add_function("strftime_now", |fmt: String| {
         Ok(Value::from(chrono::Local::now().format(&fmt).to_string()))
@@ -101,19 +108,6 @@ pub fn render_with_specials(
     // semantics (laguna's template does). minijinja has no such tag, so they
     // must be neutralized before parse; whitespace-control dashes survive.
     let template = neutralize_generation_tags(template);
-    // `tojson(ensure_ascii=False)` (laguna renders history tool-call values
-    // with it) asks for raw UTF-8 instead of \uXXXX escapes - which is what
-    // minijinja's plain `tojson` already emits, but minijinja rejects the
-    // unknown kwarg. Dropping it is behavior-preserving. `ensure_ascii=True`
-    // would be a real divergence (we don't escape non-ASCII), so that form is
-    // left alone to fail loudly rather than silently mis-render.
-    let template: std::borrow::Cow<'_, str> = if template.contains("tojson(ensure_ascii=False)") {
-        template
-            .replace("tojson(ensure_ascii=False)", "tojson")
-            .into()
-    } else {
-        template
-    };
     // ternaries inside call arguments - a minijinja PARSER gap, so this has to
     // happen before add_template or nothing renders at all
     let template: std::borrow::Cow<'_, str> = match parenthesize_call_ternaries(&template) {
@@ -782,8 +776,17 @@ pub fn system_reminder(text: &str) -> String {
 ///
 /// Text only, as the OpenAI schema defines system content - a non-text part
 /// is a 400 here rather than something dropped on the way to the template.
+///
+/// `native` (the served template renders such a turn in place itself - see
+/// [`renders_late_system`]): it stays a `system` turn where it sits, its text
+/// flattened the same way, and the template decides how it reads. That is
+/// the faithful form wherever it exists: a template that keeps an assistant
+/// turn's reasoning only after the last USER message (Kolibri's) would see a
+/// reminder folded into a user turn as a new question and drop the model's
+/// own reasoning mid tool loop.
 pub fn inline_late_system_messages(
     messages: &[serde_json::Value],
+    native: bool,
 ) -> Result<Vec<serde_json::Value>, String> {
     use serde_json::{Value, json};
     fn role(m: &Value) -> Option<&str> {
@@ -797,6 +800,19 @@ pub fn inline_late_system_messages(
         return Ok(messages.to_vec());
     }
     let mut out: Vec<Value> = messages[..lead].to_vec();
+    if native {
+        for m in &messages[lead..] {
+            if !is_sys(m) {
+                out.push(m.clone());
+                continue;
+            }
+            let text = late_system_text(m)?;
+            if !text.trim().is_empty() {
+                out.push(json!({"role": "system", "content": text}));
+            }
+        }
+        return Ok(out);
+    }
     // reminders waiting for the user turn they will be prepended to
     let mut pending: Vec<String> = Vec::new();
     for (i, m) in messages.iter().enumerate().skip(lead) {
@@ -863,6 +879,35 @@ fn late_system_text(m: &serde_json::Value) -> Result<String, String> {
             .collect::<Result<String, String>>(),
         None | Some(Value::Null) => Ok(String::new()),
         Some(_) => Err("message content must be a string or an array of parts".into()),
+    }
+}
+
+/// Whether `template` renders a `system` turn past the opening run itself,
+/// where it sits: a short conversation with one between an assistant turn
+/// and a user turn renders without error and its text lands between the
+/// two. Qwen's templates raise there and gemma's has no slot (both: false,
+/// they get the `<system-reminder>` fold); Kolibri's renders a system turn
+/// in place. A template that hoists it to the front reads false too - that
+/// would rewrite the cached prefix of the whole conversation.
+pub fn renders_late_system(template: &str) -> bool {
+    use serde_json::json;
+    const MARK: &str = "paddock-late-system-probe";
+    let msgs = [
+        json!({"role": "user", "content": "probe-user-a"}),
+        json!({"role": "assistant", "content": "probe-assistant"}),
+        json!({"role": "system", "content": MARK}),
+        json!({"role": "user", "content": "probe-user-b"}),
+    ];
+    let Ok(out) = render(template, &normalize_messages(&msgs), None, None) else {
+        return false;
+    };
+    match (
+        out.find("probe-assistant"),
+        out.find(MARK),
+        out.find("probe-user-b"),
+    ) {
+        (Some(a), Some(s), Some(b)) => a < s && s < b,
+        _ => false,
     }
 }
 
@@ -1612,7 +1657,40 @@ mod tests {
         // (none of the six emits a bare boolean - gemma4 and gpt-oss build the
         // strings themselves, and `| tojson` still emits lowercase JSON).
         assert_eq!(render1("{{ 'abc'.startswith('ab') }}"), "True");
-        assert_eq!(render1("{{ {'a': true} | tojson }}"), "{\"a\":true}");
+        assert_eq!(render1("{{ {'a': true} | tojson }}"), "{\"a\": true}");
+    }
+
+    /// `tojson` is Python's json.dumps (transformers' filter, which llama.cpp
+    /// reproduces): its separators, the mapping's own key order, no HTML
+    /// escaping, and the kwargs templates pass.
+    #[test]
+    fn tojson_writes_what_python_writes() {
+        let r = |t: &str| super::render(t, &[], None, None).expect("render");
+        assert_eq!(
+            r("{{ {'b': 1, 'a': [1.0, 1e-05, none, 'don\\'t <x> & \"y\"']} | tojson }}"),
+            r#"{"b": 1, "a": [1.0, 1e-05, null, "don't <x> & \"y\""]}"#
+        );
+        assert_eq!(
+            r("{{ {'k': 'å'} | tojson(ensure_ascii=True) }}"),
+            r#"{"k": "\u00e5"}"#
+        );
+        assert_eq!(
+            r("{{ {'k': 'å'} | tojson(ensure_ascii=False) }}"),
+            r#"{"k": "å"}"#
+        );
+        assert_eq!(
+            r("{{ {'b': 1, 'a': [2]} | tojson(indent=2) }}"),
+            "{\n  \"b\": 1,\n  \"a\": [\n    2\n  ]\n}"
+        );
+        assert_eq!(
+            r("{{ {'b': 1, 'a': 2} | tojson(sort_keys=True) }}"),
+            r#"{"a": 2, "b": 1}"#
+        );
+        assert_eq!(
+            r("{{ {'b': 1, 'a': 2} | tojson(separators=(',', ':')) }}"),
+            r#"{"b":1,"a":2}"#
+        );
+        assert_eq!(r("{{ [] | tojson }}{{ {} | tojson(indent=2) }}"), "[]{}");
     }
 
     /// The precondition, as a test: this function is DESTRUCTIVE to image
@@ -1725,11 +1803,22 @@ mod tests {
                 user("bye"),
             ];
             assert!(render(QWEN_RULE, &normalize_messages(&msgs), None, None).is_err());
-            let out = inline_late_system_messages(&msgs).unwrap();
+            let out = inline_late_system_messages(&msgs, false).unwrap();
             let text = render(QWEN_RULE, &normalize_messages(&out), None, None).expect("renders");
             assert!(
                 text.contains("<system-reminder>\nanswer in Swedish\n</system-reminder>\n\nbye")
             );
+        }
+
+        #[test]
+        fn a_native_template_keeps_the_turn_where_it_sits() {
+            let dev = json!({"role": "developer", "content": [{"type": "text", "text": "d"}]});
+            let msgs = [user("a"), asst("b"), sys("x"), dev, sys("  "), user("c")];
+            let out = inline_late_system_messages(&msgs, true).unwrap();
+            // in order, as system turns with flat text; an empty one is dropped
+            assert_eq!(roles(&out), "UASSU");
+            assert_eq!(out[2], sys("x"));
+            assert_eq!(out[3], sys("d"));
         }
 
         #[test]
@@ -1741,13 +1830,16 @@ mod tests {
                 json!({"role": "developer", "content": "b"}),
                 user("hi"),
             ];
-            assert_eq!(inline_late_system_messages(&msgs).unwrap(), msgs.to_vec());
+            assert_eq!(
+                inline_late_system_messages(&msgs, false).unwrap(),
+                msgs.to_vec()
+            );
         }
 
         #[test]
         fn placement_by_neighbour() {
             // after a user turn: appended to it
-            let out = inline_late_system_messages(&[user("hi"), sys("x")]).unwrap();
+            let out = inline_late_system_messages(&[user("hi"), sys("x")], false).unwrap();
             assert_eq!(roles(&out), "U");
             assert_eq!(
                 out[0]["content"],
@@ -1755,20 +1847,24 @@ mod tests {
             );
             // between assistant and user: prepended to the user turn
             let out =
-                inline_late_system_messages(&[user("a"), asst("b"), sys("x"), user("c")]).unwrap();
+                inline_late_system_messages(&[user("a"), asst("b"), sys("x"), user("c")], false)
+                    .unwrap();
             assert_eq!(roles(&out), "UAU");
             assert_eq!(
                 out[2]["content"],
                 "<system-reminder>\nx\n</system-reminder>\n\nc"
             );
             // last after an assistant turn: a user turn of its own
-            let out = inline_late_system_messages(&[user("a"), asst("b"), sys("x")]).unwrap();
+            let out =
+                inline_late_system_messages(&[user("a"), asst("b"), sys("x")], false).unwrap();
             assert_eq!(roles(&out), "UAU");
             // after tool results, before the assistant: its own turn there
             let tool = json!({"role": "tool", "content": "42", "tool_call_id": "t"});
-            let out =
-                inline_late_system_messages(&[user("a"), asst("b"), tool, sys("x"), asst("c")])
-                    .unwrap();
+            let out = inline_late_system_messages(
+                &[user("a"), asst("b"), tool, sys("x"), asst("c")],
+                false,
+            )
+            .unwrap();
             assert_eq!(roles(&out), "UATUA");
         }
 
@@ -1781,7 +1877,7 @@ mod tests {
                 json!({"role": "developer", "content": "y"}),
                 user("c"),
             ];
-            let out = inline_late_system_messages(&msgs).unwrap();
+            let out = inline_late_system_messages(&msgs, false).unwrap();
             assert_eq!(roles(&out), "UAU");
             assert_eq!(
                 out[2]["content"],
@@ -1796,7 +1892,7 @@ mod tests {
             let head = [sys("s"), user("a"), asst("b")];
             let mut with = head.to_vec();
             with.extend([sys("x"), user("c")]);
-            let out = inline_late_system_messages(&with).unwrap();
+            let out = inline_late_system_messages(&with, false).unwrap();
             assert_eq!(out[..head.len()], head[..]);
         }
 
@@ -1806,19 +1902,20 @@ mod tests {
             let parts = json!({"role": "developer", "content": [
                 {"type": "input_text", "text": "sw"}, {"type": "text", "text": "edish"},
             ]});
-            let out = inline_late_system_messages(&[user("a"), parts]).unwrap();
+            let out = inline_late_system_messages(&[user("a"), parts], false).unwrap();
             assert!(out[0]["content"].as_str().unwrap().contains("\nswedish\n"));
             let img = json!({"role": "system", "content": [{"type": "image_url", "image_url": {"url": "x"}}]});
-            let e = inline_late_system_messages(&[user("a"), img]).unwrap_err();
+            let e = inline_late_system_messages(&[user("a"), img], false).unwrap_err();
             assert!(e.contains("text only"), "{e}");
         }
 
         #[test]
         fn image_bearing_user_turns_take_a_text_part() {
             let u = json!({"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]});
-            let out = inline_late_system_messages(&[u.clone(), sys("x")]).unwrap();
+            let out = inline_late_system_messages(&[u.clone(), sys("x")], false).unwrap();
             assert_eq!(out[0]["content"][1]["type"], "text");
-            let out = inline_late_system_messages(&[user("a"), asst("b"), sys("x"), u]).unwrap();
+            let out =
+                inline_late_system_messages(&[user("a"), asst("b"), sys("x"), u], false).unwrap();
             assert_eq!(
                 out[2]["content"][0]["type"], "text",
                 "prepended ahead of the image"

@@ -139,7 +139,7 @@ struct EndpointSettingsView: View {
       EndpointMemorySettings(editor: editor).disabled(disabled)
       EndpointResidencySettings(editor: editor).disabled(disabled)
       EndpointKVOffloadSettings(editor: editor).disabled(disabled)
-      if editor.capabilities.contains("chat") || editor.visionServed {
+      if editor.capabilities.contains("chat") || editor.forensicsPossible {
         EndpointFormCard("Document & image intelligence") {
           if editor.forensicsPossible {
             Toggle(isOn: $editor.forensics) {

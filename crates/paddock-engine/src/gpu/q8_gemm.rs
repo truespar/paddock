@@ -1020,6 +1020,53 @@ impl GpuExecutor {
         })
     }
 
+    /// True when the pack carries the medium-row mmq tile (slot 828).
+    pub fn has_q8_0_gemm_mmq_s(&self) -> bool {
+        self.kernels.q8_0_gemm_mmq_s.is_some()
+    }
+
+    /// [`Self::q8_0_gemm_mmq`]'s tile at a smaller output footprint, elected
+    /// in the pack by how well the grid fills the die (slot 828): every
+    /// output bit-identical to the plain 128 x 128 tiling (`fixup` NULL), so
+    /// a caller may switch by row count without its outputs depending on the
+    /// choice. No K split, no bias.
+    pub fn q8_0_gemm_mmq_s(
+        &self,
+        w: &RepackedQ8,
+        yq: &CudaSlice<u8>,
+        y: &mut CudaSlice<f32>,
+        batch: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .q8_0_gemm_mmq_s
+            .ok_or(GpuError::MissingOp("q8_0_gemm_mmq_s"))?;
+        let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
+        if in_dim % 32 != 0
+            || yq.len() < super::mmq_bytes(in_dim, batch)
+            || y.len() < batch * out_dim
+        {
+            return Err(oob("q8_0_gemm_mmq_s: buffers under the GEMM geometry"));
+        }
+        let (dp, _g1) = w.data.device_ptr(&self.stream);
+        let (sp, _g2) = w.scale.device_ptr(&self.stream);
+        let (qp, _g3) = yq.device_ptr(&self.stream);
+        let (yp, _g4) = y.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slot 828); bounds checked above
+        check(unsafe {
+            f(
+                dp as *const _,
+                sp as *const _,
+                qp as *const _,
+                yp as *mut _,
+                in_dim as u32,
+                out_dim as u32,
+                batch as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// True when the pack carries the K-split Q8_0 GEMV (slot 588).
     pub fn has_q8_0_gemv_sk(&self) -> bool {
         self.kernels.q8_0_gemv_sk.is_some()

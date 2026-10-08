@@ -46,8 +46,95 @@
 // which the G<=8 build zero-pads and ignores, become real heads: softmax
 // state doubles to [16] and the fold/P-store/corr/o-store paths handle the
 // second row per lane. Nemotron's G=16 fills the m16 tile exactly.
+//
+// The head-packed arm (pd_attn_decode_batch_partial_paged, gemm/f32_qkv.cuh)
+// - lagd later WIDENED: the fp8 KV hd128 arm. Started as nemotron's
+// full-attention shape (G=16, no window), which rode vec8's scalar
+// per-q-head walk - profiled at 4.7%
+// DRAM, latency-bound, where a head-packed mma kernel (FlashInfer's
+// shape) streams KV once per group. lagd is that structure and G=16
+// fills its m16 tile exactly.
+//
+// The original gate said `group >= 9 && swa_window == 0`, and that cost
+// real ground: decode performance sorts by ARM, not by model. Every mma
+// arm lands within ~5% of the best kernel available; every shape falling
+// through to a scalar walk is 2-5x behind, and G=8 plus every windowed
+// shape had no mma arm at all.
+//
+// Both clauses were conservatism, not capability, and the kernel says so:
+//   - WINDOW: lagd computes `first_pos` from swa_window with the same
+//     expression as every other arm and stages from it. A decode row's
+//     window is a contiguous RANGE, not a mask, so there is no masking to
+//     add. The f16 KV lagd arm (the GQA branch) has served laguna's windowed layers
+//     for a long time - the windowed path is production-proven, it was only
+//     the fp8 twin that was fenced off.
+//   - G=8: the base (WIDE=false) build is the G<=8 build - q rows pad to
+//     16 mma rows and every store guards `rr < G`. It only ever lacked
+//     the fp8 instantiation, because nemotron did not need one.
+// So this is an instantiation + gate widening, the same class of change
+// that lifted the equivalent prefill shapes out of the scalar band.
+//
+// WIDE is picked by group: >8 uses the frag half-1 rows as real heads,
+// ==8 fills half 0 exactly and leaves half 1 zero-padded (running WIDE
+// at G=8 would be correct but would double the mma work on dead rows).
+// pd_pdl_go, not a plain launch: the arms this replaces (vec8, the
+// GQA-fused walk) ride the decode cascade and the laguna chain law
+// stands - arm + launcher are one change. The engine mirrors this
+// election in its split budget (n_kv-based, not nh-based).
+// Kill: PADDOCK_NO_ATTN_HP16 (falls back to vec8 / the GQA walk).
+// batch >= 1 since GB10 2026-09-11 (was >= 2, the width the arm was
+// built for): at one row the head-packed walk is faster at every context
+// on the small die - bench/nemo_dec_attn_bench.cu B=1: ctx 128 5.7 vs
+// vec8's 6.2 us, 1024 9.9 vs 15.5, 4096 28.3 vs 54.1, 7680 52.9 vs 147.6
+// - and the long-prompt board had lost the c1 cell at 7.5k tokens on the
+// vec8 walk's 327 us per layer (GB10, 2026-09-11). The r = 1
+// lane thereby joins the r >= 2 class (the NXQ2/NXP3 split-f16 walk);
+// its gates are the class gates, not bit-identity.
+//
+// f16 KV at G 9..16 joined on GB10 2026-09-25. f16 G<=8 was always lagd
+// (the launcher's GQA branch); past 8 the GQA gate dropped it onto the plain
+// per-(q-head, split) walk, where each of the group's heads re-reads the
+// group's KV: ~24 GB/s, nemotron's whole decode-vs-depth cliff (67.9 ->
+// 12.5 tok/s from 10K to 259K). bench/nemo_dec_attn_long_gb10_bench.cu,
+// 32q/2kv: 256K 11.2 ms -> 1.38 ms a layer (~193 GB/s); laguna's G9
+// window-512 shape 43 -> 9-10 us at one row, 394 -> 94 at r 8. Class:
+// the lagd split-f16 walk (rel 1e-6..7e-5 vs the exact-f32 walk, the
+// same class the G<=8 f16 lane and every fp8 hp16 row already serve).
+
+#define PD_LAGD_SMEM_SPLIT \
+    (2u * 16u * 136u * 2u + 3u * 16u * 40u * 2u + 2u * 2u * 32u * 136u * 2u)
+// RR (raw ring, the paged fp8 arm): q + P planes + ONE f16 K/V pane + the
+// 2-deep raw e4m3 ring (2 x K,V x 32 rows x 128 B)
+#define PD_LAGD_SMEM_RR \
+    (2u * 16u * 136u * 2u + 3u * 16u * 40u * 2u + 2u * 32u * 136u * 2u + 2u * 2u * 32u * 128u)
+#define PD_LAGD_SMEM_F16 \
+    (16u * 136u * 2u + 16u * 40u * 2u + 2u * 2u * 32u * 136u * 2u)
+
+// two e4m3 bytes -> two f16 (one paired convert; exact)
+__device__ __forceinline__ uint32_t pd_lagd_cvt2(unsigned short u) {
+    const __half2_raw h = __nv_cvt_fp8x2_to_halfraw2(u, __NV_E4M3);
+    return (uint32_t)h.x | ((uint32_t)h.y << 16);
+}
+//
+// RR (raw ring, fp8 only): the in-place expand above keeps each tile's raw
+// e4m3 rows inside its own f16 slots, so a tile is staged, expanded and
+// consumed in one double-buffered slot pair - one tile in flight while one
+// computes, and the expand needs a mid barrier (its reads and writes overlap).
+// RR stages raw rows into their own 2-deep ring (8 KB a tile) and expands
+// each tile into ONE f16 K/V pane: the expand reads and writes different
+// bytes (no mid barrier), the freed ring slot takes tile t+2 right after the
+// expand (two tiles in flight, not one), and the convert is the paired
+// e4m3x2 -> f16x2 instruction with 16-byte stores instead of per-element
+// cvts and 2-byte stores. Same e4m3 -> f16 values (exact both ways), same
+// pane bytes, same mma order: bit-identical to RR=false. 46,336 B of smem
+// (the slot pairs took 47,360) - 2 CTA/SM either way. GB10, one row against
+// FlashInfer's XQA on the same KV bytes (bench/rival_flashinfer_attn.py):
+// Kolibri G12 at the engine's 16 splits 183-185 -> 221-226 GB/s at 131K-262K
+// (0.82x -> 0.99-1.02x theirs); Nemotron G16 at its 24 splits 177-178 ->
+// 210-218 GB/s (0.80-0.83x -> 0.97-0.99x). Output digests identical over
+// every hd128 shape (odd lengths, partial tiles, windows, 1-8 rows).
 template <uint32_t TILE, uint32_t NXQ, uint32_t NXP, bool PAGED,
-          typename KVT = __half, bool WIDE = false>
+          typename KVT = __half, bool WIDE = false, bool RR = false>
 __global__ void pd_attn_decode_lagd_kernel(
     const float* __restrict__ q, const KVT* __restrict__ kc,
     const KVT* __restrict__ vc, float* __restrict__ out_o,
@@ -59,6 +146,7 @@ __global__ void pd_attn_decode_lagd_kernel(
 #if PD_FA_OK
     constexpr uint32_t HD = 128u;
     constexpr bool F8 = sizeof(KVT) == 1u;
+    static_assert(!RR || (F8 && PAGED), "the raw ring is the paged fp8 arm");
     // decode-graph PDL: no-op under the plain laguna launches; the fp8 arm
     // replaces a pd_pdl_go'd kernel (vec8) and must keep the cascade armed
     PD_PDL_ARM();
@@ -84,6 +172,9 @@ __global__ void pd_attn_decode_lagd_kernel(
     __half* s_qh = (__half*)lagd_smraw;                 // [NXQ][16][row_e]
     __half* s_wh = s_qh + (size_t)NXQ * 16u * row_e;    // [NXP][16][w_s]
     __half* s_kv = s_wh + (size_t)NXP * 16u * w_s;      // [2][K,V][TILE][row_e]
+                                                        // (RR: [K,V][TILE][row_e])
+    // RR: the raw ring after the single pane, [2][K,V][TILE][HD] bytes
+    unsigned char* s_raw = (unsigned char*)(s_kv + (size_t)2u * TILE * row_e);
     __shared__ float s_m[16], s_l[16], s_corr[16];
     __shared__ float s_pmax[NSW][16], s_psum[NSW][16];
 
@@ -154,16 +245,78 @@ __global__ void pd_attn_decode_lagd_kernel(
         pd_attn_cpa_commit();
     };
 
+    // RR stage: tile t0's raw e4m3 rows into ring slot rs (K then V, HD bytes
+    // a row); rows past the span are zeroed (they expand to f16 zeros, which
+    // PV weighs by exact 0)
+    auto stage_raw = [&](uint32_t rs, uint32_t t0) {
+        const uint32_t n_t = hi - t0 < TILE ? hi - t0 : TILE;
+        unsigned char* rb = s_raw + (size_t)rs * 2u * TILE * HD;
+        for (uint32_t i = d; i < 2u * TILE * lines; i += nth) {
+            const uint32_t kvsel = i / (TILE * lines);
+            const uint32_t j = i - kvsel * TILE * lines;
+            const uint32_t p = j / lines, l = j - p * lines;
+            unsigned char* dst = rb + ((size_t)kvsel * TILE + p) * HD + l * 16u;
+            if (p < n_t) {
+                const uint32_t gpos = first_pos + t0 + p;
+                const KVT* src = (kvsel ? vc : kc)
+                    + (size_t)bt[gpos >> 4] * 16u * kv_dim
+                    + (size_t)(gpos & 15u) * kv_dim + (size_t)kvh * HD;
+                pd_attn_cpa16(dst, (const char*)src + l * 16u);
+            } else {
+                *(uint4*)dst = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+        pd_attn_cpa_commit();
+    };
+    // RR expand: ring slot rs -> the pane, one 16-byte raw chunk (16 e4m3)
+    // per step as eight paired converts and two 16-byte stores
+    auto expand_rr = [&](uint32_t rs) {
+        const unsigned char* rb = s_raw + (size_t)rs * 2u * TILE * HD;
+        for (uint32_t c = d; c < 2u * TILE * lines; c += nth) {
+            const uint32_t kvsel = c / (TILE * lines);
+            const uint32_t rem = c - kvsel * TILE * lines;
+            const uint32_t p = rem / lines, j = rem - p * lines;
+            const uint4 rw = *(const uint4*)(rb + ((size_t)kvsel * TILE + p) * HD + j * 16u);
+            uint4 e0, e1;
+            e0.x = pd_lagd_cvt2((unsigned short)rw.x);
+            e0.y = pd_lagd_cvt2((unsigned short)(rw.x >> 16));
+            e0.z = pd_lagd_cvt2((unsigned short)rw.y);
+            e0.w = pd_lagd_cvt2((unsigned short)(rw.y >> 16));
+            e1.x = pd_lagd_cvt2((unsigned short)rw.z);
+            e1.y = pd_lagd_cvt2((unsigned short)(rw.z >> 16));
+            e1.z = pd_lagd_cvt2((unsigned short)rw.w);
+            e1.w = pd_lagd_cvt2((unsigned short)(rw.w >> 16));
+            __half* wb = s_kv + ((size_t)kvsel * TILE + p) * row_e + (size_t)j * 16u;
+            *(uint4*)wb = e0;
+            *(uint4*)(wb + 8u) = e1;
+        }
+    };
+
     __syncthreads();
-    if (lo < hi) stage(0u, lo);
+    if constexpr (RR) {
+        if (lo < hi) stage_raw(0u, lo);
+        if (lo + TILE < hi) stage_raw(1u, lo + TILE);
+    } else {
+        if (lo < hi) stage(0u, lo);
+    }
     uint32_t bf = 0;
     for (uint32_t t0 = lo; t0 < hi; t0 += TILE, bf ^= 1u) {
         const uint32_t n_t = hi - t0 < TILE ? hi - t0 : TILE;
         const bool more = t0 + TILE < hi;
+        if constexpr (RR) {
+            // the previous tile's end barrier already retired every read of
+            // the pane; tile t's raw group is the oldest pending one
+            if (more) pd_attn_cpa_wait1(); else pd_attn_cpa_wait0();
+            __syncthreads();
+            expand_rr(bf);
+            __syncthreads();
+            if (t0 + 2u * TILE < hi) stage_raw(bf, t0 + 2u * TILE);
+        } else {
         if (more) stage(bf ^ 1u, t0 + TILE);
         if (more) pd_attn_cpa_wait1(); else pd_attn_cpa_wait0();
         __syncthreads();
-        if constexpr (F8) {
+        }
+        if constexpr (F8 && !RR) {
             // expand buffer bf's raw e4m3 rows (front 128 B of each f16 row
             // slot) to f16 in place. Reads and writes overlap inside a row,
             // so: every thread loads its 16-byte chunks to registers, one
@@ -199,8 +352,8 @@ __global__ void pd_attn_decode_lagd_kernel(
             }
             __syncthreads();
         }
-        const __half* kbuf = s_kv + (size_t)(bf * 2u) * TILE * row_e;
-        const __half* vbuf = s_kv + ((size_t)(bf * 2u) + 1u) * TILE * row_e;
+        const __half* kbuf = s_kv + (size_t)(RR ? 0u : bf * 2u) * TILE * row_e;
+        const __half* vbuf = s_kv + ((size_t)(RR ? 0u : bf * 2u) + 1u) * TILE * row_e;
         // scores in registers: warp w owns cols [w*8, +8); m16n8k16 over the
         // head dim, q frags from the f16 plane(s), K rows as B (no trans)
         float dfr[4] = {0.f, 0.f, 0.f, 0.f};

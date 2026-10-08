@@ -6,6 +6,7 @@ enum ModelStartPurpose: String, CaseIterable, Identifiable {
   case all = "All models"
   case speech = "Speech to text"
   case tables = "Tables"
+  case embeddings = "Embeddings & rerank"
   var id: Self { self }
 
   func matches(_ artifact: CatalogArtifact, model: CatalogModel) -> Bool {
@@ -13,6 +14,9 @@ enum ModelStartPurpose: String, CaseIterable, Identifiable {
     case .all: true
     case .speech: (artifact.runtime?.capability ?? model.capability).contains("transcription")
     case .tables: (artifact.runtime?.capability ?? model.capability).contains("tabular")
+    case .embeddings:
+      !(Set(artifact.runtime?.capability ?? model.capability).intersection(["embeddings", "rerank"]))
+        .isEmpty
     }
   }
 

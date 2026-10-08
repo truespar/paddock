@@ -79,29 +79,51 @@ struct Axis {
 /// One plan per axis, replaced on geometry changes. Repeated webcam frames
 /// reuse both coefficient uploads without a growing shape cache.
 #[derive(Default)]
-pub(super) struct Cache {
+pub(crate) struct Cache {
     axes: [Option<Axis>; 2],
 }
 
 impl Cache {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.axes.iter().all(Option::is_none)
+    }
     pub(super) fn pixels(
         &mut self,
         d: &MetalDevice,
         im: &ClefImage,
         pillow: bool,
     ) -> Result<Buffer> {
-        let (h, w) = im.resized;
-        if im
-            .height
+        self.pixels_raw(d, &im.rgb, im.width, im.height, im.resized, pillow)
+    }
+
+    pub(crate) fn pixels_raw(
+        &mut self,
+        d: &MetalDevice,
+        rgb: &[u8],
+        width: usize,
+        height: usize,
+        resized: (usize, usize),
+        pillow: bool,
+    ) -> Result<Buffer> {
+        let (h, w) = resized;
+        if width == 0
+            || height == 0
+            || w == 0
+            || h == 0
+            || width.checked_mul(height).and_then(|n| n.checked_mul(3)) != Some(rgb.len())
+        {
+            return Err(error("invalid RGB resize geometry"));
+        }
+        if height
             .checked_mul(w)
             .and_then(|n| n.checked_mul(3))
             .is_none_or(|n| n > 192 << 20)
         {
             return Err(error("image resize staging exceeds 192 MiB"));
         }
-        let mut source = d.upload(&im.rgb)?;
+        let mut source = d.upload(rgb)?;
         for (index, (input, output, lines, horizontal)) in
-            [(im.width, w, im.height, true), (im.height, h, w, false)]
+            [(width, w, height, true), (height, h, w, false)]
                 .into_iter()
                 .enumerate()
         {

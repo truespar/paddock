@@ -62,7 +62,7 @@ pub enum CodecError {
 /// Encode one record for storage: CBOR -> zstd (dict v1) -> version prefix.
 pub fn encode_record(v: &Value) -> Result<Vec<u8>, CodecError> {
     let mut cbor = Vec::with_capacity(512);
-    ciborium::into_writer(v, &mut cbor).map_err(|e| CodecError::Cbor(e.to_string()))?;
+    ciborium::into_writer(&sorted(v), &mut cbor).map_err(|e| CodecError::Cbor(e.to_string()))?;
     let frame = zstd::bulk::Compressor::with_prepared_dictionary(&CDICT_V1)?.compress(&cbor)?;
     let mut out = Vec::with_capacity(frame.len() + 1);
     out.push(RECORD_V1);
@@ -82,6 +82,27 @@ pub fn decode_record(bytes: &[u8]) -> Result<Value, CodecError> {
         }
         Some(&v) if (0x02..=0x08).contains(&v) => Err(CodecError::Version(v)),
         Some(_) => serde_json::from_slice(bytes).map_err(|e| CodecError::Cbor(e.to_string())),
+    }
+}
+
+/// `v` with every object's keys in sorted order, recursively. v1 was minted
+/// when serde_json's maps were sorted by construction, and its dictionary
+/// bytes and every stored record's layout assume that order; the workspace
+/// now keeps insertion order (templates must see a client's key order), so
+/// the codec sorts explicitly - same bytes, same frames as before.
+fn sorted(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            Value::Object(
+                keys.into_iter()
+                    .map(|k| (k.clone(), sorted(&map[k])))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
+        other => other.clone(),
     }
 }
 
@@ -190,7 +211,7 @@ fn dict_v1() -> Vec<u8> {
     ];
     let mut dict = Vec::with_capacity(1024);
     for s in &samples {
-        ciborium::into_writer(s, &mut dict).expect("dict samples always encode");
+        ciborium::into_writer(&sorted(s), &mut dict).expect("dict samples always encode");
     }
     dict
 }

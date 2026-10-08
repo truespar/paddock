@@ -1052,6 +1052,9 @@ impl Admitted {
     /// Fill what the spec left open: an explicit budget was admitted verbatim
     /// and keeps its value; a fitted window replaces the target it came from.
     fn apply(self, spec: &mut crate::supervisor::SpawnSpec) {
+        if spec.vram_budget.is_none() {
+            spec.automatic_budget = self.grant;
+        }
         spec.vram_budget = spec.vram_budget.or(self.grant);
         if let Some(ctx) = self.max_ctx {
             spec.max_ctx = Some(ctx);
@@ -1651,15 +1654,7 @@ async fn vram_admission(
 }
 
 fn pin_budget_text(text: &str, grant: u64) -> String {
-    // Only the automatic (absent) Metal budget is filled; explicit user
-    // ceilings and every other key/comment retain their identity.
-    let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() else {
-        return text.into();
-    };
-    if doc.get("vram_budget").is_none() {
-        doc["vram_budget"] = toml_edit::value(grant as i64);
-    }
-    doc.to_string()
+    crate::automatic_budget::pin(text, grant)
 }
 
 async fn metal_admission(
@@ -2865,13 +2860,17 @@ async fn servers_file_put(
         && let Some(model) = doc.get("model").and_then(toml::Value::as_str)
     {
         let get_int = |k: &str| doc.get(k).and_then(toml::Value::as_integer);
+        let media = match state.supervisor.project_config_text(&body.content) {
+            Ok(media) => media,
+            Err(error) => return relay_err(StatusCode::BAD_REQUEST, error),
+        };
         let req = AdmitReq {
             on_demand: false,
             model,
             artifact: None,
             gpu_pin: doc.get("gpu").and_then(toml::Value::as_str),
             freeing_port: Some(port),
-            fixed_need: get_int("vram_budget").map(|n| (n.max(0) as u64) << 20),
+            fixed_need: media.vram_budget.map(|n| n << 20),
             max_batch: get_int("max_batch").map(|n| n as usize),
             max_ctx: get_int("max_ctx").map(|n| n as usize),
             fp8_kv: kv_ask(doc.get("kv_cache_dtype").and_then(toml::Value::as_str)),
@@ -2889,11 +2888,10 @@ async fn servers_file_put(
                 (on && gb > 0.0).then_some((gb * (1u64 << 30) as f64) as u64)
             }),
             spec: spec_wanted(doc.get("spec").and_then(toml::Value::as_str)),
-            // The runner attaches the tower whenever `mmproj` names a file,
-            // so on this verbatim path the file's own key is the answer.
-            vision: doc.get("mmproj").is_some(),
-            // and an audio tower when `audio_mmproj` names one
-            audio: Some(doc.get("audio_mmproj").is_some()),
+            // Same file/registry projection as native controls: optional
+            // bundled towers have booleans but no mmproj paths to count.
+            vision: media.vision,
+            audio: Some(media.audio),
             // a saved file's window is the file's - priced as written
             fit_ctx: false,
         };
@@ -3676,7 +3674,9 @@ mod tests {
         );
         assert_eq!(before, after);
         assert!(pinned.starts_with("# operator settings"));
-        assert_eq!(pin_budget_text(&pinned, 99999), pinned);
+        assert!(crate::automatic_budget::is_automatic(&pinned));
+        let explicit = "vram_budget = 12345\n";
+        assert_eq!(pin_budget_text(explicit, 99999), explicit);
     }
 
     /// The fit-aware default (decided 2026-10-04): a defaulted window is the

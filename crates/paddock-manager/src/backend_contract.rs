@@ -67,11 +67,19 @@ pub fn validate(registry: &Registry, backend: &str, doc: &toml::Value) -> Result
     if !(matches!(kv, "auto" | "f16") || native_f32 && kv == "f32") || directory && kv == "f16" {
         return Err("Choose checkpoint-native KV precision for Metal: auto for MLX, auto/f16 for GGUF, or f32 for Bonsai MLX.".into());
     }
-    for key in ["kernel_pack", "fp8_native", "max_image_tokens"] {
+    for key in ["kernel_pack", "fp8_native"] {
         if doc.get(key).is_some() {
             return Err(format!(
                 "{key} is not supported by this Metal runner. Remove it before saving or starting."
             ));
+        }
+    }
+    if let Some(value) = doc.get("max_image_tokens") {
+        let embedding_gemma2 = selected.is_some_and(|(m, _)| m.id == "embeddinggemma-2")
+            || paddock_models::probe::probe_path(path)
+                .is_ok_and(|p| p.architecture.as_deref() == Some("gemma-embedding2"));
+        if !embedding_gemma2 || !matches!(value.as_integer(), Some(70 | 140 | 280 | 560 | 1120)) {
+            return Err("max_image_tokens on Metal is supported for EmbeddingGemma 2 only: 70, 140, 280, 560 or 1120.".into());
         }
     }
     if doc

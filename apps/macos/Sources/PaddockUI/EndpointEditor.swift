@@ -18,6 +18,7 @@ final class EndpointEditor {
   var modelID = ""
   var artifactID = ""
   var vision = false
+  var audio = false
   var drafter = ""
   var kvDtype = ""
   var memoryLimit = ""
@@ -155,9 +156,15 @@ final class EndpointEditor {
       return "Download a compatible drafter before enabling speculative decoding."
     }
     if isCreating || compositionChanged, vision, visionArtifact?.installed != true, !embeddedVision,
-      !hasAudioCompanion
+      !bundledVision,
+      !hasAudioCompanion || splitMediaTowers
     {
       return "Download the vision companion before enabling image input."
+    }
+    if isCreating || compositionChanged, splitMediaTowers, audio, audioArtifact?.installed != true,
+      !bundledAudio
+    {
+      return "Download the audio companion before enabling audio input."
     }
     if forensics && !visionServed && forensics != endpoint.settings?.forensics {
       return "Forensics needs image input. Enable Vision first."
@@ -203,7 +210,7 @@ final class EndpointEditor {
         .composition(
           .init(
             model: modelID, artifact: artifactID, vision: vision,
-            drafter: drafter.isEmpty ? nil : drafter)))
+            drafter: drafter.isEmpty ? nil : drafter, audio: splitMediaTowers ? audio : nil)))
     }
     var options: [String: EndpointRuntimeValue?] = [:]
     for field in runtimeOptions {
@@ -234,6 +241,7 @@ final class EndpointEditor {
     modelID = endpoint.model ?? ""
     artifactID = endpoint.artifact ?? ""
     vision = endpoint.settings?.vision ?? false
+    audio = endpoint.settings?.audio ?? false
     drafter = endpoint.settings?.drafter ?? ""
     kvDtype = endpoint.settings?.kvCacheDtype ?? ""
     memoryLimit = Self.budgetText(endpoint.settings?.vramBudget)
@@ -290,7 +298,7 @@ final class EndpointEditor {
       .composition(
         .init(
           model: modelID, artifact: artifactID, vision: vision,
-          drafter: drafter.isEmpty ? nil : drafter)),
+          drafter: drafter.isEmpty ? nil : drafter, audio: splitMediaTowers ? audio : nil)),
       .runtime(
         Dictionary(
           uniqueKeysWithValues: runtimeOptions.map {

@@ -119,16 +119,26 @@ extension EndpointEditor {
   var isImageGeneration: Bool { capabilities.contains("image-generation") }
   var canTools: Bool { selectedModel == nil || capabilities.contains("tools") }
   var embeddedVision: Bool { selectedArtifact?.runtime?.embeddedVision == true }
+  var bundledVision: Bool { selectedArtifact?.runtime?.optionalTowers?.vision != nil }
+  var bundledAudio: Bool { selectedArtifact?.runtime?.optionalTowers?.audio != nil }
   var visionArtifact: CatalogArtifact? {
     selectedModel?.artifacts.first { $0.kind == "vision" && companionAllowed($0) }
   }
   var hasAudioCompanion: Bool {
     selectedModel?.artifacts.contains { $0.kind == "audio" && companionAllowed($0) } == true
   }
-  var visionServed: Bool { embeddedVision || (vision && !hasAudioCompanion) }
+  var audioArtifact: CatalogArtifact? {
+    selectedModel?.artifacts.first { $0.kind == "audio" && companionAllowed($0) }
+  }
+  var splitMediaTowers: Bool {
+    (visionArtifact != nil || bundledVision) && (audioArtifact != nil || bundledAudio)
+      && capabilities.contains("embeddings")
+  }
+  var visionServed: Bool { embeddedVision || (vision && (!hasAudioCompanion || splitMediaTowers)) }
   var forensicsPossible: Bool {
-    embeddedVision || visionArtifact != nil
-      || (endpoint.settings?.vision == true && !hasAudioCompanion)
+    !capabilities.contains("embeddings") && !capabilities.contains("rerank")
+      && (embeddedVision || visionArtifact != nil
+        || (endpoint.settings?.vision == true && !hasAudioCompanion))
   }
   var drafters: [CatalogArtifact] {
     selectedModel?.artifacts.filter { $0.kind == "drafter" && companionAllowed($0) } ?? []
@@ -159,6 +169,7 @@ extension EndpointEditor {
   var compositionChanged: Bool {
     modelID != endpoint.model ?? "" || artifactID != endpoint.artifact ?? ""
       || vision != endpoint.settings?.vision ?? false || drafter != endpoint.settings?.drafter ?? ""
+      || splitMediaTowers && audio != (endpoint.settings?.audio ?? false)
   }
   // A saved file is started verbatim. Missing keys use Config::default, not
   // launch recommendations (which only apply when choosing a composition).
@@ -184,7 +195,13 @@ extension EndpointEditor {
     kvDtype = artifact.runtime?.kvCacheDtype ?? "f16"
     drafter = ""
     vision =
-      hasAudioCompanion || visionArtifact?.installed == true || visionArtifact?.required == true
+      (hasAudioCompanion && !splitMediaTowers) || visionArtifact?.installed == true
+      || visionArtifact?.required == true
+      || selectedArtifact?.runtime?.optionalTowers?.vision?.default == true
+    audio =
+      splitMediaTowers
+      && ((audioArtifact?.default == true && audioArtifact?.installed == true)
+        || selectedArtifact?.runtime?.optionalTowers?.audio?.default == true)
     if !visionServed { forensics = false }
     if !canSpeculate { speculation = "off" }
     if newModel || Int(context).map({ $0 > contextCap }) == true {

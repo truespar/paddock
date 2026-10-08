@@ -104,6 +104,7 @@ public struct ArtifactRuntime: Decodable, Sendable {
   public let checkpointDir: Bool?
   public let capability: [String]?
   public let embeddedVision: Bool?
+  public let optionalTowers: OptionalTowers?
   public let kvCacheDtype: String?
   public let experimental: Bool?
   public let qualification: String?
@@ -116,6 +117,15 @@ public struct ArtifactRuntime: Decodable, Sendable {
   public struct Memory: Decodable, Sendable {
     public let maxCtx: Int
     public let maxBatch: Int
+  }
+  public struct OptionalTowers: Decodable, Sendable {
+    public let vision: Tower?
+    public let audio: Tower?
+  }
+  public struct Tower: Decodable, Sendable {
+    public let weightBytes: UInt64
+    public let workspaceBytes: UInt64
+    public let `default`: Bool
   }
 }
 
@@ -153,10 +163,16 @@ public struct RunnerInfo: Decodable, Identifiable, Sendable {
   }
   public var hasStudioSurface: Bool { diarization == nil }
   public var studioActionTitle: String {
-    tabular != nil ? "Open Tables" : reader != nil ? "Open Reads" : "Open Studio"
+    tabular != nil
+      ? "Open Tables"
+      : reader != nil ? "Open Reads" : embedder != nil ? "Open Embeddings" : "Open Studio"
   }
   public var studioActionSymbol: String {
-    tabular != nil ? "tablecells" : reader != nil ? "list.bullet.clipboard" : "bubble"
+    tabular != nil
+      ? "tablecells"
+      : reader != nil
+        ? "list.bullet.clipboard"
+        : embedder != nil ? "point.3.connected.trianglepath.dotted" : "bubble"
   }
 }
 

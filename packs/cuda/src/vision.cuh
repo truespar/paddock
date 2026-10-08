@@ -1006,8 +1006,11 @@ int pd_vision_attn_h(const void* q, const void* k, const void* v, void* out, uin
     cudaDeviceGetAttribute(&ccm, cudaDevAttrComputeCapabilityMinor, dev);
     if (cc < 8) return cudaErrorInvalidValue;
     const uint32_t dp = (head_dim + 15u) & ~15u;
-    // 64-row blocks on cc 12.0 (measured, see the kernel note); 128 elsewhere
-    const bool qw4 = (cc == 12 && ccm == 0);
+    // 64-row blocks on cc 12.0 (measured, see the kernel note) and cc 12.1
+    // (GB10, Gemma 4's picture tower, 2394 rows x 12 heads x hd 64, one
+    // sequence 307 -> 289 us, four 1273 -> 1099; bench/vis_attn_h2_bench.cu,
+    // 0 mismatches); 128 elsewhere
+    const bool qw4 = (cc == 12 && (ccm == 0 || ccm == 1));
     const uint32_t qw = qw4 ? 4u : PD_VM_QW;
     dim3 grid((nq + qw * 16u - 1u) / (qw * 16u), n_heads, n_batch);
     const uint32_t nth = 32u * qw;

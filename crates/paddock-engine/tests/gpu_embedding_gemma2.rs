@@ -819,3 +819,163 @@ fn embeddinggemma2_split_towers_embed_like_the_combined_file() {
         .expect("attach");
     assert!(no_audio.serves_images() && !no_audio.serves_audio());
 }
+
+/// `EG2_GOLDEN=<dir>`: record (`EG2_GOLDEN_WRITE=1`) or check every vector
+/// of a spread of passes as raw f32 bits - each text case alone, all of them
+/// packed, 8 and 32 copies of the query, each picture / clip case alone and
+/// all of them packed - so a kernel change that claims to land the same bits
+/// (a GEMM tile election, an attention grid split) is held to the build
+/// before it across every row count the elections cross.
+#[test]
+fn embeddinggemma2_matches_recorded_goldens() {
+    let Some(dir) = std::env::var_os("EG2_GOLDEN").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let write = std::env::var_os("EG2_GOLDEN_WRITE").is_some();
+    let Some(cases) = fixture() else { return };
+    let Some(mut m) = load_with_pictures(8192) else {
+        return;
+    };
+    std::fs::create_dir_all(&dir).expect("golden dir");
+    let mut passes: Vec<(String, Vec<Vec<u32>>, Option<Vec<Vec<MmChunk>>>)> = Vec::new();
+    for c in &cases {
+        passes.push((c.name.clone(), c.ids.clone(), None));
+    }
+    passes.push((
+        "text_packed".into(),
+        cases.iter().flat_map(|c| c.ids.clone()).collect(),
+        None,
+    ));
+    let query = cases.iter().find(|c| c.name == "short").expect("short").ids[0].clone();
+    for n in [8usize, 32] {
+        passes.push((format!("queries{n}"), vec![query.clone(); n], None));
+    }
+    let mut media_cases = Vec::new();
+    if let Some((_, c)) = media_fixture() {
+        media_cases.extend(c);
+    }
+    if let Some((_, c)) = audio_fixture() {
+        media_cases.extend(c);
+    }
+    for c in &media_cases {
+        passes.push((
+            format!("media_{}", c.name),
+            c.ids.clone(),
+            Some(c.media.clone()),
+        ));
+    }
+    if !media_cases.is_empty() {
+        passes.push((
+            "media_packed".into(),
+            media_cases.iter().flat_map(|c| c.ids.clone()).collect(),
+            Some(media_cases.iter().flat_map(|c| c.media.clone()).collect()),
+        ));
+    }
+    for (name, ids, media) in &passes {
+        let got = match media {
+            Some(md) => m.embed_media(ids, md, None).expect("embed"),
+            None => m.embed(ids, None).expect("embed"),
+        };
+        let bytes: Vec<u8> = got.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
+        let file = dir.join(format!("{name}.f32"));
+        if write {
+            std::fs::write(&file, bytes).expect("write golden");
+        } else {
+            let want = std::fs::read(&file).expect("golden");
+            assert!(want == bytes, "{name} moved");
+        }
+    }
+    println!(
+        "{} passes {}",
+        passes.len(),
+        if write { "recorded" } else { "match" }
+    );
+}
+
+/// Slot 829 spreads an attention tile's warps over 2 or 4 blocks; every row
+/// must land the bits slot 809's grid lands - on packed sequences of mixed
+/// lengths (ragged tiles, a 1,500-token one past the 512-key window), on the
+/// sliding hd 256 layers and the full hd 512 ones.
+#[test]
+fn embeddinggemma2_split_attention_is_bit_identical() {
+    use paddock_engine::gpu::{EG2_ATTN_ROWS, EG2_TILE_SHIFT};
+    let Some(exec) = common::gpu_arc() else {
+        return;
+    };
+    if !exec.has_eg2_attn_s() {
+        common::missing("a kernel pack with slot 829 (the split attention grid)");
+        return;
+    }
+    let lens = [270usize, 37, 1500, 5, 700, 64];
+    let rows: usize = lens.iter().sum();
+    let mut cu = vec![0u32];
+    for l in lens {
+        cu.push(cu.last().unwrap() + l as u32);
+    }
+    // a fixed LCG: values on the scale the head pass lands (unit-norm rows
+    // scaled, so scores spread across the softmax's range)
+    let mut seed = 0x2545_f491_u64;
+    let mut rnd = |n: usize, scale: f32| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((seed >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * scale
+            })
+            .collect()
+    };
+    let d_cu = exec.to_device_u32(&cu).expect("cu");
+    for (hd, window) in [(256usize, 512usize), (256, 0), (512, 0)] {
+        let per = if hd == 256 {
+            EG2_ATTN_ROWS[0]
+        } else {
+            EG2_ATTN_ROWS[1]
+        };
+        let mut tiles = Vec::new();
+        for (s, &l) in lens.iter().enumerate() {
+            for t in 0..l.div_ceil(per) {
+                tiles.push(((s as u32) << EG2_TILE_SHIFT) | t as u32);
+            }
+        }
+        let d_tiles = exec.to_device_u32(&tiles).expect("tiles");
+        let q = exec
+            .to_device_f16(&rnd(rows * 4 * hd, 0.25), "q")
+            .expect("q");
+        let k = exec.to_device_f16(&rnd(rows * 512, 1.0), "k").expect("k");
+        let v = exec.to_device_f16(&rnd(rows * 512, 1.0), "v").expect("v");
+        let mut outs = Vec::new();
+        for split in [1usize, 2, 4] {
+            let mut out = exec.stream.alloc_zeros::<f32>(rows * 4 * hd).expect("out");
+            exec.eg2_attn(
+                &q,
+                &k,
+                &v,
+                &d_cu,
+                &d_tiles,
+                tiles.len(),
+                &mut out,
+                rows,
+                hd,
+                window,
+                split,
+            )
+            .expect("attn");
+            outs.push(exec.to_host_len(&out, rows * 4 * hd).expect("host"));
+        }
+        for (i, o) in outs.iter().enumerate().skip(1) {
+            let differ = o
+                .iter()
+                .zip(&outs[0])
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            println!(
+                "hd {hd} window {window} split {}: {differ} of {} differ",
+                [1, 2, 4][i],
+                o.len()
+            );
+            assert_eq!(differ, 0, "the split grid moved a row");
+        }
+        assert!(outs[0].iter().all(|x| x.is_finite()));
+    }
+}

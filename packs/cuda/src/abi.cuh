@@ -3948,6 +3948,47 @@ struct KernelTableV1 {
                      float, float, void*);
     // 819: eg2a_out (y, bias, out, rows, n, eps, stream) - bias + weightless RMS norm, f16
     int (*eg2a_out)(const void*, const void*, void*, uint32_t, uint32_t, float, void*);
+    // 820: g4v_patchify - pd_g4v_patchify
+    int (*g4v_patchify)(const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+    // 821: g4v_pos_norm - pd_g4v_pos_norm
+    int (*g4v_pos_norm)(void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, float,
+                        void*);
+    // 822: g4v_heads - pd_g4v_heads
+    int (*g4v_heads)(const void*, const void*, const void*, uint32_t, const void*, const void*,
+                     const void*, void*, void*, void*, uint32_t, uint32_t, uint32_t, float,
+                     void*);
+    // 823: g4v_post - pd_g4v_post
+    int (*g4v_post)(void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, float,
+                    void*);
+    // 824: g4v_geglu - pd_g4v_geglu
+    int (*g4v_geglu)(const void*, const void*, uint32_t, void*, uint32_t, uint32_t, uint32_t,
+                     void*);
+    // 825: g4v_pool - pd_g4v_pool
+    int (*g4v_pool)(const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t,
+                    float, float, void*);
+    // 826: f16_gemm_h_geglu_g4 - the f16 landing with Gemma 4's vision GEGLU epilogue
+    int (*f16_gemm_h_geglu_g4)(const void*, const void*, void*, unsigned int, unsigned int,
+                               unsigned int, void*);
+    // 827: g4v_rope_table - pd_g4v_rope_table
+    int (*g4v_rope_table)(const void*, const void*, void*, uint32_t, uint32_t, float, void*);
+    // 828: q8_0_gemm_mmq_s - pd_q8_0_gemm_mmq_s
+    int (*q8_0_gemm_mmq_s)(const void*, const void*, const void*, void*, uint32_t, uint32_t,
+                           uint32_t, void*);
+    // 829: eg2_attn_s - pd_eg2_attn_s
+    int (*eg2_attn_s)(const void*, const void*, const void*, const void*, const void*, uint32_t,
+                      void*, uint32_t, uint32_t, uint32_t, void*);
+    // 830: nvf4_moe_gu_swiglu_ms (nvf4_moe_gu_swiglu_bs's arguments over moe_align_bm(64)
+    // blocks) - the sorted NVFP4 gate|up on a 3-deep ring with L2 prefetch, bit-identical
+    int (*nvf4_moe_gu_swiglu_ms)(const void*, const void*, const void*, const void*,
+                                 const void*, const void*, const void*, const void*,
+                                 const void*, const void*, void*, void*, uint32_t, uint32_t,
+                                 uint32_t, void*);
+    // 831: nvf4_moe_down_ms_b16 (nvf4_moe_down_bs_b16's arguments over moe_align_bm(64)
+    // blocks) - the down with each block's columns resident, bit-identical bf16 partials
+    int (*nvf4_moe_down_ms_b16)(const void*, const void*, const void*, const void*,
+                                const void*, const void*, const void*, const void*,
+                                const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                                uint32_t, uint32_t, void*);
 };
 
 } // extern "C"
