@@ -108,6 +108,7 @@ Every model below runs on the engine today. Sizes are the checkpoint's own, and
 - **MiniCPM5** - 2B
 - **Muse Glimmer** - 30B
 - **Nemotron 3.5 Lightning** - 30B-A3B
+- **Kolibri 1** (Aleph Alpha) - 78B with 3.5B active, German and English, text only
 
 **Images**
 
@@ -118,12 +119,24 @@ Every model below runs on the engine today. Sizes are the checkpoint's own, and
 
 - **Laya** - answers fixed questions about a text (yes or no, pick one, a
   score) with a calibrated probability each; it powers the Studio's Reads page
+- **Clef Flash** 9B and **Clef** 27B (Cloudflare) - decide every question in
+  one read of a text, or of up to 16 pictures; on the Reads page too
 
 **Tables**
 
 - **Kumo Tabular** (NVIDIA) - small, medium and large, each for classification
   and regression: give it labelled rows and it predicts the missing column of
   new ones, with no training; it powers the Studio's Tables page
+
+**Masks and maps**
+
+- **SAM 3** (Meta) - finds every object that a few words or example boxes
+  describe, in a picture or a live camera feed, and tracks it frame to frame;
+  it powers the Studio's Masks page. NVIDIA GPUs for now, and the download
+  needs Meta's licence accepted on Hugging Face
+- **TIC Forestry v1** (The Intelligence Company) - land cover and canopy height
+  at 1 m from Swedish aerial imagery, near-infrared included. NVIDIA GPUs, and
+  the download needs the DINOv3 licence accepted on Hugging Face
 
 **Documents and OCR**
 
@@ -134,12 +147,17 @@ Every model below runs on the engine today. Sizes are the checkpoint's own, and
 
 - **Qwen3-ASR** 1.7B, and **Qwen3 Forced Aligner** 0.6B
 - **Granite Speech 4.1** - 2B and 2B Plus
+- **Nemotron 3 Diarization** (NVIDIA) - who spoke when, overlapping speakers
+  included, in recordings up to 10 minutes; the Studio draws it as a speaker
+  timeline
 - **Whisper Large** fine-tunes - KB-Whisper (Swedish), NB-Whisper (Norwegian),
   Røst v3 (Danish)
 
 **Embeddings and reranking**
 
 - **Qwen 3 Embedding** - 0.6B, 4B, 8B
+- **EmbeddingGemma 2** - text, pictures and audio in one vector space, in over
+  100 languages
 - **Qwen 3 Reranker** - 0.6B, 4B, 8B
 
 ## What it contains
@@ -161,19 +179,24 @@ that reports honestly instead of failing at load.
 **APIs.** OpenAI chat completions, completions, the Responses API, embeddings,
 image generations and edits, and audio transcriptions, live over the Realtime
 WebSocket too; Anthropic messages and token counting; plus reranking, forced
-alignment, the `/v1/systemone` decision call, `/v1/tabular/predictions` for
-NVIDIA's Kumo Tabular (with fitted table contexts that later calls reuse) and a
-Model Context Protocol surface. The runner publishes its own `/openapi.json`.
+alignment, speaker diarization, the `/v1/systemone` decision call,
+`/v1/tabular/predictions` for NVIDIA's Kumo Tabular (with fitted table contexts
+that later calls reuse), `/v1/masks` for SAM 3 (with sessions that track objects
+through video), `/v1/segmentations` for maps such as TIC Forestry's, and a Model
+Context Protocol surface. The runner publishes its own `/openapi.json`.
 
 **Beyond text.** Vision models, image generation and editing, speech
-transcription, reranking, calibrated decisions, predictions on tables with
-NVIDIA's Kumo Tabular, and document extraction from PDF and Office files.
+transcription and speaker diarization, embeddings of text, pictures and audio,
+reranking, calibrated decisions, predictions on tables with NVIDIA's Kumo
+Tabular, object masks and tracking with Meta's SAM 3, land-cover maps, and
+document extraction from PDF and Office files.
 
 **Studio.** A built-in web UI for downloading and managing models, running them,
 comparing them side by side, and serving them. Beside the chat it has a Reads
-page, where a decision model answers fixed questions about a text, and a Tables
+page, where a decision model answers fixed questions about a text, a Tables
 page, where Kumo Tabular fills in the missing column of a table you paste or
-open.
+open, a Masks page, where SAM 3 outlines what you name in a picture or a live
+camera feed, and an Embeddings page for trying an embedding model hands-on.
 
 Side by side means across the boundary, not just within it: a model running on
 your own box against one behind OpenRouter or any other OpenAI-compatible
