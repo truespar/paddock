@@ -166,6 +166,13 @@ impl Drop for Slab {
     }
 }
 
+/// One slab's occupancy (see [`HostStore::layout`]).
+pub struct SlabLayout {
+    pub len: u64,
+    /// `(offset, rounded length, loc)` of each live extent, by offset.
+    pub extents: Vec<(u64, u64, Loc)>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AllocInfo {
     slab: usize,
@@ -245,7 +252,7 @@ impl HostStore {
     /// Allocate an extent for `payload` bytes. The rounded footprint is what
     /// the store charges; the payload length is what `resolve` reports back.
     pub fn alloc(&mut self, payload: u64) -> Result<Loc, HostMemError> {
-        let rounded = payload.div_ceil(ALLOC_ALIGN) * ALLOC_ALIGN;
+        let rounded = self.rounded(payload);
         // try existing slabs first
         for (si, slab) in self.slabs.iter_mut().enumerate() {
             if let Some(off) = slab.alloc(rounded) {
@@ -274,6 +281,68 @@ impl HostStore {
             .expect("fresh slab fits its own trigger");
         self.slabs.push(slab);
         Ok(self.record(self.slabs.len() - 1, off, rounded, payload))
+    }
+
+    /// The footprint `alloc` charges for `payload` bytes.
+    pub fn rounded(&self, payload: u64) -> u64 {
+        payload.div_ceil(ALLOC_ALIGN) * ALLOC_ALIGN
+    }
+
+    /// Every carved slab's length and live extents `(offset, rounded, loc)`,
+    /// sorted by offset - what eviction needs to open a hole where one fits.
+    pub fn layout(&self) -> Vec<SlabLayout> {
+        let mut out: Vec<SlabLayout> = self
+            .slabs
+            .iter()
+            .map(|s| SlabLayout {
+                len: s.mem.len() as u64,
+                extents: Vec::new(),
+            })
+            .collect();
+        for (&loc, a) in &self.allocs {
+            out[a.slab].extents.push((a.off, a.rounded, Loc(loc)));
+        }
+        for s in &mut out {
+            s.extents.sort_unstable_by_key(|e| e.0);
+        }
+        out
+    }
+
+    /// Whether `alloc` would place every extent in `payloads`, in order,
+    /// right now - the same first-fit over the same free ranges, and the same
+    /// slab growth. The catalog's ledger counts exact bytes; this arena needs
+    /// each rounded extent CONTIGUOUS inside one slab, so a ledger with room
+    /// can still sit on an arena whose free bytes are holes too small for the
+    /// next extent. Eviction asks this, not the ledger, when it is done.
+    pub fn fits(&self, payloads: &[u64]) -> bool {
+        let mut free: Vec<Vec<(u64, u64)>> = self.slabs.iter().map(|s| s.free.clone()).collect();
+        let mut used: u64 = self.slabs.iter().map(|s| s.mem.len() as u64).sum();
+        'next: for &p in payloads {
+            let rounded = self.rounded(p);
+            for ranges in free.iter_mut() {
+                if let Some(i) = ranges.iter().position(|&(_, len)| len >= rounded) {
+                    let (off, len) = ranges[i];
+                    if len == rounded {
+                        ranges.remove(i);
+                    } else {
+                        ranges[i] = (off + rounded, len - rounded);
+                    }
+                    continue 'next;
+                }
+            }
+            let room = self.capacity.saturating_sub(used);
+            let want = self.slab_bytes.min(room).max(rounded.min(room));
+            if want < rounded {
+                return false;
+            }
+            used += want;
+            free.push(if want > rounded {
+                vec![(rounded, want - rounded)]
+            } else {
+                Vec::new()
+            });
+        }
+        true
     }
 
     fn record(&mut self, slab: usize, off: u64, rounded: u64, payload: u64) -> Loc {
@@ -461,6 +530,37 @@ mod tests {
         s.free(c).unwrap();
         s.free(d).unwrap();
         assert_eq!(s.allocated(), 0);
+    }
+
+    /// The arena the customer's tier died on: free bytes enough for the next
+    /// extent but no hole that large. `fits` must say no exactly where
+    /// `alloc` fails, and yes again once a neighbor frees.
+    #[test]
+    fn fits_answers_for_holes_not_free_bytes() {
+        let mut s = HostStore::new(8 << 20, false);
+        let x: Vec<_> = (0..8).map(|_| s.alloc(1 << 20).unwrap()).collect();
+        // free every other MiB: 4 MiB free, no 2 MiB hole
+        for i in (0..8).step_by(2) {
+            s.free(x[i]).unwrap();
+        }
+        assert_eq!(s.allocated(), 4 << 20);
+        assert!(s.fits(&[1 << 20]));
+        assert!(
+            !s.fits(&[2 << 20]),
+            "4 MiB free in 1 MiB holes is no room for 2 MiB"
+        );
+        assert!(s.alloc(2 << 20).is_err());
+        // four 1 MiB extents fit, a fifth does not
+        assert!(s.fits(&[1 << 20; 4]));
+        assert!(!s.fits(&[1 << 20; 5]));
+        // free a neighbor: the 3 MiB hole now takes the 2 MiB extent
+        s.free(x[1]).unwrap();
+        assert!(s.fits(&[2 << 20]));
+        assert!(s.alloc(2 << 20).is_ok());
+        // fits never allocates
+        let before = s.allocated();
+        let _ = s.fits(&[1 << 20, 1 << 20]);
+        assert_eq!(s.allocated(), before);
     }
 
     #[test]

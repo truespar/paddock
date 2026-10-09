@@ -79,6 +79,8 @@ pub struct Counters {
     pub integrity_failures: u64,
     /// Transport-reported failures.
     pub io_failures: u64,
+    /// Stores that found no room in the tier's memory (capacity, not faults).
+    pub no_room: u64,
     pub single_flight_joins: u64,
     pub waiter_cancels: u64,
     pub op_cancels: u64,
@@ -756,6 +758,10 @@ impl TierCatalog {
                 self.counters.io_failures += 1;
                 release(t);
             }
+            IoOutcome::NoRoom => {
+                self.counters.no_room += 1;
+                release(t);
+            }
             IoOutcome::LoadDone { .. } => {
                 self.counters.protocol_errors += 1;
                 release(t);
@@ -835,7 +841,7 @@ impl TierCatalog {
                 }
                 wake(LoadResult::Ok)
             }
-            IoOutcome::Failed => {
+            IoOutcome::Failed | IoOutcome::NoRoom => {
                 self.counters.io_failures += 1;
                 release_dst(&mut self.tiers);
                 wake(LoadResult::IoFailed)

@@ -91,6 +91,10 @@ pub enum IoOutcome {
     },
     /// The transport failed the op (device error, cancellation acknowledged).
     Failed,
+    /// A store found no room for its extent in the tier's memory - capacity,
+    /// not a fault: the catalog releases it like `Failed`, but it must never
+    /// count toward the circuit breaker, or a merely FULL tier goes offline.
+    NoRoom,
 }
 
 /// The data-plane trait. Implementations own their queues, staging and
@@ -105,6 +109,13 @@ pub trait TierTransport {
     fn cancel(&mut self, op: OpId);
     /// Drain ready completions.
     fn poll(&mut self) -> Vec<IoCompletion>;
+
+    /// Whether stores of these sizes, submitted in order now, would each find
+    /// room in the tier's memory. Transports without an arena of their own
+    /// answer true; the RAM transport answers for its slabs.
+    fn can_place(&self, _extents: &[u64]) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,6 +252,16 @@ impl FakeTransport {
                 checksum,
             },
         });
+    }
+
+    /// Deliver "no room in the tier's memory" for a store.
+    pub fn deliver_no_room(&mut self, op: OpId) {
+        if self.take(op).is_some() {
+            self.ready.push(IoCompletion {
+                op,
+                outcome: IoOutcome::NoRoom,
+            });
+        }
     }
 
     /// Deliver failure (device error / acknowledged cancel).

@@ -48,6 +48,7 @@ drives those kernels.
 | `kolibri` | `kolibri/`: mixed affine4/8, raw-logit top-6, sandwich norms and BF16 full/sliding attention |
 | `unlimited_ocr`, `unlimited_vision` | `unlimited_ocr/` |
 | `clef`, `clef_quant`, `clef_attention`, `clef_head`, `clef_vision` | `clef/` |
+| `sam3`, `sam3_image` | `sam3/`: image-encoder component bring-up (not serving support); window/global attention, detector/tracker necks, distinct picture/video input arithmetic; full-model reference gates still pending |
 
 `granite.metal` comes first in the list and also defines the weight-decoding
 helpers most later files call, which is why it is not only about Granite.

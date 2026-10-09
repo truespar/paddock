@@ -213,6 +213,17 @@ pub trait XferSink: TierTransport {
         None
     }
 
+    /// The T1 arena's slabs and live extents, and the footprint it charges
+    /// for `bytes` - eviction opens holes from these when the ledger has
+    /// room but no hole fits ([`TierTransport::can_place`]). Default: no
+    /// arena (placement always succeeds).
+    fn arena_layout(&self) -> Vec<super::host::SlabLayout> {
+        Vec::new()
+    }
+    fn arena_rounded(&self, bytes: u64) -> u64 {
+        bytes
+    }
+
     fn expect_store(&mut self, key: LogicalKey, spec: XferSpec) -> Result<(), SubmitError>;
     fn expect_load(&mut self, key: LogicalKey, spec: XferSpec) -> Result<(), SubmitError>;
     fn free_extent(&mut self, loc: Loc);
@@ -243,6 +254,12 @@ impl XferSink for RamTransport {
     }
     fn t2_written_today(&self) -> u64 {
         self.t2_written_today_inner()
+    }
+    fn arena_layout(&self) -> Vec<super::host::SlabLayout> {
+        self.t1_layout()
+    }
+    fn arena_rounded(&self, bytes: u64) -> u64 {
+        self.t1_rounded(bytes)
     }
 
     fn expect_store(&mut self, key: LogicalKey, spec: XferSpec) -> Result<(), SubmitError> {
@@ -1069,10 +1086,18 @@ impl<T: XferSink> PoolTier<T> {
         // reservation-first; AlreadyPresent = dedup (already stored or in
         // flight - content keys make re-demote free)
         match self.catalog.reserve(key, Tier::Ram, bytes) {
-            Ok(()) => {}
+            Ok(()) => {
+                // the ledger had the bytes; the arena must have the hole
+                if !self.transport.can_place(&[bytes]) && !self.evict_t1(0, &[bytes]) {
+                    self.catalog.release_reservation(&key, Tier::Ram);
+                    return false;
+                }
+            }
             Err(ReserveError::AlreadyPresent) => return false,
             Err(ReserveError::Insufficient { .. }) => {
-                if !self.evict_t1(bytes) || self.catalog.reserve(key, Tier::Ram, bytes).is_err() {
+                if !self.evict_t1(bytes, &[bytes])
+                    || self.catalog.reserve(key, Tier::Ram, bytes).is_err()
+                {
                     return false; // T1 genuinely full of busy/pinned entries
                 }
             }
@@ -1185,7 +1210,9 @@ impl<T: XferSink> PoolTier<T> {
                     return;
                 }
                 Err(ReserveError::Insufficient { .. }) => {
-                    if self.evict_t1(slen) && self.catalog.reserve(skey, Tier::Ram, slen).is_ok() {
+                    if self.evict_t1(slen, &[])
+                        && self.catalog.reserve(skey, Tier::Ram, slen).is_ok()
+                    {
                         reserved += 1;
                         continue;
                     }
@@ -1197,6 +1224,16 @@ impl<T: XferSink> PoolTier<T> {
                     return;
                 }
             }
+        }
+        // the ledger holds every shard; the arena must hold them too
+        let lens: Vec<u64> = (0..shards).map(|i| self.aux_shard_len(&span, i)).collect();
+        if !self.transport.can_place(&lens) && !self.evict_t1(0, &lens) {
+            for j in 0..shards {
+                let k = t.key.child_bytes("aux", &(j as u32).to_le_bytes());
+                self.catalog.release_reservation(&k, Tier::Ram);
+            }
+            radix.recycle_state(t.state_idx);
+            return;
         }
         let mut submitted = 0usize;
         for i in 0..shards {
@@ -1307,7 +1344,7 @@ impl<T: XferSink> PoolTier<T> {
             match self.catalog.reserve(skey, Tier::Ram, slen) {
                 Ok(()) => reserved += 1,
                 Err(ReserveError::Insufficient { .. })
-                    if self.evict_t1(slen)
+                    if self.evict_t1(slen, &[])
                         && self.catalog.reserve(skey, Tier::Ram, slen).is_ok() =>
                 {
                     // a live blob outranks cold block runs: a hybrid's
@@ -1324,6 +1361,15 @@ impl<T: XferSink> PoolTier<T> {
                     return false;
                 }
             }
+        }
+        // the ledger holds every shard; the arena must hold them too
+        let lens: Vec<u64> = (0..shards).map(|i| self.aux_shard_len(&span, i)).collect();
+        if !self.transport.can_place(&lens) && !self.evict_t1(0, &lens) {
+            for j in 0..shards {
+                let k = key.child_bytes("aux", &(j as u32).to_le_bytes());
+                self.catalog.release_reservation(&k, Tier::Ram);
+            }
+            return false;
         }
         let mut submitted = 0usize;
         for i in 0..shards {
@@ -1390,62 +1436,201 @@ impl<T: XferSink> PoolTier<T> {
         true
     }
 
-    /// Make room in T1: evict least-recently-probed Ready runs. True once
-    /// `need` bytes are free.
-    fn evict_t1(&mut self, need: u64) -> bool {
-        // LRU union of block runs and aux boundaries
-        let mut victims: Vec<(u64, LogicalKey, bool)> = self
-            .runs
-            .iter()
-            .map(|(k, m)| (m.last_used, *k, false))
-            .chain(self.aux_meta.iter().map(|(k, m)| (m.last_used, *k, true)))
-            .collect();
-        victims.sort_by_key(|v| v.0);
-        for (_, key, is_aux) in victims {
-            if self.catalog.ledger(Tier::Ram).free >= need {
-                return true;
+    /// Make room in T1: evict least-recently-probed Ready entries until the
+    /// ledger has `need` bytes free, then - if the arena still has no hole
+    /// for every extent in `place` - open holes window by window
+    /// ([`Self::punch_hole`]). The ledger counts exact bytes; the RAM arena
+    /// needs each rounded extent contiguous in one slab, and LRU frees bytes
+    /// all over it. Evicting to the ledger alone left a full tier with no
+    /// hole for the next 16 MiB shard: every store failed and the breaker
+    /// took the tier offline; evicting LRU until a hole appeared drained it.
+    fn evict_t1(&mut self, need: u64, place: &[u64]) -> bool {
+        if self.catalog.ledger(Tier::Ram).free < need {
+            // LRU union of block runs and aux boundaries
+            let mut victims: Vec<(u64, LogicalKey, bool)> = self
+                .runs
+                .iter()
+                .map(|(k, m)| (m.last_used, *k, false))
+                .chain(self.aux_meta.iter().map(|(k, m)| (m.last_used, *k, true)))
+                .collect();
+            victims.sort_by_key(|v| v.0);
+            for (_, key, is_aux) in victims {
+                if self.catalog.ledger(Tier::Ram).free >= need {
+                    break;
+                }
+                if is_aux {
+                    self.retire_aux(key);
+                } else {
+                    self.evict_run_t1(key);
+                }
             }
-            if is_aux {
-                self.retire_aux(key);
-            } else {
-                let loc = self.catalog.ready_loc(&key, Tier::Ram);
-                if self.catalog.evict(&key, Tier::Ram).is_ok() {
-                    if let Some(l) = loc {
-                        self.transport.free_extent(l);
-                    }
-                    // T1 -> T2 promotion: the write-through already put these
-                    // bytes on disk, so publish the DURABLE copy as readable
-                    // instead of losing the content until the next restart.
-                    // Without this the tier writes gigabytes it can never
-                    // read back within the run - which is exactly what the
-                    // panel showed the first time it was pointed at a
-                    // thrashing workload (17.5 GB written, 0 readable).
-                    // `runs` is the T1 inventory (victim scan + extent
-                    // ownership), so a promoted key leaves it either way -
-                    // the catalog's Nvme replica is what keeps the content
-                    // findable, exactly as a boot-time preload does.
-                    self.runs.remove(&key);
-                    let promoted = match self.transport.t2_entry(&key.0) {
-                        Some((t2loc, bytes, sum)) => self.catalog.preload_ready(
-                            key,
-                            Tier::Nvme,
-                            t2loc,
-                            super::digest::Checksum(sum),
-                            bytes,
-                        ),
-                        None => false,
-                    };
-                    if promoted {
-                        self.dec.promoted_to_disk += 1;
-                    } else {
-                        // nothing durable: the content is gone, so remember
-                        // it - a later miss here is capacity, not cold
-                        self.ghosts.record_eviction(key.0);
-                    }
+            if self.catalog.ledger(Tier::Ram).free < need {
+                return false;
+            }
+        }
+        self.make_placeable(place)
+    }
+
+    /// Evict one Ready run from T1. False when the catalog refused (pinned
+    /// by a restore in flight).
+    fn evict_run_t1(&mut self, key: LogicalKey) -> bool {
+        let loc = self.catalog.ready_loc(&key, Tier::Ram);
+        if self.catalog.evict(&key, Tier::Ram).is_err() {
+            return false;
+        }
+        if let Some(l) = loc {
+            self.transport.free_extent(l);
+        }
+        // T1 -> T2 promotion: the write-through already put these
+        // bytes on disk, so publish the DURABLE copy as readable
+        // instead of losing the content until the next restart.
+        // Without this the tier writes gigabytes it can never
+        // read back within the run - which is exactly what the
+        // panel showed the first time it was pointed at a
+        // thrashing workload (17.5 GB written, 0 readable).
+        // `runs` is the T1 inventory (victim scan + extent
+        // ownership), so a promoted key leaves it either way -
+        // the catalog's Nvme replica is what keeps the content
+        // findable, exactly as a boot-time preload does.
+        self.runs.remove(&key);
+        let promoted = match self.transport.t2_entry(&key.0) {
+            Some((t2loc, bytes, sum)) => self.catalog.preload_ready(
+                key,
+                Tier::Nvme,
+                t2loc,
+                super::digest::Checksum(sum),
+                bytes,
+            ),
+            None => false,
+        };
+        if promoted {
+            self.dec.promoted_to_disk += 1;
+        } else {
+            // nothing durable: the content is gone, so remember
+            // it - a later miss here is capacity, not cold
+            self.ghosts.record_eviction(key.0);
+        }
+        true
+    }
+
+    /// Make the arena able to take every extent in `place`, in order: plan,
+    /// on a copy of the arena, one hole per extent it cannot take as it
+    /// stands - the window of Ready entries whose NEWEST entry is oldest
+    /// (fewest bytes on a tie), so LRU order holds window by window - and
+    /// evict only once the WHOLE plan exists. Evicting toward a plan that
+    /// cannot complete frees bytes the store still cannot use: a full tier
+    /// that chased holes that way drained itself to nothing during a long
+    /// prefill, while every in-flight store blocked the windows it needed.
+    fn make_placeable(&mut self, place: &[u64]) -> bool {
+        if self.transport.can_place(place) {
+            return true;
+        }
+        #[derive(Clone, Copy, PartialEq)]
+        enum Owner {
+            Run(LogicalKey),
+            Aux(LogicalKey),
+        }
+        // Ready, evictable extents and who owns them; everything else in the
+        // arena (stores in flight, pinned restores' sources) is immovable
+        let mut owner: HashMap<Loc, (u64, Owner)> = HashMap::new();
+        for (k, m) in &self.runs {
+            if let Some(l) = m.loc {
+                owner.insert(l, (m.last_used, Owner::Run(*k)));
+            }
+        }
+        for (k, m) in &self.aux_meta {
+            for i in 0..m.shards {
+                let sk = k.child_bytes("aux", &(i as u32).to_le_bytes());
+                if let Some(l) = self.catalog.ready_loc(&sk, Tier::Ram) {
+                    owner.insert(l, (m.last_used, Owner::Aux(*k)));
                 }
             }
         }
-        self.catalog.ledger(Tier::Ram).free >= need
+        // the simulated arena: per slab, (offset, len, owner and its last
+        // use) - None is immovable (live and not evictable, or a planned hole)
+        type Sim = Vec<(u64, Vec<(u64, u64, Option<(Owner, u64)>)>)>;
+        let mut sim: Sim = self
+            .transport
+            .arena_layout()
+            .into_iter()
+            .map(|s| {
+                let ex = s
+                    .extents
+                    .iter()
+                    .map(|&(o, r, l)| (o, r, owner.get(&l).map(|&(used, w)| (w, used))))
+                    .collect();
+                (s.len, ex)
+            })
+            .collect();
+        let mut plan: Vec<Owner> = Vec::new();
+        for &bytes in place {
+            let size = self.transport.arena_rounded(bytes);
+            let mut best: Option<((u64, u64), usize, u64)> = None;
+            for (si, (len, ex)) in sim.iter().enumerate() {
+                let mut starts: Vec<u64> = std::iter::once(0)
+                    .chain(ex.iter().flat_map(|&(o, r, _)| [o, o + r]))
+                    .collect();
+                starts.sort_unstable();
+                starts.dedup();
+                for p in starts {
+                    if p + size > *len {
+                        break;
+                    }
+                    let first = ex.partition_point(|&(o, r, _)| o + r <= p);
+                    let (mut newest, mut freed) = (0u64, 0u64);
+                    let mut clear = true;
+                    for &(o, r, who) in &ex[first..] {
+                        if o >= p + size {
+                            break;
+                        }
+                        match who {
+                            Some((_, used)) => {
+                                newest = newest.max(used);
+                                freed += r;
+                            }
+                            None => {
+                                clear = false;
+                                break;
+                            }
+                        }
+                    }
+                    if clear && best.as_ref().is_none_or(|(c, _, _)| (newest, freed) < *c) {
+                        best = Some(((newest, freed), si, p));
+                    }
+                }
+            }
+            let Some((_, si, p)) = best else {
+                return false; // no plan: evict nothing
+            };
+            // take the window: its owners go to the plan (an aux owner frees
+            // every shard of its blob, wherever they sit), the hole is planned
+            let ex = &sim[si].1;
+            let taken: Vec<Owner> = ex
+                .iter()
+                .filter(|&&(o, r, _)| o < p + size && o + r > p)
+                .filter_map(|&(_, _, w)| w.map(|(w, _)| w))
+                .collect();
+            for w in taken {
+                if !plan.contains(&w) {
+                    plan.push(w);
+                }
+                for (_, ex) in sim.iter_mut() {
+                    ex.retain(|&(_, _, who)| who.map(|(o, _)| o) != Some(w));
+                }
+            }
+            let ex = &mut sim[si].1;
+            let at = ex.partition_point(|&(o, _, _)| o < p);
+            ex.insert(at, (p, size, None));
+        }
+        for w in plan {
+            match w {
+                Owner::Run(k) => {
+                    self.evict_run_t1(k);
+                }
+                Owner::Aux(k) => self.retire_aux(k),
+            }
+        }
+        self.transport.can_place(place)
     }
 
     /// Retire the aux boundary owning shard key `skey` (any shard key maps
@@ -1907,6 +2092,7 @@ impl<T: XferSink> PoolTier<T> {
         let completions = self.transport.poll();
         for c in completions {
             let op = c.op;
+            let no_room = matches!(c.outcome, super::transport::IoOutcome::NoRoom);
             let catalog_wakes = self.catalog.on_completion(c);
             // demote resolution: release the pins; on success record the run
             if let Some(d) = self.deferred.remove(&op) {
@@ -1948,6 +2134,9 @@ impl<T: XferSink> PoolTier<T> {
                         t1_ready_bytes = self.catalog.ledger(Tier::Ram).ready,
                         "tier run resident"
                     );
+                } else if no_room {
+                    // capacity, not a fault: the run is simply not kept
+                    tracing::debug!(op = op.0, "tier demote found no room");
                 } else {
                     self.breaker_fail();
                     tracing::debug!(op = op.0, "tier demote did not publish");
@@ -2722,6 +2911,41 @@ mod tests {
         t.catalog.check_invariants();
     }
 
+    /// A FULL tier is not a broken one. Stores that find no room in the
+    /// arena complete NoRoom; however many arrive in a row, the breaker must
+    /// stay closed and the next store that lands must still be kept - the
+    /// tier used to count these as transport failures and go offline for
+    /// good the moment it filled.
+    #[test]
+    fn stores_without_room_never_trip_the_breaker() {
+        let mut t = tier(256 << 20);
+        let mut pool = KvPool::with_blocks(64);
+        let mut radix = armed_radix(&t);
+        for i in 0..3 * PoolTier::<FakeTransport>::BREAKER_TRIP {
+            let _ = cached_chain(&mut radix, &mut pool, 1, 4); // same content
+            t.pressure_demote(&mut radix, &mut pool, 64, None);
+            let ops = t.transport.pending_ops();
+            assert_eq!(ops.len(), 1, "iteration {i}: one store in flight");
+            t.transport.deliver_no_room(ops[0]);
+            t.pump_completions(&mut radix, &mut pool);
+        }
+        assert!(!t.is_tripped(), "no-room stores are capacity, not faults");
+        assert_eq!(
+            t.catalog.counters.no_room,
+            3 * PoolTier::<FakeTransport>::BREAKER_TRIP as u64
+        );
+        let tokens = cached_chain(&mut radix, &mut pool, 1, 4);
+        t.pressure_demote(&mut radix, &mut pool, 64, None);
+        t.transport.deliver_all();
+        t.pump_completions(&mut radix, &mut pool);
+        assert!(
+            t.probe(&tokens, 0).is_some(),
+            "the tier still keeps what lands"
+        );
+        assert_eq!(pool.free_blocks(), 64, "every pin released");
+        t.catalog.check_invariants();
+    }
+
     /// The ledger must explain a miss, not just count it. Content we
     /// held and evicted reads as a GHOST - the alarm that separates "this
     /// workload is cold" from "this tier is too small for this workload" -
@@ -2743,7 +2967,7 @@ mod tests {
 
         // force it out of T1 and back off the tier entirely
         let need = t.catalog.ledger(Tier::Ram).capacity;
-        t.evict_t1(need);
+        t.evict_t1(need, &[]);
         let before = t.dec;
         assert!(t.probe(&a, 0).is_none(), "evicted chain cannot restore");
         let after = t.dec;

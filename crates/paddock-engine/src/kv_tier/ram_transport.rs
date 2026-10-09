@@ -396,6 +396,16 @@ impl RamTransport {
         self.store.mode()
     }
 
+    /// The footprint the T1 arena charges for `bytes`.
+    pub fn t1_rounded(&self, bytes: u64) -> u64 {
+        self.store.rounded(bytes)
+    }
+
+    /// The T1 arena's occupancy (see [`HostStore::layout`]).
+    pub fn t1_layout(&self) -> Vec<super::host::SlabLayout> {
+        self.store.layout()
+    }
+
     /// Physical T1 bytes currently allocated (rounded extents) - gates and
     /// the occupancy split read this beside the catalog's logical ledger.
     pub fn t1_allocated(&self) -> u64 {
@@ -836,14 +846,19 @@ impl TierTransport for RamTransport {
                     );
                     return Err(SubmitError::SourceMissing);
                 }
-                // the T1 extent is allocated now - physical exhaustion (the
-                // rounding gap host.rs documents) completes the op Failed
-                // rather than wedging the queue
+                // the T1 extent is allocated now. The pump evicts until
+                // `can_place` holds, so no room here is a race, not the
+                // steady state - and it completes NoRoom (a capacity miss
+                // the breaker ignores), never Failed: counting it as a fault
+                // took a merely full tier offline for good
                 let host_loc = match self.store.alloc(job.bytes) {
                     Ok(l) => l,
                     Err(e) => {
-                        tracing::warn!(err = %e, "KV tier store: T1 physically exhausted");
-                        self.fail(job.op);
+                        tracing::debug!(err = %e, "KV tier store: no room in T1");
+                        self.ready.push(IoCompletion {
+                            op: job.op,
+                            outcome: IoOutcome::NoRoom,
+                        });
                         return Ok(());
                     }
                 };
@@ -880,6 +895,10 @@ impl TierTransport for RamTransport {
         }
         self.kick();
         Ok(())
+    }
+
+    fn can_place(&self, extents: &[u64]) -> bool {
+        self.store.fits(extents)
     }
 
     fn cancel(&mut self, op: OpId) {

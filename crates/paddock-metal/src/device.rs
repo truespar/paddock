@@ -63,6 +63,8 @@ pub(crate) const SHADER_SOURCE: &str = concat!(
     include_str!("../../../packs/metal/muse.metal"),
     "\n",
     include_str!("../../../packs/metal/muse_vision.metal"),
+    include_str!("../../../packs/metal/sam3.metal"),
+    include_str!("../../../packs/metal/sam3_image.metal"),
     "\n",
     include_str!("../../../packs/metal/gemma_mlx.metal"),
     include_str!("../../../packs/metal/llama_mlx.metal"),
@@ -391,6 +393,18 @@ impl MetalDevice {
         #[cfg(test)]
         let mut limited_kernels = HashMap::new();
         for name in [
+            "sam3_patch",
+            "sam3_resize_coeff",
+            "sam3_resize_image",
+            "sam3_resize_video",
+            "sam3_mm",
+            "sam3_position",
+            "sam3_norm",
+            "sam3_qkv",
+            "sam3_attention",
+            "sam3_raster",
+            "sam3_convt",
+            "sam3_conv3",
             "diar_round",
             "diar_project64",
             "diar_project32",

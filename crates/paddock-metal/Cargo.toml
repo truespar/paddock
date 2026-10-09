@@ -26,6 +26,7 @@ objc2-metal = "0.3.2"
 
 [dev-dependencies]
 paddock-kernels = { path = "../paddock-kernels" }
+paddock-jpeg.workspace = true
 
 [lints]
 workspace = true

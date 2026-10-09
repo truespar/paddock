@@ -1,6 +1,10 @@
 //! Native Metal execution for Paddock. Model state stays on its engine thread;
 //! generation, encoder and Whisper contracts share the native serving boundary.
 #[cfg(target_os = "macos")]
+mod sam3;
+#[cfg(target_os = "macos")]
+pub use sam3::{Sam3InputKind, Sam3Vision, Sam3VisionPlane};
+#[cfg(target_os = "macos")]
 mod embedding_gemma2;
 #[cfg(target_os = "macos")]
 pub use embedding_gemma2::EmbeddingGemma2;
