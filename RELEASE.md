@@ -1,96 +1,84 @@
-# Paddock 0.1.14
+# Paddock 0.1.15
 
-A new-models release: Aleph Alpha's Kolibri 1, Google's EmbeddingGemma 2,
-and Meta's SAM 3, which masks every instance of what you name in a picture
-or a live camera, with a Masks page in the Studio. Windows x64, Linux x64
-and the NVIDIA DGX Spark. NVIDIA GPUs, driver 580 or newer. The macOS
-pre-release for Apple Silicon is built from the same commit.
+A fixes and polish release: the RAM context cache no longer switches itself
+off when it fills up, Claude Code sessions on Kolibri 1 run longer and
+faster, tool definitions reach every model exactly as its chat template
+expects, and on the Mac EmbeddingGemma 2 now takes pictures and audio.
+Windows x64, Linux x64 and the NVIDIA DGX Spark. NVIDIA GPUs, driver 580 or
+newer. The macOS pre-release for Apple Silicon is built from the same commit.
 
 ## New
 
-- **Kolibri 1** (Aleph Alpha). A German-English mixture-of-experts model for
-  reasoning, retrieval and tool calling, with a 262K context. On NVIDIA GPUs
-  it serves a 4-bit GGUF on every card, with the NVFP4 checkpoint offered on
-  Blackwell; on the Mac a mixed 4/8-bit build. Plan for at least 64 GB of GPU
-  or unified memory.
+- **TIC Forestry v1** (The Intelligence Company). Land cover and canopy
+  height at 1 m from Swedish aerial imagery, near-infrared included, in one
+  pass. Over the API, `/v1/segmentations`. Like SAM 3 it is a gated
+  download: accept the DINOv3 licence on its Hugging Face page and add a
+  token in Manager > Settings. On NVIDIA GPUs.
 
-- **EmbeddingGemma 2** (Google). Turns text, pictures and audio into vectors
-  in one shared space, so photos and recordings can be searched with words.
-  The text model is 0.3 GB; the picture tower (0.4 GB, on by default) and
-  the audio tower (0.6 GB, off by default) are switches on the start form,
-  and the download follows them. The Embeddings page takes pictures and
-  audio. On NVIDIA GPUs.
-
-- **SAM 3** (Meta). Name a thing - "person", "red car" - and it returns a
-  mask, box and score for every one in the picture; draw boxes to say what
-  to include or leave out, or click on a part of the picture to mask that
-  object. Asking again about the same picture only costs the new prompt.
-  Over the API, `/v1/masks` answers a picture and `/v1/masks/sessions`
-  follows objects from frame to frame. On NVIDIA GPUs.
-
-- **The Masks page.** Drop, paste or open a picture, or turn on the camera
-  and track up to four named things at once, each in its own colour, with
-  snapshots of the moments you keep. Every picture is kept in a side panel
-  like Tables and Reads, and exports as COCO JSON, cut-outs or mask PNGs.
-
-- **Gated downloads with your own Hugging Face token.** SAM 3's weights are
-  not redistributed: accept Meta's licence on its Hugging Face page and add
-  a token in Manager > Settings, and the download comes straight from
-  Hugging Face. A refused download now says so, instead of "the file is
-  gone".
+- **Gated downloads are marked in the model picker** with a lock and
+  "licence on Hugging Face", so you know before you start that the download
+  needs your own token.
 
 ## Improved
 
-- **The context cache is 8-bit by default on most models**, so the same
-  memory holds about twice the context and long agent sessions run faster.
-  The OCR and speech models keep their 16-bit cache.
+- **Kolibri 1 in long agent sessions.** Reading long prompts and decoding
+  deep into the context are faster with the 8-bit context cache, the
+  default (Nemotron's long-context decode gains too), and so is the NVFP4
+  version's prompt reading on Blackwell. After a reply that calls a tool,
+  the next request resumes from the cache instead of reading the reply's
+  reasoning again.
 
-- **A start that names no context window gets a long one sized to the
-  card.** Qwen 3.8 27B, Nemotron and Kolibri ask for 262K on NVIDIA GPUs and
-  fall back to the largest window that fits; a window you type is never
-  shrunk.
+- **Tool definitions reach the model as its chat template writes them.**
+  Tool schemas and earlier tool calls kept their keys in alphabetical order
+  and had `<`, `>`, `&` and apostrophes escaped; they now arrive exactly as
+  the reference renderer writes them, on every model family.
 
-- **Nemotron answers faster on NVIDIA GPUs.** On Blackwell it defaults to
-  its NVFP4 weights with their speculative drafter, and each speculative
-  round does less work.
+- **System messages in the middle of a conversation stay where they are**
+  on models whose templates allow it - Kolibri 1, Laguna, Gemma 4, Granite
+  and Muse Glimmer - instead of being folded into the next user turn.
+  Claude Code ends every request with one.
 
-- **Agent sessions resume instead of starting over** when the end of a
-  prompt is rewritten - the same document with another question - on
-  Nemotron, Qwen 3.5 to 3.8, Laguna and Kolibri.
+- **Faster pictures on Gemma 4 and EmbeddingGemma 2**, which share a picture
+  tower, and faster EmbeddingGemma 2 text embeddings on NVIDIA GPUs. The
+  results are the same to the bit.
 
-- **Models with sliding-window attention get the context they can hold.**
-  The memory estimate charged their window layers as if they kept growing,
-  so Gemma 4, gpt-oss, Laguna and Kolibri were offered a fraction of the
-  context that fits.
-
-- **Reads, Tables and Masks share one page layout**, and switching between
-  them no longer flashes the side panel.
+- **Kumo Tabular asks Size and Task** on the start form instead of offering
+  six quality cards, and the Tables page offers to start the other task -
+  predicting numbers instead of classes, or the reverse.
 
 ## Fixed
 
-- **Shipped builds use the speed settings the engine picks for each card.**
-  Some of those choices were dropped in release builds, among them a faster
-  decode on the DGX Spark and a faster prompt read on Qwen 3.5 to 3.8.
+- **The RAM context cache no longer goes offline when it fills up.** A full
+  cache could have free space and still no gap big enough for the next
+  block; those stores counted as failures, and enough of them switched the
+  cache off until the model restarted ("Cache offline" in the Studio). A
+  full cache now makes room before it stores, and a cache that is simply
+  full is never switched off.
+
+- **Claude Code's thinking display setting** is accepted by the Messages
+  API instead of refusing the request.
 
 ## macOS (pre-release)
 
-- Kolibri 1 runs natively on Metal, in a mixed 4/8-bit build.
-- Qwen models in MLX format decode faster at small batch sizes, and their
-  speculative rounds cost less.
-- The settings pages share one layout.
-- Updates are checked against a pinned signing identity.
+- EmbeddingGemma 2 takes pictures and audio on Metal, from the GGUF with its
+  picture and audio downloads or from an MLX 8-bit package that holds both;
+  video comes in as sampled frames, without the soundtrack.
+- The native app has an Embeddings workspace.
+- MLX text embeddings no longer depend on what else is in the batch.
 
 ## Known
 
-- **SAM 3 runs on NVIDIA GPUs only**, and its weights download only with a
-  Hugging Face account that has accepted Meta's licence.
+- **SAM 3 and TIC Forestry run on NVIDIA GPUs only**, and their weights
+  download only with a Hugging Face account that has accepted the model's
+  licence. TIC Forestry is built for Swedish imagery at 0.5 m; it is not a
+  general-purpose aerial model.
 
 - **Kolibri 1 has no same-weights llama.cpp reference yet:** no llama.cpp
   release reads it, so its correctness is checked against Aleph Alpha's own
   serving code.
 
-- **EmbeddingGemma 2 takes audio clips of up to 30 seconds;** video is not
-  served yet.
+- **EmbeddingGemma 2 takes audio clips of up to 30 seconds;** on NVIDIA GPUs
+  video is not served yet.
 
 - **Laya reads text only**, and its confidence on choices with more than ten
   options is not calibrated: the English checkpoint ships an out-of-range
