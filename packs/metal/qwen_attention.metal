@@ -124,8 +124,10 @@ QWEN_DECODE(qwen_attention_decode,half,6,false)
 QWEN_DECODE(qwen_attention_decode_gqa4,half,4,false)
 QWEN_DECODE(qwen_attention_decode_gqa8,half,8,false)
 QWEN_DECODE(mlx_attention_decode,bfloat,6,false)
+QWEN_DECODE(mlx_attention_decode_gqa4,bfloat,4,false)
 QWEN_DECODE(mlx_attention_verify,bfloat,6,true)
 QWEN_DECODE(mlx_attention_stable,bfloat,6,true)
+QWEN_DECODE(mlx_attention_stable_gqa4,bfloat,4,true)
 QWEN_DECODE(bonsai_attention_decode,float,6,true)
 #undef QWEN_DECODE
 kernel void qwen_attention_merge(device const float* parts [[buffer(0)]],device float* out [[buffer(1)]],

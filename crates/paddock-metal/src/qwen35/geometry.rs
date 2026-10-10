@@ -13,6 +13,22 @@ pub(super) struct Geometry {
 }
 
 impl Geometry {
+    pub const DENSE_08B: Self = Self {
+        width: 1024,
+        ff: 3584,
+        layers: 24,
+        heads: 8,
+        kv_heads: 2,
+        value_heads: 16,
+    };
+    pub const DENSE_4B: Self = Self {
+        width: 2560,
+        ff: 9216,
+        layers: 32,
+        heads: 16,
+        kv_heads: 4,
+        value_heads: 32,
+    };
     pub const DENSE_9B: Self = Self {
         width: 4096,
         ff: 12288,
@@ -57,11 +73,19 @@ impl Geometry {
     }
 
     pub fn validate(self) -> Result<Self> {
-        if self == Self::DENSE_9B || self == Self::DENSE_27B || self == Self::MOE_35B {
+        if [
+            Self::DENSE_08B,
+            Self::DENSE_4B,
+            Self::DENSE_9B,
+            Self::DENSE_27B,
+            Self::MOE_35B,
+        ]
+        .contains(&self)
+        {
             Ok(self)
         } else {
             Err(MetalError::Model(format!(
-                "Metal Qwen requires elected dense 9B/27B or MoE 35B geometry, got {self:?}"
+                "Metal Qwen requires elected dense 0.8B/4B/9B/27B or MoE 35B geometry, got {self:?}"
             )))
         }
     }
@@ -95,6 +119,8 @@ mod tests {
     #[test]
     fn dense_shapes_bound_shared_scratch_and_state_without_27b_padding() {
         for (g, linear, state, conv) in [
+            (Geometry::DENSE_08B, 18, 262144, 6144),
+            (Geometry::DENSE_4B, 24, 524288, 8192),
             (Geometry::DENSE_9B, 24, 524288, 8192),
             (Geometry::DENSE_27B, 48, 786432, 10240),
             (Geometry::MOE_35B, 30, 524288, 8192),

@@ -1369,6 +1369,195 @@ impl GpuExecutor {
         })
     }
 
+    /// Whether the pack lands a qwen-family (or PaddleOCR-VL) tower's attention on halves:
+    /// [`Self::mrope_vision_qkv_h`] (slot 833) feeding
+    /// [`Self::vision_attn_h`] (slot 620). Without both, the tower keeps the
+    /// f32 chain, which lands the same bits.
+    pub fn has_vision_qkv_h(&self) -> bool {
+        self.kernels.mrope_vision_qkv_h.is_some() && self.kernels.vision_attn_h.is_some()
+    }
+
+    /// The tower's three f32 projection planes landed as
+    /// [`Self::vision_attn_h`]'s halves in one pass:
+    /// `q16 = f16(rope(q + bq) * q_mul)`, `k16 = f16(rope(k + bk))`,
+    /// `v16 = f16(v + bv)`. With `q_mul = 1/sqrt(head_dim)` the half attention
+    /// on these is bit-for-bit `mrope_vision_bias` + `bias_add` +
+    /// `vision_attn_at` followed by `convert_f32_f16` - the rotation is the
+    /// same expression, and each plane's one round is the one the f32
+    /// attention does on its way into the fragments.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mrope_vision_qkv_h(
+        &self,
+        (q, k, v): (&CudaSlice<f32>, &CudaSlice<f32>, &CudaSlice<f32>),
+        (bq, bk, bv): (&CudaSlice<f32>, &CudaSlice<f32>, &CudaSlice<f32>),
+        positions: &CudaSlice<u32>,
+        (q16, k16, v16): (
+            &mut CudaSlice<f16>,
+            &mut CudaSlice<f16>,
+            &mut CudaSlice<f16>,
+        ),
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        theta_scale: f32,
+        q_mul: f32,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .mrope_vision_qkv_h
+            .ok_or(GpuError::MissingOp("mrope_vision_qkv_h"))?;
+        let (n, w) = (n_tokens * n_heads * head_dim, n_heads * head_dim);
+        if !head_dim.is_multiple_of(2)
+            || [q.len(), k.len(), v.len(), q16.len(), k16.len(), v16.len()]
+                .iter()
+                .any(|&l| l < n)
+            || [bq.len(), bk.len(), bv.len()].iter().any(|&l| l < w)
+            || positions.len() < 2 * n_tokens
+        {
+            return Err(oob("mrope_vision_qkv_h: buffers under the tower geometry"));
+        }
+        let (qp, _g1) = q.device_ptr(&self.stream);
+        let (kp, _g2) = k.device_ptr(&self.stream);
+        let (vp, _g3) = v.device_ptr(&self.stream);
+        let (bqp, _g4) = bq.device_ptr(&self.stream);
+        let (bkp, _g5) = bk.device_ptr(&self.stream);
+        let (bvp, _g6) = bv.device_ptr(&self.stream);
+        let (pp, _g7) = positions.device_ptr(&self.stream);
+        let (q16p, _g8) = q16.device_ptr_mut(&self.stream);
+        let (k16p, _g9) = k16.device_ptr_mut(&self.stream);
+        let (v16p, _g10) = v16.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slot 833); bounds checked above
+        check(unsafe {
+            f(
+                qp as *const _,
+                kp as *const _,
+                vp as *const _,
+                bqp as *const _,
+                bkp as *const _,
+                bvp as *const _,
+                pp as *const _,
+                q16p as *mut _,
+                k16p as *mut _,
+                v16p as *mut _,
+                n_tokens as u32,
+                n_heads as u32,
+                head_dim as u32,
+                theta_scale,
+                q_mul,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// Whether the pack folds a tower FFN's seams into its GEMMs: slot 834
+    /// (the up landing with bias + GELU) and slot 835 (a projection onto the
+    /// residual stream), beside the half attention's slots.
+    pub fn has_tower_ffn_fused(&self) -> bool {
+        self.has_vision_qkv_h()
+            && self.kernels.f16_gemm_h_gelu_tanhf.is_some()
+            && self.kernels.f16_gemm_bias_res.is_some()
+    }
+
+    /// A tower FFN up landing `y16 = f16(gelu(W x + bias))` in
+    /// [`Self::gelu_bias_f16`]'s tanh form, the f32 up plane never landing:
+    /// bit-for-bit [`Self::matvec_batch_f16`] + `gelu_bias_f16`. `scratch` (an
+    /// f32 `[batch, out]` plane) is where the pack runs those two passes at a
+    /// shape its fused landing cannot reproduce. `x16` and `y16` must not
+    /// overlap.
+    pub fn matvec_batch_f16_gelu_tanh(
+        &self,
+        w: &HalfTensor,
+        x16: &CudaSlice<f16>,
+        y16: &mut CudaSlice<f16>,
+        bias: &CudaSlice<f32>,
+        scratch: &mut CudaSlice<f32>,
+        batch: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .f16_gemm_h_gelu_tanhf
+            .ok_or(GpuError::MissingOp("f16_gemm_h_gelu_tanhf"))?;
+        let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
+        if w.buf.len() < in_dim * out_dim
+            || x16.len() < batch * in_dim
+            || y16.len() < batch * out_dim
+            || scratch.len() < batch * out_dim
+            || bias.len() < out_dim
+        {
+            return Err(oob(
+                "f16_gemm_h_gelu_tanhf: buffers under the GEMM geometry",
+            ));
+        }
+        super::basic_ops::gemm_census("B-gemm-f16-h-gelu-tanhf", in_dim, out_dim, batch);
+        let (wp, _g1) = w.buf.device_ptr(&self.stream);
+        let (xp, _g2) = x16.device_ptr(&self.stream);
+        let (bp, _g3) = bias.device_ptr(&self.stream);
+        let (yp, _g4) = y16.device_ptr_mut(&self.stream);
+        let (sp, _g5) = scratch.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slot 834); bounds checked above
+        check(unsafe {
+            f(
+                wp as *const _,
+                xp as *const _,
+                yp as *mut _,
+                bp as *const _,
+                sp as *mut _,
+                in_dim as u32,
+                out_dim as u32,
+                batch as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// A projection onto an f32 residual stream, `x += W a + bias` in
+    /// [`Self::add_bias_res`]'s order, the projection plane never landing:
+    /// bit-for-bit [`Self::matvec_batch_f16`] into `scratch` + `add_bias_res`,
+    /// which is what the pack runs where its fused landing cannot reproduce it.
+    pub fn matvec_batch_f16_bias_res(
+        &self,
+        w: &HalfTensor,
+        a16: &CudaSlice<f16>,
+        x: &mut CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        scratch: &mut CudaSlice<f32>,
+        batch: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .f16_gemm_bias_res
+            .ok_or(GpuError::MissingOp("f16_gemm_bias_res"))?;
+        let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
+        if w.buf.len() < in_dim * out_dim
+            || a16.len() < batch * in_dim
+            || x.len() < batch * out_dim
+            || scratch.len() < batch * out_dim
+            || bias.len() < out_dim
+        {
+            return Err(oob("f16_gemm_bias_res: buffers under the GEMM geometry"));
+        }
+        super::basic_ops::gemm_census("B-gemm-f16-bias-res", in_dim, out_dim, batch);
+        let (wp, _g1) = w.buf.device_ptr(&self.stream);
+        let (ap, _g2) = a16.device_ptr(&self.stream);
+        let (bp, _g3) = bias.device_ptr(&self.stream);
+        let (yp, _g4) = x.device_ptr_mut(&self.stream);
+        let (sp, _g5) = scratch.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slot 835); bounds checked above
+        check(unsafe {
+            f(
+                wp as *const _,
+                ap as *const _,
+                yp as *mut _,
+                bp as *const _,
+                sp as *mut _,
+                in_dim as u32,
+                out_dim as u32,
+                batch as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// Q8_0 embedding gather with fused scale: `out[t] = q8_row(tokens[t])·scale`.
     /// Token ids are device memory - the graph-capturable decode input.
     /// Q8_0 row-gather with unit scale - drop-in for the f32 `embed_gather_batch`
@@ -1410,6 +1599,54 @@ impl GpuExecutor {
         check(unsafe {
             f(
                 tp as *const _,
+                kp as *const _,
+                op as *mut _,
+                embd as u32,
+                n_tokens as u32,
+                scale,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// The pack can gather embedding rows straight out of a REPACKED Q8_0
+    /// plane (slot 832) - what lets a tied embedding share the LM head's
+    /// plane rather than keep a raw copy of the same matrix.
+    pub fn has_embed_gather_q8r(&self) -> bool {
+        self.kernels.embed_gather_q8r.is_some()
+    }
+
+    /// [`Self::embed_gather_q8`] over a repacked plane: rows of `table`
+    /// (`dims[1]` of them, `dims[0] == embd` wide) for each device token id,
+    /// times `scale`. Bit-identical to the raw gather on the same matrix.
+    pub fn embed_gather_q8r(
+        &self,
+        table: &RepackedQ8,
+        tokens: &CudaSlice<u32>,
+        out: &mut CudaSlice<f32>,
+        embd: usize,
+        n_tokens: usize,
+        scale: f32,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .embed_gather_q8r
+            .ok_or(GpuError::MissingOp("embed_gather_q8r"))?;
+        if table.dims[0] != embd || !embd.is_multiple_of(32) {
+            return Err(GpuError::Unsupported(format!(
+                "embed_gather_q8r: table row width {} for embd {embd} (needs equal, a multiple of 32)",
+                table.dims[0]
+            )));
+        }
+        let (dp, _g1) = table.data.device_ptr(&self.stream);
+        let (sp, _g2) = table.scale.device_ptr(&self.stream);
+        let (kp, _g3) = tokens.device_ptr(&self.stream);
+        let (op, _g4) = out.device_ptr_mut(&self.stream);
+        // SAFETY: pack ABI v1 contract; pointers + stream live across the call
+        check(unsafe {
+            f(
+                dp as *const _,
+                sp as *const _,
                 kp as *const _,
                 op as *mut _,
                 embd as u32,

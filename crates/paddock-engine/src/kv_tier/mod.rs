@@ -37,6 +37,8 @@ pub mod cost;
 pub mod digest;
 pub mod fingerprint;
 #[cfg(feature = "cuda")]
+mod hash_pool;
+#[cfg(feature = "cuda")]
 pub mod host;
 pub mod io;
 pub mod nvme_store;

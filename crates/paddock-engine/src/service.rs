@@ -20,11 +20,13 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::generator::{CanvasStatus, CanvasTickReq, FinishSample, GenError, Generator, RowSample};
 use crate::metrics::{EngineMetrics, PHASE_DECODE, PHASE_IDLE, PHASE_PREFILL};
-use crate::sampler::{Sampler, SamplingParams, TokenConstraint};
+use crate::sampler::{Sampler, SamplingParams, TokenConstraint, compute_logprobs};
 use crate::spec::NgramDraft;
 use crate::spec_policy::{RoundTally, SpecController, SpecPolicy, synchronous_draft_budget};
 
+mod finish;
 mod timing;
+pub use finish::FinishReason;
 
 /// Serving spec-decode row budget per round: total rows (1 pending + drafts
 /// per slot) must fit the models' verify-pass cap. Default 32 matches
@@ -251,65 +253,6 @@ fn fixed_block_depth_bypasses_chain_ramp_but_respects_round_budget() {
     }
 }
 
-/// Per-position draft acceptance, behind `PADDOCK_SPEC_DEBUG`.
-///
-/// The aggregate "N drafted, M accepted" hides the shape, and the shape is
-/// what says which thing is wrong. A head whose weights are off is weak
-/// everywhere (0.50/0.42/0.38); a head whose chaining is off is strong at
-/// position 0 and collapses after (0.80/0.30/0.10), because each further
-/// draft rides state the previous one produced. The published references for
-/// this family quote exactly this curve - Mia's 0.80/0.59/0.41 -> 2.80 of 4 -
-/// so it is also the only form in which our number can be compared to theirs.
-///
-/// A round that drafted `d` and committed a run of `a` accepted drafts means:
-/// positions 0..a were reached and accepted, position `a` was reached and
-/// rejected (when a < d). So position i's rate is
-/// `reached_and_accepted[i] / reached[i]`.
-fn spec_pos_census(drafted: usize, accepted: usize) {
-    use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_SPEC_DEBUG").is_some()) {
-        return;
-    }
-    const K: usize = 16;
-    static REACHED: [AtomicU64; K] = [const { AtomicU64::new(0) }; K];
-    static ACCEPT: [AtomicU64; K] = [const { AtomicU64::new(0) }; K];
-    static ROUNDS: AtomicU64 = AtomicU64::new(0);
-    static TOKENS: AtomicU64 = AtomicU64::new(0);
-    static DRAFTED: AtomicU64 = AtomicU64::new(0);
-    for i in 0..drafted.min(K) {
-        REACHED[i].fetch_add(1, Relaxed);
-        if i < accepted {
-            ACCEPT[i].fetch_add(1, Relaxed);
-        }
-    }
-    DRAFTED.fetch_add(drafted as u64, Relaxed);
-    TOKENS.fetch_add(accepted as u64 + 1, Relaxed);
-    let r = ROUNDS.fetch_add(1, Relaxed) + 1;
-    if r.is_multiple_of(200) {
-        let mut curve = String::new();
-        for i in 0..K {
-            let n = REACHED[i].load(Relaxed);
-            if n == 0 {
-                break;
-            }
-            if i > 0 {
-                curve.push('/');
-            }
-            curve.push_str(&format!("{:.2}", ACCEPT[i].load(Relaxed) as f64 / n as f64));
-        }
-        let (d, t) = (DRAFTED.load(Relaxed) as f64, TOKENS.load(Relaxed) as f64);
-        tracing::info!(
-            "[spec-pos] rounds {r} per-position {curve} | overall {:.1}% of drafts, \
-             {:.2} tokens a round ({:.2} drafted)",
-            100.0 * (t - r as f64) / d,
-            t / r as f64,
-            d / r as f64,
-        );
-    }
-}
-
 /// The operator's speculation policy, from the runner's `spec` config key
 /// (threaded in as PADDOCK_SPEC). Read once - it is a serving-envelope choice,
 /// not something to re-evaluate per tick.
@@ -491,6 +434,10 @@ pub struct GenRequest {
     /// with an error event on a next-token backend. `max_tokens`, sampler
     /// and stop ids are ignored for a read.
     pub canvas_read: Option<CanvasReadRequest>,
+    /// This prompt opens a USER turn (its last message is the user's own, not
+    /// tool results): its prompt-end checkpoint is held as an anchor
+    /// (`Generator::anchor_at`) - where the next user turn's re-render resumes.
+    pub user_turn: bool,
 }
 
 /// The structured read's inputs and its reply channel (see
@@ -523,35 +470,6 @@ pub struct TokenLogprobs {
     pub chosen: f32,
     /// top alternatives, (token id, logprob), probability-descending
     pub top: Vec<(u32, f32)>,
-}
-
-/// log_softmax stats of `logits` for the chosen token + top-k alternatives.
-/// Runs on the RAW logits, before any penalty/temperature mutation.
-fn compute_logprobs(logits: &[f32], chosen: u32, top_n: u8) -> TokenLogprobs {
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let lse = max + logits.iter().map(|&l| (l - max).exp()).sum::<f32>().ln();
-    let mut top: Vec<(u32, f32)> = Vec::new();
-    if top_n > 0 {
-        let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
-        let k = (top_n as usize).min(idx.len());
-        idx.select_nth_unstable_by(k - 1, |&a, &b| {
-            logits[b as usize].total_cmp(&logits[a as usize])
-        });
-        idx.truncate(k);
-        idx.sort_unstable_by(|&a, &b| logits[b as usize].total_cmp(&logits[a as usize]));
-        top = idx
-            .into_iter()
-            .map(|i| (i, logits[i as usize] - lse))
-            .collect();
-    }
-    TokenLogprobs {
-        chosen: logits
-            .get(chosen as usize)
-            .copied()
-            .unwrap_or(f32::NEG_INFINITY)
-            - lse,
-        top,
-    }
 }
 
 /// One constrained (or plain) sampling step: stop tokens are legal only when
@@ -895,24 +813,6 @@ impl std::fmt::Display for EngineError {
 fn is_cuda_oom(msg: &str) -> bool {
     let m = msg.to_ascii_uppercase();
     m.contains("OUT_OF_MEMORY") || m.contains("OUT OF MEMORY")
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FinishReason {
-    /// hit a stop token
-    Stop,
-    /// hit max_tokens
-    Length,
-}
-
-impl FinishReason {
-    /// OpenAI `finish_reason` string.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            FinishReason::Stop => "stop",
-            FinishReason::Length => "length",
-        }
-    }
 }
 
 /// Cross-thread shutdown control: a process that
@@ -1288,6 +1188,7 @@ impl Engine {
                             logprobs: None,
                             submitted: None,
                             canvas_read: None,
+                            user_turn: false,
                         },
                         &metrics,
                     );
@@ -1330,6 +1231,7 @@ impl Engine {
                             logprobs: None,
                             submitted: None,
                             canvas_read: None,
+                            user_turn: false,
                         });
                     }
                     drop(wtx);
@@ -2693,11 +2595,15 @@ struct Slot {
     reply_pin_due: bool,
     /// The pin was taken; once per reply.
     reply_pinned: bool,
+    /// A user-turn prompt's last position, held for `Generator::anchor_at`
+    /// once its first prefill lands (text prompts only).
+    anchor_upto: Option<usize>,
 }
 
 impl Slot {
     fn new(mut req: GenRequest, metrics: Arc<EngineMetrics>) -> Self {
         let constraint_free = req.constraint.as_ref().is_none_or(|c| c.free_now());
+        let anchor_upto = (req.user_turn && req.mm_chunks.is_none()).then(|| req.prompt.len() - 1);
         Slot {
             history: req.prompt.clone(),
             prompt: req.prompt,
@@ -2725,6 +2631,7 @@ impl Slot {
             constraint_free,
             reply_pin_due: false,
             reply_pinned: false,
+            anchor_upto,
         }
     }
 
@@ -2788,7 +2695,7 @@ impl Slot {
         // nothing at the width that does not take it. That is exactly what the
         // first cut did - instrumented the MIXED path and printed no curve at
         // all at c1.
-        spec_pos_census(drafted, accepted);
+        crate::spec_policy::spec_pos_census(drafted, accepted);
     }
 
     /// Repurpose this slot for recompute after its KV was freed under pool
@@ -2817,6 +2724,12 @@ impl Slot {
     fn accept(&mut self, next: u32, logprobs: Option<TokenLogprobs>) -> bool {
         if self.stop_tokens.contains(&next) {
             finish_sampled_stop(&self.events, &self.metrics, self.run_stats());
+            return false;
+        }
+        if self.sampler.repeat_stop_hit(&self.history, next) {
+            let _ = self
+                .events
+                .send(TokenEvent::Done(FinishReason::Repetition, self.run_stats()));
             return false;
         }
         self.note_constraint();
@@ -2937,6 +2850,9 @@ fn finish_prefill(
     // first prefill only - a recompute must not restart the phase clock
     slot.prefill_done
         .get_or_insert_with(std::time::Instant::now);
+    if let Some(upto) = slot.anchor_upto.take() {
+        generator.anchor_at(k, &slot.history, upto);
+    }
     // Recompute: the slot's KV was just rebuilt from history[0..pos]. Its
     // pending/pos/history/generated are intact - resume decode without sampling a
     // fresh token or re-reporting usage. (The rebuilt KV comes from the prefill
@@ -3034,6 +2950,9 @@ fn finish_prefill_sampled(
     slot.max_tokens = slot.max_tokens.min(max_ctx.saturating_sub(rows as usize));
     slot.prefill_done
         .get_or_insert_with(std::time::Instant::now);
+    if let Some(upto) = slot.anchor_upto.take() {
+        generator.anchor_at(k, &slot.history, upto);
+    }
     if std::mem::take(&mut slot.recompute) {
         return;
     }
@@ -3729,6 +3648,7 @@ fn run_batched(
     // the blocked idle recv excluded below.
     let stall_warn_ms = static_env_u64("PADDOCK_TICK_STALL_WARN_MS", 750);
     let mut tick_t0 = std::time::Instant::now();
+    let mut held_at_start = 0usize; // decoding slots when `tick_t0` was set
     // Phase marks for the straggler self-report. A stall used to name only its
     // total, which is not actionable: an excursion is a handful of ~1 s ticks
     // (100x a normal tick) and an external profiler cannot attribute it -
@@ -3851,16 +3771,13 @@ fn run_batched(
                 ms(phase[5]),
             );
             let wall_ms = tick_wall.as_secs_f64() * 1e3;
-            // Who waited on this tick: live sequences not mid-way through a
-            // chunked prefill or a stepped multimodal one (so decoding, or
-            // taking a one-tick prefill) and the preempted ones queued for
-            // recompute. With none, every live sequence was spending its own
-            // planned prefill - a long prompt's chunk ticks run past the wall
-            // by design, one per second for the whole prompt (a 178K prompt on
-            // the 27B put ~120 WARNs in a customer log), so those go to debug
-            // and the WARN keeps meaning a client was held.
-            let waiting =
-                active.saturating_sub(chunking.len() + mm_encoding.len()) + preempted.len();
+            // Who waited on this tick: sequences already decoding when it began,
+            // and the preempted ones queued for recompute. Anyone else spent the
+            // tick on its own prefill - long chunk ticks by design (a 178K prompt
+            // put ~120 WARNs in a customer log), and the tick that finishes a
+            // prompt, which read as a held client once its slot left `chunking`
+            // (267 of another customer's 302 WARNs) - so those go to debug.
+            let waiting = held_at_start + preempted.len();
             if waiting > 0 {
                 tracing::warn!(
                     ?early_exit_phase,
@@ -3881,6 +3798,7 @@ fn run_batched(
             }
         }
         tick_t0 = std::time::Instant::now();
+        held_at_start = slots.iter().flatten().filter(|s| s.prefilled).count();
         ph_admit = std::time::Duration::ZERO;
         ph_prefill = std::time::Duration::ZERO;
         ph_mixed = std::time::Duration::ZERO;
@@ -4867,6 +4785,7 @@ fn run_batched(
                         };
                     if pipe_alive {
                         let mut prev_plans = plans0;
+                        let mut ovl_ticks = 0usize;
                         loop {
                             // stop pumping when the span completes, the pool
                             // runs low, a row needs host sampling, or every
@@ -4875,7 +4794,12 @@ fn run_batched(
                             let low_headroom = !generator
                                 .pool_free_blocks()
                                 .is_none_or(|f| f > max_batch + POOL_WATERMARK_BLOCKS);
-                            if generator.unified_span_done() || low_headroom || all_dead {
+                            // dead rows tick on too: none may step past its context
+                            let near_end = pos
+                                .iter()
+                                .any(|&p| p as usize + ovl_ticks + 3 >= generator.max_context());
+                            if generator.unified_span_done() || low_headroom || all_dead || near_end
+                            {
                                 break;
                             }
                             let mut host_row = false;
@@ -4909,6 +4833,7 @@ fn run_batched(
                             if host_row {
                                 break;
                             }
+                            ovl_ticks += 1;
                             match generator.decode_pipe_next(&next_plans) {
                                 Ok(ids) => {
                                     st_ovl += 1;
@@ -6842,18 +6767,17 @@ fn run_batched(
         ph_spec = tick_t0.elapsed();
         // Phase 2 - one decode step over the active (prefilled) slots. Dense batch
         // over [0, high_water): active rows feed their pending token at their
-        // position, holes feed (0, 0) and are ignored.
-        //
-        // "Active" means PREFILLED, not merely occupied, and the difference is
-        // not academic: an occupied slot with no KV behind it samples a token
-        // out of a hole row and streams it to the client. That used to be
-        // unreachable - admission prefilled synchronously, and a mid-chunk slot
-        // is only ever reached through the mixed tick above - until the encoder
-        // budget gave a slot a legitimate reason to sit occupied and
-        // unprefilled for several ticks. It cost exactly one junk token per
-        // encode tick, prepended to an otherwise perfect answer.
+        // position, holes feed (0, 0) and are ignored. "Active" means PREFILLED,
+        // not merely occupied: an occupied slot with no KV behind it would
+        // sample a token out of a hole row and stream it (one junk token per
+        // encode tick once the encoder budget let slots sit unprefilled). And
+        // with no active row there is no step at all - every occupied slot is
+        // encoding, chunking or parked on a KV-tier restore, and an all-hole
+        // step is a whole forward pass (~100 ms on a 27B) a tick, which also
+        // paced the tier pump the parked restore waits on to 10 Hz.
         let high_water = slots.iter().rposition(|s| s.is_some()).map_or(0, |i| i + 1);
-        if high_water == 0 {
+        if !slots.iter().flatten().any(|s| s.prefilled) {
+            std::thread::sleep(std::time::Duration::from_micros(100));
             continue;
         }
         let mut tokens = vec![0u32; high_water];
@@ -6932,6 +6856,11 @@ fn run_batched(
             let live_slots = slots.iter().filter(|s| s.is_some()).count();
             let pipe_begun = pipe_supported
                 && live_slots >= pipe_min_live()
+                // every occupied row decodes: a slot still encoding pictures or
+                // chunking a prompt needs the outer loop, which a segment only
+                // returns to on an arrival - 64 page requests admitted at once
+                // left 62 encodes waiting on two decoders forever
+                && slots[..high_water].iter().flatten().all(|s| s.prefilled)
                 && ticks_since_admit >= pipe_min_quiet.saturating_add(pipe_backoff)
                 // host-head TruncCat cannot ride the zero-host pipe;
                 // full-device (mode 5) TruncCat can
@@ -6960,6 +6889,7 @@ fn run_batched(
                 // `prev_plans` = plans of the OLDEST in-flight tick - the one
                 // whose ids the next decode_pipe_next/drain call returns.
                 let mut prev_plans = plans;
+                let mut seg_ticks = 0usize;
                 loop {
                     // Draw the next tick's plans first (per-slot RNG order is
                     // identical to the classic path - draws don't depend on
@@ -7047,7 +6977,13 @@ fn run_batched(
                     // continue-gate: drain before the pool could exhaust under
                     // a worst-case tick of block growth (oversubscribed pools)
                     let low_headroom = !pipe_headroom(generator);
-                    if host_row || admit_req.is_some() || low_headroom {
+                    // every row - a dead one ticking on as a dummy, a hole -
+                    // advances a position a tick: drain before any reaches the
+                    // context end (its block table has nothing past it)
+                    let near_end = positions
+                        .iter()
+                        .any(|&p| p as usize + seg_ticks + 3 >= generator.max_context());
+                    if host_row || admit_req.is_some() || low_headroom || near_end {
                         if paddock_models::dev_var_os!("PADDOCK_REQ_TRACE").is_some() {
                             tracing::info!(
                                 "req-trace: pipe-break host={host_row} arrival={} lowroom={low_headroom} at {}",
@@ -7190,6 +7126,7 @@ fn run_batched(
                         break;
                     }
                     let t0 = std::time::Instant::now();
+                    seg_ticks += 1;
                     match generator.decode_pipe_next(&next_plans) {
                         Ok(ids) => {
                             st[0].0 += 1;
@@ -7206,7 +7143,11 @@ fn run_batched(
                                 }
                             }
                             prev_plans = next_plans;
-                            if died && slots[..high_water].iter().any(|s| s.is_some()) {
+                            if died
+                                && slots[..high_water]
+                                    .iter()
+                                    .any(|s| s.as_ref().is_some_and(|s| s.prefilled))
+                            {
                                 // Keep the pipe HOT past completions: the dead
                                 // row keeps ticking as a device-chained dummy -
                                 // pipe_launch_tick tops up its blocks each tick
@@ -7529,6 +7470,7 @@ mod cache_admission_tests {
                     logprobs: None,
                     submitted: None,
                     canvas_read: None,
+                    user_turn: false,
                 })
                 .unwrap();
             }
@@ -7621,6 +7563,7 @@ mod diffusion_billing_tests {
                 logprobs: None,
                 submitted: None,
                 canvas_read: None,
+                user_turn: false,
             })
             .unwrap();
         }
@@ -7703,6 +7646,7 @@ mod reply_pin_tests {
                 logprobs: None,
                 submitted: None,
                 canvas_read: None,
+                user_turn: false,
             },
             Arc::new(EngineMetrics::default()),
         )
@@ -7785,6 +7729,7 @@ mod usage_tests {
                     logprobs: None,
                     submitted: None,
                     canvas_read: None,
+                    user_turn: false,
                 },
                 metrics.clone(),
             );
@@ -7825,6 +7770,7 @@ mod usage_tests {
                 logprobs: None,
                 submitted: None,
                 canvas_read: None,
+                user_turn: false,
             },
             metrics.clone(),
         );
@@ -7912,6 +7858,7 @@ mod usage_tests {
                     logprobs: None,
                     submitted: None,
                     canvas_read: None,
+                    user_turn: false,
                 },
                 Arc::new(EngineMetrics::default()),
             )
@@ -7985,6 +7932,7 @@ mod usage_tests {
                 logprobs: None,
                 submitted: None,
                 canvas_read: None,
+                user_turn: false,
             },
             &metrics,
         );
@@ -8133,6 +8081,7 @@ mod serial_pipe_tests {
                 logprobs: None,
                 submitted: None,
                 canvas_read: None,
+                user_turn: false,
             },
             &metrics,
         );

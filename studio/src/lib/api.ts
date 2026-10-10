@@ -190,6 +190,9 @@ export interface CacheTier {
   miss_no_new_tokens: number
   miss_tripped: number
   miss_ghost: number
+  /** Hybrid models: KV held without the saved state to resume on it.
+   *  Absent from runners that predate the counter. */
+  miss_no_state?: number
   elected_restore: number
   elected_recompute: number
   parked: number
@@ -588,11 +591,12 @@ export interface ChoiceAxis {
 }
 /** One independently downloadable PIECE of a model (schema 3): a weights
  *  alternative (the quality choice) or a companion (vision or audio tower,
- *  MTP drafter, native-FP8 snapshot, an image lane's text encoder or VAE) -
+ *  MTP drafter, native-FP8 snapshot, an image lane's text encoder or VAE, a
+ *  document reader's layout model) -
  *  the manager's `ArtifactKind`, kebab-cased. */
 export interface CatalogArtifact {
   id: string
-  kind: 'weights' | 'vision' | 'audio' | 'drafter' | 'fp8-snapshot' | 'text-encoder' | 'vae'
+  kind: 'weights' | 'vision' | 'audio' | 'drafter' | 'fp8-snapshot' | 'text-encoder' | 'vae' | 'layout'
   format: 'gguf' | 'safetensors'
   label: string
   /** where this weights artifact sits on the model's `specs.choices`, by

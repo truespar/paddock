@@ -705,13 +705,13 @@ impl Qwen35 {
         if self.mlx {
             self.project(
                 &cmd,
-                &[(&self.head, &d.logits)],
+                &[(self.head(), &d.logits)],
                 &d.norm,
                 head_rows,
                 &d.gemm,
             );
         } else {
-            self.head
+            self.head()
                 .linear(&cmd, &d.norm, &d.logits, rows, 1., &d.gemm);
         }
         cmd.dispatch(

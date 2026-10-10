@@ -222,6 +222,40 @@ def sec_tools(client, model, dialect):
         assert final.stop_reason == "tool_use", final.stop_reason
         ok("named tool_choice + streamed input_json_delta")
 
+        # a long string argument streams while it is written: many
+        # input_json_delta pieces, and the accumulator's input is exact JSON
+        write_tool = {
+            "name": "write_file",
+            "description": "Write a text file",
+            "input_schema": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                "required": ["path", "content"],
+            },
+        }
+        pieces, joined = 0, ""
+        with client.messages.stream(
+            model=model,
+            max_tokens=1200,
+            messages=[{"role": "user", "content": "Write a Python module of about 30 lines with three "
+                       "small functions and docstrings to fib.py."}],
+            tools=[write_tool],
+            tool_choice={"type": "tool", "name": "write_file"},
+            temperature=0.0,
+        ) as s:
+            for event in s:
+                if event.type == "content_block_delta" and event.delta.type == "input_json_delta":
+                    pieces += 1
+                    joined += event.delta.partial_json
+            final = s.get_final_message()
+        uses = [b for b in final.content if b.type == "tool_use"]
+        assert uses and uses[0].name == "write_file", final.content
+        assert json.loads(joined) == uses[0].input, (joined[:200], uses[0].input)
+        assert len(uses[0].input.get("content", "")) > 200, uses[0].input
+        assert pieces > 20, f"tool input arrived in {pieces} pieces"
+        print(f"  write_file input in {pieces} input_json_delta pieces", flush=True)
+        ok("tool input streams while it is written")
+
 
 def sec_stops(client, model):
     r = client.messages.create(
@@ -330,6 +364,30 @@ def sec_vision(client, model):
         answer = text_of(r).lower()
         assert "red" in answer and "blue" in answer, (media_type, answer)
         ok(f"vision decodes {media_type}")
+
+    # a picture an agent's file-read tool returned rides its tool_result (what
+    # Claude Code's Read does with a .png) - the model has to see it there too
+    read_tool = {"name": "read_file", "description": "Read a file",
+                 "input_schema": {"type": "object", "properties": {"path": {"type": "string"}},
+                                  "required": ["path"]}}
+    r = client.messages.create(
+        model=model,
+        max_tokens=500,
+        tools=[read_tool],
+        messages=[
+            {"role": "user", "content": "Read picture.bmp and tell me its two colors, briefly."},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_pic", "name": "read_file",
+                                               "input": {"path": "picture.bmp"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_pic", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/bmp",
+                                             "data": base64.b64encode(red_blue_bmp()).decode()}}]}]},
+        ],
+        temperature=0.0,
+    )
+    answer = text_of(r).lower()
+    assert "red" in answer and "blue" in answer, answer
+    print(f"  tool_result vision answer: {answer!r}", flush=True)
+    ok("vision inside a tool_result (an agent's file read)")
 
 
 def sec_context_management(client, model):

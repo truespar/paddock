@@ -12,7 +12,8 @@ import Foundation
     "Baidu": "Baidu", "ByteDance": "ByteDance", "PaddlePaddle": "PaddlePaddle",
     "Cloudflare": "Cloudflare",
     "MiniMax": "MiniMax", "Hugging Face": "HuggingFace", "OpenRouter": "OpenRouter",
-    "Prism ML": "PrismML", "Aleph Alpha": "AlephAlpha",
+    "Prism ML": "PrismML", "Aleph Alpha": "AlephAlpha", "LightOn": "LightOn",
+    "OpenBMB": "OpenBMB", "The Intelligence Company": "IntelligenceCompany",
     "Exa": "Exa", "Tavily": "Tavily", "Firecrawl": "Firecrawl", "Brave": "Brave",
   ]
 
@@ -61,9 +62,16 @@ import Foundation
   // KBLab's opaque background carries meaningful luminance differences: an
   // alpha-only template would erase the artwork into a solid circle. Desaturate
   // just this original image, never the workspace or future user image content.
-  static func usesTemplate(for vendor: String?) -> Bool { vendor != "KBLab" }
+  // LightOn's emblem is the same case: its starburst is opaque white paint on
+  // the disc, so a template would flatten it to a plain circle.
+  static func usesTemplate(for vendor: String?) -> Bool {
+    vendor != "KBLab" && vendor != "LightOn"
+  }
 
   // IBM has no square symbol. Preserve the 58:23 wordmark, with optical insets
   // that keep its eight bars legible in the 34-point list avatar on Retina.
-  static func insetFraction(for vendor: String?) -> CGFloat { vendor == "IBM" ? 0.06 : 0.2 }
+  // The Intelligence Company's 52:20 mark is the same shape and gets the same.
+  static func insetFraction(for vendor: String?) -> CGFloat {
+    vendor == "IBM" || vendor == "The Intelligence Company" ? 0.06 : 0.2
+  }
 }

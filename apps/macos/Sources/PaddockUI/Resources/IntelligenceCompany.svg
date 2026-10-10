@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+    viewBox="0 0 52 20"
+    preserveAspectRatio="xMidYMid meet"
+    fill="#000"
+    role="img"
+    aria-label="The Intelligence Company"
+  >
+    <path d="m 22.6348,6.66667 h 6.7288 V 0 h -6.7288 z" />
+    <path
+      fill-rule="evenodd"
+      d="M 38.542,0 H 51.9996 V 6.66667 H 38.542 Z M 31.8125,19.9991 V 6.66577 h 6.7288 v 6.66663 h 13.4576 v 6.6667 z"
+    />
+    <path
+      d="M 9.76562e-4,13.3333 H 6.72979 V 20 h 6.72881 v -6.6667 h 6.7288 V 6.66667 H 13.4586 V 0 H 6.72979 V 6.66667 H 9.76562e-4 Z"
+    />
+  </svg>

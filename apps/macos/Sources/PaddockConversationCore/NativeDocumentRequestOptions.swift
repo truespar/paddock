@@ -19,7 +19,11 @@ enum NativeDocumentRequestOptions {
       {
         ocr["mode"] = .string(mode)
       }
-      if fields["ocrRegions"]?.bool == true, advertised["grounding"]?.bool == true {
+      // LightOn trains grounding as a mode. A retained toggle from another
+      // OCR family must not override its selected Plain/Automatic mode.
+      if fields["ocrRegions"]?.bool == true, advertised["grounding"]?.bool == true,
+        advertised["modes"]?.array?.contains(.string("grounding")) != true
+      {
         ocr["grounding"] = .bool(true)
       }
     }

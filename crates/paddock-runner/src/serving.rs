@@ -65,6 +65,10 @@ pub struct ServingModel {
     /// `<system-reminder>` fold - probed once at load,
     /// `chat_template::renders_late_system`.
     pub late_system_native: bool,
+    /// The template renders image parts inside tool replies (probed at load,
+    /// `chat_template::renders_tool_images`) - with a vision tower, a picture a
+    /// tool returned reaches the model; otherwise it becomes a text note.
+    pub tool_images: bool,
     /// which assistant-output syntax to parse (tool calls, reasoning)
     pub dialect: crate::parsers::Dialect,
     /// what reasoning control this checkpoint's own template implements -
@@ -112,7 +116,12 @@ pub struct ServingModel {
     /// The paddleocr family is serving: its `ocr` request object maps modes
     /// to the checkpoint's six task prompts (see `crate::paddle_ocr`).
     pub paddleocr: bool,
-    /// This model only reads documents (deepseek2-ocr, paddleocr): its decoder
+    /// A LightOnOCR-3 checkpoint is serving on the qwen35 graph: its `ocr`
+    /// request object (plain / grounding), its trained page size and its own
+    /// sampling row all key off this (see `crate::lighton_ocr`). Read off the
+    /// file's identity, because the arch string is Qwen's.
+    pub lightonocr: bool,
+    /// This model only reads documents (deepseek2-ocr, paddleocr, LightOnOCR-3): its decoder
     /// was trained to transcribe pages, and a text-only prompt is
     /// out-of-distribution - it free-runs transcription-vocabulary noise to
     /// the token cap (observed live). The chat surfaces refuse
@@ -120,6 +129,10 @@ pub struct ServingModel {
     /// client can gate its composer instead of discovering this by burning
     /// tokens. Broader than `ocr` (which keys deepseek's request object).
     pub document_parser: bool,
+    /// PaddleOCR-VL's layout companion (PP-DocLayoutV3), when it is
+    /// installed beside the weights: it serves `ocr.mode = "document"`, the
+    /// checkpoint's own region pipeline (`crate::paddle_layout`).
+    pub layout: Option<paddock_engine::doclayout::LayoutService>,
     /// per-id byte table for constrained decoding, built on first use
     vocab_cache: std::sync::OnceLock<Arc<crate::constrained::VocabBytes>>,
 }
@@ -251,6 +264,129 @@ impl ServingModel {
             ("bos_token", text(self.tokenizer.bos_id)),
             ("eos_token", text(self.tokenizer.eos_id)),
         ]
+    }
+
+    /// The request's template kwargs with this checkpoint's own defaults
+    /// filled in under the caller's: the family table, plus LightOnOCR-3's
+    /// thinking-off - its template thinks whenever `enable_thinking` is
+    /// defined true, and the renderer defines it true for everyone else.
+    pub fn template_defaults(
+        &self,
+        kwargs: Option<serde_json::Value>,
+    ) -> Option<serde_json::Value> {
+        if !self.lightonocr {
+            return crate::chat_template::family_defaults(&self.arch, kwargs);
+        }
+        let mut kwargs = kwargs.unwrap_or_else(|| serde_json::json!({}));
+        if let Some(object) = kwargs.as_object_mut() {
+            object.entry("enable_thinking").or_insert(false.into());
+        }
+        Some(kwargs)
+    }
+
+    /// The `ocr` capability object of the document-parser family serving
+    /// here - also the test for whether the `ocr` request object is served.
+    pub fn ocr_caps(&self) -> Option<serde_json::Value> {
+        if self.ocr {
+            Some(crate::deepseek_ocr::caps_json())
+        } else if self.paddleocr {
+            Some(crate::paddle_ocr::caps_json(self.layout.is_some()))
+        } else if self.lightonocr {
+            Some(crate::lighton_ocr::caps_json())
+        } else {
+            None
+        }
+    }
+
+    /// An untouched request decodes greedy. The document parsers default to
+    /// it because their checkpoints ship greedy generation configs - except
+    /// LightOnOCR-3, whose authors sample at 0.2 (its elected row).
+    pub fn greedy_default(&self) -> bool {
+        self.document_parser && !self.lightonocr
+    }
+
+    /// The key the elected-sampling table is read with: the arch, except for
+    /// a fine-tune that keeps a base graph but publishes its own sampling.
+    pub fn sampling_key(&self) -> &str {
+        if self.lightonocr {
+            paddock_models::sampling::LIGHTONOCR3
+        } else {
+            &self.arch
+        }
+    }
+
+    /// The page size this checkpoint was trained at, when it fixes one: PDF
+    /// pages render to it and larger pictures are fitted down to it.
+    pub fn page_edge(&self) -> Option<u32> {
+        self.lightonocr.then_some(crate::lighton_ocr::PAGE_EDGE)
+    }
+
+    /// Decode a request's image parts for this model - the shared decode,
+    /// with the checkpoint's own page fit when it has one.
+    pub(crate) fn decode_images(
+        &self,
+        refs: Vec<crate::chat::ImageRef<'_>>,
+    ) -> Result<Vec<crate::chat::RequestImage>, String> {
+        crate::chat::decode_images(refs, self.engine.vision_budget(), self.page_edge())
+    }
+
+    /// Resolve the `ocr` request object and prompt vocabulary for whichever
+    /// document parser is serving - one seam for all three API surfaces.
+    /// `messages` is the normalized array the template renders, mutated when
+    /// a canonical task string is injected. `kwargs` is the
+    /// `chat_template_kwargs.ocr` channel, None where a surface has none
+    /// (/v1/messages). A top-level `ocr` on any other model is a 400.
+    /// The surfaces that do not serve PaddleOCR-VL's document pipeline
+    /// (/v1/messages, /v1/responses) resolve here; chat completions through
+    /// [`Self::resolve_ocr_on`].
+    pub(crate) fn resolve_ocr(
+        &self,
+        top: Option<&serde_json::Value>,
+        kwargs: Option<&serde_json::Value>,
+        messages: &mut [serde_json::Value],
+        images: &[crate::chat::RequestImage],
+    ) -> Result<Option<crate::deepseek_ocr::OcrResolved>, String> {
+        self.resolve_ocr_on(top, kwargs, messages, images, false)
+    }
+
+    /// [`Self::resolve_ocr`] on a surface that may serve the document
+    /// pipeline (`document_surface`: /v1/chat/completions does).
+    pub(crate) fn resolve_ocr_on(
+        &self,
+        top: Option<&serde_json::Value>,
+        kwargs: Option<&serde_json::Value>,
+        messages: &mut [serde_json::Value],
+        images: &[crate::chat::RequestImage],
+        document_surface: bool,
+    ) -> Result<Option<crate::deepseek_ocr::OcrResolved>, String> {
+        if top.is_some() && self.ocr_caps().is_none() {
+            return Err("the `ocr` request object is only served by document-parser models".into());
+        }
+        if self.ocr {
+            let opts = crate::deepseek_ocr::OcrOpts::from_request(top, kwargs)?;
+            let sizes: Vec<(usize, usize)> =
+                images.iter().map(crate::chat::RequestImage::size).collect();
+            let max_tiles = self
+                .engine
+                .vision_budget()
+                .map_or(0, |b| (b.max_pixels / (640 * 640)) as usize);
+            crate::deepseek_ocr::resolve(messages, opts, &sizes, max_tiles)
+        } else if self.paddleocr {
+            let mode = crate::paddle_ocr::opts_from_request(top, kwargs)?;
+            let document = if self.layout.is_none() {
+                Err("no layout model (PP-DocLayoutV3) is installed beside this model")
+            } else if !document_surface {
+                Err("the document pipeline is served on /v1/chat/completions")
+            } else {
+                Ok(())
+            };
+            crate::paddle_ocr::resolve(messages, mode, images.len(), document)
+        } else if self.lightonocr {
+            let mode = crate::lighton_ocr::opts_from_request(top, kwargs)?;
+            crate::lighton_ocr::resolve(messages, mode, images.len())
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -2135,6 +2271,9 @@ pub(crate) fn load_with_residency(
     // The family override carries the real shape (bare concat, markers at the
     // prefix, caller's own `<image>` wins); see the constant's docs and
     let deepseek_ocr = arch == "deepseek2-ocr";
+    // LightOnOCR-3 is a qwen35 file, so only its identity can say it reads
+    // pages; its own template (thinking off by default) serves unchanged.
+    let lightonocr = crate::lighton_ocr::is_checkpoint(&arch, map.gguf());
     let chat_template = if granite_audio {
         tokenizer.chat_template.clone()
     } else if audio_serving {
@@ -2157,6 +2296,9 @@ pub(crate) fn load_with_residency(
     let late_system_native = chat_template
         .as_deref()
         .is_some_and(crate::chat_template::renders_late_system);
+    let tool_images = chat_template
+        .as_deref()
+        .is_some_and(crate::chat_template::renders_tool_images);
     // What reasoning control this checkpoint implements, read off its own
     // template once at load - see `crate::reasoning` for why it cannot be a
     // table keyed on `arch` or `dialect`.
@@ -2170,11 +2312,16 @@ pub(crate) fn load_with_residency(
     // Same split, other axis: what this file publishes for sampling, used only
     // where the arch-keyed table has nothing.
     let published_sampling = paddock_models::sampling::published_in_gguf(map.gguf());
-    let reasoning = chat_template
-        .as_deref()
-        .map_or_else(crate::reasoning::ReasoningCaps::none, |t| {
-            crate::reasoning::probe(t, dialect)
-        });
+    // LightOnOCR-3 keeps Qwen's template, so the probe would find a working
+    // `enable_thinking` switch - but LightOn trained and evaluated with
+    // thinking off and calls everything else out of distribution, so no
+    // reasoning control is offered (a client then sends none, and
+    // `reasoning_effort` is an honest 400). `template_defaults` holds the
+    // default off.
+    let reasoning = match chat_template.as_deref() {
+        Some(t) if !lightonocr => crate::reasoning::probe(t, dialect),
+        _ => crate::reasoning::ReasoningCaps::none(),
+    };
     // per-image template placeholder: qwen renders <|image_pad|>, gemma4
     // renders <|image|> (the engine replaces it with begin+soft+end), granite
     // renders <image> (which mtmd treats as the whole marker - no end token),
@@ -2222,13 +2369,17 @@ pub(crate) fn load_with_residency(
         vram_budget,
         max_image_tokens,
         residency,
+        // a document parser's pictures are one-shot pages
+        deepseek_ocr || arch == "paddleocr" || lightonocr,
     )?;
 
     Ok(ServingModel {
         vision_off: false,
         id,
         spec: SpecReport {
+            // LightOn ships its qwen35 fine-tunes without the MTP layer
             heads: arch_has_infile_heads(&arch)
+                && !lightonocr
                 && (device != "metal"
                     || (matches!(arch.as_str(), "qwen35" | "qwen35moe") && mtp.is_none())),
             drafter: mtp.and_then(|m| m.file_stem().map(|f| f.to_string_lossy().into_owned())),
@@ -2242,6 +2393,7 @@ pub(crate) fn load_with_residency(
         chat_template,
         task_tags,
         late_system_native,
+        tool_images,
         dialect,
         reasoning,
         // An attached mmproj is the whole test: every arm below fails the load
@@ -2283,7 +2435,9 @@ pub(crate) fn load_with_residency(
         audio_word_times: granite_plus,
         ocr: deepseek_ocr,
         paddleocr: arch == "paddleocr",
-        document_parser: deepseek_ocr || arch == "paddleocr",
+        lightonocr,
+        document_parser: deepseek_ocr || arch == "paddleocr" || lightonocr,
+        layout: None,
         vocab_cache: std::sync::OnceLock::new(),
     })
 }
@@ -2341,6 +2495,8 @@ fn load_hf_dir(
         .ok_or_else(|| {
             ServeError::Open(dir.to_path_buf(), "config.json has no model_type".into())
         })?;
+    let mut lightonocr = false;
+    let mut small_mlx_vision = false;
     let arch = match model_type.as_str() {
         "kolibri1" if device == "metal" => {
             paddock_models::kolibri::KolibriConfig::read(dir)
@@ -2374,8 +2530,10 @@ fn load_hf_dir(
             .to_owned()
         }
         "qwen3_5" if device == "metal" => {
-            paddock_models::mlx::QwenConfig::read(&tokenizer_dir)
+            let cfg = paddock_models::mlx::QwenConfig::read(&tokenizer_dir)
                 .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
+            lightonocr = crate::lighton_ocr::is_hf_checkpoint(&tokenizer_dir, &cfg);
+            small_mlx_vision = cfg.tied;
             "qwen35".to_owned()
         }
         "prism_hadamard_qwen35" if device == "metal" => {
@@ -2444,12 +2602,16 @@ fn load_hf_dir(
     let late_system_native = chat_template
         .as_deref()
         .is_some_and(crate::chat_template::renders_late_system);
+    let tool_images = chat_template
+        .as_deref()
+        .is_some_and(crate::chat_template::renders_tool_images);
     // What reasoning control this checkpoint implements, read off its own
     // template once at load - see `crate::reasoning` for why it cannot be a
     // table keyed on `arch` or `dialect`.
     let dialect = crate::parsers::Dialect::for_arch_and_template(&arch, chat_template.as_deref());
     let reasoning = chat_template
         .as_deref()
+        .filter(|_| !lightonocr)
         .map_or_else(crate::reasoning::ReasoningCaps::none, |t| {
             crate::reasoning::probe(t, dialect)
         });
@@ -2457,9 +2619,10 @@ fn load_hf_dir(
     let supports_vision = device == "metal"
         && (splash
             || bonsai
+            || small_mlx_vision
             || matches!(arch.as_str(), "gemma4" | "muse-glimmer" | "diffusion-gemma"));
     let image_pad_id = if supports_vision {
-        tokenizer.token_to_id(if splash || bonsai {
+        tokenizer.token_to_id(if splash || bonsai || small_mlx_vision {
             "<|image_pad|>"
         } else if arch == "muse-glimmer" {
             "<|patch|>"
@@ -2490,6 +2653,7 @@ fn load_hf_dir(
         // Embedded MLX towers use their validated checkpoint processor budget.
         None,
         residency,
+        lightonocr,
     )?;
 
     Ok(ServingModel {
@@ -2515,6 +2679,7 @@ fn load_hf_dir(
         chat_template,
         task_tags,
         late_system_native,
+        tool_images,
         dialect,
         reasoning,
         supports_vision,
@@ -2526,7 +2691,9 @@ fn load_hf_dir(
         audio_word_times: false,
         ocr: false,
         paddleocr: false,
-        document_parser: false,
+        lightonocr,
+        document_parser: lightonocr,
+        layout: None,
         vocab_cache: std::sync::OnceLock::new(),
     })
 }
@@ -2546,6 +2713,8 @@ fn build_engine(
     vram_budget: Option<u64>,
     max_image_tokens: Option<u32>,
     residency: Option<crate::generation_residency::Options>,
+    // every picture prompt is a one-shot page (`Generator::set_page_reader`)
+    page_reader: bool,
 ) -> Result<crate::generation_residency::Handle, ServeError> {
     let (residency, reservation) = if let Some(options) = residency {
         if arch != "diffusion-gemma"
@@ -2609,7 +2778,7 @@ fn build_engine(
             fp8_native.clone(),
         );
         Engine::spawn_with_metrics(max_batch, loaded_metrics.clone(), move || {
-            build_generator(
+            let mut generator = build_generator(
                 &arch,
                 &path,
                 &device,
@@ -2622,7 +2791,9 @@ fn build_engine(
                 fp8_native.as_deref(),
                 vram_budget,
                 max_image_tokens,
-            )
+            )?;
+            generator.set_page_reader(page_reader);
+            Ok(generator)
         })
     };
     if let Some(options) = residency {
@@ -2751,6 +2922,10 @@ fn build_generator(
                     tracing::info!(
                         "native Splash packed-Q4/group-64: BF16 KV, F32 recurrent state, bundled vision and DFlash2"
                     );
+                } else if paddock_models::mlx::QwenConfig::read(path).is_ok_and(|c| c.tied) {
+                    tracing::info!(
+                        "native MLX affine-4/group-64 tied text graph with embedded BF16 vision tower; BF16 KV, F32 recurrent state"
+                    );
                 } else {
                     tracing::info!(
                         "native MLX affine-4/group-64 text path: BF16 KV, F32 recurrent state; text-only checkpoint serving"
@@ -2760,6 +2935,7 @@ fn build_generator(
                     .and_then(|mut m| {
                         if path.join("manifest.json").is_file()
                             || path.join("hadamard.json").is_file()
+                            || paddock_models::mlx::QwenConfig::read(path).is_ok_and(|c| c.tied)
                         {
                             m.attach_vision(path)?;
                         }

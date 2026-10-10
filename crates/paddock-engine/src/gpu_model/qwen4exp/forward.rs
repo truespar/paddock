@@ -330,9 +330,9 @@ impl Dump {
     }
 }
 
-/// M-RoPE section split for this family (text uses all four axes equal, so the
-/// split only matters for the vision rung; it is the checkpoint's own
-/// `[11,11,10]` plus the zero extra axis).
+/// M-RoPE sections: the checkpoint's `[11,11,10]` plus the zero extra axis, applied
+/// INTERLEAVED (`imrope`, HF `mrope_interleaved`; llama.cpp uses ROPE_TYPE_IMROPE).
+/// Text rotates the same either way (all axes equal); image rows do not.
 const MROPE_SECTIONS: [u32; 4] = [11, 11, 10, 0];
 
 /// A captured decode-step graph. The raw CUDA handles are only ever used from
@@ -4759,7 +4759,7 @@ fn qsa_index(
         ld,
         c.eps,
     )?;
-    e.mrope(
+    e.imrope(
         &mut sc.d_idx_q,
         &sc.d_mrope,
         n,
@@ -4785,7 +4785,7 @@ fn qsa_index(
         QSA_BLOCK,
         c.eps,
     )?;
-    e.mrope(
+    e.imrope(
         &mut sc.d_idx_stage,
         &sc.d_idx_spos,
         n,
@@ -4882,7 +4882,7 @@ fn attn_pass(
         }
         // k_norm carries the +1 already (Gemma (1+w), folded at load)
         e.rmsnorm_batch(&sc.d_k, &w.k_norm.buf, &mut sc.d_kn, hd, c.eps, n * nkv)?;
-        e.mrope(
+        e.imrope(
             &mut sc.d_kn,
             &sc.d_mrope,
             n,
@@ -4920,7 +4920,7 @@ fn attn_pass(
         }
         e.split_qg(&sc.d_qg, &mut sc.d_q, &mut sc.d_agate, n, nh, hd)?;
         e.rmsnorm_batch(&sc.d_q, &w.q_norm.buf, &mut sc.d_qn, hd, c.eps, n * nh)?;
-        e.mrope(
+        e.imrope(
             &mut sc.d_qn,
             &sc.d_mrope,
             n,
@@ -4961,7 +4961,7 @@ fn attn_pass(
         // q_norm/k_norm carry the +1 already (Gemma (1+w), folded at load)
         e.rmsnorm_batch(&sc.d_q, &w.q_norm.buf, &mut sc.d_qn, hd, c.eps, n * nh)?;
         e.rmsnorm_batch(&sc.d_k, &w.k_norm.buf, &mut sc.d_kn, hd, c.eps, n * nkv)?;
-        e.mrope(
+        e.imrope(
             &mut sc.d_qn,
             &sc.d_mrope,
             n,
@@ -4971,7 +4971,7 @@ fn attn_pass(
             yarn,
             MROPE_SECTIONS,
         )?;
-        e.mrope(
+        e.imrope(
             &mut sc.d_kn,
             &sc.d_mrope,
             n,
@@ -7043,11 +7043,13 @@ impl crate::generator::Generator for Qwen4ExpGpu {
     fn reply_pin(&mut self, slot: usize) {
         Qwen4ExpGpu::reply_pin(self, slot);
     }
+    fn anchor_at(&mut self, _slot: usize, tokens: &[u32], upto: usize) {
+        self.pages.anchor(tokens, upto);
+    }
 
     fn release_inactive_slots(&mut self, occupied: &[bool]) {
         Qwen4ExpGpu::release_inactive_slots(self, occupied);
     }
-
     fn reset(&mut self) {
         // trait returns unit; a state-clear failure here would surface on the
         // next forward as a driver error rather than being swallowed silently
@@ -7059,11 +7061,9 @@ impl crate::generator::Generator for Qwen4ExpGpu {
     fn forward(&mut self, token: u32) -> Result<Vec<f32>, crate::generator::GenError> {
         self.decode_step(token).map_err(q4x_gen_err)
     }
-
     fn vocab(&self) -> usize {
         self.cfg.vocab
     }
-
     fn max_context(&self) -> usize {
         self.max_tokens
     }

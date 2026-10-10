@@ -17,8 +17,11 @@ pub mod ckpt_pages;
 pub mod clef_decision;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+pub mod cv_resize;
 pub mod decision;
 pub mod diarization;
+#[cfg(feature = "cuda")]
+pub mod doclayout;
 pub mod encoder;
 pub mod envset;
 pub mod generator;
@@ -37,6 +40,7 @@ pub mod masks;
 pub mod metrics;
 pub mod pacing;
 pub mod paged_radix;
+pub mod pillow;
 #[cfg(feature = "cuda")]
 pub mod reference;
 pub mod sampler;

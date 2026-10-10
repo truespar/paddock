@@ -42,15 +42,21 @@ pub struct SamplingParams {
     /// before penalties and sampling (empty = off). Sequences with a bias
     /// cannot ride the speculative path (device argmaxes never see it).
     pub logit_bias: Vec<(u32, f32)>,
-    /// Sliding-window no-repeat n-gram guard, `(n, window)`; `(0, 0)` = off.
-    /// The DeepSeek-OCR family's required repetition control - same math as
-    /// the reference's `SlidingWindowNoRepeatNgramProcessor` (and SGLang's
-    /// `DeepseekOCRNoRepeatNGramLogitProcessor`): ban every token that would
-    /// complete an `n`-gram whose (n-1)-token prefix equals the current tail,
-    /// searching occurrences that START within the trailing `window` tokens
-    /// of prompt+output. History-dependent, so an armed guard keeps the
-    /// sequence off the device/spec paths, like the penalties above.
-    pub no_repeat_ngram: (usize, usize),
+    /// Sliding-window no-repeat n-gram guard, `(n, window, stop)`; `(0, 0, _)`
+    /// = off. The DeepSeek-OCR family's required repetition control - same
+    /// math as the reference's `SlidingWindowNoRepeatNgramProcessor` (and
+    /// SGLang's `DeepseekOCRNoRepeatNGramLogitProcessor`): ban every token
+    /// that would complete an `n`-gram whose (n-1)-token prefix equals the
+    /// current tail, searching occurrences that START within the trailing
+    /// `window` tokens of prompt+output. History-dependent, so an armed ban
+    /// keeps the sequence off the device/spec paths, like the penalties above.
+    ///
+    /// `stop` turns the ban into a STOP: the logits are never touched (the
+    /// sampler stays whatever it is, greedy device rows included) and the
+    /// sequence ends, before the token, where the token it picked is one the
+    /// ban would have masked - `repeat_stop_hit`. A degenerate loop is cut
+    /// at its first repeated n-gram instead of steered into variations.
+    pub no_repeat_ngram: (usize, usize, bool),
 }
 
 impl Default for SamplingParams {
@@ -66,7 +72,7 @@ impl Default for SamplingParams {
             frequency_penalty: 0.0,
             seed: 0,
             logit_bias: Vec::new(),
-            no_repeat_ngram: (0, 0),
+            no_repeat_ngram: (0, 0, false),
         }
     }
 }
@@ -199,11 +205,25 @@ impl Sampler {
                     && p.frequency_penalty == 0.0))
     }
 
-    /// The no-repeat-ngram guard is on (both halves non-zero, matching the
-    /// reference's `no_repeat_ngram_size > 0 and ngram_window > 0` gate).
+    /// The no-repeat-ngram BAN is on (both halves non-zero, matching the
+    /// reference's `no_repeat_ngram_size > 0 and ngram_window > 0` gate). The
+    /// stop mode masks nothing, so it never arms this.
     fn ngram_armed(&self) -> bool {
-        let (n, w) = self.params.no_repeat_ngram;
-        n > 0 && w > 0
+        let (n, w, stop) = self.params.no_repeat_ngram;
+        n > 0 && w > 0 && !stop
+    }
+
+    /// The guard in stop mode, asked of the token about to be committed: would
+    /// `next` complete an `n`-gram already started within the window? Then
+    /// the sequence ends here, without it - the output up to this token is
+    /// the unguarded output, byte for byte.
+    pub fn repeat_stop_hit(&self, history: &[u32], next: u32) -> bool {
+        let (n, w, stop) = self.params.no_repeat_ngram;
+        let mut hit = false;
+        if stop {
+            for_each_ngram_ban((n, w), history, |tok| hit |= tok == next);
+        }
+        hit
     }
 
     /// True when sampling is ROW-LOCAL - each token's distribution depends
@@ -471,7 +491,11 @@ impl Sampler {
     /// of one repeated placeholder id can never match a generated text
     /// (n-1)-gram at n=35, so the ban sets are identical where it matters.
     fn apply_no_repeat_ngram(&self, logits: &mut [f32], history: &[u32]) {
-        for_each_ngram_ban(self.params.no_repeat_ngram, history, |tok| {
+        let (n, w, stop) = self.params.no_repeat_ngram;
+        if stop {
+            return; // the stop mode never touches the logits
+        }
+        for_each_ngram_ban((n, w), history, |tok| {
             if let Some(l) = logits.get_mut(tok as usize) {
                 *l = f32::NEG_INFINITY;
             }
@@ -486,7 +510,10 @@ impl Sampler {
     /// Shares `for_each_ngram_ban` with the mask so the two can't diverge.
     pub fn ngram_would_ban(&self, history: &[u32]) -> bool {
         let mut any = false;
-        for_each_ngram_ban(self.params.no_repeat_ngram, history, |_| any = true);
+        let (n, w, stop) = self.params.no_repeat_ngram;
+        if !stop {
+            for_each_ngram_ban((n, w), history, |_| any = true);
+        }
         any
     }
 
@@ -819,6 +846,39 @@ fn argmax(logits: &[f32]) -> u32 {
     best as u32
 }
 
+/// log_softmax stats of `logits` for the chosen token + top-k alternatives.
+/// Runs on the RAW logits, before any penalty/temperature mutation.
+pub(crate) fn compute_logprobs(
+    logits: &[f32],
+    chosen: u32,
+    top_n: u8,
+) -> crate::service::TokenLogprobs {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let lse = max + logits.iter().map(|&l| (l - max).exp()).sum::<f32>().ln();
+    let mut top: Vec<(u32, f32)> = Vec::new();
+    if top_n > 0 {
+        let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
+        let k = (top_n as usize).min(idx.len());
+        idx.select_nth_unstable_by(k - 1, |&a, &b| {
+            logits[b as usize].total_cmp(&logits[a as usize])
+        });
+        idx.truncate(k);
+        idx.sort_unstable_by(|&a, &b| logits[b as usize].total_cmp(&logits[a as usize]));
+        top = idx
+            .into_iter()
+            .map(|i| (i, logits[i as usize] - lse))
+            .collect();
+    }
+    crate::service::TokenLogprobs {
+        chosen: logits
+            .get(chosen as usize)
+            .copied()
+            .unwrap_or(f32::NEG_INFINITY)
+            - lse,
+        top,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -988,7 +1048,7 @@ mod tests {
         ];
         for &((n, w), banned) in cases {
             let s = Sampler::new(SamplingParams {
-                no_repeat_ngram: (n, w),
+                no_repeat_ngram: (n, w, false),
                 ..Default::default()
             });
             let mut logits = vec![0.0f32; 7];
@@ -1005,7 +1065,7 @@ mod tests {
         // prefix [1,2] occurred at idx 0 (followed by 3) and idx 4 (followed
         // by 4): both continuations banned, greedy falls to token 5
         let params = SamplingParams {
-            no_repeat_ngram: (3, 10),
+            no_repeat_ngram: (3, 10, false),
             ..Default::default()
         };
         let mut s = Sampler::new(params);
@@ -1019,12 +1079,45 @@ mod tests {
     }
 
     #[test]
+    fn repeat_stop_fires_where_the_ban_would_and_touches_nothing() {
+        // the stop mode: same predicate as the ban, asked of the picked token
+        let stop = Sampler::new(SamplingParams {
+            no_repeat_ngram: (3, 10, true),
+            ..Default::default()
+        });
+        let ban = Sampler::new(SamplingParams {
+            no_repeat_ngram: (3, 10, false),
+            ..Default::default()
+        });
+        // tail (1, 2) occurred before followed by 3: 3 would repeat (1, 2, 3)
+        let hist = [1u32, 2, 3, 9, 1, 2];
+        assert!(stop.repeat_stop_hit(&hist, 3));
+        assert!(!stop.repeat_stop_hit(&hist, 4));
+        assert!(!ban.repeat_stop_hit(&hist, 3), "the ban never stops");
+        // it masks nothing, so a greedy stop-mode sampler stays a device row
+        assert!(stop.is_pure_greedy() && !stop.ngram_would_ban(&hist));
+        assert!(!ban.is_pure_greedy() && ban.ngram_would_ban(&hist));
+        let mut l = vec![0.0, 0.0, 0.0, 0.9, 0.8, 0.7];
+        let mut stop = stop;
+        assert_eq!(stop.sample(&mut l, &hist), 3, "the logits are untouched");
+        // outside the window, no stop
+        let far = [1u32, 2, 3, 9, 9, 9, 9, 9, 9, 9, 9, 9, 1, 2];
+        assert!(
+            !Sampler::new(SamplingParams {
+                no_repeat_ngram: (3, 10, true),
+                ..Default::default()
+            })
+            .repeat_stop_hit(&far, 3)
+        );
+    }
+
+    #[test]
     fn no_repeat_ngram_window_bounds_the_search() {
         // same history, window 5: both [1,2,_] occurrences START before
         // search_start (10-5=5), so nothing is banned - the reference indexes
         // occurrences by their start, and so must we
         let params = SamplingParams {
-            no_repeat_ngram: (3, 5),
+            no_repeat_ngram: (3, 5, false),
             ..Default::default()
         };
         let mut s = Sampler::new(params);
@@ -1032,7 +1125,7 @@ mod tests {
         let mut l = vec![0.0, 0.0, 0.0, 0.9, 0.8, 0.7];
         assert_eq!(s.sample(&mut l, &hist), 3);
         // (0, _) and (_, 0) are off - the reference gates on both being > 0
-        for off in [(0, 128), (35, 0)] {
+        for off in [(0, 128, false), (35, 0, false)] {
             let mut s = Sampler::new(SamplingParams {
                 no_repeat_ngram: off,
                 ..Default::default()
@@ -1051,7 +1144,7 @@ mod tests {
     fn ngram_would_ban_agrees_with_the_mask() {
         for (n, w) in [(1usize, 4usize), (2, 6), (3, 5), (3, 128), (35, 128)] {
             let s = Sampler::new(SamplingParams {
-                no_repeat_ngram: (n, w),
+                no_repeat_ngram: (n, w, false),
                 ..Default::default()
             });
             // deterministic pseudo-random histories over a tiny vocab so
@@ -1170,7 +1263,7 @@ mod tests {
             SamplingParams {
                 temperature: 0.7,
                 top_k: 20,
-                no_repeat_ngram: (3, 64),
+                no_repeat_ngram: (3, 64, false),
                 ..Default::default()
             },
             SamplingParams {

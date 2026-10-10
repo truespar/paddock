@@ -397,9 +397,10 @@ impl Qwen35 {
                 256,
             );
             if self.geometry.moe() {
-                self.project(&cmd, &[(&self.head, &s.logits)], &s.delta, n, &s.gemm);
+                self.project(&cmd, &[(self.head(), &s.logits)], &s.delta, n, &s.gemm);
             } else {
-                self.head.linear(&cmd, &s.delta, &s.logits, n, 1., &s.gemm);
+                self.head()
+                    .linear(&cmd, &s.delta, &s.logits, n, 1., &s.gemm);
             }
             cmd.dispatch(
                 "spec_argmax",

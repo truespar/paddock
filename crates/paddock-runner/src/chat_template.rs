@@ -911,6 +911,33 @@ pub fn renders_late_system(template: &str) -> bool {
     }
 }
 
+/// The template renders an image part inside a `tool` message - what an
+/// agent's file-read tool returns for a picture (Claude Code's Read). Probed
+/// by rendering one tool reply with and without an image part: Qwen 3.5-3.8
+/// run tool content through the same part renderer as a user turn (a picture
+/// slot appears), gemma4 keeps only a tool reply's text parts. Where it does
+/// not, the image cannot be placed and becomes a text note instead.
+pub fn renders_tool_images(template: &str) -> bool {
+    use serde_json::json;
+    let convo = |parts: Vec<serde_json::Value>| {
+        normalize_messages(&[
+            json!({"role": "user", "content": "probe-user"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function",
+                "function": {"name": "probe", "arguments": {}}}]}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": parts}),
+        ])
+    };
+    let text = json!({"type": "text", "text": "probe-tool"});
+    let image = json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}});
+    match (
+        render(template, &convo(vec![text.clone()]), None, None),
+        render(template, &convo(vec![text, image]), None, None),
+    ) {
+        (Ok(a), Ok(b)) => a != b && b.contains("probe-tool"),
+        _ => false,
+    }
+}
+
 /// A prior assistant turn's reasoning, under every name a template reads it by.
 ///
 /// The templates we serve disagree on the key: Qwen 3.5-3.8, Flash Next,

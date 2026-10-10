@@ -29,6 +29,7 @@ mod clef_vision;
 mod deltanet;
 mod dense_pred;
 mod dit;
+mod doclayout;
 mod embedding_gemma2;
 pub use embedding_gemma2::{EG2_ATTN_ROWS, EG2_LAYERS, EG2_TILE_SHIFT, EG2_WIDTH, mmq_bytes};
 mod embedding_gemma2_audio;
@@ -927,6 +928,13 @@ impl GpuExecutor {
     }
 
     /// Device SM count (e.g. 84 on an A6000, 188 on an RTX PRO 6000 Blackwell).
+    /// "name sm_XY Nsm" - what a measurement taken on this device is keyed
+    /// by when it outlives the process.
+    pub fn device_tag(&self) -> String {
+        let name = self.ctx.name().unwrap_or_else(|_| "unknown GPU".into());
+        format!("{name} sm_{}{} {}sm", self.cc.0, self.cc.1, self.sm_count)
+    }
+
     pub fn sm_count(&self) -> usize {
         self.sm_count
     }

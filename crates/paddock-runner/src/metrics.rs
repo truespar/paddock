@@ -602,6 +602,12 @@ impl Metrics {
                     n(&t.miss_ghost),
                 );
                 g(
+                    "paddock_kv_tier_miss_no_state_total",
+                    "counter",
+                    "Misses on KV held without the model state a hybrid resumes from",
+                    n(&t.miss_no_state),
+                );
+                g(
                     "paddock_kv_tier_elected_restore_total",
                     "counter",
                     "Hits where the cost model chose restore",

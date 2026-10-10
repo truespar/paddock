@@ -36,7 +36,7 @@ use crate::gpu::GpuError;
 use crate::gpu_model::prefix_cache::BLOCK_TOKENS;
 use crate::kv_tier::digest::{IdentityDigest, IdentityFields, PrivacyScope};
 use crate::kv_tier::pool_tier::tier_ram_bytes;
-use crate::kv_tier::{CacheNamespace, Election, PlaneDesc, PoolTier, RamTransport};
+use crate::kv_tier::{CacheNamespace, PlaneDesc, PoolTier, RamTransport};
 use crate::paged_radix::PagedRadix;
 
 use super::GpuGemma4;
@@ -496,20 +496,29 @@ impl GpuGemma4 {
         if pf.radix.match_full(tokens).ckpt.is_some() {
             return false;
         }
-        let hit = tier.probe(tokens, 0);
-        let afford = |pool: &crate::kv_pool::KvPool, r: usize| {
-            pool.free_blocks().saturating_sub(2 * r) / r * r
+        // the blob's geometry lets the probe find it on any tier
+        tier.declare_blob_flat(state_bytes);
+        // probe counts the lookup (and the miss when nothing is held)
+        let Some(hit) = tier.probe(tokens, 0) else {
+            return false;
         };
         let r = tier.run_blocks();
-        let mut afford_blocks = afford(&gp.pool, r);
-        let deepest = hit
-            .as_ref()
-            .and_then(|h| tier.probe_aux(tokens, h.end_block))
+        let deepest = tier
+            .probe_aux(tokens, hit.end_block)
             .filter(|a| a.end_block * BLOCK_TOKENS >= MIN_CACHE_PREFIX && a.end_block % r == 0);
-        if let Some(a) = &deepest
-            && afford_blocks < a.end_block
-        {
-            let want = a.end_block + 2 * r;
+        let Some((hit, est_us)) = tier.elect_hybrid(&hit, deepest.as_ref()) else {
+            return false;
+        };
+        let aux = deepest.expect("an elected hybrid hit has its boundary");
+        // the destination: the restored blocks (the blob lands in a fixed
+        // checkpoint slot, not in pool pages)
+        let need = aux.end_block;
+        let afford =
+            |pool: &crate::kv_pool::KvPool| pool.free_blocks().saturating_sub(2 * r) / r * r;
+        if afford(&gp.pool) < need {
+            // retention crowds the destination: pressure-demote it (the
+            // prefix cache is reclaimable capacity)
+            let want = need + 2 * r;
             let after = exec.record_event().ok();
             let (_e, taken) = tier.pressure_demote(&mut pf.radix, &mut gp.pool, want, after);
             let (cp, _g) = pf.d_ckpt.device_ptr(&exec.stream);
@@ -522,9 +531,6 @@ impl GpuGemma4 {
                     pf.radix.recycle_state(t.state_idx);
                 }
             }
-            // demote pins defer the frees - drain briefly (the restore
-            // itself no longer waits; only this make-room drain is bounded-
-            // synchronous, and only when the destination was crowded)
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
             while gp.pool.free_blocks() < want && tier.stats().2 > 0 {
                 tier.pump_completions(&mut pf.radix, &mut gp.pool);
@@ -533,32 +539,17 @@ impl GpuGemma4 {
                 }
                 std::thread::sleep(std::time::Duration::from_micros(200));
             }
-            afford_blocks = afford(&gp.pool, r);
         }
-        let aux = deepest.filter(|a| a.end_block <= afford_blocks);
-        let (Some(hit), Some(aux)) = (hit, aux) else {
+        tracing::debug!(
+            free = gp.pool.free_blocks(),
+            need,
+            boundary = aux.end_block,
+            "gemma4 tier gate"
+        );
+        if afford(&gp.pool) < need {
+            tier.refuse_park();
             return false;
-        };
-        let n_runs = aux.end_block / r;
-        let per_run = hit.bytes / hit.keys.len().max(1) as u64;
-        let hit = crate::kv_tier::TierHit {
-            start_block: 0,
-            end_block: aux.end_block,
-            bytes: per_run * n_runs as u64,
-            keys: hit.keys[..n_runs.min(hit.keys.len())].to_vec(),
-            // runs are equal-sized, so the truncated hit keeps the same
-            // share of disk-sourced bytes as the full one
-            nvme_bytes: hit.nvme_bytes.min(per_run * n_runs as u64),
-        };
-        let shape = crate::kv_tier::HitShape {
-            restore_bytes: hit.bytes + aux.bytes,
-            restore_tokens: (aux.end_block * BLOCK_TOKENS) as u32,
-            queued_bytes: tier.catalog.ledger(crate::kv_tier::Tier::Ram).in_flight,
-            nvme_bytes: hit.nvme_bytes,
-        };
-        let Election::Restore { est_us, .. } = tier.cost.elect(shape) else {
-            return false;
-        };
+        }
         let after = exec.record_event().ok();
         let (cp, _g) = pf.d_ckpt.device_ptr(&exec.stream);
         let plan = crate::kv_tier::AuxPlan {

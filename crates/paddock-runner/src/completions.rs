@@ -140,7 +140,7 @@ fn prepare(
         )?,
         // raw completions carry no images, so the OCR family's ngram
         // default never applies here
-        no_repeat_ngram: (0, 0),
+        no_repeat_ngram: (0, 0, false),
     };
 
     let stop_strings = req.stop.as_ref().map(|s| s.to_vec()).unwrap_or_default();
@@ -260,6 +260,7 @@ pub async fn handle(
             logprobs: gen_logprobs,
             submitted: None, // stamped by Engine::submit
             canvas_read: None,
+            user_turn: false,
         };
         if let Err(e) = model.engine.submit(gen_req) {
             return err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e);
@@ -569,7 +570,7 @@ fn stream_response(
                 TokenEvent::Done(reason, stats) => {
                     cs[i].ids += stats.terminal_tokens();
                     let f = match reason {
-                        FinishReason::Stop => "stop",
+                        FinishReason::Stop | FinishReason::Repetition => "stop",
                         FinishReason::Length => "length",
                     };
                     meta.scope.phases(&stats);

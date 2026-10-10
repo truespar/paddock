@@ -65,11 +65,15 @@ pub(crate) const SHADER_SOURCE: &str = concat!(
     include_str!("../../../packs/metal/muse_vision.metal"),
     include_str!("../../../packs/metal/sam3.metal"),
     include_str!("../../../packs/metal/sam3_image.metal"),
+    include_str!("../../../packs/metal/sam3_text.metal"),
     "\n",
     include_str!("../../../packs/metal/gemma_mlx.metal"),
     include_str!("../../../packs/metal/llama_mlx.metal"),
     "\n",
     include_str!("../../../packs/metal/gemma_mlx_vision.metal"),
+    include_str!("../../../packs/metal/qwen_mlx_vision_nax.metal"),
+    include_str!("../../../packs/metal/qwen_mlx_attention_nax.metal"),
+    include_str!("../../../packs/metal/qwen_mlx_vision.metal"),
     "\n",
     include_str!("../../../packs/metal/granite_vision.metal"),
     "\n",
@@ -394,6 +398,9 @@ impl MetalDevice {
         let mut limited_kernels = HashMap::new();
         for name in [
             "sam3_patch",
+            "sam3_text_embed",
+            "sam3_text_qkv",
+            "sam3_text_attention",
             "sam3_resize_coeff",
             "sam3_resize_image",
             "sam3_resize_video",
@@ -854,6 +861,8 @@ impl MetalDevice {
             "mlx_attn_gate",
             "mlx_attention_query",
             "mlx_attention_decode",
+            "mlx_attention_decode_gqa4",
+            "mlx_attention_stable_gqa4",
             "mlx_attention_verify",
             "mlx_attention_stable",
             "mlx_attention_prefill",
@@ -1227,6 +1236,11 @@ impl MetalDevice {
             "mlx_affine_stable3",
             "mlx_affine_stable4",
             "mlx_affine_stable5",
+            "mlx_affine_direct1",
+            "mlx_affine_direct2",
+            "mlx_affine_direct3",
+            "mlx_affine_direct4",
+            "mlx_affine_direct5",
             #[cfg(test)]
             "mlx_few_r2c2",
             #[cfg(test)]
@@ -1448,6 +1462,31 @@ impl MetalDevice {
             "vis_ln",
             "vis_qkv",
             "vis_attention",
+            "vis_qkv64_12",
+            "vis_qkv64_16",
+            "vis_attention64_12",
+            "vis_attention64_16",
+            "qmlx_vis_mm",
+            "qmlx_vis_norm",
+            "qmlx_vis_patches",
+            "qmlx_vis_patch_mm",
+            "qmlx_vis_position",
+            "qmlx_vis_qkv_12",
+            "qmlx_vis_qkv_16",
+            "qmlx_vis_attention_12",
+            "qmlx_vis_attention_16",
+            #[cfg(test)]
+            "qmlx_vis_attention_candidate_12",
+            #[cfg(test)]
+            "qmlx_vis_attention_candidate_16",
+            #[cfg(test)]
+            "qmlx_vis_attention_candidate_bounded_12",
+            #[cfg(test)]
+            "qmlx_vis_attention_candidate_bounded_16",
+            #[cfg(test)]
+            "qmlx_vis_attention_bounded_12",
+            #[cfg(test)]
+            "qmlx_vis_attention_bounded_16",
             "dn_verify",
             "dn_verify_commit",
             "dn_verify_conv_commit",
@@ -1634,6 +1673,16 @@ impl MetalDevice {
             kernels.insert(name, pipeline);
         }
         let profile = paddock_models::dev_var_os!("PADDOCK_METAL_PROFILE").is_some();
+        if raw.supportsFamily(MTLGPUFamily::Apple10) {
+            let name = "mlx_attention_prefill_nax";
+            let fun = lib
+                .newFunctionWithName(&NSString::from_str(name))
+                .ok_or_else(|| MetalError::Device(format!("missing kernel {name}")))?;
+            let pipeline = raw
+                .newComputePipelineStateWithFunction_error(&fun)
+                .map_err(|e| MetalError::Device(format!("{name}: {e}")))?;
+            kernels.insert(name, pipeline);
+        }
         let residency = if required.is_some() {
             Some(Arc::new(ResidentSet::new(&raw, &queue)?))
         } else {
@@ -2349,6 +2398,91 @@ mod tests {
             actual[cases.len()..]
                 .iter()
                 .all(|&v| f32::from_bits(v).is_nan())
+        );
+    }
+
+    #[test]
+    fn lighton_release_library_excludes_diagnostic_attention_aliases() {
+        let raw = MTLCreateSystemDefaultDevice().unwrap();
+        let opts = MTLCompileOptions::new();
+        opts.setLanguageVersion(MTLLanguageVersion::Version4_0);
+        opts.setMathMode(MTLMathMode::Relaxed);
+        let prefix = if raw.supportsFamily(MTLGPUFamily::Apple10) {
+            ""
+        } else {
+            "#define PADDOCK_APPLE9 1\n"
+        };
+        let lib = raw
+            .newLibraryWithSource_options_error(
+                &NSString::from_str(&format!("{prefix}{SHADER_SOURCE}")),
+                Some(&opts),
+            )
+            .unwrap();
+        for heads in [12, 16] {
+            assert!(
+                lib.newFunctionWithName(&NSString::from_str(&format!(
+                    "qmlx_vis_attention_{heads}"
+                )))
+                .is_some()
+            );
+            for suffix in ["candidate", "candidate_bounded"] {
+                assert!(
+                    lib.newFunctionWithName(&NSString::from_str(&format!(
+                        "qmlx_vis_attention_{suffix}_{heads}"
+                    )))
+                    .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lighton_attention_has_no_shared_workspace() {
+        let d = MetalDevice::new(Some(32 << 20)).unwrap();
+        if d.tensor_accelerated() {
+            for name in ["qmlx_vis_attention_12", "qmlx_vis_attention_16"] {
+                assert_eq!(d.kernels[name].staticThreadgroupMemoryLength(), 0, "{name}");
+            }
+            assert_eq!(
+                d.kernels["mlx_attention_prefill_nax"].staticThreadgroupMemoryLength(),
+                8192
+            );
+        }
+    }
+
+    #[test]
+    fn lighton_pre_apple10_attention_pipelines_compile() {
+        // Compile coverage, not a substitute for running on M1–M4 hardware.
+        // Fixed Apple10 register mappings must never leak into that path.
+        let raw = MTLCreateSystemDefaultDevice().unwrap();
+        let opts = MTLCompileOptions::new();
+        opts.setLanguageVersion(MTLLanguageVersion::Version4_0);
+        opts.setMathMode(MTLMathMode::Relaxed);
+        let lib = raw
+            .newLibraryWithSource_options_error(
+                &NSString::from_str(&format!(
+                    "#define PADDOCK_APPLE9 1\n#define PADDOCK_KERNEL_DIAGNOSTICS 1\n{SHADER_SOURCE}"
+                )),
+                Some(&opts),
+            )
+            .unwrap();
+        for name in [
+            "qmlx_vis_attention_12",
+            "qmlx_vis_attention_16",
+            "qmlx_vis_attention_bounded_12",
+            "qmlx_vis_attention_bounded_16",
+            "qmlx_vis_attention_candidate_12",
+            "qmlx_vis_attention_candidate_16",
+            "qmlx_vis_attention_candidate_bounded_12",
+            "qmlx_vis_attention_candidate_bounded_16",
+        ] {
+            let function = lib.newFunctionWithName(&NSString::from_str(name)).unwrap();
+            raw.newComputePipelineStateWithFunction_error(&function)
+                .unwrap();
+        }
+        assert!(
+            lib.newFunctionWithName(&NSString::from_str("mlx_attention_prefill_nax"))
+                .is_none()
         );
     }
 

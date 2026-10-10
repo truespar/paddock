@@ -116,6 +116,13 @@ pub struct CostModel {
     /// the deliberately minimal stance (a full batch-conditional model comes
     /// later).
     prefill_tpus: Ewma,
+    /// True once a prefill was measured in this process: until then
+    /// `prefill_tpus` is a seed (generic, or the last run's calibration),
+    /// and the first measurement REPLACES it rather than nudging it 1/8 of
+    /// the way. Nudging from the generic 50 tok/ms took ~30 prompts to reach
+    /// a 27B's ~1.3 tok/ms on GB10 - and every disk restore in between was
+    /// priced against a recompute ~40x too fast and refused.
+    prefill_measured: bool,
     /// Restore wins only when it beats recompute by this factor - hysteresis
     /// against flapping on near-ties, and a thumb on the scale for the path
     /// that cannot be wrong (recompute is always exact).
@@ -149,6 +156,7 @@ impl CostModel {
             restore_nvme_bpus: Ewma::new(1.0e9 * NVME_END_TO_END / 1e6),
             restore_fixed_us: Ewma::new(100.0),
             prefill_tpus: Ewma::new(50.0 / 1000.0),
+            prefill_measured: false,
             margin: 1.1,
             err_sum_pct: 0.0,
             err_n: 0,
@@ -182,6 +190,7 @@ impl CostModel {
     pub fn seed_prefill(&mut self, tokens: u32, actual_us: f64) {
         if tokens > 0 && actual_us.is_finite() && actual_us > 0.0 {
             self.prefill_tpus = Ewma::new(tokens as f64 / actual_us);
+            self.prefill_measured = true;
         }
     }
 
@@ -246,11 +255,35 @@ impl CostModel {
         }
     }
 
-    /// Feed a measured prefill span back (tokens computed, wall us).
+    /// Feed a measured prefill span back (tokens computed, wall us). The
+    /// first one in a process replaces the seed (see `prefill_measured`).
     pub fn observe_prefill(&mut self, tokens: u32, actual_us: f64) {
-        if actual_us > 0.0 && tokens > 0 {
+        if !self.prefill_measured {
+            self.seed_prefill(tokens, actual_us);
+        } else if actual_us > 0.0 && tokens > 0 {
             self.prefill_tpus.observe(tokens as f64 / actual_us);
         }
+    }
+
+    /// This process's measured rates, once a prefill was measured - what a
+    /// restart should start from instead of the generic seeds.
+    pub fn calibration(&self) -> Option<Calibration> {
+        self.prefill_measured.then(|| Calibration {
+            prefill_tpus: self.prefill_tpus.get(),
+            restore_bpus: self.restore_bpus.get(),
+            restore_nvme_bpus: self.restore_nvme_bpus.get(),
+            restore_fixed_us: self.restore_fixed_us.get(),
+        })
+    }
+
+    /// Start from a previous run's calibration. Seeds only: the first live
+    /// prefill still replaces the prefill rate (a new build or a different
+    /// load may run at another speed), and every rate keeps learning.
+    pub fn adopt_calibration(&mut self, c: Calibration) {
+        self.prefill_tpus = Ewma::new(c.prefill_tpus);
+        self.restore_bpus = Ewma::new(c.restore_bpus);
+        self.restore_nvme_bpus = Ewma::new(c.restore_nvme_bpus);
+        self.restore_fixed_us = Ewma::new(c.restore_fixed_us);
     }
 
     fn record_error(&mut self, predicted: f64, actual: f64) {
@@ -267,6 +300,64 @@ impl CostModel {
     }
 }
 
+/// The cost model's measured rates, persisted beside the T2 store so a
+/// restart prices its first disk hits by this machine instead of the generic
+/// seeds. A restart is exactly when that matters: RAM starts empty, so every
+/// hit before the first prefill completes comes off disk - and the generic
+/// prefill seed refused those as slower than recompute.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Calibration {
+    pub prefill_tpus: f64,
+    pub restore_bpus: f64,
+    pub restore_nvme_bpus: f64,
+    pub restore_fixed_us: f64,
+}
+
+const CALIBRATION_MAGIC: &str = "paddock-kv-cost v1";
+
+impl Calibration {
+    /// Text form, tagged with the device it was measured on.
+    pub fn encode(&self, device: &str) -> String {
+        format!(
+            "{CALIBRATION_MAGIC}\ndevice {}\nprefill_tpus {}\nrestore_bpus {}\nrestore_nvme_bpus {}\nrestore_fixed_us {}\n",
+            device.replace('\n', " "),
+            self.prefill_tpus,
+            self.restore_bpus,
+            self.restore_nvme_bpus,
+            self.restore_fixed_us
+        )
+    }
+
+    /// Parse `text` if it was measured on `device` and every rate is sane.
+    /// Anything else - another GPU, an older format, a torn write - is
+    /// ignored: the generic seeds are the safe fallback.
+    pub fn decode(text: &str, device: &str) -> Option<Self> {
+        let mut lines = text.lines();
+        if lines.next()? != CALIBRATION_MAGIC {
+            return None;
+        }
+        let mut field = |name: &str| -> Option<&str> {
+            let line = lines.next()?;
+            line.strip_prefix(name)?.strip_prefix(' ')
+        };
+        if field("device")? != device.replace('\n', " ") {
+            return None;
+        }
+        let mut num = |name: &str| -> Option<f64> {
+            field(name)?
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v > 0.0)
+        };
+        Some(Self {
+            prefill_tpus: num("prefill_tpus")?,
+            restore_bpus: num("restore_bpus")?,
+            restore_nvme_bpus: num("restore_nvme_bpus")?,
+            restore_fixed_us: num("restore_fixed_us")?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +369,73 @@ mod tests {
             queued_bytes: 0,
             nvme_bytes: 0,
         }
+    }
+
+    /// Recompute estimate for `tokens` - the prefill rate, read back.
+    fn recompute_us(m: &CostModel, tokens: u32) -> f64 {
+        match m.elect(HitShape {
+            restore_bytes: u64::MAX >> 8,
+            ..hit(0, tokens)
+        }) {
+            Election::Recompute { est_us, .. } => est_us,
+            Election::Restore { .. } => unreachable!("restore cannot win at that size"),
+        }
+    }
+
+    /// The generic seed is a guess; the first measured prefill replaces it
+    /// instead of nudging it 1/8 of the way - from 50 tok/ms that nudge took
+    /// ~30 prompts to reach a 27B's ~1.3 tok/ms, and every disk restore in
+    /// between was refused against a recompute ~40x too fast.
+    #[test]
+    fn the_first_measured_prefill_replaces_the_seed() {
+        let mut m = CostModel::new();
+        assert!(m.calibration().is_none(), "nothing measured yet");
+        m.observe_prefill(10_000, 8_000_000.0); // 1.25 tok/ms
+        assert!((recompute_us(&m, 10_000) - 8_000_000.0).abs() < 1.0);
+        // later samples smooth, as before
+        m.observe_prefill(10_000, 4_000_000.0);
+        let us = recompute_us(&m, 10_000);
+        assert!(us < 8_000_000.0 && us > 6_000_000.0, "one 1/8 step: {us}");
+        assert!(m.calibration().is_some());
+    }
+
+    /// A restart starts from the last run's rates on this device - its first
+    /// hits all come off disk, before any prefill is measured - and the first
+    /// live prefill still replaces the carried-over rate.
+    #[test]
+    fn a_calibration_round_trips_for_its_own_device_only() {
+        let mut m = CostModel::new();
+        m.observe_prefill(10_000, 8_000_000.0);
+        let c = m.calibration().expect("measured");
+        let text = c.encode("NVIDIA GB10 sm_121 48sm");
+        assert_eq!(
+            Calibration::decode(&text, "NVIDIA GB10 sm_121 48sm"),
+            Some(c)
+        );
+        assert_eq!(
+            Calibration::decode(&text, "NVIDIA RTX PRO 6000 sm_120 188sm"),
+            None
+        );
+        assert_eq!(
+            Calibration::decode(&text[..text.len() / 2], "NVIDIA GB10 sm_121 48sm"),
+            None
+        );
+        assert_eq!(Calibration::decode("prefill_tpus 1\n", "x"), None);
+        let mut fresh = CostModel::new();
+        fresh.adopt_calibration(c);
+        assert!(
+            (recompute_us(&fresh, 10_000) - 8_000_000.0).abs() < 1.0,
+            "adopted"
+        );
+        assert!(
+            fresh.calibration().is_none(),
+            "carried over, not measured here"
+        );
+        fresh.observe_prefill(10_000, 5_000_000.0);
+        assert!(
+            (recompute_us(&fresh, 10_000) - 5_000_000.0).abs() < 1.0,
+            "replaced live"
+        );
     }
 
     /// The two tiers must not share a rate: a disk hit priced at PCIe speed

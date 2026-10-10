@@ -181,6 +181,47 @@ pub fn resize_rgb8(
     out
 }
 
+/// Aspect-preserving Pillow bicubic with a centered black PAD_CEIL canvas.
+/// Shared by CUDA and Metal OCR so page pixels have one arithmetic contract.
+pub fn resize_pad_black(rgb: &[u8], w: usize, h: usize, tw: usize, th: usize) -> Vec<u8> {
+    assert_eq!(rgb.len(), 3 * w * h);
+    assert!(w > 0 && h > 0 && tw > 0 && th > 0);
+    let scale = (tw as f32 / w as f32).min(th as f32 / h as f32);
+    let nw = ((w as f32 * scale).ceil() as usize).min(tw).max(1);
+    let nh = ((h as f32 * scale).ceil() as usize).min(th).max(1);
+    let resized = resize_rgb8(rgb, w, h, nw, nh, Filter::Bicubic);
+    let mut canvas = vec![0u8; 3 * tw * th];
+    let ox = (tw - nw) / 2;
+    let oy = (th - nh) / 2;
+    for y in 0..nh {
+        let s = y * nw * 3;
+        let d = ((y + oy) * tw + ox) * 3;
+        canvas[d..d + nw * 3].copy_from_slice(&resized[s..s + nw * 3]);
+    }
+    canvas
+}
+
+#[cfg(test)]
+mod pad_tests {
+    use super::*;
+
+    #[test]
+    fn shared_pad_ceil_keeps_identity_and_centers_black_letterboxing() {
+        let src: Vec<u8> = (0..100 * 50).flat_map(|_| [255, 17, 3]).collect();
+        assert_eq!(resize_pad_black(&src, 100, 50, 100, 50), src);
+        let out = resize_pad_black(&src, 100, 50, 128, 96);
+        assert_eq!(out.len(), 128 * 96 * 3);
+        for (y, row) in out.as_chunks::<{ 128 * 3 }>().0.iter().enumerate() {
+            let pixel = if (16..80).contains(&y) {
+                [255, 17, 3]
+            } else {
+                [0; 3]
+            };
+            assert!(row.as_chunks::<3>().0.iter().all(|p| *p == pixel));
+        }
+    }
+}
+
 /// Run `f(y, row)` over every 3*`tw`-byte output row, fanning out to scoped
 /// threads when the plane is big enough to pay for them. Small planes (probe
 /// images, tests) stay on the caller's thread - identical bytes either way.

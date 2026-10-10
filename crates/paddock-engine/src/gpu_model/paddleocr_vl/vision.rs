@@ -127,6 +127,11 @@ struct TowerWs {
     q: CudaSlice<f32>,
     k: CudaSlice<f32>,
     v: CudaSlice<f32>,
+    /// The attention's planes: q/k/v as halves for `vision_attn_h` (whose
+    /// output is the wo GEMM's staging plane) where the pack has slot 833,
+    /// else the f32 kernel's output plane in `a`. The plane a pass does not
+    /// use stays one element.
+    qkv16: [CudaSlice<f16>; 3],
     a: CudaSlice<f32>,
     up: CudaSlice<f32>,
     m: CudaSlice<f32>,
@@ -144,8 +149,8 @@ struct TowerWs {
 }
 
 /// Patch rows one batched tower pass takes before a group stops taking
-/// pictures (a picture larger than this runs alone): ~56 KB of workspace per
-/// row, so ~0.9 GB - two maximum-size pictures, or three default pages.
+/// pictures (a picture larger than this runs alone): ~58 KB of workspace per
+/// row, so ~0.95 GB - two maximum-size pictures, or three default pages.
 pub(crate) const TOWER_PASS_ROWS: usize = 16384;
 
 /// Distinct geometries worth caching pos-embd planes for. Documents pages
@@ -162,6 +167,7 @@ impl TowerWs {
             q: exec.alloc(1)?,
             k: exec.alloc(1)?,
             v: exec.alloc(1)?,
+            qkv16: [exec.alloc_f16(1)?, exec.alloc_f16(1)?, exec.alloc_f16(1)?],
             a: exec.alloc(1)?,
             up: exec.alloc(1)?,
             m: exec.alloc(1)?,
@@ -491,13 +497,18 @@ impl VisionModel {
         let mid = self.mm1.dims[1];
         let out_dim = self.mm2.dims[1];
         TowerWs::grow_f16(&mut self.ws.s16, &exec, stage)?;
+        // the half attention's three planes, or the f32 one (an older pack)
+        let half = exec.has_vision_qkv_h();
+        for buf in &mut self.ws.qkv16 {
+            TowerWs::grow_f16(buf, &exec, if half { rows * e } else { 1 })?;
+        }
         for (buf, need) in [
             (&mut self.ws.x, rows * e),
             (&mut self.ws.n, rows * e),
             (&mut self.ws.q, rows * e),
             (&mut self.ws.k, rows * e),
             (&mut self.ws.v, rows * e),
-            (&mut self.ws.a, rows * e),
+            (&mut self.ws.a, if half { 1 } else { rows * e }),
             (&mut self.ws.up, rows * ffn),
             (&mut self.ws.m, n4 * mid),
             (&mut self.ws.out, n4 * out_dim),
@@ -533,7 +544,8 @@ impl VisionModel {
     }
 
     /// Encode B same-size images in one tower pass. Attention runs per image
-    /// over its own row window, so rows are independent of batch placement -
+    /// over its own row window (a group per image in `vision_attn_h`), so rows
+    /// are independent of batch placement -
     /// the qwen35 tower's contract, same reasoning (its module doc has the
     /// full numeric story).
     pub fn encode_batch(
@@ -678,6 +690,14 @@ impl VisionModel {
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         let theta_scale = 10000f32.powf(-2.0 / (self.head_dim / 2) as f32);
+        // the attention on halves (slots 833 + 620), as `size_workspace`
+        // sized the planes; an older pack keeps the f32 chain
+        let half = exec.has_vision_qkv_h();
+        // the FFN's seams ride its GEMMs (slots 834/835; bit-identical, ws.up
+        // and ws.n stay as the pack's fallback scratch), LN2 staging into the
+        // q plane the attention is done with. The oracle taps read the wo
+        // plane itself, so a tapped pass keeps the unfused chain.
+        let fused_ffn = half && taps.is_none() && exec.has_tower_ffn_fused();
 
         // The elementwise chain between the GEMMs runs FUSED: LN
         // writes the f16 staging plane directly, the q/k biases ride the rope
@@ -698,76 +718,131 @@ impl VisionModel {
             exec.matvec_batch_f16(&blk.wq, &ws.s16, &mut ws.q, rows)?;
             exec.matvec_batch_f16(&blk.wk, &ws.s16, &mut ws.k, rows)?;
             exec.matvec_batch_f16(&blk.wv, &ws.s16, &mut ws.v, rows)?;
-            exec.bias_add(&mut ws.v, &blk.bv, rows, e)?;
-            exec.mrope_vision_bias(
-                &mut ws.q,
-                &blk.bq,
-                &ws.pos,
-                rows,
-                self.n_heads,
-                self.head_dim,
-                theta_scale,
-            )?;
-            exec.mrope_vision_bias(
-                &mut ws.k,
-                &blk.bk,
-                &ws.pos,
-                rows,
-                self.n_heads,
-                self.head_dim,
-                theta_scale,
-            )?;
-            for bi in 0..b {
-                exec.vision_attn_at(
-                    &ws.q,
-                    &ws.k,
-                    &ws.v,
-                    &mut ws.a,
-                    bi * n,
+            if half {
+                // q/k/v land as halves in one pass and the half attention
+                // writes the wo GEMM's staging plane itself, a group per
+                // picture: the f32 kernel rounded q/k/v to f16 into its
+                // fragments anyway, so the bits are the f32 chain's
+                let [q16, k16, v16] = &mut ws.qkv16;
+                exec.mrope_vision_qkv_h(
+                    (&ws.q, &ws.k, &ws.v),
+                    (&blk.bq, &blk.bk, &blk.bv),
+                    &ws.pos,
+                    (q16, k16, v16),
+                    rows,
+                    self.n_heads,
+                    self.head_dim,
+                    theta_scale,
+                    scale,
+                )?;
+                exec.vision_attn_h(
+                    q16,
+                    k16,
+                    v16,
+                    &mut ws.s16,
+                    n,
                     n,
                     self.n_heads,
                     self.head_dim,
-                    scale,
+                    b,
                 )?;
-            }
-            exec.convert_f32_f16(&ws.a, &mut ws.s16, rows * e)?;
-            exec.matvec_batch_f16(&blk.wo, &ws.s16, &mut ws.n, rows)?;
-            if let Some(t) = taps.as_deref_mut()
-                && t.attn_sums.is_empty()
-            {
-                // ws.n stays unbiased (the bias rides the residual add
-                // below) - reconstruct the biased tap on the host, the
-                // same IEEE f32 add the old bias_add kernel did
-                let mut host = exec.to_host_len(&ws.n, rows * e)?;
-                let bo = exec.to_host_len(&blk.bo, e)?;
-                for (i, v) in host.iter_mut().enumerate() {
-                    *v += bo[i % e];
+            } else {
+                exec.bias_add(&mut ws.v, &blk.bv, rows, e)?;
+                exec.mrope_vision_bias(
+                    &mut ws.q,
+                    &blk.bq,
+                    &ws.pos,
+                    rows,
+                    self.n_heads,
+                    self.head_dim,
+                    theta_scale,
+                )?;
+                exec.mrope_vision_bias(
+                    &mut ws.k,
+                    &blk.bk,
+                    &ws.pos,
+                    rows,
+                    self.n_heads,
+                    self.head_dim,
+                    theta_scale,
+                )?;
+                for bi in 0..b {
+                    exec.vision_attn_at(
+                        &ws.q,
+                        &ws.k,
+                        &ws.v,
+                        &mut ws.a,
+                        bi * n,
+                        n,
+                        self.n_heads,
+                        self.head_dim,
+                        scale,
+                    )?;
                 }
-                t.attn0 = host;
+                exec.convert_f32_f16(&ws.a, &mut ws.s16, rows * e)?;
             }
-            exec.add_bias_res(&mut ws.x, &ws.n, &blk.bo, rows, e)?;
-            if let Some(t) = taps.as_deref_mut() {
-                t.attn_sums.push(
-                    exec.to_host_len(&ws.x, rows * e)?
-                        .iter()
-                        .map(|&v| v as f64)
-                        .sum(),
-                );
-            }
+            if fused_ffn {
+                let [ln16, _, _] = &mut ws.qkv16;
+                exec.matvec_batch_f16_bias_res(
+                    &blk.wo, &ws.s16, &mut ws.x, &blk.bo, &mut ws.n, rows,
+                )?;
+                exec.layernorm_f16(&ws.x, &blk.ln2_w, &blk.ln2_b, ln16, rows, e, self.eps)?;
+                // gelu_pytorch_tanh
+                exec.matvec_batch_f16_gelu_tanh(
+                    &blk.up_w,
+                    ln16,
+                    &mut ws.s16,
+                    &blk.up_b,
+                    &mut ws.up,
+                    rows,
+                )?;
+                exec.matvec_batch_f16_bias_res(
+                    &blk.down_w,
+                    &ws.s16,
+                    &mut ws.x,
+                    &blk.down_b,
+                    &mut ws.n,
+                    rows,
+                )?;
+            } else {
+                exec.matvec_batch_f16(&blk.wo, &ws.s16, &mut ws.n, rows)?;
+                if let Some(t) = taps.as_deref_mut()
+                    && t.attn_sums.is_empty()
+                {
+                    // ws.n stays unbiased (the bias rides the residual add
+                    // below) - reconstruct the biased tap on the host, the
+                    // same IEEE f32 add the old bias_add kernel did
+                    let mut host = exec.to_host_len(&ws.n, rows * e)?;
+                    let bo = exec.to_host_len(&blk.bo, e)?;
+                    for (i, v) in host.iter_mut().enumerate() {
+                        *v += bo[i % e];
+                    }
+                    t.attn0 = host;
+                }
+                exec.add_bias_res(&mut ws.x, &ws.n, &blk.bo, rows, e)?;
+                if let Some(t) = taps.as_deref_mut() {
+                    t.attn_sums.push(
+                        exec.to_host_len(&ws.x, rows * e)?
+                            .iter()
+                            .map(|&v| v as f64)
+                            .sum(),
+                    );
+                }
 
-            exec.layernorm_f16(
-                &ws.x,
-                &blk.ln2_w,
-                &blk.ln2_b,
-                &mut ws.s16,
-                rows,
-                e,
-                self.eps,
-            )?;
-            exec.matvec_batch_f16(&blk.up_w, &ws.s16, &mut ws.up, rows)?;
-            exec.gelu_bias_f16(&ws.up, &blk.up_b, &mut ws.s16, rows, ffn)?; // gelu_pytorch_tanh
-            exec.matvec_batch_f16(&blk.down_w, &ws.s16, &mut ws.n, rows)?;
-            exec.add_bias_res(&mut ws.x, &ws.n, &blk.down_b, rows, e)?;
+                exec.layernorm_f16(
+                    &ws.x,
+                    &blk.ln2_w,
+                    &blk.ln2_b,
+                    &mut ws.s16,
+                    rows,
+                    e,
+                    self.eps,
+                )?;
+                exec.matvec_batch_f16(&blk.up_w, &ws.s16, &mut ws.up, rows)?;
+                exec.gelu_bias_f16(&ws.up, &blk.up_b, &mut ws.s16, rows, ffn)?; // gelu_pytorch_tanh
+                exec.matvec_batch_f16(&blk.down_w, &ws.s16, &mut ws.n, rows)?;
+                exec.add_bias_res(&mut ws.x, &ws.n, &blk.down_b, rows, e)?;
+            }
             if let Some(t) = taps.as_deref_mut() {
                 let host = exec.to_host_len(&ws.x, rows * e)?;
                 let li = t.layer_sums.len();

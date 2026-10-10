@@ -100,6 +100,9 @@ pub struct RestoreFlow {
     boundary_blocks: usize,
     aux: Option<AuxPlan>,
     state: FlowState,
+    /// The blocks round's ticket - owner of the published path's pin (see
+    /// [`PoolTier::hold_on_publish`]) from publication until the flow ends.
+    blocks_ticket: TicketId,
     started: Instant,
     est_us: f64,
     bytes: u64,
@@ -125,6 +128,9 @@ impl RestoreFlow {
         let ticket = match tier.begin_restore(hit, tokens, pool, after) {
             Some(t) => {
                 tier.note_park(true);
+                if aux.is_some() {
+                    tier.hold_on_publish(t);
+                }
                 t
             }
             None => {
@@ -136,6 +142,9 @@ impl RestoreFlow {
             }
         };
         let cut = (hit.end_block * BLOCK_TOKENS).min(tokens.len());
+        // what the flow moves: the blob rides with the blocks
+        let bytes = hit.bytes + aux.as_ref().map_or(0, |p| p.hit.bytes);
+        let nvme = hit.nvme_bytes + aux.as_ref().map_or(0, |p| p.hit.nvme_bytes);
         Some(RestoreFlow {
             tokens: tokens[..cut].to_vec(),
             boundary_blocks: hit.end_block,
@@ -144,12 +153,13 @@ impl RestoreFlow {
                 ticket,
                 deadline: Instant::now() + park_deadline(est_us),
             },
+            blocks_ticket: ticket,
             started: Instant::now(),
             est_us,
-            bytes: hit.bytes,
+            bytes,
             // dominant source decides which tier's rate this completion
             // teaches - a mostly-disk restore is a disk measurement
-            from_nvme: hit.nvme_bytes * 2 > hit.bytes,
+            from_nvme: nvme * 2 > bytes,
         })
     }
 
@@ -172,6 +182,8 @@ impl RestoreFlow {
     }
 
     fn finish<T: XferSink>(&mut self, tier: &mut PoolTier<T>, ok: bool) {
+        // attached (or given up): the checkpoint, if any, now keeps the path
+        tier.release_hold(self.blocks_ticket);
         let el = self.started.elapsed().as_micros() as f64;
         tier.cost
             .observe_restore_from(self.bytes, el, self.est_us, self.from_nvme);
@@ -201,6 +213,8 @@ impl RestoreFlow {
     ) {
         match self.state {
             FlowState::Blocks { ticket, deadline } => {
+                // (the blob round below inherits this deadline: `est_us`
+                // already prices the blob, so the bound stays per flow)
                 if let Some(w) = tier.take_wake(ticket) {
                     if self.aux.is_none() {
                         // KV-only family (2.1-lite): any published depth is
@@ -231,7 +245,15 @@ impl RestoreFlow {
                         self.finish(tier, false);
                         return;
                     };
-                    let aux_est = plan.hit.bytes as f64 / 16_000.0 + 100.0;
+                    // the flow's own deadline, or the blob's time at the
+                    // measured rate if the blocks round ate the budget. A
+                    // fixed 16 GB/s guess here abandoned every Qwen3.8
+                    // blob round once its checksums left the tick
+                    let rate = tier.cost.rates_bpus().0.max(1.0);
+                    let aux_deadline =
+                        deadline.max(Instant::now() + park_deadline(plan.hit.bytes as f64 / rate));
+                    // a blob coming off disk is seated back in T1 whole
+                    tier.expect_aux_fill(&plan.hit, &self.tokens);
                     let started = if pr.state_is_paged() {
                         let pages = pr.state_pages(cidx).to_vec();
                         tier.begin_restore_aux_paged(&plan.hit, &pages, after())
@@ -244,7 +266,7 @@ impl RestoreFlow {
                             self.state = FlowState::Aux {
                                 ticket: tk,
                                 cidx,
-                                deadline: Instant::now() + park_deadline(aux_est),
+                                deadline: aux_deadline,
                             };
                         }
                         None => {
@@ -254,6 +276,7 @@ impl RestoreFlow {
                     }
                 } else if Instant::now() >= deadline {
                     tracing::debug!(ticket, "tier flow abandoned (blocks round deadline)");
+                    tier.note_flow_end(false, self.bytes, self.from_nvme);
                     self.state = FlowState::Abandoned { ticket, cidx: None };
                 }
             }
@@ -270,11 +293,18 @@ impl RestoreFlow {
                             cidx,
                         );
                     if !attached {
+                        tracing::debug!(
+                            ticket,
+                            blob_landed = w.ok,
+                            boundary = self.boundary_blocks,
+                            "tier flow: checkpoint not attached"
+                        );
                         pr.recycle_state(cidx);
                     }
                     self.finish(tier, attached);
                 } else if Instant::now() >= deadline {
                     tracing::debug!(ticket, "tier flow abandoned (aux round deadline)");
+                    tier.note_flow_end(false, self.bytes, self.from_nvme);
                     self.state = FlowState::Abandoned {
                         ticket,
                         cidx: Some(cidx),
@@ -283,11 +313,18 @@ impl RestoreFlow {
             }
             FlowState::Abandoned { ticket, cidx } => {
                 if tier.take_wake(ticket).is_some() {
+                    // the restore did finish, just late: teach the cost
+                    // model what it really took, or it keeps electing on
+                    // the estimate that was blown
+                    let el = self.started.elapsed().as_micros() as f64;
+                    tier.cost
+                        .observe_restore_from(self.bytes, el, self.est_us, self.from_nvme);
                     // a late blocks-round success already published via the
                     // ticket's own resolution; only the reservation needs us
                     if let Some(c) = cidx {
                         pr.recycle_state(c);
                     }
+                    tier.release_hold(self.blocks_ticket);
                     self.state = FlowState::Done {
                         ok: false,
                         at: Instant::now(),
@@ -300,6 +337,7 @@ impl RestoreFlow {
                             "tier zombie flow dropped - checkpoint slot leaked (bounded)"
                         );
                     }
+                    tier.release_hold(self.blocks_ticket);
                     self.state = FlowState::Done {
                         ok: false,
                         at: Instant::now(),
@@ -403,6 +441,18 @@ impl<T: XferSink> PoolTier<T> {
         }
         park.zombies
             .retain(|f| !matches!(f.state, FlowState::Done { .. }));
+        // a pin outlives its flow only when the flow went without finishing
+        // (GC'd unclaimed, or dropped as a zombie before its wake): let go
+        let owned = |t: &TicketId| {
+            park.active
+                .values()
+                .chain(park.zombies.iter())
+                .any(|f| f.blocks_ticket == *t && f.done().is_none())
+        };
+        let stray: Vec<TicketId> = self.holds.keys().filter(|t| !owned(t)).copied().collect();
+        for t in stray {
+            self.release_hold(t);
+        }
         // GC resolved entries nobody consulted (requester cancelled while
         // parked) - normally the consult claims Done within a tick
         park.active.retain(|_, f| match f.done() {

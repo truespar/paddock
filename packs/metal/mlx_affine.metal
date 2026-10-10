@@ -200,6 +200,59 @@ MLX_STABLE(4)
 MLX_STABLE(5)
 #undef MLX_STABLE
 
+// Small backbones are dispatch-sensitive. Consume their F32 scheduler planes
+// directly, retaining the compact route's BF16 input cut inside the load.
+// No conversion dispatch or scratch write; identical eight-lane arithmetic.
+template<uint R>
+inline void mlx_affine_direct_rows(device const uchar* w,device const float* x,device float* out,
+    uint K,uint N,uint column,uint lane,uint valid) {
+    if(column>=N)return;
+    device const bfloat* scales=reinterpret_cast<device const bfloat*>(w+ulong(K)*N/2);
+    device const bfloat* biases=scales+ulong(K)*N/64;
+    float sum[2][R];for(uint c=0;c<2;++c)for(uint r=0;r<R;++r)sum[c][r]=0;
+    for(uint base=lane*64;base<K;base+=512) {
+        float scale[2],bias[2];
+        for(uint c=0;c<2;++c) {
+            ulong group=ulong(min(column+c,N-1))*(K/64)+base/64;
+            scale[c]=float(scales[group]);bias[c]=float(biases[group]);
+        }
+        #pragma unroll
+        for(uint word=0;word<8;++word) {
+            float4 lo[2],hi[2];
+            for(uint c=0;c<2;++c) {
+                ulong at=ulong(min(column+c,N-1))*K+base+word*8;
+                uint bits=reinterpret_cast<device const uint*>(w)[at/8];
+                lo[c]=fma(float4((uint4(bits)>>uint4(0,4,8,12))&15),float4(scale[c]),float4(bias[c]));
+                hi[c]=fma(float4((uint4(bits)>>uint4(16,20,24,28))&15),float4(scale[c]),float4(bias[c]));
+            }
+            #pragma unroll
+            for(uint r=0;r<R;++r) {
+                device const float* at=x+ulong(min(r,valid-1))*K+base+word*8;
+                float4 a=mlx_bf(*reinterpret_cast<device const float4*>(at));
+                float4 b=mlx_bf(*reinterpret_cast<device const float4*>(at+4));
+                for(uint c=0;c<2;++c)sum[c][r]=mlx_affine_contract8(a,b,lo[c],hi[c],sum[c][r]);
+            }
+        }
+    }
+    for(uint c=0;c<2;++c)for(uint r=0;r<R;++r) {
+        float v=kquant_sum<8>(sum[c][r]);
+        if(lane==0 && r<valid && column+c<N)out[ulong(r)*N+column+c]=mlx_bf(v);
+    }
+}
+#define MLX_STABLE_DIRECT(R) \
+kernel void mlx_affine_direct##R(device const uchar* w0 [[buffer(0)]],device const uchar* w1 [[buffer(1)]],device const uchar* w2 [[buffer(2)]], \
+device const float* x [[buffer(3)]],device float* o0 [[buffer(4)]],device float* o1 [[buffer(5)]],device float* o2 [[buffer(6)]], \
+constant uint* p [[buffer(7)]],uint2 group [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) { \
+uint g=group.x,n0=(p[1]+15)/16,n1=(p[2]+15)/16,N=p[1];device const uchar* w=w0;device float* out=o0; \
+if(g>=n0){g-=n0;N=p[2];w=w1;out=o1;if(g>=n1){g-=n1;N=p[3];w=w2;out=o2;}} \
+mlx_affine_direct_rows<R>(w,x+ulong(group.y)*R*p[0],out+ulong(group.y)*R*N,p[0],N,g*16+tid/8*2,tid%8,min(uint(R),p[4]-group.y*R));}
+MLX_STABLE_DIRECT(1)
+MLX_STABLE_DIRECT(2)
+MLX_STABLE_DIRECT(3)
+MLX_STABLE_DIRECT(4)
+MLX_STABLE_DIRECT(5)
+#undef MLX_STABLE_DIRECT
+
 // Single-token bandwidth path: a complete SIMD group shares sixteen input
 // values across four independent output columns. Fewer scale/bias loads and
 // shorter K loops than the small-batch eight-lane layout above.

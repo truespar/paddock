@@ -1,4 +1,4 @@
-//! Validated metadata for the explicitly approved MLX Qwen3.8-27B checkpoint.
+//! Validated metadata for elected MLX Qwen dense 27B and tied 0.8B/4B checkpoints.
 //! This is a storage lane, not a dependency on the MLX inference runtime.
 use crate::safetensors::StError;
 use serde_json::Value;
@@ -15,6 +15,13 @@ pub use llama::MiniCpmConfig;
 
 #[derive(Clone, Debug)]
 pub struct QwenConfig {
+    pub width: usize,
+    pub ff: usize,
+    pub layers: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub value_heads: usize,
+    pub tied: bool,
     pub context: usize,
     pub eps: f32,
     pub rope: f32,
@@ -33,8 +40,8 @@ impl QwenConfig {
 
     pub fn parse(v: &Value) -> Result<Self, StError> {
         let bad = |s: &str| StError::Header(format!("MLX Qwen: {s}"));
-        if v["model_type"] != "qwen3_5" || v["tie_word_embeddings"] != false {
-            return Err(bad("requires untied dense qwen3_5"));
+        if v["model_type"] != "qwen3_5" {
+            return Err(bad("requires dense qwen3_5"));
         }
         let quant = v
             .get("quantization")
@@ -50,17 +57,31 @@ impl QwenConfig {
             }
         }
         let t = &v["text_config"];
-        Self::parse_text(t)
+        let config = Self::parse_text(t)?;
+        if v["tie_word_embeddings"].as_bool() != Some(config.tied) {
+            return Err(bad("conflicting tied embedding metadata"));
+        }
+        if config.tied {
+            config.validate_vision(&v["vision_config"])?;
+        }
+        Ok(config)
     }
 
     pub(crate) fn parse_text(t: &Value) -> Result<Self, StError> {
         let bad = |s: &str| StError::Header(format!("MLX Qwen: {s}"));
+        let (width, ff, layers, heads, kv_heads, value_heads, tied) =
+            match t["hidden_size"].as_u64() {
+                Some(1024) => (1024, 3584, 24, 8, 2, 16, true),
+                Some(2560) => (2560, 9216, 32, 16, 4, 32, true),
+                Some(5120) => (5120, 17408, 64, 24, 4, 48, false),
+                _ => return Err(bad("unsupported hidden_size")),
+            };
         for (key, expected) in [
-            ("hidden_size", 5120),
-            ("intermediate_size", 17408),
-            ("num_hidden_layers", 64),
-            ("num_attention_heads", 24),
-            ("num_key_value_heads", 4),
+            ("hidden_size", width),
+            ("intermediate_size", ff),
+            ("num_hidden_layers", layers),
+            ("num_attention_heads", heads),
+            ("num_key_value_heads", kv_heads),
             ("head_dim", 256),
             ("vocab_size", 248320),
             ("full_attention_interval", 4),
@@ -68,7 +89,7 @@ impl QwenConfig {
             ("linear_key_head_dim", 128),
             ("linear_value_head_dim", 128),
             ("linear_num_key_heads", 16),
-            ("linear_num_value_heads", 48),
+            ("linear_num_value_heads", value_heads),
         ] {
             if t[key].as_u64() != Some(expected) {
                 return Err(bad(&format!("unsupported {key}")));
@@ -77,18 +98,21 @@ impl QwenConfig {
         if t["hidden_act"] != "silu"
             || t["dtype"] != "bfloat16"
             || t["attention_bias"] != false
-            || t["tie_word_embeddings"] != false
+            || t["tie_word_embeddings"].as_bool() != Some(tied)
             || t["attn_output_gate"] != true
-            || t["output_gate_type"] != "swish"
+            || (t["output_gate_type"] != "swish" && !(tied && t.get("output_gate_type").is_none()))
             || t["mamba_ssm_dtype"] != "float32"
         {
             return Err(bad("unsupported arithmetic/attention configuration"));
         }
-        let layers = t["layer_types"]
+        if tied && t["mtp_num_hidden_layers"] != 0 {
+            return Err(bad("small tied checkpoints require zero MTP layers"));
+        }
+        let ordering = t["layer_types"]
             .as_array()
             .ok_or_else(|| bad("missing layer_types"))?;
-        if layers.len() != 64
-            || layers.iter().enumerate().any(|(i, l)| {
+        if ordering.len() != layers as usize
+            || ordering.iter().enumerate().any(|(i, l)| {
                 l != if (i + 1) % 4 == 0 {
                     "full_attention"
                 } else {
@@ -118,16 +142,116 @@ impl QwenConfig {
             .filter(|&n| n > 0 && n <= u32::MAX as u64)
             .ok_or_else(|| bad("invalid trained context"))? as usize;
         Ok(Self {
+            width: width as usize,
+            ff: ff as usize,
+            layers: layers as usize,
+            heads: heads as usize,
+            kv_heads: kv_heads as usize,
+            value_heads: value_heads as usize,
+            tied,
             context,
             eps: positive(&t["rms_norm_eps"], "rms_norm_eps")?,
             rope: positive(&r["rope_theta"], "rope_theta")?,
         })
+    }
+
+    fn validate_vision(&self, v: &Value) -> Result<(), StError> {
+        let (width, ff, layers, heads) = match self.width {
+            1024 => (768, 3072, 12, 12),
+            2560 => (1024, 4096, 24, 16),
+            _ => return Err(StError::Header("unsupported MLX OCR tower".into())),
+        };
+        for (key, expected) in [
+            ("hidden_size", width),
+            ("intermediate_size", ff),
+            ("depth", layers),
+            ("num_heads", heads),
+            ("out_hidden_size", self.width as u64),
+            ("patch_size", 16),
+            ("temporal_patch_size", 2),
+            ("spatial_merge_size", 2),
+            ("num_position_embeddings", 2304),
+            ("in_channels", 3),
+        ] {
+            if v[key].as_u64() != Some(expected) {
+                return Err(StError::Header(format!("MLX OCR tower: unsupported {key}")));
+            }
+        }
+        if v["dtype"] != "bfloat16"
+            || v["hidden_act"] != "gelu_pytorch_tanh"
+            || v["deepstack_visual_indexes"] != serde_json::json!([])
+        {
+            return Err(StError::Header(
+                "unsupported MLX OCR tower arithmetic/DeepStack".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[test]
+    fn small_tied_mlx_requires_matching_tower_and_text_geometry() {
+        for (width, ff, layers, heads, kv, values, vw, vf, depth, vh) in [
+            (1024, 3584, 24, 8, 2, 16, 768, 3072, 12, 12),
+            (2560, 9216, 32, 16, 4, 32, 1024, 4096, 24, 16),
+        ] {
+            let mut v = config();
+            v["tie_word_embeddings"] = true.into();
+            let t = &mut v["text_config"];
+            for (key, value) in [
+                ("hidden_size", width),
+                ("intermediate_size", ff),
+                ("num_hidden_layers", layers),
+                ("num_attention_heads", heads),
+                ("num_key_value_heads", kv),
+                ("linear_num_value_heads", values),
+                ("mtp_num_hidden_layers", 0),
+            ] {
+                t[key] = value.into();
+            }
+            t["tie_word_embeddings"] = true.into();
+            t.as_object_mut().unwrap().remove("output_gate_type");
+            t["layer_types"] = serde_json::json!(
+                (0..layers)
+                    .map(|i| if i % 4 == 3 {
+                        "full_attention"
+                    } else {
+                        "linear_attention"
+                    })
+                    .collect::<Vec<_>>()
+            );
+            v["vision_config"] = serde_json::json!({"hidden_size":vw,"intermediate_size":vf,
+                "depth":depth,"num_heads":vh,"out_hidden_size":width,"patch_size":16,
+                "temporal_patch_size":2,"spatial_merge_size":2,"num_position_embeddings":2304,
+                "in_channels":3,"dtype":"bfloat16","hidden_act":"gelu_pytorch_tanh",
+                "deepstack_visual_indexes":[]});
+            let cfg = QwenConfig::parse(&v).unwrap();
+            assert_eq!(
+                (cfg.width, cfg.layers, cfg.tied),
+                (width as usize, layers as usize, true)
+            );
+            for (path, wrong) in [
+                ("/tie_word_embeddings", serde_json::json!(false)),
+                ("/vision_config/out_hidden_size", serde_json::json!(5120)),
+                (
+                    "/vision_config/deepstack_visual_indexes",
+                    serde_json::json!([2]),
+                ),
+                ("/vision_config/hidden_act", serde_json::json!("gelu")),
+                ("/text_config/mtp_num_hidden_layers", serde_json::json!(1)),
+                ("/text_config/linear_num_key_heads", serde_json::json!(8)),
+                ("/text_config/attn_output_gate", serde_json::json!(false)),
+                ("/quantization/bits", serde_json::json!(8)),
+            ] {
+                let mut bad = v.clone();
+                *bad.pointer_mut(path).unwrap() = wrong;
+                assert!(QwenConfig::parse(&bad).is_err(), "accepted {path}");
+            }
+        }
+    }
     pub(crate) fn config() -> Value {
         serde_json::json!({
             "model_type": "qwen3_5", "tie_word_embeddings": false,

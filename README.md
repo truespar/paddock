@@ -140,6 +140,8 @@ Every model below runs on the engine today. Sizes are the checkpoint's own, and
 
 **Documents and OCR**
 
+- **LightOnOCR-3** (LightOn) - 0.8B and 4B; reads a page as text, or as
+  labelled blocks with their boxes
 - **PaddleOCR-VL** 1.6
 - **Unlimited-OCR** 3B
 

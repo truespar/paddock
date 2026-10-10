@@ -21,10 +21,11 @@ import Popover from '@/components/ui/Popover.vue'
 const props = defineProps<{
   images: ImagePart[]
   pdf?: FilePart
-  /** Grounded regions of a SINGLE-REQUEST run. Drawn only when the run had
-   *  exactly one page - that wire's region list carries no page index, and a
-   *  guessed page would be a wrong overlay. A fan-out run uses `runPages`
-   *  instead, where the ambiguity never existed. */
+  /** Grounded regions of a SINGLE-REQUEST run. Drawn on their own page when
+   *  every region names it (PaddleOCR-VL's document pipeline), else only when
+   *  the run had exactly one page - a region list without page indices on a
+   *  multi-page run would be a guessed, wrong overlay. A fan-out run uses
+   *  `runPages` instead, where the ambiguity never existed. */
   regions?: OcrRegion[]
   /** Per-page fan-out results, index-aligned with this stack:
    *  each page's own regions overlay that page, and the reading page is
@@ -266,8 +267,12 @@ const pageBoxes = computed<RegionBox[][]>(() => {
       return p ? pageRegionBoxes(p) : []
     })
   }
-  if (!props.regions?.length || pages.length !== 1 || props.pdf) return pages.map(() => [])
-  return [regionBoxes(props.regions)]
+  const regions = props.regions ?? []
+  if (regions.length && regions.every((r) => typeof r.page === 'number')) {
+    return pages.map((_, i) => regionBoxes(regions.filter((r) => r.page === i)))
+  }
+  if (!regions.length || pages.length !== 1 || props.pdf) return pages.map(() => [])
+  return [regionBoxes(regions)]
 })
 const legend = computed(() => {
   const counts = new Map<string, { n: number; hue: number }>()

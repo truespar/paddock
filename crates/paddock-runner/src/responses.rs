@@ -32,8 +32,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::chat::{
-    ConstraintSpec, GateSpec, build_mm_chunks, content_gate, decode_images, find_images,
-    instantiate_constraint,
+    ConstraintSpec, GateSpec, build_mm_chunks, content_gate, find_images, instantiate_constraint,
 };
 use crate::chat_template;
 use crate::constrained::{CompiledSchema, ToolSet};
@@ -41,6 +40,7 @@ use crate::loop_budget;
 use crate::parsers::{Dialect, Parsed, ToolHints, holdback, parse, tool_hints};
 use crate::routes::AppState;
 use crate::serving::ServingModel;
+use crate::tool_stream::ToolEv;
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -214,7 +214,7 @@ fn messages_from_input(instructions: Option<&str>, input: &Value) -> Result<Vec<
                     }
                     // prior tool result fed back for the next turn
                     "function_call_output" => {
-                        let out = it.get("output").map(content_text).unwrap_or_default();
+                        let out = crate::tool_images::output_content(it.get("output"));
                         let id = it.get("call_id").and_then(Value::as_str).unwrap_or("");
                         msgs.push(json!({"role": "tool", "content": out, "tool_call_id": id}));
                     }
@@ -356,6 +356,12 @@ fn prepare(
         .chat_template
         .as_deref()
         .ok_or("this model has no chat template")?;
+    // pictures in tool outputs this endpoint cannot show turn into text notes
+    let see = model.supports_vision && model.tool_images;
+    let blinded = (!see)
+        .then(|| crate::tool_images::blind(messages))
+        .flatten();
+    let messages = blinded.as_deref().unwrap_or(messages);
     // Image items are extracted before normalize_messages, which rewrites
     // every image part down to a bare `{"type":"image"}` marker for the
     // template - running that first DESTROYS the payload, and this surface
@@ -390,7 +396,7 @@ fn prepare(
     }
     // Responses spells `detail` on the input_image part itself rather than
     // nested under image_url; find_images accepts both spellings.
-    let images = decode_images(image_refs, model.engine.vision_budget())?;
+    let images = model.decode_images(image_refs)?;
 
     // Name anything we don't serve before the template sees it. This surface
     // was the silent one: chat at least died inside the template, but
@@ -528,29 +534,12 @@ fn prepare(
     } else {
         Some(Value::Object(kwargs_obj))
     };
-    let kwargs = chat_template::family_defaults(&model.arch, kwargs);
+    let kwargs = model.template_defaults(kwargs);
 
-    // deepseek2-ocr instruction mapping  - same seam as chat:
-    // resolve the `ocr` object + prompt vocabulary against the normalized
-    // messages, right before render (see crate::deepseek_ocr).
-    if req.ocr.is_some() && !model.ocr && !model.paddleocr {
-        return Err("the `ocr` request object is only served by document-parser models".into());
-    }
-    let ocr = if model.ocr {
-        let opts = crate::deepseek_ocr::OcrOpts::from_request(req.ocr.as_ref(), kwargs.as_ref())?;
-        let sizes: Vec<(usize, usize)> =
-            images.iter().map(crate::chat::RequestImage::size).collect();
-        let max_tiles = model
-            .engine
-            .vision_budget()
-            .map_or(0, |b| (b.max_pixels / (640 * 640)) as usize);
-        crate::deepseek_ocr::resolve(&mut messages, opts, &sizes, max_tiles)?
-    } else if model.paddleocr {
-        let mode = crate::paddle_ocr::opts_from_request(req.ocr.as_ref(), kwargs.as_ref())?;
-        crate::paddle_ocr::resolve(&mut messages, mode, images.len())?
-    } else {
-        None
-    };
+    // document-parser instruction mapping - same seam as chat: resolve the
+    // `ocr` object + prompt vocabulary against the normalized messages, right
+    // before render (see ServingModel::resolve_ocr).
+    let ocr = model.resolve_ocr(req.ocr.as_ref(), kwargs.as_ref(), &mut messages, &images)?;
 
     let prompt = chat_template::render_with_specials(
         template,
@@ -685,7 +674,7 @@ fn prepare(
     let dflt = sd.resolve(thinking_open);
     let sampler = SamplingParams {
         // document parsers default greedy - same rule as chat completions
-        temperature: req.temperature.unwrap_or(if model.document_parser {
+        temperature: req.temperature.unwrap_or(if model.greedy_default() {
             0.0
         } else {
             dflt.temp
@@ -703,7 +692,7 @@ fn prepare(
         // the Responses API has no logit_bias knob
         logit_bias: Vec::new(),
         // the OCR family's repetition guard (reference parity), off elsewhere
-        no_repeat_ngram: ocr.as_ref().map_or((0, 0), |o| o.ngram),
+        no_repeat_ngram: ocr.as_ref().map_or((0, 0, false), |o| o.guard()),
     };
     Ok(Prepared {
         prompt_ids,
@@ -1218,6 +1207,7 @@ pub async fn handle(
         logprobs: logprobs_k,
         submitted: None, // stamped by Engine::submit
         canvas_read: None,
+        user_turn: crate::user_turn::responses(&req.input),
     };
     if let Err(e) = model.engine.submit(gen_req) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e);
@@ -1338,7 +1328,7 @@ fn response_object(
     // the OCR resolution echo (paddock extension, deepseek2-ocr only) - the
     // terminal points append grounded `regions` via `attach_ocr_regions`
     if let Some(o) = &meta.ex.ocr {
-        body["ocr"] = o.echo();
+        body["ocr"] = o.echo_at(finish);
     }
     body
 }
@@ -1428,13 +1418,12 @@ async fn collect_response(mut meta: Meta, mut rx: UnboundedReceiver<TokenEvent>)
 /// a monotonic sequence_number.
 fn stream_response(mut meta: Meta, mut rx: UnboundedReceiver<TokenEvent>) -> Response {
     let sse = stream! {
-        let mut seq = 0u64;
-        let mut next = || { let s = seq; seq += 1; s };
+        let mut sq = crate::responses_stream::Seq::default();
 
         let snapshot = response_object(&meta, "in_progress", vec![], None, None);
-        yield ev("response.created", json!({"type":"response.created","sequence_number":next(),"response":snapshot}));
+        yield ev("response.created", json!({"type":"response.created","sequence_number":sq.next(),"response":snapshot}));
         let snapshot = response_object(&meta, "in_progress", vec![], None, None);
-        yield ev("response.in_progress", json!({"type":"response.in_progress","sequence_number":next(),"response":snapshot}));
+        yield ev("response.in_progress", json!({"type":"response.in_progress","sequence_number":sq.next(),"response":snapshot}));
 
         // a fired compaction leads the stream: the item has no delta events
         // in the spec (opaque there, plaintext here) so it rides a complete
@@ -1446,19 +1435,19 @@ fn stream_response(mut meta: Meta, mut rx: UnboundedReceiver<TokenEvent>) -> Res
         let base = comp + meta.ex.enrichment.len();
         if let Some(item) = &meta.ex.compaction {
             yield ev("response.output_item.added", json!({
-                "type":"response.output_item.added","sequence_number":next(),
+                "type":"response.output_item.added","sequence_number":sq.next(),
                 "output_index":0,"item":item}));
             yield ev("response.output_item.done", json!({
-                "type":"response.output_item.done","sequence_number":next(),
+                "type":"response.output_item.done","sequence_number":sq.next(),
                 "output_index":0,"item":item}));
         }
         for (k, item) in meta.ex.enrichment.iter().enumerate() {
             let idx = comp + k;
             yield ev("response.output_item.added", json!({
-                "type":"response.output_item.added","sequence_number":next(),
+                "type":"response.output_item.added","sequence_number":sq.next(),
                 "output_index":idx,"item":item}));
             yield ev("response.output_item.done", json!({
-                "type":"response.output_item.done","sequence_number":next(),
+                "type":"response.output_item.done","sequence_number":sq.next(),
                 "output_index":idx,"item":item}));
         }
 
@@ -1471,6 +1460,10 @@ fn stream_response(mut meta: Meta, mut rx: UnboundedReceiver<TokenEvent>) -> Res
         let mut msg_open = false;
         let mut rs_emitted = 0usize;
         let mut emitted = 0usize;
+        // tool calls stream as they are written; the reasoning and message
+        // items close when the first one starts (items go out in order)
+        let mut tools = crate::tool_stream::ToolStream::default();
+        let mut calls = crate::responses_stream::Calls::default();
         let mut ids: Vec<u32> = Vec::new();
         let mut terminal_tokens = 0;
         // incremental decode of `ids` (the O(n^2) per-token full re-decode
@@ -1502,12 +1495,12 @@ fn stream_response(mut meta: Meta, mut rx: UnboundedReceiver<TokenEvent>) -> Res
                     let parsed = meta.parse_raw(&raw);
 
                     // reasoning channel -> reasoning item at index `base`
-                    if let Some(reasoning) = &parsed.reasoning
+                    if let Some(reasoning) = parsed.reasoning.as_ref().filter(|_| tools.started() == 0)
                         && safe_len(reasoning, meta.dialect.reasoning_markers()) > rs_emitted {
                         if !rs_open {
                             rs_open = true;
                             yield ev("response.output_item.added", json!({
-                                "type":"response.output_item.added","sequence_number":next(),
+                                "type":"response.output_item.added","sequence_number":sq.next(),
                                 "output_index":base,
                                 "item":{"type":"reasoning","id":rs_id,"summary":[],"content":[]}}));
                         }
@@ -1515,23 +1508,23 @@ fn stream_response(mut meta: Meta, mut rx: UnboundedReceiver<TokenEvent>) -> Res
                         let delta = reasoning[rs_emitted..safe].to_owned();
                         rs_emitted = safe;
                         yield ev("response.reasoning_text.delta", json!({
-                            "type":"response.reasoning_text.delta","sequence_number":next(),
+                            "type":"response.reasoning_text.delta","sequence_number":sq.next(),
                             "item_id":rs_id,"output_index":base,"content_index":0,"delta":delta}));
                     }
 
                     // final channel -> message item
-                    if let Some(content) = &parsed.content
+                    if let Some(content) = parsed.content.as_ref().filter(|_| tools.started() == 0)
                         && safe_len(content, meta.dialect.content_markers()) > emitted {
                         let msg_index = base + rs_open as usize;
                         if !msg_open {
                             msg_open = true;
                             yield ev("response.output_item.added", json!({
-                                "type":"response.output_item.added","sequence_number":next(),
+                                "type":"response.output_item.added","sequence_number":sq.next(),
                                 "output_index":msg_index,
                                 "item":{"type":"message","id":msg_id,"role":"assistant",
                                         "status":"in_progress","content":[]}}));
                             yield ev("response.content_part.added", json!({
-                                "type":"response.content_part.added","sequence_number":next(),
+                                "type":"response.content_part.added","sequence_number":sq.next(),
                                 "item_id":msg_id,"output_index":msg_index,"content_index":0,
                                 "part":{"type":"output_text","text":"","annotations":[]}}));
                         }
@@ -1543,9 +1536,23 @@ fn stream_response(mut meta: Meta, mut rx: UnboundedReceiver<TokenEvent>) -> Res
                         // include set, a delta carries every entry sampled
                         // since the previous text delta
                         yield ev("response.output_text.delta", json!({
-                            "type":"response.output_text.delta","sequence_number":next(),
+                            "type":"response.output_text.delta","sequence_number":sq.next(),
                             "item_id":msg_id,"output_index":msg_index,"content_index":0,
                             "delta":delta,"logprobs":std::mem::take(&mut lp_pending)}));
+                    }
+                    for e in tools.step(meta.dialect, &raw, meta.thinking_open, meta.hints.as_ref(), meta.single_tool_call, &parsed) {
+                        if matches!(e, ToolEv::Start { k: 0, .. }) {
+                            // the prose items close (whole texts) before call 0 opens
+                            if rs_open {
+                                let text = parsed.reasoning.clone().unwrap_or_default();
+                                for (n, d) in crate::responses_stream::reasoning_done(&mut sq, &rs_id, base, &text) { yield ev(n, d); }
+                            }
+                            if msg_open {
+                                let text = parsed.content.clone().unwrap_or_default();
+                                for (n, d) in crate::responses_stream::message_done(&mut sq, &msg_id, base + rs_open as usize, &text, &lp_all, meta.want_logprobs) { yield ev(n, d); }
+                            }
+                        }
+                        for (n, d) in calls.event(e, base + rs_open as usize + msg_open as usize, &mut sq) { yield ev(n, d); }
                     }
                 }
                 Some(TokenEvent::Done(r, stats)) => { finish = Some(r); terminal_tokens = stats.terminal_tokens(); meta.scope.phases(&stats); break }
@@ -1555,7 +1562,7 @@ fn stream_response(mut meta: Meta, mut rx: UnboundedReceiver<TokenEvent>) -> Res
                     let mut snapshot = response_object(&meta, "failed", vec![], None, None);
                     snapshot["error"] = json!({"code": e.code.unwrap_or("server_error"), "message": e.message});
                     yield ev("response.failed", json!({
-                        "type":"response.failed","sequence_number":next(),"response":snapshot}));
+                        "type":"response.failed","sequence_number":sq.next(),"response":snapshot}));
                     return;
                 }
             }
@@ -1563,62 +1570,18 @@ fn stream_response(mut meta: Meta, mut rx: UnboundedReceiver<TokenEvent>) -> Res
 
         let parsed = meta.parse(&ids);
 
-        // close the reasoning item
-        if rs_open {
+        // close the reasoning and message items (unless call 0 already did)
+        if rs_open && tools.started() == 0 {
             let text = parsed.reasoning.clone().unwrap_or_default();
-            yield ev("response.reasoning_text.done", json!({
-                "type":"response.reasoning_text.done","sequence_number":next(),
-                "item_id":rs_id,"output_index":base,"content_index":0,"text":text}));
-            yield ev("response.output_item.done", json!({
-                "type":"response.output_item.done","sequence_number":next(),"output_index":base,
-                "item":{"type":"reasoning","id":rs_id,"summary":[],
-                        "content":[{"type":"reasoning_text","text":text}]}}));
+            for (n, d) in crate::responses_stream::reasoning_done(&mut sq, &rs_id, base, &text) { yield ev(n, d); }
         }
-        let msg_index = base + rs_open as usize;
-
-        // close the message item; the done event carries the full logprobs
-        // run, and the part itself carries it too when the include asked
-        if msg_open {
+        if msg_open && tools.started() == 0 {
             let text = parsed.content.clone().unwrap_or_default();
-            yield ev("response.output_text.done", json!({
-                "type":"response.output_text.done","sequence_number":next(),
-                "item_id":msg_id,"output_index":msg_index,"content_index":0,
-                "text":text,"logprobs":lp_all}));
-            let mut part = json!({"type":"output_text","text":text,"annotations":[]});
-            if meta.want_logprobs {
-                part["logprobs"] = json!(lp_all);
-            }
-            yield ev("response.content_part.done", json!({
-                "type":"response.content_part.done","sequence_number":next(),
-                "item_id":msg_id,"output_index":msg_index,"content_index":0,
-                "part":part}));
-            yield ev("response.output_item.done", json!({
-                "type":"response.output_item.done","sequence_number":next(),"output_index":msg_index,
-                "item":{"type":"message","id":msg_id,"role":"assistant","status":"completed",
-                        "content":[part]}}));
+            for (n, d) in crate::responses_stream::message_done(&mut sq, &msg_id, base + rs_open as usize, &text, &lp_all, meta.want_logprobs) { yield ev(n, d); }
         }
-
-        // function_call items (parallel-capable), after reasoning + message
-        let fc_base = base + rs_open as usize + msg_open as usize;
-        for (n, tc) in parsed.tool_calls.iter().enumerate() {
-            let idx = fc_base + n;
-            let fc_id = format!("fc_{}", uuid::Uuid::new_v4().simple());
-            let call_id = format!("call_{}", uuid::Uuid::new_v4().simple());
-            let item = json!({"type":"function_call","id":fc_id,"call_id":call_id,
-                              "name":tc.name,"arguments":"","status":"in_progress"});
-            yield ev("response.output_item.added", json!({
-                "type":"response.output_item.added","sequence_number":next(),
-                "output_index":idx,"item":item}));
-            yield ev("response.function_call_arguments.delta", json!({
-                "type":"response.function_call_arguments.delta","sequence_number":next(),
-                "item_id":fc_id,"output_index":idx,"delta":tc.arguments}));
-            yield ev("response.function_call_arguments.done", json!({
-                "type":"response.function_call_arguments.done","sequence_number":next(),
-                "item_id":fc_id,"output_index":idx,"arguments":tc.arguments}));
-            yield ev("response.output_item.done", json!({
-                "type":"response.output_item.done","sequence_number":next(),"output_index":idx,
-                "item":{"type":"function_call","id":fc_id,"call_id":call_id,
-                        "name":tc.name,"arguments":tc.arguments,"status":"completed"}}));
+        // function_call items still open (a block cut by max_tokens) or never started
+        for e in tools.finish(&parsed) {
+            for (n, d) in calls.event(e, base + rs_open as usize + msg_open as usize, &mut sq) { yield ev(n, d); }
         }
 
         let mut output = output_items(&parsed, meta.want_logprobs.then_some(lp_all.as_slice()));
@@ -1634,7 +1597,7 @@ fn stream_response(mut meta: Meta, mut rx: UnboundedReceiver<TokenEvent>) -> Res
         let mut full = response_object(&meta, status, output, Some((output_tokens, rt, cached)), finish);
         meta.attach_ocr_regions(&mut full, &ids);
         yield ev(event_name, json!({
-            "type":event_name,"sequence_number":next(),"response":full}));
+            "type":event_name,"sequence_number":sq.next(),"response":full}));
     };
     streaming_response(sse)
 }
@@ -1795,6 +1758,7 @@ async fn summary_pass(
         logprobs: None,
         submitted: None, // stamped by Engine::submit
         canvas_read: None,
+        user_turn: false,
     };
     if let Err(e) = model.engine.submit(gen1) {
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e));
@@ -2049,6 +2013,7 @@ async fn run_compacting_oa(
         logprobs: lane_want_logprobs(&req).then(|| req.top_logprobs.unwrap_or(0)),
         submitted: None, // stamped by Engine::submit
         canvas_read: None,
+        user_turn: false,
     };
     if let Err(e) = model.engine.submit(gen_req) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e);
@@ -3592,6 +3557,7 @@ async fn run_agent(
             logprobs: None,
             submitted: None, // stamped by Engine::submit
             canvas_read: None,
+            user_turn: false,
         };
         if let Err(e) = model.engine.submit(gen_req) {
             return err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e);
@@ -4345,6 +4311,7 @@ fn stream_agent(
                 logprobs: None,
                 submitted: None, // stamped by Engine::submit
                 canvas_read: None,
+                user_turn: false,
             };
             if let Err(e) = model.engine.submit(gen_req) {
                 let mut snap = response_object(&meta, "failed", vec![], None, None);

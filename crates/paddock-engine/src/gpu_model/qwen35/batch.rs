@@ -217,8 +217,8 @@ fn dnc_vl_on() -> bool {
 
 /// The multimodal extras one batched-prefill share carries through
 /// `prefill_batch_pass` (parallel to `items`): the request-relative
-/// [4, take] axis-major mrope rows, the per-row attention bound (image
-/// equal-t visibility), the (row offset, rows) embedding splices with their
+/// [4, take] axis-major mrope rows, the per-row attention bound (causal,
+/// image rows included), the (row offset, rows) embedding splices with their
 /// encoded outputs, and the request's final llama-position for the decode
 /// mrope delta.
 pub(super) struct MmShareCtx {
@@ -2104,7 +2104,7 @@ impl GpuQwen35 {
         let out_f8 = &self.out_f8;
         let sinks = &self.sinks;
         let layers = &self.layers;
-        let tok_embd = &self.tok_embd;
+        let tok_embd = self.tok_embd.src(&self.output);
         let rot = self.rot.as_ref();
         let output = &self.output;
         let out_f8_h = self.out_f8.as_ref();
@@ -2573,7 +2573,7 @@ impl GpuQwen35 {
                                     eps,
                                     r * n_kv_heads,
                                 )?;
-                                exec.mrope(
+                                exec.imrope(
                                     &mut sc.d_qn,
                                     &d_mrope,
                                     r,
@@ -2583,7 +2583,7 @@ impl GpuQwen35 {
                                     yarn,
                                     sections,
                                 )?;
-                                exec.mrope(
+                                exec.imrope(
                                     &mut sc.d_kn,
                                     &d_mrope,
                                     r,
@@ -2683,8 +2683,8 @@ impl GpuQwen35 {
                                     continue;
                                 }
                                 if let Some(m) = mm {
-                                    // mm segment: bound-driven attention (image rows see
-                                    // their whole equal-t block) - the exact solo-mm
+                                    // mm segment: bound-driven attention (raster-causal
+                                    // image rows, per build_mm_layout) - the exact solo-mm
                                     // prefill_attn call at base-0, bit-identical to
                                     // forward_prefill_slot_mm's. The fast
                                     // in-place paged arm assumes bound == row position,
@@ -5975,7 +5975,7 @@ impl GpuQwen35 {
 
         let sinks = &self.sinks;
         let layers = &self.layers;
-        let tok_embd = &self.tok_embd;
+        let tok_embd = self.tok_embd.src(&self.output);
         let rot = self.rot.as_ref();
         let output = &self.output;
         let out_f8_h = self.out_f8.as_ref();
@@ -6445,7 +6445,7 @@ impl GpuQwen35 {
                             eps,
                             r * n_kv_heads,
                         )?;
-                        exec.mrope(
+                        exec.imrope(
                             &mut sc.d_qn,
                             &d_mrope,
                             r,
@@ -6455,7 +6455,7 @@ impl GpuQwen35 {
                             yarn,
                             sections,
                         )?;
-                        exec.mrope(
+                        exec.imrope(
                             &mut sc.d_kn,
                             &d_mrope,
                             r,
@@ -9353,7 +9353,7 @@ impl GpuQwen35 {
         // b >= 8 than alone. gpu_qwen35_ternary_class holds it.)
         let e4m3_norms =
             self.bs_f8ffn.iter().any(Option::is_some) && b >= 8 && exec.has_add_rmsnorm_e4m3_xn();
-        let tok_embd = &self.tok_embd;
+        let tok_embd = self.tok_embd.src(&self.output);
         let rot = self.rot.as_ref();
         // b=1 serving class for k-quant weights: the W4A8 dp4a GEMV (mmvq
         // design point - llama's own decode class; the exact-f32 GEMV measured
@@ -10001,7 +10001,7 @@ impl GpuQwen35 {
                             eps,
                             b * n_kv_heads,
                         )?;
-                        exec.mrope(
+                        exec.imrope(
                             &mut sc.d_qn,
                             &bs.d_mrope,
                             b,
@@ -10011,7 +10011,7 @@ impl GpuQwen35 {
                             yarn,
                             sections,
                         )?;
-                        exec.mrope(
+                        exec.imrope(
                             &mut sc.d_kn,
                             &bs.d_mrope,
                             b,

@@ -76,7 +76,7 @@ fn padded_attention_matches_independent_gpu_scan() {
     cmd.dispatch(
         "vis_attention_check",
         &[&q, &k, &v, &reference, &b],
-        &[],
+        &[72, 16, 80],
         [16, rows, 1],
         32,
     );

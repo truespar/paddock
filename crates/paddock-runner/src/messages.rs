@@ -43,8 +43,8 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::chat::{
-    ConstraintSpec, GateSpec, build_mm_chunks, content_gate, decode_images, find_images,
-    instantiate_constraint, no_forced_tool_grammar, safe_emit_len,
+    ConstraintSpec, GateSpec, build_mm_chunks, content_gate, find_images, instantiate_constraint,
+    no_forced_tool_grammar, safe_emit_len,
 };
 use crate::chat_template;
 use crate::constrained::ToolSet;
@@ -164,6 +164,7 @@ fn convert_messages(
     system: Option<&Value>,
     messages: &[Value],
     native: bool,
+    see_tool_images: bool,
 ) -> Result<Vec<Value>, String> {
     let mut msgs = Vec::new();
     if let Some(sys) = system {
@@ -233,7 +234,11 @@ fn convert_messages(
                         return Err("tool_result blocks belong in user messages".into());
                     }
                     let id = b.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
-                    let out = b.get("content").map(block_text).unwrap_or_default();
+                    let out = crate::tool_images::tool_content(
+                        b.get("content"),
+                        see_tool_images,
+                        image_part,
+                    )?;
                     msgs.push(json!({"role": "tool", "content": out, "tool_call_id": id}));
                 }
                 Some("tool_use") => {
@@ -513,7 +518,8 @@ fn render_prompt(
         .chat_template
         .as_deref()
         .ok_or("this model has no chat template")?;
-    let msgs = convert_messages(system, messages, model.late_system_native)?;
+    let see = model.supports_vision && model.tool_images;
+    let msgs = convert_messages(system, messages, model.late_system_native, see)?;
     // Extract before normalize_messages: convert_messages turns an
     // Anthropic `{"type":"image","source":{base64,media_type,data}}` block
     // into a chat image part, and normalize then rewrites every image part
@@ -552,7 +558,7 @@ fn render_prompt(
     // to Auto. That is deliberate: inventing one would put a paddock-only key
     // in a request shape the Anthropic SDKs validate, and `auto` is the same
     // conservative size this surface was already serving.
-    let images = decode_images(image_refs, model.engine.vision_budget())?;
+    let images = model.decode_images(image_refs)?;
     let mut msgs = chat_template::normalize_messages(&msgs);
     if let Some(marker) = model.audio_inline_marker.as_deref() {
         chat_template::inline_audio_content(&mut msgs, marker);
@@ -598,34 +604,12 @@ fn render_prompt(
     if let Some(e) = effort {
         kwargs = crate::chat::merge_reasoning_effort(&model.reasoning, e, kwargs)?;
     }
-    let kwargs = chat_template::family_defaults(&model.arch, kwargs);
+    let kwargs = model.template_defaults(kwargs);
 
-    // deepseek2-ocr instruction mapping  - same seam as chat and
-    // responses. This surface has no chat_template_kwargs channel, so the
-    // top-level `ocr` field is the only form here.
-    if ocr_req.is_some() && !model.ocr && !model.paddleocr {
-        return Err("the `ocr` request object is only served by document-parser models".into());
-    }
-    let ocr = if model.ocr {
-        let opts = ocr_req
-            .map(crate::deepseek_ocr::OcrOpts::parse)
-            .transpose()?;
-        let sizes: Vec<(usize, usize)> =
-            images.iter().map(crate::chat::RequestImage::size).collect();
-        let max_tiles = model
-            .engine
-            .vision_budget()
-            .map_or(0, |b| (b.max_pixels / (640 * 640)) as usize);
-        crate::deepseek_ocr::resolve(&mut msgs, opts, &sizes, max_tiles)?
-    } else if model.paddleocr {
-        let mode = ocr_req
-            .map(crate::paddle_ocr::parse_opts)
-            .transpose()?
-            .flatten();
-        crate::paddle_ocr::resolve(&mut msgs, mode, images.len())?
-    } else {
-        None
-    };
+    // document-parser instruction mapping - same seam as chat and responses.
+    // This surface has no chat_template_kwargs channel, so the top-level `ocr`
+    // field is the only form here.
+    let ocr = model.resolve_ocr(ocr_req, None, &mut msgs, &images)?;
 
     let mut prompt = chat_template::render_with_specials(
         template,
@@ -904,7 +888,7 @@ fn prepare(
     let dflt = sd.resolve(thinking_open);
     let sampler = SamplingParams {
         // document parsers default greedy - same rule as chat completions
-        temperature: req.temperature.unwrap_or(if model.document_parser {
+        temperature: req.temperature.unwrap_or(if model.greedy_default() {
             0.0
         } else {
             dflt.temp
@@ -922,7 +906,7 @@ fn prepare(
         // the Anthropic API has no logit_bias knob
         logit_bias: Vec::new(),
         // the OCR family's repetition guard (reference parity), off elsewhere
-        no_repeat_ngram: ocr.as_ref().map_or((0, 0), |o| o.ngram),
+        no_repeat_ngram: ocr.as_ref().map_or((0, 0, false), |o| o.guard()),
     };
     Ok(Prepared {
         prompt_ids,
@@ -1000,9 +984,9 @@ impl Ctx {
     /// The `ocr` extension object for this turn - the resolution echo plus
     /// grounded `regions` parsed from a decode that keeps special tokens
     /// (the markup rides on `<|ref|>`/`<|det|>` specials).
-    fn ocr_json(&self, ids: &[u32]) -> Option<Value> {
+    fn ocr_json(&self, ids: &[u32], finish: Option<FinishReason>) -> Option<Value> {
         let o = self.ocr.as_ref()?;
-        let mut echo = o.echo();
+        let mut echo = o.echo_at(finish);
         if let Ok(raw) = self.tokenizer.decode(ids, false)
             && let Some(regions) = crate::deepseek_ocr::regions_json(&raw)
         {
@@ -1614,6 +1598,7 @@ pub async fn handle(
         logprobs: None,
         submitted: None, // stamped by Engine::submit
         canvas_read: None,
+        user_turn: crate::user_turn::anthropic(&req.messages),
     };
     if let Err(e) = model.engine.submit(gen_req) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "api_error", e);
@@ -1752,16 +1737,16 @@ async fn collect_response(mut ctx: Ctx, mut rx: UnboundedReceiver<TokenEvent>) -
     if let Some(cm) = &ctx.context_management {
         body["context_management"] = cm.clone();
     }
-    if let Some(o) = ctx.ocr_json(&ids) {
+    if let Some(o) = ctx.ocr_json(&ids, finish) {
         body["ocr"] = o;
     }
     Json(body).into_response()
 }
 
 /// Streaming: the Anthropic event protocol. Thinking and text stream as
-/// deltas; tool_use blocks emit atomically on completion (one
-/// input_json_delta with the full arguments - fragmenting a non-JSON
-/// dialect's arguments is not prefix-stable, same policy as chat).
+/// deltas; a tool_use block opens when its name is known and its input
+/// streams as prefix-stable input_json_delta pieces while it is written
+/// (tool_stream; whole on completion where a dialect has no incremental reader).
 /// Anthropic `usage` for one generation: a prompt of `prompt_len` tokens,
 /// `cached` of them served from Paddock's prefix cache, `output` generated.
 ///
@@ -1822,8 +1807,10 @@ fn stream_response(mut ctx: Ctx, mut rx: UnboundedReceiver<TokenEvent>) -> Respo
             yield ev("content_block_stop", json!({"type": "content_block_stop", "index": index}));
             index += 1;
         }
-        let mut think_open = false;
-        let mut text_open = false;
+        // blocks open in generation order; tool calls stream their input as
+        // it is written (tool_stream), not whole at the end of the turn
+        let mut blocks = crate::messages_blocks::AnthBlocks::new(index, ctx.omit_thinking);
+        let mut tools = crate::tool_stream::ToolStream::default();
         let mut think_emitted = 0usize;
         let mut text_emitted = 0usize;
         let mut ids: Vec<u32> = Vec::new();
@@ -1848,55 +1835,26 @@ fn stream_response(mut ctx: Ctx, mut rx: UnboundedReceiver<TokenEvent>) -> Respo
                     if let Some(reasoning) = &parsed.reasoning {
                         let safe = safe_emit_len(reasoning, ctx.dialect.reasoning_markers(), &[]);
                         if safe > think_emitted {
-                            if !think_open {
-                                think_open = true;
-                                yield ev("content_block_start", json!({
-                                    "type": "content_block_start", "index": index,
-                                    "content_block": {"type": "thinking", "thinking": "", "signature": ""}}));
-                            }
-                            let delta = reasoning[think_emitted..safe].to_owned();
+                            for (n, d) in blocks.thinking(&reasoning[think_emitted..safe]) { yield ev(n, d); }
                             think_emitted = safe;
-                            // display "omitted": the block opens and closes,
-                            // but no thinking text goes over the wire
-                            if !ctx.omit_thinking {
-                                yield ev("content_block_delta", json!({
-                                    "type": "content_block_delta", "index": index,
-                                    "delta": {"type": "thinking_delta", "thinking": delta}}));
-                            }
                         }
                     }
-
+                    let mut hit = false;
                     if let Some(content) = &parsed.content {
-                        let (cut, hit) = match find_stop(content, &ctx.stop_strings) {
-                            Some((i, _)) => (i, true),
-                            None => (
-                                safe_emit_len(content, ctx.dialect.content_markers(), &ctx.stop_strings),
-                                false,
-                            ),
+                        let cut = match find_stop(content, &ctx.stop_strings) {
+                            Some((i, _)) => { hit = true; i }
+                            None => safe_emit_len(content, ctx.dialect.content_markers(), &ctx.stop_strings),
                         };
-                        if cut > text_emitted || hit {
-                            if think_open && !text_open {
-                                yield ev("content_block_stop", json!({
-                                    "type": "content_block_stop", "index": index}));
-                                index += 1;
-                            }
-                            if !text_open {
-                                text_open = true;
-                                yield ev("content_block_start", json!({
-                                    "type": "content_block_start", "index": index,
-                                    "content_block": {"type": "text", "text": ""}}));
-                            }
-                            if cut > text_emitted {
-                                let delta = content[text_emitted..cut].to_owned();
-                                text_emitted = cut;
-                                yield ev("content_block_delta", json!({
-                                    "type": "content_block_delta", "index": index,
-                                    "delta": {"type": "text_delta", "text": delta}}));
-                            }
+                        if cut > text_emitted {
+                            for (n, d) in blocks.text(&content[text_emitted..cut]) { yield ev(n, d); }
+                            text_emitted = cut;
                         }
-                        if hit {
-                            break;
-                        }
+                    }
+                    if hit {
+                        break;
+                    }
+                    for e in tools.step(ctx.dialect, &raw, ctx.thinking_open, ctx.hints.as_ref(), ctx.single_tool_call, &parsed) {
+                        for (n, d) in blocks.tool(e) { yield ev(n, d); }
                     }
                 }
                 Some(TokenEvent::Done(r, stats)) => { finish = Some(r); terminal_tokens = stats.terminal_tokens(); ctx.scope.phases(&stats); break }
@@ -1911,29 +1869,20 @@ fn stream_response(mut ctx: Ctx, mut rx: UnboundedReceiver<TokenEvent>) -> Respo
 
         let parsed = ctx.parse(&ids);
         let (_, stop_reason, stop_seq) = finish_blocks(&ctx, &parsed, finish);
-
-        // close whichever streaming block is open
-        if think_open && !text_open {
-            yield ev("content_block_stop", json!({"type": "content_block_stop", "index": index}));
-            index += 1;
+        // what the marker/stop-string holdback kept mid-stream is plain text
+        // at end of turn - the non-streaming body has it, so the stream must
+        if let Some(r) = parsed.reasoning.as_deref().filter(|r| r.is_char_boundary(think_emitted.min(r.len()))) {
+            for (n, d) in blocks.thinking(r.get(think_emitted..).unwrap_or("")) { yield ev(n, d); }
         }
-        if text_open {
-            yield ev("content_block_stop", json!({"type": "content_block_stop", "index": index}));
-            index += 1;
+        if let Some(c) = parsed.content.as_deref().filter(|c| c.is_char_boundary(text_emitted.min(c.len()))) {
+            let end = find_stop(c, &ctx.stop_strings).map_or(c.len(), |(i, _)| i);
+            for (n, d) in blocks.text(c.get(text_emitted..end).unwrap_or("")) { yield ev(n, d); }
         }
-
-        // tool_use blocks, atomically
-        for tc in &parsed.tool_calls {
-            let id = format!("toolu_{}", uuid::Uuid::new_v4().simple());
-            yield ev("content_block_start", json!({
-                "type": "content_block_start", "index": index,
-                "content_block": {"type": "tool_use", "id": id, "name": tc.name, "input": {}}}));
-            yield ev("content_block_delta", json!({
-                "type": "content_block_delta", "index": index,
-                "delta": {"type": "input_json_delta", "partial_json": tc.arguments}}));
-            yield ev("content_block_stop", json!({"type": "content_block_stop", "index": index}));
-            index += 1;
+        // the calls still open (a block cut by max_tokens) or never started
+        for e in tools.finish(&parsed) {
+            for (n, d) in blocks.tool(e) { yield ev(n, d); }
         }
+        for (n, d) in blocks.close() { yield ev(n, d); }
 
         let output_tokens = ids.len() + terminal_tokens;
         ctx.scope.usage(ctx.prompt_len, output_tokens);
@@ -1963,7 +1912,7 @@ fn stream_response(mut ctx: Ctx, mut rx: UnboundedReceiver<TokenEvent>) -> Respo
             // event in streams, same shape as the non-streaming body
             delta_ev["context_management"] = cm.clone();
         }
-        if let Some(o) = ctx.ocr_json(&ids) {
+        if let Some(o) = ctx.ocr_json(&ids, finish) {
             delta_ev["ocr"] = o;
         }
         yield ev("message_delta", delta_ev);
@@ -2069,7 +2018,7 @@ async fn anth_summary_pass(
         frequency_penalty: 0.0,
         seed: state.sampling.seed_or_now(req.seed),
         logit_bias: Vec::new(),
-        no_repeat_ngram: (0, 0),
+        no_repeat_ngram: (0, 0, false),
     };
     // bounded: a summary, not an essay (the pass is billed via usage.iterations)
     let max1 = state.max_output_ceiling.map_or(4096, |c| c.min(4096));
@@ -2085,6 +2034,7 @@ async fn anth_summary_pass(
         logprobs: None,
         submitted: None, // stamped by Engine::submit
         canvas_read: None,
+        user_turn: false,
     };
     if let Err(e) = model.engine.submit(gen1) {
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "api_error", e));
@@ -2385,6 +2335,7 @@ async fn run_compacting(
         logprobs: None,
         submitted: None, // stamped by Engine::submit
         canvas_read: None,
+        user_turn: false,
     };
     if let Err(e) = model.engine.submit(gen2) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "api_error", e);
@@ -3170,6 +3121,7 @@ async fn run_mcp_agent(
             logprobs: None,
             submitted: None, // stamped by Engine::submit
             canvas_read: None,
+            user_turn: false,
         };
         if let Err(e) = model.engine.submit(gen_req) {
             return err(StatusCode::INTERNAL_SERVER_ERROR, "api_error", e);
@@ -3679,7 +3631,7 @@ fn stream_mcp_agent(
             let gen_req = GenRequest {
                 prompt: prepared.engine_prompt, max_tokens: prepared.max_tokens, sampler: prepared.sampler,
                 stop_tokens: prepared.stop_tokens, events: tx, mm_chunks: prepared.mm_chunks, constraint, logprobs: None,
-                submitted: None, canvas_read: None };
+                submitted: None, canvas_read: None, user_turn: false };
             if let Err(e) = model.engine.submit(gen_req) {
                 yield ev("error", json!({"type":"error","error":{"type":"api_error","message":e}}));
                 return;
@@ -3959,8 +3911,8 @@ fn stream_mcp_agent(
 /// sent whenever the stream has been silent for 15 s.
 ///
 /// A stream can be silent for minutes while the model works - a cold prefill
-/// of a long prompt (173K tokens took 309 s on the Spark), a tool call being
-/// generated (it is emitted whole, on completion) - and clients abort a
+/// of a long prompt (173K tokens took 309 s on the Spark), a non-JSON tool
+/// value being coerced, a dialect that sends calls whole - and clients abort a
 /// silent stream: Claude Code's idle watchdog (CLAUDE_STREAM_IDLE_TIMEOUT_MS,
 /// 300 s) hung up on exactly that prefill and paid for a retry. Anthropic's
 /// own streams carry `ping` events for this ("event streams may also include
@@ -4504,6 +4456,27 @@ mod tests {
         ]
     }
 
+    /// A picture an agent's Read returned rides its tool reply into the
+    /// template as a picture slot (it used to be cut to the reply's text).
+    #[test]
+    fn a_read_picture_reaches_qwen38_in_its_tool_reply() {
+        let qwen = include_str!("../tests/fixtures/qwen38_chat_template.jinja");
+        let mut h = tool_loop_history();
+        h[2]["content"][0]["content"] = json!([{"type": "image", "source": {"type": "base64",
+            "media_type": "image/png", "data": "iVBORw0KGgo="}}]);
+        let converted = convert_messages(None, &h, false, true).expect("convert");
+        assert_eq!(find_images(&converted).expect("images").len(), 1);
+        let msgs = crate::chat_template::normalize_messages(&converted);
+        let out = crate::chat_template::render(qwen, &msgs, None, None).expect("render");
+        assert!(
+            out.contains("<tool_response>\n<|vision_start|><|image_pad|><|vision_end|>"),
+            "{out}"
+        );
+        assert!(crate::chat_template::renders_tool_images(qwen));
+        let gemma = include_str!("../tests/fixtures/gemma4_chat_template.jinja");
+        assert!(!crate::chat_template::renders_tool_images(gemma));
+    }
+
     /// An Anthropic caller's prior thinking has to reach the template the way
     /// a chat-completions caller's `reasoning_content` does. It didn't: the
     /// conversion wrote `thinking`, which only gpt-oss reads, so Qwen3.8 - whose
@@ -4513,7 +4486,8 @@ mod tests {
     #[test]
     fn anthropic_thinking_renders_on_qwen38_like_chat_reasoning_content() {
         let qwen = include_str!("../tests/fixtures/qwen38_chat_template.jinja");
-        let converted = convert_messages(None, &tool_loop_history(), false).expect("convert");
+        let converted =
+            convert_messages(None, &tool_loop_history(), false, false).expect("convert");
         let msgs = crate::chat_template::normalize_messages(&converted);
         let out = crate::chat_template::render(qwen, &msgs, None, None).expect("render");
         assert!(
@@ -4549,7 +4523,8 @@ mod tests {
     #[test]
     fn anthropic_tool_loop_renders_on_gpt_oss() {
         let gptoss = include_str!("../tests/fixtures/gptoss_chat_template.jinja");
-        let converted = convert_messages(None, &tool_loop_history(), false).expect("convert");
+        let converted =
+            convert_messages(None, &tool_loop_history(), false, false).expect("convert");
         let msgs = crate::chat_template::normalize_messages(&converted);
         let out = crate::chat_template::render(gptoss, &msgs, None, None).expect("render");
         assert!(
@@ -4559,7 +4534,7 @@ mod tests {
 
         let mut quiet = tool_loop_history();
         quiet[1]["content"].as_array_mut().unwrap().remove(1); // drop the text block
-        let converted = convert_messages(None, &quiet, false).expect("convert");
+        let converted = convert_messages(None, &quiet, false, false).expect("convert");
         let msgs = crate::chat_template::normalize_messages(&converted);
         let out = crate::chat_template::render(gptoss, &msgs, None, None).expect("render");
         assert!(
@@ -4600,7 +4575,7 @@ mod tests {
                 {"type": "text", "text": "What is this?"}
             ]
         })];
-        let converted = convert_messages(None, &anthropic, false).expect("convert");
+        let converted = convert_messages(None, &anthropic, false, false).expect("convert");
         // the pixels have to still be reachable after conversion - this is the
         // ordering the surface got wrong (convert -> extract -> normalize)
         let urls = crate::chat::find_images(&converted).expect("find");
@@ -4645,7 +4620,7 @@ mod tests {
                 {"type": "text", "text": "<chart2csv>"}
             ]
         })];
-        let converted = convert_messages(None, &anthropic, false).expect("convert");
+        let converted = convert_messages(None, &anthropic, false, false).expect("convert");
         let msgs = crate::chat_template::normalize_messages(&converted);
         let out =
             crate::chat_template::render(granite_template(), &msgs, None, None).expect("render");
@@ -4725,7 +4700,7 @@ mod tests {
                 {"type": "text", "text": "thanks"},
             ]}),
         ];
-        let out = convert_messages(Some(&json!("sys")), &messages, false).unwrap();
+        let out = convert_messages(Some(&json!("sys")), &messages, false, false).unwrap();
         assert_eq!(out[0]["role"], "system");
         assert_eq!(out[1]["content"], "hi");
         assert_eq!(out[2]["role"], "assistant");
@@ -4750,7 +4725,7 @@ mod tests {
                 {"type": "text", "text": "# Environment", "cache_control": {"type": "ephemeral"}},
             ]}),
         ];
-        let out = convert_messages(Some(&json!("sys")), &messages, false).unwrap();
+        let out = convert_messages(Some(&json!("sys")), &messages, false, false).unwrap();
         assert_eq!(out.len(), 2, "no system turn past the first");
         assert_eq!(out[0]["content"], "sys");
         assert_eq!(out[1]["role"], "user");
@@ -4776,8 +4751,8 @@ mod tests {
         ];
         let mut with = head.clone();
         with.push(json!({"role": "system", "content": "tests are flaky here"}));
-        let base = convert_messages(None, &head, false).unwrap();
-        let out = convert_messages(None, &with, false).unwrap();
+        let base = convert_messages(None, &head, false, false).unwrap();
+        let out = convert_messages(None, &with, false, false).unwrap();
         assert_eq!(out[..base.len()], base[..]);
         assert_eq!(out.len(), base.len() + 1);
         assert_eq!(out[base.len()]["role"], "user");
@@ -4802,7 +4777,7 @@ mod tests {
             json!({"role": "system", "content": "x"}),
             json!({"role": "user", "content": "hi"}),
         ];
-        let e = convert_messages(None, &first, false).unwrap_err();
+        let e = convert_messages(None, &first, false, false).unwrap_err();
         assert!(e.contains("must follow a user message"), "{e}");
     }
 
@@ -4812,7 +4787,7 @@ mod tests {
             {"type": "text", "text": "what is this?"},
             {"type": "image", "source": {"type": "base64", "media_type": "image/bmp", "data": "AAAA"}},
         ]})];
-        let out = convert_messages(None, &messages, false).unwrap();
+        let out = convert_messages(None, &messages, false, false).unwrap();
         assert!(out[0]["content"].is_array());
         let urls = crate::chat::find_images(&out).unwrap();
         assert_eq!(

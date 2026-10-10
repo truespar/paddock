@@ -133,9 +133,9 @@ impl GpuQwen35 {
     /// - M-RoPE: text rows use the sequential llama-position on all four axes;
     ///   image rows share t = the running cursor and vary h/w over the merged grid;
     /// - the llama-position after each image advances by max(grid_x, grid_y);
-    /// - the causal mask compares llama-positions, so all rows of one image
-    ///   (equal t) see each other - emulated on our row-indexed KV by setting
-    ///   each image row's attention bound to that image block's last row.
+    /// - attention stays causal by row, image rows included (raster order -
+    ///   equal t is a shared rotary coordinate, not a visibility group; see
+    ///   `build_mm_layout`).
     ///   Returns the last row's logits; decode continues incrementally.
     pub fn prefill_multimodal(
         &mut self,
@@ -143,7 +143,7 @@ impl GpuQwen35 {
         images: &[super::pictures::Picture],
     ) -> Result<Vec<f32>, GpuModelError> {
         // token ids (image spans are `0` placeholders, overwritten by the vision
-        // embeddings below), the mRoPE grid, and the equal-t image visibility
+        // embeddings below), the mRoPE grid, and the per-row causal
         // bound - one ordered walk over the chunks, any number of images.
         let grids: Vec<(usize, usize)> = images.iter().map(|v| (v.nx, v.ny)).collect();
         let MmLayout {
@@ -198,7 +198,7 @@ impl GpuQwen35 {
 
         let sinks = &self.sinks;
         let layers = &self.layers;
-        let tok_embd = &self.tok_embd;
+        let tok_embd = self.tok_embd.src(&self.output);
         let rot = self.rot.as_ref();
         let bs_f8ffn_p = &self.bs_f8ffn;
         let bs_f8row_p = &self.bs_f8row_ffn;
@@ -338,7 +338,7 @@ impl GpuQwen35 {
                         eps,
                         r * n_kv_heads,
                     )?;
-                    exec.mrope(
+                    exec.imrope(
                         &mut sc.d_qn,
                         &d_mrope,
                         r,
@@ -348,7 +348,7 @@ impl GpuQwen35 {
                         yarn,
                         sections,
                     )?;
-                    exec.mrope(
+                    exec.imrope(
                         &mut sc.d_kn,
                         &d_mrope,
                         r,

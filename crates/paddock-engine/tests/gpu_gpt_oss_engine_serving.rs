@@ -101,6 +101,7 @@ fn engine_scheduler_specs_gpt_oss() {
                     logprobs: None,
                     submitted: None,
                     canvas_read: None,
+                    user_turn: false,
                 })
                 .expect("submit");
             rxs.push(rx);
@@ -123,6 +124,7 @@ fn engine_scheduler_specs_gpt_oss() {
                     logprobs: None,
                     submitted: None,
                     canvas_read: None,
+                    user_turn: false,
                 })
                 .expect("submit temp");
             temp_rx = Some(rx);

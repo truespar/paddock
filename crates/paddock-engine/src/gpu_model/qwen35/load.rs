@@ -447,8 +447,15 @@ impl GpuQwen35 {
         let sections = read_sections(map)?;
         let rope_base = f("rope.freq_base").unwrap_or(1e7);
         let ctx_train = u("context_length").unwrap_or(max_ctx as u64) as usize;
-        // ext_factor 0 => plain (no YaRN) rope; multimodal sectioning happens in
-        // the mrope kernel from `sections`, not here.
+        // ext_factor 0 => plain (no YaRN) rope. The multimodal sections are
+        // INTERLEAVED (HF `mrope_interleaved`, llama.cpp ROPE_TYPE_IMROPE for
+        // qwen35/qwen35moe): every rotary call on this lane is `imrope`, and the
+        // kernel takes `sections` from here. Until 2026-10-09 the lane called the
+        // contiguous `mrope` - invisible to every text gate (t == h == w rotates
+        // the same either way) and to short image answers, but it handed image
+        // rows' row/column positions to the wrong rotary pairs, and
+        // LightOnOCR-3's grounding boxes came out wrong against a reference
+        // ~9 nats sure of them.
         let yarn_params =
             YarnRope::new(n_rot, rope_base, 1.0, ctx_train, 0.0, 1.0, 32.0, 1.0).kernel_params();
 
@@ -493,7 +500,20 @@ impl GpuQwen35 {
             .tensor_info("token_embd.weight")
             .map(|t| t.ggml_type)
             .ok_or_else(|| GpuModelError::MissingMeta("token_embd.weight".into()))?;
-        let (tok_embd, vocab) = if crate::gpu::kq_params(te_ty).is_some() {
+        let te_kq = crate::gpu::kq_params(te_ty).is_some();
+        // A TIED file (no `output.weight`) loads this matrix again as the LM
+        // head below, so the gather reads the head's repacked plane instead of
+        // a second resident copy. Needs slot 832 for a Q8_0 head; an older
+        // pack keeps the two copies it always had.
+        let tied = map.tensor_info("output.weight").is_none()
+            && (te_kq || te_ty == GgmlType::Q8_0)
+            && exec.has_embed_gather_q8r();
+        let (tok_embd, vocab) = if tied {
+            let info = map
+                .tensor_info("token_embd.weight")
+                .ok_or_else(|| GpuModelError::MissingMeta("token_embd.weight".into()))?;
+            (TokEmbd::Tied, info.dims[1] as usize)
+        } else if te_kq {
             let t = exec.repack_kquant(map, "token_embd.weight")?;
             let vocab = t.dims[1];
             (TokEmbd::Kq(t), vocab)
@@ -695,7 +715,7 @@ impl GpuQwen35 {
         // against the real `kq_resident` after the loop and a disagreement is
         // a hard load error, not a debug_assert (release strips those, and
         // this seam has already shipped one silent corruption that way).
-        let kq_early = matches!(&tok_embd, TokEmbd::Kq(_))
+        let kq_early = te_kq
             || map
                 .tensor_infos()
                 .any(|t| crate::gpu::kq_params(t.ggml_type).is_some())
@@ -1829,7 +1849,7 @@ impl GpuQwen35 {
         // per-pass dequant-scratch size. Head/embedding excluded from the max
         // (never dequanted whole - GEMV/gather only).
         let mut kq_max_elems = 0usize;
-        let mut kq_resident = matches!(&tok_embd, TokEmbd::Kq(_));
+        let mut kq_resident = te_kq && !tied;
         fn note_kq(w: &QuantW, resident: &mut bool, max_elems: &mut usize) {
             if let Some(k) = w.kq() {
                 *resident = true;
@@ -2068,11 +2088,18 @@ impl GpuQwen35 {
         // - the class change is labeled, b=1 parity surfaces stay
         // Q8_0-exact via the existing row gates. Costs one duplicate f8
         // plane (vocab x embd bytes, 1.27 GB at 248320x5120).
+        // A TIED file builds none by default: its one Q8_0 plane already
+        // serves the token gather (`TokEmbd::Tied`), so the e4m3 twin is a
+        // second copy of the matrix, and it bought nothing - LightOnOCR-3
+        // 4B / 0.8B on GB10 at 1/8/64 pages in flight ran within +-3% either
+        // way, held 0.70 / 0.31 GB more, and tipped near-tie pages off the
+        // Q8_0 (reference) transcript (2026-10-09). The opt-in still builds it.
         let out_f8 = if paddock_models::dev_var_os!("PADDOCK_NO_F8_LMHEAD").is_none()
             && (paddock_models::dev_var_os!("PADDOCK_F8_LMHEAD").is_some()
-                || f8t_ffn_enabled(&exec)
-                || fp8_native.is_some()
-                || exec.has_f8d_gemm_mma_ks())
+                || (!tied
+                    && (f8t_ffn_enabled(&exec)
+                        || fp8_native.is_some()
+                        || exec.has_f8d_gemm_mma_ks())))
         {
             match &output {
                 QuantW::Q8(q8) => (|| {
@@ -2212,7 +2239,14 @@ impl GpuQwen35 {
         // above and the f8t sites read it, not the Q8 head, but the tile lane
         // is only elected at b <= 64 so the Q8 head is still its fallback.
         // Nothing is dropped where f8t is live.
-        if let (Some(_), true, None) = (out_f8.as_ref(), f8_head_min() <= 1, out_f8t.as_ref())
+        //
+        // A TIED file keeps it too: its token gather reads this very plane
+        // (`TokEmbd::Tied`), so dropping it would leave the gather a 32-byte
+        // stub. By default a tied file builds no e4m3 head at all (see the
+        // election above), so this plane is its one copy of the matrix and
+        // its head on every die; only the opt-in adds the twin.
+        if let (Some(_), true, None, false) =
+            (out_f8.as_ref(), f8_head_min() <= 1, out_f8t.as_ref(), tied)
             && let QuantW::Q8(q) = &mut output
         {
             let freed = (q.data.len() + q.scale.len()) as u64;
@@ -2871,6 +2905,7 @@ impl GpuQwen35 {
                 (2 * super::chunk_tick_rows() * embd * std::mem::size_of::<f32>()) as u64,
             ),
             mm_steps: std::collections::VecDeque::new(),
+            page_reader: false,
             pipe: None,
         })
     }

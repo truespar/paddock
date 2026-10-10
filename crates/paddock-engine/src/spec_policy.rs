@@ -696,6 +696,65 @@ impl SpecController {
     }
 }
 
+/// Per-position draft acceptance, behind `PADDOCK_SPEC_DEBUG`.
+///
+/// The aggregate "N drafted, M accepted" hides the shape, and the shape is
+/// what says which thing is wrong. A head whose weights are off is weak
+/// everywhere (0.50/0.42/0.38); a head whose chaining is off is strong at
+/// position 0 and collapses after (0.80/0.30/0.10), because each further
+/// draft rides state the previous one produced. The published references for
+/// this family quote exactly this curve - Mia's 0.80/0.59/0.41 -> 2.80 of 4 -
+/// so it is also the only form in which our number can be compared to theirs.
+///
+/// A round that drafted `d` and committed a run of `a` accepted drafts means:
+/// positions 0..a were reached and accepted, position `a` was reached and
+/// rejected (when a < d). So position i's rate is
+/// `reached_and_accepted[i] / reached[i]`.
+pub(crate) fn spec_pos_census(drafted: usize, accepted: usize) {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_SPEC_DEBUG").is_some()) {
+        return;
+    }
+    const K: usize = 16;
+    static REACHED: [AtomicU64; K] = [const { AtomicU64::new(0) }; K];
+    static ACCEPT: [AtomicU64; K] = [const { AtomicU64::new(0) }; K];
+    static ROUNDS: AtomicU64 = AtomicU64::new(0);
+    static TOKENS: AtomicU64 = AtomicU64::new(0);
+    static DRAFTED: AtomicU64 = AtomicU64::new(0);
+    for i in 0..drafted.min(K) {
+        REACHED[i].fetch_add(1, Relaxed);
+        if i < accepted {
+            ACCEPT[i].fetch_add(1, Relaxed);
+        }
+    }
+    DRAFTED.fetch_add(drafted as u64, Relaxed);
+    TOKENS.fetch_add(accepted as u64 + 1, Relaxed);
+    let r = ROUNDS.fetch_add(1, Relaxed) + 1;
+    if r.is_multiple_of(200) {
+        let mut curve = String::new();
+        for i in 0..K {
+            let n = REACHED[i].load(Relaxed);
+            if n == 0 {
+                break;
+            }
+            if i > 0 {
+                curve.push('/');
+            }
+            curve.push_str(&format!("{:.2}", ACCEPT[i].load(Relaxed) as f64 / n as f64));
+        }
+        let (d, t) = (DRAFTED.load(Relaxed) as f64, TOKENS.load(Relaxed) as f64);
+        tracing::info!(
+            "[spec-pos] rounds {r} per-position {curve} | overall {:.1}% of drafts, \
+             {:.2} tokens a round ({:.2} drafted)",
+            100.0 * (t - r as f64) / d,
+            t / r as f64,
+            d / r as f64,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

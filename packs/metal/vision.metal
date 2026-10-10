@@ -28,13 +28,13 @@ kernel void vis_attention_check(device const half* q [[buffer(0)]],device const 
                                 device const half* v [[buffer(2)]],device float* out [[buffer(3)]],
                                 device const uint2* bounds [[buffer(4)]],constant uint* p [[buffer(5)]],
                                 uint2 g [[threadgroup_position_in_grid]],uint lane [[thread_index_in_simdgroup]]) {
-    uint row=g.y,h=g.x;float acc[3]={0,0,0},maximum=-INFINITY,den=0;
+    uint row=g.y,h=g.x,hd=p[0],heads=p[1],pad=p[2];float acc[3]={0,0,0},maximum=-INFINITY,den=0;
     for(uint t=bounds[row].x;t<bounds[row].y;++t) {
-        float score=0;for(uint d=lane;d<72;d+=32)score+=float(q[(ulong(row)*16+h)*80+d])*float(k[(ulong(t)*16+h)*80+d]);
-        score=simd_sum(score)*0.1178511301977579f;float next=max(score,maximum),old=exp(maximum-next),pr=exp(score-next);den=den*old+pr;maximum=next;
-        for(uint j=0;j<3;++j){uint d=lane+j*32;if(d<72)acc[j]=acc[j]*old+pr*float(v[(ulong(t)*16+h)*80+d]);}
+        float score=0;for(uint d=lane;d<hd;d+=32)score+=float(q[(ulong(row)*heads+h)*pad+d])*float(k[(ulong(t)*heads+h)*pad+d]);
+        score=simd_sum(score)/sqrt(float(hd));float next=max(score,maximum),old=exp(maximum-next),pr=exp(score-next);den=den*old+pr;maximum=next;
+        for(uint j=0;j<3;++j){uint d=lane+j*32;if(d<hd)acc[j]=acc[j]*old+pr*float(v[(ulong(t)*heads+h)*pad+d]);}
     }
-    for(uint j=0;j<3;++j){uint d=lane+j*32;if(d<72)out[(ulong(row)*16+h)*72+d]=acc[j]/den;}
+    for(uint j=0;j<3;++j){uint d=lane+j*32;if(d<hd)out[(ulong(row)*heads+h)*hd+d]=acc[j]/den;}
 }
 
 inline float vis_gelu(float x) {
@@ -174,6 +174,32 @@ kernel void vis_qkv(device const float* x [[buffer(0)]],device const uint2* xy [
     q[i]=half(qv);k[i]=half(kv);v[i]=half(vv);
 }
 
+// The smaller LightOn/Qwen towers have head64 and need no padded channels.
+// Specialize the head count so addressing/division is compile-time constant.
+template<uint Heads>
+inline void vis_qkv64_impl(device const float* x,device const uint2* xy,
+                          device half* q,device half* k,device half* v,
+                          constant uint* p,uint i) {
+    uint row=i/(Heads*64),h=i/64%Heads,d=i%64;if(row>=p[0]+64)return;
+    float qv=0,kv=0,vv=0;
+    if(row<p[0]) {
+        ulong src=ulong(row)*Heads*64*3+h*64;uint pair=d%32,other=(d+32)%64;
+        float theta=float(pair<16?xy[row].y:xy[row].x)*pow(10000.0f,-float(pair%16)/16.0f);
+        float cs=cos(theta),sn=sin(theta)*(d<32?-1.0f:1.0f);
+        qv=x[src+d]*cs+x[src+other]*sn;
+        kv=x[src+Heads*64+d]*cs+x[src+Heads*64+other]*sn;
+        vv=x[src+Heads*128+d];
+    }
+    q[i]=half(qv);k[i]=half(kv);v[i]=half(vv);
+}
+#define VIS_QKV64(HEADS) \
+kernel void vis_qkv64_##HEADS(device const float* x [[buffer(0)]],device const uint2* xy [[buffer(1)]], \
+device half* q [[buffer(2)]],device half* k [[buffer(3)]],device half* v [[buffer(4)]], \
+constant uint* p [[buffer(5)]],uint i [[thread_position_in_grid]]) {vis_qkv64_impl<HEADS>(x,xy,q,k,v,p,i);}
+VIS_QKV64(12)
+VIS_QKV64(16)
+#undef VIS_QKV64
+
 // Each tile is (first query,count,image first,image length). Ragged images
 // share projections but never an attention domain. Unnormalized output stays
 // in cooperative registers until the final division, not in device memory.
@@ -298,3 +324,13 @@ vis_attention_impl<GEMMA>(q,k,v,out,tiles,p,g,tid,correction,normalizer,remap); 
 VIS_ATTN(vis_attention,false)
 VIS_ATTN(gv_attention,true)
 #undef VIS_ATTN
+
+#define VIS_ATTN64(HEADS) \
+kernel void vis_attention64_##HEADS(device half* q [[buffer(0)]],device half* k [[buffer(1)]],device half* v [[buffer(2)]], \
+device ushort* out [[buffer(3)]],device const uint4* tiles [[buffer(4)]],constant uint* p [[buffer(5)]], \
+uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) { \
+threadgroup float correction[32],normalizer[32],remap[32*64]; \
+vis_attention_impl<false,64,64,HEADS>(q,k,v,out,tiles,p,g,tid,correction,normalizer,remap); }
+VIS_ATTN64(12)
+VIS_ATTN64(16)
+#undef VIS_ATTN64

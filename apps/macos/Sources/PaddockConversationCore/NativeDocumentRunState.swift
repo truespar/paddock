@@ -139,10 +139,12 @@ struct NativeDocumentRunState: Sendable {
             }
           })
       }
-      return .object([
+      var region: O = [
         "label": .string(label), "text": .string(value["text"]?.string ?? ""),
         "boxes": coordinates("boxes", count: 4), "quads": coordinates("quads", count: 8),
-      ])
+      ]
+      if value["continues"]?.bool == true { region["continues"] = .bool(true) }
+      return .object(region)
     }
   }
   static func recover(_ message: O) -> O {

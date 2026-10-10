@@ -42,8 +42,13 @@ pub struct PdfConfig {
     /// `truncated = true` (callers surface "N of M pages" - never silent).
     pub max_pages: usize,
     /// Target long-edge (px) per page; per-page DPI derived from it, capped at
-    /// 300. 1568 matches the Qwen vision sweet spot.
+    /// `max_dpi`. 1568 matches the Qwen vision sweet spot.
     pub long_edge: u32,
+    /// The DPI ceiling that keeps an odd tiny page from rendering huge - 300
+    /// unless the serving checkpoint was trained on pages rendered to a fixed
+    /// edge whatever their size (LightOnOCR-3), which lifts it. The pdfium
+    /// path honours it; the macOS PDFKit path keeps its own 300.
+    pub max_dpi: f32,
 }
 
 impl PdfConfig {
@@ -51,6 +56,7 @@ impl PdfConfig {
         Self {
             max_pages: cfg.pdf_max_pages,
             long_edge: cfg.pdf_page_long_edge,
+            max_dpi: 300.0,
         }
     }
 }
@@ -263,8 +269,9 @@ pub(crate) fn render(bytes: &[u8], cfg: &PdfConfig, sel: PageSel) -> Result<Rend
             .page_size(idx)
             .ok_or_else(|| PdfError::Render(idx, "page not found".into()))?;
         let long_pts = pw.max(ph);
-        // pixels = points * dpi/72; DPI capped at 300 to bound odd tiny-page PDFs.
-        let dpi = ((cfg.long_edge as f32) / long_pts * 72.0).min(300.0);
+        // pixels = points * dpi/72; DPI capped (300 by default) to bound odd
+        // tiny-page PDFs.
+        let dpi = ((cfg.long_edge as f32) / long_pts * 72.0).min(cfg.max_dpi);
         // interleaved RGB8 straight to the engine's image shape - no PNG hop
         let bitmap = doc
             .render(
@@ -616,6 +623,7 @@ mod tests {
         let cfg = PdfConfig {
             max_pages: 1,
             long_edge: 512,
+            max_dpi: 300.0,
         };
         assert!(!available(&cfg));
         assert!(matches!(
@@ -665,6 +673,7 @@ mod tests {
         let cfg = PdfConfig {
             max_pages: 2,
             long_edge: 256,
+            max_dpi: 300.0,
         };
         // 3 portrait pages (200×300 pts) with a 2-page cap
         let out = render(&tiny_pdf(3, 200, 300), &cfg, PageSel::All).expect("render");
@@ -686,6 +695,7 @@ mod tests {
         let cfg = PdfConfig {
             max_pages: 20,
             long_edge: 512,
+            max_dpi: 300.0,
         };
         let out = render(&tiny_pdf(1, 300, 200), &cfg, PageSel::All).expect("render");
         assert_eq!(out.total_pages, 1);
@@ -716,6 +726,7 @@ mod tests {
         let cfg = PdfConfig {
             max_pages: 4,
             long_edge: 792, // 1:1 with the 612x792 page, so PDF units == pixels
+            max_dpi: 300.0,
         };
         // Drawn at (72, 720) in PDF space: 1 inch in from the left, and 720 up
         // from the BOTTOM, so it lands near the top-left of the raster.
@@ -769,6 +780,7 @@ mod tests {
         let cfg = PdfConfig {
             max_pages: 4,
             long_edge: 512,
+            max_dpi: 300.0,
         };
         assert!(matches!(
             render(b"%PDF-1.4", &cfg, PageSel::All),
@@ -817,6 +829,7 @@ mod tests {
         let cfg = PdfConfig {
             max_pages: 2,
             long_edge: 256,
+            max_dpi: 300.0,
         };
         let uri = pdf_data_uri(&tiny_pdf(3, 200, 300));
         let messages = vec![json!({
@@ -867,6 +880,7 @@ mod tests {
         let cfg = PdfConfig {
             max_pages: 4,
             long_edge: 256,
+            max_dpi: 300.0,
         };
         let uri = pdf_data_uri(&tiny_pdf(3, 200, 300));
         let messages = vec![json!({
@@ -905,6 +919,7 @@ mod tests {
         let tight = PdfConfig {
             max_pages: 2,
             long_edge: 256,
+            max_dpi: 300.0,
         };
         let uri = pdf_data_uri(&tiny_pdf(3, 200, 300));
         let messages = vec![json!({
@@ -945,6 +960,7 @@ mod tests {
         let cfg = PdfConfig {
             max_pages: 4,
             long_edge: 512,
+            max_dpi: 300.0,
         };
         let messages = vec![json!({"role":"user","content":[{"type":"text","text":"hi"}]})];
         let (out, summary) = expand_in_messages(
@@ -975,6 +991,7 @@ mod tests {
         let cfg = PdfConfig {
             max_pages: 20,
             long_edge: 512,
+            max_dpi: 300.0,
         };
         let uri = pdf_data_uri(&crate::doc::tests::text_pdf(&["One", "Two", "Three"], ""));
         let messages = vec![json!({
@@ -1041,6 +1058,7 @@ mod tests {
         let cfg = PdfConfig {
             max_pages: 20,
             long_edge: 512,
+            max_dpi: 300.0,
         };
         let uri = pdf_data_uri(&crate::doc::tests::text_pdf(&["One", "Two", "Three"], ""));
         let messages = vec![json!({
@@ -1077,6 +1095,7 @@ mod tests {
         let cfg = PdfConfig {
             max_pages: 20,
             long_edge: 512,
+            max_dpi: 300.0,
         };
         let uri = pdf_data_uri(&tiny_pdf(1, 200, 300));
         let messages = vec![json!({

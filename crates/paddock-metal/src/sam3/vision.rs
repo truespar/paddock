@@ -1,7 +1,15 @@
 use super::*;
 use objc2_metal::MTLBuffer;
 
-fn mm(c: &Commands<'_>, m: &Matrix, b: &Buffer, x: &Buffer, out: &Buffer, rows: usize, mode: u32) {
+pub(super) fn mm(
+    c: &Commands<'_>,
+    m: &Matrix,
+    b: &Buffer,
+    x: &Buffer,
+    out: &Buffer,
+    rows: usize,
+    mode: u32,
+) {
     c.dispatch(
         "sam3_mm",
         &[&m.w, x, out, b],

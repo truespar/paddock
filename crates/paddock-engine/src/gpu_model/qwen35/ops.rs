@@ -13,7 +13,7 @@ use paddock_models::mapped::MappedGguf;
 /// inverse here - the one place, so no walk can forget it.
 pub(super) fn embed_any(
     exec: &GpuExecutor,
-    te: &TokEmbd,
+    te: EmbedSrc<'_>,
     tokens: &CudaSlice<u32>,
     out: &mut CudaSlice<f32>,
     embd: usize,
@@ -21,8 +21,9 @@ pub(super) fn embed_any(
     rot: Option<&Rotation>,
 ) -> Result<(), GpuModelError> {
     match te {
-        TokEmbd::Q8(t) => exec.embed_gather_batch_q8(t, tokens, out, embd, n)?,
-        TokEmbd::Kq(t) => exec.kquant_gather(t, tokens, out, embd, n)?,
+        EmbedSrc::Q8(t) => exec.embed_gather_batch_q8(t, tokens, out, embd, n)?,
+        EmbedSrc::Q8r(t) => exec.embed_gather_q8r(t, tokens, out, embd, n, 1.0)?,
+        EmbedSrc::Kq(t) => exec.kquant_gather(t, tokens, out, embd, n)?,
     }
     if let Some(r) = rot {
         r.after_embed(exec, out, embd, n)?;

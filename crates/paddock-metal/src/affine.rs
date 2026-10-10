@@ -31,6 +31,9 @@ thread_local! {
     pub(crate) static BASELINE_STAGING_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static STAGING_MASK_FOR_TEST: std::cell::Cell<u8> = const { std::cell::Cell::new(31) };
     pub(crate) static BASELINE_RAGGED_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static BASELINE_DIRECT_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static REFERENCE_CHUNKS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static REFERENCE_DECODE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn compact_prefill_rows(rows: usize) -> bool {
@@ -265,6 +268,23 @@ pub(crate) fn project_stable(
 ) {
     let mut end = 0;
     for &(first, count, logical) in spans {
+        #[cfg(test)]
+        if (logical != 1 && REFERENCE_CHUNKS_FOR_TEST.with(|v| v.get()))
+            || (logical == 1 && REFERENCE_DECODE_FOR_TEST.with(|v| v.get()))
+        {
+            // Diagnostic only: prompt-length-dependent reference contractions
+            // are not safe to elect with ordinary shared prefix-cache keys.
+            project_inner(
+                cmd,
+                planes,
+                input,
+                count,
+                workspace,
+                (Arithmetic::Llama(logical), first),
+            );
+            end += count;
+            continue;
+        }
         assert!(first == end && count > 0 && first + count <= rows && matches!(logical, 1 | 512));
         let mode = if logical == 1 {
             Arithmetic::StableDecode
@@ -418,10 +438,20 @@ fn project_group(
         || (matches!(arithmetic, Arithmetic::Adaptive | Arithmetic::Llama(_))
             && logical_rows >= vector_limit);
     let fast_contract = matches!(arithmetic, Arithmetic::StableDecode);
+    let direct =
+        fast_contract && rows > 1 && cmd.tensor_accelerated() && matches!(k, 1024 | 2048 | 3584);
+    #[cfg(test)]
+    let direct = direct && !BASELINE_DIRECT_FOR_TEST.with(|v| v.get());
     let contraction_rows = if matches!(arithmetic, Arithmetic::StablePrefill) {
         512
     } else {
         cmd.affine_prefill_rows().unwrap_or(logical_rows)
+    };
+    #[cfg(test)]
+    let contraction_rows = if REFERENCE_CHUNKS_FOR_TEST.with(|v| v.get()) {
+        logical_rows
+    } else {
+        contraction_rows
     };
     let single = decode.unwrap_or(rows == 1) && k.is_multiple_of(512) && !fast_contract;
     // Minimize weight re-reads, then balance the last vector tile: six rows
@@ -509,6 +539,8 @@ fn project_group(
         (workspace, 32, rows.div_ceil(tile))
     } else if single {
         (input, verify_columns, rows.div_ceil(verify_rows))
+    } else if direct {
+        (input, 16, rows.div_ceil(vector_rows))
     } else if rows > 1 || fast_contract {
         assert!(workspace.len() >= rows * k * 2);
         if !prepared {
@@ -576,6 +608,14 @@ fn project_group(
             (3, _) => "mlx_affine_verify_single3",
             _ => "mlx_affine_verify_single4",
         }
+    } else if direct {
+        [
+            "mlx_affine_direct1",
+            "mlx_affine_direct2",
+            "mlx_affine_direct3",
+            "mlx_affine_direct4",
+            "mlx_affine_direct5",
+        ][vector_rows - 1]
     } else if fast_contract {
         [
             "mlx_affine_stable1",
@@ -750,6 +790,100 @@ fn project_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_decode_preserves_compact_rounding_offsets_and_guards() {
+        let device = MetalDevice::new(Some(128 << 20)).unwrap();
+        if !device.tensor_accelerated() {
+            return;
+        }
+        for k in [1024, 2048, 2560, 3584, 4096, 9216] {
+            let weights: Vec<_> = [16, 33, 129]
+                .into_iter()
+                .map(|n| {
+                    let mut bytes: Vec<_> = (0..k * n / 8)
+                        .flat_map(|i| (i as u32).wrapping_mul(2654435761).to_le_bytes())
+                        .collect();
+                    for bias in [false, true] {
+                        bytes.extend((0..k * n / 64).flat_map(|i| {
+                            half::bf16::from_f32(if bias {
+                                -((i % 59) as f32) / 23.0
+                            } else {
+                                (i % 71 + 1) as f32 / 301.0
+                            })
+                            .to_le_bytes()
+                        }));
+                    }
+                    Weight {
+                        buffer: device.upload(&bytes).unwrap(),
+                        ty: AFFINE4,
+                        k,
+                        n,
+                    }
+                })
+                .collect();
+            for rows in [1, 2, 3, 4, 5, 6, 9] {
+                // Deliberately NOT BF16: direct loads must retain the removed
+                // conversion's rounding, including mixed-row byte offsets.
+                let input = device
+                    .upload(
+                        &(0..(rows + 1) * k)
+                            .flat_map(|i| (((i * 37) % 1999) as f32 / 113. - 8.).to_le_bytes())
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+                let workspace = device.alloc(workspace_bytes(k, 129, rows + 1)).unwrap();
+                let mut reference = None;
+                for baseline in [true, false] {
+                    let outputs: Vec<_> = weights
+                        .iter()
+                        .map(|w| {
+                            device
+                                .upload(&vec![0xff; ((rows + 1) * w.n + 16) * 4])
+                                .unwrap()
+                        })
+                        .collect();
+                    let planes: Vec<_> = weights.iter().zip(&outputs).collect();
+                    BASELINE_DIRECT_FOR_TEST.with(|v| v.set(baseline));
+                    let cmd = device.begin().unwrap();
+                    project_inner(
+                        &cmd,
+                        &planes,
+                        &input,
+                        rows,
+                        &workspace,
+                        (Arithmetic::StableDecode, 1),
+                    );
+                    cmd.finish().unwrap();
+                    BASELINE_DIRECT_FOR_TEST.with(|v| v.set(false));
+                    let mut result = Vec::new();
+                    for (w, output) in weights.iter().zip(&outputs) {
+                        let actual = unsafe { output.read_f32(w.n, rows * w.n) };
+                        assert!(actual.iter().all(|v| v.is_finite()));
+                        assert!(
+                            unsafe { output.read_u32(w.n) }
+                                .iter()
+                                .all(|&v| v == u32::MAX)
+                        );
+                        assert!(
+                            unsafe { output.read_f32((rows + 1) * w.n, 16) }
+                                .iter()
+                                .all(|v| v.is_nan())
+                        );
+                        result.push(actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+                    }
+                    if let Some(expected) = &reference {
+                        assert!(
+                            result == *expected,
+                            "direct contraction changed k={k} rows={rows}"
+                        );
+                    } else {
+                        reference = Some(result);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn verifier_columns_keep_large_working_sets_on_qualified_routes() {

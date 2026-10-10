@@ -9,17 +9,37 @@ use paddock_models::{
 pub(super) enum Source {
     Gguf(MappedGguf),
     Ternary(MappedGguf, paddock_models::hadamard::HadamardSpec),
-    Mlx(ShardedSafetensors),
+    Mlx(ShardedSafetensors, bool),
     Bonsai(ShardedSafetensors, paddock_models::bonsai::BonsaiConfig),
     Splash(paddock_models::splash::Target),
 }
 
 impl Source {
+    pub(super) fn load_head(&self, device: &MetalDevice, dims: &[usize]) -> Result<Option<Weight>> {
+        // Tied GGUF/MLX reuse the embedding allocation itself. Untied storage
+        // adapters still require their independently validated output head.
+        if matches!(self, Self::Gguf(m) if m.tensor_info("output.weight").is_none()) {
+            return Ok(None);
+        }
+        if let Self::Mlx(source, true) = self {
+            if source
+                .names()
+                .any(|n| n.starts_with("language_model.lm_head."))
+            {
+                return Err(MetalError::Model(
+                    "tied MLX checkpoint carries an independent output head".into(),
+                ));
+            }
+            return Ok(None);
+        }
+        self.load(device, "output.weight", dims).map(Some)
+    }
+
     pub(super) fn total_len(&self) -> u64 {
         match self {
             Self::Gguf(m) => m.total_len(),
             Self::Ternary(m, _) => m.total_len(),
-            Self::Mlx(m) => m.total_len(),
+            Self::Mlx(m, _) => m.total_len(),
             Self::Bonsai(m, _) => m.total_len(),
             Self::Splash(m) => m.total_len(),
         }
@@ -38,7 +58,7 @@ impl Source {
                 .map_err(|e| MetalError::Model(e.to_string()))?;
             return splash_weight(device, tensor, name, dims);
         }
-        let Self::Mlx(source) = self else {
+        let Self::Mlx(source, _) = self else {
             let Self::Gguf(map) = self else {
                 unreachable!()
             };

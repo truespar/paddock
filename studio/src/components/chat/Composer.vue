@@ -2020,7 +2020,7 @@ onBeforeUnmount(() => {
           </button>
         </Tooltip>
         <Tooltip
-          v-if="ocrCaps.grounding"
+          v-if="ocrCaps.grounding && !ocrCaps.modes.includes('grounding')"
           label="The answer marks where on the page each piece came from - drawn as boxes over your image."
         >
           <button

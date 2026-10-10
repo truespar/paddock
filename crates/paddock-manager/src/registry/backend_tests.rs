@@ -1,6 +1,82 @@
 use super::*;
 
 #[test]
+fn lighton_metal_catalog_keeps_gguf_companions_separate_from_embedded_mlx() {
+    for backend in ["metal", "cuda"] {
+        let registry = Registry::new("./models".into()).with_backend(backend);
+        for id in ["lightonocr-3-0.8b", "lightonocr-3-4b"] {
+            let model = registry.catalog_of(id).unwrap();
+            assert_eq!(model.capability, ["chat", "documents"]);
+            assert!(!model.mtp_in_file);
+            let bundle = model.default_bundle_for_backend(backend, None);
+            assert_eq!(
+                bundle.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
+                ["q8", "vision"]
+            );
+            assert!(bundle[1].required);
+            assert_eq!(bundle[0].runtime.default_spec.as_deref(), Some("off"));
+            let mlx = model.artifact("mlx-4bit").unwrap();
+            assert!(mlx.runtime.checkpoint_dir);
+            assert!(mlx.runtime.embedded_vision);
+            assert_eq!(mlx.runtime.supports_backend(backend), backend == "metal");
+            assert!(!mlx.runtime.allows_companion("vision"));
+            assert!(!mlx.runtime.allows_companion("drafter"));
+            assert_eq!(mlx.runtime.kv_cache_dtype.as_deref(), Some("auto"));
+            assert_eq!(mlx.runtime.default_spec.as_deref(), Some("off"));
+            assert_eq!(mlx.files.len(), 11);
+            let shape = mlx.shape.as_ref().unwrap();
+            let recurrent = shape.recurrent.unwrap();
+            let kv = shape
+                .kv_layers
+                .iter()
+                .map(|l| (l.k_dim + l.v_dim) * l.count)
+                .sum::<u64>()
+                * 2048
+                * 2
+                * 4;
+            let state = recurrent.layers
+                * (recurrent.state_elems + recurrent.conv_elems)
+                * recurrent.elem_bytes
+                * 4;
+            assert_eq!(
+                kv + state,
+                if id.ends_with("0.8b") {
+                    544407552
+                } else {
+                    1437597696
+                },
+                "must price both live and prefix-checkpoint capacities"
+            );
+            let source = mlx.source.as_ref().unwrap();
+            assert_eq!(source.revision.len(), 40);
+            for file in &mlx.files {
+                assert!(
+                    file.url
+                        .contains(&format!("/resolve/{}/4bit/", source.revision))
+                );
+                assert_eq!(file.sha256.len(), 64);
+                assert!(file.size > 0);
+            }
+            if backend == "metal" {
+                assert_eq!(registry.default_envelope(id, Some("mlx-4bit")), (16384, 1));
+                let paths = registry.planned_paths(id, Some("mlx-4bit")).unwrap();
+                assert!(paths.0.ends_with("4bit"));
+                assert!(
+                    paths.1.is_none(),
+                    "embedded tower must not download GGUF vision"
+                );
+                assert_eq!(bundle[0].runtime.kv_cache_dtype.as_deref(), Some("f16"));
+                assert_eq!(registry.default_envelope(id, Some("q8")), (16384, 1));
+                assert!(bundle[0].runtime.allows_companion("vision"));
+                assert!(!bundle[0].runtime.allows_companion("drafter"));
+            } else {
+                assert_eq!(model.kv_default.as_deref(), Some("fp8_e4m3"));
+            }
+        }
+    }
+}
+
+#[test]
 fn diarization_catalog_serves_metal_and_cuda_non_chat_with_measured_bounded_memory() {
     let metal = Registry::new("./models".into()).with_backend("metal");
     let model = metal.catalog_of("nemotron-3-diarization").unwrap();

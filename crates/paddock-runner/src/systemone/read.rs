@@ -405,6 +405,7 @@ async fn read_once(
             pinned: if steps > 1 { plan.pinned() } else { Vec::new() },
             reply: reply_tx,
         }),
+        user_turn: false,
     };
     if let Err(e) = model.engine.submit(req) {
         return Err(Box::new(err(
@@ -747,6 +748,7 @@ pub async fn think(
         logprobs: None,
         submitted: None,
         canvas_read: None,
+        user_turn: false,
     };
     if let Err(e) = model.engine.submit(req) {
         return Err(Box::new(err(

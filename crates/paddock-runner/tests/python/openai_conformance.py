@@ -335,11 +335,16 @@ def sec_tools_stream(client, model, dialect):
                 slot["name"] = tc.function.name
             if tc.function and tc.function.arguments:
                 slot["args"] += tc.function.arguments
+                slot["pieces"] = slot.get("pieces", 0) + 1
     assert finishes == ["tool_calls"], finishes
     assert by_index, "no streamed tool-call deltas"
     call = by_index[0]
     assert call["id"] and call["name"] == "get_weather", call
     assert "city" in json.loads(call["args"]), call
+    # the qwen dialect streams arguments while they are written: the string
+    # value arrives apart from the key that opens it
+    if dialect == "qwen":
+        assert call.get("pieces", 0) >= 2, call
     ok("streamed tool-call deltas (SDK accumulation)")
 
 
@@ -636,6 +641,24 @@ def sec_responses_tools(client, model):
     assert "21" in low or "clear" in low or "sunny" in low, r2.output_text
     ok("responses tool round trip")
 
+    # streamed: the arguments arrive as deltas while the call is written, the
+    # done event and the SDK-accumulated item agree with them
+    deltas, done_args = [], None
+    with client.responses.stream(
+        model=model, input=prompt, tools=[flat_tool], max_output_tokens=500, temperature=0.0
+    ) as s:
+        for ev in s:
+            if ev.type == "response.function_call_arguments.delta":
+                deltas.append(ev.delta)
+            elif ev.type == "response.function_call_arguments.done":
+                done_args = ev.arguments
+        final = s.get_final_response()
+    fcs = [it for it in final.output if it.type == "function_call"]
+    assert fcs and done_args is not None, [it.type for it in final.output]
+    assert "".join(deltas) == done_args, (deltas, done_args)
+    assert json.loads(done_args) == json.loads(fcs[0].arguments), (done_args, fcs[0].arguments)
+    ok("responses streamed function_call arguments")
+
 
 def sec_errors(client, model, dialect):
     msgs = [{"role": "user", "content": "hi"}]
@@ -782,6 +805,29 @@ def sec_vision(client, model):
     assert "red" in c and "blue" in c, c
     print(f"  responses vision answer: {c!r}", flush=True)
     ok("vision via responses input_image item")
+
+    # the same picture returned by a function call: input_image inside a
+    # function_call_output (the Responses API allows images there)
+    tool = {"type": "function", "name": "read_file", "description": "Read a file",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}},
+                           "required": ["path"]}}
+    r = client.responses.create(
+        model=model,
+        tools=[tool],
+        input=[
+            {"role": "user", "content": "Read picture.bmp and tell me its two colors, briefly."},
+            {"type": "function_call", "call_id": "call_pic", "name": "read_file",
+             "arguments": '{"path": "picture.bmp"}'},
+            {"type": "function_call_output", "call_id": "call_pic",
+             "output": [{"type": "input_image", "image_url": uri}]},
+        ],
+        max_output_tokens=500,
+        temperature=0.0,
+    )
+    c = r.output_text.lower()
+    assert "red" in c and "blue" in c, c
+    print(f"  function_call_output vision answer: {c!r}", flush=True)
+    ok("vision inside a function_call_output")
 
 
 def sec_mcp(client, model, mcp_url):

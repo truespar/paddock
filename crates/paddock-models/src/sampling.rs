@@ -57,7 +57,8 @@
 //! parsers (paddleocr, deepseek2-ocr) and Qwen3-ASR all publish greedy
 //! generation configs (`do_sample: false`), and their handlers already force
 //! temperature 0. Repeating them as rows would create a second place to
-//! disagree with.
+//! disagree with. LightOnOCR-3 is the document parser that is NOT greedy -
+//! its authors sample at 0.2 - so it has a row, under the identity key below.
 
 /// A published knob widened to f64 carrying the number it was written as, not
 /// its binary representation.
@@ -130,6 +131,12 @@ impl Elected {
 /// The elected profile for a served architecture, or `None` when that
 /// checkpoint's authors publish no decoding parameters at all.
 ///
+/// The key is `general.architecture` with one kind of exception: a fine-tune
+/// that keeps a base model's graph but publishes its own sampling gets an
+/// identity key of its own, and the caller passes that instead of the arch.
+/// `lightonocr-3` is the one today - a `qwen35` graph whose authors sample
+/// nothing like Qwen's card ([`LIGHTONOCR3`]).
+///
 /// `None` is a real answer and not a hole to fill: gpt-oss ships a
 /// `generation_config.json` with `do_sample: true` and nothing else, and
 /// granite's is `_from_model_config` with only token ids in it. Inventing
@@ -137,6 +144,23 @@ impl Elected {
 /// to remove - they keep the wire defaults, and the runner says so out loud.
 pub fn elected(arch: &str) -> Option<Elected> {
     Some(match arch {
+        // LightOn's own client is the most specific source: models.py keys
+        // sampling by generation and gives the Qwen3.5-based LightOnOCR-3
+        // sizes top_p 1.0 at temperature 0.2, keeping 0.9 for generations 1
+        // and 2. The model cards recommend temperature 0.2 and their
+        // transformers snippet leaves top_p at its 1.0 default; only their
+        // vLLM snippet sends 0.9, the LightOnOCR-2 value. generation_config.json
+        // carries token ids only.
+        LIGHTONOCR3 => Elected {
+            thinking: Knobs {
+                temperature: 0.2,
+                top_k: 0,
+                top_p: 1.0,
+                min_p: 0.0,
+            },
+            instruct: None,
+            source: "lightonai/LightOnOCR client lightonocr/models.py (LightOnOCR-3                      0.8B/4B: temperature 0.2, top_p 1.0) and the LightOnOCR-3 model                      cards' recommended temperature 0.2",
+        },
         "kolibri1" => Elected {
             thinking: Knobs {
                 temperature: 1.0,
@@ -234,6 +258,9 @@ pub fn elected(arch: &str) -> Option<Elected> {
         _ => return None,
     })
 }
+
+/// The identity key for LightOnOCR-3 checkpoints - see [`elected`].
+pub const LIGHTONOCR3: &str = "lightonocr-3";
 
 /// What the CHECKPOINT itself publishes, read off its own header.
 ///
@@ -343,6 +370,11 @@ mod tests {
         assert_eq!(elected("muse-glimmer").unwrap().thinking.top_p, 0.95);
         assert_eq!(elected("laguna").unwrap().thinking.top_p, 1.0);
         assert_eq!(elected("nemotron_h_moe").unwrap().thinking.top_k, 0);
+        let lo = elected(LIGHTONOCR3).expect("LightOn publishes sampling");
+        assert_eq!((lo.thinking.temperature, lo.thinking.top_p), (0.2, 1.0));
+        assert_eq!(lo.thinking.top_k, 0, "unstated, so off");
+        // the identity key must not inherit its base graph's row
+        assert_ne!(lo.thinking, q.thinking);
     }
 
     fn hdr(kv: &[(&str, f32)]) -> crate::gguf::GgufFile {
@@ -451,6 +483,7 @@ mod tests {
             "muse-glimmer",
             "laguna",
             "nemotron_h_moe",
+            LIGHTONOCR3,
         ] {
             let e = elected(arch).unwrap();
             assert!(
@@ -495,6 +528,7 @@ mod tests {
             "muse-glimmer",
             "laguna",
             "nemotron_h_moe",
+            LIGHTONOCR3,
         ] {
             let Some(e) = elected(arch) else { continue };
             for k in [Some(&e.thinking), e.instruct.as_ref()]

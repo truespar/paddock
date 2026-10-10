@@ -341,7 +341,7 @@ impl GpuNemotron {
     /// DeltaNet one. `true` = skip this slot this tick; the per-pass
     /// `tier_pump` drives the flow and the wake re-enters admission.
     pub(crate) fn tier_consult_impl(&mut self, slot: usize, tokens: &[u32]) -> bool {
-        use crate::kv_tier::{Election, FlowStatus};
+        use crate::kv_tier::FlowStatus;
         let exec = self.exec.clone();
         let Some(bs) = self.batch.as_mut() else {
             return false;
@@ -367,24 +367,31 @@ impl GpuNemotron {
         if pr.match_full(tokens).ckpt.is_some() {
             return false;
         }
-        let hit = tier.probe(tokens, 0);
-        let afford = |pool: &crate::kv_pool::KvPool, r: usize| {
-            pool.free_blocks().saturating_sub(2 * r) / r * r
+        // the blob's geometry lets the probe find it on any tier
+        tier.declare_blob_pages(pr.pages_per_ckpt());
+        // probe counts the lookup (and the miss when nothing is held)
+        let Some(hit) = tier.probe(tokens, 0) else {
+            return false;
         };
         let r = tier.run_blocks();
-        let mut afford_blocks = afford(&bs.pool, r);
-        let deepest = hit
-            .as_ref()
-            .and_then(|h| tier.probe_aux(tokens, h.end_block))
+        let deepest = tier
+            .probe_aux(tokens, hit.end_block)
             .filter(|a| a.end_block * BLOCK_TOKENS >= MIN_CACHE_PREFIX && a.end_block % r == 0);
-        if let Some(a) = &deepest
-            && afford_blocks < a.end_block
-        {
+        let Some((hit, est_us)) = tier.elect_hybrid(&hit, deepest.as_ref()) else {
+            return false;
+        };
+        let aux = deepest.expect("an elected hybrid hit has its boundary");
+        // the destination: the restored blocks, then the checkpoint's own
+        // pages - the blob round draws those from the pool too
+        let need = aux.end_block + pr.pages_per_ckpt();
+        let afford =
+            |pool: &crate::kv_pool::KvPool| pool.free_blocks().saturating_sub(2 * r) / r * r;
+        if afford(&bs.pool) < need {
             // retention crowds the destination: pressure-demote it (the
             // prefix cache is reclaimable capacity)
-            let want = a.end_block + 2 * r;
+            let want = need + 2 * r;
             let after = exec.record_event().ok();
-            let (_e, taken) = tier.pressure_demote(pr, &mut bs.pool, want, after);
+            let (_e, taken) = tier.pressure_demote(&mut *pr, &mut bs.pool, want, after);
             for t in taken {
                 if t.end_block % r == 0 {
                     let ev = exec.record_event().ok();
@@ -396,45 +403,23 @@ impl GpuNemotron {
             pr.reclaim(&mut bs.pool);
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
             while bs.pool.free_blocks() < want && tier.stats().2 > 0 {
-                tier.pump_completions(pr, &mut bs.pool);
+                tier.pump_completions(&mut *pr, &mut bs.pool);
                 if std::time::Instant::now() >= deadline {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_micros(200));
             }
-            afford_blocks = afford(&bs.pool, r);
         }
-        let aux = deepest.filter(|a| a.end_block <= afford_blocks);
         tracing::debug!(
             free = bs.pool.free_blocks(),
-            afford_blocks,
-            hit_end = hit.as_ref().map(|h| h.end_block),
-            aux_end = aux.as_ref().map(|a| a.end_block),
+            need,
+            boundary = aux.end_block,
             "nemotron tier gate"
         );
-        let (Some(hit), Some(aux)) = (hit, aux) else {
+        if afford(&bs.pool) < need {
+            tier.refuse_park();
             return false;
-        };
-        let n_runs = aux.end_block / r;
-        let per_run = hit.bytes / hit.keys.len().max(1) as u64;
-        let hit = crate::kv_tier::TierHit {
-            start_block: 0,
-            end_block: aux.end_block,
-            bytes: per_run * n_runs as u64,
-            keys: hit.keys[..n_runs.min(hit.keys.len())].to_vec(),
-            // runs are equal-sized, so the truncated hit keeps the same
-            // share of disk-sourced bytes as the full one
-            nvme_bytes: hit.nvme_bytes.min(per_run * n_runs as u64),
-        };
-        let shape = crate::kv_tier::HitShape {
-            restore_bytes: hit.bytes + aux.bytes,
-            restore_tokens: (aux.end_block * BLOCK_TOKENS) as u32,
-            queued_bytes: tier.catalog.ledger(crate::kv_tier::Tier::Ram).in_flight,
-            nvme_bytes: hit.nvme_bytes,
-        };
-        let Election::Restore { est_us, .. } = tier.cost.elect(shape) else {
-            return false;
-        };
+        }
         let after = exec.record_event().ok();
         // the blob lands in pool pages the flow reserves; the radix names
         // them, so there is no slot base to hand over
@@ -848,6 +833,18 @@ impl GpuNemotron {
     /// the next filed snapshot opens a new live one instead of replacing it.
     /// Once per reply. A snapshot still waiting for its ids precedes the call
     /// too; it files as the new live one.
+    /// `Generator::anchor_at`: hold the user turn's prompt-end checkpoint.
+    pub(crate) fn anchor_at(&mut self, tokens: &[u32], upto: usize) {
+        if let Some(radix) = self.batch.as_mut().and_then(|bs| bs.prefix.as_mut())
+            && let Some(at) = radix.mark_anchor(tokens, upto)
+        {
+            tracing::debug!(
+                "nemotron anchor: user-turn checkpoint at {at} (prompt {})",
+                upto + 1
+            );
+        }
+    }
+
     pub(crate) fn reply_pin(&mut self, slot: usize) {
         let Some(bs) = self.batch.as_mut() else {
             return;

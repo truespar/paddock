@@ -43,7 +43,9 @@ const chat = useChatStore()
 const runDocId = computed(
   () => docContexts(chat.active).find((c) => c.run?.id === props.message.id)?.source.id,
 )
-const FIG = /^(image|figure|picture)$/i
+// pictures by every family's name for them (PaddleOCR-VL's document
+// pipeline keeps charts and seals as pictures too)
+const FIG = /^(image|figure|picture|chart|seal)$/i
 interface Crop {
   label: string
   style: Record<string, string>

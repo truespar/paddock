@@ -3989,6 +3989,69 @@ struct KernelTableV1 {
                                 const void*, const void*, const void*, const void*,
                                 const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
                                 uint32_t, uint32_t, void*);
+    // 832: embed_gather_q8r (data, scales, tokens, out, embd, n_tokens, scale, stream) - the Q8_0
+    // row-gather over the repacked streams, bit-identical to embed_gather_q8 (tied heads)
+    int (*embed_gather_q8r)(const void*, const void*, const void*, void*, uint32_t, uint32_t,
+                            float, void*);
+    // 833: mrope_vision_qkv_h (q, k, v, bq, bk, bv, positions, q16, k16, v16, n_tokens,
+    // n_heads, head_dim, theta_scale, q_mul, stream) - the qwen-family tower's three f32
+    // projections landed as 620's halves: rope + bias + scale on q, rope + bias on k, bias on v
+    int (*mrope_vision_qkv_h)(const void*, const void*, const void*, const void*, const void*,
+                              const void*, const void*, void*, void*, void*, uint32_t, uint32_t,
+                              uint32_t, float, float, void*);
+    // 834: f16_gemm_h_gelu_tanhf (w, x, y16, bias, scratch, in_dim, out_dim, batch, stream) -
+    // the tower FFN up landing f16(gelu(Wx + b)) in pd_gelu_bias_f16's form, bit-identical to
+    // pd_f16_gemm + pd_gelu_bias_f16 (which it runs through the f32 scratch where not fusable)
+    int (*f16_gemm_h_gelu_tanhf)(const void*, const void*, void*, const void*, void*, unsigned int,
+                                 unsigned int, unsigned int, void*);
+    // 835: f16_gemm_bias_res (w, x, y, bias, scratch, in_dim, out_dim, batch, stream) - y +=
+    // Wx + b on an f32 residual stream, bit-identical to pd_f16_gemm + pd_add_bias_res
+    int (*f16_gemm_bias_res)(const void*, const void*, void*, const void*, void*, unsigned int,
+                             unsigned int, unsigned int, void*);
+    // 836: f16_gemm_h_silu (w, x, y, bias, in_dim, out_dim, batch, stream) - the f16
+    // landing with bias + SiLU
+    int (*f16_gemm_h_silu)(const void*, const void*, void*, const void*, unsigned int,
+                           unsigned int, unsigned int, void*);
+    // 837: dl_u8_to_h (src, dst, n, stream) - u8 -> half / 255
+    int (*dl_u8_to_h)(const void*, void*, uint32_t, void*);
+    // 838: dl_im2row_h (src, dst, ih, iw, c, oh, ow, kh, kw, stride, pad_t, pad_l, kpad,
+    // stream) - k x k im2row over NHWC halves, tap order (ky, kx, c)
+    int (*dl_im2row_h)(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                       uint32_t, uint32_t, uint32_t, int32_t, int32_t, uint32_t, void*);
+    // 839: dl_dwconv_h (src, dst, w, b, ih, iw, c, oh, ow, k, stride, act, stream) -
+    // depthwise k x k conv, NHWC halves, f32 folded weights
+    int (*dl_dwconv_h)(const void*, void*, const void*, const void*, uint32_t, uint32_t,
+                       uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 840: dl_maxpool2_h (src, dst, h, w, c, stream) - 2 x 2 / stride 1 max pool, zero
+    // pad bottom / right
+    int (*dl_maxpool2_h)(const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+    // 841: dl_concat_h (src, dst, rows, c, ctot, off, stream) - channel concat into a
+    // wider NHWC plane
+    int (*dl_concat_h)(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 842: dl_up2_h (src, dst, add, h, w, c, mode, stream) - 2x upsample, nearest /
+    // bilinear (align_corners=False), optional add
+    int (*dl_up2_h)(const void*, void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                    void*);
+    // 843: dl_add_h (a, b, dst, n, act, stream) - a + b over halves, act 0 / ReLU / SiLU
+    int (*dl_add_h)(const void*, const void*, void*, uint64_t, uint32_t, void*);
+    // 844: dl_rowscale_h (x, scale, rows, cols, stream) - rows of halves times a per-row f32
+    int (*dl_rowscale_h)(void*, const void*, uint32_t, uint32_t, void*);
+    // 845: dl_gather_rows (src, dst, idx, n, words, stream) - row gather by u32 index, rows of
+    // 32-bit words
+    int (*dl_gather_rows)(const void*, void*, const void*, uint32_t, uint32_t, void*);
+    // 846: dl_mask_ref (logits, ref, q, h, w, stream) - per-query mask box (logit > 0) as the
+    // initial reference point
+    int (*dl_mask_ref)(const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+    // 847: dl_msda (value, off, logit, ref, out, q, h0, w0, h1, w1, h2, w2, stream) - multi-scale
+    // deformable attention, 8 x 32, 3 levels, 4 points
+    int (*dl_msda)(const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t,
+                   uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 848: dl_ref_step (ref, delta, ref16, q, stream) - box refinement step + the 8-wide f16
+    // query-pos input
+    int (*dl_ref_step)(void*, const void*, void*, uint32_t, void*);
+    // 849: dl_order_votes (s, votes, q, stream) - reading-order votes, sigmoid(s - s^T) column
+    // sums
+    int (*dl_order_votes)(const void*, void*, uint32_t, void*);
 };
 
 } // extern "C"

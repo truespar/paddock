@@ -120,12 +120,13 @@ pub fn evict_ahead_margin(configured: usize, pool_capacity: usize) -> usize {
 /// Walk a checkpoint cut back to a page boundary at or before the start of any
 /// image span it lands strictly inside.
 ///
-/// Both vision families that cache across pictures give an image's rows MUTUAL
-/// visibility rather than causal-within-the-span: gemma4v decodes them
-/// non-causally, and qwen35 gives every row of one picture the same mRoPE `t`
-/// plus an attention bound pointing at the span's last row. Either way a resume
-/// landing strictly inside a picture would re-prefill rows whose attention
-/// reaches keys the adopted blocks already hold, written in a different order.
+/// gemma4v gives an image's rows MUTUAL visibility (it decodes them
+/// non-causally), so a resume landing strictly inside a picture would
+/// re-prefill rows whose attention reaches keys the adopted blocks already
+/// hold, written in a different order. qwen35 used to do the same (an
+/// attention bound at the span's last row); its rows are raster-causal now,
+/// but it keeps the guard - a picture spliced whole per pass is what keeps its
+/// per-pass encoding and image-keyed radix simple.
 ///
 /// Rather than reason about whether that is benign, no CHECKPOINT is ever
 /// attached inside an image span - and since a resume position is exactly a

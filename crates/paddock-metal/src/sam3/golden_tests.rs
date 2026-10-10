@@ -5,7 +5,7 @@
 use super::*;
 use paddock_models::safetensors::{SafetensorsFile, StDtype};
 
-fn tensor(path: &Path, name: &str, shape: &[usize]) -> Vec<f32> {
+pub(super) fn tensor(path: &Path, name: &str, shape: &[usize]) -> Vec<f32> {
     let file = SafetensorsFile::open(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let (t, bytes) = file
         .bytes(name)

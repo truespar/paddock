@@ -726,6 +726,11 @@ impl NvmeStore {
     /// This store's measured device geometry - the transport seeds the cost
     /// model's T2 bandwidth from it instead of guessing (an unseeded EWMA
     /// spends its first restores learning what open already measured).
+    /// The namespace directory this store lives in.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     pub fn device(&self) -> super::io::DeviceClass {
         self.io.class()
     }

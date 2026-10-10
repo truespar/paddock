@@ -77,6 +77,7 @@ fn engine_scheduler_batches_qwen35() {
                 logprobs: None,
                 submitted: None,
                 canvas_read: None,
+                user_turn: false,
             })
             .expect("submit");
         rxs.push(rx);

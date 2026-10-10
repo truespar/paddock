@@ -462,18 +462,24 @@ fn mlx_verify_attention_preserves_per_row_partition_boundaries() {
 
 #[test]
 fn mlx_decode_attention_is_batch_and_length_invariant() {
-    mlx_decode_attention_cohorts(false);
+    mlx_decode_attention_cohorts(false, 24, 4);
+}
+
+#[test]
+fn small_mlx_decode_attention_is_batch_and_length_invariant() {
+    mlx_decode_attention_cohorts(false, 8, 2);
+    mlx_decode_attention_cohorts(false, 16, 4);
 }
 
 #[test]
 #[ignore = "warm GPU attention cost only; full-model and serving gates are separate"]
 fn mlx_decode_attention_cohort_cost() {
-    mlx_decode_attention_cohorts(true);
+    mlx_decode_attention_cohorts(true, 24, 4);
 }
 
-fn mlx_decode_attention_cohorts(timing: bool) {
+fn mlx_decode_attention_cohorts(timing: bool, heads: usize, kv: usize) {
     let device = MetalDevice::new(Some(128 << 20)).unwrap();
-    let (heads, kv, rows, stride) = (24usize, 4usize, 8usize, 256usize);
+    let (rows, stride) = (8usize, 256usize);
     let upload_u = |v: &[u32]| {
         device
             .upload(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>())
@@ -543,7 +549,11 @@ fn mlx_decode_attention_cohorts(timing: bool) {
                 .max(floor)
                 .min(MAX_SPLITS);
             cmd.dispatch(
-                if stable {
+                if stable && heads / kv == 4 {
+                    "mlx_attention_stable_gqa4"
+                } else if !stable && heads / kv == 4 {
+                    "mlx_attention_decode_gqa4"
+                } else if stable {
                     "mlx_attention_stable"
                 } else {
                     "mlx_attention_decode"

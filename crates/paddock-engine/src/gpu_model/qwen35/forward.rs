@@ -476,7 +476,7 @@ impl GpuQwen35 {
 
         let sinks = &self.sinks;
         let layers = &self.layers;
-        let tok_embd = &self.tok_embd;
+        let tok_embd = self.tok_embd.src(&self.output);
         let rot = self.rot.as_ref();
         let sc = self.scratch.as_mut().expect("scratch");
         let ds = self.decode.as_mut().expect("decode");
@@ -612,7 +612,7 @@ impl GpuQwen35 {
                         eps,
                         t_len * n_kv_heads,
                     )?;
-                    exec.mrope(
+                    exec.imrope(
                         &mut sc.d_qn,
                         &ds.d_pf_mrope,
                         t_len,
@@ -622,7 +622,7 @@ impl GpuQwen35 {
                         yarn,
                         sections,
                     )?;
-                    exec.mrope(
+                    exec.imrope(
                         &mut sc.d_kn,
                         &ds.d_pf_mrope,
                         t_len,
@@ -1087,7 +1087,7 @@ impl GpuQwen35 {
 
         let sinks = &self.sinks;
         let layers = &self.layers;
-        let tok_embd = &self.tok_embd;
+        let tok_embd = self.tok_embd.src(&self.output);
         let rot = self.rot.as_ref();
         let sc = self.scratch.as_mut().expect("scratch");
         let ds = self.decode.as_mut().expect("decode");
@@ -1127,7 +1127,7 @@ impl GpuQwen35 {
                         eps,
                         n_kv_heads,
                     )?;
-                    exec.mrope(
+                    exec.imrope(
                         &mut sc.d_qn,
                         &ds.d_mrope,
                         1,
@@ -1137,7 +1137,7 @@ impl GpuQwen35 {
                         yarn,
                         sections,
                     )?;
-                    exec.mrope(
+                    exec.imrope(
                         &mut sc.d_kn,
                         &ds.d_mrope,
                         1,

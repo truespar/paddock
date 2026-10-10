@@ -22,7 +22,8 @@ kernel void sam3_patch(device const uchar* px [[buffer(0)]], device half* out [[
 }
 
 // F16 contractions, F32 accumulation. All operation boundaries are explicit:
-// 0 raw F32; 1 raw F16; 2 bias/F16; 3 bias+tanh-GELU/F16; 4 bias/F32.
+// 0 raw F32; 1 raw F16; 2 bias/F16; 3 bias+tanh-GELU/F16; 4 bias/F32;
+// 5 bias+erf-GELU/F16 (CLIP text, deliberately NOT vision's tanh-GELU).
 kernel void sam3_mm(device half* w [[buffer(0)]],device half* x [[buffer(1)]],
     device uint* out [[buffer(2)]],device const float* bias [[buffer(3)]],
     constant uint* p [[buffer(4)]],uint2 g [[threadgroup_position_in_grid]]) {
@@ -36,6 +37,7 @@ kernel void sam3_mm(device half* w [[buffer(0)]],device half* x [[buffer(1)]],
         auto ij=it.get_multidimensional_index();uint c=n+ij[0],r=m+ij[1];
         if(it.is_valid_element() && r<M && c<N) {
             float v=*it;if(p[3]>=2)v+=bias[c];if(p[3]==3)v=vis_gelu(v);
+            if(p[3]==5)v=mv_gelu_value(v);
             ulong ix=ulong(r)*N+c;
             if(p[3]==0 || p[3]==4)reinterpret_cast<device float*>(out)[ix]=v;
             else reinterpret_cast<device half*>(out)[ix]=half(v);

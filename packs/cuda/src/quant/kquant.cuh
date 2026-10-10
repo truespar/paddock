@@ -755,6 +755,41 @@ int pd_kquant_gather(const void* data, const void* scales, const void* tokens,
     return pd_launch_status();
 }
 
+// ---- Q8_0 embedding row-gather from the REPACKED streams --------------------
+// pd_embed_gather_q8's twin over the layout pd_q8_0_repack writes: the GGUF
+// block stream split into an int8 plane (32 per block) and an f16 scale plane
+// (one per block), block order unchanged, so row r of a [embd, rows] table is
+// data[r*embd ..) and scales[r*embd/32 ..). It lets a TIED embedding gather
+// from the LM head's own repacked plane instead of holding a second, raw copy
+// of the same matrix (248320 x 2560 is 675 MB of Q8_0 on LightOnOCR-3-4B).
+// Same product order as the raw kernel, q * d * scale, so the two are
+// bit-identical on the same table. Graph-capturable: token ids from device.
+__global__ void pd_embed_gather_q8r_kernel(const int8_t* __restrict__ data,
+                                           const __half* __restrict__ scales,
+                                           const uint32_t* __restrict__ tokens,
+                                           float* __restrict__ out, uint32_t embd,
+                                           float scale) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t t = blockIdx.y;
+    if (i >= embd) return;
+    const size_t row = (size_t)tokens[t];
+    const float d = __half2float(scales[row * (embd >> 5u) + (i >> 5u)]);
+    out[(size_t)t * embd + i] = (float)data[row * embd + i] * d * scale;
+}
+
+PD_EXPORT
+int pd_embed_gather_q8r(const void* data, const void* scales, const void* tokens, void* out,
+                        uint32_t embd, uint32_t n_tokens, float scale, void* stream) {
+    if (embd == 0 || n_tokens == 0) return 0;
+    if ((embd & 31u) != 0u) return cudaErrorInvalidValue;
+    const uint32_t threads = 256;
+    dim3 grid((embd + threads - 1) / threads, n_tokens);
+    pd_embed_gather_q8r_kernel<<<grid, threads, 0, (cudaStream_t)stream>>>(
+        (const int8_t*)data, (const __half*)scales, (const uint32_t*)tokens, (float*)out, embd,
+        scale);
+    return pd_launch_status();
+}
+
 // ---- dequant from the REPACKED streams (per-use, prefill interim) ------------
 // The raw GGUF upload is freed after repack, so the batch-GEMM interim
 // (dequant whole weight into an f32 scratch -> f32 GEMM, exact values) dequants

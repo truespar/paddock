@@ -128,6 +128,9 @@ impl Qwen35 {
         if self.mlx
             && !(self.splash && path.join("manifest.json").is_file())
             && !(self.bonsai.is_some() && path.join("hadamard.json").is_file())
+            && !(self.head.is_none()
+                && matches!(self.geometry, Geometry::DENSE_08B | Geometry::DENSE_4B)
+                && path.is_dir())
         {
             return Err(MetalError::Model("native MLX vision tower ingestion is not yet qualified; a GGUF companion would change the checkpoint".into()));
         }
@@ -180,7 +183,7 @@ impl Qwen35 {
                     }
                 }
                 MmChunk::Image { rgb, w, h } => {
-                    let (tw, th) = vision::resize(w, h, vision.budget)?;
+                    let (tw, th) = vision.dimensions(w, h)?;
                     if rgb.len() != w * h * 3 {
                         return Err(err("RGB byte count mismatch"));
                     }
@@ -261,7 +264,7 @@ impl Qwen35 {
                     .take_while(|r| r.0 == slot && (r.2 as usize) < key.offset + key.nx * key.ny)
                     .count();
                 cmd.dispatch(
-                    if self.splash {
+                    if self.splash || (self.mlx && self.bonsai.is_none()) {
                         "splash_image_copy"
                     } else {
                         "spec_copy"

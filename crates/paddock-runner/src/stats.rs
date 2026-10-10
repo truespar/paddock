@@ -70,6 +70,8 @@ pub struct TierSnapshot {
     pub miss_tripped: u64,
     /// Missed on content this tier evicted - the capacity alarm's input.
     pub miss_ghost: u64,
+    /// Missed on KV held without the state a hybrid model resumes from.
+    pub miss_no_state: u64,
     pub elected_restore: u64,
     pub elected_recompute: u64,
     pub parked: u64,
@@ -129,6 +131,7 @@ impl TierSnapshot {
             miss_no_new_tokens: n(&t.miss_no_new_tokens),
             miss_tripped: n(&t.miss_tripped),
             miss_ghost: n(&t.miss_ghost),
+            miss_no_state: n(&t.miss_no_state),
             elected_restore: n(&t.elected_restore),
             elected_recompute: n(&t.elected_recompute),
             parked: n(&t.parked),

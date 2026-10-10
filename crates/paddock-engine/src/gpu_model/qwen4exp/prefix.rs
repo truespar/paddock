@@ -300,7 +300,7 @@ impl PrefixCache {
             let mut at: Vec<usize> = radix
                 .state_attachments()
                 .iter()
-                .map(|&(d, _, _)| d * BLOCK_TOKENS)
+                .map(|&(d, _, _, _)| d * BLOCK_TOKENS)
                 .collect();
             at.sort_unstable();
             tracing::info!(

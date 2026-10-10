@@ -37,6 +37,7 @@ enum NativeOCRMetadata {
         "document": "Document", "multipage": "Pages of one document", "free": "Plain text",
         "layout": "Layout map", "figure": "Figure", "ocr": "Text", "table": "Table",
         "formula": "Formula", "chart": "Chart", "spotting": "Text spotting", "seal": "Seal",
+        "plain": "Markdown", "grounding": "Blocks with boxes",
       ]
       add("Read as", labels[mode] ?? mode.prefix(1).uppercased() + mode.dropFirst())
     }

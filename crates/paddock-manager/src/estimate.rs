@@ -357,33 +357,37 @@ pub(crate) fn towers_bytes_for(
         + if audio { one(ArtifactKind::Audio) } else { 0 }
 }
 
-/// The companions an image-generation lane holds resident beside its DiT:
-/// the text encoder and the VAE. Both load at startup and stay for the
-/// endpoint's life, like a tower - and unlike a tower neither has a switch,
-/// because the DiT conditions on one and decodes through the other. Elected
-/// per kind the way the tower is (installed, else default, else first),
-/// within what the weights artifact allows, since the compact DiT pairs with
-/// the compact text encoder. Zero for every other kind of model.
+/// The companions a model holds resident beside its weights with no switch:
+/// an image-generation lane's text encoder and VAE (the DiT conditions on
+/// one and decodes through the other), and a document reader's layout model.
+/// Each loads at startup and stays for the endpoint's life, like a tower.
+/// Elected per kind the way the tower is (installed, else default, else
+/// first), within what the weights artifact allows, since the compact DiT
+/// pairs with the compact text encoder. Zero for every other kind of model.
 pub(crate) fn lane_companion_bytes_for(
     m: &crate::registry::CatalogModel,
     reg: &crate::registry::Registry,
     weights: Option<&crate::registry::CatalogArtifact>,
 ) -> u64 {
     use crate::registry::ArtifactKind;
-    [ArtifactKind::TextEncoder, ArtifactKind::Vae]
-        .into_iter()
-        .map(|kind| {
-            let of = || {
-                m.artifacts.iter().filter(|a| {
-                    a.kind == kind && weights.is_none_or(|w| w.runtime.allows_companion(&a.id))
-                })
-            };
-            of().find(|a| reg.is_artifact_installed(a))
-                .or_else(|| of().find(|a| a.default))
-                .or_else(|| of().next())
-                .map_or(0, |a| a.total_size() + a.workspace.unwrap_or(0))
-        })
-        .sum()
+    [
+        ArtifactKind::TextEncoder,
+        ArtifactKind::Vae,
+        ArtifactKind::Layout,
+    ]
+    .into_iter()
+    .map(|kind| {
+        let of = || {
+            m.artifacts.iter().filter(|a| {
+                a.kind == kind && weights.is_none_or(|w| w.runtime.allows_companion(&a.id))
+            })
+        };
+        of().find(|a| reg.is_artifact_installed(a))
+            .or_else(|| of().find(|a| a.default))
+            .or_else(|| of().next())
+            .map_or(0, |a| a.total_size() + a.workspace.unwrap_or(0))
+    })
+    .sum()
 }
 
 /// Shared geometry for fit and admission, including directory checkpoints.
@@ -395,7 +399,8 @@ pub(crate) fn artifact_shape(
     audio: Option<bool>,
 ) -> Option<ModelShape> {
     // the towers follow their switches; an image lane's text encoder and
-    // VAE have no switch and are always charged
+    // VAE, and a document reader's layout model, have no switch and are
+    // always charged
     let tower = lane_companion_bytes_for(model, &state.registry, Some(artifact))
         + towers_bytes_for(model, &state.registry, Some(artifact), vision, audio);
     let path = artifact.entry_path(state.registry.models_dir())?;
@@ -778,7 +783,8 @@ pub async fn handle(
                 ..env
             };
             // the towers follow their switches; an image lane's text
-            // encoder and VAE have no switch and are always charged
+            // encoder and VAE, and a document reader's layout model, have no
+            // switch and are always charged
             let tower = lane_companion_bytes_for(m, &state.registry, Some(a))
                 + towers_bytes_for(m, &state.registry, Some(a), want_vision, q.audio);
             let weights = a.total_size();
@@ -925,8 +931,12 @@ pub async fn handle(
                 "min_p": paddock_models::sampling::as_written(k.min_p),
             })
         };
-        let sampling = arch
-            .as_deref()
+        // LightOnOCR-3 is a qwen35 file, so its own row is named by the catalog
+        // family - the same identity key the runner reads off the file
+        let lightonocr = m.family.as_deref() == Some(paddock_models::sampling::LIGHTONOCR3);
+        let sampling = lightonocr
+            .then_some(paddock_models::sampling::LIGHTONOCR3)
+            .or(arch.as_deref())
             .and_then(paddock_models::sampling::elected)
             .map(|e| {
                 let mut o = knobs(&e.thinking).as_object().cloned().unwrap_or_default();

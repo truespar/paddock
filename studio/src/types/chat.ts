@@ -314,6 +314,20 @@ export interface OcrRegion {
   /** full 4-corner quads [x1,y1,...,x4,y4] parallel to boxes (spotting keeps
    *  rotated shapes; each box is its quad's axis-aligned hull) */
   quads?: number[][]
+  /** continues the previous block (LightOnOCR-3's `label+`: a paragraph
+   *  flowing into the next column) */
+  continues?: boolean
+  /** which page of the request it is on (PaddleOCR-VL's document pipeline,
+   *  which reads every page of one request; 0-based) */
+  page?: number
+  /** the box in the page's own pixels [x1, y1, x2, y2] */
+  bbox?: [number, number, number, number]
+  /** a picture region's crop name in the answer's markdown */
+  image?: string
+  /** a merged block's group (its first block's index) */
+  group?: number
+  /** why a readable region was not read */
+  unread?: string
 }
 
 /** The structured half of an OCR answer (deepseek2-ocr family) -
@@ -337,6 +351,10 @@ export interface OcrMeta {
   passThrough?: boolean
   /** an explicit mode replaced text the user also typed - shown, never silent. */
   droppedText?: boolean
+  /** the server's repetition stop ended the read where the model began to
+   *  loop (PaddleOCR-VL): what came before is kept, the rest of the page is
+   *  unread - shown, never silent. */
+  repetitionStop?: boolean
   /** grounded regions parsed from the finished output (grounding only). */
   regions?: OcrRegion[]
 }

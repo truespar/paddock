@@ -480,7 +480,11 @@ impl Generator for Qwen35 {
                 crate::schedule::row_cap(decodes.len(), capacity),
                 decodes.len(),
                 self.pending.iter().any(|p| self.slots[p.slot].mm.is_some()),
-                self.pending.iter().any(|p| {
+                // Mixed prefill grants are FIFO. Only its advancing head may
+                // need the first-image quantum. Looking at *any* untouched
+                // follower pins the entire queue to eight rows until that
+                // follower runs, starving it behind hundreds of tiny passes.
+                self.pending.front().is_some_and(|p| {
                     self.slots[p.slot].mm.is_some() && p.tokens.len() - p.offset == p.work
                 }),
             ),

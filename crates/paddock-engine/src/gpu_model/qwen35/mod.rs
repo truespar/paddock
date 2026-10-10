@@ -1748,6 +1748,9 @@ pub struct GpuQwen35 {
     /// `encode_step` runs one planned unit of the oldest, and the scheduler's
     /// ticks run between them.
     mm_steps: std::collections::VecDeque<mm_steps::MmStepJob>,
+    /// The endpoint reads one-shot pages (`Generator::set_page_reader`): a wave
+    /// of cold picture prompts groups up to the elected prefill chunk.
+    page_reader: bool,
     /// In-flight pipelined pure-decode (see [`Self::decode_pipe_begin`]). Some
     /// only transiently, between a `decode_pipe_begin` and its matching drain
     /// inside one `run_batched` decode burst; the scheduler always drains before
@@ -1827,7 +1830,9 @@ struct MmLayout {
     ids: Vec<u32>,
     /// axis-major `[4, t_len]` mRoPE positions (t, h, w, extra).
     mrope: Vec<u32>,
-    /// per-token causal visibility bound (image rows share their span's last).
+    /// per-token causal visibility bound - the row's own index for every row,
+    /// image rows included (raster-causal, see [`build_mm_layout`]). Kept as a
+    /// per-row array because the attention kernels take one.
     bound: Vec<u32>,
     /// `(seq_offset, n_img)` per image chunk, in order - where to inject the
     /// vision embeddings over the placeholder rows.
@@ -1894,14 +1899,23 @@ fn build_mm_layout(
                 }
                 let base = pos;
                 let img_start = ids.len();
-                let img_last = (img_start + n_img - 1) as u32;
                 splices.push((img_start, n_img));
+                // M-RoPE shares the temporal coordinate, not an attention
+                // domain: image rows stay raster-causal in the language model,
+                // as transformers' Qwen3.5 (a plain causal mask over the
+                // sequence) and llama.cpp's M-RoPE causal mask (equal t,
+                // compared in (y, x) order - b11516) both run it. Only the ViT
+                // is non-causal. This lane used to give every image row its
+                // whole picture (b9895's equal-t visibility); plain answers
+                // survived that, LightOnOCR-3's grounding boxes did not, and
+                // the Metal lane had already moved (32c7c0661).
                 for j in 0..n_img {
+                    let seq = ids.len() as u32;
                     ids.push(0);
                     ts.push(base);
                     hs.push(base + (j / nx) as u32);
                     ws.push(base + (j % nx) as u32);
-                    bound.push(img_last);
+                    bound.push(seq);
                 }
                 pos = base + nx.max(ny) as u32;
             }
@@ -3128,18 +3142,46 @@ struct Scratch {
 }
 
 /// Input-embedding table, quantized-resident with per-tensor dispatch (rows
-/// dequant on the fly in both arms - same values as full dequant).
+/// dequant on the fly in every arm - same values as full dequant).
 enum TokEmbd {
     Q8(QuantTensor),
     Kq(RepackedKQ),
+    /// A tied file (no `output.weight`): the LM head IS this matrix, so rows
+    /// are gathered from the head's own repacked plane and nothing else is
+    /// resident - one copy where there used to be two (675 MB of Q8_0 on
+    /// LightOnOCR-3-4B, 270 MB on the 0.8B). Both repacks are exact, so the
+    /// rows are the values the raw table held.
+    Tied,
+}
+
+/// What one token gather reads - see [`TokEmbd::src`].
+#[derive(Clone, Copy)]
+pub(super) enum EmbedSrc<'a> {
+    Q8(&'a QuantTensor),
+    Q8r(&'a RepackedQ8),
+    Kq(&'a RepackedKQ),
 }
 
 impl TokEmbd {
-    /// Resident device bytes (the VRAM ledger line).
+    /// The plane a gather reads: the resident table, or for a tied file the
+    /// LM head's. Takes the head as a separate field borrow so a call site
+    /// can still hold other fields mutably.
+    fn src<'a>(&'a self, head: &'a QuantW) -> EmbedSrc<'a> {
+        match (self, head) {
+            (TokEmbd::Q8(t), _) => EmbedSrc::Q8(t),
+            (TokEmbd::Kq(t), _) => EmbedSrc::Kq(t),
+            (TokEmbd::Tied, QuantW::Q8(q)) => EmbedSrc::Q8r(q),
+            (TokEmbd::Tied, QuantW::Kq(k)) => EmbedSrc::Kq(k),
+        }
+    }
+
+    /// Resident device bytes (the VRAM ledger line) - zero when tied, the
+    /// head's line already counts the plane.
     fn resident_bytes(&self) -> usize {
         match self {
             TokEmbd::Q8(t) => t.bytes.len(),
             TokEmbd::Kq(t) => t.data.len() + t.scales.len(),
+            TokEmbd::Tied => 0,
         }
     }
     fn label(&self) -> &'static str {
@@ -3151,6 +3193,7 @@ impl TokEmbd {
                 paddock_models::ggml_type::GgmlType::Q6K => "Q6_K",
                 _ => "IQ4_XS",
             },
+            TokEmbd::Tied => "tied - the lm_head plane",
         }
     }
 }
@@ -3185,7 +3228,6 @@ mod mm_layout_tests {
         ids.extend(std::iter::repeat_n(0u32, n_img));
         ids.extend_from_slice(after);
         let p0 = before.len() as u32;
-        let img_last_row = (before.len() + n_img - 1) as u32;
         let after_base = p0 + nx.max(ny) as u32;
         let mut mrope = vec![0u32; 4 * t_len];
         let mut bound = vec![0u32; t_len];
@@ -3203,11 +3245,8 @@ mod mm_layout_tests {
             mrope[t_len + i] = h;
             mrope[2 * t_len + i] = w;
             mrope[3 * t_len + i] = 0;
-            bound[i] = if i >= before.len() && i < before.len() + n_img {
-                img_last_row
-            } else {
-                i as u32
-            };
+            // raster-causal everywhere, image rows included
+            bound[i] = i as u32;
         }
         let final_mrope_pos = after_base as usize + after.len();
         MmLayout {
@@ -3276,8 +3315,9 @@ mod mm_layout_tests {
         // img B 1x3, base 5: nx=1 -> w const, h = base + j
         assert_eq!(&h[7..10], &[5, 6, 7]);
         assert_eq!(&w[7..10], &[5, 5, 5]);
-        // bounds: text = own index; each image span = its last row index
-        assert_eq!(l.bound, vec![0, 1, 5, 5, 5, 5, 6, 9, 9, 9, 10, 11]);
+        // bounds: every row its own index - image rows are raster-causal
+        // (equal t is a shared rotary coordinate, not a visibility group)
+        assert_eq!(l.bound, (0..12).collect::<Vec<u32>>());
     }
 
     /// `mm_rows` is what routes a long picture prompt away from the batched

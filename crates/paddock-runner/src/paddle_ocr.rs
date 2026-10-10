@@ -19,10 +19,14 @@ use serde_json::{Value, json};
 
 use crate::deepseek_ocr::{OcrResolved, Region, body_text, set_body_text};
 
-/// The six official tasks. Wire names are ours (short, stable); canonical
-/// strings are the checkpoint's.
+/// The six official tasks, plus the authors' document pipeline. Wire names
+/// are ours (short, stable); canonical strings are the checkpoint's.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PoMode {
+    /// the page through PP-DocLayoutV3 first, each region read with its
+    /// label's task (`crate::paddle_layout`) - served where the layout
+    /// companion is installed
+    Document,
     Ocr,
     Table,
     Formula,
@@ -34,6 +38,7 @@ pub enum PoMode {
 impl PoMode {
     fn parse(s: &str) -> Result<PoMode, String> {
         Ok(match s {
+            "document" => PoMode::Document,
             "ocr" => PoMode::Ocr,
             "table" => PoMode::Table,
             "formula" => PoMode::Formula,
@@ -42,8 +47,8 @@ impl PoMode {
             "seal" => PoMode::Seal,
             other => {
                 return Err(format!(
-                    "invalid ocr.mode {other:?} (expected one of ocr, table, formula, chart, \
-                     spotting, seal)"
+                    "invalid ocr.mode {other:?} (expected one of document, ocr, table, formula, \
+                     chart, spotting, seal)"
                 ));
             }
         })
@@ -51,6 +56,7 @@ impl PoMode {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            PoMode::Document => "document",
             PoMode::Ocr => "ocr",
             PoMode::Table => "table",
             PoMode::Formula => "formula",
@@ -60,10 +66,11 @@ impl PoMode {
         }
     }
 
-    /// The checkpoint's own task prompt for this mode.
+    /// The checkpoint's own task prompt for this mode (document mode's
+    /// regions carry their own; its page prompt is never rendered).
     fn canonical(self) -> &'static str {
         match self {
-            PoMode::Ocr => "OCR:",
+            PoMode::Document | PoMode::Ocr => "OCR:",
             PoMode::Table => "Table Recognition:",
             PoMode::Formula => "Formula Recognition:",
             PoMode::Chart => "Chart Recognition:",
@@ -84,44 +91,64 @@ impl PoMode {
 
 /// The capability object - same shape as deepseek's so one client reads
 /// both; this family has no crop classes and no grounded-region parse.
-pub fn caps_json() -> Value {
+/// `document` is advertised only where the layout companion is loaded.
+pub fn caps_json(document: bool) -> Value {
+    let mut modes: Vec<&str> = Vec::new();
+    if document {
+        modes.push(PoMode::Document.as_str());
+    }
+    modes.extend(PoMode::ALL.map(PoMode::as_str));
     json!({
-        "modes": PoMode::ALL.map(PoMode::as_str),
+        "modes": modes,
         "crops": [],
         "grounding": false,
     })
 }
 
-/// Parse one `ocr` object for this family: `mode` is the only field - its
-/// interface has no crops, grounding or sampling knobs, and accepting them
-/// silently would advertise behaviour that does not exist.
-pub fn parse_opts(v: &Value) -> Result<Option<PoMode>, String> {
+/// The repetition stop's n-gram and window: the DeepSeek-OCR reference's
+/// guard sizes (35 within 128), here ending the read instead of banning.
+const REPEAT_STOP: (usize, usize) = (35, 128);
+
+/// What one request asks of this family.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct PoOpts {
+    pub mode: Option<PoMode>,
+    /// `ocr.repetition_stop` - None keeps the default (armed).
+    pub repetition_stop: Option<bool>,
+}
+
+/// Parse one `ocr` object for this family: `mode`, and `repetition_stop`
+/// (on by default) - its interface has no crops, grounding or sampling
+/// knobs, and accepting them silently would advertise behaviour that does
+/// not exist.
+pub fn parse_opts(v: &Value) -> Result<PoOpts, String> {
     let Some(obj) = v.as_object() else {
         return Err("ocr must be a JSON object".into());
     };
-    let mut mode = None;
+    let mut opts = PoOpts::default();
     for (k, v) in obj {
         match k.as_str() {
             "mode" => {
                 let s = v.as_str().ok_or("ocr.mode must be a string")?;
-                mode = Some(PoMode::parse(s)?);
+                opts.mode = Some(PoMode::parse(s)?);
+            }
+            "repetition_stop" => {
+                opts.repetition_stop =
+                    Some(v.as_bool().ok_or("ocr.repetition_stop must be a boolean")?);
             }
             other => {
                 return Err(format!(
-                    "unknown ocr field {other:?} for this family (only `mode` - it has no \
-                     crop classes, grounding or sampling knobs)"
+                    "unknown ocr field {other:?} for this family (only `mode` and \
+                     `repetition_stop` - it has no crop classes, grounding or sampling knobs)"
                 ));
             }
         }
     }
-    Ok(mode)
+    Ok(opts)
 }
 
 /// The two accepted channels, same precedence as deepseek's from_request.
-pub fn opts_from_request(
-    top: Option<&Value>,
-    kwargs: Option<&Value>,
-) -> Result<Option<PoMode>, String> {
+pub fn opts_from_request(top: Option<&Value>, kwargs: Option<&Value>) -> Result<PoOpts, String> {
     let kw = kwargs
         .and_then(|k| k.as_object())
         .and_then(|k| k.get("ocr"));
@@ -136,21 +163,39 @@ pub fn opts_from_request(
             parse_opts(t)
         }
         (None, Some(k)) => parse_opts(k),
-        (None, None) => Ok(None),
+        (None, None) => Ok(PoOpts::default()),
     }
 }
 
 /// Resolve one request: pass-through text stands, an explicit mode's
 /// canonical prompt wins (dropped text echoed, never silent), and an empty
-/// body defaults to `OCR:` - the checkpoint is task-prompt-conditioned, so a
-/// bare image without any prompt is off its training distribution.
+/// body defaults to the document pipeline where it is served (`document`:
+/// Ok), else to `OCR:` - the checkpoint is task-prompt-conditioned, so a
+/// bare image without any prompt is off its training distribution, and its
+/// authors read pages region by region, not whole. `document` carries why
+/// the pipeline is not served here when it is not; asking for it then is a
+/// 400 that says so.
+///
+/// The repetition stop is armed unless the request turns it off. Greedy
+/// decoding of a whole page can fall into a loop that runs to the token cap
+/// (the checkpoint ships no repetition control: its own pipeline reads
+/// layout-detected regions, not pages); the stop ends the read at the
+/// loop's first repeated 35-token n-gram, so everything before it is the
+/// unguarded output byte for byte, and a page that never loops is untouched.
 pub fn resolve(
     messages: &mut [Value],
-    mode: Option<PoMode>,
+    opts: PoOpts,
     pages: usize,
+    document: Result<(), &str>,
 ) -> Result<Option<OcrResolved>, String> {
+    let (mode, stop) = (opts.mode, opts.repetition_stop.unwrap_or(true));
+    if mode == Some(PoMode::Document)
+        && let Err(why) = document
+    {
+        return Err(format!("ocr.mode \"document\" is not served here: {why}"));
+    }
     if pages == 0 {
-        if mode.is_some() {
+        if opts != PoOpts::default() {
             return Err(
                 "the ocr request object applies to image requests - this request has no image \
                  (attach the page as an image or PDF)"
@@ -165,6 +210,7 @@ pub fn resolve(
 
     let resolved_mode = match mode {
         Some(m) => Some(m),
+        None if !has_text && document.is_ok() => Some(PoMode::Document),
         None if !has_text => Some(PoMode::Ocr),
         None => None,
     };
@@ -178,7 +224,10 @@ pub fn resolve(
                 "explicit ocr.mode replaced the request's own text - echoed as dropped_text"
             );
         }
-        set_body_text(messages, m.canonical(), mode.is_some());
+        // the document pipeline renders each region's own prompt
+        if m != PoMode::Document {
+            set_body_text(messages, m.canonical(), mode.is_some());
+        }
     }
 
     let resolved = OcrResolved {
@@ -193,7 +242,9 @@ pub fn resolve(
         image_tokens: 0,
         pass_through,
         dropped_text,
-        ngram: (0, 0),
+        // off is off - never the ban the same sizes would arm
+        ngram: if stop { REPEAT_STOP } else { (0, 0) },
+        repeat_stop: stop,
     };
     tracing::info!(
         mode = resolved.mode.unwrap_or("pass-through"),
@@ -293,6 +344,7 @@ pub fn parse_spotting(raw: &str) -> Vec<Region> {
                 boxes,
                 text: Some(text.to_owned()),
                 quads,
+                continues: false,
             });
         }
     }
@@ -302,6 +354,31 @@ pub fn parse_spotting(raw: &str) -> Vec<Region> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const NO_DOC: Result<(), &str> = Err("no layout model");
+
+    #[test]
+    fn a_bare_page_reads_as_a_document_where_the_pipeline_serves() {
+        let mut msgs = user("");
+        let r = resolve(&mut msgs, PoOpts::default(), 1, Ok(()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.mode, Some("document"));
+        // the page prompt is never rendered: the regions carry their own
+        assert!(!body_text(&msgs).contains("OCR:"));
+        // text still passes through, and the other modes still resolve
+        let mut msgs = user("Table Recognition:");
+        let r = resolve(&mut msgs, PoOpts::default(), 1, Ok(()))
+            .unwrap()
+            .unwrap();
+        assert!(r.pass_through);
+        // asked for where it is not served: a 400 naming why
+        let opts = parse_opts(&json!({"mode": "document"})).unwrap();
+        let e = resolve(&mut user(""), opts, 1, NO_DOC).unwrap_err();
+        assert!(e.contains("no layout model"), "{e}");
+        assert_eq!(caps_json(false)["modes"][0], "ocr");
+        assert_eq!(caps_json(true)["modes"][0], "document");
+    }
 
     fn user(text: &str) -> Vec<Value> {
         vec![json!({"role": "user", "content": [
@@ -313,7 +390,9 @@ mod tests {
     #[test]
     fn empty_body_defaults_to_ocr() {
         let mut msgs = user("");
-        let r = resolve(&mut msgs, None, 1).unwrap().unwrap();
+        let r = resolve(&mut msgs, PoOpts::default(), 1, NO_DOC)
+            .unwrap()
+            .unwrap();
         assert_eq!(r.mode, Some("ocr"));
         assert!(!r.pass_through && !r.dropped_text);
         assert!(body_text(&msgs).contains("OCR:"));
@@ -322,7 +401,9 @@ mod tests {
     #[test]
     fn pass_through_text_stands() {
         let mut msgs = user("Table Recognition:");
-        let r = resolve(&mut msgs, None, 1).unwrap().unwrap();
+        let r = resolve(&mut msgs, PoOpts::default(), 1, NO_DOC)
+            .unwrap()
+            .unwrap();
         assert_eq!(r.mode, None);
         assert!(r.pass_through);
         assert_eq!(body_text(&msgs).trim(), "Table Recognition:");
@@ -331,7 +412,17 @@ mod tests {
     #[test]
     fn explicit_mode_wins_and_echoes_drop() {
         let mut msgs = user("make a markdown");
-        let r = resolve(&mut msgs, Some(PoMode::Table), 1).unwrap().unwrap();
+        let r = resolve(
+            &mut msgs,
+            PoOpts {
+                mode: Some(PoMode::Table),
+                ..PoOpts::default()
+            },
+            1,
+            NO_DOC,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(r.mode, Some("table"));
         assert!(r.dropped_text);
         assert_eq!(body_text(&msgs).trim(), "Table Recognition:");
@@ -341,18 +432,53 @@ mod tests {
     fn unknown_field_is_a_loud_400() {
         assert!(parse_opts(&json!({"mode": "ocr", "crop": "base"})).is_err());
         assert!(parse_opts(&json!({"grounding": true})).is_err());
-        assert!(parse_opts(&json!({"mode": "ocr"})).unwrap().is_some());
+        assert!(parse_opts(&json!({"mode": "ocr"})).unwrap().mode.is_some());
     }
 
     #[test]
     fn text_only_with_ocr_object_is_refused() {
         let mut msgs = user("hello");
-        assert!(resolve(&mut msgs, Some(PoMode::Ocr), 0).is_err());
+        assert!(
+            resolve(
+                &mut msgs,
+                PoOpts {
+                    mode: Some(PoMode::Ocr),
+                    ..PoOpts::default()
+                },
+                0,
+                NO_DOC,
+            )
+            .is_err()
+        );
     }
 
     // live-probe fixture: greedy spotting output on a 1000×1400
     // synthetic page with text drawn at known pixel positions
     const SPOT: &str = "INVOICE 2026-001<|LOC_81|><|LOC_76|><|LOC_626|><|LOC_76|><|LOC_626|><|LOC_115|><|LOC_81|><|LOC_115|>\nTotal: 1234,56 kr<|LOC_78|><|LOC_289|><|LOC_390|><|LOC_289|><|LOC_390|><|LOC_317|><|LOC_78|><|LOC_317|>\nPADDOCK<|LOC_599|><|LOC_896|><|LOC_801|><|LOC_896|><|LOC_801|><|LOC_921|><|LOC_599|><|LOC_921|>";
+
+    #[test]
+    fn the_repetition_stop_is_armed_by_default_and_turns_off_whole() {
+        use paddock_engine::service::FinishReason;
+        let mut msgs = user("");
+        let r = resolve(&mut msgs, PoOpts::default(), 1, NO_DOC)
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.guard(), (35, 128, true), "a stop, never the ban");
+        let echo = r.echo_at(Some(FinishReason::Repetition));
+        assert_eq!(echo["repetition_stop"]["fired"], true);
+        assert_eq!(echo["no_repeat_ngram"]["size"], 0, "nothing is masked");
+        assert_eq!(
+            r.echo_at(Some(FinishReason::Stop))["repetition_stop"]["fired"],
+            false
+        );
+
+        let opts = parse_opts(&json!({"repetition_stop": false})).unwrap();
+        let mut msgs = user("");
+        let r = resolve(&mut msgs, opts, 1, NO_DOC).unwrap().unwrap();
+        assert_eq!(r.guard(), (0, 0, false), "off is off, not the ban");
+        assert!(r.echo_at(None).get("repetition_stop").is_none());
+        assert!(parse_opts(&json!({"repetition_stop": "no"})).is_err());
+    }
 
     #[test]
     fn spotting_lines_parse_to_text_regions() {

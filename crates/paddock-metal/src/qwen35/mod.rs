@@ -24,6 +24,8 @@ mod ternary_tests;
 use geometry::Geometry;
 #[cfg(test)]
 mod few_bench;
+#[cfg(test)]
+mod language_mlx_trace_tests;
 mod load;
 mod lookup;
 #[cfg(test)]
@@ -169,7 +171,8 @@ pub struct Qwen35 {
     device: MetalDevice,
     embedding: Weight,
     output_norm: Weight,
-    head: Weight,
+    // Tied checkpoints reuse the embedding allocation, including its quantization.
+    head: Option<Weight>,
     layers: Vec<Layer>,
     scratch: Scratch,
     moe_scratch: Option<moe::Workspace>,
@@ -209,6 +212,10 @@ pub struct Qwen35 {
 }
 
 impl Qwen35 {
+    fn head(&self) -> &Weight {
+        self.head.as_ref().unwrap_or(&self.embedding)
+    }
+
     fn checkpoint_copy(&self, cmd: &Commands<'_>, from: usize, to: usize) {
         let g = self.geometry;
         self.dflash_checkpoint(cmd, from, to);

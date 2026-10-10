@@ -4,6 +4,21 @@ import Testing
 @testable import PaddockConversationCore
 
 struct OCRPresentationTests {
+  @Test func lightOnBlocksPreserveWordsAndContinuationWithoutBrokenImages() throws {
+    let raw =
+      "![title](102,61,898,95) Quarterly Report\n![text](102,120,480,410)\nRevenue grew.\n![text+](520,120,898,300) The north led."
+    #expect(NativeOCRText.display(raw) == "Quarterly Report\n\nRevenue grew.\nThe north led.")
+    #expect(NativeOCRText.display("Quarterly Report\n![text](102,12") == "Quarterly Report\n")
+    #expect(NativeOCRText.display("![logo](logo.png) hi") == "![logo](logo.png) hi")
+    let regions = NativeDocumentRunState.regions([
+      .object([
+        "label": .string("text"), "continues": .bool(true),
+        "boxes": .array([.array([.number(1), .number(2), .number(3), .number(4)])]),
+      ])
+    ])
+    #expect(regions.first?["continues"]?.bool == true)
+  }
+
   struct Fixture: Decodable {
     let name: String
     let raw: String

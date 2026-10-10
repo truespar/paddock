@@ -18,7 +18,7 @@ struct StudioDocumentReadingControls: View {
           Button(Self.label(value)) { onMode(value) }
             .buttonStyle(ComposerButtonStyle(active: mode == value))
         }
-        if grounding {
+        if grounding && !modes.contains("grounding") {
           Button("Show where", systemImage: "viewfinder") { onRegions(!regions) }
             .buttonStyle(ComposerButtonStyle(active: regions))
         }
@@ -32,6 +32,7 @@ struct StudioDocumentReadingControls: View {
       "document": "Document", "multipage": "Pages of one document", "free": "Plain text",
       "layout": "Layout map", "figure": "Figure", "ocr": "Text", "table": "Table",
       "formula": "Formula", "chart": "Chart", "spotting": "Text spotting", "seal": "Seal",
+      "plain": "Markdown", "grounding": "Blocks with boxes",
     ][mode]
       ?? mode.prefix(1).uppercased() + mode.dropFirst()
   }

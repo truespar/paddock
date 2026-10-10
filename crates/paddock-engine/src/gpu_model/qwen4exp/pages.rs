@@ -263,6 +263,20 @@ impl KvPages {
         self.radix.as_mut().map(|r| (r, pool))
     }
 
+    /// `Generator::anchor_at`: hold the user turn's prompt-end checkpoint.
+    pub(super) fn anchor(&mut self, tokens: &[u32], upto: usize) {
+        if let Some(at) = self
+            .radix
+            .as_mut()
+            .and_then(|r| r.mark_anchor(tokens, upto))
+        {
+            tracing::debug!(
+                "qwen4exp anchor: user-turn checkpoint at {at} (prompt {})",
+                upto + 1
+            );
+        }
+    }
+
     /// Upload the table if a `back` grew it. Called by every walk's staging,
     /// after its `back`s and before the walk or replay reads the table.
     pub(super) fn sync(&mut self, e: &GpuExecutor) -> Result<(), GpuModelError> {

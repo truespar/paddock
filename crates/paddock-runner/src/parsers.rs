@@ -663,45 +663,11 @@ fn scan_qwen_blocks(region: &str, hints: &ToolHints, out: &mut Parsed) -> String
     kept
 }
 
+/// One block's call. The JSON comes from the streaming builder run over a
+/// final block, so a streamed call's fragments and this text agree.
 fn parse_function_block(block: &str, hints: &ToolHints) -> Option<ToolCallRaw> {
-    let f = block.find("<function=")?;
-    let after = &block[f + "<function=".len()..];
-    let name_end = after.find('>')?;
-    let name = after[..name_end].trim();
-    if name.is_empty() {
-        return None;
-    }
-    let mut body = &after[name_end + 1..];
-    if let Some(e) = body.find("</function>") {
-        body = &body[..e];
-    }
-
-    let param_hints = hints.get(name);
-    let mut args = serde_json::Map::new();
-    let mut cur = body;
-    while let Some(p) = cur.find("<parameter=") {
-        let after_p = &cur[p + "<parameter=".len()..];
-        let Some(k_end) = after_p.find('>') else {
-            break;
-        };
-        let key = after_p[..k_end].trim().to_owned();
-        let vstart = &after_p[k_end + 1..];
-        let (raw, next) = match vstart.find("</parameter>") {
-            Some(e) => (&vstart[..e], &vstart[e + "</parameter>".len()..]),
-            None => (vstart, ""),
-        };
-        // the template wraps values in single newlines; inner newlines are data
-        let val = raw.strip_prefix('\n').unwrap_or(raw);
-        let val = val.strip_suffix('\n').unwrap_or(val);
-        let declared_string = param_hints.and_then(|h| h.get(&key)).copied();
-        args.insert(key, coerce(val, declared_string));
-        cur = next;
-    }
-
-    Some(ToolCallRaw {
-        name: name.to_owned(),
-        arguments: Value::Object(args).to_string(),
-    })
+    let (name, arguments, _) = crate::tool_stream::qwen_call_json(block, hints, None)?;
+    Some(ToolCallRaw { name, arguments })
 }
 
 pub(crate) const MINICPM_FUNC: &str = "<function";

@@ -77,6 +77,9 @@ struct Node {
     /// MambaRadixCache keeps the same two lists: KV leaf-to-root, states from
     /// any node).
     ckpt_used: u64,
+    /// The checkpoint here is a USER-TURN anchor (see [`PagedRadix::mark_anchor`]):
+    /// stolen only after every plain one.
+    anchor: bool,
     /// KV tier content-chain key for the prefix ending at this node
     /// `parent.tkey.child(tokens)`, rooted in the cache
     /// namespace via [`PagedRadix::set_tier_root`]. `None` when the tier is
@@ -202,6 +205,7 @@ impl PagedRadix {
                 recurred: false,
                 state_blk: None,
                 ckpt_used: 0,
+                anchor: false,
                 tkey: None,
             }],
             free_nodes: Vec::new(),
@@ -419,6 +423,13 @@ impl PagedRadix {
         Some(idx)
     }
 
+    /// The page of the cached node ending exactly at block boundary `pos` of
+    /// `tokens` (see `node_at`). No LRU bump.
+    pub fn block_at(&self, tokens: &[u32], pos: usize) -> Option<BlockId> {
+        let node = self.node_at(tokens, pos)?;
+        Some(self.nodes[node as usize].block)
+    }
+
     /// The cached node ending exactly at block boundary `pos` of `tokens`.
     /// Unlike a match, which keeps a token back for the prefill to run and
     /// so never reaches the node at `tokens.len()`, this walks all the way.
@@ -606,6 +617,59 @@ impl PagedRadix {
         );
     }
 
+    /// Hold the deepest checkpoint on `tokens`' path at or below `upto` as a
+    /// USER-TURN anchor: it goes after every plain checkpoint when room is
+    /// needed. The runner flags the prompt that opens a user turn; its end is
+    /// where that turn's re-render will diverge - chat templates drop the
+    /// reasoning of turns before the latest user message, so at the NEXT user
+    /// message the conversation re-renders from this turn's first reply on.
+    /// Plain LRU had stolen exactly this checkpoint during any long tool loop
+    /// (it is the turn's OLDEST), and a hybrid without it re-prefills the
+    /// whole conversation (Nemotron, 150-216K: 34-58 s a user turn). It is
+    /// also where an edited or retried user message branches. Anchors are
+    /// capped at a quarter of the checkpoint capacity (at least two); the
+    /// stalest one past the cap turns plain again. Returns the anchored
+    /// boundary in tokens.
+    pub fn mark_anchor(&mut self, tokens: &[u32], upto: usize) -> Option<usize> {
+        let mut node = 0u32;
+        let mut best = None;
+        for bi in 0..upto.min(tokens.len()) / BLOCK_TOKENS {
+            let chunk = &tokens[bi * BLOCK_TOKENS..(bi + 1) * BLOCK_TOKENS];
+            let Some(&child) = self.nodes[node as usize].children.get(&hash_block(chunk)) else {
+                break;
+            };
+            if self.nodes[child as usize].tokens != chunk {
+                break;
+            }
+            node = child;
+            if self.nodes[node as usize].state_blk.is_some() {
+                best = Some((node, (bi + 1) * BLOCK_TOKENS));
+            }
+        }
+        let (node, at) = best?;
+        self.nodes[node as usize].anchor = true;
+        let cap = (self.state_slots() / 4).max(2);
+        let held: Vec<usize> = (0..self.nodes.len())
+            .filter(|&i| {
+                self.nodes[i].alive && self.nodes[i].anchor && self.nodes[i].state_blk.is_some()
+            })
+            .collect();
+        if held.len() > cap
+            && let Some(&old) = held
+                .iter()
+                .filter(|&&i| i != node as usize)
+                .min_by_key(|&&i| self.nodes[i].ckpt_used)
+        {
+            self.nodes[old].anchor = false;
+        }
+        Some(at)
+    }
+
+    /// Checkpoint indices in all: free plus resident.
+    fn state_slots(&self) -> usize {
+        self.state_free.len() + self.count_state()
+    }
+
     /// The checkpoint to give up first: never-recurred first under
     /// `protect_proven`, then least recently written or resumed. The paged
     /// backing orders by the checkpoint's own recency (`ckpt_used`); the
@@ -619,6 +683,7 @@ impl PagedRadix {
             .filter(|(i, n)| *i != 0 && *i as u32 != spare && n.alive && n.state_blk.is_some())
             .min_by_key(|(_, n)| {
                 (
+                    n.anchor,
                     protect && n.recurred,
                     if paged { n.ckpt_used } else { n.last_used },
                 )
@@ -725,7 +790,7 @@ impl PagedRadix {
             .iter()
             .enumerate()
             .filter(|(i, n)| *i != 0 && *i as u32 != spare && n.alive && n.state_blk.is_some())
-            .min_by_key(|(_, n)| if paged { n.ckpt_used } else { n.last_used })
+            .min_by_key(|(_, n)| (n.anchor, if paged { n.ckpt_used } else { n.last_used }))
             .map(|(i, _)| i)
     }
 
@@ -778,7 +843,7 @@ impl PagedRadix {
             .iter()
             .enumerate()
             .filter(|(i, n)| *i != 0 && n.alive && n.state_blk.is_some())
-            .min_by_key(|(_, n)| (protect && n.recurred, n.last_used))
+            .min_by_key(|(_, n)| (n.anchor, protect && n.recurred, n.last_used))
             .map(|(i, _)| i)?;
         if self.protect_proven && self.nodes[victim].recurred {
             // Every resident checkpoint belongs to a prefix that came back, so
@@ -829,6 +894,7 @@ impl PagedRadix {
                 recurred: false,
                 state_blk: None,
                 ckpt_used: 0,
+                anchor: false,
                 tkey: self.nodes[node as usize].tkey.map(|k| k.child(chunk)),
             });
             self.nodes[node as usize].children.insert(h, nid);
@@ -868,10 +934,10 @@ impl PagedRadix {
     }
 
     /// Every live checkpoint attachment: (depth-blocks, tier chain key,
-    /// state index). Bounded by the state-pool capacity, so the blob
+    /// state index, node). Bounded by the state-pool capacity, so the blob
     /// write-through can scan it every pass - the LRU leaves are exactly
     /// the chains whose checkpoints have already recycled.
-    pub fn state_attachments(&self) -> Vec<(usize, Option<LogicalKey>, u32)> {
+    pub fn state_attachments(&self) -> Vec<(usize, Option<LogicalKey>, u32, u32)> {
         self.nodes
             .iter()
             .enumerate()
@@ -883,7 +949,7 @@ impl PagedRadix {
                     d += 1;
                     node = self.nodes[node as usize].parent;
                 }
-                (d, n.tkey, n.state_blk.expect("filtered"))
+                (d, n.tkey, n.state_blk.expect("filtered"), i as u32)
             })
             .collect()
     }
@@ -1003,6 +1069,7 @@ impl PagedRadix {
                 recurred: false,
                 state_blk: None,
                 ckpt_used: 0,
+                anchor: false,
                 tkey,
             });
             self.nodes[node as usize].children.insert(h, nid);
@@ -1640,6 +1707,52 @@ mod tests {
             2,
             "the other chain kept its checkpoint"
         );
+    }
+
+    #[test]
+    fn a_user_turn_anchor_outlives_newer_plain_checkpoints() {
+        // turn 1's prompt-end checkpoint is the anchor; the tool loop's later
+        // plain ones go first when a live context needs pages, and the next
+        // turn's re-render (diverging inside block 2) still resumes at it
+        let mut pool = KvPool::with_blocks(16);
+        let mut r = PagedRadix::new();
+        r.set_state_paged(8, 2);
+        let conv = cached(&mut r, &mut pool, 1, 4);
+        let anchor = r
+            .attach_state_with_pool(&conv, BLOCK_TOKENS, &mut pool)
+            .expect("turn 1");
+        assert_eq!(r.mark_anchor(&conv, BLOCK_TOKENS + 5), Some(BLOCK_TOKENS));
+        let mid = r
+            .attach_state_with_pool(&conv, 2 * BLOCK_TOKENS, &mut pool)
+            .expect("loop");
+        let last = r
+            .attach_state_with_pool(&conv, 4 * BLOCK_TOKENS, &mut pool)
+            .expect("loop end");
+        assert_eq!(pool.free_blocks(), 6);
+        assert!(r.make_room(&mut pool, 10, 0));
+        assert!(r.state_pages(mid).is_empty() && r.state_pages(last).is_empty());
+        assert_eq!(r.state_pages(anchor).len(), 2, "the anchor held");
+        let mut rewritten = conv[..BLOCK_TOKENS + 3].to_vec();
+        rewritten.extend([9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9]);
+        assert_eq!(r.match_full(&rewritten).ckpt, Some((BLOCK_TOKENS, anchor)));
+    }
+
+    #[test]
+    fn anchors_are_capped_at_a_quarter_of_the_checkpoints() {
+        let mut pool = KvPool::with_blocks(64);
+        let mut r = PagedRadix::new();
+        r.set_state_paged(8, 1); // cap: max(2, 8 / 4)
+        for seed in 1..=3 {
+            let c = cached(&mut r, &mut pool, seed, 1);
+            r.attach_state_with_pool(&c, BLOCK_TOKENS, &mut pool)
+                .expect("ckpt");
+            assert_eq!(r.mark_anchor(&c, BLOCK_TOKENS), Some(BLOCK_TOKENS));
+        }
+        let held = r.nodes.iter().filter(|n| n.anchor && n.state_blk.is_some());
+        assert_eq!(held.count(), 2, "the stalest anchor turned plain");
+        // no checkpoint on the path: nothing to hold
+        let bare = cached(&mut r, &mut pool, 9, 2);
+        assert_eq!(r.mark_anchor(&bare, 2 * BLOCK_TOKENS), None);
     }
 
     #[test]

@@ -3,10 +3,16 @@ use super::*;
 
 #[test]
 fn head256_prefill_matches_split_gqa_with_shuffled_pages() {
-    for (g, prefix, strict) in [Geometry::DENSE_9B, Geometry::DENSE_27B, Geometry::MOE_35B]
-        .into_iter()
-        .flat_map(|g| [3usize, 997].map(|p| (g, p)))
-        .flat_map(|(g, p)| [false, true].map(|strict| (g, p, strict)))
+    for (g, prefix, strict) in [
+        Geometry::DENSE_08B,
+        Geometry::DENSE_4B,
+        Geometry::DENSE_9B,
+        Geometry::DENSE_27B,
+        Geometry::MOE_35B,
+    ]
+    .into_iter()
+    .flat_map(|g| [3usize, 997].map(|p| (g, p)))
+    .flat_map(|(g, p)| [false, true].map(|strict| (g, p, strict)))
     {
         let heads = g.heads;
         let device = MetalDevice::new(Some(192 << 20)).unwrap();
@@ -740,7 +746,7 @@ fn qwen_four_row_decode_and_ragged_prefill_match_serial_gpu() {
 
 #[test]
 fn deltanet_chunked_matches_gpu_recurrence_with_ragged_resumed_spans() {
-    for vh in [4, 6] {
+    for vh in [2, 4, 6] {
         for strict in [false, true] {
             deltanet_chunked_geometry(vh, strict);
         }

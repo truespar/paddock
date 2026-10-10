@@ -79,6 +79,42 @@ fn sam3_loader_rejects_wrong_shapes_dtypes_nonfinite_and_half_overflow() {
 }
 
 #[test]
+fn sam3_weight_conversion_is_chunk_bounded_and_overflow_flag_is_sticky() {
+    let file = Fixture::new(&[("stub", "F32", &[1], f32_bytes(&[0.]))]);
+    let st = SafetensorsFile::open(&file.0).unwrap();
+    let elements = 65536 * 2 + 8;
+    let budget = (elements * 2 + 65536 * 4 + 4) as u64;
+    let d = MetalDevice::new(Some(budget)).unwrap();
+    let r = Reader { d: &d, st: &st };
+    let mut values: Vec<_> = (0..elements).map(|i| (i % 511) as f32 - 255.).collect();
+    let m = r.matrix_values(&values, 8, elements / 8).unwrap();
+    let actual = super::super::tests::bytes(&m.w);
+    assert_eq!(
+        actual,
+        values
+            .iter()
+            .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(d.allocated_bytes(), (elements * 2) as u64);
+    drop(m);
+    for index in [0, 65536, elements - 1] {
+        let saved = values[index];
+        values[index] = f32::INFINITY;
+        assert!(r.matrix_values(&values, 8, elements / 8).is_err());
+        assert_eq!(
+            d.allocated_bytes(),
+            0,
+            "failed chunk upload leaked allocations"
+        );
+        values[index] = saved;
+    }
+    for (k, n) in [(0, 1), (8, 0), (usize::MAX, 8)] {
+        assert!(r.matrix_values(&[], k, n).is_err());
+    }
+}
+
+#[test]
 fn sam3_loader_transposed_convolution_taps_have_exact_checkpoint_order() {
     let weights: Vec<_> = (0..64).map(|i| i as f32).collect();
     let file = Fixture::new(&[

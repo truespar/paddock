@@ -2,7 +2,7 @@ use super::*;
 use paddock_models::{gguf::Value, mapped::MappedGguf};
 
 impl Qwen35 {
-    /// Load elected dense 9B/27B or MoE 35B geometry. In-file MTP weights are not
+    /// Load elected dense 0.8B/4B/9B/27B or MoE 35B geometry. In-file MTP weights are not
     /// executed with speculation off. Unsupported architectures fail loudly.
     pub fn load(
         path: &Path,
@@ -87,14 +87,22 @@ impl Qwen35 {
                 ));
             }
             return Self::from_source(
-                checkpoint::Source::Mlx(source),
+                checkpoint::Source::Mlx(source, cfg.tied),
                 context,
                 max_batch,
                 budget,
                 tiered,
                 source_versions,
                 (
-                    Geometry::DENSE_27B,
+                    Geometry {
+                        width: cfg.width,
+                        ff: cfg.ff,
+                        layers: cfg.layers,
+                        heads: cfg.heads,
+                        kv_heads: cfg.kv_heads,
+                        value_heads: cfg.value_heads,
+                    }
+                    .validate()?,
                     248320,
                     64,
                     cfg.context,
@@ -246,7 +254,7 @@ impl Qwen35 {
         }
         let mlx = matches!(
             map,
-            checkpoint::Source::Mlx(_)
+            checkpoint::Source::Mlx(_, _)
                 | checkpoint::Source::Splash(_)
                 | checkpoint::Source::Bonsai(_, _)
         );
@@ -331,7 +339,7 @@ impl Qwen35 {
         }
         let embedding = map.load(&device, "token_embd.weight", &[width, vocab])?;
         let output_norm = map.load(&device, "output_norm.weight", &[width])?;
-        let head = map.load(&device, "output.weight", &[width, vocab])?;
+        let head = map.load_head(&device, &[width, vocab])?;
         let mut layers = Vec::new();
         let mut index = 0;
         for i in 0..count {

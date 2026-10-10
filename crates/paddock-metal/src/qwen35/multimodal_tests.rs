@@ -201,12 +201,80 @@ fn ptq1_causal_image_lifecycle_without_speculation() {
     causal_image_lifecycle(&["off"]);
 }
 
+#[test]
+#[ignore = "requires LightOn GGUF/tower or MLX directory in PADDOCK_METAL_QWEN_MODEL / PADDOCK_METAL_MMPROJ"]
+fn lighton_tied_head_and_causal_image_lifecycle() {
+    let path = std::env::var_os("PADDOCK_METAL_QWEN_MODEL").expect("LightOn target");
+    let m = Qwen35::load(Path::new(&path), 2048, 4, None).unwrap();
+    assert!(matches!(
+        m.geometry,
+        Geometry::DENSE_08B | Geometry::DENSE_4B
+    ));
+    assert!(
+        m.head.is_none(),
+        "tied checkpoint must not allocate a second vocabulary plane"
+    );
+    assert!(std::ptr::eq(m.head(), &m.embedding));
+    drop(m);
+    causal_image_lifecycle(&["off"]);
+}
+
+#[test]
+#[ignore = "requires LightOn MLX in PADDOCK_METAL_QWEN_MODEL / PADDOCK_METAL_MMPROJ"]
+fn lighton_mixed_image_followers_do_not_reapply_handoff_cap() {
+    let path = std::env::var_os("PADDOCK_METAL_QWEN_MODEL").unwrap();
+    let tower = std::env::var_os("PADDOCK_METAL_MMPROJ").unwrap();
+    let mut m = Qwen35::load(Path::new(&path), 2048, 4, None).unwrap();
+    m.attach_vision(Path::new(&tower)).unwrap();
+    let mut rider = pick(&m.prefill(3, &[100; 64]).unwrap());
+    let requests = [[255, 0, 0], [0, 255, 0], [0, 0, 255]]
+        .into_iter()
+        .enumerate()
+        .map(|(slot, color)| (slot, image_prompt(color, 1024)))
+        .collect();
+    assert_eq!(m.admit_images(requests).len(), 3);
+    while m.encoding_pending() {
+        m.step_images();
+    }
+    assert_eq!(m.pending.len(), 3);
+    // Identical leading text may already be restored from the rider's cache.
+    let follower_offsets = [m.pending[1].offset, m.pending[2].offset];
+    for expected in [7, 127, 127] {
+        let before = m.pending.front().unwrap().offset;
+        let pos = m.slots[3].history.len() as u32;
+        let (logits, done) = m.forward_mixed(&[(3, rider, pos)], 512).unwrap();
+        rider = pick(&logits);
+        assert!(done.is_empty());
+        assert_eq!(m.pending.front().unwrap().offset - before, expected);
+        assert_eq!(
+            m.pending[1].offset, follower_offsets[0],
+            "follower must not pin the head to seven rows"
+        );
+        assert_eq!(m.pending[2].offset, follower_offsets[1]);
+    }
+    assert!(m.prefill_abort(1));
+    let before = m.pending.front().unwrap().offset;
+    let pos = m.slots[3].history.len() as u32;
+    let (_, done) = m.forward_mixed(&[(3, rider, pos)], 512).unwrap();
+    assert!(done.is_empty());
+    assert_eq!(m.pending.front().unwrap().offset - before, 127);
+    assert_eq!(m.pending[1].slot, 2);
+    assert_eq!(m.pending[1].offset, follower_offsets[1]);
+    assert!(m.cache.iter().all(|c| !c.reserved));
+}
+
 fn causal_image_lifecycle(modes: &[&str]) {
     let path = std::env::var_os("PADDOCK_METAL_QWEN_MODEL").expect("target");
     let mm = std::env::var_os("PADDOCK_METAL_MMPROJ").expect("vision");
     for &mode in modes {
         let mut m = Qwen35::load(Path::new(&path), 2048, 4, None).unwrap();
         m.attach_vision(Path::new(&mm)).unwrap();
+        eprintln!(
+            "resident model weights={} KV/state={} device={:?}",
+            m.weight_bytes,
+            m.kv_bytes,
+            m.device_mem_used()
+        );
         match mode {
             "mtp" => m.attach_mtp(Path::new(&path)).unwrap(),
             "dflash" => m
@@ -272,7 +340,15 @@ fn causal_image_lifecycle(modes: &[&str]) {
             }
             assert_eq!(ticks, 10, "7-row handoff then 127-row hybrid grants");
         }
-        assert_eq!(captures[0], captures[1], "{mode}: interleaved image chunks");
+        assert!(
+            captures[0] == captures[1],
+            "{mode}: interleaved image chunks; max error {}",
+            captures[0]
+                .iter()
+                .zip(&captures[1])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max)
+        );
         let mut next = pick(&captures[0]);
         for pos in 1089..1105 {
             let a = m.execute(&[(0, next, pos)], &[0]).unwrap();

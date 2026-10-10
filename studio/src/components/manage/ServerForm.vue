@@ -377,6 +377,9 @@ const AF_CARDS: { hd: string; fields: AfField[] }[] = [
       { key: 'audio_mmproj', kind: 'file', src: 'mmproj', hint: 'audio encoder GGUF beside the image one (EmbeddingGemma 2) - enables audio input' },
       { key: 'audio', kind: 'bool3', choices: ['true', 'false'], hint: 'false = audio input off, even with an audio tower beside the weights (refused beside audio_mmproj) · unset = load one found there' },
       { key: 'mtp', kind: 'file', src: 'mtp', hint: 'drafter GGUF for speculative decode (models without in-file MTP)' },
+      // PaddleOCR-VL's layout companion (config.rs `layout`): a checkpoint
+      // FOLDER no picker lists, so it is a plain path
+      { key: 'layout', kind: 'text', hint: 'PP-DocLayoutV3 folder for PaddleOCR-VL - serves its document pipeline · unset = load one found in or beside the weights folder' },
       // The image lane's two companions (config.rs `text_encoder` / `vae`).
       // The encoder is a GGUF, so the gguf picker suits it; the VAE is a
       // safetensors file no picker lists, so it is a plain path.

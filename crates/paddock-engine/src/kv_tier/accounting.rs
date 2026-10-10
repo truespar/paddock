@@ -30,6 +30,11 @@ pub enum MissReason {
     /// workload whose repeats keep landing here is being served by a tier
     /// that is too small, or by an eviction policy picking the wrong victim.
     Ghost,
+    /// The prefix's KV is held but not the model state a hybrid (DeltaNet,
+    /// Mamba, sliding window) needs to resume on it: none was saved at a
+    /// boundary the held KV reaches, or it was evicted. Blocks alone are
+    /// worthless there, so this is a miss, not a hit.
+    NoState,
 }
 
 /// How many recently-evicted keys the ghost set remembers. Sized to cover a
@@ -87,6 +92,8 @@ pub struct TierDecisions {
     pub miss_tripped: u64,
     /// The alarm: missed on content we evicted (see [`MissReason::Ghost`]).
     pub miss_ghost: u64,
+    /// KV held without the state to resume on it (see [`MissReason::NoState`]).
+    pub miss_no_state: u64,
     /// Cost-model arms taken on a hit.
     pub elected_restore: u64,
     pub elected_recompute: u64,
@@ -124,6 +131,7 @@ impl TierDecisions {
             MissReason::NoNewTokens => self.miss_no_new_tokens += 1,
             MissReason::Tripped => self.miss_tripped += 1,
             MissReason::Ghost => self.miss_ghost += 1,
+            MissReason::NoState => self.miss_no_state += 1,
         }
     }
 

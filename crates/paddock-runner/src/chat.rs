@@ -1,9 +1,9 @@
 //! `POST /v1/chat/completions` - renders the model's chat template, generates,
 //! parses the model family's dialect (Harmony, Qwen XML) into content /
 //! reasoning / tool calls. Streaming emits `reasoning_content` deltas (the
-//! DeepSeek/vLLM convention) alongside `content` deltas; each tool call
-//! streams ATOMICALLY as its block completes (fragmenting the arguments of a
-//! non-JSON dialect is not prefix-stable, so no partial-argument deltas).
+//! DeepSeek/vLLM convention) alongside `content` deltas; tool calls stream
+//! their arguments as they are written, in prefix-stable pieces (see
+//! `tool_stream`), where the dialect has an incremental reader.
 //! Supports n<=8 merged-SSE choices and logprobs over all sampled tokens.
 //! Streams always end with a terminal usage chunk (server-exact counts -
 //! benchmark clients undercount from visible text otherwise); the
@@ -828,6 +828,7 @@ pub(crate) fn decode_image_url(
     url: &str,
     budget: Option<paddock_engine::generator::VisionBudget>,
     detail: ImageDetail,
+    page_edge: Option<u32>,
 ) -> Result<RequestImage, String> {
     let bytes = crate::reference_image::data_url_bytes(url)?;
     // an actionable refusal: the crate's error names the format it found
@@ -878,6 +879,12 @@ pub(crate) fn decode_image_url(
         img.apply_orientation(orientation);
         img.to_rgb8()
     };
+    // A checkpoint trained at a fixed page size gets its own client's fit
+    // first, on the original pixels, so the budget below sees a fitted page
+    // rather than resampling a resample (LightOnOCR-3, `lighton_ocr::fit_page`).
+    if let Some(edge) = page_edge {
+        rgb = crate::lighton_ocr::fit_page(rgb, edge);
+    }
     // Down only when the request's allowance is smaller than the tower's.
     // Auto can bind too: Bonsai permits 16,384 image tokens, while the default
     // request budget is 4,096. Passing a camera photo through unchanged here
@@ -944,9 +951,10 @@ pub(crate) fn parse_mm_processor_kwargs(
 pub(crate) fn decode_images(
     refs: Vec<ImageRef<'_>>,
     budget: Option<paddock_engine::generator::VisionBudget>,
+    page_edge: Option<u32>,
 ) -> Result<Vec<RequestImage>, String> {
     refs.into_iter()
-        .map(|r| decode_image_url(&r.url, budget, r.detail))
+        .map(|r| decode_image_url(&r.url, budget, r.detail, page_edge))
         .collect()
 }
 
@@ -1470,7 +1478,7 @@ fn prepare(
         );
     }
     let t_img = std::time::Instant::now();
-    let images = decode_images(image_refs, model.engine.vision_budget())?;
+    let images = model.decode_images(image_refs)?;
     if !images.is_empty() && paddock_models::dev_var_os!("PADDOCK_REQ_TRACE").is_some() {
         eprintln!(
             "req-trace: decode_images {:.1} ms ({} images), done at {}",
@@ -1511,7 +1519,7 @@ fn prepare(
     if let Some(effort) = req.reasoning_effort.as_deref() {
         kwargs = merge_reasoning_effort(&model.reasoning, effort, kwargs)?;
     }
-    let kwargs = chat_template::family_defaults(&model.arch, kwargs);
+    let kwargs = model.template_defaults(kwargs);
     // reasoning: {"max_tokens": N} - the OpenRouter-shaped thinking budget
     // (effort stays on reasoning_effort above). Resolved against the rendered
     // prompt further down, once thinking_open is known.
@@ -1552,27 +1560,17 @@ fn prepare(
     if let Some(marker) = model.audio_inline_marker.as_deref() {
         chat_template::inline_audio_content(&mut messages, marker);
     }
-    // deepseek2-ocr instruction mapping: resolve the `ocr`
-    // request object + prompt vocabulary - mutates `messages` (canonical
-    // task string / grounding token) and carries the family's sampling
-    // default and crop override out through `Prepared`.
-    if req.ocr.is_some() && !model.ocr && !model.paddleocr {
-        return Err("the `ocr` request object is only served by document-parser models".into());
-    }
-    let ocr = if model.ocr {
-        let opts = crate::deepseek_ocr::OcrOpts::from_request(req.ocr.as_ref(), kwargs.as_ref())?;
-        let sizes: Vec<(usize, usize)> = images.iter().map(RequestImage::size).collect();
-        let max_tiles = model
-            .engine
-            .vision_budget()
-            .map_or(0, |b| (b.max_pixels / (640 * 640)) as usize);
-        crate::deepseek_ocr::resolve(&mut messages, opts, &sizes, max_tiles)?
-    } else if model.paddleocr {
-        let mode = crate::paddle_ocr::opts_from_request(req.ocr.as_ref(), kwargs.as_ref())?;
-        crate::paddle_ocr::resolve(&mut messages, mode, images.len())?
-    } else {
-        None
-    };
+    // document-parser instruction mapping: resolve the `ocr` request object +
+    // prompt vocabulary - mutates `messages` (canonical task string /
+    // grounding token) and carries the family's sampling default and crop
+    // override out through `Prepared`.
+    let ocr = model.resolve_ocr_on(
+        req.ocr.as_ref(),
+        kwargs.as_ref(),
+        &mut messages,
+        &images,
+        true,
+    )?;
     let mut prompt = chat_template::render_with_specials(
         template,
         &messages,
@@ -1724,7 +1722,7 @@ fn prepare(
     // untouched request decodes greedy.
     let dflt = sd.resolve(thinking_open);
     let sampler = SamplingParams {
-        temperature: req.temperature.unwrap_or(if model.document_parser {
+        temperature: req.temperature.unwrap_or(if model.greedy_default() {
             0.0
         } else {
             dflt.temp
@@ -1740,7 +1738,7 @@ fn prepare(
         logit_bias: parse_logit_bias(req.logit_bias.as_ref(), model.tokenizer.vocab_size)?,
         // the OCR family's required repetition guard (reference parity),
         // 35/128 single page, 35/1024 multi-page, caller-overridable
-        no_repeat_ngram: ocr.as_ref().map_or((0, 0), |o| o.ngram),
+        no_repeat_ngram: ocr.as_ref().map_or((0, 0, false), |o| o.guard()),
     };
 
     Ok(Prepared {
@@ -1814,9 +1812,13 @@ impl Meta {
     /// `regions` parsed from the finished output (choice 0) when armed. The
     /// parse runs on a decode that keeps special tokens - the markup rides on
     /// `<|ref|>`/`<|det|>` specials the content decode may strip.
-    fn ocr_json(&self, first_choice_ids: &[u32]) -> Option<serde_json::Value> {
+    fn ocr_json(
+        &self,
+        first_choice_ids: &[u32],
+        finish: Option<FinishReason>,
+    ) -> Option<serde_json::Value> {
         let o = self.ocr.as_ref()?;
-        let mut echo = o.echo();
+        let mut echo = o.echo_at(finish);
         if let Ok(raw) = self.tokenizer.decode(first_choice_ids, false)
             && let Some(regions) = crate::deepseek_ocr::regions_json(&raw)
         {
@@ -2319,6 +2321,10 @@ pub async fn handle(
         Err(e) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
     };
     scope.tokenized(t_prep.elapsed());
+    if let Some(o) = prepared.ocr.as_ref().filter(|o| o.mode == Some("document")) {
+        let pages = prepared.mm_chunks.clone().unwrap_or_default();
+        return crate::paddle_layout::respond(&state, &req, o.clone(), pages).await;
+    }
     // multimodal prompts feed the engine TEXT tokens only (the pad slot is
     // replaced by the image rows engine-side); history/penalties see text
     let prompt: Vec<u32> = prepared.engine_prompt.clone();
@@ -2372,6 +2378,7 @@ pub async fn handle(
             logprobs: prepared.logprobs,
             submitted: None, // stamped by Engine::submit
             canvas_read: None,
+            user_turn: crate::user_turn::chat(&req.messages),
         };
         if let Err(e) = model.engine.submit(gen_req) {
             return err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e);
@@ -2390,8 +2397,10 @@ async fn collect_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>
     let mut choices = Vec::with_capacity(rxs.len());
     let mut completion_tokens = 0usize;
     let mut cached = 0usize;
-    // choice 0's raw ids, kept for the OCR grounding-region parse
+    // choice 0's raw ids and finish, kept for the OCR echo (grounding regions,
+    // whether the repetition stop fired)
     let mut first_ids: Vec<u32> = Vec::new();
+    let mut first_reason = None;
     for (index, mut rx) in rxs.into_iter().enumerate() {
         let mut ids = Vec::new();
         let mut lps: Vec<TokenLogprobs> = Vec::new();
@@ -2459,6 +2468,7 @@ async fn collect_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>
         completion_tokens += ids.len();
         if index == 0 && meta.ocr.is_some() {
             first_ids = ids.clone();
+            first_reason = Some(reason);
         }
         meta.scope.finish(finish);
         choices.push(ChatChoice {
@@ -2478,7 +2488,7 @@ async fn collect_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>
         meta.media_tokens(),
         meta.media_is_audio,
     );
-    let ocr = meta.ocr_json(&first_ids);
+    let ocr = meta.ocr_json(&first_ids, first_reason);
     Json(ChatCompletionResponse {
         id: meta.id,
         object: "chat.completion",
@@ -2521,8 +2531,8 @@ struct ChoiceState {
     lp_flushed: usize,
     r_emitted: usize,
     c_emitted: usize,
-    /// complete tool calls already streamed (atomic per-call deltas)
-    calls_emitted: usize,
+    /// tool calls streaming their arguments as they are written
+    tools: crate::tool_stream::ToolStream,
     stop_hit: bool,
     done: bool,
     finish_sent: bool,
@@ -2539,7 +2549,7 @@ impl ChoiceState {
             lp_flushed: 0,
             r_emitted: 0,
             c_emitted: 0,
-            calls_emitted: 0,
+            tools: Default::default(),
             stop_hit: false,
             done: false,
             finish_sent: false,
@@ -2549,9 +2559,9 @@ impl ChoiceState {
 }
 
 /// Streaming: `reasoning_content` / `content` deltas as they resolve, tool
-/// calls streamed ATOMICALLY as each call's block completes (id + name +
-/// full arguments in one delta - incremental argument fragments of a non-JSON
-/// dialect are not prefix-stable), n choices merged into one SSE with per-
+/// calls as prefix-stable argument fragments while they are written (one
+/// whole-call delta per block on dialects without an incremental reader),
+/// n choices merged into one SSE with per-
 /// chunk `index`, optional terminal usage chunk (stream_options).
 fn stream_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>>) -> Response {
     use futures::StreamExt as _;
@@ -2617,24 +2627,11 @@ fn stream_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>>) -> R
                             ));
                         }
                     }
-                    // tool calls stream as soon as their block CLOSES
-                    let complete = parsed.complete_calls.min(parsed.tool_calls.len());
-                    while cs.calls_emitted < complete {
-                        let k = cs.calls_emitted;
-                        let tc = &parsed.tool_calls[k];
-                        let call = serde_json::json!([{
-                            "index": k,
-                            "id": format!("call_{}", uuid::Uuid::new_v4().simple()),
-                            "type": "function",
-                            "function": {"name": tc.name, "arguments": tc.arguments},
-                        }]);
-                        cs.calls_emitted += 1;
+                    // tool calls stream their arguments as they are written
+                    let evs = cs.tools.step(meta.dialect, &raw, meta.thinking_open, meta.hints.as_ref(), meta.single_tool_call, &parsed);
+                    for d in evs.into_iter().filter_map(|e| crate::tool_stream::chat_delta(e, meta.legacy_functions)) {
                         let lp = flush_lps(&meta, cs);
-                        yield sse_data(&chunk(
-                            &meta, created, i,
-                            serde_json::json!({"tool_calls": call}),
-                            None, lp,
-                        ));
+                        yield sse_data(&chunk(&meta, created, i, d, None, lp));
                     }
                     if let Some(c) = &parsed.content {
                         let (trunc, hit) = apply_stop_strings(c, &meta.stop_strings);
@@ -2769,33 +2766,14 @@ fn stream_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>>) -> R
             } else {
                 cs.reason.as_str()
             };
-            if !cs.stop_hit && parsed.tool_calls.len() > cs.calls_emitted {
-                let calls: Vec<serde_json::Value> = parsed.tool_calls[cs.calls_emitted..]
-                    .iter()
-                    .enumerate()
-                    .map(|(off, tc)| {
-                        serde_json::json!({
-                            "index": cs.calls_emitted + off,
-                            "id": format!("call_{}", uuid::Uuid::new_v4().simple()),
-                            "type": "function",
-                            "function": {"name": tc.name, "arguments": tc.arguments},
-                        })
-                    })
-                    .collect();
-                let lp = flush_lps(&meta, cs);
-                // Legacy clients read `delta.function_call`, and their protocol
-                // has room for exactly one call - which is safe here because
-                // adopt_legacy_functions pinned parallel_tool_calls off, so
-                // `calls` is never longer than 1 on this branch.
-                let delta = if meta.legacy_functions {
-                    match calls.first() {
-                        Some(c) => serde_json::json!({"function_call": c["function"]}),
-                        None => serde_json::json!({}),
-                    }
-                } else {
-                    serde_json::json!({"tool_calls": calls})
-                };
-                yield sse_data(&chunk(&meta, created, i, delta, None, lp));
+            // calls still open at the end (a block cut by max_tokens) or
+            // never started; legacy `function_call` holds one call, which is
+            // safe because adopt_legacy_functions pinned parallel calls off
+            if !cs.stop_hit {
+                for d in cs.tools.finish(&parsed).into_iter().filter_map(|e| crate::tool_stream::chat_delta(e, meta.legacy_functions)) {
+                    let lp = flush_lps(&meta, cs);
+                    yield sse_data(&chunk(&meta, created, i, d, None, lp));
+                }
             }
             meta.scope.finish(finish);
             yield sse_data(&chunk(&meta, created, i, serde_json::json!({}), Some(finish), None));
@@ -2828,7 +2806,8 @@ fn stream_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>>) -> R
             });
             // the OCR resolution echo (+ grounded regions) rides the terminal
             // chunk - the one place a streaming client gets whole-turn facts
-            if let Some(o) = meta.ocr_json(states.first().map_or(&[], |s| &s.ids)) {
+            let first = states.first();
+            if let Some(o) = meta.ocr_json(first.map_or(&[], |s| &s.ids), first.map(|s| s.reason)) {
                 usage["ocr"] = o;
             }
             yield sse_data(&usage.to_string());
@@ -2836,7 +2815,7 @@ fn stream_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>>) -> R
         yield Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"));
     };
     // SSE comments while the model works in silence (a long cold prefill, a
-    // tool call that is emitted whole): client idle timeouts count them,
+    // non-string tool value being coerced): client idle timeouts count them,
     // parsers skip them - the Responses surface's rule (responses.rs)
     Sse::new(sse)
         .keep_alive(KeepAlive::default())
@@ -3122,7 +3101,7 @@ mod tests {
         })];
         let refs = find_images(&msgs).expect("find");
         assert_eq!(refs.len(), 1);
-        let img = decode_image_url(&refs[0].url, None, refs[0].detail).expect("decode");
+        let img = decode_image_url(&refs[0].url, None, refs[0].detail, None).expect("decode");
         assert_eq!((img.w, img.h), (2, 1));
         // BMP is BGR bottom-up; decoded RGB: pixel0 = (0,0,255), pixel1 = (255,0,0)
         assert_eq!(&img.rgb, &[0, 0, 255, 255, 0, 0]);
@@ -3152,7 +3131,7 @@ mod tests {
         let refs = find_images(&msgs).expect("find");
         assert_eq!(refs.len(), 3);
         for r in &refs {
-            let img = decode_image_url(&r.url, None, r.detail).expect("decode");
+            let img = decode_image_url(&r.url, None, r.detail, None).expect("decode");
             assert_eq!((img.w, img.h), (2, 1));
             assert_eq!(&img.rgb, &[0, 0, 255, 255, 0, 0]);
         }
@@ -3181,7 +3160,7 @@ mod tests {
     #[test]
     fn remote_urls_and_videos_are_rejected() {
         assert!(
-            decode_image_url("https://x.test/cat.png", None, ImageDetail::Auto)
+            decode_image_url("https://x.test/cat.png", None, ImageDetail::Auto, None)
                 .unwrap_err()
                 .contains("data:")
         );
@@ -3299,7 +3278,7 @@ mod tests {
             .encode(rgb.as_raw(), 20, 12, image::ExtendedColorType::Rgb8)
             .expect("webp encode");
         let uri = format!("data:image/webp;base64,{}", b64(&webp));
-        let img = decode_image_url(&uri, None, ImageDetail::Auto).expect("webp decode");
+        let img = decode_image_url(&uri, None, ImageDetail::Auto, None).expect("webp decode");
         assert_eq!((img.w, img.h), (20, 12));
         assert_eq!(&img.rgb[..3], &[255, 0, 0]);
 
@@ -3313,7 +3292,7 @@ mod tests {
         }
         drop(enc);
         let uri = format!("data:image/gif;base64,{}", b64(&gif));
-        let img = decode_image_url(&uri, None, ImageDetail::Auto).expect("gif decode");
+        let img = decode_image_url(&uri, None, ImageDetail::Auto, None).expect("gif decode");
         assert_eq!((img.w, img.h), (8, 8));
         assert_eq!(&img.rgb[..3], &[255, 0, 0]);
     }
@@ -3333,7 +3312,7 @@ mod tests {
             "data:image/tiff;base64,{}",
             base64::engine::general_purpose::STANDARD.encode(out.into_inner())
         );
-        let img = decode_image_url(&uri, None, ImageDetail::Auto).expect("tiff decode");
+        let img = decode_image_url(&uri, None, ImageDetail::Auto, None).expect("tiff decode");
         assert_eq!((img.w, img.h), (10, 6));
         assert_eq!(&img.rgb[..3], &[0, 0, 255]);
     }
@@ -3379,7 +3358,7 @@ mod tests {
             "data:image/jpeg;base64,{}",
             base64::engine::general_purpose::STANDARD.encode(&tagged)
         );
-        let img = decode_image_url(&uri, None, ImageDetail::Auto).expect("jpeg decode");
+        let img = decode_image_url(&uri, None, ImageDetail::Auto, None).expect("jpeg decode");
         assert_eq!((img.w, img.h), (2, 4), "dimensions must swap");
         // top-left red, bottom-left blue (JPEG lossy -> tolerant thresholds)
         let top = &img.rgb[..3];
@@ -3410,7 +3389,7 @@ mod tests {
             "data:image/avif;base64,{}",
             base64::engine::general_purpose::STANDARD.encode(bytes)
         );
-        let img = decode_image_url(&uri, None, ImageDetail::Auto).expect("AVIF must decode");
+        let img = decode_image_url(&uri, None, ImageDetail::Auto, None).expect("AVIF must decode");
         assert_eq!((img.w, img.h), (32, 32));
         assert!(img.rgb.iter().any(|&b| b != 0), "decoded to black");
     }
@@ -3427,7 +3406,8 @@ mod tests {
             "data:image/heic;base64,{}",
             base64::engine::general_purpose::STANDARD.encode(bytes)
         );
-        let e = decode_image_url(&uri, None, ImageDetail::Auto).expect_err("HEVC is not decodable");
+        let e = decode_image_url(&uri, None, ImageDetail::Auto, None)
+            .expect_err("HEVC is not decodable");
         assert!(e.contains("HEIC") && e.contains("HEVC"), "{e}");
         assert!(e.contains("convert"), "a refusal must offer a way out: {e}");
     }
@@ -3443,7 +3423,7 @@ mod tests {
             "data:image/jp2;base64,{}",
             base64::engine::general_purpose::STANDARD.encode(junk)
         );
-        let err = decode_image_url(&uri, None, ImageDetail::Auto).unwrap_err();
+        let err = decode_image_url(&uri, None, ImageDetail::Auto, None).unwrap_err();
         assert!(err.starts_with("image decode:"), "{err}");
         assert!(err.contains("accepted formats"), "{err}");
     }
@@ -3516,11 +3496,11 @@ mod tests {
         let uri = data_uri(&png_of(900, 600));
         let b = test_budget();
         let dims = |d| {
-            let i = decode_image_url(&uri, Some(b), d).expect("decode");
+            let i = decode_image_url(&uri, Some(b), d, None).expect("decode");
             (i.w, i.h)
         };
-        let plain = decode_image_url(&uri, None, ImageDetail::Auto).expect("decode");
-        let high = decode_image_url(&uri, Some(b), ImageDetail::High).expect("decode");
+        let plain = decode_image_url(&uri, None, ImageDetail::Auto, None).expect("decode");
+        let high = decode_image_url(&uri, Some(b), ImageDetail::High, None).expect("decode");
         assert_eq!((high.w, high.h), (900, 600));
         assert_eq!(high.rgb, plain.rgb, "Original must retain decoded pixels");
         let auto = dims(ImageDetail::Auto);
@@ -3542,8 +3522,8 @@ mod tests {
         let mut b = test_budget();
         b.max_tokens = 1024;
         b.max_pixels = 1024 * b.pixels_per_token;
-        let plain = decode_image_url(&uri, None, ImageDetail::Auto).expect("decode");
-        let auto = decode_image_url(&uri, Some(b), ImageDetail::Auto).expect("decode");
+        let plain = decode_image_url(&uri, None, ImageDetail::Auto, None).expect("decode");
+        let auto = decode_image_url(&uri, Some(b), ImageDetail::Auto, None).expect("decode");
         assert_eq!((auto.w, auto.h), (plain.w, plain.h));
         assert_eq!(auto.rgb, plain.rgb, "do not double-resize ordinary towers");
     }
@@ -3561,11 +3541,11 @@ mod tests {
         // The dimensions of the reported 17.3 MiB JPEG. A generated image
         // keeps this regression independent of anyone's private photograph.
         let uri = data_uri(&png_of(6720, 4480));
-        let auto = decode_image_url(&uri, Some(b), ImageDetail::Auto).expect("decode");
+        let auto = decode_image_url(&uri, Some(b), ImageDetail::Auto, None).expect("decode");
         assert_eq!((auto.w, auto.h), (2508, 1672));
         assert!(b.tokens_for(auto.w as u32, auto.h as u32) <= 4096);
         drop(auto);
-        let high = decode_image_url(&uri, Some(b), ImageDetail::High).expect("decode");
+        let high = decode_image_url(&uri, Some(b), ImageDetail::High, None).expect("decode");
         assert_eq!((high.w, high.h), (6720, 4480));
     }
 
@@ -3575,9 +3555,9 @@ mod tests {
     #[test]
     fn an_image_within_budget_is_not_resampled() {
         let uri = data_uri(&png_of(64, 48));
-        let plain = decode_image_url(&uri, None, ImageDetail::Auto).expect("decode");
+        let plain = decode_image_url(&uri, None, ImageDetail::Auto, None).expect("decode");
         for d in [ImageDetail::Auto, ImageDetail::High] {
-            let fitted = decode_image_url(&uri, Some(test_budget()), d).expect("decode");
+            let fitted = decode_image_url(&uri, Some(test_budget()), d, None).expect("decode");
             assert_eq!((fitted.w, fitted.h), (64, 48));
             assert_eq!(fitted.rgb, plain.rgb, "pixels changed without a resize");
         }
@@ -3589,7 +3569,8 @@ mod tests {
     #[test]
     fn a_tiny_image_is_left_alone_rather_than_upsampled() {
         let uri = data_uri(&png_of(8, 8));
-        let img = decode_image_url(&uri, Some(test_budget()), ImageDetail::High).expect("decode");
+        let img =
+            decode_image_url(&uri, Some(test_budget()), ImageDetail::High, None).expect("decode");
         assert_eq!((img.w, img.h), (8, 8));
     }
 

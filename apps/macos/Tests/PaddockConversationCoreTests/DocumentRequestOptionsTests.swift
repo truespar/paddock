@@ -3,6 +3,27 @@ import Testing
 @testable import PaddockConversationCore
 
 struct DocumentRequestOptionsTests {
+  @Test func lightOnGroundingIsAModeNotABoolean() {
+    let capability: O = [
+      "ocr": .object([
+        "modes": .array([.string("plain"), .string("grounding")]), "grounding": .bool(true),
+      ])
+    ]
+    for mode in ["grounding", "plain"] {
+      let settings: O = ["ocrMode": .string(mode), "ocrRegions": .bool(true)]
+      var body: O = [:]
+      #expect(
+        NativeDocumentRequestOptions.apply(
+          fields: settings, capability: capability, input: input, body: &body))
+      #expect(body["ocr"] == .object(["mode": .string(mode)]))
+    }
+    var body: O = [:]
+    #expect(
+      !NativeDocumentRequestOptions.apply(
+        fields: ["ocrRegions": .bool(true)], capability: capability, input: input, body: &body))
+    #expect(body["ocr"] == nil)
+  }
+
   typealias V = ConversationValue
   typealias O = [String: V]
   let input: [V] = [

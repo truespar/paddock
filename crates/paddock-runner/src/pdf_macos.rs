@@ -271,6 +271,7 @@ mod tests {
         let config = PdfConfig {
             max_pages: 1,
             long_edge: 100,
+            max_dpi: 300.0,
         };
         let p = render(&bytes, &config, PageSel::All).unwrap();
         assert_eq!((p.total_pages, p.first_page, p.pages.len()), (2, 1, 1));

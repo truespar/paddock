@@ -2015,6 +2015,7 @@ pub(crate) async fn generative_pass(
         logprobs: None,
         submitted: None,
         canvas_read: None,
+        user_turn: false,
     })?;
 
     let mut ids = Vec::new();
@@ -3007,6 +3008,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
         logprobs: want_logprobs.then_some(2),
         submitted: None,
         canvas_read: None,
+        user_turn: false,
     };
     if let Err(e) = model.engine.submit(gen_req) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e);

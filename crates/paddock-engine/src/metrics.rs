@@ -23,6 +23,7 @@ pub struct TierGauges {
     pub miss_no_new_tokens: AtomicU64,
     pub miss_tripped: AtomicU64,
     pub miss_ghost: AtomicU64,
+    pub miss_no_state: AtomicU64,
     pub elected_restore: AtomicU64,
     pub elected_recompute: AtomicU64,
     pub parked: AtomicU64,
@@ -78,6 +79,7 @@ impl TierGauges {
         self.miss_no_new_tokens.store(d.miss_no_new_tokens, Relaxed);
         self.miss_tripped.store(d.miss_tripped, Relaxed);
         self.miss_ghost.store(d.miss_ghost, Relaxed);
+        self.miss_no_state.store(d.miss_no_state, Relaxed);
         self.elected_restore.store(d.elected_restore, Relaxed);
         self.elected_recompute.store(d.elected_recompute, Relaxed);
         self.parked.store(d.parked, Relaxed);

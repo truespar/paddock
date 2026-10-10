@@ -5,6 +5,8 @@ thread_local! {
     pub(super) static BASELINE_PREFILL_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static CANONICAL_PREFILL_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static BASELINE_GQA_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static BASELINE_LANGUAGE_NAX_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static FORCE_LANGUAGE_NAX_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn split_append(rows: usize, visible_kv: usize, workspace_bytes: usize, heads: usize) -> bool {
@@ -12,6 +14,21 @@ fn split_append(rows: usize, visible_kv: usize, workspace_bytes: usize, heads: u
 }
 
 impl Qwen35 {
+    pub(super) fn register_language_attention(&self) -> bool {
+        let shape = self.geometry == Geometry::DENSE_08B;
+        #[cfg(test)]
+        let shape = shape
+            || (self.geometry == Geometry::DENSE_4B
+                && FORCE_LANGUAGE_NAX_FOR_TEST.with(|v| v.get()));
+        let enabled = self.mlx
+            && self.head.is_none()
+            && self.vision.is_some()
+            && self.device.tensor_accelerated()
+            && shape;
+        #[cfg(test)]
+        let enabled = enabled && !BASELINE_LANGUAGE_NAX_FOR_TEST.with(|v| v.get());
+        enabled
+    }
     pub(super) fn full_attention(
         &self,
         cmd: &Commands<'_>,
@@ -155,33 +172,39 @@ impl Qwen35 {
                 &s.limits,
                 &s.prepared,
             ];
-            cmd.dispatch(
-                if grouped {
-                    "mlx_attention_prefill_gqa"
-                } else if self.splash {
-                    "splash_attention_prefill_grouped"
-                } else if self.mlx && split {
-                    "mlx_attention_prefill_split"
-                } else if self.mlx && append_length >= 256 {
-                    // Read each existing BF16 physical page directly. The
-                    // one-partition kernel retains the same 16-token causal
-                    // blocks and softmax order, without staging/transposing KV.
-                    if indexed {
-                        "mlx_attention_prefill_indexed"
-                    } else {
-                        "mlx_attention_prefill_direct"
-                    }
-                } else if self.mlx {
-                    "mlx_attention_prefill"
-                } else if strict && split {
-                    "qwen_attention_prefill_split_strict"
-                } else if strict {
-                    "qwen_attention_prefill_strict"
-                } else if split {
-                    "qwen_attention_prefill_split"
+            let kernel = if grouped {
+                "mlx_attention_prefill_gqa"
+            } else if self.splash {
+                "splash_attention_prefill_grouped"
+            } else if self.mlx && split {
+                "mlx_attention_prefill_split"
+            } else if self.mlx && append_length >= 256 {
+                // Read each existing BF16 physical page directly. The
+                // one-partition kernel retains the same 16-token causal
+                // blocks and softmax order, without staging/transposing KV.
+                if indexed {
+                    "mlx_attention_prefill_indexed"
                 } else {
-                    "qwen_attention_prefill"
-                },
+                    "mlx_attention_prefill_direct"
+                }
+            } else if self.mlx {
+                "mlx_attention_prefill"
+            } else if strict && split {
+                "qwen_attention_prefill_split_strict"
+            } else if strict {
+                "qwen_attention_prefill_strict"
+            } else if split {
+                "qwen_attention_prefill_split"
+            } else {
+                "qwen_attention_prefill"
+            };
+            let kernel = if self.register_language_attention() && !split {
+                "mlx_attention_prefill_nax"
+            } else {
+                kernel
+            };
+            cmd.dispatch(
+                kernel,
                 &buffers[..if self.mlx && !self.splash { 8 } else { 9 }],
                 &[
                     heads as u32,
@@ -238,10 +261,14 @@ impl Qwen35 {
                 .max(16usize.div_ceil(decode_live))
                 .clamp(1, MAX_SPLITS);
             cmd.dispatch(
-                if stable {
+                if stable && heads / kv_heads == 4 {
+                    "mlx_attention_stable_gqa4"
+                } else if stable {
                     "mlx_attention_stable"
                 } else if self.mlx && self.verifying {
                     "mlx_attention_verify"
+                } else if self.mlx && heads / kv_heads == 4 {
+                    "mlx_attention_decode_gqa4"
                 } else if self.mlx {
                     "mlx_attention_decode"
                 } else {

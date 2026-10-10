@@ -23,6 +23,7 @@
 //! on the response (and logged), so a bench artifact can stamp the serve
 //! configuration from server state rather than intent.
 
+use paddock_engine::service::FinishReason;
 use serde_json::{Value, json};
 
 /// The family's five task modes. The canonical strings are BYTE-EXACT to the
@@ -246,13 +247,23 @@ pub struct OcrResolved {
     pub dropped_text: bool,
     /// (n, window) for the sampler; (0, 0) = off.
     pub ngram: (usize, usize),
+    /// The n-gram guard STOPS the read where it would have banned (the
+    /// sampler's stop mode) instead of masking - PaddleOCR-VL's default.
+    pub repeat_stop: bool,
 }
 
 impl OcrResolved {
+    /// The sampler's `no_repeat_ngram`: the guard sizes and whether it stops.
+    pub fn guard(&self) -> (usize, usize, bool) {
+        (self.ngram.0, self.ngram.1, self.repeat_stop)
+    }
+
     /// The response extension object (without `regions`, which is appended
-    /// from the finished output when grounding is armed).
-    pub fn echo(&self) -> Value {
-        json!({
+    /// from the finished output when grounding is armed). `finish` says
+    /// whether the repetition stop ended the read; None while it runs.
+    pub fn echo_at(&self, finish: Option<FinishReason>) -> Value {
+        let ban = if self.repeat_stop { (0, 0) } else { self.ngram };
+        let mut echo = json!({
             "mode": self.mode,
             "crop": self.crop,
             "grounding": self.grounding,
@@ -262,8 +273,16 @@ impl OcrResolved {
             "image_tokens": self.image_tokens,
             "pass_through": self.pass_through,
             "dropped_text": self.dropped_text,
-            "no_repeat_ngram": { "size": self.ngram.0, "window": self.ngram.1 },
-        })
+            "no_repeat_ngram": { "size": ban.0, "window": ban.1 },
+        });
+        if self.repeat_stop {
+            echo["repetition_stop"] = json!({
+                "size": self.ngram.0,
+                "window": self.ngram.1,
+                "fired": finish == Some(FinishReason::Repetition),
+            });
+        }
+        echo
     }
 }
 
@@ -397,6 +416,7 @@ pub fn resolve(
         pass_through,
         dropped_text,
         ngram,
+        repeat_stop: false,
     };
     tracing::info!(
         mode = resolved.mode.unwrap_or("pass-through"),
@@ -526,6 +546,10 @@ pub struct Region {
     /// quad to its hull loses that - deepseek's rectangle forms leave it
     /// empty and the wire omits it.
     pub quads: Vec<[i64; 8]>,
+    /// The block continues the previous one (LightOnOCR-3's `label+`: a
+    /// paragraph flowing into the next column). Only that parse sets it, and
+    /// the wire carries it only when true.
+    pub continues: bool,
 }
 
 impl Region {
@@ -536,6 +560,9 @@ impl Region {
         }
         if !self.quads.is_empty() {
             v["quads"] = json!(self.quads);
+        }
+        if self.continues {
+            v["continues"] = json!(true);
         }
         v
     }
@@ -576,6 +603,7 @@ pub fn parse_regions(raw: &str) -> Vec<Region> {
                 boxes,
                 text: None,
                 quads: vec![],
+                continues: false,
             });
         }
         cur = &body[de + "<|/det|>".len()..];
@@ -620,6 +648,7 @@ pub fn parse_regions(raw: &str) -> Vec<Region> {
                 boxes,
                 text: (!span.is_empty()).then(|| span.to_owned()),
                 quads: vec![],
+                continues: false,
             });
         }
     }
@@ -653,12 +682,16 @@ fn parse_boxes(s: &str) -> Option<Vec<[i64; 4]>> {
 
 /// Regions as the response extension array, or None when nothing parsed.
 /// Tries this family's det/ref markup first, then paddleocr's spotting
-/// `<|LOC_n|>` lines - the marker vocabularies are disjoint, so one entry
-/// point serves every attach site and the parse itself stays the truth test.
+/// `<|LOC_n|>` lines, then LightOnOCR-3's `![label](x1,y1,x2,y2)` blocks -
+/// the marker vocabularies are disjoint, so one entry point serves every
+/// attach site and the parse itself stays the truth test.
 pub fn regions_json(raw: &str) -> Option<Value> {
     let mut rs = parse_regions(raw);
     if rs.is_empty() {
         rs = crate::paddle_ocr::parse_spotting(raw);
+    }
+    if rs.is_empty() {
+        rs = crate::lighton_ocr::parse_blocks(raw);
     }
     (!rs.is_empty()).then(|| Value::Array(rs.iter().map(Region::to_json).collect()))
 }
@@ -908,6 +941,7 @@ mod tests {
                 boxes: vec![[68, 69, 385, 100]],
                 text: Some("Quarterly Report".into()),
                 quads: vec![],
+                continues: false,
             }
         );
         assert_eq!(rs[1].label, "text");

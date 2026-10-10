@@ -1,4 +1,4 @@
-//! SAM 3 image encoder bring-up. Shared backbone and both feature pyramids,
+//! SAM 3 component bring-up. Shared backbone, both feature pyramids and text,
 //! not yet a complete mask-serving backend. Do not advertise catalog/HTTP
 //! support before the detector, click decoder and video graph are qualified.
 //! CUDA's existing family is the arithmetic/layout contract, Meta's saved
@@ -16,7 +16,14 @@ mod image_tests;
 mod input_golden_tests;
 mod load;
 mod memory;
+mod text;
+#[cfg(test)]
+mod text_golden_tests;
+mod text_load;
+#[cfg(test)]
+mod text_tests;
 pub use image::Sam3InputKind;
+pub use text::Sam3Text;
 #[cfg(test)]
 mod tests;
 mod vision;

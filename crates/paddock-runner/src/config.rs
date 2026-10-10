@@ -109,6 +109,16 @@ pub struct Config {
     /// loads. The manager's Audio switch, mirroring `vision`; `false`
     /// alongside an `audio_mmproj` line is refused as a contradiction.
     pub audio: Option<bool>,
+    /// PaddleOCR-VL's layout companion: a PP-DocLayoutV3 checkpoint
+    /// directory (`model.safetensors` + `config.json`), which serves the
+    /// checkpoint's document pipeline (`ocr.mode = "document"`). Discovery
+    /// fills it from a `PP-DocLayoutV3*` directory in the weights' folder or
+    /// beside it.
+    pub layout: Option<PathBuf>,
+    /// `layout` came from discovery, not the config: a companion that fails
+    /// to load then costs the document mode (said loudly), not the runner.
+    #[serde(skip)]
+    pub layout_discovered: bool,
     /// MTP drafter GGUF (separate-model speculative drafter, e.g. gemma4's
     /// mtp-*.gguf); enables serving spec rounds with model drafts.
     pub mtp: Option<PathBuf>,
@@ -376,6 +386,8 @@ impl Default for Config {
             vision: None,
             audio_mmproj: None,
             audio: None,
+            layout: None,
+            layout_discovered: false,
             mtp: None,
             text_encoder: None,
             vae: None,
@@ -584,6 +596,9 @@ impl Config {
         if let Some(v) = env_str("PADDOCK_MMPROJ") {
             self.mmproj = Some(PathBuf::from(v));
         }
+        if let Some(v) = env_str("PADDOCK_LAYOUT") {
+            self.layout = Some(PathBuf::from(v));
+        }
         if let Some(v) = env_str("PADDOCK_MTP") {
             self.mtp = Some(PathBuf::from(v));
         }
@@ -783,6 +798,7 @@ pub const ENV_SURFACE: &[&str] = &[
     "PADDOCK_HOST",
     "PADDOCK_KERNEL_PACK",
     "PADDOCK_KV_CACHE_DTYPE",
+    "PADDOCK_LAYOUT",
     "PADDOCK_LOG_FILE",
     "PADDOCK_MAX_BATCH",
     "PADDOCK_MAX_CTX",

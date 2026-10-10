@@ -344,6 +344,7 @@ mod tests {
             logprobs: None,
             submitted: None,
             canvas_read: None,
+            user_turn: false,
         }
     }
     #[tokio::test]

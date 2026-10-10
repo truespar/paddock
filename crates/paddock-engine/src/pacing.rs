@@ -68,10 +68,29 @@
 //! together - measured: 243 bootstrap ticks, ~124K tokens, before the fit
 //! could establish). The model then takes over. No one waiting, or no measured
 //! growth, and the row budget stays exactly as before.
+//!
+//! The KNEE is the one place a shallow tick is trimmed: while a few streams
+//! decode beside an ingest. The span elections behind the full tick were
+//! measured for throughput at width, and at one or two streams they leave
+//! each one a token round per ~1 s (GB10, 1024 rows; a 188-SM die's 4096-row
+//! tick likewise) for the whole ingest. Sarathi-Serve's stall-free batching
+//! (OSDI '24) sizes the prefill share that rides beside the decodes as the
+//! SMALLEST that still runs efficiently - below that, the per-pass weight
+//! stream dominates and the prompt pays for the streams' latency several
+//! times over. So with 1..=[`KNEE_STREAMS`] streams waiting, a tick takes the
+//! smallest aligned share whose cost per prompt token stays within
+//! [`knee::KNEE_COST`] of the full share's - MEASURED by this process on
+//! its own ticks ([`knee`]), so the same rule lands where each machine's
+//! knee is (GB10: 512 rows, +12% ingest for 1.75x the stream's tokens; a
+//! die with a cheap weight stream lands at a fraction of its ~1 s tick).
+//! Wider batches keep the elected spans: their throughput elections were
+//! measured with every tick shared.
 
 use std::time::{Duration, Instant};
 
 use crate::generator::{GenError, Generator};
+
+mod knee;
 
 /// Rows are granted in multiples of this: the gated-DeltaNet chunk size and a
 /// GEMM M-tile multiple (a 257-row chunk costs a 320-row pass).
@@ -110,6 +129,11 @@ const HYSTERESIS: f64 = 0.25;
 const PACE_MIN_DEPTH: usize = 8192;
 /// Deep ticks the model must have timed before it is trusted.
 const MIN_DEEP_OBS: usize = 4;
+/// The knee applies while at most this many streams decode beside an ingest:
+/// one or two interactive sessions and a small agent fan-out. From here up
+/// the board cells' measured span elections (every tick shared, throughput
+/// at width) stand.
+pub const KNEE_STREAMS: usize = 4;
 /// Hard bound on the whole store (oldest dropped first).
 const MAX_OBS: usize = 1024;
 /// Observations before a fit is attempted.
@@ -223,6 +247,8 @@ pub struct Plan {
     pub budget: usize,
     /// the tick's time target (ms); None on a bootstrap tick (no model yet)
     pub target_ms: Option<f64>,
+    /// the knee capped it (streams waiting), not the depth pacing
+    pub knee: bool,
 }
 
 /// One tick kind's pacer: records timed ticks, keeps the fit, sizes budgets.
@@ -231,6 +257,8 @@ pub struct TickPacer {
     obs: Vec<Obs>,
     seq: u64,
     model: Option<CostModel>,
+    /// The knee search beside a few waiting streams (see `knee.rs`).
+    knee: knee::KneeSearch,
     /// Per row bucket: (shallowest wall seen, latest wall, latest deepest
     /// share start) - the model-free growth signal the bootstrap reads.
     shape_walls: std::collections::HashMap<u32, (f64, f64, usize)>,
@@ -289,6 +317,19 @@ impl TickPacer {
         self.model = fit(&self.obs);
     }
 
+    /// A knee tick (streams waiting, a long head) against the full share
+    /// `full` ran `rows` prefill rows in `wall`: the knee search's sample.
+    pub fn record_knee(&mut self, full: usize, rows: usize, wall: Duration) {
+        self.knee.observe(full, rows, wall.as_secs_f64() * 1e3);
+    }
+
+    /// Whether a tick against `full_rows` with this queue is a knee tick.
+    pub fn knee_tick(waiting: usize, full_rows: usize, queue: &PrefillQueue) -> bool {
+        (1..=KNEE_STREAMS).contains(&waiting)
+            && full_rows > ROW_ALIGN
+            && queue.first().is_some_and(|&(_, _, rem)| rem >= full_rows)
+    }
+
     /// Size a tick. `waiting`: decode rows that wait on this tick's end (the
     /// caller's question: riders of a fused or prefill-then-decode tick, the
     /// round of a spec-in-mixed tick - but never a route-B overlapped span,
@@ -313,6 +354,31 @@ impl TickPacer {
         if waiting == 0 || full_rows == 0 || queue.is_empty() {
             return None;
         }
+        let paced = self.depth_plan(pass_riders, full_rows, queue);
+        let knee = if Self::knee_tick(waiting, full_rows, queue) {
+            self.knee.size(full_rows).map(|budget| Plan {
+                budget,
+                target_ms: None,
+                knee: true,
+            })
+        } else {
+            None
+        };
+        match (paced, knee) {
+            (Some(p), Some(k)) if k.budget < p.budget => Some(k),
+            (p @ Some(_), _) => p,
+            (None, k) => k,
+        }
+    }
+
+    /// The depth pacing proper (see the module docs): None when nothing
+    /// would shrink.
+    fn depth_plan(
+        &self,
+        pass_riders: usize,
+        full_rows: usize,
+        queue: &PrefillQueue,
+    ) -> Option<Plan> {
         if let Some(mut tb) = self.budget(pass_riders, full_rows) {
             let mut room = full_rows;
             let mut total = 0;
@@ -336,6 +402,7 @@ impl TickPacer {
             return (total < full_rows).then_some(Plan {
                 budget: total,
                 target_ms: Some(tb.target_ms()),
+                knee: false,
             });
         }
         // no model yet: the bootstrap, only for a tick that opens deep
@@ -347,6 +414,7 @@ impl TickPacer {
             .map(|budget| Plan {
                 budget,
                 target_ms: None,
+                knee: false,
             })
     }
 
@@ -476,6 +544,8 @@ pub(crate) struct PacedTick {
     kind: TickKind,
     before: Vec<(usize, usize, usize)>,
     pass_riders: usize,
+    /// a knee tick's full share (it samples the knee search)
+    knee_full: Option<usize>,
     t0: Instant,
 }
 
@@ -536,6 +606,7 @@ impl Pacers {
             return Ok((budget, None));
         }
         let full = budget.min(g.prefill_tick_cap(decode_rows));
+        let knee_full = TickPacer::knee_tick(waiting, full, &before).then_some(full);
         let log = self.log;
         let pacer = self.pacer(kind);
         let sized = match pacer.plan(waiting, pass_riders, full, &before) {
@@ -543,6 +614,12 @@ impl Pacers {
                 if log {
                     let (_, depth, remaining) = before[0];
                     match (plan.target_ms, pacer.model()) {
+                        _ if plan.knee => tracing::info!(
+                            "pace: {} head depth {depth} (rem {remaining}) rows {full} -> {} \
+                             knee (streams {waiting}, riders {pass_riders})",
+                            kind.name(),
+                            plan.budget,
+                        ),
                         (Some(t), Some(m)) => tracing::info!(
                             "pace: {} head depth {depth} (rem {remaining}) rows {full} -> {} \
                              target {t:.0} ms (model {:.1} + {:.3}/row + {:.2}/Mrow-pos, \
@@ -571,6 +648,7 @@ impl Pacers {
                 kind,
                 before,
                 pass_riders,
+                knee_full,
                 t0: Instant::now(),
             }),
         ))
@@ -587,6 +665,10 @@ impl Pacers {
         // other tick's shape, not this kind's
         if shape.prefill_rows == 0 {
             return;
+        }
+        if let Some(full) = t.knee_full {
+            self.pacer(t.kind)
+                .record_knee(full, shape.prefill_rows, wall);
         }
         self.pacer(t.kind).record(
             t.pass_riders + shape.prefill_rows,
@@ -683,6 +765,52 @@ fn invert3(m: [[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A batch wider than the knee's: the depth pacing alone.
+    const WIDE: usize = KNEE_STREAMS + 1;
+
+    /// Run knee ticks beside one stream (6 verify rows) through `plan` and
+    /// `record_knee` under the cost law `truth` until the search settles.
+    fn settle_knee(p: &mut TickPacer, truth: CostModel) {
+        let q = [(0, 0, 1_000_000)];
+        for _ in 0..64 {
+            let rows = p.plan(1, 6, 1024, &q).map_or(1024, |plan| plan.budget);
+            let wall = truth.predict_ms(6 + rows, attn_work(0, rows));
+            p.record_knee(1024, rows, Duration::from_secs_f64(wall / 1e3));
+        }
+    }
+
+    /// One or two streams beside an ingest: once the search has priced the
+    /// shares, the shallow tick takes the knee - on the GB10 law the half,
+    /// as measured - and wider batches keep the elected span.
+    #[test]
+    fn a_few_streams_take_the_measured_knee() {
+        let mut p = warmed(GB10, 180_000);
+        let q = [(0, 0, 50_000)];
+        // a fresh search runs its first knee tick full, to price against
+        assert!(p.plan(1, 6, 1024, &q).is_none());
+        settle_knee(&mut p, GB10);
+        let plan = p.plan(1, 6, 1024, &q).expect("capped");
+        assert_eq!((plan.budget, plan.knee), (512, true), "{plan:?}");
+        assert!(p.plan(WIDE, 6, 1024, &q).is_none(), "width keeps the span");
+        // a remainder the tick would not fill is not a knee tick
+        let tail = p.plan(1, 6, 1024, &[(0, 0, 700)]);
+        assert!(tail.is_none_or(|t| !t.knee), "{tail:?}");
+    }
+
+    /// Deep, the knee and the depth pacing both apply: the tick takes the
+    /// smaller - never more than the depth pacing alone grants.
+    #[test]
+    fn the_knee_only_ever_tightens_the_depth_pacing() {
+        let mut p = warmed(GB10, 180_000);
+        settle_knee(&mut p, GB10);
+        let q = [(0, 176_000, 50_000)];
+        let paced = p.plan(WIDE, 6, 1024, &q).expect("paced").budget;
+        let both = p.plan(1, 6, 1024, &q).expect("paced").budget;
+        assert!(both <= paced && both >= ROW_ALIGN, "{both} vs {paced}");
+        let shallow = p.plan(1, 6, 1024, &[(0, 0, 50_000)]).expect("knee");
+        assert_eq!(shallow.budget, 512);
+    }
 
     /// The GB10 / qwen3.8-27b shape measured on 2026-09-23: ~0.63 ms per row
     /// plus ~0.0128 ms per row per 1K of depth, on a ~100 ms pass floor.
@@ -843,10 +971,11 @@ mod tests {
         let mut boots = 0;
         while depth < 150_000 && p.model().is_none() {
             let q = [(0, depth, 1_000_000)];
-            let rows = match p.plan(2, 2, 1024, &q) {
+            let rows = match p.plan(WIDE, 2, 1024, &q) {
                 Some(Plan {
                     budget,
                     target_ms: None,
+                    ..
                 }) => {
                     boots += 1;
                     budget
@@ -921,7 +1050,7 @@ mod tests {
                 Duration::from_millis(wall),
             );
             assert!(
-                p.plan(2, 2, 1024, &[(0, 3000, 50_000)]).is_none(),
+                p.plan(WIDE, 2, 1024, &[(0, 3000, 50_000)]).is_none(),
                 "tick {i}"
             );
         }
@@ -932,13 +1061,15 @@ mod tests {
         let p = warmed(GB10, 180_000);
         // a deep head that cannot finish: it takes the whole (trimmed) budget
         let deep = p
-            .plan(2, 2, 1024, &[(1, 176_000, 50_000), (2, 0, 300)])
+            .plan(WIDE, 2, 1024, &[(1, 176_000, 50_000), (2, 0, 300)])
             .expect("paced");
         assert!(
             deep.budget < 1024 && deep.budget.is_multiple_of(ROW_ALIGN),
             "{deep:?}"
         );
-        let alone = p.plan(2, 2, 1024, &[(1, 176_000, 50_000)]).expect("paced");
+        let alone = p
+            .plan(WIDE, 2, 1024, &[(1, 176_000, 50_000)])
+            .expect("paced");
         assert_eq!(
             deep.budget, alone.budget,
             "the prompt behind it gets nothing"
@@ -946,13 +1077,13 @@ mod tests {
         // a shallow head that finishes, then a deep prompt: the head is never
         // trimmed and the deep one gets what is left of the time
         let mixed = p
-            .plan(2, 2, 1024, &[(1, 0, 200), (2, 176_000, 50_000)])
+            .plan(WIDE, 2, 1024, &[(1, 0, 200), (2, 176_000, 50_000)])
             .expect("paced");
         assert!(mixed.budget > 200 && mixed.budget < 1024, "{mixed:?}");
         // nobody waiting, or nothing to trim: the caller's budget stands
         assert!(p.plan(0, 0, 1024, &[(1, 176_000, 50_000)]).is_none());
-        assert!(p.plan(2, 2, 1024, &[(1, 0, 50_000)]).is_none());
-        assert!(p.plan(2, 2, 1024, &[]).is_none());
+        assert!(p.plan(WIDE, 2, 1024, &[(1, 0, 50_000)]).is_none());
+        assert!(p.plan(WIDE, 2, 1024, &[]).is_none());
     }
 
     /// A backend reduced to what the scheduler glue sees: a FIFO queue
@@ -1025,15 +1156,27 @@ mod tests {
         p.end(&g, tick);
         assert_eq!(p.mixed.seq, seq0 + 1, "the tick it ran is fitted");
         assert_eq!(p.unified.seq, 0, "on its own kind's pacer only");
-        // shallow: the scheduler's budget passes through untouched
+        // shallow at width: the scheduler's budget passes through untouched
         let mut shallow = Fifo {
             q: vec![(3, 0, 50_000)],
             prepared: 0,
         };
         let (b, _) = p
-            .begin(TickKind::Mixed, &mut shallow, 2, 2, 8190, 2)
+            .begin(TickKind::Mixed, &mut shallow, WIDE, WIDE, 8190, WIDE)
             .expect("prepare");
         assert_eq!(b, 8190);
+        // ...and beside a couple of streams the knee search starts: a full
+        // tick to price against, then the half
+        let (b, t) = p
+            .begin(TickKind::Mixed, &mut shallow, 2, 2, 8190, 2)
+            .expect("prepare");
+        assert_eq!(b, 8190, "the first knee tick runs full");
+        shallow.tick(b);
+        p.end(&shallow, t);
+        let (b, _) = p
+            .begin(TickKind::Mixed, &mut shallow, 2, 2, 8190, 2)
+            .expect("prepare");
+        assert_eq!(b, 512, "then probes the half");
         // nothing queued: nothing to size or record
         let mut idle = Fifo {
             q: Vec::new(),

@@ -64,6 +64,14 @@ struct Merger {
     fc2_b: CudaSlice<f32>,
 }
 
+/// The attention's planes for one tower pass: q/k/v as halves feeding
+/// `vision_attn_h` (whose output is the wo GEMM's staging plane), or, on a
+/// pack without slot 833, the f32 kernel's output plane.
+enum AttnPlanes {
+    Half([CudaSlice<f16>; 3]),
+    F32(CudaSlice<f32>),
+}
+
 /// The encoded image: merged-grid embeddings ready for LLM injection.
 /// Patch rows one batched tower pass takes before it splits (a picture
 /// larger than this runs alone, at its own size): ~80 KB of activations per
@@ -95,10 +103,15 @@ pub struct VisionModel {
     /// grid) - bilinearly resized + merge-reordered per image, then uploaded.
     pos_embd: Vec<f32>,
     n_side: usize,
-    /// Resize the pos-embd grid with `align_corners` (Qwen3-VL's
-    /// `interpolation_align_corners = True`, llama.cpp's qwen3vl graph)
-    /// instead of half-pixel centres. Off by default - the qwen35 lane was
-    /// gated at half-pixel and stays there.
+    /// Resize the pos-embd grid with `align_corners` (on) or half-pixel
+    /// centres (off). On since 2026-10-09, because that is the reference:
+    /// transformers' Qwen3.5 tower samples `linspace(0, side - 1, n)`
+    /// (`vision_utils::get_vision_bilinear_indices_and_weights`) and
+    /// llama.cpp's qwen3vl graph resizes with `GGML_SCALE_FLAG_ALIGN_CORNERS`.
+    /// The lane was first gated at half-pixel while its rotary was also wrong
+    /// (contiguous instead of interleaved sections, see the loader), and plain
+    /// answers hid both; LightOnOCR-3's grounding boxes exposed them - with
+    /// both fixed its box streams agree with llama.cpp to near-tie flips.
     align_corners: bool,
     /// (tower block index the tap follows, its merger), in tap order
     deepstack: Vec<(usize, Merger)>,
@@ -291,7 +304,7 @@ impl VisionModel {
             eps,
             pos_embd: pos_host,
             n_side,
-            align_corners: false,
+            align_corners: true,
             deepstack,
             image_mean: arr3("clip.vision.image_mean"),
             image_std: arr3("clip.vision.image_std"),
@@ -432,7 +445,8 @@ impl VisionModel {
 
     /// Encode B same-size images in one tower pass (rows = B·n). Every tower op
     /// is row-independent except attention, which runs per image over its own
-    /// row window (`vision_attn_at`), so an image's rows are BITWISE independent
+    /// row window (a group per image in `vision_attn_h`, or `vision_attn_at`
+    /// per image on the f32 chain), so an image's rows are BITWISE independent
     /// of where it sits in the batch and of what else is in it - both gated in
     /// `batched_encode_matches_serial`. The tower weights are read once for the
     /// batch instead of B times.
@@ -555,8 +569,30 @@ impl VisionModel {
         let mut d_q = exec.alloc(rows * e)?;
         let mut d_k = exec.alloc(rows * e)?;
         let mut d_v = exec.alloc(rows * e)?;
-        let mut d_a = exec.alloc(rows * e)?;
+        // Attention on halves where the pack can (slots 833 + 620): q/k/v land
+        // as f16 in one pass off the projection planes and the attention
+        // writes the wo GEMM's f16 staging plane itself, so the f32 attention
+        // plane and the convert behind it are gone - and the f32 kernel already
+        // rounded q/k/v to f16 into its fragments, so it is the same math on
+        // narrower planes. Bit-identical to the f32 chain, which an older pack
+        // keeps.
+        let mut attn = if exec.has_vision_qkv_h() {
+            AttnPlanes::Half([
+                exec.alloc_f16(rows * e)?,
+                exec.alloc_f16(rows * e)?,
+                exec.alloc_f16(rows * e)?,
+            ])
+        } else {
+            AttnPlanes::F32(exec.alloc(rows * e)?)
+        };
         let mut d_up = exec.alloc(rows * ffn)?;
+        // The FFN's seams ride its GEMMs where the pack can (slots 834/835):
+        // the up GEMM lands bias + GELU as halves and wo / down add onto the
+        // residual stream, so the f32 up and projection planes never land -
+        // bit-identical, d_up / d_n staying only as the pack's fallback scratch.
+        // LN2 then stages into the attention's q plane, free until the next
+        // layer's rope, because the up GEMM writes the staging plane.
+        let fused_ffn = matches!(attn, AttnPlanes::Half(_)) && exec.has_tower_ffn_fused();
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         let theta_scale = 10000f32.powf(-2.0 / (self.head_dim / 2) as f32);
 
@@ -583,66 +619,123 @@ impl VisionModel {
         // as the final merger, and the result is split per image like `embd`
         let n4 = rows / 4;
         let mut ds_per_image: Vec<Vec<CudaSlice<f32>>> = (0..b).map(|_| Vec::new()).collect();
+        // The elementwise chain between the GEMMs runs FUSED, as on the
+        // PaddleOCR-VL tower: LN writes the f16 staging plane directly, the
+        // q/k biases ride the rope load, the o/down biases ride the residual
+        // add, and the FFN's bias+GELU+convert is one pass. Each fusion keeps
+        // the unfused chain's IEEE order and its one f16 round (vision.cuh's
+        // fusion header), so the tower's output is bit-identical. Unfused, a
+        // 1440x2048 page (11520 rows) re-streamed ~1.3 GB a layer between the
+        // GEMMs - about a fifth of the tower's time on GB10.
         for (bi, blk) in self.blocks.iter().enumerate() {
-            exec.layernorm(&d_x, &blk.ln1_w, &blk.ln1_b, &mut d_n, rows, e, self.eps)?;
+            // q, k and v all read the same normed rows - staged once, in f16
+            exec.layernorm_f16(&d_x, &blk.ln1_w, &blk.ln1_b, &mut s16, rows, e, self.eps)?;
             mark!(0);
-            // q, k and v all read the same normed rows - stage them once
-            exec.convert_f32_f16(&d_n, &mut s16, rows * e)?;
             exec.matvec_batch_f16(&blk.wq, &s16, &mut d_q, rows)?;
             exec.matvec_batch_f16(&blk.wk, &s16, &mut d_k, rows)?;
             exec.matvec_batch_f16(&blk.wv, &s16, &mut d_v, rows)?;
-            exec.bias_add(&mut d_q, &blk.bq, rows, e)?;
-            exec.bias_add(&mut d_k, &blk.bk, rows, e)?;
-            exec.bias_add(&mut d_v, &blk.bv, rows, e)?;
-            mark!(1);
-            // per-image pos blocks make one batched call correct: row i of image
-            // bi reads pos[4·n·bi + ...] exactly as the serial call did
-            exec.mrope_vision(
-                &mut d_q,
-                &d_pos,
-                rows,
-                self.n_heads,
-                self.head_dim,
-                theta_scale,
-            )?;
-            exec.mrope_vision(
-                &mut d_k,
-                &d_pos,
-                rows,
-                self.n_heads,
-                self.head_dim,
-                theta_scale,
-            )?;
-            mark!(2);
-            for bi in 0..b {
-                exec.vision_attn_at(
-                    &d_q,
-                    &d_k,
-                    &d_v,
-                    &mut d_a,
-                    bi * n,
-                    n,
-                    self.n_heads,
-                    self.head_dim,
-                    scale,
-                )?;
+            // positions are axis-major over the whole pass ([4, rows]), so one
+            // batched call reads every row's (y, x) as the serial call did
+            match &mut attn {
+                AttnPlanes::Half([q16, k16, v16]) => {
+                    mark!(1);
+                    exec.mrope_vision_qkv_h(
+                        (&d_q, &d_k, &d_v),
+                        (&blk.bq, &blk.bk, &blk.bv),
+                        &d_pos,
+                        (&mut *q16, &mut *k16, &mut *v16),
+                        rows,
+                        self.n_heads,
+                        self.head_dim,
+                        theta_scale,
+                        scale,
+                    )?;
+                    mark!(2);
+                    // the pass's pictures share their dims, so one launch
+                    // covers them all, a group per picture over its own rows
+                    exec.vision_attn_h(
+                        q16,
+                        k16,
+                        v16,
+                        &mut s16,
+                        n,
+                        n,
+                        self.n_heads,
+                        self.head_dim,
+                        b,
+                    )?;
+                    mark!(3);
+                }
+                AttnPlanes::F32(d_a) => {
+                    exec.bias_add(&mut d_v, &blk.bv, rows, e)?;
+                    mark!(1);
+                    exec.mrope_vision_bias(
+                        &mut d_q,
+                        &blk.bq,
+                        &d_pos,
+                        rows,
+                        self.n_heads,
+                        self.head_dim,
+                        theta_scale,
+                    )?;
+                    exec.mrope_vision_bias(
+                        &mut d_k,
+                        &blk.bk,
+                        &d_pos,
+                        rows,
+                        self.n_heads,
+                        self.head_dim,
+                        theta_scale,
+                    )?;
+                    mark!(2);
+                    for bi in 0..b {
+                        exec.vision_attn_at(
+                            &d_q,
+                            &d_k,
+                            &d_v,
+                            d_a,
+                            bi * n,
+                            n,
+                            self.n_heads,
+                            self.head_dim,
+                            scale,
+                        )?;
+                    }
+                    mark!(3);
+                    exec.convert_f32_f16(d_a, &mut s16, rows * e)?;
+                }
             }
-            mark!(3);
-            exec.convert_f32_f16(&d_a, &mut s16, rows * e)?;
-            exec.matvec_batch_f16(&blk.wo, &s16, &mut d_n, rows)?;
-            exec.bias_add(&mut d_n, &blk.bo, rows, e)?;
-            exec.add(&mut d_x, &d_n, rows * e)?;
-            mark!(4);
-
-            exec.layernorm(&d_x, &blk.ln2_w, &blk.ln2_b, &mut d_n, rows, e, self.eps)?;
-            exec.convert_f32_f16(&d_n, &mut s16, rows * e)?;
-            exec.matvec_batch_f16(&blk.up_w, &s16, &mut d_up, rows)?;
-            exec.bias_add(&mut d_up, &blk.up_b, rows, ffn)?;
-            exec.gelu(&mut d_up, rows * ffn)?;
-            exec.convert_f32_f16(&d_up, &mut s16, rows * ffn)?;
-            exec.matvec_batch_f16(&blk.down_w, &s16, &mut d_n, rows)?;
-            exec.bias_add(&mut d_n, &blk.down_b, rows, e)?;
-            exec.add(&mut d_x, &d_n, rows * e)?;
+            match (&mut attn, fused_ffn) {
+                (AttnPlanes::Half([ln16, _, _]), true) => {
+                    exec.matvec_batch_f16_bias_res(
+                        &blk.wo, &s16, &mut d_x, &blk.bo, &mut d_n, rows,
+                    )?;
+                    mark!(4);
+                    exec.layernorm_f16(&d_x, &blk.ln2_w, &blk.ln2_b, ln16, rows, e, self.eps)?;
+                    // gelu_pytorch_tanh
+                    exec.matvec_batch_f16_gelu_tanh(
+                        &blk.up_w, ln16, &mut s16, &blk.up_b, &mut d_up, rows,
+                    )?;
+                    exec.matvec_batch_f16_bias_res(
+                        &blk.down_w,
+                        &s16,
+                        &mut d_x,
+                        &blk.down_b,
+                        &mut d_n,
+                        rows,
+                    )?;
+                }
+                _ => {
+                    exec.matvec_batch_f16(&blk.wo, &s16, &mut d_n, rows)?;
+                    exec.add_bias_res(&mut d_x, &d_n, &blk.bo, rows, e)?;
+                    mark!(4);
+                    exec.layernorm_f16(&d_x, &blk.ln2_w, &blk.ln2_b, &mut s16, rows, e, self.eps)?;
+                    exec.matvec_batch_f16(&blk.up_w, &s16, &mut d_up, rows)?;
+                    exec.gelu_bias_f16(&d_up, &blk.up_b, &mut s16, rows, ffn)?; // gelu_pytorch_tanh
+                    exec.matvec_batch_f16(&blk.down_w, &s16, &mut d_n, rows)?;
+                    exec.add_bias_res(&mut d_x, &d_n, &blk.down_b, rows, e)?;
+                }
+            }
             mark!(5);
             if let Some((_, m)) = self.deepstack.iter().find(|(at, _)| *at == bi) {
                 let (mid, out_dim) = (m.fc1.dims[1], m.fc2.dims[1]);
@@ -678,28 +771,25 @@ impl VisionModel {
             );
         }
 
-        exec.layernorm(
+        // merger: consecutive 2x2-block rows are contiguous -> [rows/4, 4e] is a
+        // view, and image boundaries land on 4-row multiples (n % 4 == 0); the
+        // post-LN lands in the f16 staging plane directly (n4 x 4e == rows x e)
+        exec.layernorm_f16(
             &d_x,
             &self.post_ln_w,
             &self.post_ln_b,
-            &mut d_n,
+            &mut s16,
             rows,
             e,
             self.eps,
         )?;
-        // merger: consecutive 2×2-block rows are contiguous -> [rows/4, 4e] is a
-        // view, and image boundaries land on 4-row multiples (n % 4 == 0)
         let n4 = rows / 4;
         let mid = self.mm0.dims[1];
         let mut d_m = exec.alloc(n4 * mid)?;
-        // the merger reads 4 consecutive rows as one, so n4 × 4e == rows × e
-        exec.convert_f32_f16(&d_n, &mut s16, n4 * self.mm0.dims[0])?;
         exec.matvec_batch_f16(&self.mm0, &s16, &mut d_m, n4)?;
-        exec.bias_add(&mut d_m, &self.mm0_b, n4, mid)?;
-        exec.gelu(&mut d_m, n4 * mid)?;
+        exec.gelu_bias_f16(&d_m, &self.mm0_b, &mut s16, n4, mid)?;
         let out_dim = self.mm2.dims[1];
         let mut d_out = exec.alloc(n4 * out_dim)?;
-        exec.convert_f32_f16(&d_m, &mut s16, n4 * mid)?;
         exec.matvec_batch_f16(&self.mm2, &s16, &mut d_out, n4)?;
         exec.bias_add(&mut d_out, &self.mm2_b, n4, out_dim)?;
 
@@ -767,8 +857,9 @@ impl VisionModel {
 
     /// Device bytes one `encode_batch` pass over `rows` patch rows allocates,
     /// by the same arithmetic the pass allocates with: the patch upload,
-    /// positions and position embeddings, the seven `embd`-wide activation
-    /// planes, the FFN plane and the f16 staging plane, then the merger's two
+    /// positions and position embeddings, the six `embd`-wide f32 activation
+    /// planes and the attention's three f16 ones, the FFN plane and the f16
+    /// staging plane, then the merger's two
     /// planes and the per-picture outputs it hands back (plus DeepStack's
     /// streams where the tower has taps). The plan reserves this for the
     /// largest pass the tower can be asked for, since the pass allocates on
@@ -780,7 +871,9 @@ impl VisionModel {
         let (mid, out) = (self.mm0.dims[1], self.mm2.dims[1]);
         let n4 = rows / 4;
         let stage = (rows * ffn.max(e).max(k_in)).max(n4 * self.mm0.dims[0].max(mid));
-        let f32s = rows * (k_in + e + 7 * e + ffn) + n4 * (mid + 2 * out);
+        // six embd-wide f32 planes plus the half attention's three f16 ones
+        // (an older pack's f32 attention plane instead is half a plane less)
+        let f32s = rows * (k_in + e + 6 * e + ffn) + n4 * (mid + 2 * out);
         let taps = self.deepstack.len();
         let deepstack = if taps == 0 {
             0
@@ -793,13 +886,9 @@ impl VisionModel {
                 .unwrap_or(0);
             taps * n4 * out + n4 * (widest + out)
         };
-        (4 * (f32s + deepstack) + 4 * 4 * rows + 2 * stage) as u64
+        (4 * (f32s + deepstack) + 4 * 4 * rows + 2 * stage + 2 * 3 * rows * e) as u64
     }
 
-    /// Full llama.cpp-b9895 `dyn_size` preprocessing for an arbitrary-size RGB
-    /// image: smart-resize target, aspect-preserving bilinear with black
-    /// letterbox (PAD_CEIL), then mean/std normalization. Returns the planar
-    /// f32 image `encode` takes plus its (32-aligned) pixel dims.
     /// The largest image this tower can use. One vision token is a 2·patch
     /// square block, so the pixel budget divides straight into a token count.
     pub fn budget(&self) -> crate::generator::VisionBudget {
@@ -837,6 +926,11 @@ impl VisionModel {
         Some((was, tokens))
     }
 
+    /// llama.cpp's qwen3vl `dyn_size` preprocessing for an arbitrary-size RGB
+    /// image: smart-resize target, aspect-preserving Pillow bicubic with a
+    /// black letterbox (PAD_CEIL, [`resize_pad_black`]), then mean/std
+    /// normalization. Returns the planar f32 image `encode` takes plus its
+    /// (32-aligned) pixel dims.
     pub fn preprocess_rgb(&self, rgb: &[u8], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
         let t0 = std::time::Instant::now();
         let (tw, th) = smart_resize_target(w, h, self.patch, self.budget);
@@ -956,66 +1050,14 @@ pub fn smart_resize_target(
     (w_bar, h_bar)
 }
 
-/// Port of llama.cpp b9895 `img_tool::resize` with the qwen defaults
-/// (RESIZE_ALGO_BILINEAR, PAD_CEIL, black): scale = min over both axes,
-/// new dims ceil-clamped, bilinear resize, centered composite (floor offsets).
-pub fn resize_pad_black(rgb: &[u8], w: usize, h: usize, tw: usize, th: usize) -> Vec<u8> {
-    assert_eq!(rgb.len(), 3 * w * h);
-    let scale = (tw as f32 / w as f32).min(th as f32 / h as f32);
-    let nw = ((w as f32 * scale).ceil() as usize).min(tw).max(1);
-    let nh = ((h as f32 * scale).ceil() as usize).min(th).max(1);
-    let resized = resize_bilinear_u8(rgb, w, h, nw, nh);
-    let mut canvas = vec![0u8; 3 * tw * th];
-    let ox = (tw - nw) / 2;
-    let oy = (th - nh) / 2;
-    for y in 0..nh {
-        let s = y * nw * 3;
-        let d = ((y + oy) * tw + ox) * 3;
-        canvas[d..d + nw * 3].copy_from_slice(&resized[s..s + nw * 3]);
-    }
-    canvas
-}
-
-/// Port of llama.cpp b9895 `img_tool::resize_bilinear`: align-corners ratios
-/// ((src-1)/(dst-1)), truncating u8 cast - byte-identical inputs to the tower.
-///
-/// The lerp uses mul_add to mirror Clang's -ffp-contract=on codegen of the
-/// C++ `s + (e-s)*t` (single rounding). Measured on the gate image the fused
-/// and unfused forms agree on every byte, so this is faithfulness insurance,
-/// not a known-difference fix.
-fn resize_bilinear_u8(src: &[u8], sw: usize, sh: usize, tw: usize, th: usize) -> Vec<u8> {
-    let lerp = |s: f32, e: f32, t: f32| (e - s).mul_add(t, s);
-    let mut dst = vec![0u8; 3 * tw * th];
-    let x_ratio = if tw > 1 {
-        (sw - 1) as f32 / (tw - 1) as f32
-    } else {
-        0.0
-    };
-    let y_ratio = if th > 1 {
-        (sh - 1) as f32 / (th - 1) as f32
-    } else {
-        0.0
-    };
-    for y in 0..th {
-        for x in 0..tw {
-            let px = x as f32 * x_ratio;
-            let py = y as f32 * y_ratio;
-            let x0 = (px as usize).min(sw - 1);
-            let y0 = (py as usize).min(sh - 1);
-            let x1 = (x0 + 1).min(sw - 1);
-            let y1 = (y0 + 1).min(sh - 1);
-            let xf = px - x0 as f32;
-            let yf = py - y0 as f32;
-            for c in 0..3 {
-                let p = |xx: usize, yy: usize| src[(yy * sw + xx) * 3 + c] as f32;
-                let top = lerp(p(x0, y0), p(x1, y0), xf);
-                let bottom = lerp(p(x0, y1), p(x1, y1), xf);
-                dst[(y * tw + x) * 3 + c] = lerp(top, bottom, yf) as u8;
-            }
-        }
-    }
-    dst
-}
+/// llama.cpp's `img_tool::resize` with the qwen3vl settings (b11516:
+/// RESIZE_ALGO_BICUBIC through `resize_pillow`, PAD_CEIL, black): scale = min
+/// over both axes, new dims ceil-clamped, Pillow's exact bicubic (our
+/// [`crate::pillow`] port), centered composite (floor offsets). Until
+/// 2026-10-09 this was b9895's align-corners BILINEAR - llama.cpp has since
+/// moved to Pillow bicubic, which is also the filter Qwen's own processor
+/// names (`resample: 3`), and the parity gate is the newest release.
+pub use crate::pillow::resize_pad_black;
 
 #[cfg(test)]
 mod tests {
@@ -1104,9 +1146,9 @@ mod tests {
     }
 
     #[test]
-    fn bilinear_identity_when_same_size() {
+    fn resize_is_identity_when_same_size() {
         let src: Vec<u8> = (0..3 * 8 * 4).map(|i| (i * 7 % 251) as u8).collect();
-        assert_eq!(resize_bilinear_u8(&src, 8, 4, 8, 4), src);
+        assert_eq!(resize_pad_black(&src, 8, 4, 8, 4), src);
     }
 
     #[test]

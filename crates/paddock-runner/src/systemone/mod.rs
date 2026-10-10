@@ -428,6 +428,7 @@ async fn decide(
                 u,
                 model.engine.vision_budget(),
                 crate::chat::ImageDetail::Auto,
+                model.page_edge(),
             )
             .map(crate::chat::RequestImage::into_chunk)
         })

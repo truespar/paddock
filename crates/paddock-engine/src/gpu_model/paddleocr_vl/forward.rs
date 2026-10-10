@@ -12,8 +12,9 @@
 //!
 //! Attention is STRICTLY causal in sequence order - the reference builds a
 //! plain `create_causal_mask`, so image tokens attend raster-causally within
-//! their own grid too (this is not qwen35's equal-t block visibility; copying
-//! that here would be a silent divergence). KV rows sit at their sequence
+//! their own grid too (qwen35 now runs the same; it used to give a picture's
+//! rows mutual visibility, which copied here would be a silent divergence).
+//! KV rows sit at their sequence
 //! index; the 3-axis M-RoPE positions ride separately per token.
 //!
 //! Because the spine feeds every prefill token through the same cached-decode

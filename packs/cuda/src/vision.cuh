@@ -405,6 +405,76 @@ int pd_mrope_vision_bias(void* x, const void* bias, const void* positions, uint3
     return pd_launch_status();
 }
 
+// 833: the qwen-family tower's q/k/v landing for the half attention (620) in
+// one pass, straight off the three f32 GEMM planes:
+//   q16 = f16(rope(q + bq) * q_mul)    (q_mul = 1/sqrt(hd): 620 takes q pre-scaled)
+//   k16 = f16(rope(k + bk))
+//   v16 = f16(v + bv)
+// Each is the f32 chain's value with its one round moved here: the f32
+// attention multiplies its stored q by the scale and rounds the pair to f16
+// on the way into the fragment, and rounds k and v at the stage - so 620 on
+// these halves is bit-for-bit the f32 kernel's output rounded, which is what
+// the convert behind it produced. The rotation is pd_mrope_vision_bias_kernel's
+// expression for expression (same serial theta, same sinf/cosf), shared by q
+// and k since both rotate by the same angle; the final scale is an explicit
+// __fmul_rn so nothing can fold it into the rotation's fma.
+// One thread per (token, head, pair), as the rope kernels.
+__global__ void pd_mrope_vision_qkv_h_kernel(
+    const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
+    const float* __restrict__ bq, const float* __restrict__ bk, const float* __restrict__ bv,
+    const unsigned int* __restrict__ positions, __half* __restrict__ q16,
+    __half* __restrict__ k16, __half* __restrict__ v16, uint32_t n_tokens, uint32_t n_heads,
+    uint32_t head_dim, float theta_scale, float q_mul) {
+    uint32_t half = head_dim / 2;
+    uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= n_tokens * n_heads * half) return;
+    uint32_t p = gid % half;
+    uint32_t idx = gid / half;                    // (t, h) flat index
+    uint32_t t = idx / n_heads;
+    const size_t o = (size_t)idx * head_dim;
+    const size_t bo = (size_t)(idx % n_heads) * head_dim;
+    uint32_t s = head_dim / 4;
+    float theta = (p < s) ? (float)positions[t] : (float)positions[(size_t)n_tokens + t];
+    uint32_t steps = (p < s) ? p : (p - s);
+    for (uint32_t i = 0; i < steps; ++i) theta *= theta_scale;
+    float sn = sinf(theta);
+    float cs = cosf(theta);
+    {
+        float a = q[o + p] + bq[bo + p];
+        float b = q[o + p + half] + bq[bo + p + half];
+        float r0 = a * cs - b * sn;
+        float r1 = a * sn + b * cs;
+        q16[o + p] = __float2half_rn(__fmul_rn(r0, q_mul));
+        q16[o + p + half] = __float2half_rn(__fmul_rn(r1, q_mul));
+    }
+    {
+        float a = k[o + p] + bk[bo + p];
+        float b = k[o + p + half] + bk[bo + p + half];
+        float r0 = a * cs - b * sn;
+        float r1 = a * sn + b * cs;
+        k16[o + p] = __float2half_rn(r0);
+        k16[o + p + half] = __float2half_rn(r1);
+    }
+    v16[o + p] = __float2half_rn(v[o + p] + bv[bo + p]);
+    v16[o + p + half] = __float2half_rn(v[o + p + half] + bv[bo + p + half]);
+}
+
+PD_EXPORT
+int pd_mrope_vision_qkv_h(const void* q, const void* k, const void* v, const void* bq,
+                          const void* bk, const void* bv, const void* positions, void* q16,
+                          void* k16, void* v16, uint32_t n_tokens, uint32_t n_heads,
+                          uint32_t head_dim, float theta_scale, float q_mul, void* stream) {
+    uint32_t total = n_tokens * n_heads * (head_dim / 2);   // one thread per pair
+    if (total == 0) return 0;
+    uint32_t threads = 256;
+    uint32_t blocks = (total + threads - 1) / threads;
+    pd_mrope_vision_qkv_h_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+        (const float*)q, (const float*)k, (const float*)v, (const float*)bq, (const float*)bk,
+        (const float*)bv, (const unsigned int*)positions, (__half*)q16, (__half*)k16,
+        (__half*)v16, n_tokens, n_heads, head_dim, theta_scale, q_mul);
+    return pd_launch_status();
+}
+
 // Non-causal (bidirectional) ViT attention: q/k/v [n, heads, hd] f32, out
 // [n, heads*hd]. grid (heads, n); block hd threads; online softmax over all n
 // keys - the same structure as pd_attn_decode_batch minus the causal bound and

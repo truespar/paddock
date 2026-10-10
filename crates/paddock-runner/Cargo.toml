@@ -135,6 +135,8 @@ tempfile = "3"
 scriptor-ooxml = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 http-body-util = { workspace = true }
+# the layout gates compare crops by the reference's own SHA-256 fingerprints
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

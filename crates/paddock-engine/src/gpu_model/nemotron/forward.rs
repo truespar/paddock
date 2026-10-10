@@ -1687,6 +1687,9 @@ impl Generator for GpuNemotron {
     fn reply_pin(&mut self, slot: usize) {
         GpuNemotron::reply_pin(self, slot);
     }
+    fn anchor_at(&mut self, _slot: usize, tokens: &[u32], upto: usize) {
+        GpuNemotron::anchor_at(self, tokens, upto);
+    }
     fn tier_prefix_loading(&mut self, slot: usize, tokens: &[u32]) -> bool {
         self.tier_consult_impl(slot, tokens)
     }

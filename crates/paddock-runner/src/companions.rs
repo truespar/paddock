@@ -215,6 +215,38 @@ fn is_gguf(p: &Path) -> bool {
 
 /// Check the configured companions against the weights, then fill the unset
 /// ones from the weights' own folder - the layout catalog pulls produce.
+/// A PP-DocLayoutV3 checkpoint directory for PaddleOCR-VL weights: one named
+/// `PP-DocLayoutV3*` inside the weights' folder, else beside it (the
+/// catalog's one-folder-per-repo layout), its `config.json` naming the
+/// architecture.
+fn layout_dir(weights: &Path) -> Option<PathBuf> {
+    let folder = weights.parent()?;
+    let is_layout = |d: &Path| {
+        d.join("model.safetensors").is_file()
+            && std::fs::read_to_string(d.join("config.json"))
+                .is_ok_and(|c| c.contains("\"pp_doclayout_v3\""))
+    };
+    [Some(folder), folder.parent()]
+        .into_iter()
+        .flatten()
+        .find_map(|root| {
+            let mut dirs: Vec<PathBuf> = std::fs::read_dir(root)
+                .ok()?
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name().is_some_and(|n| {
+                        n.to_string_lossy()
+                            .to_lowercase()
+                            .starts_with("pp-doclayoutv3")
+                    }) && is_layout(p)
+                })
+                .collect();
+            dirs.sort();
+            dirs.into_iter().next()
+        })
+}
+
 pub(crate) fn resolve(cfg: &mut Config, weights: &Path) -> Result<(), String> {
     // `vision = false` / `--no-mmproj`: the tower is switched OFF. Leaving the
     // mmproj line out used to be the only off switch, and discovery below
@@ -252,6 +284,16 @@ pub(crate) fn resolve(cfg: &mut Config, weights: &Path) -> Result<(), String> {
     // of the right width, so the generic pick could seat the audio file in
     // `mmproj`. Its discovery sorts the candidates by the tower they carry.
     let split_towers = model.arch.as_deref() == Some("gemma-embedding2");
+    // the layout lane is CUDA's; elsewhere the page is read whole
+    if model.arch.as_deref() == Some("paddleocr")
+        && cfg.device == "cuda"
+        && cfg.layout.is_none()
+        && let Some(d) = layout_dir(weights)
+    {
+        tracing::info!(layout = %d.display(), "PaddleOCR-VL layout companion discovered");
+        cfg.layout = Some(d);
+        cfg.layout_discovered = true;
+    }
     for (slot, what, key, check) in [
         (
             &cfg.mmproj,

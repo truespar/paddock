@@ -251,6 +251,24 @@ __device__ __forceinline__ void pd_f16_mma(float d[4], const uint32_t a[4],
 // output), off GEGLU's 16-row block re-lay with the GATE in rows 0-7 and the
 // UP in rows 8-15. The two [N][F] f32 planes never land.
 #define PD_F16_EPI_GEGLU_G4 7u
+// GELU_TANHF (H16): y = f16(gelu(acc + bias[m])) in pd_gelu_bias_f16's own
+// FACTORED tanh form - K * v * (1 + c v^2), not GELU_TANH's K * (v + c v^3) -
+// so the landing is bit-for-bit that pass over pd_f16_gemm's f32 output: the
+// qwen-family and PaddleOCR-VL towers' FFN up (gelu_pytorch_tanh).
+#define PD_F16_EPI_GELU_TANHF 8u
+// BIAS_RES (f32 landing only): y = y + (acc + bias[m]) on the residual stream
+// the landing writes into - pd_add_bias_res's two adds in its order (the
+// bias rides the projection, then the residual add), so the f32 projection
+// plane between them never lands.
+#define PD_F16_EPI_BIAS_RES 9u
+// SILU (H16): y = f16(silu(acc + bias[m])), bias optional - the RT-DETR
+// hybrid encoder's conv-BN-SiLU seams (PP-DocLayoutV3), x * sigmoid(x) as
+// torch spells it, x / (1 + exp(-x)) with the accurate exp.
+#define PD_F16_EPI_SILU 10u
+__device__ __forceinline__ float pd_f16_gelu_tanhf(float v) {
+    return 0.5f * v * (1.0f + tanhf(0.79788456080286535587989211986876f * v
+                                    * (1.0f + 0.044715f * v * v)));
+}
 __device__ __forceinline__ float pd_f16_geglu_g4(float g, float u) {
     float gelu = 0.5f * g * (1.0f + tanhf(0.79788456080286535587989211986876f * g
                                           * (1.0f + 0.044715f * g * g)));
@@ -334,8 +352,10 @@ __global__ void __launch_bounds__(NWARP * 32) pd_f16_gemm_mma_kernel(
         PdF16Qkv qv = {nullptr, nullptr, nullptr, nullptr, nullptr, 0u, 0u, 1.0f}) {
 #if PD_MMA_OK
     // the f32 landing takes the bias epilogue too (the conv entry's FPN levels)
-    static_assert(EPI == PD_F16_EPI_NONE || H16 || EPI == PD_F16_EPI_BIAS,
+    static_assert(EPI == PD_F16_EPI_NONE || H16 || EPI == PD_F16_EPI_BIAS ||
+                      EPI == PD_F16_EPI_BIAS_RES,
                   "the fused epilogues are half-landing features");
+    static_assert(EPI != PD_F16_EPI_BIAS_RES || (!H16 && !KS), "the residual is an f32 stream");
     static_assert(!(CONV3 && KS), "the conv entry never K-splits");
     constexpr uint32_t NTH = NWARP * 32u;
     constexpr uint32_t WM = RG * 16u;      // warp tile rows
@@ -708,6 +728,26 @@ __global__ void __launch_bounds__(NWARP * 32) pd_f16_gemm_mma_kernel(
                     v10 = pd_f16_gelu_tanh(v10 + b8);
                     v11 = pd_f16_gelu_tanh(v11 + b8);
                 }
+                if (EPI == PD_F16_EPI_SILU) {
+                    const float b0 = (bias != nullptr && r0 < M) ? bias[r0] : 0.0f;
+                    const float b8 = (bias != nullptr && r8 < M) ? bias[r8] : 0.0f;
+                    v00 += b0;
+                    v01 += b0;
+                    v10 += b8;
+                    v11 += b8;
+                    v00 = v00 / (1.0f + expf(-v00));
+                    v01 = v01 / (1.0f + expf(-v01));
+                    v10 = v10 / (1.0f + expf(-v10));
+                    v11 = v11 / (1.0f + expf(-v11));
+                }
+                if (EPI == PD_F16_EPI_GELU_TANHF) {
+                    const float b0 = r0 < M ? bias[r0] : 0.0f;
+                    const float b8 = r8 < M ? bias[r8] : 0.0f;
+                    v00 = pd_f16_gelu_tanhf(v00 + b0);
+                    v01 = pd_f16_gelu_tanhf(v01 + b0);
+                    v10 = pd_f16_gelu_tanhf(v10 + b8);
+                    v11 = pd_f16_gelu_tanhf(v11 + b8);
+                }
                 if (EPI == PD_F16_EPI_BIAS && bias != nullptr) {
                     v00 += r0 < M ? bias[r0] : 0.0f;
                     v01 += r0 < M ? bias[r0] : 0.0f;
@@ -762,6 +802,21 @@ __global__ void __launch_bounds__(NWARP * 32) pd_f16_gemm_mma_kernel(
                 const uint32_t c1 = c0 + 1u;
                 float v00 = acc[rg][cg][0], v01 = acc[rg][cg][1];
                 float v10 = acc[rg][cg][2], v11 = acc[rg][cg][3];
+                if (EPI == PD_F16_EPI_BIAS_RES) {
+                    // t = projection + bias, then x += t - each element is
+                    // this thread's alone, so the read-modify-write is safe
+                    if (r0 < M) {
+                        const float b0 = bias[r0];
+                        if (c0 < N) { float* o = &out[(size_t)c0 * M + r0]; *o += v00 + b0; }
+                        if (c1 < N) { float* o = &out[(size_t)c1 * M + r0]; *o += v01 + b0; }
+                    }
+                    if (r8 < M) {
+                        const float b8 = bias[r8];
+                        if (c0 < N) { float* o = &out[(size_t)c0 * M + r8]; *o += v10 + b8; }
+                        if (c1 < N) { float* o = &out[(size_t)c1 * M + r8]; *o += v11 + b8; }
+                    }
+                    continue;
+                }
                 if (EPI == PD_F16_EPI_BIAS && bias != nullptr) {
                     // the bias_add pass's own f32 add, in the landing
                     v00 += r0 < M ? bias[r0] : 0.0f;
@@ -2170,23 +2225,32 @@ static int pd_f16_gemm_wmma_launch(const __half* w, const __half* x, float* y,
 // instantiation, then launches with the computed byte count. Exposed so the
 // perf sweep can drive arbitrary (tile, ST, KT) without editing the dispatch.
 template <uint32_t BM, uint32_t BN, uint32_t NW, uint32_t ST, uint32_t KT,
-          uint32_t RG, uint32_t CG, bool SWZ = false>
+          uint32_t RG, uint32_t CG, bool SWZ = false, uint32_t EPI = PD_F16_EPI_NONE>
 static int pd_f16_mma_cfg(const __half* w, const __half* x, float* y, float beta,
                           unsigned in_dim, unsigned out_dim, unsigned batch,
-                          cudaStream_t st) {
+                          cudaStream_t st, const float* bias = nullptr) {
     constexpr uint32_t KPAD = SWZ ? KT : KT + 8u;
     constexpr unsigned smem = 2u * ST * (BM + BN) * KPAD;  // bytes
     static bool set = false;
     if (!set) {
         cudaFuncSetAttribute(
-                pd_f16_gemm_mma_kernel<BM, BN, NW, ST, KT, RG, CG, false, false, false, SWZ>,
+                pd_f16_gemm_mma_kernel<BM, BN, NW, ST, KT, RG, CG, false, false, EPI, SWZ>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        cudaFuncSetAttribute(
-                pd_f16_gemm_mma_kernel<BM, BN, NW, ST, KT, RG, CG, true, false, false, SWZ>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        if (EPI == PD_F16_EPI_NONE)
+            cudaFuncSetAttribute(
+                    pd_f16_gemm_mma_kernel<BM, BN, NW, ST, KT, RG, CG, true, false, false, SWZ>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         set = true;
     }
     dim3 grid((out_dim + BM - 1u) / BM, (batch + BN - 1u) / BN);
+    if (EPI != PD_F16_EPI_NONE) {
+        // an epilogue entry is only routed here where the split does not fire
+        // (pd_f16_tower_fusable) - the partials plane has no epilogue
+        pd_f16_gemm_mma_kernel<BM, BN, NW, ST, KT, RG, CG, false, false, EPI, SWZ>
+                <<<grid, NW * 32u, smem, st>>>(w, x, y, beta, in_dim, out_dim, batch, nullptr,
+                                               0u, 0u, 0u, 1u, bias);
+        return (int)cudaGetLastError();
+    }
 
     // K-split arm: same tile, grid.z slabs into the partials plane, then one
     // fixed-order combine. Self-gates on grid fill, slab depth and plane fit,
@@ -3386,6 +3450,91 @@ PD_EXPORT int pd_f16_gemm_h_bias(const void* w, const void* x, void* y, const vo
                                   unsigned int in_dim, unsigned int out_dim,
                                   unsigned int batch, void* stream) {
     return pd_f16_gemm_h_route<PD_F16_EPI_BIAS>(w, x, y, (const float*)bias, in_dim, out_dim, batch, stream);
+}
+
+// 836: the landing with bias (optional - null is none) + SiLU in the epilogue:
+// y = f16(silu(acc + bias[m])). Same election and K order as 618.
+PD_EXPORT int pd_f16_gemm_h_silu(const void* w, const void* x, void* y, const void* bias,
+                                  unsigned int in_dim, unsigned int out_dim,
+                                  unsigned int batch, void* stream) {
+    return pd_f16_gemm_h_route<PD_F16_EPI_SILU>(w, x, y, (const float*)bias, in_dim, out_dim,
+                                                batch, stream);
+}
+
+// ---- the tower FFN's seams in the GEMMs that feed them (834, 835) ----------
+// The qwen-family and PaddleOCR-VL towers ran each FFN up as pd_f16_gemm ->
+// pd_gelu_bias_f16 and each wo / down as pd_f16_gemm -> pd_add_bias_res: an
+// f32 plane written by the GEMM and read straight back by an elementwise pass
+// (a 1440x2048 page: 189 MB a layer for the up plane alone). Folded into the
+// landing those planes never exist - the same accumulator, the same f32 ops
+// in the same order, one round.
+//
+// Bit identity holds where the fused landing runs the tile pd_f16_gemm would
+// have run, unsplit: the mma rings above. pd_f16_gemm takes other arms at
+// some shapes - the GEMV band (decode rows), the K-split partials (small
+// grids), the per-element wmma stage (ragged K), the tcgen05 routes (cc
+// 10.0) - and there the entries below run the two passes through the
+// caller's f32 scratch plane instead, so every shape lands the unfused bits.
+static bool pd_f16_tower_fusable(unsigned in_dim, unsigned out_dim, unsigned batch) {
+    if ((in_dim & 7u) != 0u || pd_f16_wmma_forced()) return false;
+#if defined(PD_TC5_HOST) && (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900))
+    if (pd_f16_tc5_on()) return false;
+#endif
+    if (batch <= 8u) return false;  // the GEMV band lives here
+    if (!pd_f16_mma_wide_tile(out_dim, batch)) {
+        const uint32_t blocks2d = ((out_dim + 63u) / 64u) * ((batch + 63u) / 64u);
+        if (pd_f16ks_nz(blocks2d, in_dim, out_dim, batch) >= 2u) return false;
+    }
+    return true;
+}
+
+// 834: the tower FFN up - y16 [batch][out_dim] halves = f16(gelu(W x + bias))
+// in pd_gelu_bias_f16's form (GELU_TANHF). scratch is an f32 [batch][out_dim]
+// plane, used only where the landing is not fusable (see above). bias [out_dim].
+PD_EXPORT int pd_f16_gemm_h_gelu_tanhf(const void* w, const void* x, void* y16, const void* bias,
+                                        void* scratch, unsigned int in_dim, unsigned int out_dim,
+                                        unsigned int batch, void* stream) {
+    if (out_dim == 0u || batch == 0u) return 0;
+    if (bias == nullptr) return (int)cudaErrorInvalidValue;
+    if (pd_f16_tower_fusable(in_dim, out_dim, batch))
+        return pd_f16_gemm_h_route<PD_F16_EPI_GELU_TANHF>(w, x, y16, (const float*)bias, in_dim,
+                                                          out_dim, batch, stream);
+    if (scratch == nullptr) return (int)cudaErrorInvalidValue;
+    const int r = pd_f16_gemm(w, x, scratch, 0.0f, in_dim, out_dim, batch, stream);
+    if (r != 0) return r;
+    return pd_gelu_bias_f16(scratch, bias, y16, batch, out_dim, stream);
+}
+
+// 835: a projection onto the f32 residual stream - y [batch][out_dim] f32 +=
+// (W x + bias), pd_add_bias_res's order (BIAS_RES). scratch as 834's.
+PD_EXPORT int pd_f16_gemm_bias_res(const void* w, const void* x, void* y, const void* bias,
+                                   void* scratch, unsigned int in_dim, unsigned int out_dim,
+                                   unsigned int batch, void* stream) {
+    if (out_dim == 0u || batch == 0u) return 0;
+    if (bias == nullptr) return (int)cudaErrorInvalidValue;
+    const __half* W = (const __half*)w;
+    const __half* X = (const __half*)x;
+    float* Y = (float*)y;
+    const float* B = (const float*)bias;
+    cudaStream_t st = (cudaStream_t)stream;
+    if (pd_f16_tower_fusable(in_dim, out_dim, batch)) {
+        // pd_f16_gemm_mma_launch's election, arm for arm
+        if (!pd_f16_mma_wide_tile(out_dim, batch))
+            return pd_f16_mma_cfg<64u, 64u, 8u, 3u, 32u, 2u, 2u, false, PD_F16_EPI_BIAS_RES>(
+                W, X, Y, 0.0f, in_dim, out_dim, batch, st, B);
+        if (pd_f16_mma_blocked_elect(out_dim, batch))
+            return pd_f16_mma_blocked<false, PD_F16_EPI_BIAS_RES>(W, X, Y, 0.0f, in_dim, out_dim,
+                                                                  batch, st, B);
+        if (pd_f16_mma_ring2_elect(out_dim, batch))
+            return pd_f16_mma_cfg<128u, 128u, 8u, 2u, 32u, 4u, 4u, true, PD_F16_EPI_BIAS_RES>(
+                W, X, Y, 0.0f, in_dim, out_dim, batch, st, B);
+        return pd_f16_mma_cfg<128u, 128u, 8u, 3u, 32u, 4u, 4u, false, PD_F16_EPI_BIAS_RES>(
+            W, X, Y, 0.0f, in_dim, out_dim, batch, st, B);
+    }
+    if (scratch == nullptr) return (int)cudaErrorInvalidValue;
+    const int r = pd_f16_gemm(w, x, scratch, 0.0f, in_dim, out_dim, batch, stream);
+    if (r != 0) return r;
+    return pd_add_bias_res(y, scratch, bias, batch, out_dim, stream);
 }
 
 // 775: a 3x3 / stride 1 / pad 1 convolution as one GEMM with the im2row

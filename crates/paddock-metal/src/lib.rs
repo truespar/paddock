@@ -3,7 +3,7 @@
 #[cfg(target_os = "macos")]
 mod sam3;
 #[cfg(target_os = "macos")]
-pub use sam3::{Sam3InputKind, Sam3Vision, Sam3VisionPlane};
+pub use sam3::{Sam3InputKind, Sam3Text, Sam3Vision, Sam3VisionPlane};
 #[cfg(target_os = "macos")]
 mod embedding_gemma2;
 #[cfg(target_os = "macos")]

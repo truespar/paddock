@@ -1927,6 +1927,7 @@ pub(crate) mod tests {
         let cfg = crate::pdf::PdfConfig {
             max_pages: 20,
             long_edge: 512,
+            max_dpi: 300.0,
         };
         let (out, summary) = crate::pdf::expand_in_messages(
             messages, &cfg, true, 8192, None, None, false, "test", false,

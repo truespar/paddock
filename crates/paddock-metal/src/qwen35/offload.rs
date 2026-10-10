@@ -131,6 +131,11 @@ impl Qwen35 {
             layout.push_str(":sequence-local-decode-attention-v1");
             layout.push_str(":phase-local-affine-f32-v1");
         }
+        if self.register_language_attention() {
+            // Attention changes every later recurrent snapshot; never restore
+            // the old BF16-probability/16-key arithmetic under this graph.
+            layout.push_str(":paged-nax-head256-f32-probability-v1");
+        }
         crate::offload::require_unchanged(&self.source_versions)?;
         let ns = crate::offload::namespace(paths, layout.as_bytes(), config.scope)?;
         crate::offload::require_unchanged(&self.source_versions)?;
@@ -672,6 +677,45 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires 0.8B MLX vision checkpoint; persistent cache namespace guard"]
+    fn lighton_attention_arithmetic_has_distinct_namespace() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                attention::BASELINE_LANGUAGE_NAX_FOR_TEST.with(|v| v.set(false));
+            }
+        }
+        let _reset = Reset;
+        let path = std::env::var_os("PADDOCK_METAL_QWEN_MODEL").unwrap();
+        let path = Path::new(&path);
+        let mut model = Qwen35::load_for_offload(path, 1024, 1, None).unwrap();
+        model.attach_vision(path).unwrap();
+        if !model.device.tensor_accelerated() {
+            return;
+        }
+        assert_eq!(model.geometry, Geometry::DENSE_08B);
+        let mut roots = Vec::new();
+        for baseline in [true, false, true, false] {
+            attention::BASELINE_LANGUAGE_NAX_FOR_TEST.with(|v| v.set(baseline));
+            model
+                .enable_kv_offload(
+                    crate::KvOffloadConfig {
+                        ram_bytes: 1 << 30,
+                        disk: None,
+                        scope: b"lighton-arithmetic-namespace".to_vec(),
+                    },
+                    &[path],
+                )
+                .unwrap();
+            roots.push(model.cold.as_ref().unwrap().root);
+            drop(model.cold.take());
+        }
+        assert_ne!(roots[0], roots[1]);
+        assert_eq!(roots[0], roots[2]);
+        assert_eq!(roots[1], roots[3]);
+    }
+
+    #[test]
     #[ignore = "requires PADDOCK_METAL_QWEN_MODEL + PADDOCK_METAL_MMPROJ; image disk restart"]
     fn image_disk_restart_skips_tower_and_preserves_c4_logits() {
         use paddock_engine::service::MmChunk;
@@ -790,7 +834,8 @@ mod tests {
             assert_eq!(
                 m.take_prefill_reused(s),
                 boundary,
-                "disk reuse, not recomputation"
+                "disk reuse, not recomputation: {:?}",
+                m.cold_report()
             );
             assert_eq!(logits, *reference, "full multimodal suffix logits");
             assert!(m.slots[s].mm.as_ref().unwrap().images.is_empty());

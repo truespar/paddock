@@ -31,6 +31,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use cudarc::driver::{CudaEvent, CudaSlice, DevicePtr, DevicePtrMut};
 
 use super::digest::{Checksum, LogicalKey};
+use super::hash_pool::HashPool;
 use super::host::{HostStore, PinMode, StagingRing};
 use super::nvme_store::NvmeStore;
 use super::transport::{
@@ -175,10 +176,28 @@ fn utc_day() -> u64 {
 /// device staging size - one per direction in the pageable fallback.
 pub const RING_EXTENTS: usize = paddock_models::kv_tier_geom::STAGING_EXTENTS as usize;
 
+/// A finished flight whose payload digest is still being computed (see
+/// `hash_pool`): its completion waits for the digest.
+enum Hashing {
+    Store {
+        key: LogicalKey,
+        loc: Loc,
+        bytes: u64,
+    },
+    Load {
+        bytes: u64,
+    },
+}
+
 pub struct RamTransport {
     /// Forked lane: `exec.stream` is the tier stream. Shares the context,
     /// mempool and kernel table with the serving executor.
     exec: GpuExecutor,
+    /// Checksum workers. Declared before `store` on purpose: fields drop in
+    /// order, and the workers read slab bytes until they are joined.
+    hasher: HashPool,
+    /// Finished flights waiting on their digest, by op.
+    hashing: HashMap<OpId, Hashing>,
     store: HostStore,
     /// T2 durable store: when attached, every successful T1 store
     /// writes through to disk (restart persistence), and loads whose job
@@ -324,6 +343,8 @@ impl RamTransport {
         );
         Ok(Self {
             exec,
+            hasher: HashPool::new(),
+            hashing: HashMap::new(),
             store,
             t2,
             ring,
@@ -437,6 +458,11 @@ impl RamTransport {
     /// The attached T2 store, when one is (restart preload + tombstones).
     pub fn t2(&self) -> Option<&NvmeStore> {
         self.t2.as_ref()
+    }
+
+    /// The serving device's tag (see `GpuExecutor::device_tag`).
+    pub fn device_tag(&self) -> String {
+        self.exec.device_tag()
     }
 
     pub fn t2_mut(&mut self) -> Option<&mut NvmeStore> {
@@ -794,16 +820,36 @@ impl RamTransport {
             self.launch_load(q);
         }
         // stores only in load-slack (no duplex - a demote beside a
-        // restore halves the restore) - and at most a few flights deep:
-        // the lane stream is FIFO, so a restore that arrives next tick
-        // waits behind every store already on the stream. A shallow store
-        // pipeline keeps that wait to ~one extent's wire time while the
-        // tight make-room drain still retires-and-refills it fast enough
-        // to stay wire-limited.
-        const STORE_FLIGHTS_MAX: usize = 4;
+        // restore halves the restore) - and only so many bytes deep: the
+        // lane stream is FIFO, so a restore that arrives next tick waits
+        // behind every store already on the stream. The window refills
+        // once per pump, i.e. once per service tick, so its depth IS the
+        // write-through rate: four 4 MiB flights a tick was 16 MB/s under
+        // a long prefill (~1 s ticks) against ~0.8 GB of KV and state a
+        // 10K-token Qwen3.8 prompt produces - the queue never drained,
+        // its pins starved the pool, and repeats probed runs still
+        // queued. 256 MiB keeps a restore's wait near 10 ms at PCIe rate.
+        // (a store still hashing holds its extent and its pool pins just the
+        // same, so it counts until its completion is out)
+        const STORE_INFLIGHT_BYTES: usize = 256 << 20;
+        let open = |fl: &[Flight], h: &HashMap<OpId, Hashing>| -> usize {
+            let flying: usize = fl
+                .iter()
+                .filter(|f| f.dir == Dir::Store)
+                .map(|f| f.spec_total)
+                .sum();
+            let hashing: usize = h
+                .values()
+                .map(|x| match x {
+                    Hashing::Store { bytes, .. } => *bytes as usize,
+                    Hashing::Load { .. } => 0,
+                })
+                .sum();
+            flying + hashing
+        };
         while self.q_load.is_empty()
             && !self.flights.iter().any(|f| f.dir == Dir::Load)
-            && self.flights.iter().filter(|f| f.dir == Dir::Store).count() < STORE_FLIGHTS_MAX
+            && open(&self.flights, &self.hashing) < STORE_INFLIGHT_BYTES
         {
             let Some(q) = self.q_store.front() else { break };
             let needs_ring = !self.store.is_pinned(q.host_loc);
@@ -931,41 +977,33 @@ impl TierTransport for RamTransport {
                     self.free_extent(f.host_loc);
                     self.fail(f.op);
                 }
-                (Dir::Store, false) => {
-                    let outcome = match self.store.resolve(f.host_loc) {
-                        Ok((ptr, len)) => {
-                            // SAFETY: extent valid until free; len is payload.
-                            let bytes = unsafe {
-                                std::slice::from_raw_parts(ptr as *const u8, len as usize)
-                            };
-                            // Restart write-through, DEFERRED: the
-                            // extent is durable-eligible now, but the disk
-                            // write waits for read slack (see `t2_pending`).
-                            // Ordering is irrelevant to correctness here -
-                            // the T1 copy already serves, and the durable
-                            // copy only has to exist before the next restart.
-                            if self.t2.is_some() {
-                                self.t2_pending.push_back((f.key, f.host_loc));
-                                if self.t2_pending.len() > T2_PENDING_MAX {
-                                    // a cache, not a journal: the oldest
-                                    // deferred write is the one whose T1
-                                    // extent is likeliest to be gone anyway
-                                    self.t2_pending.pop_front();
-                                }
-                            }
-                            IoOutcome::StoreDone {
+                (Dir::Store, false) => match self.store.resolve(f.host_loc) {
+                    // the digest is computed off the tick; the completion
+                    // goes out when it is back (see `hash_pool`)
+                    Ok((ptr, len)) => {
+                        // SAFETY: the extent is freed only after this op's
+                        // completion, which waits for the digest.
+                        unsafe {
+                            self.hasher
+                                .submit(f.op, ptr as *const u8, len as usize, false)
+                        };
+                        self.hashing.insert(
+                            f.op,
+                            Hashing::Store {
+                                key: f.key,
                                 loc: f.host_loc,
                                 bytes: len,
-                                checksum: Checksum::of_payload(bytes),
-                            }
-                        }
-                        Err(_) => IoOutcome::Failed,
-                    };
-                    if matches!(outcome, IoOutcome::Failed) {
-                        self.free_extent(f.host_loc);
+                            },
+                        );
                     }
-                    self.ready.push(IoCompletion { op: f.op, outcome });
-                }
+                    Err(_) => {
+                        self.free_extent(f.host_loc);
+                        self.ready.push(IoCompletion {
+                            op: f.op,
+                            outcome: IoOutcome::Failed,
+                        });
+                    }
+                },
                 (Dir::Load, true) => self.fail(f.op),
                 (Dir::Load, false) if f.from_t2 => {
                     // T2 load: the disk bytes verified against their commit
@@ -1023,22 +1061,68 @@ impl TierTransport for RamTransport {
                     // the leg the checksum exists for; the H2D+scatter leg
                     // rides link-layer CRC like every other transfer in the
                     // engine
-                    let outcome = match self.store.resolve(f.host_loc) {
+                    match self.store.resolve(f.host_loc) {
                         Ok((ptr, len)) => {
-                            // SAFETY: extent valid until free.
-                            let bytes = unsafe {
-                                std::slice::from_raw_parts(ptr as *const u8, len as usize)
+                            // SAFETY: the catalog pins a load's source until
+                            // its completion, which waits for the digest.
+                            unsafe {
+                                self.hasher
+                                    .submit(f.op, ptr as *const u8, len as usize, true)
                             };
-                            IoOutcome::LoadDone {
-                                bytes: len,
-                                checksum: Checksum::of_payload(bytes),
-                                dst_loc: None,
-                            }
+                            self.hashing.insert(f.op, Hashing::Load { bytes: len });
                         }
-                        Err(_) => IoOutcome::Failed,
-                    };
-                    self.ready.push(IoCompletion { op: f.op, outcome });
+                        Err(_) => self.ready.push(IoCompletion {
+                            op: f.op,
+                            outcome: IoOutcome::Failed,
+                        }),
+                    }
                 }
+            }
+        }
+        for (op, checksum) in self.hasher.collect() {
+            let Some(h) = self.hashing.remove(&op) else {
+                continue;
+            };
+            let cancelled = self.cancelled.remove(&op);
+            match h {
+                Hashing::Store { loc, .. } if cancelled => {
+                    self.free_extent(loc);
+                    self.fail(op);
+                }
+                Hashing::Store { key, loc, bytes } => {
+                    // Restart write-through, DEFERRED: the extent is
+                    // durable-eligible now, but the disk write waits for
+                    // read slack (see `t2_pending`). Ordering is irrelevant
+                    // to correctness here - the T1 copy already serves, and
+                    // the durable copy only has to exist before the next
+                    // restart.
+                    if self.t2.is_some() {
+                        self.t2_pending.push_back((key, loc));
+                        if self.t2_pending.len() > T2_PENDING_MAX {
+                            // a cache, not a journal: the oldest deferred
+                            // write is the one whose T1 extent is likeliest
+                            // to be gone anyway
+                            self.t2_pending.pop_front();
+                        }
+                    }
+                    self.ready.push(IoCompletion {
+                        op,
+                        outcome: IoOutcome::StoreDone {
+                            loc,
+                            bytes,
+                            checksum,
+                        },
+                    });
+                }
+                Hashing::Load { .. } if cancelled => self.fail(op),
+                Hashing::Load { bytes } => self.ready.push(IoCompletion {
+                    op,
+                    outcome: IoOutcome::LoadDone {
+                        bytes,
+                        checksum,
+                        dst_loc: None,
+                    },
+                }),
             }
         }
         self.kick();

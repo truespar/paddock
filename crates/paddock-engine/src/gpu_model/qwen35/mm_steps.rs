@@ -130,7 +130,7 @@ impl GpuQwen35 {
         assert!(self.batch.is_some(), "enable_batch first");
         assert!(slot < self.batch.as_ref().expect("batch").max_batch);
         // token ids (image spans are `0` placeholders), the mRoPE grid, and the
-        // equal-t image visibility bound - one ordered walk, any number of images
+        // per-row causal bound - one ordered walk, any number of images
         let grids = self.picture_grids(chunks)?;
         let lay = build_mm_layout(chunks, &grids)?;
         let t_len = lay.t_len;
@@ -369,15 +369,32 @@ impl GpuQwen35 {
             .collect())
     }
 
+    /// `Generator::set_page_reader`.
+    pub(crate) fn set_page_reader(&mut self, on: bool) {
+        self.page_reader = on;
+    }
+
     /// `Generator::prefill_begin_multimodal`: plan the wave exactly as the
     /// blocking one routes it, with the step budget as the cap, and hold every
     /// planned slot until its units have run. A request that cannot be planned
     /// fails alone.
+    ///
+    /// On a page reader a wave of several pages groups up to the elected
+    /// prefill chunk instead: a page (~2.9K rows at LightOnOCR-3's 2048-px
+    /// edge) is past the step budget, so each went alone, two units and two
+    /// decode ticks apiece. Grouped two to a unit, 64 pages in flight on GB10
+    /// reached their first token 18-19% sooner (p50 39.8 -> 32.6 s, p95 72.9 ->
+    /// 59.0 s). The group pass publishes nothing to the prefix cache, which is
+    /// why only an endpoint whose pictures are never continued groups this wide.
     pub(crate) fn mm_steps_begin(
         &mut self,
         reqs: Vec<(usize, Vec<MmChunk>)>,
     ) -> Vec<(usize, MmAdmit)> {
-        let step = self.mm_step_rows();
+        let step = if self.page_reader && reqs.len() > 1 {
+            self.mm_step_rows().max(self.prefill_chunk_rows)
+        } else {
+            self.mm_step_rows()
+        };
         let mut out: Vec<(usize, MmAdmit)> = Vec::with_capacity(reqs.len());
         let mut cold: Vec<(Vec<MmChunk>, usize, Vec<(usize, usize)>)> = Vec::new();
         let mut alone: Vec<(usize, Vec<MmChunk>)> = Vec::new();

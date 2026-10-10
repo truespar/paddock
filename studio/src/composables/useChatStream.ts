@@ -787,7 +787,8 @@ function buildBody(
     if (visual) {
       const o: Record<string, unknown> = {}
       if (conv.ocrMode && ocrCaps.modes.includes(conv.ocrMode)) o.mode = conv.ocrMode
-      if (conv.ocrRegions && ocrCaps.grounding) o.grounding = true
+      if (conv.ocrRegions && ocrCaps.grounding && !ocrCaps.modes.includes('grounding'))
+        o.grounding = true
       if (Object.keys(o).length) body.ocr = o
     }
   }
@@ -2329,7 +2330,8 @@ export function useChatStream() {
           ) {
             o.mode = conv!.ocrMode
           }
-          if (conv!.ocrRegions && caps.ocr.grounding) o.grounding = true
+          if (conv!.ocrRegions && caps.ocr.grounding && !caps.ocr.modes.includes('grounding'))
+            o.grounding = true
           if (Object.keys(o).length) body.ocr = o
         }
         let res = await fetch(endpoint!, {
@@ -2355,6 +2357,7 @@ export function useChatStream() {
           return
         }
         const lps: LogprobEntry[] = []
+        let repeatStopped = false
         for await (const data of readSse(res.body)) {
           let ev: ResponseEvent
           try {
@@ -2383,6 +2386,7 @@ export function useChatStream() {
             // facts and the flat fallback view stay populated
             if (pages.length === 1 && meta) assistant.ocr = meta
             if (ev.type === 'response.incomplete') page.note = 'cut off at the token cap'
+            if (meta?.repetitionStop) repeatStopped = true
           } else if (ev.type === 'response.failed') {
             page.state = 'error'
             page.note = ev.response?.error?.message ?? 'the model failed to respond'
@@ -2399,9 +2403,15 @@ export function useChatStream() {
         }
         if (page.state !== 'error') {
           // the degeneration guard: a page that collapsed into a loop is
-          // marked for review instead of standing as a clean answer
+          // marked for review instead of standing as a clean answer - and so
+          // is one the server stopped at the loop's start, whose text no
+          // longer looks degenerate but ends early
           const ratio = await degenerationRatio(page.text)
-          if (ratio > DEGENERATION_THRESHOLD) {
+          if (repeatStopped) {
+            page.state = 'review'
+            page.note =
+              'the model began repeating itself, so the read stopped there - the rest of this page may be missing'
+          } else if (ratio > DEGENERATION_THRESHOLD) {
             page.state = 'review'
             page.note = 'output degenerated into repetition - the page may be too low-resolution'
           } else {

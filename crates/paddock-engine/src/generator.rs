@@ -795,6 +795,17 @@ pub trait Generator: Send {
         self.reply_pin(slot);
     }
 
+    /// The prompt `tokens` just prefilled on `slot` opens a USER turn: hold its
+    /// deepest checkpoint at or below `upto` as an anchor, after which plain
+    /// checkpoints are given up first (`PagedRadix::mark_anchor`). Default:
+    /// nothing to hold (no hybrid prefix cache).
+    fn anchor_at(&mut self, _slot: usize, _tokens: &[u32], _upto: usize) {}
+
+    /// The endpoint reads ONE-SHOT pages (a document parser): no picture
+    /// prompt is ever continued, so a wave of them may share batched passes
+    /// that publish nothing to the prefix cache. Default: no such waves.
+    fn set_page_reader(&mut self, _on: bool) {}
+
     /// Prompt tokens the last prefill of `slot` served from a prefix cache
     /// (usage reporting; taken - resets to 0). 0 = no cache / no reuse.
     fn take_prefill_reused(&mut self, _slot: usize) -> usize {
@@ -1789,6 +1800,12 @@ impl Generator for crate::gpu_model::qwen35::GpuQwen35 {
     }
     fn reply_pin(&mut self, slot: usize) {
         crate::gpu_model::qwen35::GpuQwen35::reply_pin(self, slot)
+    }
+    fn anchor_at(&mut self, _slot: usize, tokens: &[u32], upto: usize) {
+        crate::gpu_model::qwen35::GpuQwen35::anchor_at(self, tokens, upto)
+    }
+    fn set_page_reader(&mut self, on: bool) {
+        crate::gpu_model::qwen35::GpuQwen35::set_page_reader(self, on)
     }
     fn forward_prefill_batch(
         &mut self,

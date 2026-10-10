@@ -120,6 +120,13 @@ pub enum ArtifactKind {
     /// safetensors). Required and resident like the text encoder; rides
     /// `--vae`.
     Vae,
+    /// A layout model a document reader runs ahead of itself (PaddleOCR-VL's
+    /// PP-DocLayoutV3): a checkpoint folder inside the weights' folder, which
+    /// the runner discovers there and loads beside the engine. Resident and
+    /// charged like the lane companions, but not required - without it the
+    /// reader still serves, page by page instead of region by region - and
+    /// no flag carries it, so it has no switch either.
+    Layout,
 }
 
 impl ArtifactKind {
@@ -2252,3 +2259,5 @@ mod flash_next_mlx_tests;
 mod flash_next_nvfp4_tests;
 #[cfg(test)]
 mod kolibri_tests;
+#[cfg(test)]
+mod paddleocr_layout_tests;

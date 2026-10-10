@@ -36,12 +36,15 @@ pub mod generation_residency;
 pub mod harmony;
 pub mod images;
 pub mod language;
+pub mod lighton_ocr;
 pub mod mask_sessions;
 pub mod masks;
 pub mod messages;
+mod messages_blocks;
 pub mod messages_system;
 pub mod metrics;
 pub mod muse;
+mod paddle_layout;
 pub mod paddle_ocr;
 pub mod parsers;
 pub mod pdf;
@@ -51,6 +54,7 @@ pub mod reasoning;
 pub(crate) mod reference_image;
 pub mod residency;
 pub mod responses;
+mod responses_stream;
 pub mod routes;
 pub mod segmentations;
 pub mod service;
@@ -61,6 +65,9 @@ pub mod subtitles;
 pub mod systemone;
 pub mod tabular;
 pub mod tiffdoc;
+mod tool_images;
+mod tool_stream;
+mod user_turn;
 pub use paddock_mcp::{loop_budget, tool_search};
 pub mod transcriptions;
 pub mod websearch;
@@ -109,6 +116,50 @@ fn resolve_local_model(cfg: &mut Config) -> Result<(), String> {
     companions::resolve(cfg, &found.path)?;
     cfg.model = Some(found.path);
     Ok(())
+}
+
+/// The layout companion named or discovered for this model, loaded on its
+/// own thread. A discovered one that cannot load costs the document mode,
+/// said loudly; a configured one that cannot load stops the runner.
+fn load_layout(
+    cfg: &Config,
+    gpu: usize,
+) -> Result<Option<paddock_engine::doclayout::LayoutService>, String> {
+    let Some(dir) = cfg.layout.clone() else {
+        return Ok(None);
+    };
+    let fail = |e: String| {
+        if cfg.layout_discovered {
+            tracing::warn!(layout = %dir.display(), error = %e,
+                "layout companion did not load - the document pipeline is not served");
+            Ok(None)
+        } else {
+            Err(format!("layout model {}: {e}", dir.display()))
+        }
+    };
+    if cfg.device != "cuda" {
+        return fail(format!(
+            "the layout model needs cuda (got {:?})",
+            cfg.device
+        ));
+    }
+    match paddock_engine::doclayout::LayoutService::spawn(
+        gpu,
+        cfg.kernel_pack.clone(),
+        dir.clone(),
+        cfg.vram_budget.map(|mib| mib << 20),
+    ) {
+        Ok(l) => {
+            tracing::info!(
+                layout = %dir.display(),
+                weights_mb = l.info().weight_bytes as f64 / 1e6,
+                workspace_mb = l.info().workspace_bytes as f64 / 1e6,
+                "layout companion ready (PP-DocLayoutV3)"
+            );
+            Ok(Some(l))
+        }
+        Err(e) => fail(e),
+    }
 }
 
 /// Bind and serve until the process is stopped. Caller sets up tracing.
@@ -951,6 +1002,11 @@ pub async fn run(
             } else {
                 None
             };
+            // PaddleOCR-VL's layout companion loads FIRST: its weights and
+            // its warm-up's workspace (held as a placeholder) are then in the
+            // pool the engine sizes its KV around; the placeholder goes back
+            // once the engine is planned
+            let layout = load_layout(&cfg, gpu_ordinal)?;
             let mut m = serving::load_with_residency(
                 id,
                 path,
@@ -968,6 +1024,15 @@ pub async fn run(
                 resident_options,
             )?;
             m.vision_off = cfg.vision == Some(false);
+            if let Some(l) = layout {
+                if !m.paddleocr {
+                    return Err("`layout` is PaddleOCR-VL's companion (PP-DocLayoutV3); \
+                                this model does not read documents through it"
+                        .into());
+                }
+                l.release();
+                m.layout = Some(l);
+            }
             tracing::info!(model = %m.id, "model ready");
             spec_policy_off = spec_off;
             serving = Some(m);
@@ -1071,7 +1136,14 @@ pub async fn run(
 
     // Text extraction is always available. Experimental builds without our
     // PDFium archive must report image rendering unavailable before requests.
-    let pdf_cfg = crate::pdf::PdfConfig::from_config(&cfg);
+    let mut pdf_cfg = crate::pdf::PdfConfig::from_config(&cfg);
+    // A checkpoint trained at a fixed page size reads PDFs at it: its own
+    // client renders straight to that edge, whatever the page's point size, so
+    // the DPI cap that bounds odd tiny pages for everyone else is lifted too.
+    if let Some(edge) = serving.as_ref().and_then(|s| s.page_edge()) {
+        pdf_cfg.long_edge = edge;
+        pdf_cfg.max_dpi = f32::INFINITY;
+    }
     tracing::info!(
         max_pages = pdf_cfg.max_pages,
         long_edge = pdf_cfg.long_edge,
@@ -1104,7 +1176,7 @@ pub async fn run(
     // without reading the table.
     let sampling = crate::routes::SamplingDefaults::for_model(
         &cfg,
-        serving.as_ref().map(|s| s.arch.as_str()),
+        serving.as_ref().map(|s| s.sampling_key()),
         serving.as_ref().and_then(|s| s.published_sampling),
     );
     if serving.is_some() {

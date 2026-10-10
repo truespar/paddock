@@ -25,6 +25,21 @@ views supply monochrome ink.
 Source: https://aleph-alpha.com/_astro/logo-bm.C1UmWdTa_ZKMPHl.svg
 The mark remains Aleph Alpha's property.
 
+OpenBMB (2026-10-10, MiniCPM's maker) and The Intelligence Company (2026-10-10,
+TIC Forestry's maker) are converted from `VendorLogo.vue`, where their sources
+are recorded (openbmb.cn's own favicon.svg; the company's BIMI verified-mark
+SVG). Path geometry and viewBoxes are unchanged; OpenBMB's themed blue becomes
+its light-theme #315efe beside the unchanged #00D3ED, TIC's currentColor its
+source black. Native views supply monochrome ink. The marks remain their
+owners' property.
+
+LightOn (2026-10-10, the LightOnOCR-3 models' maker) is the official square
+emblem lighton.ai serves as its site icon, an exact copy of
+`studio/src/assets/lighton.svg`. Full color (gradient disc, white starburst),
+so like KBLab it keeps its original luminance rather than an alpha template.
+Source: https://www.lighton.ai/icon.svg
+The mark remains LightOn's property.
+
 The following SVGs are copied from Studio's installed simple-icons 16.28.0.
 The package's full license and disclaimer are bundled as
 `SimpleIcons-LICENSE.md` and `SimpleIcons-DISCLAIMER.md`. Package CC0 is not a

@@ -148,7 +148,8 @@ impl SamplingDefaults {
     /// Build from the config's pins and whatever the served architecture
     /// publishes. `arch` is `general.architecture` - the one identity field
     /// every checkpoint fills in honestly (laguna's `general.name` is a bare
-    /// commit hash).
+    /// commit hash) - or a fine-tune's own key where it publishes its own
+    /// sampling on a base graph (`ServingModel::sampling_key`).
     ///
     /// `published` is what the checkpoint's own header said, for the case the
     /// arch string cannot decide (granite 4.1 vs 4.2 - same `arch`, different
@@ -451,6 +452,7 @@ impl AppState {
             pdf: crate::pdf::PdfConfig {
                 max_pages: 8,
                 long_edge: 1568,
+                max_dpi: 300.0,
             },
             drain: Arc::new(crate::drain::DrainCtl::default()),
             events: crate::events::EventRing::new(),
@@ -1106,15 +1108,7 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
         // Same unreachable-otherwise reasoning as task_tags - the modes are
         // this model's real interface, and nothing else lists them. null on
         // every other model.
-        "ocr": state.serving.as_ref().and_then(|s| {
-            if s.ocr {
-                Some(crate::deepseek_ocr::caps_json())
-            } else if s.paddleocr {
-                Some(crate::paddle_ocr::caps_json())
-            } else {
-                None
-            }
-        }),
+        "ocr": state.serving.as_ref().and_then(|s| s.ocr_caps()),
         // PDF attachments are always accepted: sift text extraction is
         // compiled in, so any model reads a PDF's text layer. `raster` says
         // whether a vision model additionally gets page images (pdfium
@@ -1305,8 +1299,11 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
         // when the matching mmproj is actually attached. `transcription` is the
         // functional truth for POST /v1/audio/transcriptions - same computed-
         // never-declared rule as everything else in this listing.
+        // OCR fine-tunes retain their base model's template/dialect, not
+        // its tool-calling capability. Do not expose chat tools on readers.
+        let supports_tools = !s.document_parser && s.dialect.supports_tools();
         let mut capabilities = serde_json::json!({
-            "function_calling": s.dialect.supports_tools(),
+            "function_calling": supports_tools,
             "vision": s.supports_vision,
             // A document parser reads pages and nothing else: text-only chat
             // is refused with a 400 (its decoder free-runs noise on a bare
@@ -1360,7 +1357,7 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
         ]
         .map(str::to_owned)
         .into();
-        if !s.dialect.supports_tools() {
+        if !supports_tools {
             params
                 .retain(|p| !matches!(p.as_str(), "tools" | "tool_choice" | "parallel_tool_calls"));
         }
@@ -1394,17 +1391,13 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
                     _ => false,
                 }
         );
-        if s.ocr || s.paddleocr {
+        if let Some(caps) = s.ocr_caps() {
             // the document-parser request object - named here, and its
             // vocabulary spelled out in `capabilities` (the parameter name
             // alone leaves the modes discoverable by 400)
             params.push("ocr".to_owned());
             params.sort();
-            capabilities["ocr"] = if s.ocr {
-                crate::deepseek_ocr::caps_json()
-            } else {
-                crate::paddle_ocr::caps_json()
-            };
+            capabilities["ocr"] = caps;
         }
         data.push(
             ModelObject::new(s.id.clone(), 0, "paddock")

@@ -15,7 +15,7 @@ impl GpuQwen35 {
     /// resolves. Failure of any kind degrades to recompute; the family's
     /// normal resume path adopts whatever published via an ordinary match.
     pub(crate) fn tier_consult_impl(&mut self, slot: usize, tokens: &[u32]) -> bool {
-        use crate::kv_tier::{Election, FlowStatus};
+        use crate::kv_tier::FlowStatus;
         let exec = self.exec.clone();
         let Some(bs) = self.batch.as_mut() else {
             return false;
@@ -43,22 +43,30 @@ impl GpuQwen35 {
         if pr.match_full(tokens).ckpt.is_some() {
             return false;
         }
-        let hit = tier.probe(tokens, 0);
-        let afford = |pool: &crate::kv_pool::KvPool, r: usize| {
-            pool.free_blocks().saturating_sub(2 * r) / r * r
+        // the blob's geometry lets the probe find it on any tier
+        tier.declare_blob_pages(pr.pages_per_ckpt());
+        // probe counts the lookup (and the miss when nothing is held)
+        let Some(hit) = tier.probe(tokens, 0) else {
+            return false;
         };
         let r = tier.run_blocks();
-        let mut afford_blocks = afford(pool, r);
-        let deepest = hit
-            .as_ref()
-            .and_then(|h| tier.probe_aux(tokens, h.end_block))
+        let deepest = tier
+            .probe_aux(tokens, hit.end_block)
             .filter(|a| a.end_block * crate::kv_pool::BLOCK_TOKENS >= 32 && a.end_block % r == 0);
-        if let Some(a) = &deepest
-            && afford_blocks < a.end_block
-        {
+        let Some((hit, est_us)) = tier.elect_hybrid(&hit, deepest.as_ref()) else {
+            return false;
+        };
+        let aux = deepest.expect("an elected hybrid hit has its boundary");
+        // the destination: the restored blocks, then the checkpoint's own
+        // pages - the blob round draws those from the pool too, and a pool
+        // that seats only the blocks makes it evict to find them
+        let need = aux.end_block + pr.pages_per_ckpt();
+        let afford =
+            |pool: &crate::kv_pool::KvPool| pool.free_blocks().saturating_sub(2 * r) / r * r;
+        if afford(pool) < need {
             // retention crowds the destination: pressure-demote it (the
             // prefix cache is reclaimable capacity)
-            let want = a.end_block + 2 * r;
+            let want = need + 2 * r;
             let after = exec.record_event().ok();
             let (_e, taken) = tier.pressure_demote(pr, pool, want, after);
             for t in taken {
@@ -78,39 +86,17 @@ impl GpuQwen35 {
                 }
                 std::thread::sleep(std::time::Duration::from_micros(200));
             }
-            afford_blocks = afford(pool, r);
         }
-        let aux = deepest.filter(|a| a.end_block <= afford_blocks);
         tracing::debug!(
             free = pool.free_blocks(),
-            afford_blocks,
-            hit_end = hit.as_ref().map(|h| h.end_block),
-            aux_end = aux.as_ref().map(|a| a.end_block),
+            need,
+            boundary = aux.end_block,
             "qwen35 tier gate"
         );
-        let (Some(hit), Some(aux)) = (hit, aux) else {
+        if afford(pool) < need {
+            tier.refuse_park();
             return false;
-        };
-        let n_runs = aux.end_block / r;
-        let per_run = hit.bytes / hit.keys.len().max(1) as u64;
-        let hit = crate::kv_tier::TierHit {
-            start_block: 0,
-            end_block: aux.end_block,
-            bytes: per_run * n_runs as u64,
-            keys: hit.keys[..n_runs.min(hit.keys.len())].to_vec(),
-            // runs are equal-sized, so the truncated hit keeps the same
-            // share of disk-sourced bytes as the full one
-            nvme_bytes: hit.nvme_bytes.min(per_run * n_runs as u64),
-        };
-        let shape = crate::kv_tier::HitShape {
-            restore_bytes: hit.bytes + aux.bytes,
-            restore_tokens: (aux.end_block * crate::kv_pool::BLOCK_TOKENS) as u32,
-            queued_bytes: tier.catalog.ledger(crate::kv_tier::Tier::Ram).in_flight,
-            nvme_bytes: hit.nvme_bytes,
-        };
-        let Election::Restore { est_us, .. } = tier.cost.elect(shape) else {
-            return false;
-        };
+        }
         let after = exec.record_event().ok();
         // the checkpoint lands in pool pages the flow reserves; the radix
         // names them, so there is no slot base to hand over
@@ -480,8 +466,8 @@ impl GpuQwen35 {
     }
 
     /// Multimodal prefill into batch slot `slot`: text + each image's
-    /// embeddings (any number interleaved), each image block given equal-t
-    /// mutual visibility via the attention bound, and the slot's mrope delta
+    /// embeddings (any number interleaved), image rows raster-causal like
+    /// every other row (`build_mm_layout`), and the slot's mrope delta
     /// recorded so the batched decode/spec steps carry the diverged
     /// llama-position. Returns the last row's logits and the total row count
     /// (the engine's KV position for this slot).
@@ -509,11 +495,12 @@ impl GpuQwen35 {
     /// state that cannot be rolled back to an arbitrary position, so a resume is
     /// only possible where state was SNAPSHOTTED - the same `m.ckpt` gate the
     /// text path uses, the same two-boundary cut rule (`ckpt_cuts`), and the
-    /// same window-extended conv for a span that starts mid-sequence. On top of
-    /// that, qwen35 gives every row of one picture equal mRoPE `t` and an
-    /// attention bound pointing at the span's last row, so a cut landing inside
-    /// a picture has gemma4v's non-causal hazard; `cut_outside_image_spans`
-    /// makes such a cut - and therefore such a resume - unreachable.
+    /// same window-extended conv for a span that starts mid-sequence. Cuts still
+    /// stay out of pictures (`cut_outside_image_spans`): image rows are causal
+    /// now (they used to see their whole picture, gemma4v's non-causal hazard,
+    /// which is what the rule was written for), but a picture spliced whole per
+    /// pass is also what keeps encoding per pass and the image-keyed radix
+    /// simple, so the rule stays.
     pub fn forward_prefill_slot_mm(
         &mut self,
         slot: usize,
@@ -656,8 +643,7 @@ impl GpuQwen35 {
     /// One prefill pass over rows [a, b) of a multimodal prompt.
     ///
     /// Rows and mRoPE stay ABSOLUTE (the attention bound indexes the whole
-    /// prompt, and an image row's bound points at its span's last row, which may
-    /// sit in an earlier span), so only the host slices move. Every image lies
+    /// prompt), so only the host slices move. Every image lies
     /// entirely inside one span - the cut rule guarantees no boundary falls
     /// inside a picture - so a span either splices a picture whole or not at all.
     pub(super) fn mm_prefill_span(
@@ -727,7 +713,7 @@ impl GpuQwen35 {
 
         let sinks = &self.sinks;
         let layers = &self.layers;
-        let tok_embd = &self.tok_embd;
+        let tok_embd = self.tok_embd.src(&self.output);
         let rot = self.rot.as_ref();
         let bs_f8ffn_p = &self.bs_f8ffn;
         let bs_f8row_p = &self.bs_f8row_ffn;
@@ -746,11 +732,10 @@ impl GpuQwen35 {
         // The window-extended conv stages [window | span] through the shared
         // ext buffers, which are sized for a typical resumed tail. A wider one
         // GROWS them rather than asserting: a follow-up turn can legitimately
-        // add a whole second picture, and an image's rows cannot be split
-        // across passes (they attend to their span's last row, which would not
-        // be in KV yet). Growth persists, so it happens at most once per size,
-        // and no captured graph holds these - decode replays read the conv
-        // WINDOW, never this staging.
+        // add a whole second picture, and a picture is spliced whole per pass
+        // (`cut_outside_image_spans`). Growth persists, so it happens at most
+        // once per size, and no captured graph holds these - decode replays
+        // read the conv WINDOW, never this staging.
         if !fresh {
             let need = (conv_k - 1 + r) * conv_dim;
             if bs.d_conv_ext.len() < need {
@@ -889,7 +874,7 @@ impl GpuQwen35 {
                         eps,
                         r * n_kv_heads,
                     )?;
-                    exec.mrope(
+                    exec.imrope(
                         &mut sc.d_qn,
                         &d_mrope,
                         r,
@@ -899,7 +884,7 @@ impl GpuQwen35 {
                         yarn,
                         sections,
                     )?;
-                    exec.mrope(
+                    exec.imrope(
                         &mut sc.d_kn,
                         &d_mrope,
                         r,
@@ -1795,7 +1780,7 @@ impl GpuQwen35 {
 
         let sinks = &self.sinks;
         let layers = &self.layers;
-        let tok_embd = &self.tok_embd;
+        let tok_embd = self.tok_embd.src(&self.output);
         let rot = self.rot.as_ref();
         // b1: fp8 W8A8 dense-proj planes (empty unless PADDOCK_QWEN35_W8). Consulted
         // only above w8_min for large (prefill) batches; else the exact Q8_0 path.
@@ -1992,7 +1977,7 @@ impl GpuQwen35 {
                         eps,
                         r * n_kv_heads,
                     )?;
-                    exec.mrope(
+                    exec.imrope(
                         &mut sc.d_qn,
                         &d_mrope,
                         r,
@@ -2002,7 +1987,7 @@ impl GpuQwen35 {
                         yarn,
                         sections,
                     )?;
-                    exec.mrope(
+                    exec.imrope(
                         &mut sc.d_kn,
                         &d_mrope,
                         r,
@@ -3116,6 +3101,18 @@ impl GpuQwen35 {
     /// `Generator::reply_pin`): the live checkpoint becomes the held one and
     /// the next page's snapshot opens a new live one instead of replacing it.
     /// Once per reply; a reply with no checkpoint yet has nothing to hold.
+    /// `Generator::anchor_at`: hold the user turn's prompt-end checkpoint.
+    pub(crate) fn anchor_at(&mut self, tokens: &[u32], upto: usize) {
+        if let Some(radix) = self.batch.as_mut().and_then(|bs| bs.paged_prefix.as_mut())
+            && let Some(at) = radix.mark_anchor(tokens, upto)
+        {
+            tracing::debug!(
+                "qwen35 anchor: user-turn checkpoint at {at} (prompt {})",
+                upto + 1
+            );
+        }
+    }
+
     pub(crate) fn reply_pin(&mut self, slot: usize) {
         let Some(bs) = self.batch.as_mut() else {
             return;

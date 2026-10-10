@@ -5,12 +5,12 @@ use paddock_models::safetensors::{SafetensorsFile, StDtype};
 mod tests;
 
 const ROOT: &str = "detector_model.vision_encoder.backbone";
-struct Reader<'a> {
-    d: &'a MetalDevice,
-    st: &'a SafetensorsFile,
+pub(super) struct Reader<'a> {
+    pub(super) d: &'a MetalDevice,
+    pub(super) st: &'a SafetensorsFile,
 }
 impl Reader<'_> {
-    fn values(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
+    fn checked_bytes(&self, name: &str, shape: &[usize]) -> Result<&[u8]> {
         let (t, b) = self
             .st
             .bytes(name)
@@ -21,50 +21,70 @@ impl Reader<'_> {
                 t.dtype, t.shape
             )));
         }
-        let v: Vec<_> = b
+        if b.as_chunks::<4>()
+            .0
+            .iter()
+            .any(|x| !f32::from_le_bytes(*x).is_finite())
+        {
+            return Err(error(format!("SAM 3 nonfinite {name}")));
+        }
+        Ok(b)
+    }
+    pub(super) fn values(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
+        Ok(self
+            .checked_bytes(name, shape)?
             .as_chunks::<4>()
             .0
             .iter()
             .map(|b| f32::from_le_bytes(*b))
-            .collect();
-        if v.iter().any(|x| !x.is_finite()) {
-            return Err(error(format!("SAM 3 nonfinite {name}")));
-        }
-        Ok(v)
+            .collect())
     }
-    fn vector(&self, name: &str, n: usize) -> Result<Buffer> {
-        upload(self.d, &self.values(name, &[n])?)
+    pub(super) fn f32_buffer(&self, name: &str, shape: &[usize]) -> Result<Buffer> {
+        // A 193 MiB token table is already mapped in the checkpoint. Validate
+        // it there and upload once, without two additional host-sized copies.
+        self.d.upload(self.checked_bytes(name, shape)?)
     }
-    fn norm(&self, prefix: &str, n: usize) -> Result<Norm> {
+    pub(super) fn vector(&self, name: &str, n: usize) -> Result<Buffer> {
+        self.f32_buffer(name, &[n])
+    }
+    pub(super) fn norm(&self, prefix: &str, n: usize) -> Result<Norm> {
         Ok(Norm {
             w: self.vector(&format!("{prefix}.weight"), n)?,
             b: self.vector(&format!("{prefix}.bias"), n)?,
         })
     }
-    fn matrix_values(&self, v: &[f32], k: usize, n: usize) -> Result<Matrix> {
-        if v.len() != k * n || !k.is_multiple_of(8) {
+    pub(super) fn matrix_values(&self, v: &[f32], k: usize, n: usize) -> Result<Matrix> {
+        if k == 0 || n == 0 || k.checked_mul(n) != Some(v.len()) || !k.is_multiple_of(8) {
             return Err(error("SAM 3 invalid matrix dimensions"));
         }
         // Weight conversion/overflow validation stays on the GPU. Permutations
         // below only rearrange checkpoint elements, never perform model math.
-        let source = upload(self.d, v)?;
         let w = self.d.alloc(v.len() * 2)?;
         let bad = self.d.upload(&0u32.to_le_bytes())?;
-        let c = self.d.begin()?;
-        point(
-            &c,
-            "vis_cast",
-            &[&source, &w, &bad],
-            &[v.len() as u32, 0, 1],
-            v.len(),
-        );
-        c.finish()?;
+        // Bound temporary GPU residency to 256 KiB + the error word. Loading
+        // a late text MLP must fit the admitted model, not require a second
+        // full FP32 copy of its largest matrix. Each chunk is fenced before
+        // releasing staging, and the error flag is sticky across chunks.
+        const CHUNK: usize = 65536;
+        for (i, values) in v.chunks(CHUNK).enumerate() {
+            let source = upload(self.d, values)?;
+            let c = self.d.begin()?;
+            c.dispatch_at(
+                "vis_cast",
+                &[&source, &w, &bad],
+                &[0, i * CHUNK * 2, 0],
+                &[values.len() as u32, 0, 1],
+                [values.len().div_ceil(256), 1, 1],
+                256,
+            );
+            c.finish()?;
+        }
         if unsafe { bad.read_u32(1)[0] } != 0 {
             return Err(error("SAM 3 weight exceeds finite F16 range"));
         }
         Ok(Matrix { w, k, n })
     }
-    fn conv(&self, name: &str, shape: &[usize]) -> Result<Conv> {
+    pub(super) fn conv(&self, name: &str, shape: &[usize]) -> Result<Conv> {
         let values = self.values(&format!("{name}.weight"), shape)?;
         let n = shape[0];
         let k = values.len() / n;

@@ -83,6 +83,7 @@
 #include "src/diarization.cuh"  // Nemotron 3 Diarization: log-mel frontend, LayerNorm, rope, conv rows, activations (needs f32_qkv's pd_launch_status)
 #include "src/clef.cuh"         // Clef's joint schema head: LayerNorm, span/lexical means, varlen F32 attention, option routing, scorer (needs f32_qkv's pd_launch_status)
 #include "src/clef_vision.cuh"  // Clef's image lane: the processor's uint8 resize + patchify, the vision tower's position embedding, rope, attention (needs clef.cuh's pd_clef_cpa16)
+#include "src/doclayout.cuh"    // PP-DocLayoutV3 (PaddleOCR-VL's layout stage): im2row, depthwise conv, stem pool, concat, 2x upsample, adds over NHWC halves (needs f32_qkv's pd_launch_status)
 #include "src/sam3/vit.cuh"     // SAM 3's ViT glue: window-major patch stem, q|k|v split + rope with all three biases, window-major -> raster exit (needs f32_qkv's pd_launch_status)
 #include "src/sam3/neck.cuh"    // SAM 3's FPN necks: 2x2/s2 convT depth-to-space + bias + GELU (needs f32_qkv's pd_launch_status)
 #include "src/sam3/text.cuh"    // SAM 3's text tower: causal self-attention over 32-token CLIP prompts (needs f32_qkv's pd_launch_status)

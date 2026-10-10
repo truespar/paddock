@@ -1,4 +1,4 @@
-// The OCR surface (deepseek2-ocr family): reading-mode copy for
+// The OCR surface (the document-parser families): reading-mode copy for
 // the composer control, the wire↔store mapping for the server's `ocr`
 // response extension, and the display cleaning for grounded output.
 //
@@ -53,13 +53,19 @@ const MODE_COPY: Record<string, { label: string; hint: string }> = {
   chart: { label: 'Chart', hint: 'Reads a chart into data.' },
   spotting: { label: 'Text spotting', hint: 'Words with their position on the page.' },
   seal: { label: 'Seal', hint: 'Reads stamp and seal text.' },
+  // LightOnOCR-3's two trained prompts
+  plain: { label: 'Markdown', hint: 'The page as markdown, tables and charts as data.' },
+  grounding: { label: 'Blocks with boxes', hint: 'Every block of the page with its label and box.' },
 }
 
 /** The composer's automatic entry: no mode rides and the server derives one
- *  from the request shape (one picture = document, several = pages). */
+ *  from the request shape - which one is the family's own default
+ *  (deepseek: one picture = document, several = pages; paddleocr: its
+ *  authors' document pipeline where the layout model is installed, else
+ *  text; LightOnOCR-3: markdown). */
 export const OCR_AUTO = {
   label: 'Automatic',
-  hint: 'One picture is read as a document; several as pages of one.',
+  hint: "The model's own default reading - no mode is sent.",
 }
 
 export function ocrModeLabel(mode: string): string {
@@ -87,6 +93,8 @@ export function ocrMetaFromWire(v: unknown): OcrMeta | undefined {
     passThrough: o.pass_through === true,
     droppedText: o.dropped_text === true,
   }
+  const rs = o.repetition_stop as { fired?: unknown } | null | undefined
+  if (rs && rs.fired === true) meta.repetitionStop = true
   const regions = regionsFromWire(o.regions)
   if (regions.length) meta.regions = regions
   return meta
@@ -97,11 +105,17 @@ function regionsFromWire(v: unknown): OcrRegion[] {
   const out: OcrRegion[] = []
   for (const r of v) {
     if (!r || typeof r !== 'object') continue
-    const { label, boxes, text, quads } = r as {
+    const { label, boxes, text, quads, continues, page, bbox, image, group, unread } = r as {
       label?: unknown
       boxes?: unknown
       text?: unknown
       quads?: unknown
+      continues?: unknown
+      page?: unknown
+      bbox?: unknown
+      image?: unknown
+      group?: unknown
+      unread?: unknown
     }
     if (typeof label !== 'string' || !Array.isArray(boxes)) continue
     const bs = boxes.filter(
@@ -120,6 +134,14 @@ function regionsFromWire(v: unknown): OcrRegion[] {
         boxes: bs,
         ...(typeof text === 'string' && text ? { text } : {}),
         ...(qs.length ? { quads: qs } : {}),
+        ...(continues === true ? { continues: true } : {}),
+        ...(typeof page === 'number' ? { page } : {}),
+        ...(Array.isArray(bbox) && bbox.length === 4 && bbox.every((n) => typeof n === 'number')
+          ? { bbox: bbox as [number, number, number, number] }
+          : {}),
+        ...(typeof image === 'string' ? { image } : {}),
+        ...(typeof group === 'number' ? { group } : {}),
+        ...(typeof unread === 'string' ? { unread } : {}),
       })
     }
   }
@@ -134,6 +156,10 @@ function regionsFromWire(v: unknown): OcrRegion[] {
  *  page finishes. */
 export function parseRegionsLive(raw: string): OcrRegion[] {
   if (raw.includes('<|LOC_')) return parseSpottingLive(raw)
+  if (raw.includes('![')) {
+    const blocks = parseBlocksLive(raw)
+    if (blocks.length) return blocks
+  }
   if (!raw.includes('<|det|>')) return []
   const out: OcrRegion[] = []
   const boxesFrom = (s: string): [number, number, number, number][] | null => {
@@ -214,6 +240,33 @@ function parseSpottingLive(raw: string): OcrRegion[] {
   return out
 }
 
+/** LightOnOCR-3's grounding marker, its client's MARKER regex verbatim:
+ *  `![label](x1,y1,x2,y2)` on a 0..=1000 grid, a trailing `+` on the label
+ *  for a block continuing the previous one, and the spaces after it. */
+const LO_MARKER = /!\[([A-Za-z_][\w-]*?)(\+?)\]\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)[ \t]*/g
+/** A marker the stream has not finished yet - hidden until it closes. */
+const LO_TAIL = /!\[[A-Za-z_][\w-]*\+?(?:\]\([\d\s,]*)?$/
+
+/** Client mirror of the runner's lighton_ocr::parse_blocks: each marker
+ *  owns the text up to the next one, boxes rescaled onto the 0-999 space
+ *  every other region uses. A cut marker at a mid-stream tail does not
+ *  match, so this is safe per frame. */
+function parseBlocksLive(raw: string): OcrRegion[] {
+  const marks = [...raw.matchAll(LO_MARKER)]
+  const s = (v: string) => Math.round((Math.min(parseInt(v, 10), 1000) * 999) / 1000)
+  return marks.map((m, i): OcrRegion => {
+    const end = (m.index ?? 0) + m[0].length
+    const stop = i + 1 < marks.length ? (marks[i + 1].index ?? raw.length) : raw.length
+    const text = raw.slice(end, stop).trim()
+    return {
+      label: m[1],
+      boxes: [[s(m[3]), s(m[4]), s(m[5]), s(m[6])]],
+      ...(text ? { text } : {}),
+      ...(m[2] ? { continues: true } : {}),
+    }
+  })
+}
+
 // The grounded output rides its regions inside the text as special-token
 // markup (the server decodes with specials kept, because the region parse
 // needs them). Two reference forms, mirrored from the runner's parse_regions:
@@ -230,14 +283,28 @@ const LOC_FORM = /(?:<\|LOC_(?:BEGIN|END|SEP|\d+)\|>)+/g
  *  (its text follows it anyway). The structured regions live in
  *  `OcrMeta.regions` - this is only what the eyes get. A text with no
  *  markup passes through untouched, so it is safe to run on every turn of
- *  an OCR lane, streaming included. */
+ *  an OCR lane, streaming included. LightOnOCR-3's block markers go too -
+ *  left in, the markdown renderer would draw each as a broken image. */
+// PaddleOCR-VL's document pipeline answers in its authors' own markdown, which
+// centers captions and pictures in HTML divs. The renderer escapes raw HTML,
+// so the display unwraps a caption to its words and drops a picture's
+// reference - the pictures are drawn from their regions on the page instead.
+const PD_PICTURE =
+  /<div style="text-align: center;"><img src="imgs\/img_in_[\w-]+_box_\d+_\d+_\d+_\d+\.jpg" alt="Image" width="\d+%" \/><\/div>\n?/g
+const PD_CENTER = /<div style="text-align: center;">([\s\S]*?)<\/div>\n?/g
+
 export function cleanOcrText(raw: string): string {
-  if (!raw.includes('<|')) return raw
-  return raw
+  if (raw.includes('<div style="text-align: center;">')) {
+    raw = raw.replace(PD_PICTURE, '').replace(PD_CENTER, '$1')
+  }
+  const blocks = raw.includes('![')
+  if (!raw.includes('<|') && !blocks) return raw
+  const out = raw
     .replace(REF_FORM, '$1')
     .replace(DET_FORM, '')
     .replace(LOC_FORM, '')
     .replace(/<\|grounding\|>/g, '')
+  return blocks ? out.replace(LO_MARKER, '').replace(LO_TAIL, '') : out
 }
 
 /** Overlay geometry: one 0-999 box as percentages of the page image. */

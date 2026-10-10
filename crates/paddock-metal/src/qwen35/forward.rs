@@ -35,7 +35,10 @@ impl Qwen35 {
         self.mlx
             && !self.splash
             && self.bonsai.is_none()
-            && self.geometry == Geometry::DENSE_27B
+            && matches!(
+                self.geometry,
+                Geometry::DENSE_08B | Geometry::DENSE_4B | Geometry::DENSE_27B
+            )
             && self.device.tensor_accelerated()
     }
     pub(super) fn stable_affine_contract(&self) -> bool {
@@ -339,6 +342,22 @@ impl Qwen35 {
                     CHUNK
                 } else {
                     1
+                };
+                #[cfg(test)]
+                let logical = if crate::affine::REFERENCE_CHUNKS_FOR_TEST.with(|v| v.get())
+                    && logical == CHUNK
+                {
+                    let remaining = self.slots[slot]
+                        .prefill_end
+                        .saturating_sub(1)
+                        .saturating_sub(pos as usize / 2048 * 2048);
+                    if pos as usize + 1 == self.slots[slot].prefill_end {
+                        1
+                    } else {
+                        remaining.clamp(1, 2048)
+                    }
+                } else {
+                    logical
                 };
                 if let Some(last) = affine_spans.last_mut().filter(|s| s.2 == logical) {
                     last.1 += 1;
@@ -850,7 +869,7 @@ impl Qwen35 {
             self.project(
                 &cmd,
                 &[(
-                    &self.head,
+                    self.head(),
                     if self.verifying {
                         &self
                             .spec

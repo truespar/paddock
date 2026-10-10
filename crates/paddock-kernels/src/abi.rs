@@ -8993,6 +8993,74 @@ pub struct KernelTableV1 {
     /// expert's row tiles stream through one ring; every bf16 partial equal
     /// to slot 758's. ff % 256 == 0, ff <= 1024. Arguments as slot 758.
     pub nvf4_moe_down_ms_b16: Option<Nvf4MoeDownBsFn>,
+    /// Slot 832: `pd_embed_gather_q8r` - `embed_gather_q8` over the REPACKED
+    /// Q8_0 streams (int8 plane + f16 scale plane, block order unchanged), so
+    /// a tied embedding gathers from the LM head's own plane instead of a
+    /// second raw copy. Bit-identical to `embed_gather_q8` on the same table.
+    /// embd % 32 == 0.
+    pub embed_gather_q8r: Option<EmbedGatherQ8rFn>,
+    /// Slot 833: `pd_mrope_vision_qkv_h` - the qwen-family tower's three f32
+    /// q/k/v projection planes landed as `vision_attn_h`'s (slot 620) halves
+    /// in one pass: `q16 = f16(rope(q + bq) * q_mul)`, `k16 = f16(rope(k +
+    /// bk))`, `v16 = f16(v + bv)`. The rotation is `mrope_vision_bias`'s, so
+    /// slot 620 on these halves is bit-for-bit the f32 attention's output
+    /// rounded to f16. head_dim even.
+    pub mrope_vision_qkv_h: Option<MropeVisionQkvHFn>,
+    /// Slot 834: `pd_f16_gemm_h_gelu_tanhf` - a tower FFN up landing
+    /// `y16 = f16(gelu(W x + bias))` in `gelu_bias_f16`'s tanh form: the f32
+    /// up plane never lands. Bit-identical to `f16_gemm` + `gelu_bias_f16`,
+    /// which it runs through the f32 `scratch` plane at shapes the fused
+    /// landing cannot reproduce. bias [out_dim]; in_dim, out_dim, batch as
+    /// `f16_gemm`.
+    pub f16_gemm_h_gelu_tanhf: Option<F16GemmEpiScratchFn>,
+    /// Slot 835: `pd_f16_gemm_bias_res` - a projection onto an f32 residual
+    /// stream, `y += W x + bias` in `add_bias_res`'s order. Bit-identical to
+    /// `f16_gemm` + `add_bias_res`; `scratch` as slot 834's.
+    pub f16_gemm_bias_res: Option<F16GemmEpiScratchFn>,
+    /// Slot 836: `pd_f16_gemm_h_silu` - the f16 landing with bias (optional) +
+    /// SiLU in the epilogue, `y = f16(silu(acc + bias[m]))` - PP-DocLayoutV3's
+    /// conv-BN-SiLU seams. Arguments as slot 671.
+    pub f16_gemm_h_silu: Option<F16GemmHBiasFn>,
+    /// Slot 837: `pd_dl_u8_to_h` - u8 -> f16 / 255, PP-DocLayoutV3's input
+    /// rescale: `(src, dst, n, stream)`.
+    pub dl_u8_to_h: Option<DlU8ToHFn>,
+    /// Slot 838: `pd_dl_im2row_h` - k x k im2row of an NHWC half plane into
+    /// `[oh * ow][kpad]` halves, tap order (ky, kx, c), zeros for the conv's
+    /// padding and the K pad.
+    pub dl_im2row_h: Option<DlIm2rowHFn>,
+    /// Slot 839: `pd_dl_dwconv_h` - depthwise k x k conv over NHWC halves,
+    /// f32 `[c][k * k]` weights + bias (BatchNorm folded), act 0 none / 1 ReLU.
+    pub dl_dwconv_h: Option<DlDwconvHFn>,
+    /// Slot 840: `pd_dl_maxpool2_h` - 2 x 2 / stride 1 max pool of an NHWC
+    /// plane padded by one zero row and column (HGNetV2's stem pool).
+    pub dl_maxpool2_h: Option<DlMaxpool2HFn>,
+    /// Slot 841: `pd_dl_concat_h` - copy `[rows][c]` halves into a
+    /// `[rows][ctot]` plane at channel `off`.
+    pub dl_concat_h: Option<DlConcatHFn>,
+    /// Slot 842: `pd_dl_up2_h` - 2x upsample of NHWC halves, mode 0 nearest /
+    /// 1 bilinear (align_corners=False), plus an `add` plane when not null.
+    pub dl_up2_h: Option<DlUp2HFn>,
+    /// Slot 843: `pd_dl_add_h` - `dst = act(a + b)` over halves, act 0 none /
+    /// 1 ReLU / 2 SiLU.
+    pub dl_add_h: Option<DlAddHFn>,
+    /// Slot 844: `pd_dl_rowscale_h` - `x[r][:] *= scale[r]` over halves (the
+    /// encoder memory times the anchors' valid mask).
+    pub dl_rowscale_h: Option<DlRowscaleHFn>,
+    /// Slot 845: `pd_dl_gather_rows` - `dst[i] = src[idx[i]]` for rows of `words`
+    /// 32-bit words.
+    pub dl_gather_rows: Option<DlGatherRowsFn>,
+    /// Slot 846: `pd_dl_mask_ref` - each query's mask box (pixels with logit
+    /// > 0) as the decoder's initial reference point, f32 `[q][4]`.
+    pub dl_mask_ref: Option<DlMaskRefFn>,
+    /// Slot 847: `pd_dl_msda` - multi-scale deformable attention (8 heads x 32,
+    /// 3 levels, 4 points, four-coordinate references), out `[q][256]` halves.
+    pub dl_msda: Option<DlMsdaFn>,
+    /// Slot 848: `pd_dl_ref_step` - `ref = sigmoid(delta + inverse_sigmoid(ref))`
+    /// (delta optional), and `ref16 [q][8]` halves zero-padded for the query-pos head.
+    pub dl_ref_step: Option<DlRefStepFn>,
+    /// Slot 849: `pd_dl_order_votes` - `votes[j] = sum_{i != j} sigmoid(s[i][j]
+    /// - s[j][i])` over the global pointer's `[q][q]` scores.
+    pub dl_order_votes: Option<DlOrderVotesFn>,
 }
 
 /// See [`KernelTableV1::rmsnorm_add_scale_norm`].
@@ -10918,7 +10986,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 817;
+pub const KERNEL_TABLE_SLOTS: usize = 835;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,
@@ -12127,6 +12195,21 @@ pub type GemmaQkvNraFn = unsafe extern "C" fn(
     theta_scale: f32,
     stream: *mut core::ffi::c_void,
 ) -> i32;
+
+/// Q8_0 embedding gather over the repacked streams (see
+/// `KernelTableV1::embed_gather_q8r`). `(data, scales, tokens, out, embd,
+/// n_tokens, scale, stream)`
+#[allow(clippy::too_many_arguments)]
+pub type EmbedGatherQ8rFn = unsafe extern "C" fn(
+    data: *const core::ffi::c_void,
+    scales: *const core::ffi::c_void,
+    tokens: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    embd: u32,
+    n_tokens: u32,
+    scale: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
 
 /// Q8_0 embedding gather (see `KernelTableV1::embed_gather_q8`).
 pub type EmbedGatherQ8Fn = unsafe extern "C" fn(
@@ -14059,6 +14142,193 @@ pub type MropeVisionBiasFn = unsafe extern "C" fn(
     n_heads: u32,
     head_dim: u32,
     theta_scale: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::dl_u8_to_h`].
+pub type DlU8ToHFn = unsafe extern "C" fn(
+    src: *const core::ffi::c_void,
+    dst: *mut core::ffi::c_void,
+    n: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::dl_im2row_h`].
+pub type DlIm2rowHFn = unsafe extern "C" fn(
+    src: *const core::ffi::c_void,
+    dst: *mut core::ffi::c_void,
+    ih: u32,
+    iw: u32,
+    c: u32,
+    oh: u32,
+    ow: u32,
+    kh: u32,
+    kw: u32,
+    stride: u32,
+    pad_t: i32,
+    pad_l: i32,
+    kpad: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::dl_dwconv_h`].
+pub type DlDwconvHFn = unsafe extern "C" fn(
+    src: *const core::ffi::c_void,
+    dst: *mut core::ffi::c_void,
+    w: *const core::ffi::c_void,
+    b: *const core::ffi::c_void,
+    ih: u32,
+    iw: u32,
+    c: u32,
+    oh: u32,
+    ow: u32,
+    k: u32,
+    stride: u32,
+    act: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::dl_maxpool2_h`].
+pub type DlMaxpool2HFn = unsafe extern "C" fn(
+    src: *const core::ffi::c_void,
+    dst: *mut core::ffi::c_void,
+    h: u32,
+    w: u32,
+    c: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::dl_concat_h`].
+pub type DlConcatHFn = unsafe extern "C" fn(
+    src: *const core::ffi::c_void,
+    dst: *mut core::ffi::c_void,
+    rows: u32,
+    c: u32,
+    ctot: u32,
+    off: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::dl_up2_h`].
+pub type DlUp2HFn = unsafe extern "C" fn(
+    src: *const core::ffi::c_void,
+    dst: *mut core::ffi::c_void,
+    add: *const core::ffi::c_void,
+    h: u32,
+    w: u32,
+    c: u32,
+    mode: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::dl_rowscale_h`].
+pub type DlRowscaleHFn = unsafe extern "C" fn(
+    x: *mut core::ffi::c_void,
+    scale: *const core::ffi::c_void,
+    rows: u32,
+    cols: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::dl_gather_rows`].
+pub type DlGatherRowsFn = unsafe extern "C" fn(
+    src: *const core::ffi::c_void,
+    dst: *mut core::ffi::c_void,
+    idx: *const core::ffi::c_void,
+    n: u32,
+    words: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::dl_mask_ref`].
+pub type DlMaskRefFn = unsafe extern "C" fn(
+    logits: *const core::ffi::c_void,
+    ref_: *mut core::ffi::c_void,
+    q: u32,
+    h: u32,
+    w: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::dl_msda`].
+pub type DlMsdaFn = unsafe extern "C" fn(
+    value: *const core::ffi::c_void,
+    off: *const core::ffi::c_void,
+    logit: *const core::ffi::c_void,
+    ref_: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    q: u32,
+    h0: u32,
+    w0: u32,
+    h1: u32,
+    w1: u32,
+    h2: u32,
+    w2: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::dl_ref_step`].
+pub type DlRefStepFn = unsafe extern "C" fn(
+    ref_: *mut core::ffi::c_void,
+    delta: *const core::ffi::c_void,
+    ref16: *mut core::ffi::c_void,
+    q: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::dl_order_votes`].
+pub type DlOrderVotesFn = unsafe extern "C" fn(
+    s: *const core::ffi::c_void,
+    votes: *mut core::ffi::c_void,
+    q: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::dl_add_h`].
+pub type DlAddHFn = unsafe extern "C" fn(
+    a: *const core::ffi::c_void,
+    b: *const core::ffi::c_void,
+    dst: *mut core::ffi::c_void,
+    n: u64,
+    act: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// A tower GEMM with its seam in the epilogue and an f32 fallback plane (see
+/// `KernelTableV1::f16_gemm_h_gelu_tanhf`): `(w, x, y, bias, scratch, in_dim,
+/// out_dim, batch, stream)`.
+#[allow(clippy::too_many_arguments)]
+pub type F16GemmEpiScratchFn = unsafe extern "C" fn(
+    w: *const core::ffi::c_void,
+    x: *const core::ffi::c_void,
+    y: *mut core::ffi::c_void,
+    bias: *const core::ffi::c_void,
+    scratch: *mut core::ffi::c_void,
+    in_dim: u32,
+    out_dim: u32,
+    batch: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// The tower's q/k/v landing for the half attention (see
+/// `KernelTableV1::mrope_vision_qkv_h`).
+#[allow(clippy::too_many_arguments)]
+pub type MropeVisionQkvHFn = unsafe extern "C" fn(
+    q: *const core::ffi::c_void,
+    k: *const core::ffi::c_void,
+    v: *const core::ffi::c_void,
+    bq: *const core::ffi::c_void,
+    bk: *const core::ffi::c_void,
+    bv: *const core::ffi::c_void,
+    positions: *const core::ffi::c_void,
+    q16: *mut core::ffi::c_void,
+    k16: *mut core::ffi::c_void,
+    v16: *mut core::ffi::c_void,
+    n_tokens: u32,
+    n_heads: u32,
+    head_dim: u32,
+    theta_scale: f32,
+    q_mul: f32,
     stream: *mut core::ffi::c_void,
 ) -> KernelStatus;
 

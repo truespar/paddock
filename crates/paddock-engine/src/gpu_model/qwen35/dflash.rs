@@ -2051,7 +2051,7 @@ impl GpuQwen35 {
         let embd = self.embd;
         let vocab = self.vocab;
         let r = n * rows;
-        let tok_embd = &self.tok_embd;
+        let tok_embd = self.tok_embd.src(&self.output);
         let rot = self.rot.as_ref();
         let output = &self.output;
         let out_f8 = self.out_f8.as_ref();

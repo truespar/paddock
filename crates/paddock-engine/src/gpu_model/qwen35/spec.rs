@@ -80,7 +80,7 @@ impl GpuQwen35 {
 
         let sinks = &self.sinks;
         let layers = &self.layers;
-        let tok_embd = &self.tok_embd;
+        let tok_embd = self.tok_embd.src(&self.output);
         let rot = self.rot.as_ref();
         // e4m3 dense-FFN twins. This WALK had no f8 ARM at all, and the Q8_0
         // reclaim stubs exactly the planes its `Ffn::Dense` arm
@@ -156,7 +156,7 @@ impl GpuQwen35 {
                         eps,
                         r * n_kv_heads,
                     )?;
-                    exec.mrope(
+                    exec.imrope(
                         &mut sc.d_qn,
                         &d_mrope,
                         r,
@@ -166,7 +166,7 @@ impl GpuQwen35 {
                         yarn,
                         sections,
                     )?;
-                    exec.mrope(
+                    exec.imrope(
                         &mut sc.d_kn,
                         &d_mrope,
                         r,
@@ -683,7 +683,7 @@ impl GpuQwen35 {
             eps,
             r * n_kv_heads,
         )?;
-        exec.mrope(
+        exec.imrope(
             &mut sc.d_qn,
             d_mrope,
             r,
@@ -693,7 +693,7 @@ impl GpuQwen35 {
             yarn,
             sections,
         )?;
-        exec.mrope(
+        exec.imrope(
             &mut sc.d_kn,
             d_mrope,
             r,
@@ -836,7 +836,7 @@ impl GpuQwen35 {
         let exec = self.exec.clone();
         let (embd, eps) = (self.embd, self.rms_eps);
         let m = self.mtp.as_ref().expect("mtp weights");
-        let tok_embd = &self.tok_embd;
+        let tok_embd = self.tok_embd.src(&self.output);
         let rot = self.rot.as_ref();
         let sc = self.scratch.as_mut().expect("scratch");
         let ds = self.decode.as_ref().expect("decode");
@@ -1370,7 +1370,7 @@ impl GpuQwen35 {
         let exec = self.exec.clone();
         let (embd, eps) = (self.embd, self.rms_eps);
         let m = self.mtp.as_ref().expect("mtp weights");
-        let tok_embd = &self.tok_embd;
+        let tok_embd = self.tok_embd.src(&self.output);
         let rot = self.rot.as_ref();
         let sc = self.scratch.as_mut().expect("scratch");
         let sb = self.spec_batch.as_mut().expect("spec batch");
@@ -1490,7 +1490,7 @@ impl GpuQwen35 {
             eps,
             r * n_kv_heads,
         )?;
-        exec.mrope(
+        exec.imrope(
             &mut sc.d_qn,
             &sb.d_mrope_rows,
             r,
@@ -1500,7 +1500,7 @@ impl GpuQwen35 {
             yarn,
             sections,
         )?;
-        exec.mrope(
+        exec.imrope(
             &mut sc.d_kn,
             &sb.d_mrope_rows,
             r,
@@ -2202,7 +2202,7 @@ impl GpuQwen35 {
 
         let sinks = &self.sinks;
         let layers = &self.layers;
-        let tok_embd = &self.tok_embd;
+        let tok_embd = self.tok_embd.src(&self.output);
         let rot = self.rot.as_ref();
         // f8 class mirror: the verify decides the EMITTED stream, so it must
         // run the same numeric class the dense decode path serves at this
@@ -2374,7 +2374,7 @@ impl GpuQwen35 {
                         eps,
                         r * n_kv_heads,
                     )?;
-                    exec.mrope(
+                    exec.imrope(
                         &mut sc.d_qn,
                         &sb.d_mrope_rows,
                         r,
@@ -2384,7 +2384,7 @@ impl GpuQwen35 {
                         yarn,
                         sections,
                     )?;
-                    exec.mrope(
+                    exec.imrope(
                         &mut sc.d_kn,
                         &sb.d_mrope_rows,
                         r,

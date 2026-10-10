@@ -141,6 +141,14 @@ const anyArmed = computed(() => rows.value.length > 0)
               <dt>Dropped to make room</dt>
               <dd class="c-mono">{{ s.tier.miss_ghost.toLocaleString() }}</dd>
             </div>
+            <div v-if="(s.tier.miss_no_state ?? 0) > 0" class="ch__row">
+              <dt>
+                <Tooltip label="The prompt's attention cache was held, but not the model state this model also needs to pick up where the prompt left off. Hybrid models (Qwen 3.5 and later, Nemotron, Gemma 4) resume only where that state was saved.">
+                  <span>No saved state</span>
+                </Tooltip>
+              </dt>
+              <dd class="c-mono">{{ (s.tier.miss_no_state ?? 0).toLocaleString() }}</dd>
+            </div>
             <div v-if="s.tier.miss_tripped > 0" class="ch__row">
               <dt>Cache offline</dt>
               <dd class="c-mono c-warn">{{ s.tier.miss_tripped.toLocaleString() }}</dd>

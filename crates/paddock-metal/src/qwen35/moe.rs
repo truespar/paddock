@@ -247,13 +247,13 @@ impl Qwen35 {
         workspace: &Buffer,
     ) {
         if let Some(ternary) = &self.ternary {
-            let head = planes.len() == 1 && std::ptr::eq(planes[0].0, &self.head);
+            let head = planes.len() == 1 && std::ptr::eq(planes[0].0, self.head());
             return ternary.project(cmd, planes, input, rows, workspace, head);
         }
         if let Some(bonsai) = &self.bonsai {
             // The head consumes selected rows, not the plan's full row map.
             // Always preserve its strict, live-count-independent reduction.
-            let head = planes.len() == 1 && std::ptr::eq(planes[0].0, &self.head);
+            let head = planes.len() == 1 && std::ptr::eq(planes[0].0, self.head());
             return bonsai.project(
                 cmd,
                 planes,
@@ -268,7 +268,7 @@ impl Qwen35 {
         if self.mlx
             && let Some(spans) = cmd.projection_rows()
         {
-            let head = planes.len() == 1 && std::ptr::eq(planes[0].0, &self.head);
+            let head = planes.len() == 1 && std::ptr::eq(planes[0].0, self.head());
             let head_span = [(0, rows, 1)];
             return crate::affine::project_stable(
                 cmd,

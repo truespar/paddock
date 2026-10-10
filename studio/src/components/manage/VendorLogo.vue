@@ -41,6 +41,11 @@
 //    OpenAI/IBM; the white BIMI backdrop is dropped and the viewBox is the
 //    glyph's own 52:20 box, fit to HEIGHT like IBM's - letterboxed into a
 //    square it would be 5px tall at the inline call sites.
+//  - LightOn (LightOnOCR-3): the official square emblem, lighton.ai's own
+//    site icon, as an <img> asset unchanged - full color (a teal gradient
+//    disc, white starburst), and like Google/KBLab its gradient and clip defs
+//    keep their ids scoped to the file. Source:
+//    https://www.lighton.ai/icon.svg
 //  - OpenBMB (MiniCPM): the official two-tone mark, openbmb.cn's own
 //    favicon.svg, path geometry and viewBox unchanged. Its blue is lifted on
 //    dark like Qwen's; the cyan reads on both grounds as shipped. Source:
@@ -70,6 +75,7 @@ import {
 } from 'simple-icons'
 import googleG from '@/assets/google-g.svg'
 import kblabLogo from '@/assets/kblab.svg'
+import lightonLogo from '@/assets/lighton.svg'
 
 withDefaults(defineProps<{ vendor: string; size?: number }>(), { size: 28 })
 
@@ -307,6 +313,13 @@ const SI: Record<string, { path: string; title: string }> = {
     :width="size"
     :height="size"
     alt="KBLab"
+  />
+  <img
+    v-else-if="vendor === 'LightOn'"
+    :src="lightonLogo"
+    :width="size"
+    :height="size"
+    alt="LightOn"
   />
   <svg
     v-else-if="vendor === 'NB AI-Lab'"
