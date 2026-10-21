@@ -50,6 +50,19 @@ pub(super) fn send_verify_masks(
 /// Commit a device-sampled token (the phase-3 body for GPU-picked rows: no
 /// host logits exist - constraint/logprob slots never take this path), with
 /// its row's stop pressure (false where no stop mask rode the row).
+/// PADDOCK_TOK_TRACE=1: one line per committed device token (slot, position
+/// it lands at, id, the phase that produced it) - the instrument that places a
+/// wrong token at the tick that committed it.
+pub(super) fn tok_trace(k: usize, slot: &Option<Slot>, id: u32, src: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_TOK_TRACE").is_some()) {
+        return;
+    }
+    if let Some(s) = slot {
+        eprintln!("[tok] slot={k} pos={} id={id} src={src}", s.pos);
+    }
+}
+
 pub(super) fn commit_device_token(slot_opt: &mut Option<Slot>, next: u32, pressure: bool) {
     let Some(slot) = slot_opt.as_mut() else {
         return;
@@ -220,6 +233,7 @@ mod tests {
             submitted: None,
             canvas_read: None,
             user_turn: false,
+            background: false,
         })
         .unwrap();
         drop(send);

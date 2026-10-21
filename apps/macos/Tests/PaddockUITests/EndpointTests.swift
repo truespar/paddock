@@ -105,6 +105,8 @@ struct EndpointTests {
     }
     #expect(try artifact("MLX-affine-4-g64").shortFormat == "MLX · 4-bit")
     #expect(try artifact("MLX-AFFINE-4-G64").shortFormat == "MLX · 4-bit")
+    #expect(try artifact("MLX-TERNARY-2-G128").shortFormat == "MLX · Ternary 2-bit")
+    #expect(try artifact("affine-4/8").shortFormat == "MLX · Mixed 4/8-bit")
     #expect(try artifact("MLX-future").shortFormat == "SAFETENSORS · MLX-future")
     #expect(try artifact("MLX-affine-mixed").shortFormat == "SAFETENSORS · MLX-affine-mixed")
   }

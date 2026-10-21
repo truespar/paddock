@@ -35,6 +35,11 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .merge(table_history::routes())
         .merge(mask_history::routes())
+        .route("/api/conversation-drafts", get(list_conversation_drafts))
+        .route(
+            "/api/conversation-drafts/{id}",
+            get(get_conversation_draft).put(put_conversation_draft),
+        )
         .route("/api/conversations", get(list_conversations))
         .route(
             "/api/conversations/{id}",
@@ -122,11 +127,58 @@ async fn get_conversation(State(s): State<Arc<AppState>>, Path(id): Path<String>
 async fn put_conversation(
     State(s): State<Arc<AppState>>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(mut doc): Json<Value>,
 ) -> Response {
     doc["id"] = Value::String(id); // the path is authoritative
-    match s.db.put_conversation(&doc) {
+    let revision = match headers.get("x-paddock-consume-draft") {
+        Some(value) => match value.to_str() {
+            Ok(value) if !value.is_empty() && value.len() <= 128 => Some(value),
+            _ => {
+                return errx(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "Invalid draft revision",
+                );
+            }
+        },
+        None => None,
+    };
+    match s.db.put_conversation_consuming_draft(&doc, revision) {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(crate::store::StoreError::Conflict(e)) => errx(StatusCode::CONFLICT, "conflict", e),
+        Err(e) => err500(e),
+    }
+}
+
+async fn list_conversation_drafts(State(s): State<Arc<AppState>>) -> Response {
+    match s.db.list_conversation_drafts() {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => err500(e),
+    }
+}
+
+async fn get_conversation_draft(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    match s.db.get_conversation_draft(&id) {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => err500(e),
+    }
+}
+
+async fn put_conversation_draft(
+    State(s): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(doc): Json<Value>,
+) -> Response {
+    match s.db.put_conversation_draft(&id, &doc) {
+        Ok(value) => Json(value).into_response(),
+        Err(crate::store::StoreError::Conflict(e)) => errx(StatusCode::CONFLICT, "conflict", e),
+        Err(crate::store::StoreError::Bad(e)) => {
+            errx(StatusCode::BAD_REQUEST, "invalid_request", e)
+        }
         Err(e) => err500(e),
     }
 }

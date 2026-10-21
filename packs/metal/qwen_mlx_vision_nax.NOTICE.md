@@ -15,6 +15,13 @@ uses this fixed register mapping only on Apple10. Earlier Apple GPU families
 retain the layout-independent MPP implementation.
 The MLX runtime is not linked or redistributed.
 
+`gemma_mlx_attention_nax.metal` adapts the same head-dimension splitting to
+Gemma head widths 256 and 512, native paged/global and sliding-ring storage,
+and masked ragged tiles. It contracts three residual BF16 components of
+each F32 probability rather than silently reducing probabilities to BF16.
+Its production election is limited to dense Gemma 31B MLX text on Apple10;
+vision, speculative serving, diffusion and MoE retain their prior paths.
+
 `qwen_mlx_attention_nax.metal` is a head-256 language-attention implementation
 based on the same upstream head-dimension-split implementation.
 It uses Paddock's paged KV addressing, 32-row scheduler tiles and bounded

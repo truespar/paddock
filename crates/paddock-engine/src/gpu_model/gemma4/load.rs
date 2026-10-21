@@ -837,11 +837,16 @@ impl GpuGemma4 {
         // <|image_start|>/<|image_end|>.
         let (beg_tok, end_tok) = super::image_markers(arch);
         let (mut img_beg_id, mut img_end_id) = (None, None);
+        // and the clip markers, which only the 12B's (unified) mmproj uses -
+        // HF Gemma4Processor's boa / eoa, llama.cpp mtmd's aud_beg / aud_end
+        let (mut aud_beg_id, mut aud_end_id) = (None, None);
         if let Some(Value::Array(toks)) = map.gguf().metadata.get("tokenizer.ggml.tokens") {
             for (i, t) in toks.iter().enumerate() {
                 match t.as_str() {
                     Some(s) if s == beg_tok => img_beg_id = Some(i as u32),
                     Some(s) if s == end_tok => img_end_id = Some(i as u32),
+                    Some("<|audio>") => aud_beg_id = Some(i as u32),
+                    Some("<audio|>") => aud_end_id = Some(i as u32),
                     _ => {}
                 }
             }
@@ -2958,6 +2963,13 @@ impl GpuGemma4 {
             kq_moe: layers
                 .iter()
                 .any(|l| l.moe.as_ref().is_some_and(|m| m.experts.kq().is_some())),
+            // live (not reclaimed) Q8 gate/up planes on a %128 FFN: prefill
+            // lands them straight into the down GEMM's input
+            q8_gu: n_ff.is_multiple_of(128)
+                && exec.has_q8_0_gemm_mmq_gu(super::glu_act_of(arch))
+                && layers
+                    .iter()
+                    .any(|l| l.ffn_gate.q8_len() > 48 && l.ffn_up.q8_len() > 48),
             // uniq-routing diagnostic (PADDOCK_MOE_UNIQ, MoE models only): raw
             // non-pool accumulator + detached dumper thread - see the Scratch
             // field comment for the two measured constraints. Armed once here
@@ -3067,6 +3079,8 @@ impl GpuGemma4 {
             ),
             img_beg_id,
             img_end_id,
+            aud_beg_id,
+            aud_end_id,
             batch_logits: None,
             samp: None,
             fin_samp: None,

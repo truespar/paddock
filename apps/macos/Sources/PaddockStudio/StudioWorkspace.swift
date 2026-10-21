@@ -62,7 +62,15 @@ public final class StudioWorkspace: NSObject {
   public var messageEdit: StudioMessageEdit?
   public internal(set) var messageMutation = false
   public internal(set) var messageNavigationAnchor: String?
-  public var attachments: [StudioAttachment] = []
+  public var attachments: [StudioAttachment] = [] { didSet { composerChanged() } }
+  public var composerText = "" { didSet { if oldValue != composerText { composerChanged() } } }
+  public private(set) var switchingConversation = false
+  var applyingComposer = false
+  var composerIdentity: String?
+  var composerEditRevision: UInt64 = 0
+  var composerSavedRevision: UInt64 = 0
+  var composerDebounce: Task<Void, Never>?
+  var composerSave: Task<Void, Error>?
   public var selectedArtifactId: String?
   /// Public origin only, never the private session descriptor/cookie. HTML
   /// previews use their own ephemeral WebKit store and credential-free shells.
@@ -98,7 +106,8 @@ public final class StudioWorkspace: NSObject {
   public var conversation: StudioState.Conversation? { state?.conversation }
   public var history: [StudioState.History] { state?.history ?? [] }
   public var busy: Bool {
-    sending || messageMutation || microphoneStarting || (ready && state?.busy == true)
+    switchingConversation || sending || messageMutation || microphoneStarting
+      || (ready && state?.busy == true)
   }
   public var uploading: Bool { !uploads.isEmpty || !incomingDrops.isEmpty }
   private var incomingDrops: [UUID: Task<Void, Never>] = [:]
@@ -136,6 +145,7 @@ public final class StudioWorkspace: NSObject {
   private func boot(assets: URL?) async {
     guard !closed, !Task.isCancelled else { return }
     restoring = true
+    let initialText = composerIdentity == nil ? composerText : ""
     defer { restoring = false }
     do {
       if runtime == nil {
@@ -159,7 +169,7 @@ public final class StudioWorkspace: NSObject {
             await self?.receiveNative(fields)
           })
         runtime = core
-        do { try await core.start() } catch {
+        do { try await core.start(resumeDraft: initialText.isEmpty) } catch {
           await core.close()
           runtime = nil
           nativeTransport = nil
@@ -174,6 +184,7 @@ public final class StudioWorkspace: NSObject {
         throw ManagerError.core(error ?? "The native Studio could not restore its presentation")
       }
       ready = true
+      if !initialText.isEmpty { composerText = initialText }
       error = nil
       NSLog(
         "Paddock native Studio ready: %d model choices; hidden web workspace: none",
@@ -229,7 +240,11 @@ public final class StudioWorkspace: NSObject {
   func apply(_ value: StudioState) {
     guard !closed, value.version == 1, value.revision > receivedRevision else { return }
     receivedRevision = value.revision
-    if value.conversation?.id != state?.conversation?.id {
+    let becameIdle = state?.busy == true && !value.busy
+    let sessionChanged =
+      value.composerDraft?.id != state?.composerDraft?.id
+      || (value.composerDraft == nil && value.conversation?.id != state?.conversation?.id)
+    if sessionChanged {
       if state?.conversation?.id != nil { closeViewers() }
       selectedArtifactId = nil
       artifactPicks = [:]
@@ -237,7 +252,7 @@ public final class StudioWorkspace: NSObject {
       audioMedia.reset()
       documentMedia.reset()
     }
-    if value.conversation?.id != state?.conversation?.id || value.audio?.busy == true {
+    if sessionChanged || value.audio?.busy == true {
       audioPlayback.reset()
     } else if let id = audioPlayback.clipId,
       value.nativeAudioPreview?.id != id,
@@ -248,6 +263,8 @@ public final class StudioWorkspace: NSObject {
       audioPlayback.reset()
     }
     state = value
+    restoreComposer(value.composerDraft)
+    if becameIdle, composerSavedRevision != composerEditRevision { composerChanged() }
     dismissedArtifactIDs.formIntersection((value.nativeArtifacts ?? []).map(\.id))
     if value.nativeArtifactsPaneOpen != false, value.nativeGraph?.visible != true {
       let artifacts = presentedArtifacts
@@ -300,6 +317,18 @@ public final class StudioWorkspace: NSObject {
       return [:]
     }
     guard let runtime else { throw ManagerError.core("Native conversation core is not ready") }
+    let navigating = ["newChat", "open", "openEndpoint"].contains(kind)
+    let deletingCurrent =
+      kind == "deleteChats"
+      && composerIdentity.map { payload["ids"]?.array?.contains(.string($0)) == true } == true
+    if navigating || deletingCurrent {
+      guard canNavigateConversation else {
+        throw ManagerError.core("Finish the current operation before switching conversations.")
+      }
+      switchingConversation = true
+    }
+    defer { if navigating || deletingCurrent { switchingConversation = false } }
+    if navigating || deletingCurrent { try await flushComposerDraft() }
     let native = try JSONDecoder().decode(
       [String: ConversationValue].self, from: JSONEncoder().encode(payload))
     if kind.hasPrefix("microphone") || kind == "dictationAck" {
@@ -311,7 +340,15 @@ public final class StudioWorkspace: NSObject {
     {
       await updateViewers()
     }
-    if ["newChat", "open", "openEndpoint"].contains(kind) { closeViewers() }
+    if navigating || kind == "deleteChats" {
+      closeViewers()
+      await runtime.publishNow()
+    }
+    if ["models", "settings", "samplerDefaults", "toolPicker", "instructionsApply"].contains(kind),
+      !composerText.isEmpty || !attachments.isEmpty
+    {
+      composerChanged()
+    }
     return try JSONDecoder().decode([String: StudioValue].self, from: JSONEncoder().encode(reply))
   }
   public func perform(_ kind: String, _ payload: [String: StudioValue] = [:]) async {
@@ -347,7 +384,6 @@ public final class StudioWorkspace: NSObject {
     guard !busy, !uploading else { return }
     do {
       try await command("newChat")
-      attachments = []
       error = nil
     } catch { self.error = describe(error) }
   }
@@ -355,7 +391,6 @@ public final class StudioWorkspace: NSObject {
     guard !busy, !uploading else { return }
     do {
       try await command("open", ["id": .string(id)])
-      attachments = []
       error = nil
     } catch { self.error = describe(error) }
   }
@@ -373,12 +408,21 @@ public final class StudioWorkspace: NSObject {
     error = nil
     let ids = Set(attachments.map(\.id))
     do {
+      try await flushComposerDraft()
       let result = try await command(
         "send", ["text": .string(text), "attachments": .array(attachments.map(\.choices))])
       guard result["accepted"]?.boolean == true else {
         throw ManagerError.core("The message was not accepted; your draft has been kept")
       }
+      applyingComposer = true
       attachments.removeAll { ids.contains($0.id) }
+      if composerText == text { composerText = "" }
+      applyingComposer = false
+      if composerText.isEmpty && attachments.isEmpty {
+        composerSavedRevision = composerEditRevision
+      } else {
+        composerChanged()
+      }
       return true
     } catch {
       self.error = describe(error)
@@ -712,6 +756,8 @@ public final class StudioWorkspace: NSObject {
     ready = false
     restoring = false
     startTask?.cancel()
+    do { try await flushComposerDraft(allowClosed: true) } catch { self.error = describe(error) }
+    composerDebounce?.cancel()
     await presentationDecoder.close()
     audioPlayback.reset()
     audioMedia.reset()

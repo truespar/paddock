@@ -8,15 +8,20 @@ use std::path::Path;
 
 #[test]
 fn affine_small_admission_is_exact_and_bounded() {
-    small_admission_control(false);
+    small_admission_control(false, false);
 }
 
 #[test]
 fn affine_tiny_prompt_is_exact_and_bounded() {
-    small_admission_control(true);
+    small_admission_control(true, false);
 }
 
-fn small_admission_control(tiny_only: bool) {
+#[test]
+fn affine_gemma_prefill_is_exact_and_bounded() {
+    small_admission_control(false, true);
+}
+
+fn small_admission_control(tiny_only: bool, gemma: bool) {
     let d = MetalDevice::new(None).expect("Metal projection test GPU operation");
     if !d.tensor_accelerated() {
         return;
@@ -30,13 +35,18 @@ fn small_admission_control(tiny_only: bool) {
         }
     }
     let _reset = Reset;
-    for (k, n) in [
-        (5120usize, 48usize),
-        (5120, 65),
-        (5120, 17408),
-        (6144, 5120),
-        (17408, 5120),
-    ] {
+    let shapes = if gemma {
+        vec![(5376, 1057), (8192, 5376), (16384, 5376), (21504, 5376)]
+    } else {
+        vec![
+            (5120usize, 48usize),
+            (5120, 65),
+            (5120, 17408),
+            (6144, 5120),
+            (17408, 5120),
+        ]
+    };
+    for (k, n) in shapes {
         let mut bytes: Vec<_> = (0..k * n / 8)
             .flat_map(|i| (i as u32).wrapping_mul(2654435761).to_le_bytes())
             .collect();
@@ -475,6 +485,13 @@ enum PrefillLayoutProbe {
     Admission,
     MixerOutput,
     WideStaging,
+    Gemma,
+}
+
+#[test]
+#[ignore = "Gemma MLX shape election; exact GPU outputs and paired timings"]
+fn affine_gemma_prefill_benchmark() {
+    prefill_layout_control(true, PrefillLayoutProbe::Gemma);
 }
 
 #[test]
@@ -523,7 +540,16 @@ fn prefill_layout_control(timed: bool, probe: PrefillLayoutProbe) {
     } else {
         kernels
     };
-    let shapes = if probe == PrefillLayoutProbe::MixerOutput {
+    let shapes = if probe == PrefillLayoutProbe::Gemma {
+        vec![
+            (5376, vec![21504, 21504]),
+            (21504, vec![5376]),
+            (5376, vec![8192, 4096, 4096]),
+            (8192, vec![5376]),
+            (5376, vec![16384, 2048]),
+            (16384, vec![5376]),
+        ]
+    } else if probe == PrefillLayoutProbe::MixerOutput {
         vec![(6144, vec![5120])]
     } else if timed {
         vec![
@@ -569,7 +595,9 @@ fn prefill_layout_control(timed: bool, probe: PrefillLayoutProbe) {
                 }
             })
             .collect();
-        let rows: &[usize] = if probe == PrefillLayoutProbe::MixerOutput
+        let rows: &[usize] = if probe == PrefillLayoutProbe::Gemma {
+            &[128, 512]
+        } else if probe == PrefillLayoutProbe::MixerOutput
             || probe == PrefillLayoutProbe::WideStaging
         {
             &[512]

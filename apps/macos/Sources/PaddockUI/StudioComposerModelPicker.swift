@@ -5,30 +5,15 @@ import SwiftUI
 struct StudioComposerModelPicker: View {
   @Bindable var chat: StudioWorkspace
   var compact = false
-  var compare: () -> Void
+  @State private var showingPicker = false
   private var header: StudioModelHeader? { chat.state?.modelHeader }
   private var title: String {
     if header?.comparing == true { return "\(header?.compareLanes.count ?? 0) models" }
     return header?.current?.label ?? "Choose a model"
   }
   var body: some View {
-    Menu {
-      ForEach(header?.pickerOptions ?? []) { option in
-        Button {
-          Task { await chat.perform("models", ["ids": .array([.string(option.value)])]) }
-        } label: {
-          if option.value == header?.currentModel && header?.comparing != true {
-            Label("\(option.label) · \(option.hint)", systemImage: "checkmark")
-          } else {
-            Text("\(option.label) · \(option.hint)")
-          }
-        }.disabled(!option.available).help(option.title)
-      }
-      if header?.pickerOptions.isEmpty != false {
-        Text("Start a local model or add a cloud model in Settings")
-      }
-      Divider()
-      Button("Compare models…", action: compare)
+    Button {
+      showingPicker = true
     } label: {
       HStack(spacing: 6) {
         if let vendor = header?.current?.vendor, let image = ProviderArtwork.image(for: vendor) {
@@ -43,11 +28,15 @@ struct StudioComposerModelPicker: View {
         }
         Image(systemName: "chevron.down").font(.system(size: 8))
       }.frame(maxWidth: compact ? 150 : 230)
-    }.menuStyle(.button).buttonStyle(ComposerButtonStyle()).menuIndicator(.hidden)
+    }.buttonStyle(ComposerButtonStyle())
       .fixedSize(horizontal: false, vertical: true)
       .disabled(!chat.ready || chat.busy || chat.hasMessageEdit)
       .accessibilityLabel("Choose model").accessibilityValue(title)
       .accessibilityIdentifier("composer-model")
+      .popover(isPresented: $showingPicker) {
+        StudioModelSelectionView(chat: chat, initiallyComparing: header?.comparing == true)
+          .studioPopoverSurface()
+      }
       .help(
         header?.comparing == true
           ? (header?.compareLanes.map(\.label).joined(separator: " vs. ") ?? title) : title)

@@ -290,6 +290,7 @@ async fn anth_run_pass(
         submitted: None, // stamped by Engine::submit
         canvas_read: None,
         user_turn: false,
+        background: false,
     };
     if let Err(e) = model.engine.submit(gen1) {
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "api_error", e));
@@ -641,6 +642,7 @@ async fn compact(
         submitted: None, // stamped by Engine::submit
         canvas_read: None,
         user_turn: false,
+        background: false,
     };
     if let Err(e) = model.engine.submit(gen2) {
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "api_error", e));

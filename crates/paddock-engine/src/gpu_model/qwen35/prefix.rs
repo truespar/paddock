@@ -380,7 +380,7 @@ impl GpuQwen35 {
                 bs.paged_prefix
                     .as_mut()
                     .expect("paged tail: prefix cache on")
-                    .insert(&tokens[..c], &blocks, pool);
+                    .insert_for(slot, &tokens[..c], &blocks, pool);
             }
             let idx = {
                 let bs = self.batch.as_mut().expect("batch");
@@ -412,7 +412,7 @@ impl GpuQwen35 {
             bs.paged_prefix
                 .as_mut()
                 .expect("paged tail: prefix cache on")
-                .insert(&tokens[..full * BLOCK_TOKENS], &blocks, pool);
+                .insert_for(slot, &tokens[..full * BLOCK_TOKENS], &blocks, pool);
         }
         Ok(logits)
     }
@@ -510,8 +510,12 @@ impl GpuQwen35 {
         // at most one planned prefill chunk, pictures encoded as it comes up
         let mut job = self.mm_slot_begin(slot, chunks, self.prefill_chunk_rows)?;
         loop {
-            if let Some(done) = self.mm_slot_unit(&mut job, chunks)? {
-                return Ok(done);
+            match self.mm_slot_unit(&mut job, chunks, false)? {
+                super::mm_steps::MmUnit::More => {}
+                super::mm_steps::MmUnit::Prefilled(logits, rows) => return Ok((logits, rows)),
+                super::mm_steps::MmUnit::Riding => {
+                    unreachable!("ride is off on the blocking entry")
+                }
             }
         }
     }
@@ -585,7 +589,8 @@ impl GpuQwen35 {
     }
 
     /// The checkpoint cuts for a multimodal prompt: [`ckpt_cuts`]'s two
-    /// boundaries, each walked back out of any image span it lands inside, then
+    /// boundaries, each walked back out of any image span it lands inside, plus
+    /// the page boundary before the first picture (`first_picture_cut`), then
     /// filtered to the ones this prefill can actually reach.
     pub(super) fn mm_ckpt_cuts(
         &self,
@@ -602,6 +607,15 @@ impl GpuQwen35 {
             if c > start && c < t_len && !out.contains(&c) {
                 out.push(c);
             }
+        }
+        // and where requests that share everything before the picture diverge
+        let head = crate::gpu_model::prefix_cache::first_picture_cut(
+            start,
+            img_spans,
+            super::min_cache_prefix(),
+        );
+        if let Some(c) = head.filter(|c| *c < t_len && !out.contains(c)) {
+            out.push(c);
         }
         out
     }
@@ -626,7 +640,7 @@ impl GpuQwen35 {
             let bs = self.batch.as_mut().expect("batch");
             let pool = bs.pool.as_mut().expect("prefix requires the pool");
             let radix = bs.paged_prefix.as_mut().expect("prefix checked above");
-            radix.insert(&keys[..nb * BLOCK_TOKENS], &blocks, pool);
+            radix.insert_for(slot, &keys[..nb * BLOCK_TOKENS], &blocks, pool);
             checkpoint
                 .then(|| radix.attach_state_with_pool(keys, upto, pool))
                 .flatten()
@@ -1522,46 +1536,7 @@ impl GpuQwen35 {
                             )?;
                         }
                     } else {
-                        prefill_mm_pre_any(
-                            &exec,
-                            gate,
-                            &sc.d_pxq,
-                            &sc.d_pxs,
-                            &sc.d_yq,
-                            &mut sc.d_xsums,
-                            &mut sc.d_ssums,
-                            &mut sc.d_skfix,
-                            &mut sc.d_ffn_gate,
-                            r,
-                        )?;
-                        prefill_mm_pre_any(
-                            &exec,
-                            up,
-                            &sc.d_pxq,
-                            &sc.d_pxs,
-                            &sc.d_yq,
-                            &mut sc.d_xsums,
-                            &mut sc.d_ssums,
-                            &mut sc.d_skfix,
-                            &mut sc.d_ffn_up,
-                            r,
-                        )?;
-                        prefill_ffn_down_rot(
-                            &exec,
-                            down,
-                            &mut sc.d_pxq,
-                            &mut sc.d_pxs,
-                            &mut sc.d_yq,
-                            &mut sc.d_xsums,
-                            &mut sc.d_ssums,
-                            &mut sc.d_skfix,
-                            &mut sc.d_ffn_gate,
-                            &sc.d_ffn_up,
-                            &mut sc.d_proj,
-                            ff,
-                            r,
-                            rot,
-                        )?;
+                        prefill_ffn_dense(&exec, sc, gate, up, down, ff, r, rot)?;
                     }
                 }
                 Ffn::Nvf4Dense { gu, down } => {
@@ -2666,46 +2641,7 @@ impl GpuQwen35 {
                             )?;
                         }
                     } else {
-                        prefill_mm_pre_any(
-                            &exec,
-                            gate,
-                            &sc.d_pxq,
-                            &sc.d_pxs,
-                            &sc.d_yq,
-                            &mut sc.d_xsums,
-                            &mut sc.d_ssums,
-                            &mut sc.d_skfix,
-                            &mut sc.d_ffn_gate,
-                            r,
-                        )?;
-                        prefill_mm_pre_any(
-                            &exec,
-                            up,
-                            &sc.d_pxq,
-                            &sc.d_pxs,
-                            &sc.d_yq,
-                            &mut sc.d_xsums,
-                            &mut sc.d_ssums,
-                            &mut sc.d_skfix,
-                            &mut sc.d_ffn_up,
-                            r,
-                        )?;
-                        prefill_ffn_down_rot(
-                            &exec,
-                            down,
-                            &mut sc.d_pxq,
-                            &mut sc.d_pxs,
-                            &mut sc.d_yq,
-                            &mut sc.d_xsums,
-                            &mut sc.d_ssums,
-                            &mut sc.d_skfix,
-                            &mut sc.d_ffn_gate,
-                            &sc.d_ffn_up,
-                            &mut sc.d_proj,
-                            ff,
-                            r,
-                            rot,
-                        )?;
+                        prefill_ffn_dense(&exec, sc, gate, up, down, ff, r, rot)?;
                     }
                 }
                 Ffn::Nvf4Dense { gu, down } => {
@@ -3054,7 +2990,7 @@ impl GpuQwen35 {
             let radix = bs.paged_prefix.as_mut().expect("prefix checked above");
             let pool = bs.pool.as_mut().expect("prefix requires the pool");
             let blocks = bs.tables[slot].blocks()[..cut / BLOCK_TOKENS].to_vec();
-            radix.insert(&seq[..cut], &blocks, pool);
+            radix.insert_for(slot, &seq[..cut], &blocks, pool);
             if !radix.attach_state_at(&seq, cut, idx) {
                 radix.recycle_state(idx);
                 bs.seq[slot] = seq;
@@ -3101,6 +3037,27 @@ impl GpuQwen35 {
     /// `Generator::reply_pin`): the live checkpoint becomes the held one and
     /// the next page's snapshot opens a new live one instead of replacing it.
     /// Once per reply; a reply with no checkpoint yet has nothing to hold.
+    /// Queue a chunked prefill. A live prompt goes ahead of every background
+    /// (batch) one, so the next span fills with its rows first instead of
+    /// waiting behind batch prompts already chunking. Never mid-queue while a
+    /// span is in flight - its shares name chunk indices. The class comes from
+    /// the prefix cache; without one every prompt queues in arrival order.
+    pub(super) fn enqueue_chunk(&mut self, c: ChunkedPrefill) {
+        let radix = self.batch.as_ref().and_then(|bs| bs.paged_prefix.as_ref());
+        let at = radix
+            .filter(|_| self.unified_inflight.is_none())
+            .and_then(|r| r.chunk_queue_at(c.slot, self.chunked.iter().map(|q| q.slot)))
+            .unwrap_or(self.chunked.len());
+        self.chunked.insert(at, c);
+    }
+
+    /// `Generator::set_slot_background`: the class `slot`'s inserts carry.
+    pub(crate) fn set_slot_background(&mut self, slot: usize, on: bool) {
+        if let Some(radix) = self.batch.as_mut().and_then(|bs| bs.paged_prefix.as_mut()) {
+            radix.set_slot_low(slot, on);
+        }
+    }
+
     /// `Generator::anchor_at`: hold the user turn's prompt-end checkpoint.
     pub(crate) fn anchor_at(&mut self, tokens: &[u32], upto: usize) {
         if let Some(radix) = self.batch.as_mut().and_then(|bs| bs.paged_prefix.as_mut())

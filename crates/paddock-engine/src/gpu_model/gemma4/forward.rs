@@ -7,73 +7,11 @@
 
 use cudarc::driver::CudaSlice;
 
-use crate::gpu::{GpuError, GpuExecutor, RepackedKQ, RepackedQ8};
+use crate::gpu::{GpuError, GpuExecutor, RepackedKQ};
 
+use super::pf_q8::{attn_q8_only, pf_gu_q8, pf_sandwich_q8};
+pub(super) use super::pf_q8::{pf_down_q8, pf_gu_q8_arm, pf_mmq}; // batch.rs takes these here
 use super::{EmbdTable, GpuGemma4, kq_rows, kq_stage, planes};
-
-/// mmq GEMM ladder for the prefill lane (qwen35's `prefill_mm_pre` shape):
-/// the deep-pipe kernel on %128 weights, plain split-tile mmq otherwise.
-/// Caller has already quantized the activation tile into `yq`.
-///
-/// The pipe used to be gated at `r > 1024` - inherited from qwen35's
-/// `mmq_hi_min_batch`, never measured below it on this lane. It is BIT-EQUAL
-/// to the sync mmq (both fold per k32 in ascending order; only the staging
-/// differs - memcmp-gated across 24 shape x batch cells, and the live server's
-/// greedy text is byte-identical across this flip), and
-/// bench/muse_mcol_proto.cu measures it faster at every row count 64..512 on
-/// all three muse shapes: ffn_gate 128 rows 520 -> 331 us, 136 rows 828 -> 570,
-/// ffn_down 136 rows 1254 -> 805, wq 202 -> 125. The sync kernel is
-/// barrier-bound at 1 block/SM (its own header says so) and nothing about that
-/// changes below 1024 rows, which is why the old gate was leaving a third of
-/// the prefill on the floor. PADDOCK_G4_PF_SYNC=1 pins the old kernel for A/B.
-pub(super) fn pf_mmq(
-    exec: &GpuExecutor,
-    w: &RepackedQ8,
-    yq: &CudaSlice<u8>,
-    skfix: &mut CudaSlice<f32>,
-    y: &mut CudaSlice<f32>,
-    r: usize,
-) -> Result<(), GpuError> {
-    // The A/B pin reproduces the old GATE, not "sync everywhere": this lane
-    // already took the pipe above 1024 rows, so a pin that forced sync at
-    // every r would measure pipe-vs-sync rather than new-vs-old and credit
-    // the 1024-row flip with a gain at 2048..8192 tokens that was already
-    // there. Keep the `r <= 1024` clause.
-    if pf_sync_pin() && r <= 1024 {
-        return exec.q8_0_gemm_mmq(w, yq, Some(skfix), y, r);
-    }
-    if w.dims[0].is_multiple_of(128) && exec.has_q8_0_gemm_mmq_pipe() {
-        // stream-K tail split (qwen35's serving rung) - OPT-IN via
-        // PADDOCK_G4_SK: it recovers last-wave slack on the narrow
-        // projections (~1% throughput) but reproducibly costs c8 TTFT p50
-        // around +180 ms - and TTFT is the standing target. skfix doubles
-        // as the partials plane (sized 256*128*128, the sk contract).
-        // (kept on its original r > 1024 band - the tail-split arm was only
-        // ever measured there, and this change is not the place to widen it)
-        if r > 1024
-            && exec.has_q8_0_gemm_mmq_pipe_sk()
-            && paddock_models::dev_var_os!("PADDOCK_G4_SK").is_some()
-        {
-            exec.q8_0_gemm_mmq_pipe_sk(w, yq, skfix, y, r)
-        } else {
-            exec.q8_0_gemm_mmq_pipe(w, None, yq, y, r)
-        }
-    } else {
-        exec.q8_0_gemm_mmq(w, yq, Some(skfix), y, r)
-    }
-}
-
-/// A/B pin for the prefill GEMM rung: `PADDOCK_G4_PF_SYNC=1` restores the
-/// old ladder - sync mmq at or below 1024 rows, pipe above. Read once; this
-/// sits inside the per-projection prefill path.
-fn pf_sync_pin() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        paddock_models::dev_var!("PADDOCK_G4_PF_SYNC")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    })
-}
 
 /// GEGLU -> e4m3 for the F8R down-GEMM input: fused single-pass kernel when
 /// the pack ships it (gate/up read once, the f32 activation never lands -
@@ -100,49 +38,7 @@ pub(super) fn g4_e4m3_glu(
     }
 }
 
-/// Batched-prefill chunk rows. 2048 (llama's ubatch class) puts the mmq
-/// GEMMs above the pipe rung's 1024-row floor; widest scratch row set is
-/// ~1 GB - noise next to the 33 GB of weights.
-// 8192: SGLang's B200 heuristic runs 16384-token prefill chunks -
-// at our old 2048 cap every full-weight pass amortized over 8x fewer
-// tokens and the BM=128 expert-sort PAD fraction sat at ~2x (255 blocks
-// for 128 experts). The tick stays 2048 by DEFAULT (decode cadence);
-// PADDOCK_G4_TICK_ROWS raises it per deployment up to this cap.
-pub(crate) const PF_ROWS: usize = 8192;
-
-/// Rows the prefill scratch is actually allocated for on this server - and
-/// therefore the size every prefill lane chunks at. The two must never
-/// diverge: the scratch planes are `[rows, dim]`, so a chunk wider than the
-/// allocation is an out-of-bounds write, not a slow path.
-///
-/// PF_ROWS above is a CEILING, not a size. It was raised 2048 -> 8192 for
-/// B200 muse waves, and allocating the full 8192 unconditionally costs every
-/// server ~5.0 GiB on gemma-4-31B - even a 4096-context serve, which can
-/// never present more than 4096 rows in one chunk. That unusable half of the
-/// scratch is enough to push the batch pool to zero slots and drop the model
-/// onto the serial engine.
-///
-/// Two things bound a chunk, and the wider wins:
-///  - a single-sequence bulk prefill, at most `max_ctx` rows;
-///  - one serving tick - the mixed prefill budget plus every live slot's
-///    spec-verify rows. [`pf_rows_floor`] covers the budget plus 1024 rows of
-///    verify, i.e. any width up to ~113 slots.
-///
-/// This is where a server STARTS. `enable_batch` steps it down the halving
-/// ladder when the KV plan cannot seat the configured context beside it, so
-/// `GpuGemma4::pf_rows` - not this - is the width every lane must read.
-pub(crate) fn pf_rows(max_ctx: usize) -> usize {
-    PF_ROWS.min(max_ctx.next_multiple_of(128).max(pf_rows_floor()))
-}
-
-/// The narrowest chunk this server may run: one serving tick - the mixed
-/// prefill budget plus 1024 rows of spec verify.
-///
-/// Below it a tick overruns the planes, which is an out-of-bounds write and
-/// not a slow path, so this is where `batch::set_pf_rows`'s ladder stops.
-pub(crate) fn pf_rows_floor() -> usize {
-    (super::batch::mixed_tick_rows() + 1024).next_multiple_of(128)
-}
+pub(crate) use super::scratch::{PF_ROWS, pf_rows, pf_rows_floor};
 
 /// SWA append+attend sub-span rows. The WindowRing only has to absorb one
 /// sub-span of appends (plus the window behind it) before older blocks may
@@ -1474,7 +1370,10 @@ impl GpuGemma4 {
         // layer's input residual, which holds because muse never defers a
         // post-norm (every gated layer answers `fused_norm_ok() == false`).
         let mut dtap = self.dflash.as_mut().filter(|d| d.state.is_some());
+        // the previous layer's sandwich landed this layer's attention norm in pf_yq
+        let mut attn_yq_next = false;
         for (li, lw) in self.layers.iter().enumerate() {
+            let attn_yq = std::mem::take(&mut attn_yq_next);
             if let Some(df) = dtap.as_mut()
                 && let Some(band) = df.target_layers.iter().position(|&t| t == li)
             {
@@ -1555,7 +1454,7 @@ impl GpuGemma4 {
                     r,
                     hp.eps,
                 )?;
-            } else {
+            } else if !attn_yq {
                 exec.rmsnorm_batch(
                     &sc.pf_x,
                     &lw.attn_norm,
@@ -1951,7 +1850,9 @@ impl GpuGemma4 {
                     r,
                 )?;
             } else if let (true, Some(wq)) = (mmq, lw.wq.q8()) {
-                exec.quantize_q8_mmq(&sc.pf_normed, &mut sc.pf_yq, hp.n_embd, r)?;
+                if !attn_yq {
+                    exec.quantize_q8_mmq(&sc.pf_normed, &mut sc.pf_yq, hp.n_embd, r)?;
+                }
                 pf_mmq(exec, wq, &sc.pf_yq, &mut sc.pf_skfix, &mut sc.pf_q, r)?;
             } else {
                 // the class-generic form: the plain repacked GEMM for Q8, the
@@ -3533,6 +3434,7 @@ impl GpuGemma4 {
             }
             // (n_ff and the FFN-side gates are hoisted above the qkv
             // section - the c16 stream gate needs them early)
+            let mut ffn_yq = false; // pf_yq holds the FFN's quantized norm (pf_sandwich_q8)
             if pc_gu && c16 {
                 exec.addnorm_e4m3_row_p16(
                     &mut sc.pf_x,
@@ -3572,6 +3474,18 @@ impl GpuGemma4 {
                     1.0,
                     r,
                 )?;
+            } else if !f8t_pf2
+                && !f8
+                && !f8r
+                && !(f8w_pf && lw.f8_gate.is_some())
+                && !(f8row_pf && lw.f8r_gate.is_some())
+                && lw.moe.is_none()
+                && lw.ffn_gate.q8().is_some_and(|w| w.data.len() > 48)
+                && lw.ffn_up.q8().is_some_and(|w| w.data.len() > 48)
+                && pf_sandwich_q8(exec, sc, &lw.attn_post_norm, &lw.ffn_norm, hp, 1.0, r)?
+            {
+                // the FFN below is the Q8 mmq arm: its quantized input already landed
+                ffn_yq = true;
             } else {
                 // fused post-norm + residual (the decode walk's kernel, same
                 // bit-exact math): one pass instead of rmsnorm + add
@@ -3620,6 +3534,7 @@ impl GpuGemma4 {
             // set by the fused gu-epilogue arm below: ff activations landed
             // in pf_ffq/pf_ffs straight from the GEMM (no geglu launch)
             let mut gu_fused = false;
+            let mut gu_q8 = false; // gate|up landed the down's mmq input (pf_yq_ff)
             // pf_gate came from the INTERLEAVED f8_gu plane (pair-addressed
             // geglu) - Not set by the fp4_gu quality-probe arm, whose plane
             // keeps the plain [gate|up] order
@@ -3910,9 +3825,19 @@ impl GpuGemma4 {
                     r,
                 )?;
             } else if let (true, Some(g8), Some(u8_)) = (mmq, lw.ffn_gate.q8(), lw.ffn_up.q8()) {
-                exec.quantize_q8_mmq(&sc.pf_normed, &mut sc.pf_yq, hp.n_embd, r)?;
-                pf_mmq(exec, g8, &sc.pf_yq, &mut sc.pf_skfix, &mut sc.pf_gate, r)?;
-                pf_mmq(exec, u8_, &sc.pf_yq, &mut sc.pf_skfix, &mut sc.pf_up, r)?;
+                if !ffn_yq {
+                    exec.quantize_q8_mmq(&sc.pf_normed, &mut sc.pf_yq, hp.n_embd, r)?;
+                }
+                // only when the down below is the mmq arm (an e4m3 down plane
+                // would outrank it and read the f32 gate/up planes)
+                gu_q8 = !(f8w_pf && lw.f8_down.is_some())
+                    && !(f8row_pf && lw.f8r_down.is_some())
+                    && lw.ffn_down.q8().is_some()
+                    && pf_gu_q8(exec, g8, u8_, &sc.pf_yq, &mut sc.pf_yq_ff, r, hp.glu_act())?;
+                if !gu_q8 {
+                    pf_mmq(exec, g8, &sc.pf_yq, &mut sc.pf_skfix, &mut sc.pf_gate, r)?;
+                    pf_mmq(exec, u8_, &sc.pf_yq, &mut sc.pf_skfix, &mut sc.pf_up, r)?;
+                }
             } else {
                 lw.ffn_gate
                     .gemm(exec, kq_rows!(sc), &sc.pf_normed, &mut sc.pf_gate, r)?;
@@ -4080,7 +4005,9 @@ impl GpuGemma4 {
                     r,
                 )?;
             } else if let (true, Some(d8)) = (mmq, lw.ffn_down.q8()) {
-                if exec.has_quantize_q8_mmq_glu(hp.glu_act()) {
+                if gu_q8 {
+                    // gate|up already landed this GEMM's input (pf_q8::pf_gu_q8)
+                } else if exec.has_quantize_q8_mmq_glu(hp.glu_act()) {
                     // GEGLU fused into the down-GEMM's quantize (qwen35 P6j
                     // shape): gate/up read once, the f32 activation never
                     // lands - saves pd_geglu's full n_ff round trip per chunk.
@@ -4098,7 +4025,8 @@ impl GpuGemma4 {
                     exec.glu(&mut sc.pf_gate, &sc.pf_up, r * n_ff, hp.glu_act())?;
                     exec.quantize_q8_mmq(&sc.pf_gate, &mut sc.pf_yq, n_ff, r)?;
                 }
-                pf_mmq(exec, d8, &sc.pf_yq, &mut sc.pf_skfix, &mut sc.pf_proj, r)?;
+                let yq = if gu_q8 { &sc.pf_yq_ff } else { &sc.pf_yq };
+                pf_mmq(exec, d8, yq, &mut sc.pf_skfix, &mut sc.pf_proj, r)?;
             } else {
                 exec.glu(&mut sc.pf_gate, &sc.pf_up, r * n_ff, hp.glu_act())?;
                 lw.ffn_down
@@ -4131,6 +4059,19 @@ impl GpuGemma4 {
                     lw.out_scale,
                     r,
                 )?;
+            } else if let Some(nl) = self.layers.get(li + 1).filter(|nl| attn_q8_only(nl))
+                && pf_sandwich_q8(
+                    exec,
+                    sc,
+                    &lw.ffn_post_norm,
+                    &nl.attn_norm,
+                    hp,
+                    lw.out_scale,
+                    r,
+                )?
+            {
+                // the next layer's attention norm landed quantized in pf_yq
+                attn_yq_next = true;
             } else {
                 exec.rmsnorm_add_scale(
                     &mut sc.pf_x,

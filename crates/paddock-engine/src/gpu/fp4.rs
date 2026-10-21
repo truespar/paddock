@@ -299,6 +299,118 @@ impl GpuExecutor {
         self.kernels.swiglu_fused_nvf4_il.is_some()
     }
 
+    /// Slot 880: [`Self::swiglu_fused_nvf4_il`] with the scales in the tcgen05
+    /// GEMM's swizzled atom layout (`scale` holds ceil(n_rows / 128) * 128 rows'
+    /// worth) for [`Self::nvf4_gemm_f4_sw`].
+    pub fn swiglu_fused_nvf4_il_sw(
+        &self,
+        fused: &CudaSlice<f32>,
+        q: &mut CudaSlice<i8>,
+        scale: &mut CudaSlice<u8>,
+        ff: usize,
+        n_rows: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .swiglu_fused_nvf4_il_sw
+            .ok_or(GpuError::MissingOp("swiglu_fused_nvf4_il_sw"))?;
+        if !ff.is_multiple_of(64)
+            || q.len() < n_rows * ff / 2
+            || scale.len() < n_rows.next_multiple_of(128) * ff / 16
+        {
+            return Err(GpuError::Unsupported(format!(
+                "swiglu_fused_nvf4_il_sw: ff {ff} / q {} / scale {} for {n_rows} rows",
+                q.len(),
+                scale.len()
+            )));
+        }
+        let (fp, _g1) = fused.device_ptr(&self.stream);
+        let (qp, _g2) = q.device_ptr_mut(&self.stream);
+        let (sp, _g3) = scale.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slot 880); sizes checked above
+        check(unsafe {
+            f(
+                fp as *const _,
+                qp as *mut _,
+                sp as *mut _,
+                ff as u32,
+                n_rows as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// The scale-swizzled W4A4 chain (slots 879 / 880 / 881) is in the pack.
+    pub fn has_nvf4_swz_chain(&self) -> bool {
+        self.kernels.add_rmsnorm_nvf4_batch_sw.is_some()
+            && self.kernels.swiglu_fused_nvf4_il_sw.is_some()
+            && self.kernels.nvf4_gemm_tc5w_sw.is_some()
+    }
+
+    /// Slot 874: [`Self::nvf4_gemm_f4t_swq`]'s contract on tcgen05 (sm_100) -
+    /// the interleaved gate|up plane's GEMM writes the down GEMM's (`q`, `qs`)
+    /// from its epilogue, reading the tc5w-tiled weight scales. Any batch
+    /// width (the tile follows tc5w's 32/64/128 bands).
+    pub fn nvf4_gemm_tc5_swq(
+        &self,
+        w: &Nvf4Plane,
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<u8>,
+        q: &mut CudaSlice<i8>,
+        qs: &mut CudaSlice<u8>,
+        batch: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .nvf4_gemm_tc5_swq
+            .ok_or(GpuError::MissingOp("nvf4_gemm_tc5_swq"))?;
+        let st = w.scale_tc5.as_ref().ok_or_else(|| {
+            GpuError::Unsupported("nvf4_gemm_tc5_swq: plane has no tc5 scales".into())
+        })?;
+        let ff = w.out_dim / 2;
+        if !w.gu_pairs
+            || w.layout != Nvf4Layout::Row
+            || !w.in_dim.is_multiple_of(256)
+            || !w.out_dim.is_multiple_of(256)
+            || xq.len() < batch * w.in_dim / 2
+            || xs.len() < batch * w.in_dim / 16
+            || q.len() < batch * ff / 2
+            || qs.len() < batch * ff / 16
+        {
+            return Err(GpuError::Unsupported(format!(
+                "nvf4_gemm_tc5_swq: needs an interleaved row-major gate|up plane (in%256, out%256) and \
+                 room for {batch} rows (pairs {} in {} out {})",
+                w.gu_pairs, w.in_dim, w.out_dim
+            )));
+        }
+        let (dp, _g1) = w.data.device_ptr(&self.stream);
+        let (sp, _g2) = st.device_ptr(&self.stream);
+        let (xqp, _g3) = xq.device_ptr(&self.stream);
+        let (xsp, _g4) = xs.device_ptr(&self.stream);
+        let (qp, _g5) = q.device_ptr_mut(&self.stream);
+        let (qsp, _g6) = qs.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slot 874); operand sizes checked above
+        check(unsafe {
+            f(
+                dp as *const _,
+                sp as *const _,
+                xqp as *const _,
+                xsp as *const _,
+                qp as *mut _,
+                qsp as *mut _,
+                w.scale2,
+                w.in_dim as u32,
+                w.out_dim as u32,
+                batch as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    pub fn has_nvf4_gemm_tc5_swq(&self) -> bool {
+        self.kernels.nvf4_gemm_tc5_swq.is_some()
+    }
+
     /// f4t with the swiglu + nvf4-quant epilogue (slot 533) over an
     /// INTERLEAVED gate|up plane (`gu_pairs`): stages the down GEMM's
     /// activation pair (`q`, `qs`) directly from the accumulators -- no f32
@@ -1039,6 +1151,7 @@ impl GpuExecutor {
         // session 6).
         let data = self.stream.clone_htod(packed).map_err(drv)?;
         let scale = self.stream.clone_htod(scales).map_err(drv)?;
+        let scale_tc5 = self.nvf4_tc5_tile(&scale, out_dim, in_dim)?;
         Ok(Nvf4Plane {
             data,
             scale,
@@ -1047,6 +1160,7 @@ impl GpuExecutor {
             in_dim,
             layout: Nvf4Layout::Row,
             gu_pairs: false,
+            scale_tc5,
         })
     }
 
@@ -1123,6 +1237,7 @@ impl GpuExecutor {
             in_dim,
             layout: Nvf4Layout::Tiled,
             gu_pairs: false,
+            scale_tc5: None,
         })
     }
 
@@ -1188,6 +1303,7 @@ impl GpuExecutor {
             in_dim,
             layout: Nvf4Layout::Frag,
             gu_pairs: false,
+            scale_tc5: None,
         })
     }
 
@@ -1567,15 +1683,60 @@ impl GpuExecutor {
         })
     }
 
-    /// True when the checkpoint-plane W4A4 GEMM (slot 426) is loadable.
+    /// True when the checkpoint-plane W4A4 GEMM is loadable: slot 426 (the
+    /// mma.sync family, cc 12.x) or slot 867 (tcgen05, cc 10.0).
     pub fn has_nvf4_gemm_f4(&self) -> bool {
-        self.kernels.nvf4_gemm_f4.is_some()
+        self.kernels.nvf4_gemm_f4.is_some() || self.nvf4_tc5_on()
     }
 
     /// The W4A4 family's prefill-width arm (the f4t TMA ring, rows >= 128,
     /// in_dim % 256): what a lane asks before electing W4A4 for its wide band.
+    /// On cc 10.0 slot 867 is that arm too - one kernel serves every width.
     pub fn has_nvf4_gemm_f4t(&self) -> bool {
-        self.kernels.nvf4_gemm_f4t.is_some()
+        self.kernels.nvf4_gemm_f4t.is_some() || self.nvf4_tc5_on()
+    }
+
+    /// The sm_100 tcgen05 W4A4 GEMM (slot 867) and its scale tiler (868) are
+    /// loaded. `PADDOCK_NO_NVF4_TC5=1` kills the arm for A/B (planes then
+    /// upload without the tiled scales and the chain keeps its other arms).
+    pub fn nvf4_tc5_on(&self) -> bool {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let off = *OFF.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_NVF4_TC5").is_some());
+        !off && self.kernels.nvf4_gemm_tc5w.is_some() && self.kernels.nvf4_tc5_tile_scales.is_some()
+    }
+
+    /// Slot 867's scale plane for a `Row` upload: the e4m3 cells re-ordered by
+    /// slot 868 into one 2 KB canonical block per (128-row tile, 256-K slab).
+    /// None where the arm is absent or the plane's K is not a whole number of
+    /// slabs (the arm's own constraint) - the plane then serves as before.
+    pub(crate) fn nvf4_tc5_tile(
+        &self,
+        scale: &CudaSlice<u8>,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Result<Option<CudaSlice<u8>>, GpuError> {
+        if !self.nvf4_tc5_on() || !in_dim.is_multiple_of(256) || out_dim == 0 {
+            return Ok(None);
+        }
+        let f = self.kernels.nvf4_tc5_tile_scales.expect("nvf4_tc5_on");
+        let bytes = out_dim.div_ceil(128) * (in_dim / 256) * 2048;
+        let mut tiled = self.alloc_u8(bytes)?;
+        {
+            let (sp, _g1) = scale.device_ptr(&self.stream);
+            let (tp, _g2) = tiled.device_ptr_mut(&self.stream);
+            // SAFETY: ABI contract (slot 868); `scale` holds out*in/16 cells,
+            // `tiled` the tile-order bytes computed above
+            check(unsafe {
+                f(
+                    sp as *const _,
+                    tp as *mut _,
+                    in_dim as u32,
+                    out_dim as u32,
+                    self.stream_ptr(),
+                )
+            })?;
+        }
+        Ok(Some(tiled))
     }
 
     /// Checkpoint-plane W4A4 GEMM: the fp4 x fp4 block-scale mma
@@ -1672,6 +1833,72 @@ impl GpuExecutor {
         Some((st, rt))
     }
 
+    /// Slot 881: [`Self::nvf4_gemm_f4`]'s tcgen05 arm with `xs` already in the
+    /// swizzled atom layout (slots 879 / 880 wrote it; ceil(batch / 128) * 128
+    /// rows' worth) - no swizzle launch. Batch > 64 and a tc5-tiled plane only;
+    /// the caller elects it up front (the scales are not row-major), so a
+    /// missing slot or a decline is an error, not a fallback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn nvf4_gemm_f4_sw(
+        &self,
+        w: &Nvf4Plane,
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<u8>,
+        y: &mut CudaSlice<f32>,
+        batch: usize,
+        part: Option<&mut CudaSlice<f32>>,
+    ) -> Result<(), GpuError> {
+        let (Some(f), Some(st)) = (self.kernels.nvf4_gemm_tc5w_sw, w.scale_tc5.as_ref()) else {
+            return Err(GpuError::MissingOp("nvf4_gemm_tc5w_sw"));
+        };
+        if w.layout != Nvf4Layout::Row
+            || batch <= 64
+            || xq.len() < batch * w.in_dim / 2
+            || xs.len() < batch.next_multiple_of(128) * w.in_dim / 16
+            || y.len() < batch * w.out_dim
+        {
+            return Err(GpuError::Unsupported(format!(
+                "nvf4_gemm_f4_sw: batch {batch} / xq {} / xs {} / y {} for [{}, {}]",
+                xq.len(),
+                xs.len(),
+                y.len(),
+                w.out_dim,
+                w.in_dim
+            )));
+        }
+        let (dp, _g1) = w.data.device_ptr(&self.stream);
+        let (sp, _g2) = st.device_ptr(&self.stream);
+        let (xqp, _g3) = xq.device_ptr(&self.stream);
+        let (xsp, _g4) = xs.device_ptr(&self.stream);
+        let (yp, _g5) = y.device_ptr_mut(&self.stream);
+        let (pp, pn) = match part {
+            Some(p) => {
+                let n = p.len();
+                let (q, _g) = p.device_ptr_mut(&self.stream);
+                (q as *mut core::ffi::c_void, n as u64)
+            }
+            None => (core::ptr::null_mut(), 0u64),
+        };
+        // SAFETY: ABI contract (slot 881); operand sizes checked above
+        check(unsafe {
+            f(
+                dp as *const _,
+                sp as *const _,
+                core::ptr::null(),
+                xqp as *const _,
+                xsp as *const _,
+                yp as *mut _,
+                w.scale2,
+                w.in_dim as u32,
+                w.out_dim as u32,
+                batch as u32,
+                pp,
+                pn,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     pub fn nvf4_gemm_f4(
         &self,
         w: &Nvf4Plane,
@@ -1699,6 +1926,48 @@ impl GpuExecutor {
                 w.out_dim,
                 w.in_dim
             )));
+        }
+        // sm_100: the tcgen05 arm serves every width (one kernel, split-K
+        // into `part` where the tile grid starves the die)
+        if let (Some(f), Some(st)) = (self.kernels.nvf4_gemm_tc5w, w.scale_tc5.as_ref()) {
+            let (dp, _g1) = w.data.device_ptr(&self.stream);
+            let (sp, _g2) = st.device_ptr(&self.stream);
+            let (xqp, _g3) = xq.device_ptr(&self.stream);
+            let (xsp, _g4) = xs.device_ptr(&self.stream);
+            let (yp, _g5) = y.device_ptr_mut(&self.stream);
+            let bp = match bias {
+                Some(b) => {
+                    let (p, _g) = b.device_ptr(&self.stream);
+                    p as *const core::ffi::c_void
+                }
+                None => core::ptr::null(),
+            };
+            let (pp, pn) = match part.as_deref_mut() {
+                Some(p) => {
+                    let n = p.len();
+                    let (q, _g) = p.device_ptr_mut(&self.stream);
+                    (q as *mut core::ffi::c_void, n as u64)
+                }
+                None => (core::ptr::null_mut(), 0u64),
+            };
+            // SAFETY: ABI contract (slot 867); operand sizes checked above
+            return check(unsafe {
+                f(
+                    dp as *const _,
+                    sp as *const _,
+                    bp,
+                    xqp as *const _,
+                    xsp as *const _,
+                    yp as *mut _,
+                    w.scale2,
+                    w.in_dim as u32,
+                    w.out_dim as u32,
+                    batch as u32,
+                    pp,
+                    pn,
+                    self.stream_ptr(),
+                )
+            });
         }
         let (dp, _g1) = w.data.device_ptr(&self.stream);
         let (sp, _g2) = w.scale.device_ptr(&self.stream);

@@ -2306,13 +2306,14 @@ static int pd_attn_prefill_f16_paged_impl(
     const bool wp_swa = wp != nullptr && swa_window != 0u;
     if (head_dim != 256u && head_dim != 64u && head_dim != 512u && head_dim != 128u)
         return cudaErrorInvalidValue;
-    // fp8 caches: the v3w (hd512 8:1) and v3s (hd256 2:1) tiles convert at
+    // fp8 caches: the v3w (hd512 8:1 and 16:1) and v3s (hd256 2:1) tiles convert at
     // staging, the v4 hd256 arm (qwen35 G in {4,6,8}, Flash-Next G=12) expands raw e4m3
     // tiles in-kernel, the v4 granite/laguna/muse/paddleocr arm (hd128, G in
     // {4,6,8,9,16}) does the same, and the v4 gpt-oss arm (hd64, G=8)
     // too; every other f16-fragment tile requires half in memory
     if (kv_dtype == PD_KV_FP8_E4M3
-        && !(head_dim == 512u && n_heads == 8u * n_kv_heads)
+        && !(head_dim == 512u
+             && (n_heads == 8u * n_kv_heads || n_heads == 16u * n_kv_heads))
         && !(head_dim == 256u && n_heads == 2u * n_kv_heads && (n_kv_heads & 3u) == 0u)
         && !(head_dim == 256u
              && (n_heads == 4u * n_kv_heads || n_heads == 6u * n_kv_heads
@@ -2589,7 +2590,9 @@ static int pd_attn_prefill_f16_paged_impl(
             }
         }
         static const bool no_gqa512 = pd_env("PD_NO_PF512_GQA") != nullptr;
-        if ((!no_gqa512 || kv_dtype == PD_KV_FP8_E4M3) && n_heads == 8u * n_kv_heads) {
+        // groups of 8 (31B / 26B-A4B) and 16 (12B): every arm above is 8-only
+        const bool g8_16 = n_heads == 8u * n_kv_heads || n_heads == 16u * n_kv_heads;
+        if ((!no_gqa512 || kv_dtype == PD_KV_FP8_E4M3) && g8_16) {
             static bool a3w = false;
             if (!a3w) {
                 cudaFuncSetAttribute((const void*)pd_attn_prefill_f16_v3w_kernel<512u, __half>,
@@ -2600,7 +2603,8 @@ static int pd_attn_prefill_f16_paged_impl(
                                      PD_AF3W_SMEM_F8);
                 a3w = true;
             }
-            dim3 gw(n_kv_heads, (batch + PD_AF3W_NR - 1u) / PD_AF3W_NR, 2u);
+            dim3 gw(n_kv_heads, (batch + PD_AF3W_NR - 1u) / PD_AF3W_NR,
+                    n_heads / n_kv_heads / 4u);
             if (kv_dtype == PD_KV_FP8_E4M3)
                 pd_attn_prefill_f16_v3w_kernel<512u, __nv_fp8_e4m3><<<gw, 256, PD_AF3W_SMEM_F8, (cudaStream_t)stream>>>(
                     (const float*)q, (const __nv_fp8_e4m3*)pool_k, (const __nv_fp8_e4m3*)pool_v,
@@ -3564,7 +3568,7 @@ static int pd_attn_prefill_f16_paged2_impl(
                                               swa_window, batch, scale, kv_dtype, stream);
     if (n_heads == 0 || batch == 0) return 0;
     const unsigned int* wp = (const unsigned int*)win_pos;
-    if (head_dim == 512u && n_heads == 8u * n_kv_heads) {
+    if (head_dim == 512u && (n_heads == 8u * n_kv_heads || n_heads == 16u * n_kv_heads)) {
         static bool a3w16 = false;
         if (!a3w16) {
             cudaFuncSetAttribute(
@@ -3575,7 +3579,8 @@ static int pd_attn_prefill_f16_paged2_impl(
                 cudaFuncAttributeMaxDynamicSharedMemorySize, PD_AF3W_SMEM_F8);
             a3w16 = true;
         }
-        dim3 gw(n_kv_heads, (batch + PD_AF3W_NR - 1u) / PD_AF3W_NR, 2u);
+        dim3 gw(n_kv_heads, (batch + PD_AF3W_NR - 1u) / PD_AF3W_NR,
+                n_heads / n_kv_heads / 4u);
         if (kv_dtype == PD_KV_FP8_E4M3)
             pd_attn_prefill_f16_v3w_kernel<512u, __nv_fp8_e4m3, __half, __half>
                 <<<gw, 256, PD_AF3W_SMEM_F8, (cudaStream_t)stream>>>(

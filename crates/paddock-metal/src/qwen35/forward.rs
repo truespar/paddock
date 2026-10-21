@@ -177,7 +177,23 @@ impl Qwen35 {
             let mut cut_index = 0;
             for r in first..end {
                 let cut = rows[r].2 as usize + 1;
-                if self.verifying || !self.slots[slot].cuts.contains(&cut) {
+                // Retain committed generated prefixes as well as prompt cuts.
+                // Tool follow-ups preserve these token IDs, but previously
+                // re-ran every generated token through prefill. Reuse the
+                // existing rolling entry/state slab: no extra allocation.
+                // Capture every complete KV page: short tool calls otherwise
+                // leave up to three additional pages to replay on follow-up.
+                // Only a single committed decode row can be a continuation;
+                // verification, images and disk-offload contracts stay intact.
+                let continuation = self.bonsai.is_some()
+                    && self.device.tensor_accelerated()
+                    && self.spec.is_none()
+                    && self.cold.is_none()
+                    && self.slots[slot].mm.is_none()
+                    && count == 1
+                    && rows[r].2 as usize >= self.slots[slot].prefill_end
+                    && cut.is_multiple_of(BLOCK_TOKENS);
+                if self.verifying || !(continuation || self.slots[slot].cuts.contains(&cut)) {
                     continue;
                 }
                 let mut history = self.slots[slot].history.clone();
@@ -189,13 +205,25 @@ impl Qwen35 {
                     continue;
                 }
                 let images = self.slots[slot].mm.as_ref().map_or(&[][..], |m| &m.keys);
-                let keep_from = self.slots[slot].cuts[0];
+                let keep_from = if continuation {
+                    cut
+                } else {
+                    self.slots[slot].cuts[0]
+                };
                 let pending_cut = checkpoints
                     .iter()
                     .any(|(_, s, h): &(usize, usize, Vec<u32>)| *s == slot && h.len() >= keep_from);
-                let Some(index) =
+                let replacement = if continuation {
+                    retention::continuation_replacement(
+                        &self.cache,
+                        &history,
+                        images,
+                        self.slots[slot].prefill_end,
+                    )
+                } else {
                     retention::replacement(&self.cache, &history, images, keep_from, pending_cut)
-                else {
+                };
+                let Some(index) = replacement else {
                     // Async cold restores can still own checkpoint state after
                     // a requesting slot is cancelled/reused. Capturing a prefix
                     // is optional; never steal their destination or panic.
@@ -682,13 +710,21 @@ impl Qwen35 {
                                     && !self.splash
                                     && cmd.tensor_accelerated()
                                     && spans.chunks_exact(4).any(|span| span[1] >= 32));
+                            // Bonsai shares the same F32 recurrence but must
+                            // not round its output to BF16. Only prompt spans
+                            // amortize the packed reduction; pure decode keeps
+                            // the existing four-value implementation.
                             let packed = reuse
-                                && self.bonsai.is_none()
-                                && self.geometry == Geometry::DENSE_27B;
+                                && self.geometry == Geometry::DENSE_27B
+                                && cmd.tensor_accelerated()
+                                && (self.bonsai.is_none()
+                                    || spans.chunks_exact(4).any(|span| span[1] >= 32));
                             #[cfg(test)]
                             let packed = packed && !BASELINE_RECURRENT_FOR_TEST.with(|v| v.get());
                             cmd.dispatch(
-                                if self.bonsai.is_some() {
+                                if self.bonsai.is_some() && packed {
+                                    "bonsai_dn_recurrent_packed"
+                                } else if self.bonsai.is_some() {
                                     "bonsai_dn_recurrent"
                                 } else if packed {
                                     "mlx_dn_recurrent_packed"

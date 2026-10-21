@@ -8,12 +8,14 @@
 // Build: build.sh [arches] compiles only this file.
 #include <cstdio>  // host-side route witnesses (puts) only
 #include "src/abi.cuh"
-#include "src/tma_desc.cuh"      // TMA tensor-map builders + tcgen05 sdesc/idesc constructors; leaf-level, consumed by gemm/f8_lin, attn/decode_tc5, moe/f8, quant/nvf4 (moved out of dense_fp4_w8)
+#include "src/tma_desc.cuh"
+#include "src/part_scratch.cuh"  // per-stream split-K partial planes (grow-by-retain; graph + two-lane safe)      // TMA tensor-map builders + tcgen05 sdesc/idesc constructors; leaf-level, consumed by gemm/f8_lin, attn/decode_tc5, moe/f8, quant/nvf4 (moved out of dense_fp4_w8)
 #include "src/elementwise.cuh"
 #include "src/attn/decode.cuh"
 #include "src/attn/decode_spec.cuh"  // spec-verify attention: GQA walk, FA-lite, spec-FA krs (split from decode.cuh; needs its ldm/mma/cpa helpers)
 #include "src/attn/decode_fp8.cuh"   // fp8-native decode lane v8q/v9q/v9q2 + vdim sync + laguna sigmoid router (split from decode.cuh)
 #include "src/attn/lagd.cuh"        // hd128 v5-class decode partial (needs decode's ldm/mma/cpa helpers; f32_qkv launches it)
+#include "src/gemm/f32_mv_staged.cuh"  // the f32 tile matvec with K staged in smem (cc 10, bit-identical); f32_qkv's batch launcher tries it first
 #include "src/gemm/f32_qkv.cuh"
 #include "src/sandwich_norm.cuh"  // sandwich post-norm + next norm (slot 777; elementwise + abi helpers)
 #include "src/attn/rows.cuh"        // split-K decode attention over runs of one slot's rows (spec verify + block drafter); needs decode's cpa/ldm/mma helpers + f32_qkv's pd_launch_status
@@ -25,13 +27,17 @@
 #include "src/gemm/lowm.cuh"  // bf16 weight planes (mixed UD files); abi.cuh helpers only
 #include "src/attn/fmha16.cuh"      // Q16xKv128 tensor-core decode attention, muse hd128/G16 (needs bf16_dense's pd_bf16m_ldm/mma)
 #include "src/deltanet/core.cuh"
+#include "src/vision_tc5.cuh"  // tcgen05 picture-tower attention (sm_100a, hd 72); abi + tma_desc only, pd_vision_attn_h tries it first
 #include "src/vision.cuh"
 #include "src/attn/varlen.cuh"     // packed variable-length bidirectional attention (text encoders: ModernBERT / Laya); needs decode_spec's pd_fa_mma16 + f32_qkv's launch helpers
 #include "src/gemm/int8_mma.cuh"
 #include"src/gemm/f16_dense.cuh"   // in-house f16xf16->f32 wmma GEMM (PADDOCK_INHOUSE_F16 cuBLAS-removal); needs int8_mma's PD_MMA_OK
 #include "src/deltanet/split.cuh"   // split walk/o-pass + shared tf32 mma helpers (needs int8_mma's PD_DNC_* defines; stage2_sample's launcher dispatches it)
 #include "src/deltanet/walk_rs.cuh"  // register-state bf16-operand walk (needs split.cuh's pd_dnc_cpa16; stage2_sample's launcher dispatches it)
+#include "src/deltanet/walk_tc5.cuh" // the walk on tcgen05, TMEM-resident state (stage2_sample's varlen launcher routes it)
 #include "src/deltanet/stage2_sample.cuh"
+#include "src/deltanet/conv_step_qkvn.cuh" // decode conv step + silu + split + q/k norms + GQA widening in one launch (slot 875)
+#include "src/deltanet/chunked_vl.cuh"    // varlen chunked-GDN entries (slots 323/447): stage1 + walk per tick
 #include "src/deltanet/stop_mask.cuh"    // reasoning stop mask, run on the logits before the samplers
 #include "src/deltanet/spec_rs.cuh"   // canonical spec rejection sampling (sampled drafts + full-q verify)
 #include "src/deltanet/slots_runs.cuh"  // row-exact verify GDN walk: slot 564's decode body over a run's rows (needs stage2_sample's slots env + abi's state helpers)
@@ -44,20 +50,28 @@
 #include "src/attn/prefill.cuh"
 #include "src/attn/prefill_fa2.cuh"  // FA-2 prefill tile, f16 v4, pf7/pf7rp (split from prefill.cuh); also carries the shared CK macro
 #include "src/attn/prefill_pf5.cuh"  // tcgen05 prefill pf5/pf6 family + batch f16 WMMA (split from prefill.cuh); all PD_TC5_OK-gated, so verify changes here on sm_100
+#include "src/attn/prefill_tc5.cuh"  // hd256 fp8 varlen prefill with both GEMMs on tcgen05 (slot 872); needs prefill.cuh + f32_qkv maps + vision_tc5 tmem helpers
 #include "src/moe/block_scale_quant.cuh"
 #include "src/moe/decode_block_scale.cuh"
+#include "src/quant/e2m1.cuh"         // pd_e2m1_rn / pd_nvf4_scale: shared by dense_fp4_w8, the tc5 SWQ epilogue and quant/nvf4
 #include "src/gemm/dense_fp4_w8.cuh"
+#include "src/gemm/tc5_lanes.cuh"       // per-stream tc5q / fold / row-quant scratch (graph + two-lane safe)
 #include "src/gemm/dense_tc5.cuh"       // tcgen05 dense GEMM families (split from dense_fp4_w8); needs its mma/tmap helpers
 #include "src/gemm/dense_f8_decode.cuh" // e4m3 decode/GEMV lane, mma_ks twins, rowwise prefill; must follow dense_tc5 (uses pd_rowq_*/pd_tc5{p,q}_* from it)
+#include "src/gemm/dense_nvf4_tc5.cuh"  // tcgen05 NVFP4 x NVFP4 GEMM (W4A4 on sm_100a) + its load-time scale tiling; abi + tma_desc only
 #include "src/gemm/f8_lin.cuh"      // tile-linear f8 weight lane (needs int8_mma ldm helpers + dense_fp4_w8's mma helpers; tmap builders now from tma_desc)
+#include "src/gemm/f8_lin_gemv.cuh" // the b=1 GEMV over the lin boxes (f8_lin's layout)
 #include "src/gemm/f8_lin_tall.cuh" // kt3t: the kt3 frame on a 256x128 tile (f8_lin forward-declares its try-launch)
+#include "src/attn/decode_tc5d.cuh"  // qwen3.8 G6 decode on tcgen05 with a decoupled TMA ring; pd_attn_decode_tc5_paged routes to it
 #include"src/attn/decode_tc5.cuh"  // tcgen05 decode attention (needs tma_desc's pd_tc5_sdesc + f32_qkv's pd_attn_tmap_kv_f8s - no longer tied to dense_fp4_w8)
 #include "src/quant/nvf4.cuh"
+#include "src/quant/nvf4_il.cuh"   // swiglu_fused_nvf4_il(_sw), split from quant/nvf4.cuh
 #include "src/moe/nvf4_expert.cuh"   // NVFP4 MoE expert consumers + persistent raw-ring + TM/TF plane twins (split from quant/nvf4.cuh); needs its quantizers/mma helpers
 #include "src/moe/nvf4_sorted.cuh"   // NVFP4 MoE over the sorted layout + sm_100 sorted-tile arm + decode expert GEMVs; follows nvf4_expert
 #include"src/moe/nvf4_st.cuh"      // tiled-layout MoE consumers (skinny-tile pair; needs nvf4's mma/dot4w helpers)
 #include "src/moe/nvf4_w16.cuh"    // W4A16 expert pair on tensor cores over the tiled plane, batch-invariant (needs nvf4_st's layout, decode.cuh's PD_MOE_PAD)
 #include "src/moe/q8.cuh"
+#include "src/norm/add_rmsnorm.cuh"     // fused residual add + RMSNorm rows (pd_add_rmsnorm_batch; moved from moe/q8.cuh)
 #include "src/moe/q8_relu2.cuh"
 #include "src/moe/f8.cuh"           // tcgen05 e4m3 grouped MoE (needs attn/decode + moe/block_scale_quant; its tc5 descriptors now come from tma_desc)
 #include "src/moe/f8row.cuh"        // flat per-row-scale e4m3 expert GEMM, sm_89+ mma.sync (needs moe/mmq stage_y + int8_mma's PD_MMA_OK)
@@ -85,6 +99,7 @@
 #include "src/kumo.cuh"         // Kumo-Tabular F32 graph: GEMM, norms, head transforms, attention, cell embedding (needs f32_qkv's pd_launch_status)
 #include "src/diarization.cuh"  // Nemotron 3 Diarization: log-mel frontend, LayerNorm, rope, conv rows, activations (needs f32_qkv's pd_launch_status)
 #include "src/clef.cuh"         // Clef's joint schema head: LayerNorm, span/lexical means, varlen F32 attention, option routing, scorer (needs f32_qkv's pd_launch_status)
+#include "src/asr/nemotron_asr.cuh"  // Nemotron 3.5 ASR: cache-aware FastConformer subsampler, rel-position chunked attention, causal dwconv, RNN-T greedy walk (needs diarization.cuh's stored-weight GEMM + f32_qkv's pd_launch_status)
 #include "src/clef_vision.cuh"  // Clef's image lane: the processor's uint8 resize + patchify, the vision tower's position embedding, rope, attention (needs clef.cuh's pd_clef_cpa16)
 #include "src/doclayout.cuh"    // PP-DocLayoutV3 (PaddleOCR-VL's layout stage): im2row, depthwise conv, stem pool, concat, 2x upsample, adds over NHWC halves (needs f32_qkv's pd_launch_status)
 #include "src/sam3/vit.cuh"     // SAM 3's ViT glue: window-major patch stem, q|k|v split + rope with all three biases, window-major -> raster exit (needs f32_qkv's pd_launch_status)
@@ -101,4 +116,5 @@
 #include "src/embedding_gemma2.cuh"  // EmbeddingGemma 2 text encoder: batch-invariant row norms + sandwich seam, q/k/v head transform, bidirectional varlen attention at hd 256/512, pooling (needs decode_spec's pd_fa_mma16, f32_qkv's pd_launch_status)
 #include "src/embedding_gemma2_audio.cuh"  // EmbeddingGemma 2 audio tower: log-mel frontend, conv subsampling, the clipped Conformer's seams, chunked rel-pos attention, light conv (needs f32_qkv's pd_launch_status)
 #include "src/gemma4v.cuh"  // Gemma 4 vision tower fused glue: device patchify, pos + norm, head norms + 2-D rope (angle table once a picture), post + next norm, GEGLU, pooled tail (bit-identical to the unfused chain; needs abi pd_df + elementwise PD_ACC_*)
+#include "src/gemma4u.cuh"  // Gemma 4 12B's encoder-free media embedders: picture patches + LayerNorm, the post-projection norms, audio frames + RMS (needs abi pd_df, f32_qkv's pd_launch_status)
 #include "src/exports.cuh"

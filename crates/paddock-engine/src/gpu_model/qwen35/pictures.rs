@@ -71,17 +71,20 @@ impl GpuQwen35 {
 
     /// Borrow the encoded pictures `want` names - `(rgb, w, h)` in order -
     /// serving each from the store when its bytes were encoded before and
-    /// running the rest through the tower: preprocessed, grouped by canvas
-    /// size and encoded in row-capped batched passes (`TOWER_PASS_ROWS`), the
-    /// batching the concurrent-image TTFT fix relies on.
+    /// running the rest through the tower: resized, grouped by canvas size and
+    /// encoded in row-capped batched passes (`TOWER_PASS_ROWS`), the batching
+    /// the concurrent-image TTFT fix relies on. The normalize and the im2col
+    /// run on the device where the pack can (`device_patchify`); the host
+    /// chain they replace held the engine thread ~12 ms a page with the GPU
+    /// idle behind it.
     pub(super) fn encode_pictures(
         &mut self,
         want: &[(&[u8], usize, usize)],
     ) -> Result<Vec<Picture>, GpuModelError> {
-        struct Miss {
+        struct Miss<'a> {
             at: usize,
             key: PictureKey,
-            img: Vec<f32>,
+            canvas: std::borrow::Cow<'a, [u8]>,
             tw: usize,
             th: usize,
         }
@@ -101,11 +104,11 @@ impl GpuQwen35 {
                 continue;
             }
             let vm = self.vision.as_ref().ok_or_else(no_tower)?;
-            let (img, tw, th) = vm.preprocess_rgb(rgb, w, h);
+            let (canvas, tw, th) = vm.resize_rgb(rgb, w, h);
             fresh.push(Miss {
                 at,
                 key,
-                img,
+                canvas,
                 tw,
                 th,
             });
@@ -128,11 +131,21 @@ impl GpuQwen35 {
                 {
                     gj += 1;
                 }
-                let batch: Vec<(&[f32], usize, usize)> = order[gi..gj]
-                    .iter()
-                    .map(|&i| (fresh[i].img.as_slice(), tw, th))
-                    .collect();
-                (vm.encode_batch(&batch)?, gj)
+                let group = &order[gi..gj];
+                let encoded = if vm.device_patchify() {
+                    let batch: Vec<(&[u8], usize, usize)> =
+                        group.iter().map(|&i| (&*fresh[i].canvas, tw, th)).collect();
+                    vm.encode_batch_rgb(&batch)?
+                } else {
+                    let planar: Vec<Vec<f32>> = group
+                        .iter()
+                        .map(|&i| vm.normalize_rgb(&fresh[i].canvas, tw, th))
+                        .collect();
+                    let batch: Vec<(&[f32], usize, usize)> =
+                        planar.iter().map(|img| (img.as_slice(), tw, th)).collect();
+                    vm.encode_batch(&batch)?
+                };
+                (encoded, gj)
             };
             for (vo, &mi) in encoded.into_iter().zip(&order[gi..gj]) {
                 let bytes = (vo.embd.len() * std::mem::size_of::<f32>()) as u64;

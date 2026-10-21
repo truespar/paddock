@@ -11,6 +11,7 @@
 pub mod admin;
 pub mod alignments;
 pub mod chat;
+pub(crate) mod chat_audio;
 pub use paddock_mcp::clock;
 mod asr_residency;
 pub mod chat_template;
@@ -56,6 +57,8 @@ pub(crate) mod reference_image;
 pub mod residency;
 pub mod responses;
 mod responses_stream;
+pub mod rnnt_asr;
+pub mod rnnt_realtime;
 pub mod routes;
 pub mod segmentations;
 pub mod service;
@@ -386,6 +389,7 @@ pub async fn run(
     let mut clef = None;
     let mut tabular = None;
     let mut diarization = None;
+    let mut rnnt_asr = None;
     let mut image = None;
     // the resolved off policy, surfaced on admin identify (SpecInfo.off)
     let mut spec_policy_off = false;
@@ -494,7 +498,29 @@ pub async fn run(
                 );
             }
         }
-        if diarizations::is_model(path, &arch) {
+        if rnnt_asr::is_model(&arch) {
+            if cfg.mmproj.is_some()
+                || cfg.kv_offload.enabled
+                || cfg.spec.as_deref().is_some_and(|s| s != "off")
+            {
+                return Err("Nemotron 3.5 ASR is a speech recognizer; remove vision, KV-offload and speculative-decoding overrides".into());
+            }
+            let m = rnnt_asr::load(
+                cfg.served_model_name.clone().unwrap_or(id),
+                path,
+                &cfg.device,
+                gpu_ordinal,
+                cfg.kernel_pack.as_deref(),
+                cfg.vram_budget.map(|mib| mib << 20),
+            )
+            .map_err(serving::ServeError::Engine)?;
+            tracing::info!(
+                model = %m.id,
+                languages = m.languages.len(),
+                "Nemotron 3.5 ASR ready (cache-aware streaming RNN-T, 80 ms frames)"
+            );
+            rnnt_asr = Some(m);
+        } else if diarizations::is_model(path, &arch) {
             if cfg.mmproj.is_some()
                 || cfg.kv_offload.enabled
                 || cfg.spec.as_deref().is_some_and(|s| s != "off")
@@ -1025,6 +1051,13 @@ pub async fn run(
                 resident_options,
             )?;
             m.vision_off = cfg.vision == Some(false);
+            // `audio = false` on Gemma 4 12B: its one mmproj holds both
+            // embedders, so the switch closes the clip surface (the 5 MB
+            // projection stays resident) instead of leaving a file out
+            if cfg.audio == Some(false) && m.audio_frontend == serving::AudioFrontend::Gemma4Raw {
+                m.supports_audio = false;
+                m.audio_frontend = serving::AudioFrontend::None;
+            }
             if let Some(l) = layout {
                 if !m.paddleocr {
                     return Err("`layout` is PaddleOCR-VL's companion (PP-DocLayoutV3); \
@@ -1074,6 +1107,7 @@ pub async fn run(
         .or_else(|| clef.as_ref().map(|m| m.decider.metrics()))
         .or_else(|| tabular.as_ref().map(|m| m.service.metrics()))
         .or_else(|| diarization.as_ref().map(|m| m.service.metrics()))
+        .or_else(|| rnnt_asr.as_ref().map(|m| m.recognizer.metrics()))
         .or_else(|| image.as_ref().map(|m| Arc::clone(&m.metrics)));
     let stats = crate::stats::start(engine_metrics.clone());
     // Held for the graceful-shutdown path below: on SIGINT/SIGTERM the engine
@@ -1212,6 +1246,7 @@ pub async fn run(
         clef,
         tabular,
         diarization,
+        rnnt_asr,
         image,
         max_ctx: cfg.max_ctx,
         vad_gate: cfg.vad_gate,

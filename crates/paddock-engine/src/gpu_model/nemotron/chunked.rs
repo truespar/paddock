@@ -188,12 +188,19 @@ impl GpuNemotron {
             tracing::info!("[spec2a-ids] admit slot={slot} cursor={cursor} prompt={tokens:?}");
         }
         self.reply_track_admit(slot, &tokens);
-        self.chunked.push(ChunkedPrefill {
-            slot,
-            keys: tokens.clone(),
-            tokens,
-            cursor,
-        });
+        // a live prompt queues ahead of batch ones (rows are picked in order)
+        let at = (self.batch.as_ref().and_then(|b| b.prefix.as_ref()))
+            .and_then(|r| r.chunk_queue_at(slot, self.chunked.iter().map(|c| c.slot)))
+            .unwrap_or(self.chunked.len());
+        self.chunked.insert(
+            at,
+            ChunkedPrefill {
+                slot,
+                keys: tokens.clone(),
+                tokens,
+                cursor,
+            },
+        );
         Ok(())
     }
 

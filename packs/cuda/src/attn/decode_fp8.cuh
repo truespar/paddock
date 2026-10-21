@@ -495,6 +495,13 @@ __global__ void __launch_bounds__(256, MB) pd_attn_decode_v9q_kernel(
     const uint32_t d = threadIdx.x, nth = blockDim.x;
     const uint32_t warp = d >> 5, lane = d & 31u;
     const uint32_t n_heads = G * gridDim.x;
+    // kv heads may be VIRTUAL: a 16-group (gemma-4-12B's globals, one kv
+    // head) rides <512,8> as two heads of 8 over the same physical rows, so
+    // K/V are addressed by the physical head kv_dim / HD names. 1 on every
+    // native geometry (kv_dim == gridDim.x * HD), where kvp == kvh.
+    const uint32_t vdiv =
+        kv_dim >= gridDim.x * HD ? 1u : (gridDim.x * HD) / kv_dim;
+    const uint32_t kvp = kvh / vdiv;
 
     const uint32_t pos = positions[b];
     const uint32_t first_pos =
@@ -581,7 +588,7 @@ __global__ void __launch_bounds__(256, MB) pd_attn_decode_v9q_kernel(
             // == STB/2 so the expect above is already right
             if (lane < blocks) {
                 const uint32_t blk = bt[B0 + st * 2u + lane];
-                const int y = (int)(blk * kv_dim + kvh * HD);
+                const int y = (int)(blk * kv_dim + kvp * HD);
                 const uint32_t dst = (uint32_t)__cvta_generic_to_shared(
                     dstb + lane * (STB / 2u));
                 asm volatile(
@@ -594,7 +601,7 @@ __global__ void __launch_bounds__(256, MB) pd_attn_decode_v9q_kernel(
         if (lane < blocks * BPB) {
             const uint32_t blk = bt[B0 + st * 2u + lane / BPB];
             const int y = (int)(blk * 16u);
-            const int x = (int)(kvh * HD + (lane % BPB) * 128u);
+            const int x = (int)(kvp * HD + (lane % BPB) * 128u);
             const uint32_t dst = (uint32_t)__cvta_generic_to_shared(
                 dstb + (lane / BPB) * (STB / 2u) + (lane % BPB) * 2048u);
             asm volatile(

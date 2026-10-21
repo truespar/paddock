@@ -276,10 +276,11 @@ __device__ __forceinline__ void pd_bs_bar_wait(uint64_t* bar, uint32_t parity) {
 // shfls. (The original one-warp-per-block shape ran at 0.2 TB/s and cost
 // more than the GEMM it fed.) Bit-identical outputs to that version - same
 // amax, same e pick, same fp8 cvt.
-__device__ __forceinline__ void pd_e4m3_quant4(float4 v, uint32_t lane8,
-                                               unsigned char* __restrict__ q,
-                                               unsigned char* __restrict__ scale,
-                                               uint32_t i) {
+// pd_e4m3_quant4_at: the scale byte's address given (sdst) - the swizzled-atom writers (slots
+// 884-886) put it at pd_nvf4_swz_off; pd_e4m3_quant4 is the row-major scale[i / 32].
+__device__ __forceinline__ void pd_e4m3_quant4_at(float4 v, uint32_t lane8,
+                                                  unsigned char* __restrict__ q, uint32_t i,
+                                                  unsigned char* __restrict__ sdst) {
     float a = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
     const uint32_t gm = 0xffu << ((threadIdx.x & 31u) & ~7u);  // this 8-lane group
     for (uint32_t off = 4; off > 0; off >>= 1)
@@ -297,7 +298,13 @@ __device__ __forceinline__ void pd_e4m3_quant4(float4 v, uint32_t lane8,
                      | ((uint32_t)__nv_fp8_e4m3(v.z * inv).__x << 16)
                      | ((uint32_t)__nv_fp8_e4m3(v.w * inv).__x << 24);
     *(uint32_t*)(q + i) = p;
-    if (lane8 == 0) scale[i >> 5] = (unsigned char)(e + 127);
+    if (lane8 == 0) *sdst = (unsigned char)(e + 127);
+}
+__device__ __forceinline__ void pd_e4m3_quant4(float4 v, uint32_t lane8,
+                                               unsigned char* __restrict__ q,
+                                               unsigned char* __restrict__ scale,
+                                               uint32_t i) {
+    pd_e4m3_quant4_at(v, lane8, q, i, scale + (i >> 5));
 }
 
 // Fused rmsnorm -> per-32 e4m3 quantize (the prefill norm band):
@@ -366,6 +373,7 @@ template <typename TI = float>
 __global__ void pd_quantize_e4m3_kernel(const TI* __restrict__ x,
                                         unsigned char* __restrict__ q,
                                         unsigned char* __restrict__ scale, uint32_t n) {
+    PD_PDL_ARM_WAIT();   // programmatic dependent (pd_pdl_go): full predecessor completion
     const uint32_t i = (blockIdx.x * 256u + threadIdx.x) * 4u;
     if (i >= n) return;  // n % 32 == 0: 8-lane groups exit whole, shfls stay valid
     pd_e4m3_quant4(pd_ld4f(x + i), threadIdx.x & 7u, q, scale, i);
@@ -374,8 +382,31 @@ __global__ void pd_quantize_e4m3_kernel(const TI* __restrict__ x,
 PD_EXPORT
 int pd_quantize_e4m3(const void* x, void* q, void* scale, uint32_t n, void* stream) {
     if (n == 0) return 0;
-    pd_quantize_e4m3_kernel<float><<<(n / 4u + 255u) / 256u, 256u, 0, (cudaStream_t)stream>>>(
+    pd_pdl_go(pd_quantize_e4m3_kernel<float>, (n / 4u + 255u) / 256u, 256u, 0, (cudaStream_t)stream,
         (const float*)x, (unsigned char*)q, (unsigned char*)scale, n);
+    return pd_launch_status();
+}
+
+// pd_quantize_e4m3_kernel with each row's scales at pd_nvf4_swz_off (rows of n_row elements)
+__global__ void pd_quantize_e4m3_sw_kernel(const float* __restrict__ x, unsigned char* __restrict__ q,
+                                           unsigned char* __restrict__ scale, uint32_t n, uint32_t n_row) {
+    PD_PDL_ARM_WAIT();
+    const uint32_t i = (blockIdx.x * 256u + threadIdx.x) * 4u;
+    if (i >= n) return;
+    const uint32_t r = i / n_row, c = i - r * n_row;
+    pd_e4m3_quant4_at(pd_ld4f(x + i), threadIdx.x & 7u, q, i, scale + pd_nvf4_swz_off(r, c >> 5, n_row >> 7));
+}
+
+// 886: pd_quantize_e4m3 over `rows` rows of n_row (% 128) with the scales in the tcgen05 GEMM's
+// swizzled atom layout (scale holds ceil(rows / 128) * 128 rows' worth) - the activation side of
+// slot 887; the same bytes as pd_quantize_e4m3 + pd_sf_swz128.
+PD_EXPORT
+int pd_quantize_e4m3_sw(const void* x, void* q, void* scale, uint32_t n_row, uint32_t rows, void* stream) {
+    const uint32_t n = n_row * rows;
+    if (n == 0) return 0;
+    if ((n_row & 127u) != 0u) return cudaErrorInvalidValue;
+    pd_pdl_go(pd_quantize_e4m3_sw_kernel, (n / 4u + 255u) / 256u, 256u, 0, (cudaStream_t)stream,
+        (const float*)x, (unsigned char*)q, (unsigned char*)scale, n, n_row);
     return pd_launch_status();
 }
 
@@ -387,7 +418,7 @@ int pd_quantize_e4m3_i16(const void* x, void* q, void* scale, uint32_t n,
     if (n == 0) return 0;
     if (!i16)
         return pd_quantize_e4m3(x, q, scale, n, stream);
-    pd_quantize_e4m3_kernel<__half><<<(n / 4u + 255u) / 256u, 256u, 0, (cudaStream_t)stream>>>(
+    pd_pdl_go(pd_quantize_e4m3_kernel<__half>, (n / 4u + 255u) / 256u, 256u, 0, (cudaStream_t)stream,
         (const __half*)x, (unsigned char*)q, (unsigned char*)scale, n);
     return pd_launch_status();
 }
@@ -911,11 +942,13 @@ int pd_rmsnorm_e4m3_batch(const void* x, const void* w, void* q, void* scale,
 // exact row max + frexpf power-of-2 scale + fp8 emit), with the normed f32
 // row stashed in smem instead of round-tripping through global - at the same
 // block width the outputs are BIT-IDENTICAL to the two-kernel chain.
+// `xn` (nullable): the f32 normed row also lands there (the _xn exports, 888 / 889) - qwen35's
+// decode step relies on d_xn holding the layer's pre-norm until its post-norm.
 __global__ void pd_rmsnorm_e4m3_row_kernel(const float* __restrict__ x,
                                            const float* __restrict__ w,
                                            unsigned char* __restrict__ q,
                                            float* __restrict__ rscale,
-                                           uint32_t n, float eps) {
+                                           uint32_t n, float eps, float* __restrict__ xn) {
     // PDL: let the next (dependent-launched) GEMM start its dep-free W
     // prefetch while this kernel runs; its griddepcontrol.wait still gates
     // every dependent read on our full completion (probe-proven semantics).
@@ -962,6 +995,7 @@ __global__ void pd_rmsnorm_e4m3_row_kernel(const float* __restrict__ x,
         r.z = v.z * inv * wv.z;
         r.w = v.w * inv * wv.w;
         *(float4*)(rm_normed + (size_t)i * 4u) = r;
+        if (xn) *(float4*)(xn + (size_t)b * n + (size_t)i * 4u) = r;
         m = fmaxf(m, fmaxf(fmaxf(fabsf(r.x), fabsf(r.y)),
                            fmaxf(fabsf(r.z), fabsf(r.w))));
     }
@@ -995,17 +1029,30 @@ __global__ void pd_rmsnorm_e4m3_row_kernel(const float* __restrict__ x,
     }
 }
 
-PD_EXPORT
-int pd_rmsnorm_e4m3_row(const void* x, const void* w, void* q, void* rscale,
-                        uint32_t n, float eps, uint32_t rows, void* stream) {
+static int pd_rmsnorm_e4m3_row_go(const void* x, const void* w, void* xn, void* q, void* rscale,
+                                  uint32_t n, float eps, uint32_t rows, void* stream) {
     if (n == 0 || rows == 0) return 0;
     if ((n & 3u) != 0) return cudaErrorInvalidValue;
     const uint32_t nth = rows >= 64u ? pd_norm_wide_nth_ws(rows) : 1024u;
     pd_pdl_go(pd_rmsnorm_e4m3_row_kernel, rows, nth, n * 4u,
               (cudaStream_t)stream,
               (const float*)x, (const float*)w, (unsigned char*)q, (float*)rscale,
-              n, eps);
+              n, eps, (float*)xn);
     return pd_launch_status();
+}
+
+PD_EXPORT
+int pd_rmsnorm_e4m3_row(const void* x, const void* w, void* q, void* rscale,
+                        uint32_t n, float eps, uint32_t rows, void* stream) {
+    return pd_rmsnorm_e4m3_row_go(x, w, nullptr, q, rscale, n, eps, rows, stream);
+}
+
+// 888: pd_rmsnorm_e4m3_row also landing the f32 normed row in `xn` (the same bytes the
+// rmsnorm_batch half of the two-kernel chain writes).
+PD_EXPORT
+int pd_rmsnorm_e4m3_row_xn(const void* x, const void* w, void* xn, void* q, void* rscale,
+                           uint32_t n, float eps, uint32_t rows, void* stream) {
+    return pd_rmsnorm_e4m3_row_go(x, w, xn, q, rscale, n, eps, rows, stream);
 }
 
 // The full band-boundary fusion: residual-add + post-norm + next band's
@@ -1189,7 +1236,7 @@ __global__ void pd_add_rmsnorm_e4m3_row_kernel(float* __restrict__ x,
                                                const float* __restrict__ prew,
                                                unsigned char* __restrict__ q,
                                                float* __restrict__ rscale,
-                                               uint32_t n, float eps) {
+                                               uint32_t n, float eps, float* __restrict__ xn) {
     PD_PDL_ARM();
     extern __shared__ float aq_normed[];               // [n] f32 normed row
     const uint32_t b = blockIdx.x;
@@ -1239,6 +1286,7 @@ __global__ void pd_add_rmsnorm_e4m3_row_kernel(float* __restrict__ x,
             r.z = v.z * inv * wv.z;
             r.w = v.w * inv * wv.w;
             *(float4*)(aq_normed + (size_t)i * 4u) = r;
+            if (xn) *(float4*)(xn + (size_t)b * n + (size_t)i * 4u) = r;
             m = fmaxf(m, fmaxf(fmaxf(fabsf(r.x), fabsf(r.y)),
                                fmaxf(fabsf(r.z), fabsf(r.w))));
         }
@@ -1274,18 +1322,32 @@ __global__ void pd_add_rmsnorm_e4m3_row_kernel(float* __restrict__ x,
     }
 }
 
-PD_EXPORT
-int pd_add_rmsnorm_e4m3_row(void* x, const void* proj, const void* prew,
-                            void* q, void* rscale, uint32_t n, float eps,
-                            uint32_t rows, void* stream) {
+static int pd_add_rmsnorm_e4m3_row_go(void* x, const void* proj, const void* prew, void* xn,
+                                      void* q, void* rscale, uint32_t n, float eps,
+                                      uint32_t rows, void* stream) {
     if (n == 0 || rows == 0) return 0;
     if ((n & 3u) != 0) return cudaErrorInvalidValue;
     // same width election as both parents
     const uint32_t nth = rows >= 64u ? pd_norm_wide_nth_ws(rows) : pd_norm_decode_nth();
     pd_pdl_go(pd_add_rmsnorm_e4m3_row_kernel, rows, nth, n * 4u,
               (cudaStream_t)stream, (float*)x, (const float*)proj,
-              (const float*)prew, (unsigned char*)q, (float*)rscale, n, eps);
+              (const float*)prew, (unsigned char*)q, (float*)rscale, n, eps, (float*)xn);
     return pd_launch_status();
+}
+
+PD_EXPORT
+int pd_add_rmsnorm_e4m3_row(void* x, const void* proj, const void* prew,
+                            void* q, void* rscale, uint32_t n, float eps,
+                            uint32_t rows, void* stream) {
+    return pd_add_rmsnorm_e4m3_row_go(x, proj, prew, nullptr, q, rscale, n, eps, rows, stream);
+}
+
+// 889: pd_add_rmsnorm_e4m3_row also landing the f32 normed row in `xn`.
+PD_EXPORT
+int pd_add_rmsnorm_e4m3_row_xn(void* x, const void* proj, const void* prew, void* xn,
+                               void* q, void* rscale, uint32_t n, float eps,
+                               uint32_t rows, void* stream) {
+    return pd_add_rmsnorm_e4m3_row_go(x, proj, prew, xn, q, rscale, n, eps, rows, stream);
 }
 
 // p16 twin: `proj` bytes are bf16 (the o16 GEMM epilogue's

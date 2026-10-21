@@ -2,8 +2,10 @@
 //! decides whether a mixed tick (decode riders aboard a prefill span) runs
 //! on the decode pipe beside the span or fuses into one unified tick.
 
-use super::Slot;
-use crate::generator::Generator;
+use super::commit::{commit_device_token, tok_trace};
+use super::{EngineError, EngineMetrics, Slot, TokenEvent, admit_mm};
+use crate::generator::{Generator, RowSample};
+use std::collections::HashSet;
 
 /// Live-REQUEST floor (slots holding a request, chunking or decoding) for
 /// the two side-stream decode paths - the OVERLAP block (span-only prefill
@@ -100,4 +102,237 @@ pub(super) fn log_pipe_exit(
         pool_free = ?generator.pool_free_blocks(),
         "overlap: pipe loop exit"
     );
+}
+
+/// A/B knob (PADDOCK_PIPE_BREAK_ON_DEATH): the overlap pipe segment ends when
+/// any of its rows finishes, instead of carrying the dead row as a hole.
+pub(super) fn break_on_death() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_PIPE_BREAK_ON_DEATH").is_some())
+}
+
+/// Kill switch (PADDOCK_NO_PIPE_FIRST): launch the prefill span BEFORE the
+/// overlap pipe's first decode tick, the order this block shipped with. The
+/// span launch is eager - ~1,360 kernels and ~190 copies on the engine
+/// thread, ~25 ms at 128 slots on the 27B - and with the span first the decode
+/// lane sat idle through all of it: 226 gaps, 5.6 s of a 20 s depth-128
+/// window (nsys, B200 recover load). Pipe-first puts tick 0 (one graph
+/// replay) on the decode lane before the host starts enqueueing the span.
+pub(super) fn pipe_first() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_PIPE_FIRST").is_none())
+}
+
+/// Begin the overlap decode pipe over `dec` (slot, pending token, position):
+/// draws each row's tick-0 plan and enqueues tick 0 on the decode lane.
+/// Returns the plans, or None when the backend declines - the span then runs
+/// alone and the riders wait for the next tick.
+pub(super) fn pipe_begin(
+    generator: &mut dyn Generator,
+    slots: &mut [Option<Slot>],
+    dec: &[(usize, u32, u32)],
+    trunc_pipe_ok: bool,
+) -> Option<Vec<RowSample>> {
+    let slots_v: Vec<u32> = dec.iter().map(|&(k, _, _)| k as u32).collect();
+    let toks: Vec<u32> = dec.iter().map(|&(_, t, _)| t).collect();
+    let pos: Vec<u32> = dec.iter().map(|&(_, _, p)| p).collect();
+    let plans0: Vec<RowSample> = dec
+        .iter()
+        .map(|&(k, _, _)| {
+            let sl = slots[k].as_mut().expect("live decode row");
+            match if trunc_pipe_ok {
+                sl.sampler.device_plan_trunc()
+            } else {
+                sl.sampler.device_plan()
+            } {
+                Some(p) => RowSample::Device(p),
+                None => RowSample::Hole, // plannable-gated by the caller
+            }
+        })
+        .collect();
+    match generator.decode_pipe_begin_slots(&slots_v, &toks, &pos, &plans0) {
+        Ok(()) => Some(plans0),
+        Err(e) => {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!("serve: overlap decode pipe unavailable, span-only ticks: {e}");
+            });
+            None
+        }
+    }
+}
+
+/// End the overlap pipe: commit the last in-flight tick's ids (rows whose
+/// plan was Device). A failed drain fails the riders - their state is gone -
+/// never the span's prefills.
+pub(super) fn pipe_drain(
+    generator: &mut dyn Generator,
+    slots: &mut [Option<Slot>],
+    dec: &[(usize, u32, u32)],
+    prev_plans: &[RowSample],
+) {
+    match generator.decode_pipe_drain() {
+        Ok(ids) => {
+            for (i, &(k, _, _)) in dec.iter().enumerate() {
+                if matches!(prev_plans[i], RowSample::Device(_)) {
+                    tok_trace(k, &slots[k], ids[i], "ovl-drain");
+                    commit_device_token(&mut slots[k], ids[i], false);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!("serve: overlap decode_pipe_drain failed: {e}");
+            for &(k, _, _) in dec {
+                if let Some(s) = slots[k].take() {
+                    let _ = s.events.send(TokenEvent::Error(EngineError::from_gen(&e)));
+                }
+            }
+        }
+    }
+}
+
+/// One encoder step and the admissions it finished. `overlap`: only the
+/// non-blocking half (`encode_step_overlap`) - the pump loop runs it beside
+/// the span, in the host time the decode tick it just queued leaves; at the
+/// loop top the same work (~20 ms a call on the B200 recover load) idled the
+/// drained decode lane.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn encode_admit(
+    generator: &mut dyn Generator,
+    slots: &mut [Option<Slot>],
+    chunking: &mut HashSet<usize>,
+    mm_encoding: &mut HashSet<usize>,
+    st_adm: &mut u64,
+    metrics: &EngineMetrics,
+    overlap: bool,
+) -> usize {
+    let seg_t = std::time::Instant::now();
+    let done = if overlap {
+        generator.encode_step_overlap()
+    } else {
+        generator.encode_step()
+    };
+    let n = done.len();
+    for (k, res) in done {
+        mm_encoding.remove(&k);
+        admit_mm(generator, slots, chunking, st_adm, k, res, metrics);
+    }
+    if crate::tickseg::on() {
+        crate::tickseg::enc(seg_t.elapsed());
+    }
+    n
+}
+
+/// Pump the decode lane while the span runs on the main lane, then drain.
+/// Same protocol as the quiet-phase pipe: plans for tick N+1 are drawn
+/// before tick N's ids come back (`prev_plans`), dead rows keep ticking as
+/// dummies, and the drain collects the last in-flight tick. With no span in
+/// flight (failed, or nothing to launch) span_done is already true, so the
+/// loop exits at once and only tick 0 drains. Each tick queued covers the
+/// host for one riding encoder step. Returns the encoder results admitted.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn pump(
+    generator: &mut dyn Generator,
+    slots: &mut [Option<Slot>],
+    dec: &[(usize, u32, u32)],
+    mut prev_plans: Vec<RowSample>,
+    trunc_pipe_ok: bool,
+    max_batch: usize,
+    chunking: &mut HashSet<usize>,
+    mm_encoding: &mut HashSet<usize>,
+    st_adm: &mut u64,
+    st_ovl: &mut u64,
+    metrics: &EngineMetrics,
+) -> usize {
+    let mut encoded = 0usize;
+    let mut ovl_ticks = 0usize;
+    loop {
+        // stop pumping when the span completes, the pool runs low, a row
+        // needs host sampling, or every row died - the drain collects the
+        // in-flight tick
+        let all_dead = dec.iter().all(|&(k, _, _)| slots[k].is_none());
+        // A/B instrument: PADDOCK_PIPE_BREAK_ON_DEATH ends the segment as
+        // soon as any row dies, instead of carrying it as a hole; isolates
+        // the dead-row continuation.
+        let all_dead =
+            all_dead || (break_on_death() && dec.iter().any(|&(k, _, _)| slots[k].is_none()));
+        let low_headroom = !generator
+            .pool_free_blocks()
+            .is_none_or(|f| f > max_batch + super::POOL_WATERMARK_BLOCKS);
+        // dead rows tick on too: none may step past its context
+        let near_end = dec
+            .iter()
+            .any(|&(_, _, p)| p as usize + ovl_ticks + 3 >= generator.max_context());
+        if generator.unified_span_done() || low_headroom || all_dead || near_end {
+            log_pipe_exit(&*generator, ovl_ticks, low_headroom, all_dead, near_end);
+            break;
+        }
+        let mut host_row = false;
+        let next_plans: Vec<RowSample> = dec
+            .iter()
+            .map(|&(k, _, _)| match &mut slots[k] {
+                // died mid-pump: dummy row keeps ticking, ids discarded
+                // (quiet-pipe trick)
+                None => RowSample::Hole,
+                Some(sl) if sl.constraint.is_none() && sl.logprobs.is_none() => {
+                    match if trunc_pipe_ok {
+                        sl.sampler.device_plan_trunc()
+                    } else {
+                        sl.sampler.device_plan()
+                    } {
+                        Some(p) => RowSample::Device(p),
+                        None => {
+                            host_row = true;
+                            RowSample::Host
+                        }
+                    }
+                }
+                Some(_) => {
+                    host_row = true;
+                    RowSample::Host
+                }
+            })
+            .collect();
+        if host_row {
+            break;
+        }
+        ovl_ticks += 1;
+        match generator.decode_pipe_next(&next_plans) {
+            Ok(ids) => {
+                *st_ovl += 1;
+                for (i, &(k, _, _)) in dec.iter().enumerate() {
+                    if matches!(prev_plans[i], RowSample::Device(_)) {
+                        tok_trace(k, &slots[k], ids[i], "ovl-next");
+                        commit_device_token(&mut slots[k], ids[i], false);
+                    }
+                }
+                prev_plans = next_plans;
+                // the tick just queued covers the host
+                if generator.encoding_pending() {
+                    encoded += encode_admit(
+                        generator,
+                        slots,
+                        chunking,
+                        mm_encoding,
+                        st_adm,
+                        metrics,
+                        true,
+                    );
+                }
+            }
+            Err(e) => {
+                // the decode rows' state is compromised; the span (chunking
+                // slots) is not - fail only the riders, keep the prefills
+                tracing::warn!("serve: overlap decode_pipe_next failed: {e}");
+                for &(k, _, _) in dec {
+                    if let Some(s) = slots[k].take() {
+                        let _ = s.events.send(TokenEvent::Error(EngineError::from_gen(&e)));
+                    }
+                }
+                return encoded;
+            }
+        }
+    }
+    pipe_drain(generator, slots, dec, &prev_plans);
+    encoded
 }

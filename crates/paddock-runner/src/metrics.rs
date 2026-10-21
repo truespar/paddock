@@ -146,6 +146,32 @@ impl Origin {
             Self::Studio => "studio",
         }
     }
+
+    /// The engine's scheduling class: batch lines are background work (they
+    /// wait while live requests wait, and give up their slot to one). A client
+    /// that sends the header itself can only lower its own priority.
+    pub fn background(self) -> bool {
+        self == Self::Batch
+    }
+}
+
+/// Handlers read the origin straight off the header: the event middleware
+/// that also reads it can be switched off (`no_events`), and the scheduling
+/// class must not go with it.
+impl<S: Send + Sync> axum::extract::FromRequestParts<S> for Origin {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self::from_header(
+            parts
+                .headers
+                .get("x-paddock-origin")
+                .and_then(|v| v.to_str().ok()),
+        ))
+    }
 }
 
 /// One completed request, as the events middleware saw it. Everything here is

@@ -976,6 +976,72 @@ impl GpuExecutor {
         }
     }
 
+    /// Whether the pack lands the FFN's gate|up mmq GEMMs straight into the
+    /// down GEMM's input for this activation ([`Self::q8_0_gemm_mmq_gu`]).
+    pub fn has_q8_0_gemm_mmq_gu(&self, _act: GluAct) -> bool {
+        self.kernels.q8_0_gemm_mmq_gu.is_some()
+    }
+
+    /// The FFN's gate and up mmq GEMMs in one launch, landing `glu(gate) *
+    /// up` (tanh GELU or SiLU) quantized in the mmq layout: `yq` is the FFN input
+    /// ([`Self::quantize_q8_mmq`] over `in_dim`), `yo` the down GEMM's input
+    /// (n_ff / 128 chunks x the 128-padded batch). The same bytes the two
+    /// [`Self::q8_0_gemm_mmq_pipe`] GEMMs + [`Self::quantize_q8_mmq_glu`]
+    /// write, without the f32 gate / up planes. n_ff % 128 == 0.
+    pub fn q8_0_gemm_mmq_gu(
+        &self,
+        gate: &RepackedQ8,
+        up: &RepackedQ8,
+        yq: &CudaSlice<u8>,
+        yo: &mut CudaSlice<u8>,
+        batch: usize,
+        act: GluAct,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .q8_0_gemm_mmq_gu
+            .ok_or(GpuError::MissingOp("q8_0_gemm_mmq_gu"))?;
+        let (in_dim, n_ff) = (gate.dims[0], gate.dims[1]);
+        if up.dims != gate.dims || !n_ff.is_multiple_of(128) {
+            return Err(GpuError::Driver(format!(
+                "q8_0_gemm_mmq_gu: gate {:?} / up {:?} (n_ff % 128 required)",
+                gate.dims, up.dims
+            )));
+        }
+        let need = n_ff / 128 * batch.next_multiple_of(128) * 144;
+        if yo.len() < need {
+            return Err(GpuError::Driver(format!(
+                "q8_0_gemm_mmq_gu: yo holds {} bytes, {need} needed",
+                yo.len()
+            )));
+        }
+        let (gp, _g1) = gate.data.device_ptr(&self.stream);
+        let (gsp, _g2) = gate.scale.device_ptr(&self.stream);
+        let (up_, _g3) = up.data.device_ptr(&self.stream);
+        let (usp, _g4) = up.scale.device_ptr(&self.stream);
+        let (yqp, _g5) = yq.device_ptr(&self.stream);
+        let (yop, _g6) = yo.device_ptr_mut(&self.stream);
+        check(unsafe {
+            f(
+                gp as *const _,
+                gsp as *const _,
+                up_ as *const _,
+                usp as *const _,
+                yqp as *const _,
+                yop as *mut _,
+                in_dim as u32,
+                n_ff as u32,
+                batch as u32,
+                // the pack's PD_ACT_GELU / PD_ACT_SILU
+                match act {
+                    GluAct::Gelu => 0,
+                    GluAct::Silu => 1,
+                },
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// mmq-class int8 tensor-core GEMM: activations pre-quantized by
     /// [`Self::quantize_q8_mmq`]. Same numeric class as `q8_0_gemm_mma`.
     /// `fixup` is stream-k scratch (>= 256 * 128 * 128 f32); `None` forces

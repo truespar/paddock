@@ -1,7 +1,7 @@
 //! Qwen3.5/3.6 continuous batching: slots, batched prefill/decode, pipe, unified/mixed.
 
 use super::*;
-use crate::gpu::{GpuError, GpuExecutor, KvDtype, QuantW};
+use crate::gpu::{GpuError, GpuExecutor, KvDtype, QuantW, w8_swz_on};
 use crate::gpu_model::gpt_oss::GpuModelError;
 use crate::gpu_model::prefix_cache::BLOCK_TOKENS;
 use crate::kv_plan;
@@ -10,7 +10,15 @@ use crate::paged_radix::PagedRadix;
 use cudarc::driver::DevicePtr;
 use cudarc::driver::sys::CUstreamCaptureMode;
 
+mod attn_front;
+mod chunks;
+mod gates;
+mod pipe;
 mod sampled;
+
+pub(super) use gates::f8t_chunk_rmax;
+use gates::*;
+use sampled::{pack_samp_par, trunc_fill_ids};
 
 /// Max rows a tick may overdraw to absorb a prompt tail that would otherwise
 /// ride a whole extra tick (chunk-tail finding).
@@ -21,135 +29,6 @@ mod sampled;
 const CKPT_STAGE_BLOBS: usize = 3;
 const TAIL_SLOP: usize = 64;
 
-/// f8t unified arm master switch (see the bs_f8t_attn_p note in
-/// `unified_launch_core`). Kill: PADDOCK_NO_F8T_UNIFIED.
-fn f8t_unified_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_F8T_UNIFIED").is_none())
-}
-
-/// f8t CHUNK arm row ceiling: `prefill_batch_pass` rides the tile plane
-/// while r <= this (65+ takes the launcher's tc5r 2-SM whole-prefill route,
-/// which pads batch to 256 and TMA-reads the activation buffer to that pad -
-/// d_f8t_q/d_f8t_rs are sized to next_multiple_of(256) of this value, see
-/// the scratch alloc). Motivation: the split path's admission chunk passes
-/// (r ~= 128 at the c32 board) ran q8_0/f8bs at ~18.6 ms/admission where the
-/// tile plane's roofline says ~4 - the same mixed-tick mechanism the unified
-/// arm already fixed at r <= 64. Default 256 = one full tc5r batch band.
-/// PADDOCK_F8T_CHUNK_RMAX overrides; PADDOCK_NO_F8T_CHUNK kills (0).
-/// tc5r@128 probe instrument: decode-side f8t arm batch bound.
-/// Default 64 = shipped behavior exactly. PADDOCK_F8T_DEC_BMAX=128 lets the
-/// b<=128 decode tick keep the f8t class (f8t_gemm routes 65..256 via tc5r,
-/// one weight pass) instead of splitting into 2x64 halves - pair with
-/// PADDOCK_NO_DEC_SPLIT=1 to probe.
-pub(super) fn f8t_dec_bmax() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("PADDOCK_F8T_DEC_BMAX")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(64)
-    })
-}
-
-pub(super) fn f8t_chunk_rmax() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        if paddock_models::dev_var_os!("PADDOCK_NO_F8T_CHUNK").is_some() {
-            return 0;
-        }
-        paddock_models::dev_var!("PADDOCK_F8T_CHUNK_RMAX")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(256)
-    })
-}
-
-/// P65: fill TruncCat rows' ids from the device top-64 head plane
-/// (`head` = the dtoh'd [rows, 64, 2] u32 (id, raw-logit bits) plane;
-/// `plans[i]` indexes row i). Sentinel id u32::MAX = n < 64 padding.
-pub(super) fn trunc_fill_ids(head: &[u32], plans: &[crate::generator::RowSample], ids: &mut [u32]) {
-    use crate::generator::RowSample;
-    use crate::sampler::DevicePlan;
-    // engagement witness (bisect-trap law): once per process
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let n = plans
-            .iter()
-            .filter(|p| matches!(p, RowSample::Device(DevicePlan::TruncCat { .. })))
-            .count();
-        eprintln!("[trunc-head] engaged: rows={n} (device top-64 + host head sampling)");
-    });
-    for (i, p) in plans.iter().enumerate() {
-        if let RowSample::Device(DevicePlan::TruncCat {
-            inv_t,
-            u,
-            k,
-            top_p,
-            min_p,
-        }) = *p
-        {
-            let base = i * 128;
-            let pairs: Vec<(u32, f32)> = (0..64usize)
-                .filter_map(|j| {
-                    let id = head[base + j * 2];
-                    (id != u32::MAX).then(|| (id, f32::from_bits(head[base + j * 2 + 1])))
-                })
-                .collect();
-            if !pairs.is_empty() {
-                ids[i] = crate::sampler::sample_trunc_head(&pairs, inv_t, u, k, top_p, min_p);
-            }
-        }
-    }
-}
-
-/// P70 fused decode recurrence kill (PADDOCK_NO_DN_V2F restores the
-/// split_gqa_norm + recurrent_v2 chain for A/B).
-fn dn_v2f_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_DN_V2F").is_none())
-}
-
-/// Row ceiling for the P70/P71-R2 fused GDN recurrence (`v2f` and the strided
-/// `v2f_g` twin). 24 came from a probe curve of the RECURRENCE KERNEL alone
-/// (2.01x at b=1, 1.5x at 8, 1.22x at 12, 1.02x at 24, 0.94x at 32) - the
-/// fused form loses 6% at b=32 because the recurrence is state-bandwidth-bound
-/// there and the in-block norm recompute is redundant.
-///
-/// But the kernel is not the band. At b=32 the fused form ELIMINATES
-/// `deltanet_split_gqa_norm` (159.1 ms in a long-prompt census) and, in
-/// the strided form, `row_slice2_gate` (204.8 ms) - against a 6% premium on a
-/// 1465.6 ms recurrence (+93.5 ms). Band arithmetic says -270 ms of an
-/// 11 287 ms die, ~2.4%. That is worth a measurement the kernel probe could
-/// never see. `PADDOCK_DN_V2F_BMAX` overrides.
-fn dn_v2f_bmax() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        paddock_models::dev_var!("PADDOCK_DN_V2F_BMAX")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(24)
-    })
-}
-
-/// P65 small-b twin of the device prefilter: top-64 by f32 total order from
-/// a full host row (identical head to pd_topk_rows modulo boundary-tie
-/// choice, which was never contractual). Used at b <= 2 where the one-block
-/// binary-search kernel is DRAM-latency-bound (c1 measured -13% before this
-/// fallback existed).
-pub(super) fn host_top64(row: &[f32]) -> Vec<(u32, f32)> {
-    let k = 64.min(row.len());
-    let mut idx: Vec<u32> = (0..row.len() as u32).collect();
-    if k < idx.len() {
-        idx.select_nth_unstable_by(k - 1, |&a, &b| row[b as usize].total_cmp(&row[a as usize]));
-        idx.truncate(k);
-    }
-    idx.into_iter().map(|i| (i, row[i as usize])).collect()
-}
-
-/// Varlen chunked-GDN route gate - the same env chain the unified tick's
-/// `vl_route` static checks (GDN formulation band); kept in
-/// sync by hand because that one is fn-local. Kill: PADDOCK_NO_DNC_VL.
 /// DeltaNet state checkpoints the prefix cache WANTS per seated slot.
 ///
 /// Sized by demand, not by the card. Each checkpoint is a whole recurrent-state
@@ -178,59 +57,7 @@ pub(super) fn ckpt_page_demand(slots: usize, pages_per_ckpt: usize) -> (usize, u
     crate::ckpt_pages::page_demand(slots, pages_per_ckpt, STATE_CKPTS_PER_SLOT)
 }
 
-/// The `graph pools + headroom` reserve: what the plan cannot meet in the
-/// ledger before it runs and what no other term names - CUDA graph
-/// instantiation for every captured width, the decode arena, per-width sampler
-/// planes, per-image vision transients, and allocator retained-not-live slack.
-///
-/// This is the residual of the old 3 GiB "graph/prefill scratch" guess once
-/// its two large tenants got honest accounting: the prefill scratch is now
-/// profiled at load (`enable_batch_sized` allocates it before the grant is
-/// read) and the wave-pass buffers are computed (`pf_bufs_bytes`). The
-/// operator's `graph_scratch_mib` override still applies, to this term.
-///
-/// Measured 2026-09-06 on the RTX PRO 6000, Qwen3.8-27B Q8_0, max_batch 32,
-/// spec on, vision, after the smoke sweep: see the audit log
-/// (`qwen35 VRAM plan audit`) - the constant is the measured residual with
-/// headroom, and the audit line is how to re-check it after a change.
-const GRAPH_POOLS_HEADROOM_MIB: u64 = 768;
-
-pub(super) fn graph_pools_headroom_bytes() -> u64 {
-    crate::kv_plan::graph_scratch_override_mib().unwrap_or(GRAPH_POOLS_HEADROOM_MIB) << 20
-}
-
-fn dnc_vl_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        paddock_models::dev_var_os!("PADDOCK_NO_DNC_VL").is_none()
-            && std::env::var("PADDOCK_DNC_RS").map(|v| v != "0").unwrap_or(false)
-            && std::env::var("PADDOCK_DNC_S1MMA").map(|v| v != "0").unwrap_or(false)
-            && paddock_models::dev_var_os!("PADDOCK_DNC_DWB16").is_none()
-            // bf16 state stays falsified and excluded; f16 state rides the
-            // ST walk_rs (PPL-gated +0.09%) so it does not disqualify VL.
-            && paddock_models::dev_var_os!("PADDOCK_DN_STATE_BF16").is_none()
-            && paddock_models::dev_var_os!("PADDOCK_NO_DNC_MMA_V2").is_none()
-            && paddock_models::dev_var_os!("PADDOCK_DNC_SCAN").is_none()
-            && paddock_models::dev_var_os!("PADDOCK_DNC_FLA").is_none()
-            && paddock_models::dev_var_os!("PADDOCK_DNC_SPLIT").is_none()
-            && paddock_models::dev_var_os!("PADDOCK_NO_CHUNKED_DN").is_none()
-    })
-}
-
-/// The multimodal extras one batched-prefill share carries through
-/// `prefill_batch_pass` (parallel to `items`): the request-relative
-/// [4, take] axis-major mrope rows, the per-row attention bound (causal,
-/// image rows included), the (row offset, rows) embedding splices with their
-/// encoded outputs, and the request's final llama-position for the decode
-/// mrope delta.
-pub(super) struct MmShareCtx {
-    pub(super) mrope: Vec<u32>,
-    pub(super) bound: Vec<u32>,
-    pub(super) splices: Vec<(usize, usize)>,
-    /// the request's pictures while its group's pass runs, empty otherwise
-    pub(super) images: Vec<super::pictures::Picture>,
-    pub(super) final_mrope_pos: usize,
-}
+pub(super) use super::mm_ride::MmShareCtx;
 
 impl GpuQwen35 {
     /// Allocate the continuous-batching state for up to `max_batch` concurrent
@@ -454,7 +281,7 @@ impl GpuQwen35 {
             * 4;
         let ckpt_staging = CKPT_STAGE_BLOBS as u64 * n_lin * state_win * 4;
         let wave_bufs = self.pf_bufs_bytes(chunk, chunk, max_batch);
-        let graph_headroom = graph_pools_headroom_bytes();
+        let graph_headroom = super::pool_grow::graph_pools_headroom_bytes();
         let tier_staging = if crate::kv_tier::pool_tier::tier_ram_bytes().is_some() {
             crate::kv_tier::ram_transport::device_staging_bytes()
         } else {
@@ -793,6 +620,7 @@ impl GpuQwen35 {
             // unchecked serving rung can never outgrow it (the 35B's
             // 8192-wide in_qkv/wq outgrew the old ff-based size at B>=24).
             d_ks_part: e.alloc(8 * 64 * self.ks_out_max())?,
+            d_span_part: e.alloc(8 * 64 * self.ks_out_max())?,
             // lin-GEMV ticket regions (non-KV-overhead R2.2): gate|up at
             // offset 0, down at `lin_tick_dn_off()`. Zeroed once - the
             // kernel's atomicInc wraps at nz, restoring 0 each launch.
@@ -999,92 +827,6 @@ impl GpuQwen35 {
             "qwen35 VRAM plan audit: ledger vs plan after enable_batch"
         );
         Ok(Ok(max_batch))
-    }
-
-    /// P5 budget pool: grow slot `slot`'s block table to back logical position
-    /// `upto_pos`, allocating physical blocks from the shared free-list and
-    /// re-uploading the (small) block table to the device. No-op in identity
-    /// mode (`pool` is `None`). The device upload is outside any captured graph
-    /// (callers invoke this before the capture/replay), and the paged kernels
-    /// read the table by pointer at replay - so growth is graph-safe.
-    pub(super) fn ensure_slot_blocks(
-        &mut self,
-        slot: usize,
-        upto_pos: usize,
-    ) -> Result<(), GpuModelError> {
-        let exec = self.exec.clone();
-        if self.batch.as_ref().expect("batch").pool.is_none() {
-            return Ok(());
-        }
-        let before = self.batch.as_ref().expect("batch enabled").tables[slot]
-            .blocks()
-            .len();
-        // Grow the slot's table from the pool. On exhaustion, evict an LRU cached
-        // prefix - its pages return to the pool (blocks a live slot still holds
-        // survive on refcount) - and retry; when the tree is dry, surface
-        // PoolExhausted for the scheduler to preempt.
-        loop {
-            let grew = {
-                let bs = self.batch.as_mut().expect("batch enabled");
-                let pool = bs.pool.as_mut().expect("pool checked above");
-                bs.tables[slot].ensure(upto_pos, pool).is_ok()
-            };
-            if grew {
-                break;
-            }
-            let evicted = {
-                let exec = self.exec.clone();
-                let bs = self.batch.as_mut().expect("batch enabled");
-                let pool = bs.pool.as_mut().expect("pool checked above");
-                let want = pool.free_blocks() + 1;
-                match (bs.tier.as_mut(), bs.paged_prefix.as_mut()) {
-                    (Some(tier), Some(pr)) => {
-                        // tier-aware shed: closing runs (and their DeltaNet
-                        // checkpoint blobs) demote to T1 before eviction -
-                        // the cliff-grade press (see `make_room_blocking`:
-                        // one pressure pass + 50ms was not enough while a
-                        // parked restore's loads held the lane). The
-                        // checkpoints are pool pages, which the tier reads off
-                        // the radix, so there is no blob base to pass.
-                        tier.make_room_blocking(pr, pool, want, None, &mut || {
-                            exec.record_event().ok()
-                        })
-                        .then_some(0u32)
-                    }
-                    // dead KV, then the stalest checkpoint's pages, then LRU
-                    // KV - context a slot was promised outranks all cache
-                    (None, Some(pr)) => pr.make_room(pool, want, 0).then_some(0u32),
-                    _ => None,
-                }
-            };
-            if evicted.is_none() {
-                return Err(GpuModelError::PoolExhausted);
-            }
-        }
-        let bs = self.batch.as_mut().expect("batch enabled");
-        let pool = bs.pool.as_mut().expect("pool checked above");
-        let (free, cap) = (pool.free_blocks(), pool.capacity());
-        let blocks = bs.tables[slot].blocks().to_vec();
-        if blocks.len() > before {
-            if paddock_models::dev_var_os!("PADDOCK_POOL_STATS").is_some() {
-                tracing::info!(
-                    "pool: slot {slot} grew {before}->{} blocks  ({free}/{cap} free)",
-                    blocks.len()
-                );
-            }
-            let base = slot * bs.blocks_per_slot;
-            for (j, &blk) in blocks.iter().enumerate() {
-                bs.block_table_host[base + j] = blk;
-            }
-            let dst = bs
-                .d_block_tables
-                .as_mut()
-                .expect("pool implies device table");
-            exec.stream
-                .memcpy_htod(&bs.block_table_host, dst)
-                .map_err(|e| GpuError::Driver(e.to_string()))?;
-        }
-        Ok(())
     }
 
     /// Record whether state checkpoint `idx` (attached at boundary `c` for
@@ -2182,6 +1924,8 @@ impl GpuQwen35 {
         {
             let mut it: Vec<u32> = Vec::new();
             let mut rb = 0usize;
+            // the tcgen05 arm (slot 872) tiles 128 rows; slot 322 tiles 64
+            let tile = if pf_tc5_vl(&exec, attn_g) { 128 } else { 64 };
             for (si, &(_, slot, take)) in shares.iter().enumerate() {
                 let w = wtake(take);
                 if w > 24 {
@@ -2189,7 +1933,7 @@ impl GpuQwen35 {
                     let mut t0 = 0usize;
                     while t0 < w * attn_g {
                         it.extend_from_slice(&[rb as u32, w as u32, t0 as u32, slot as u32]);
-                        t0 += 64;
+                        t0 += tile;
                     }
                 }
                 rb += w;
@@ -2654,7 +2398,13 @@ impl GpuQwen35 {
                             // below); covered spans skip in the loop.
                             let mut pf_vl_fired = false;
                             if let Some((it, n_tiles)) = d_pf_attn_items.as_ref() {
-                                exec.attn_prefill_f16_paged_vl(
+                                let vl = if pf_tc5_vl(&exec, attn_g) {
+                                    GpuExecutor::attn_prefill_tc5_vl
+                                } else {
+                                    GpuExecutor::attn_prefill_f16_paged_vl
+                                };
+                                vl(
+                                    &exec,
                                     &sc.d_qn,
                                     bs.kv_k[li].as_ref().expect("full-attn layer KV"),
                                     bs.kv_v[li].as_ref().expect("full-attn layer KV"),
@@ -3916,46 +3666,7 @@ impl GpuQwen35 {
                                     )?;
                                 }
                             } else {
-                                prefill_mm_pre_any(
-                                    &exec,
-                                    gate,
-                                    &sc.d_pxq,
-                                    &sc.d_pxs,
-                                    &sc.d_yq,
-                                    &mut sc.d_xsums,
-                                    &mut sc.d_ssums,
-                                    &mut sc.d_skfix,
-                                    &mut sc.d_ffn_gate,
-                                    r,
-                                )?;
-                                prefill_mm_pre_any(
-                                    &exec,
-                                    up,
-                                    &sc.d_pxq,
-                                    &sc.d_pxs,
-                                    &sc.d_yq,
-                                    &mut sc.d_xsums,
-                                    &mut sc.d_ssums,
-                                    &mut sc.d_skfix,
-                                    &mut sc.d_ffn_up,
-                                    r,
-                                )?;
-                                prefill_ffn_down_rot(
-                                    &exec,
-                                    down,
-                                    &mut sc.d_pxq,
-                                    &mut sc.d_pxs,
-                                    &mut sc.d_yq,
-                                    &mut sc.d_xsums,
-                                    &mut sc.d_ssums,
-                                    &mut sc.d_skfix,
-                                    &mut sc.d_ffn_gate,
-                                    &sc.d_ffn_up,
-                                    &mut sc.d_proj,
-                                    ff,
-                                    r,
-                                    rot,
-                                )?;
+                                prefill_ffn_dense(&exec, sc, gate, up, down, ff, r, rot)?;
                             }
                         }
                         Ffn::Nvf4Dense { gu, down } => {
@@ -4485,35 +4196,6 @@ impl GpuQwen35 {
         self.batch.is_some() && self.exec.has_sample_rows_t() && self.exec.has_sample_rows_p()
     }
 
-    /// Chunked prefill is available once enable_batch has run. OPT-IN
-    /// (PADDOCK_CHUNKED_PREFILL, DEFAULT-ON via apply_default_stack;
-    /// kill: PADDOCK_NO_CHUNKED_PREFILL - the kill pins the classic
-    /// blocking prefill),
-    /// which an early sweep showed beats the chunked/unified path on the
-    /// prefill-heavy concurrency configs (c8/c32/pf8). Enable it (with
-    /// PADDOCK_UNIFIED=1 for the fused tick) for decode-dominated workloads where
-    /// it wins (dc4/c1). Reverted from default-on after that measurement.
-    pub fn supports_chunked_prefill(&self) -> bool {
-        self.batch.is_some() && std::env::var_os("PADDOCK_CHUNKED_PREFILL").is_some()
-    }
-
-    /// `Generator::prefill_queue`: every tick shape here spends its budget
-    /// FIFO over `chunked`, from each prompt's `done`.
-    pub(crate) fn prefill_queue(&self) -> Vec<(usize, usize, usize)> {
-        self.chunked
-            .iter()
-            .map(|c| (c.slot, c.done, c.tokens.len() - c.done))
-            .collect()
-    }
-
-    /// `Generator::prefill_tick_cap`: a long prompt advances at most one
-    /// unified span per tick - fused, overlapped, spec-in-mixed, and the split
-    /// tick's bounded head alike (a short tail the split tick prefills whole
-    /// is shallow-or-short, never a paced tick's shape).
-    pub(crate) fn prefill_tick_cap(&self) -> usize {
-        super::unified_prefill_rows()
-    }
-
     /// Register a chunked prefill on `slot`. The whole prompt is queued; the
     /// unified tick advances it a budgeted SPAN per tick from `done` (or
     /// the split tick's `advance_chunks` prefills a tail that fits whole). We
@@ -4575,11 +4257,12 @@ impl GpuQwen35 {
         // tick covers only tokens[done..], attending the adopted prefix in KV.
         self.reply_track_admit(slot, &tokens);
         let done = self.prefix_resume_begin(slot, &tokens)?;
-        self.chunked.push(ChunkedPrefill {
+        self.enqueue_chunk(ChunkedPrefill {
             slot,
             tokens,
             done,
             hints,
+            mm: None,
         });
         Ok(done)
     }
@@ -4597,281 +4280,6 @@ impl GpuQwen35 {
         let before = self.chunked.len();
         self.chunked.retain(|c| c.slot != slot);
         self.chunked.len() != before
-    }
-
-    /// Split-tick prefill (the two-forward mixed tick: deep decode batches
-    /// past PADDOCK_UNIFIED_DEC_MAX, or PADDOCK_NO_UNIFIED): run in-flight
-    /// prompts this tick, FIFO (earliest admission first -> its first token
-    /// sooner), up to a ~`budget` row soft cap but always at least one. A tail
-    /// that FITS the cap is prefilled whole from `done` (the resume point
-    /// `prefill_begin` restored) via `prefill_slot_tail` - bit-identical to a
-    /// standalone prefill of the same tokens. This staggers the cohort's first
-    /// tokens over several ticks and lets decode run between them (the TTFT
-    /// win) without splitting a short prompt mid-tick.
-    ///
-    /// A tail LONGER than the cap never runs whole. It used to - "always at
-    /// least one" meant a 150K-token prompt at the head of the queue was one
-    /// prefill call, and every decode row of the serve waited minutes for its
-    /// next token (measured on GB10, qwen3.8-27b). Every serving engine bounds
-    /// the per-step prefill instead (vLLM's max_num_batched_tokens, SGLang's
-    /// chunked_prefill_size), and so does every other path here: such a head
-    /// advances by one prefill-only unified span per tick - the same span the
-    /// fused, overlapped and spec-in-mixed ticks run, cut at the budget, its
-    /// DeltaNet state and conv window resumed in the slot across ticks - and
-    /// the decode pass follows it. The scheduler's budget then bounds the tick
-    /// for long prompts too, which is what its tick pacer (crate::pacing)
-    /// relies on. A long tail behind a short head waits until it heads the
-    /// queue. Invariant this also keeps: the whole-tail path never sees a
-    /// tail longer than the elected chunk - its resume walk stages the conv
-    /// window for at most that many rows, and a 19,920-row tail against a
-    /// 1024-row election tripped that assert and took the engine thread down
-    /// (GB10, 16 slots under an 80 GiB budget, 2026-09-23). Finishers
-    /// sample per `fin_plans` on the span path (Logits without a plan), and
-    /// read logits back on the whole-tail path.
-    /// Returns `(slot, finish, prompt rows)` per finished prompt.
-    fn advance_chunks(
-        &mut self,
-        budget: usize,
-        fin_plans: &[(usize, crate::generator::RowSample)],
-    ) -> Result<Vec<(usize, crate::generator::FinishSample, usize)>, GpuModelError> {
-        use crate::generator::FinishSample;
-        let cap = budget.min(self.prefill_chunk_rows).max(1);
-        if self
-            .chunked
-            .first()
-            .is_some_and(|c| c.tokens.len() - c.done > cap)
-        {
-            return if self.unified_span_launch(cap, fin_plans)? {
-                self.unified_span_finish()
-            } else {
-                Ok(Vec::new())
-            };
-        }
-        let logits = |v: Vec<(usize, Vec<f32>, usize)>| {
-            v.into_iter()
-                .map(|(k, l, r)| (k, FinishSample::Logits(l), r))
-                .collect()
-        };
-        // With a DFlash drafter armed the soft cap is HARD past prompt 0. The
-        // drafter's fusion accumulator is sized for chunk_tick_rows() prefill
-        // rows (+ the verify/decode share), and the soft cap's overshoot -
-        // admit the next tail whenever `used < cap` - put 8 x 1075-token
-        // tails (8601 rows) in one tick against an 8544-row cap. tap_band
-        // then marks the state stale and the append wipes every ring in the
-        // tick, decoding slots included - which costs a wide leg roughly
-        // three quarters of its throughput. Deferring that
-        // one tail by a tick costs nothing the TTFT stagger doesn't already
-        // pay; prompt 0 keeps its always-admitted guarantee (a single tail
-        // longer than the cap still wipes, and now says so in the log).
-        let hard = self.dflash_armed().then(chunk_tick_rows);
-        // Lever 2: BATCH this tick's prefill spans into one weight-amortized pass
-        // (PADDOCK_QWEN35_CHUNK_BATCH, DEFAULT-ON via apply_default_stack;
-        // kill: PADDOCK_NO_CHUNK_BATCH - the kill pins the serial path, which
-        // prefills the
-        // chunked prompts one at a time -> re-reads the 256-expert MoE per prompt,
-        // which tanks decode throughput on every mixed tick. Batching keeps
-        // the chunk path's low TTFT while restoring decode.
-        if std::env::var_os("PADDOCK_QWEN35_CHUNK_BATCH").is_some() {
-            return self.advance_chunks_batched(cap, hard).map(logits);
-        }
-        let mut finished = Vec::new();
-        let mut used = 0usize;
-        while !self.chunked.is_empty() {
-            // budget the tick, but guarantee forward progress on prompt 0
-            if used > 0 && used >= cap {
-                break;
-            }
-            let (slot, toks, done) = {
-                let c = &self.chunked[0];
-                (c.slot, c.tokens.clone(), c.done)
-            };
-            let len = toks.len();
-            if used > 0 && hard.is_some_and(|h| used + len > h) {
-                break; // the drafter's fusion cap: this tail goes next tick
-            }
-            if len - done > cap {
-                break; // a long tail waits to head the queue (spans, above)
-            }
-            // Resume from `done` (prefill_begin already restored the prefix state
-            // + KV); prefill only the tail, snapshot + insert. Bit-identical to an
-            // un-chunked prefill - chunked prefill changes only when prompts run.
-            let logits = self.prefill_slot_tail(slot, &toks, done)?;
-            finished.push((slot, logits, len));
-            self.chunked.remove(0);
-            used += len;
-        }
-        Ok(logits(finished))
-    }
-
-    /// Lever 2 batched tick prefill: pop fresh (done==0) chunked prompts up to the
-    /// row `cap` and prefill them in one weight-amortized pass (`prefill_batch_pass`),
-    /// instead of the serial per-prompt loop. Resumed (done>0, prefix-cache-hit)
-    /// prompts still go serial (they need the resume + snapshot path; rare on the
-    /// salted concurrency workload this targets). v1: batched prompts are not
-    /// re-inserted into the prefix cache (matches `prefill_batch_pass`); caching in
-    /// the batched path is the same v2 follow-up as Lever 1. NOTE: this
-    /// lane is not reachable under the default unified
-    /// stack (verified live - the kill-switch A/B changed nothing); if it is ever
-    /// re-defaulted, the missing insert means every prompt through it loses
-    /// multi-turn prefix reuse, so the v2 follow-up becomes mandatory then.
-    fn advance_chunks_batched(
-        &mut self,
-        cap: usize,
-        hard: Option<usize>,
-    ) -> Result<Vec<(usize, Vec<f32>, usize)>, GpuModelError> {
-        let mut finished = Vec::new();
-        // collect this tick's spans front-to-back up to the row cap. Fresh
-        // spans are PEEKED (removed only after their pass succeeds) so a
-        // fallible pass can't lose queue entries - the gemma4 destructive
-        // take zombied its chunking slots on PoolExhausted.
-        // Resumed spans keep their commit-after-success serial removal, so
-        // after the walk the peeked fresh spans sit at queue positions
-        // [0, batch.len()).
-        let mut batch: Vec<(usize, Vec<u32>)> = Vec::new();
-        let mut lens: Vec<usize> = Vec::new();
-        let mut used = 0usize;
-        let mut i = 0usize;
-        while i < self.chunked.len() {
-            if used > 0 && used >= cap {
-                break;
-            }
-            let (slot, toks, done) = {
-                let c = &self.chunked[i];
-                (c.slot, c.tokens.clone(), c.done)
-            };
-            let len = toks.len();
-            if used > 0 && hard.is_some_and(|h| used + len > h) {
-                break; // the drafter's fusion cap: this tail goes next tick
-            }
-            if len - done > cap {
-                break; // a long tail waits to head the queue (advance_chunks)
-            }
-            if done != 0 {
-                // resumed span: keep the serial resume+snapshot path (correctness
-                // over amortization for the rare cache-hit-mid-prompt case).
-                let logits = self.prefill_slot_tail(slot, &toks, done)?;
-                finished.push((slot, logits, len));
-                self.chunked.remove(i);
-                used += len;
-                continue;
-            }
-            batch.push((slot, toks));
-            lens.push(len);
-            i += 1;
-            used += len;
-        }
-        if !batch.is_empty() {
-            // A lone admission rides the group pass when the f8t chunk arm
-            // would engage there: the serial tail ran the q8/f8bs routes at
-            // ~18.6 ms per c32 admission where the group pass does the same
-            // rows on the decode tile plane (tc5r at 65+). Costs the v1
-            // prefix-cache insert, like every grouped span here.
-            let f8t_solo = batch.len() == 1
-                && lens[0] <= f8t_chunk_rmax()
-                && f8t_unified_on()
-                && self.bs_f8t_attn.iter().any(Option::is_some);
-            if batch.len() == 1 && !f8t_solo {
-                // one fresh span: serial (its own tail already amortizes its
-                // read) - and that path publishes on its own.
-                let (slot, toks) = &batch[0];
-                let logits = self.prefill_slot_tail(*slot, toks, 0)?;
-                finished.push((*slot, logits, lens[0]));
-                self.chunked.remove(0);
-            } else {
-                // Make the wave PUBLISH. `prefill_batch_pass`
-                // prefills "fresh whole prompts, KV pos 0..take" and never
-                // touches the radix, so every prompt riding it loses prefix
-                // reuse - the v1 gap documented above. That gap went live when
-                // PADDOCK_QWEN35_CHUNK_BATCH became default-on, which makes
-                // the older "not reachable" note stale: instrumented, 96 of a
-                // 112-request c16 leg ride this pass and their
-                // `prefix_resume_begin` reads `ckpt None` forever (only the 16
-                // warmup requests, which take the unified span path, resume).
-                //
-                // Teaching the pass per-share START positions would pull in the
-                // resumed-span machinery `unified_launch_core` already owns.
-                // Instead stop the wave at each prompt's DeltaNet checkpoint
-                // boundary: after a pass over [0, cut) the slot's state sits
-                // exactly on the boundary, so it snapshots exactly the way
-                // `prefill_slot_tail_paged` does. The <=16-row remainder keeps
-                // `done = cut` in the queue and rides the next tick, where the
-                // unified tick fuses it with decode rather than paying a pass.
-                // Splitting is bit-exact by the same argument the serial tail
-                // makes: chunk splits don't change the math.
-                //
-                // One cut, not `ckpt_cuts`' two - a second stop costs a second
-                // wave pass, and one resumable boundary is what a repeated
-                // prompt needs. `>= MIN_CACHE_PREFIX` because a shallower
-                // checkpoint is one `prefix_resume_begin` would refuse anyway.
-                //
-                // OPT-IN, DEFAULT off - this arm is MEASURED A NET LOSS and is
-                // kept only as scaffolding for the real fix (below). Over 3
-                // legs at c16 it costs both TTFT and throughput badly.
-                // It works - legs 2-3 resume all 112 requests at `ckpt Some(176)`
-                // and that saves ~126 ms of prefill - but splitting leaves a
-                // <=16-row tail per prompt, and those tails are picked up by the
-                // `done != 0` branch above, i.e. SERIALLY: 16 prompts x a full
-                // weight pass ~= +850 ms, which swamps the win.
-                //
-                // So the split is the wrong shape. The fix has to leave no tail:
-                // stage the DeltaNet state mid-pass at the boundary (the
-                // `d_ckpt_stage` pattern `unified_finish_core` already uses for
-                // its fused share, via `snapshot_staged_pool`) so the wave still
-                // runs each prompt whole. That fights the wave's packed varlen
-                // walk (one stage1+walk pair per layer), which is why it is a
-                // separate piece of work rather than a widening of this one.
-                // The alternative - per-share START positions so resumed spans
-                // can ride the wave in a batch - is the `v2 follow-up` named
-                // above and is the same machinery `unified_launch_core` owns.
-                // NOTE: with publishing live the checkpoint pool BINDS (96
-                // publishes/leg vs a 94-slot pool -> `attach_state` returns None
-                // and nothing resumes); pool 256 is what made legs 2-3 resume.
-                // That is why the earlier pool A/B read NULL: nothing published.
-                let publish = self
-                    .batch
-                    .as_ref()
-                    .is_some_and(|b| b.paged_prefix.is_some())
-                    && paddock_models::dev_var_os!("PADDOCK_WAVE_PUBLISH").is_some();
-                let cuts: Vec<Option<usize>> = lens
-                    .iter()
-                    .map(|&len| {
-                        let c = ckpt_pos(len);
-                        (publish && c >= min_cache_prefix() && c < len).then_some(c)
-                    })
-                    .collect();
-                for (e, cut) in batch.iter_mut().zip(&cuts) {
-                    if let Some(c) = *cut {
-                        e.1.truncate(c);
-                    }
-                }
-                let mut out: Vec<Vec<f32>> = vec![Vec::new(); batch.len()];
-                let group: Vec<usize> = (0..batch.len()).collect();
-                self.prefill_batch_pass(&batch, &group, &mut out, None)?;
-                for i in 0..batch.len() {
-                    let slot = batch[i].0;
-                    match cuts[i] {
-                        // ran whole: its last-token logits finish the prompt
-                        None => finished.push((slot, std::mem::take(&mut out[i]), lens[i])),
-                        // ran to the boundary: publish it, tail rides next tick
-                        Some(c) => {
-                            let toks = std::mem::take(&mut batch[i].1);
-                            self.wave_publish_ckpt(slot, &toks, c)?;
-                        }
-                    }
-                }
-                // Finished prompts leave the queue; the split ones keep their
-                // tail. Descending so the removals don't shift later indices.
-                for i in (0..batch.len()).rev() {
-                    match cuts[i] {
-                        Some(c) => self.chunked[i].done = c,
-                        None => {
-                            self.chunked.remove(i);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(finished)
     }
 
     /// P80: publish a wave-prefilled prefix into the radix - insert its full KV
@@ -4901,7 +4309,7 @@ impl GpuQwen35 {
             let bs = self.batch.as_mut().expect("batch enabled");
             let pool = bs.pool.as_mut().expect("prefix cache implies pool");
             let radix = bs.paged_prefix.as_mut().expect("prefix cache built");
-            radix.insert(toks, &blocks, pool);
+            radix.insert_for(slot, toks, &blocks, pool);
             radix.attach_state_with_pool(toks, cut, pool)
         };
         if let Some(idx) = idx {
@@ -4938,6 +4346,12 @@ impl GpuQwen35 {
     > {
         use crate::generator::SampledStep;
         assert_eq!(plans.len(), decodes.len(), "one plan per decode row");
+        // a picture prompt in the queue rides the fused tick (mm_ride): one
+        // forward for its span and the decode rows, whatever width the
+        // scheduler elected the split tick at
+        if self.chunked.iter().any(|c| c.mm.is_some()) {
+            return self.forward_unified_sampled(decodes, budget, plans, fin_plans);
+        }
         // two-forward tick: the prefill share, then the decode pass
         let finished = self.advance_chunks(budget, fin_plans)?;
         let step = if decodes.is_empty() {
@@ -5015,25 +4429,6 @@ impl GpuQwen35 {
             self.unified_span_settle(staged)?;
         }
         self.unified_finish_core()
-    }
-
-    /// Which shares are FUSED CKPT shares (their tail share of the same
-    /// chunk follows immediately in the same tick), and which d_ckpt_stage
-    /// blob each owns. Single source of truth: the launch-side per-layer
-    /// stage copies and the finish-side staged snapshot both recompute this
-    /// from the shares list (deterministic - adjacency + the 2-blob cap).
-    fn fused_stage_map(
-        shares: &[(usize, usize, usize, usize, bool, Vec<u32>)],
-    ) -> Vec<Option<usize>> {
-        let mut map = vec![None; shares.len()];
-        let mut stg = 0usize;
-        for i in 0..shares.len().saturating_sub(1) {
-            if shares[i].0 == shares[i + 1].0 && stg < 2 {
-                map[i] = Some(stg);
-                stg += 1;
-            }
-        }
-        map
     }
 
     pub(super) fn unified_launch_core(
@@ -5248,8 +4643,9 @@ impl GpuQwen35 {
             // overflow tails keep the old two-tick path.
             // PADDOCK_NO_CKPT_FUSE reverts.
             static NO_FUSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let fuse = !*NO_FUSE
-                .get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_CKPT_FUSE").is_some());
+            let fuse = ch.mm.is_none()
+                && !*NO_FUSE
+                    .get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_CKPT_FUSE").is_some());
             // With two boundaries a prompt can land on the first (b1-16) and
             // still have the second (b1) plus the partial-page tail ahead, so
             // the fusion walks: each fused share runs to the next boundary or
@@ -5656,7 +5052,7 @@ impl GpuQwen35 {
             }
             v
         };
-        let mrope_h: Vec<u32> = (0..4)
+        let mut mrope_h: Vec<u32> = (0..4)
             .flat_map(|_| {
                 pos_h
                     .iter()
@@ -5664,6 +5060,7 @@ impl GpuQwen35 {
                     .map(|(i, &p)| (p as i64 + mrope_delta_of[i]) as u32)
             })
             .collect();
+        self.mm_ride_mrope(&shares, b, r, &mut mrope_h);
 
         let sinks = &self.sinks;
         let layers = &self.layers;
@@ -5671,6 +5068,7 @@ impl GpuQwen35 {
         let rot = self.rot.as_ref();
         let output = &self.output;
         let out_f8_h = self.out_f8.as_ref();
+        let out_f8_t = self.out_f8_t.as_ref();
         let out_norm = &self.out_norm;
         let kv_dtype = self.kv_dtype;
         // pf7 varlen packed prefill attention (AF3): one
@@ -5715,13 +5113,14 @@ impl GpuQwen35 {
             // already fills the machine. Tail rows change numeric class
             // (decode-split -> the pf7 regroup class the rest of the tick's
             // prefill rows already use) - serve-gated like the pf7 landing.
+            let tile = if pf_tc5_vl(&exec, attn_g) { 128 } else { 64 };
             for (si, &(_, slot, _, take, _, _)) in shares.iter().enumerate() {
                 if take > 0 {
                     attn_vl_share[si] = true;
                     let mut t0 = 0usize;
                     while t0 < take * attn_g {
                         items.extend_from_slice(&[rb as u32, take as u32, t0 as u32, slot as u32]);
-                        t0 += 64;
+                        t0 += tile;
                     }
                 }
                 rb += take;
@@ -5786,6 +5185,7 @@ impl GpuQwen35 {
         // kernel reads `batch=b` entries from base 0, so passing the full
         // `&d_slots` with count `b` addresses exactly the decode sub-range.
         embed_any(&exec, tok_embd, &d_tokens, &mut sc.d_x, embd, r, rot)?;
+        super::mm_ride::splice(&exec, &self.chunked, &shares, b, &mut sc.d_x, embd)?;
 
         // DFlash feature taps over the whole unified tick (decode rows first,
         // then the prefill shares - the append in unified_finish_core walks
@@ -5825,15 +5225,18 @@ impl GpuQwen35 {
         // prefill_batch_pass. Here it rides per SPAN: fresh vl spans land
         // compact in d_dqc/d_dkc, every other span keeps the expanded f32
         // planes and its expanded consumers, so the tick no longer has to be
-        // all-vl. Resumed vl spans (the ext-build conv + split) have no
-        // compact producer yet, so a tick with one stays expanded.
+        // all-vl. A resumed vl span takes the window conv (slot 873: its
+        // left taps read the slot's conv window in place) when its rows cover
+        // a whole window; otherwise it keeps the ext build + split and the
+        // tick stays expanded.
+        let win_qkc = exec.has_conv_silu_qkv_win_qkc();
         let qkc_tick = super::dn_qkc(&exec)
             && d_dn_vl.is_some()
             && sc.d_dqc.len() > 1
             && vl_share
                 .iter()
                 .enumerate()
-                .all(|(si, &v)| !v || shares[si].2 == 0);
+                .all(|(si, &v)| !v || shares[si].2 == 0 || (win_qkc && shares[si].3 >= km1));
 
         for (li, layer) in layers.iter().enumerate() {
             if let Some(df) = dtap.as_mut()
@@ -5958,7 +5361,7 @@ impl GpuQwen35 {
                             qkv_t,
                             &sc.d_f8t_q,
                             &sc.d_f8t_rs,
-                            &mut bs.d_ks_part,
+                            &mut bs.d_span_part,
                             &mut sc.d_qg,
                             embd,
                             nqkv,
@@ -6252,7 +5655,13 @@ impl GpuQwen35 {
                     if let (Some((items, n_tiles)), Some((bt, bps))) =
                         (d_attn_items.as_ref(), paged_arg)
                     {
-                        exec.attn_prefill_f16_paged_vl(
+                        let vl = if pf_tc5_vl(&exec, attn_g) {
+                            GpuExecutor::attn_prefill_tc5_vl
+                        } else {
+                            GpuExecutor::attn_prefill_f16_paged_vl
+                        };
+                        vl(
+                            &exec,
                             &sc.d_qn,
                             kv_k,
                             kv_v,
@@ -6372,7 +5781,7 @@ impl GpuQwen35 {
                             wo_t,
                             &sc.d_f8t_q,
                             &sc.d_f8t_rs,
-                            &mut bs.d_ks_part,
+                            &mut bs.d_span_part,
                             &mut sc.d_proj,
                             w.wo.dims()[0],
                             w.wo.dims()[1],
@@ -6475,7 +5884,7 @@ impl GpuQwen35 {
                             in_t,
                             &sc.d_f8t_q,
                             &sc.d_f8t_rs,
-                            &mut bs.d_ks_part,
+                            &mut bs.d_span_part,
                             &mut sc.d_ffn_gate,
                             nin,
                             tot,
@@ -6654,10 +6063,37 @@ impl GpuQwen35 {
                                     take * conv_dim,
                                 )?;
                             }
+                        } else if qkc_tick && vl_share[si] {
+                            // resumed vl span on the compact tick: the window
+                            // conv reads the slot's history in place and emits
+                            // the QKC planes; then the span's last k-1 rows
+                            // become the window (take >= km1 by the tick gate)
+                            exec.causal_conv1d_silu_qkv_win_qkc_at(
+                                &sc.d_mixed,
+                                &w.conv_w.buf,
+                                bs.conv_win[li].as_ref().expect("DeltaNet layer window"),
+                                woff,
+                                &mut sc.d_dqc,
+                                &mut sc.d_dkc,
+                                &mut sc.d_dv,
+                                rb,
+                                rb,
+                                take,
+                                n_k_heads,
+                                n_v_heads,
+                                state_size,
+                                conv_k,
+                            )?;
+                            exec.copy_region(
+                                &sc.d_mixed,
+                                (rb + take - km1) * conv_dim,
+                                bs.conv_win[li].as_mut().expect("DeltaNet layer window"),
+                                woff,
+                                km1 * conv_dim,
+                            )?;
                         } else {
                             // resumed span: the window carries real history -
-                            // the ext build stays (a window-aware conv kernel
-                            // would be the next cut)
+                            // the ext build stays
                             let win = bs.conv_win[li].as_ref().expect("DeltaNet layer window");
                             assert!(
                                 (km1 + take) * conv_dim <= bs.d_conv_ext.len(),
@@ -7106,7 +6542,7 @@ impl GpuQwen35 {
                             ow_t,
                             &sc.d_f8t_q,
                             &sc.d_f8t_rs,
-                            &mut bs.d_ks_part,
+                            &mut bs.d_span_part,
                             &mut sc.d_proj,
                             w.out_w.dims()[0],
                             w.out_w.dims()[1],
@@ -7205,6 +6641,8 @@ impl GpuQwen35 {
                     let f8f = bs_f8ffn_p.get(li).and_then(|o| o.as_ref()).filter(|_| {
                         r > super::f8_ffn_pf_min()
                             && paddock_models::dev_var_os!("PADDOCK_F8_ROWSCALE").is_none()
+                            // A/B instrument: the span's W8 FFN alone off the lin lane
+                            && paddock_models::dev_var_os!("PADDOCK_NO_PF_F8F").is_none()
                     });
                     let f8r = bs_f8row_p.get(li).and_then(|o| o.as_ref());
                     prefill_add_norm_quant_rot(
@@ -7249,7 +6687,7 @@ impl GpuQwen35 {
                             gu_t,
                             &sc.d_f8t_q,
                             &sc.d_f8t_rs,
-                            &mut bs.d_ks_part,
+                            &mut bs.d_span_part,
                             &mut sc.d_ffn_gate,
                             embd,
                             2 * ff,
@@ -7267,7 +6705,7 @@ impl GpuQwen35 {
                             dn_t,
                             &sc.d_f8t_q,
                             &sc.d_f8t_rs,
-                            &mut bs.d_ks_part,
+                            &mut bs.d_span_part,
                             &mut sc.d_proj,
                             ff,
                             embd,
@@ -7409,46 +6847,7 @@ impl GpuQwen35 {
                             )?;
                         }
                     } else {
-                        prefill_mm_pre_any(
-                            &exec,
-                            gate,
-                            &sc.d_pxq,
-                            &sc.d_pxs,
-                            &sc.d_yq,
-                            &mut sc.d_xsums,
-                            &mut sc.d_ssums,
-                            &mut sc.d_skfix,
-                            &mut sc.d_ffn_gate,
-                            r,
-                        )?;
-                        prefill_mm_pre_any(
-                            &exec,
-                            up,
-                            &sc.d_pxq,
-                            &sc.d_pxs,
-                            &sc.d_yq,
-                            &mut sc.d_xsums,
-                            &mut sc.d_ssums,
-                            &mut sc.d_skfix,
-                            &mut sc.d_ffn_up,
-                            r,
-                        )?;
-                        prefill_ffn_down_rot(
-                            &exec,
-                            down,
-                            &mut sc.d_pxq,
-                            &mut sc.d_pxs,
-                            &mut sc.d_yq,
-                            &mut sc.d_xsums,
-                            &mut sc.d_ssums,
-                            &mut sc.d_skfix,
-                            &mut sc.d_ffn_gate,
-                            &sc.d_ffn_up,
-                            &mut sc.d_proj,
-                            ff,
-                            r,
-                            rot,
-                        )?;
+                        prefill_ffn_dense(&exec, sc, gate, up, down, ff, r, rot)?;
                     }
                 }
                 Ffn::Nvf4Dense { gu, down } => {
@@ -7528,7 +6927,7 @@ impl GpuQwen35 {
                             gu_t,
                             &sc.d_f8t_q,
                             &sc.d_f8t_rs,
-                            &mut bs.d_ks_part,
+                            &mut bs.d_span_part,
                             &mut sc.d_ffn_gate,
                             embd,
                             2 * ff,
@@ -7546,7 +6945,7 @@ impl GpuQwen35 {
                             dn_t,
                             &sc.d_f8t_q,
                             &sc.d_f8t_rs,
-                            &mut bs.d_ks_part,
+                            &mut bs.d_span_part,
                             &mut sc.d_proj,
                             ff,
                             embd,
@@ -7585,6 +6984,7 @@ impl GpuQwen35 {
                             ff,
                             r,
                             xq_ready,
+                            false,
                         )?;
                     }
                 }
@@ -7852,12 +7252,11 @@ impl GpuQwen35 {
             // dropped at load) every decode tick through this path would read
             // a freed plane.
             if let Some(p) = super::head_f8(out_f8_h, b) {
-                super::head_f8_gemm(
-                    &exec,
-                    p,
+                exec.f8_head_logits(
+                    (&p.0, out_f8_t),
+                    (p.1, p.2),
                     &sc.d_h,
-                    &mut sc.d_pxq,
-                    &mut sc.d_exs,
+                    (&mut sc.d_pxq, &mut sc.d_exs),
                     &mut bs.d_ks_part,
                     &mut bs.d_logits,
                     b,
@@ -7918,13 +7317,11 @@ impl GpuQwen35 {
                 b >= super::f8_head_min()
                     || paddock_models::dev_var_os!("PADDOCK_QWEN_F8_LMHEAD_LOWB").is_some()
             }) {
-                exec.quantize_e4m3(&sc.d_h, &mut sc.d_pxq, &mut sc.d_exs, b * embd)?;
-                exec.f8d_gemm_mma_ks(
-                    p8,
-                    *pi,
-                    *po,
-                    &sc.d_pxq,
-                    &sc.d_exs,
+                exec.f8_head_logits(
+                    (p8, self.out_f8_t.as_ref()),
+                    (*pi, *po),
+                    &sc.d_h,
+                    (&mut sc.d_pxq, &mut sc.d_exs),
                     &mut bs.d_ks_part,
                     &mut bs.d_logits,
                     b,
@@ -8071,11 +7468,10 @@ impl GpuQwen35 {
         let exec = self.exec.clone();
         let vocab = self.vocab;
         let drv = |e: cudarc::driver::DriverError| crate::gpu::from_driver(e);
-        // Drain the MAIN lane before any readback and before the span's
-        // eager buffers (held in `inf`) drop. The single-body version synced
-        // here too (its blocking ids readback implied it); the decode lane
-        // is untouched - pipe ticks enqueued during the span keep running.
-        exec.synchronize()?;
+        // Wait for the SPAN (`ev`: walk + finisher sampling), not the lane, before
+        // any readback or `inf` drops: the pump queues picture towers behind it
+        // here, which a lane drain waited out every block. Readbacks: copy stream.
+        inf.ev.synchronize().map_err(drv)?;
         let UnifiedInflight {
             shares,
             b,
@@ -8084,6 +7480,7 @@ impl GpuQwen35 {
             plans,
             fin_dev,
             mut finished,
+            ev,
             ..
         } = inf;
         let step = if tot == 0 {
@@ -8094,17 +7491,9 @@ impl GpuQwen35 {
         } else {
             let bs = self.batch.as_ref().ok_or(GpuModelError::BatchDisabled)?;
             let mut ids = if b == 0 {
-                let view = bs
-                    .d_fin_out
-                    .try_slice(0..nf)
-                    .ok_or_else(|| GpuError::Driver("fin_out slice out of range".into()))?;
-                exec.stream.clone_dtoh(&view).map_err(drv)?
+                exec.to_host_u32_after(&ev, &bs.d_fin_out, 0, nf)?
             } else {
-                let view = bs
-                    .d_samp_out
-                    .try_slice(0..tot)
-                    .ok_or_else(|| GpuError::Driver("samp_out slice out of range".into()))?;
-                exec.stream.clone_dtoh(&view).map_err(drv)?
+                exec.to_host_u32_after(&ev, &bs.d_samp_out, 0, tot)?
             };
             // P65: TruncCat rows (decode AND finisher) head-sample on the
             // host from the compact top-64 plane - same composite row order
@@ -8127,10 +7516,7 @@ impl GpuQwen35 {
                     } else {
                         (&bs.d_samp_head, tot)
                     };
-                    let hv = buf
-                        .try_slice(0..rows * 128)
-                        .ok_or_else(|| GpuError::Driver("head slice out of range".into()))?;
-                    let head = exec.stream.clone_dtoh(&hv).map_err(drv)?;
+                    let head = exec.to_host_u32_after(&ev, buf, 0, rows * 128)?;
                     trunc_fill_ids(&head, &comp, &mut ids);
                 }
             }
@@ -8175,7 +7561,7 @@ impl GpuQwen35 {
                 let (in_range, chain_ok) = {
                     let sb = self.spec_batch.as_ref().expect("spec enabled");
                     let ir = slot < sb.alloc_batch;
-                    let within = done + take <= warm_max;
+                    let within = done + take <= warm_max && self.chunked[idx].mm.is_none();
                     (
                         ir,
                         ir && within && (done == 0 || (sb.mtp_warm[slot] && sb.pos[slot] == done)),
@@ -8224,6 +7610,9 @@ impl GpuQwen35 {
                 let step = self.tier_ckpt_step();
                 let cuts = super::chunk_cuts(&self.chunked[idx], step);
                 let landed = done + take;
+                if self.chunked[idx].mm.is_some() {
+                    continue; // published below through the picture keys
+                }
                 if !finishing && landed > 0 && cuts.contains(&landed) {
                     let toks: Vec<u32> = self.chunked[idx].tokens[..landed].to_vec();
                     let blocks: Vec<u32> = self.batch.as_ref().expect("batch enabled").tables[slot]
@@ -8235,7 +7624,7 @@ impl GpuQwen35 {
                         bs.paged_prefix
                             .as_mut()
                             .expect("prefix cache checked above")
-                            .insert(&toks, &blocks, pool);
+                            .insert_for(slot, &toks, &blocks, pool);
                         bs.paged_prefix
                             .as_mut()
                             .expect("prefix cache checked above")
@@ -8287,9 +7676,14 @@ impl GpuQwen35 {
                         bs.paged_prefix
                             .as_mut()
                             .expect("prefix cache checked above")
-                            .insert(&toks, &blocks, pool);
+                            .insert_for(slot, &toks, &blocks, pool);
                     }
                 }
+            }
+        }
+        for &(idx, slot, done, take, finishing, _) in &shares {
+            if self.chunked[idx].mm.is_some() {
+                self.mm_ride_landed(idx, slot, done + take, finishing)?;
             }
         }
         // Advance non-finishing chunks; drop finished ones (descending index so
@@ -8376,632 +7770,6 @@ impl GpuQwen35 {
         self.launch_batch_step_slots(tokens, positions, None)
     }
 
-    /// Capture the fixed-B batched decode step into a replayable graph, cached
-    /// per batch size. Shared by the classic single-tick path and the pipelined
-    /// path - both replay the same graph, so the pipe is bit-identical to
-    /// `forward_batch_sampled`. Grid-stable for a given B (loop bounds like KV
-    /// length come from the device position buffer), so one capture replays at
-    /// every position.
-    fn ensure_batch_graph(&mut self, b: usize) -> Result<(), GpuModelError> {
-        if self
-            .batch
-            .as_ref()
-            .ok_or(GpuModelError::BatchDisabled)?
-            .graphs
-            .contains_key(&b)
-        {
-            return Ok(());
-        }
-        if b > f8t_dec_bmax() {
-            tracing::warn!(
-                "ensure_batch_graph TRIPWIRE b={b} caller:\n{}",
-                std::backtrace::Backtrace::force_capture()
-            );
-        }
-        let exec = self.exec.clone();
-        exec.stream
-            .synchronize()
-            .map_err(|e| GpuError::Driver(format!("pre-capture sync: {e}")))?;
-        // capture against the DEDICATED decode arena (see enable_batch): the
-        // graph must not bake the shared prefill scratch's addresses
-        let saved = self.scratch.take();
-        self.scratch = self.decode_arena.take();
-        exec.stream
-            .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
-            .map_err(|e| GpuError::Driver(format!("begin_capture: {e}")))?;
-        let rec = self.record_batch_step(b);
-        let graph = crate::gpu::end_capture_no_flags(&exec.stream)
-            .map_err(|e| GpuError::Driver(format!("end_capture: {e}")));
-        self.decode_arena = self.scratch.take();
-        self.scratch = saved;
-        rec?; // surface a record failure only after capture is cleanly ended
-        let graph =
-            graph?.ok_or_else(|| GpuError::Driver("batch capture produced no graph".into()))?;
-        self.batch
-            .as_mut()
-            .expect("batch enabled")
-            .graphs
-            .insert(b, SendGraph(graph));
-        Ok(())
-    }
-
-    /// True when the pipelined pure-decode path can run: device sampling + the
-    /// advance kernel, with no pin forcing a different dispatch. Runs in
-    /// identity-KV mode AND under a FULLY-BACKED budget pool (capacity >=
-    /// max_batch x blocks_per_slot - the enable_batch hard-reject guarantees
-    /// this unless the user opted into oversubscription): per-tick block growth
-    /// then cannot PoolExhaust (worst case it evicts radix pages), so
-    /// `pipe_launch_tick` grows tables infallibly before each replay, exactly
-    /// like the classic path does per step. Oversubscribed pools keep the
-    /// classic tick (growth can fail there and the pipe has no clean unwind -
-    /// the tick's KV/DeltaNet state advances before its ids are read back).
-    /// Measured on an RTX PRO 6000, the pool gate cost ~7 ms/step of host
-    /// serialization at b=32 (83% GPU busy on the classic tick).
-    pub fn supports_decode_pipe(&self) -> bool {
-        // A DFlash drafter needs every decode tick's feature append (the
-        // pipe is device-driven and cannot append - the ring stalls behind
-        // the cursor and the drafter goes permanently cold; see
-        // dflash_ensure_warm). Classic ticks carry decode while attached.
-        self.dflash.is_none()
-            && self.exec.has_sample_rows()
-            && self.exec.has_pipe_advance()
-            // k-quant rides the pipe since the kq batch step is the
-            // same captured-graph body (bmmq!'s dp4a/ks rungs are stream-ordered
-            // and capture-safe - the ks launcher's device-attr statics warm on
-            // the pre-capture run, like Q8's). Greedy A/B pipe-vs-classic gated.
-            //
-            // The static full-backing pool requirement is gone - it
-            // silently disabled the pipe for every oversubscribed serve (the
-            // FP8 headline stack runs PADDOCK_KV_OVERSUBSCRIBE=1), which the
-            // 128x128c32 investigation exposed after five flat scheduling
-            // fixes landed into dead code. Oversubscription safety moved to
-            // the scheduler's DYNAMIC headroom gate: the pipe begins/continues
-            // only while pool_free_blocks() covers a worst-case tick of block
-            // growth plus the admission watermark (service.rs pipe loop), so
-            // ensure_slot_blocks inside pipe_launch_tick can never PoolExhaust
-            // mid-flight.
-            && paddock_models::dev_var_os!("PADDOCK_NO_DECODE_PIPE").is_none()
-    }
-
-    /// True when the overlap decode lane is forked (PADDOCK_OVERLAP at
-    /// enable_batch) and the pipe machinery is available - the scheduler's
-    /// gate for the overlapped span+decode tick (route B).
-    pub fn overlap_ready(&self) -> bool {
-        self.overlap_exec.is_some() && self.supports_decode_pipe()
-    }
-
-    /// Pack per-row sampler params exactly like `batch_sampled_impl` (Host/Hole
-    /// are skip - the pipe never runs with Host rows). Returns
-    /// (par, tpar, any_trunc): TruncCat rows pack mode 5 - the pipe only
-    /// ever receives them when the pack ships slot 435 (the service gates
-    /// on supports_device_trunc), so full-device is the only pipe form.
-    /// Launch fold for the sampler chains (nemotron's (any5,any6)
-    /// fold ported): launch only the chains this tick's rows need. The
-    /// elected qwen truncation (top_k 20) is pure mode 5, so without this
-    /// every tick also paid the 11-launch mode-6 nucleus chain (and the
-    /// base modes-1/2 kernel) for zero rows. PADDOCK_NO_SAMP_FOLD=1
-    /// restores launch-always for A/B legs. Behavior-identical: a skipped
-    /// chain had no rows of its mode, so it wrote nothing.
-    fn samp_fold_off() -> bool {
-        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *V.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_SAMP_FOLD").is_some())
-    }
-
-    /// Engagement witness (bisect-trap law): once per process, the first
-    /// folded trunc tick prints which chains it actually launched.
-    fn samp_fold_witness(any_base: bool, any5: bool, any6: bool) {
-        static W: std::sync::Once = std::sync::Once::new();
-        W.call_once(|| {
-            eprintln!("[samp-fold] engaged: base={any_base} t5={any5} p6={any6}");
-        });
-    }
-
-    fn pack_samp_par(
-        plans: &[crate::generator::RowSample],
-    ) -> (Vec<u32>, Vec<u32>, bool, bool, bool) {
-        use crate::generator::RowSample;
-        use crate::sampler::DevicePlan;
-        let mut par = vec![0u32; plans.len() * 4];
-        let mut tpar = vec![0u32; plans.len() * 4];
-        let (mut any_base, mut any5, mut any6) = (false, false, false);
-        for (i, p) in plans.iter().enumerate() {
-            match p {
-                RowSample::Hole | RowSample::Host => {}
-                RowSample::Device(DevicePlan::Greedy) => {
-                    par[i * 4 + 2] = 1;
-                    any_base = true;
-                }
-                RowSample::Device(DevicePlan::Categorical { inv_t, u }) => {
-                    par[i * 4] = inv_t.to_bits();
-                    par[i * 4 + 1] = u.to_bits();
-                    par[i * 4 + 2] = 2;
-                    any_base = true;
-                }
-                // P67b: full-device truncation sampling in the pipe
-                RowSample::Device(DevicePlan::TruncCat {
-                    inv_t,
-                    u,
-                    k,
-                    top_p,
-                    min_p,
-                }) => {
-                    par[i * 4] = inv_t.to_bits();
-                    par[i * 4 + 1] = u.to_bits();
-                    par[i * 4 + 2] = if *k >= 1 && *k <= 64 { 5 } else { 6 };
-                    tpar[i * 4] = *k;
-                    tpar[i * 4 + 1] = top_p.to_bits();
-                    tpar[i * 4 + 2] = min_p.to_bits();
-                    if *k >= 1 && *k <= 64 {
-                        any5 = true
-                    } else {
-                        any6 = true
-                    }
-                }
-                // RS plans are gemma4-only (supports_spec_rs); skip-safe
-                RowSample::Device(DevicePlan::RsVerify { .. })
-                | RowSample::Device(DevicePlan::RsTrunc { .. }) => {}
-            }
-        }
-        (par, tpar, any_base, any5, any6)
-    }
-
-    /// Host-build the section-major mrope buffer for a pipe tick - positions are
-    /// deterministic (`pos0[i] + tick`), so RoPE needs no device->host roundtrip.
-    /// Byte-identical layout to `launch_batch_step_slots`' host build.
-    fn pipe_mrope_host(pos0: &[u32], delta: &[i64], tick: u64) -> Vec<u32> {
-        let b = pos0.len();
-        let mut v = vec![0u32; 4 * b];
-        for sec in 0..4 {
-            for i in 0..b {
-                v[sec * b + i] = (pos0[i] as i64 + tick as i64 + delta[i]) as u32;
-            }
-        }
-        v
-    }
-
-    /// Enqueue one pipelined tick: advance the device-dependent inputs (token =
-    /// previous tick's sampled id, position += 1) from the previous out ring,
-    /// rebuild mrope host-side, replay the shared step graph (no sync), sample
-    /// on device into this tick's out ring, and record its readiness event.
-    fn pipe_launch_tick(
-        &mut self,
-        plans: &[crate::generator::RowSample],
-        advance: bool,
-    ) -> Result<(), GpuModelError> {
-        let exec = self.exec.clone();
-        let vocab = self.vocab;
-        let (b, tick) = {
-            let p = self.pipe.as_ref().expect("pipe active");
-            (p.b, p.tick)
-        };
-        // P5 budget pool: back the position this tick writes (pos0[i] + tick -
-        // deterministic, same arithmetic as pipe_mrope_host) before any pipe
-        // state mutates, so a growth error leaves the rings/inputs untouched.
-        // The pipe only runs on a fully-backed pool (supports_decode_pipe), so
-        // this cannot PoolExhaust; the table htod inside ensure_slot_blocks is
-        // stream-ordered ahead of the graph replay below. Row i drives its
-        // mapped slot (identity unless the pipe carries an explicit set).
-        // No-op in identity/dense mode.
-        if self.batch.as_ref().expect("batch enabled").pool.is_some() {
-            let (pos0, slot_map) = {
-                let p = self.pipe.as_ref().expect("pipe active");
-                (p.pos0.clone(), p.slots.clone())
-            };
-            for (i, &p0) in pos0.iter().enumerate().take(b) {
-                let slot = slot_map.as_ref().map_or(i, |s| s[i] as usize);
-                self.ensure_slot_blocks(slot, p0 as usize + tick as usize)?;
-            }
-        }
-        let ring = (tick % 2) as usize;
-        let (par, tpar, any_base, any5, any6) = Self::pack_samp_par(plans);
-        let fold_off = Self::samp_fold_off();
-        let any_trunc = any5 || any6;
-        let mrope = {
-            let p = self.pipe.as_ref().expect("pipe active");
-            Self::pipe_mrope_host(&p.pos0, &p.delta, tick)
-        };
-        let drv = |e: cudarc::driver::DriverError| crate::gpu::from_driver(e);
-        let max_batch = self.batch.as_ref().expect("batch enabled").max_batch;
-        // sampler params into this tick's ring plane
-        {
-            let bs = self.batch.as_mut().expect("batch enabled");
-            let off = ring * max_batch * 4;
-            let mut v = bs.d_pipe_par.slice_mut(off..off + b * 4);
-            exec.stream.memcpy_htod(&par, &mut v).map_err(drv)?;
-            if any_trunc {
-                let mut t = bs.d_pipe_tpar.slice_mut(off..off + b * 4);
-                exec.stream.memcpy_htod(&tpar, &mut t).map_err(drv)?;
-            }
-        }
-        // advance the device-dependent inputs from the previous ring's out plane
-        if advance {
-            let prev = ((tick + 1) % 2) as usize;
-            let bs = self.batch.as_mut().expect("batch enabled");
-            let (out, tok, pos) = (&bs.d_pipe_out, &mut bs.d_tokens, &mut bs.d_pos);
-            exec.pipe_advance(out, prev * max_batch, tok, pos, b)?;
-        }
-        // rebuild mrope (deterministic positions) - stream-ordered before the
-        // replay, so the captured graph reads this tick's RoPE positions
-        {
-            let bs = self.batch.as_mut().expect("batch enabled");
-            let mut v = bs.d_mrope.slice_mut(0..4 * b);
-            exec.stream.memcpy_htod(&mrope, &mut v).map_err(drv)?;
-        }
-        // replay the same per-B step graph the classic path uses
-        self.batch.as_ref().expect("batch enabled").graphs[&b]
-            .0
-            .launch()
-            .map_err(|e| GpuError::Driver(format!("pipe step graph launch: {e}")))?;
-        // fused device sampling into this tick's out ring plane (folded:
-        // launch only the chains this tick's row modes need)
-        if any_base || fold_off {
-            let bs = self.batch.as_mut().expect("batch enabled");
-            let (logits, par_buf, out) = (&bs.d_logits, &bs.d_pipe_par, &mut bs.d_pipe_out);
-            exec.sample_rows_at(
-                logits,
-                par_buf,
-                ring * max_batch * 4,
-                out,
-                ring * max_batch,
-                b,
-                vocab,
-            )?;
-        }
-        if any_trunc {
-            Self::samp_fold_witness(any_base, any5, any6);
-            // P67b: mode-5 rows sample in the same out ring plane - the
-            // pipe_advance of tick N+1 consumes them device-side unchanged.
-            // Engagement witness (bisect-trap law; its absence cost a
-            // diagnosis round on): once per process.
-            static PIPE5: std::sync::Once = std::sync::Once::new();
-            PIPE5.call_once(|| {
-                eprintln!("[trunc-pipe] engaged: b={b} (mode-5 rows in the decode pipe)");
-            });
-            let bs = self.batch.as_mut().expect("batch enabled");
-            let (logits, par_buf, tpar_buf) = (&bs.d_logits, &bs.d_pipe_par, &bs.d_pipe_tpar);
-            if any5 || fold_off {
-                exec.sample_rows_t_at(
-                    logits,
-                    par_buf,
-                    ring * max_batch * 4,
-                    tpar_buf,
-                    ring * max_batch * 4,
-                    &mut bs.d_pipe_out,
-                    ring * max_batch,
-                    b,
-                    vocab,
-                )?;
-            }
-            if any6 || fold_off {
-                exec.sample_rows_p_at(
-                    logits,
-                    par_buf,
-                    ring * max_batch * 4,
-                    tpar_buf,
-                    ring * max_batch * 4,
-                    &mut bs.d_pipe_out,
-                    ring * max_batch,
-                    b,
-                    vocab,
-                )?;
-            }
-        }
-        let ev = exec.record_event()?;
-        self.pipe.as_mut().expect("pipe active").ev[ring] = Some(ev);
-        Ok(())
-    }
-
-    /// Begin a pipelined pure-decode over the same rows `forward_batch_sampled`
-    /// would take (all Device/Hole plans - no Host rows). No ids come back yet;
-    /// the first `decode_pipe_next` returns tick 0's while tick 1 runs.
-    pub fn decode_pipe_begin(
-        &mut self,
-        tokens: &[u32],
-        positions: &[u32],
-        plans: &[crate::generator::RowSample],
-    ) -> Result<(), GpuModelError> {
-        self.with_decode_lane(|m| m.decode_pipe_begin_inner(tokens, positions, None, plans))
-    }
-
-    /// `decode_pipe_begin` over an ARBITRARY slot set: row i drives
-    /// `slots[i]` instead of slot i. The overlap scheduler uses this for the
-    /// churn-phase decode set (the non-chunking slots - never contiguous).
-    /// The mapping is written to `d_slots` once here; the captured graph
-    /// reads `d_slots` per replay, so every tick sees it. Identity is
-    /// restored at drain/abort.
-    pub fn decode_pipe_begin_slots(
-        &mut self,
-        slots: &[u32],
-        tokens: &[u32],
-        positions: &[u32],
-        plans: &[crate::generator::RowSample],
-    ) -> Result<(), GpuModelError> {
-        self.with_decode_lane(|m| m.decode_pipe_begin_inner(tokens, positions, Some(slots), plans))
-    }
-
-    fn decode_pipe_begin_inner(
-        &mut self,
-        tokens: &[u32],
-        positions: &[u32],
-        slots: Option<&[u32]>,
-        plans: &[crate::generator::RowSample],
-    ) -> Result<(), GpuModelError> {
-        let b = tokens.len();
-        assert_eq!(plans.len(), b, "one plan per row");
-        assert_eq!(positions.len(), b, "one position per row");
-        if !self.supports_decode_pipe() {
-            return Err(GpuModelError::Unsupported("decode pipe".into()));
-        }
-        // Split-decode companion (see batch_sampled_impl): the pipe graph
-        // cannot split, so above the fast arms' b <= 64 bound it would
-        // replay slow eager lanes (~62ms ticks at 128 rows). Decline; the
-        // service falls back to classic sampled ticks, which split.
-        if b > f8t_dec_bmax() && paddock_models::dev_var_os!("PADDOCK_NO_DEC_SPLIT").is_none() {
-            return Err(GpuModelError::Unsupported(
-                "decode pipe above the fast-arm bound".into(),
-            ));
-        }
-        match &self.batch {
-            None => return Err(GpuModelError::BatchDisabled),
-            Some(bs) if b > bs.max_batch => {
-                return Err(GpuModelError::BatchTooLarge {
-                    got: b,
-                    max: bs.max_batch,
-                });
-            }
-            _ => {}
-        }
-        if let Some(s) = slots {
-            assert_eq!(s.len(), b, "one slot per row");
-        }
-        assert!(self.pipe.is_none(), "decode pipe already active");
-        self.ensure_scratch(b)?;
-        self.ensure_batch_graph(b)?;
-        let delta: Vec<i64> = {
-            let bs = self.batch.as_ref().expect("batch enabled");
-            (0..b)
-                .map(|i| bs.mrope_delta[slots.map_or(i, |s| s[i] as usize)])
-                .collect()
-        };
-        let exec = self.exec.clone();
-        let drv = |e: cudarc::driver::DriverError| crate::gpu::from_driver(e);
-        // tick-0 inputs land in the fixed graph buffers (advance=false won't set
-        // them); d_slots is identity (pure decode) unless an explicit mapping
-        // rides the whole pipe - written once here, restored at drain/abort.
-        {
-            let bs = self.batch.as_mut().expect("batch enabled");
-            let mut vt = bs.d_tokens.slice_mut(0..b);
-            exec.stream.memcpy_htod(tokens, &mut vt).map_err(drv)?;
-            let mut vp = bs.d_pos.slice_mut(0..b);
-            exec.stream.memcpy_htod(positions, &mut vp).map_err(drv)?;
-            if let Some(s) = slots {
-                let mut vs = bs.d_slots.slice_mut(0..b);
-                exec.stream.memcpy_htod(s, &mut vs).map_err(drv)?;
-            }
-        }
-        self.pipe = Some(PipeStateQ {
-            b,
-            tick: 0,
-            ev: [None, None],
-            pos0: positions.to_vec(),
-            delta,
-            slots: slots.map(<[u32]>::to_vec),
-        });
-        if let Err(e) = self.pipe_launch_tick(plans, false) {
-            self.pipe_abort();
-            return Err(e);
-        }
-        Ok(())
-    }
-
-    /// Enqueue the next tick (its inputs advance on device from the previous
-    /// tick's sampler output) and return the ids of the OLDEST in-flight tick,
-    /// read via the side stream while the new tick executes. `plans[i]` must be
-    /// Device or Hole, same rows as begin.
-    pub fn decode_pipe_next(
-        &mut self,
-        plans: &[crate::generator::RowSample],
-    ) -> Result<Vec<u32>, GpuModelError> {
-        self.with_decode_lane(|m| m.decode_pipe_next_inner(plans))
-    }
-
-    fn decode_pipe_next_inner(
-        &mut self,
-        plans: &[crate::generator::RowSample],
-    ) -> Result<Vec<u32>, GpuModelError> {
-        let exec = self.exec.clone();
-        let (b, j) = {
-            let p = self.pipe.as_ref().ok_or_else(|| {
-                GpuModelError::Unsupported("decode_pipe_next without begin".into())
-            })?;
-            (p.b, p.tick)
-        };
-        assert_eq!(plans.len(), b, "one plan per row");
-        self.pipe.as_mut().expect("pipe active").tick = j + 1;
-        if let Err(e) = self.pipe_launch_tick(plans, true) {
-            self.pipe_abort();
-            return Err(e);
-        }
-        let ring = (j % 2) as usize;
-        let max_batch = self
-            .batch
-            .as_ref()
-            .ok_or(GpuModelError::BatchDisabled)?
-            .max_batch;
-        let r = {
-            let bs = self.batch.as_ref().ok_or(GpuModelError::BatchDisabled)?;
-            let ev = self.pipe.as_ref().expect("pipe active").ev[ring]
-                .as_ref()
-                .expect("in-flight tick event");
-            exec.to_host_u32_after(ev, &bs.d_pipe_out, ring * max_batch, b)
-        };
-        match r {
-            Ok(ids) => Ok(ids),
-            Err(e) => {
-                self.pipe_abort();
-                Err(e.into())
-            }
-        }
-    }
-
-    /// End the pipe: return the last in-flight tick's ids without enqueueing
-    /// more work. Must be called before any other forward call - the fixed
-    /// input buffers are left stale and every other path re-uploads them.
-    pub fn decode_pipe_drain(&mut self) -> Result<Vec<u32>, GpuModelError> {
-        self.with_decode_lane(|m| m.decode_pipe_drain_inner())
-    }
-
-    fn decode_pipe_drain_inner(&mut self) -> Result<Vec<u32>, GpuModelError> {
-        let exec = self.exec.clone();
-        let st = self
-            .pipe
-            .take()
-            .ok_or_else(|| GpuModelError::Unsupported("decode_pipe_drain without begin".into()))?;
-        let ring = (st.tick % 2) as usize;
-        let max_batch = self
-            .batch
-            .as_ref()
-            .ok_or(GpuModelError::BatchDisabled)?
-            .max_batch;
-        let ev = st.ev[ring].as_ref().expect("in-flight tick event");
-        let bs = self.batch.as_ref().ok_or(GpuModelError::BatchDisabled)?;
-        let r = exec.to_host_u32_after(ev, &bs.d_pipe_out, ring * max_batch, st.b);
-        // a slot-mapped pipe leaves real slots in d_slots - restore identity
-        // (stream-ordered after the last replay's reads on this same stream)
-        // so following pure-decode ticks see row i -> slot i again.
-        if st.slots.is_some() {
-            let ident: Vec<u32> = (0..st.b as u32).collect();
-            let bs = self.batch.as_mut().expect("batch enabled");
-            let mut v = bs.d_slots.slice_mut(0..st.b);
-            let drv = |e: cudarc::driver::DriverError| crate::gpu::from_driver(e);
-            exec.stream.memcpy_htod(&ident, &mut v).map_err(drv)?;
-        }
-        match r {
-            Ok(ids) => Ok(ids),
-            Err(e) => {
-                let _ = exec.synchronize(); // state gone - quiesce readers of the rings
-                Err(e.into())
-            }
-        }
-    }
-
-    /// Kill an in-flight pipe after an error (or on reset): quiesce the stream so
-    /// nothing still reads the pipe buffers, then drop the state.
-    pub(super) fn pipe_abort(&mut self) {
-        // quiesce the lane the pipe actually ran on
-        self.with_decode_lane(|m| {
-            if let Some(st) = m.pipe.take() {
-                let _ = m.exec.synchronize();
-                // best-effort identity restore after a slot-mapped pipe (the
-                // stream is quiesced, so this can't race a replay)
-                if st.slots.is_some()
-                    && let Some(bs) = m.batch.as_mut()
-                {
-                    let ident: Vec<u32> = (0..st.b as u32).collect();
-                    let mut v = bs.d_slots.slice_mut(0..st.b);
-                    let _ = m.exec.stream.memcpy_htod(&ident, &mut v);
-                }
-            }
-        })
-    }
-
-    /// `launch_batch_step` with an optional explicit slot mapping. `None` = the
-    /// identity mapping (row i drives slot i - the pure batched-decode path).
-    /// `Some(slots)` maps row i to `slots[i]`: the batched-step kernels already
-    /// take `bs.d_slots` for per-slot KV/state/pool indexing, so a mixed tick's
-    /// compacted decode rows (arbitrary slots) ride the same captured graph - we
-    /// just write the real slots into `bs.d_slots` before the replay and restore
-    /// identity after (so a following pure-decode tick is unaffected).
-    fn launch_batch_step_slots(
-        &mut self,
-        tokens: &[u32],
-        positions: &[u32],
-        slots: Option<&[u32]>,
-    ) -> Result<(), GpuModelError> {
-        self.with_decode_lane(|m| m.launch_batch_step_slots_inner(tokens, positions, slots))
-    }
-
-    fn launch_batch_step_slots_inner(
-        &mut self,
-        tokens: &[u32],
-        positions: &[u32],
-        slots: Option<&[u32]>,
-    ) -> Result<(), GpuModelError> {
-        let b = tokens.len();
-        assert_eq!(b, positions.len());
-        if let Some(s) = slots {
-            assert_eq!(s.len(), b, "one slot per row");
-        }
-        assert!(self.batch.is_some(), "enable_batch first");
-        assert!(b >= 1 && b <= self.batch.as_ref().expect("batch enabled").max_batch);
-        self.ensure_scratch(b)?;
-        let exec = self.exec.clone();
-        let drv = |e: cudarc::driver::DriverError| crate::gpu::from_driver(e);
-
-        {
-            let bs = self.batch.as_mut().expect("batch enabled");
-            // mrope delta is per-SLOT: identity indexes by row i, slot-explicit
-            // by the row's actual slot (text sequences carry delta 0 either way).
-            let mrope_host: Vec<u32> = (0..4)
-                .flat_map(|_| {
-                    positions.iter().enumerate().map(|(i, &p)| {
-                        let d = match slots {
-                            Some(s) => bs.mrope_delta[s[i] as usize],
-                            None => bs.mrope_delta[i],
-                        };
-                        (p as i64 + d) as u32
-                    })
-                })
-                .collect();
-            exec.stream
-                .memcpy_htod(tokens, &mut bs.d_tokens)
-                .map_err(drv)?;
-            exec.stream
-                .memcpy_htod(positions, &mut bs.d_pos)
-                .map_err(drv)?;
-            if let Some(s) = slots {
-                let mut v = bs.d_slots.slice_mut(0..b);
-                exec.stream.memcpy_htod(s, &mut v).map_err(drv)?;
-            }
-            // d_mrope holds 4*max_batch; write the leading 4*b axis-major view
-            let mut staged = vec![0u32; 4 * b];
-            staged.copy_from_slice(&mrope_host);
-            exec.stream
-                .memcpy_htod(&staged, &mut bs.d_mrope)
-                .map_err(drv)?;
-        }
-
-        // P5 budget pool: grow each row's ACTUAL slot block table to back the
-        // token it writes this step (positions[i]) before the (captured) compute
-        // reads the device table. The upload is outside the graph, so growth is
-        // replay-safe. No-op in identity/dense mode.
-        if self.batch.as_ref().expect("batch enabled").pool.is_some() {
-            for (i, &p) in positions.iter().enumerate() {
-                let slot = slots.map_or(i, |s| s[i] as usize);
-                self.ensure_slot_blocks(slot, p as usize)?;
-            }
-        }
-
-        // Capture the fixed-B step once, then replay per token - the compute is
-        // grid-stable for a given B (loop bounds like the KV length come from the
-        // device position buffer, exactly as the single-stream graph relies on).
-        self.ensure_batch_graph(b)?;
-        self.batch.as_ref().expect("batch enabled").graphs[&b]
-            .0
-            .launch()
-            .map_err(|e| GpuError::Driver(format!("batch graph launch: {e}")))?;
-        // restore the identity d_slots (stream-ordered after the graph read it)
-        // so a following pure-decode tick sees row i -> slot i again.
-        if slots.is_some() {
-            let ident: Vec<u32> = (0..b as u32).collect();
-            let bs = self.batch.as_mut().expect("batch enabled");
-            let mut v = bs.d_slots.slice_mut(0..b);
-            exec.stream.memcpy_htod(&ident, &mut v).map_err(drv)?;
-        }
-        exec.synchronize()?;
-        Ok(())
-    }
-
     /// The batched per-step compute (device-resident inputs, capture-safe ops
     /// only) - everything `forward_batch` replays via its per-B graph.
     fn record_batch_step(&mut self, b: usize) -> Result<(), GpuModelError> {
@@ -9038,6 +7806,8 @@ impl GpuQwen35 {
         let lin_dn_off = self.lin_tick_dn_off();
 
         let bs_w8_dec = &self.bs_w8;
+        // W8 decode projections ride beside the f8 FFN lane OR a W4A4-served NVFP4 FFN (B200)
+        let w8_dec_ok = !self.bs_f8ffn.is_empty() || super::nvf4_wide_w4a4(&exec);
         // decode norm+e4m3 fuse: stage the group e4m3 inside the norms when
         // the f8 lane serves this model (arms skip their d_xn quantizes)
         // (the loader pushes one entry per layer, Some or None, so the vec is
@@ -9339,8 +8109,15 @@ impl GpuQwen35 {
             // where the 8 Dense layers pay one 5.7 us kernel: 8.0 us x 64
             // sites = ~540 us/tick at c16.
             // Kill: PADDOCK_NO_QWEN_ATTN_COVERS (reverts to the layer-wide gate).
+            // the layer's f8t mixer planes where this tick can serve them (f8t_rows_ok): the arms
+            // and the pre-norm that stages only their e4m3 input must agree on it
+            let f8t_ap = self
+                .bs_f8t_attn
+                .get(li)
+                .and_then(|o| o.as_ref())
+                .filter(|p| f8t_rows_ok(b, p));
             let f8t_covers_attn_side = b <= f8t_dec_bmax()
-                && self.bs_f8t_attn.get(li).and_then(|o| o.as_ref()).is_some()
+                && f8t_ap.is_some()
                 && bs.d_dn_fused.is_some()
                 && bs.d_gu_fused.is_some()
                 && dn_ab_ok
@@ -9363,11 +8140,8 @@ impl GpuQwen35 {
             // arm below reads it. The arm's predicate is known here, so the
             // choice is exact rather than optimistic.
             // Without PDL: rmsnorm 4.24 us + quantize 2.66 us -> one launch.
-            let f8t_prenorm = self
-                .bs_f8t_attn
-                .get(li)
-                .and_then(|o| o.as_ref())
-                .is_some()
+            let f8t_prenorm = f8t_ap.is_some()
+                && exec.has_prenorm_e4m3_row_xn()
                 && b <= f8t_dec_bmax()
                 // both landings, because this layer may be either mixer kind
                 // (Full lands in d_gu_fused, Linear in d_dn_fused) and both
@@ -9377,28 +8151,21 @@ impl GpuQwen35 {
                 && exec.has_rmsnorm_e4m3_row()
                 && (!qdedup || f8t_attn_covers)
                 && paddock_models::dev_var_os!("PADDOCK_NO_QWEN_PRENORM_FUSE").is_none();
+            let (mut pre_e4m3, mut pre_swz) = (false, false);
             if f8t_prenorm {
-                if pending_res {
-                    exec.add_rmsnorm_e4m3_row(
-                        &mut sc.d_x,
-                        &sc.d_proj,
-                        &layer.attn_norm.buf,
-                        &mut sc.d_f8t_q,
-                        &mut sc.d_f8t_rs,
-                        embd,
-                        eps,
-                        b,
-                    )?;
-                } else {
-                    exec.rmsnorm_e4m3_row(
-                        &sc.d_x,
-                        &layer.attn_norm.buf,
-                        &mut sc.d_f8t_q,
-                        &mut sc.d_f8t_rs,
-                        embd,
-                        eps,
-                        b,
-                    )?;
+                // d_xn lands too: the step relies on it until the post-norm (slots 888 / 889)
+                let proj = pending_res.then_some(&sc.d_proj);
+                let xn_q = (&mut sc.d_f8t_q, &mut sc.d_f8t_rs);
+                let w_ = &layer.attn_norm.buf;
+                if !exec.prenorm_e4m3_row_xn(
+                    &mut sc.d_x,
+                    proj,
+                    w_,
+                    &mut sc.d_xn,
+                    xn_q,
+                    (embd, eps, b),
+                )? {
+                    return Err(GpuError::MissingOp("rmsnorm_e4m3_row_xn").into());
                 }
             } else if e4m3_norms {
                 let proj = if pending_res { Some(&sc.d_proj) } else { None };
@@ -9414,15 +8181,37 @@ impl GpuQwen35 {
                     eps,
                 )?;
             } else if pending_res {
-                exec.add_rmsnorm_batch(
-                    &mut sc.d_x,
-                    &sc.d_proj,
-                    &layer.attn_norm.buf,
-                    &mut sc.d_xn,
-                    embd,
-                    eps,
-                    b,
-                )?;
+                // the W8 qkv / in-proj's quantize_e4m3 folded into the norm (slot 877,
+                // bit-identical); the f32 row still lands for alpha|beta and the fallbacks
+                pre_swz = w8_swz_on(&exec, bs_w8_dec.get(li).and_then(LayerW8::mixer_t), b);
+                pre_e4m3 = rot.is_none()
+                    && w8_dec_ok
+                    && b >= super::f8_dec_min()
+                    && bs_w8_dec
+                        .get(li)
+                        .is_some_and(|l| l.wq.is_some() || l.in_qkv.is_some())
+                    && exec.add_rmsnorm_e4m3_batch(
+                        &mut sc.d_x,
+                        &sc.d_proj,
+                        &layer.attn_norm.buf,
+                        &mut sc.d_xn,
+                        &mut sc.d_pxq,
+                        (&mut sc.d_exs, pre_swz),
+                        embd,
+                        eps,
+                        b,
+                    )?;
+                if !pre_e4m3 {
+                    exec.add_rmsnorm_batch(
+                        &mut sc.d_x,
+                        &sc.d_proj,
+                        &layer.attn_norm.buf,
+                        &mut sc.d_xn,
+                        embd,
+                        eps,
+                        b,
+                    )?;
+                }
             } else {
                 exec.rmsnorm_batch(&sc.d_x, &layer.attn_norm.buf, &mut sc.d_xn, embd, eps, b)?;
             }
@@ -9431,23 +8220,32 @@ impl GpuQwen35 {
             // the rotated rows (rotation.rs), so it turns before the group
             // quantize below stages it
             let xn_staged = rot_stage!(&mut sc.d_xn, embd);
-            if qdedup && !f8t_attn_covers && !xn_staged {
-                // one quantize serves every xn consumer in this layer's group;
-                // the b=1 kq tick uses the fused variant so the group's per-16
-                // sums land in the same node
-                if tern {
-                    exec.quantize_q8_b128(&sc.d_xn, &mut bs.d_xq, &mut bs.d_xs, b * embd)?;
-                } else if b == 1 && kq_w4a8_b1 {
-                    exec.quantize_q8_sums(
-                        &sc.d_xn,
-                        &mut bs.d_xq,
-                        &mut bs.d_xs,
-                        &mut sc.d_ssums,
-                        embd,
-                    )?;
-                } else {
-                    exec.quantize_q8(&sc.d_xn, &mut bs.d_xq, &mut bs.d_xs, b * embd)?;
-                }
+            // One quantize serves every xn consumer in this layer's group, but
+            // it is OWED, not run: each qdedup reader below ensures it first.
+            // A lane whose projections all stage their own input (sm_100's W8
+            // e4m3 qkv / DN in-proj, f32 alpha/beta) never reads d_xq, and paid
+            // this 64 times a tick for nothing (~0.85 ms of a ~32 ms B200 tick).
+            // The b=1 kq tick uses the fused variant so the group's per-16
+            // sums land in the same node.
+            let xq_due = std::cell::Cell::new(qdedup && !f8t_attn_covers && !xn_staged);
+            macro_rules! xq_ensure {
+                () => {
+                    if xq_due.replace(false) {
+                        if tern {
+                            exec.quantize_q8_b128(&sc.d_xn, &mut bs.d_xq, &mut bs.d_xs, b * embd)?;
+                        } else if b == 1 && kq_w4a8_b1 {
+                            exec.quantize_q8_sums(
+                                &sc.d_xn,
+                                &mut bs.d_xq,
+                                &mut bs.d_xs,
+                                &mut sc.d_ssums,
+                                embd,
+                            )?;
+                        } else {
+                            exec.quantize_q8(&sc.d_xn, &mut bs.d_xq, &mut bs.d_xs, b * embd)?;
+                        }
+                    }
+                };
             }
             match &layer.mixer {
                 Mixer::Full(w) => {
@@ -9457,7 +8255,7 @@ impl GpuQwen35 {
                     // last GEMM band still paying Q8_0's 1.0625 B/param.
                     let l8d = bs_w8_dec
                         .get(li)
-                        .filter(|_| b >= super::f8_dec_min() && !bs_f8ffn.is_empty());
+                        .filter(|_| b >= super::f8_dec_min() && w8_dec_ok);
                     // wq holds the fused wq|wk|wv plane since the merge
                     let f8_qkv = l8d.is_some_and(|l| l.wq.is_some());
                     // set when the qkv arm below took the tile lane; wo then
@@ -9470,11 +8268,7 @@ impl GpuQwen35 {
                     // b>=8 floor: the f8 rungs below are all batch-gated, so at
                     // c1/c4 serving widths they never fire and the projections
                     // ride Q8_0 int8-MMA - the exact trap the FFN half hit.
-                    let f8t_qkv = self
-                        .bs_f8t_attn
-                        .get(li)
-                        .and_then(|o| o.as_ref())
-                        .filter(|_| b <= f8t_dec_bmax() && bs.d_gu_fused.is_some());
+                    let f8t_qkv = f8t_ap.filter(|_| b <= f8t_dec_bmax() && bs.d_gu_fused.is_some());
                     if let Some([qkv_t, wo_t]) = f8t_qkv {
                         let (nq, nk2, nv2) = (w.wq.dims()[1], w.wk.dims()[1], w.wv.dims()[1]);
                         let nt = nq + nk2 + nv2;
@@ -9499,90 +8293,32 @@ impl GpuQwen35 {
                             nt,
                             b,
                         )?;
-                        // decode twin of the prefill Phase-A consumer
-                        // (norm band): one pd_q36_qkg_nra_rows
-                        // over the fused plane replaces row_slice4 + split_qg
-                        // + 2x rmsnorm_batch + 2x mrope + 2x paged append -
-                        // 7 launches/layer, bit-identical planes + pools.
-                        // The nra kernel is PDL-armed while the chain it
-                        // replaces is plain-launched - judge it end-to-end,
-                        // per the second PDL law. PADDOCK_NO_QNF_DEC
-                        // kills to the chain.
-                        static QNF_DEC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                        let qnf_dec = bs.paged
-                            && head_dim == 256
-                            && n_rot == 64
-                            && exec.has_q36_qkg_nra_rows()
-                            && *QNF_DEC.get_or_init(|| {
-                                paddock_models::dev_var_os!("PADDOCK_NO_QNF_DEC").is_none()
-                            });
-                        if qnf_dec {
-                            let bt = bs.d_block_tables.as_ref().expect("paged block tables");
-                            let bps = bs.blocks_per_slot;
-                            exec.q36_qkg_nra_rows(
-                                fused,
-                                0,
-                                nt,
-                                nq,
-                                nq + nk2,
-                                &w.q_norm.buf,
-                                &w.k_norm.buf,
-                                &mut sc.d_qn,
-                                &mut sc.d_gate,
-                                bs.kv_k[li].as_mut().expect("full-attn layer KV"),
-                                bs.kv_v[li].as_mut().expect("full-attn layer KV"),
-                                &bs.d_pos,
-                                Some(&bs.d_slots),
-                                &bs.d_mrope,
-                                bt,
-                                bps,
-                                n_heads,
-                                n_kv_heads,
-                                head_dim,
-                                n_rot,
-                                eps,
-                                yarn,
-                                sections,
-                                b,
-                                self.kv_dtype,
-                            )?;
-                            attn_nra_done = true;
-                        } else if exec.has_row_slice4() {
-                            exec.row_slice4(
-                                fused,
-                                nt,
-                                b,
-                                &mut [
-                                    (&mut sc.d_qg, 0, nq),
-                                    (&mut sc.d_k, nq, nk2),
-                                    (&mut sc.d_v, nq + nk2, nv2),
-                                ],
-                            )?;
-                            exec.split_qg(
-                                &sc.d_qg,
-                                &mut sc.d_q,
-                                &mut sc.d_gate,
-                                b,
-                                n_heads,
-                                head_dim,
-                            )?;
-                        } else {
-                            exec.row_slice(fused, &mut sc.d_qg, nt, 0, nq, b)?;
-                            exec.row_slice(fused, &mut sc.d_k, nt, nq, nk2, b)?;
-                            exec.row_slice(fused, &mut sc.d_v, nt, nq + nk2, nv2, b)?;
-                            exec.split_qg(
-                                &sc.d_qg,
-                                &mut sc.d_q,
-                                &mut sc.d_gate,
-                                b,
-                                n_heads,
-                                head_dim,
-                            )?;
-                        }
+                        let geo = attn_front::QkgGeo {
+                            nq,
+                            nk2,
+                            nv2,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            n_rot,
+                        };
+                        attn_nra_done = attn_front::qkg_front(
+                            &exec,
+                            bs,
+                            sc,
+                            w,
+                            li,
+                            &geo,
+                            eps,
+                            yarn,
+                            sections,
+                            b,
+                            self.kv_dtype,
+                        )?;
                         f8t_wo = Some(wo_t);
                     } else if f8_qkv {
                         let l8 = l8d.expect("f8_qkv checked above");
-                        if !e4m3_norms {
+                        if !(e4m3_norms || pre_e4m3) {
                             exec.quantize_e4m3(&sc.d_xn, &mut sc.d_pxq, &mut sc.d_exs, b * embd)?;
                         }
                         let (nq, nk2, nv2) = (w.wq.dims()[1], w.wk.dims()[1], w.wv.dims()[1]);
@@ -9591,20 +8327,38 @@ impl GpuQwen35 {
                         // launches/tick) into the gu landing (free at mixer
                         // time) + row_slice x3
                         let fused = bs.d_gu_fused.as_mut().expect("qkv fused landing");
-                        exec.f8d_gemm_mma_ks(
-                            l8.wq.as_ref().expect("full-attn W8 qkv plane"),
+                        exec.f8d_gemm_t(
+                            l8.qkv_pair(),
                             w.wq.dims()[0],
                             nt,
                             &sc.d_pxq,
-                            &sc.d_exs,
+                            (&sc.d_exs, pre_swz && pre_e4m3),
                             &mut bs.d_ks_part,
                             fused,
                             b,
                         )?;
-                        exec.row_slice(fused, &mut sc.d_qg, nt, 0, nq, b)?;
-                        exec.split_qg(&sc.d_qg, &mut sc.d_q, &mut sc.d_gate, b, n_heads, head_dim)?;
-                        exec.row_slice(fused, &mut sc.d_k, nt, nq, nk2, b)?;
-                        exec.row_slice(fused, &mut sc.d_v, nt, nq + nk2, nv2, b)?;
+                        let geo = attn_front::QkgGeo {
+                            nq,
+                            nk2,
+                            nv2,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            n_rot,
+                        };
+                        attn_nra_done = attn_front::qkg_front(
+                            &exec,
+                            bs,
+                            sc,
+                            w,
+                            li,
+                            &geo,
+                            eps,
+                            yarn,
+                            sections,
+                            b,
+                            self.kv_dtype,
+                        )?;
                     } else {
                         // b=1 q|k|v launch merge (entry 317): three same-input
                         // GEMVs pay three fixed ramp/drain tolls where wk/wv's
@@ -9641,6 +8395,7 @@ impl GpuQwen35 {
                             (QuantW::Kq(kq), QuantW::Kq(kk), QuantW::Kq(kv))
                                 if tern && (tern_nb || exec.ternary_multi_fits(&[kq, kk, kv])) =>
                             {
+                                xq_ensure!();
                                 if !(xn_staged || qdedup) {
                                     exec.quantize_q8_b128(
                                         &sc.d_xn,
@@ -9666,6 +8421,7 @@ impl GpuQwen35 {
                                 )?;
                             }
                             _ => {
+                                xq_ensure!();
                                 bmmq!(&w.wq, &sc.d_xn, &mut sc.d_qg, qdedup);
                                 exec.split_qg(
                                     &sc.d_qg,
@@ -9811,18 +8567,19 @@ impl GpuQwen35 {
                             b,
                         )?;
                     } else if let Some(w8o) = l8d.and_then(|l| l.wo.as_ref()).filter(|_| f8_qkv) {
-                        exec.quantize_e4m3(
+                        let wo_t = l8d.and_then(|l| l.wo_t.as_ref());
+                        let swz = exec.quantize_e4m3_w8(
                             &sc.d_attn,
-                            &mut sc.d_pxq,
-                            &mut sc.d_exs,
-                            b * w.wo.dims()[0],
+                            (&mut sc.d_pxq, &mut sc.d_exs),
+                            (w.wo.dims()[0], b),
+                            w8_swz_on(&exec, wo_t, b),
                         )?;
-                        exec.f8d_gemm_mma_ks(
-                            w8o,
+                        exec.f8d_gemm_t(
+                            (w8o, wo_t),
                             w.wo.dims()[0],
                             w.wo.dims()[1],
                             &sc.d_pxq,
-                            &sc.d_exs,
+                            (&sc.d_exs, swz),
                             &mut bs.d_ks_part,
                             &mut sc.d_proj,
                             b,
@@ -9845,11 +8602,7 @@ impl GpuQwen35 {
                     // tcgen05 twin of the merge, ahead of it for the same
                     // reason as the qkv arm: every rung below floors at b>=8.
                     // Same row-slice split, so d_mixed/d_z land identically.
-                    let f8t_dn = self
-                        .bs_f8t_attn
-                        .get(li)
-                        .and_then(|o| o.as_ref())
-                        .filter(|_| b <= f8t_dec_bmax() && bs.d_dn_fused.is_some());
+                    let f8t_dn = f8t_ap.filter(|_| b <= f8t_dec_bmax() && bs.d_dn_fused.is_some());
                     let mut f8t_out_w: Option<&crate::gpu::F8TilePlane> = None;
                     // set when the plane carries the alpha||beta tile block, so
                     // the two decay gemvs below are skipped
@@ -9865,6 +8618,27 @@ impl GpuQwen35 {
                     // P71-R2: no split at all - conv/z/gate read the fused
                     // plane strided (offsets carried below)
                     let mut dn_strided = false;
+                    // the W8 lane's half of it (sm_100 decode): conv and z read the fused
+                    // in-proj plane strided, the gate keeps its own path
+                    let mut dn_cz_strided = false;
+                    // the conv half alone read strided (the fused front below takes a row
+                    // stride); z still lands split
+                    let mut dn_c_strided = false;
+                    // z read in place from the fused plane by the gated norm (slot 878)
+                    let mut dn_z_fused = false;
+                    // the split+norm recurrence arm below (b above the v2f band) takes the
+                    // fused front: conv step + silu + split + q/k norms + GQA widening in one
+                    // launch (slot 875, bit-identical to conv_step + split_gqa_norm). Elected
+                    // here so the W8 split knows it. Kill: PADDOCK_NO_DN_QKVN.
+                    let qkvn_elect = |strided: bool| {
+                        !strided
+                            && !((b <= dn_v2f_bmax() || tern)
+                                && exec.has_gated_delta_recurrent_v2f()
+                                && dn_v2f_on())
+                            && conv_k == 4
+                            && exec.has_conv_step_slots_qkvn()
+                            && dn_qkvn_on()
+                    };
                     let (mut dn_tot, mut dn_z_off, mut dn_ab_off) = (0usize, 0usize, 0usize);
                     let dn_fused_done = if let Some([in_t, ow_t]) = f8t_dn {
                         let (nin, nc) = (w.in_qkv.dims()[0], w.in_qkv.dims()[1]);
@@ -9983,6 +8757,7 @@ impl GpuQwen35 {
                         f8t_out_w = Some(ow_t);
                         true
                     } else if let (Some(dn), Some(fused)) = (dnf, bs.d_dn_fused.as_mut()) {
+                        xq_ensure!();
                         if !qdedup {
                             exec.quantize_q8(&sc.d_xn, &mut bs.d_xq, &mut bs.d_xs, b * dn.dims[0])?;
                         }
@@ -10001,13 +8776,13 @@ impl GpuQwen35 {
                     // bs_dn plane, when opted in, takes precedence above)
                     let l8d = bs_w8_dec
                         .get(li)
-                        .filter(|_| b >= super::f8_dec_min() && !bs_f8ffn.is_empty());
+                        .filter(|_| b >= super::f8_dec_min() && w8_dec_ok);
                     // in_qkv now holds the fused in_qkv|gate_w plane (gate_w
                     // slot intentionally None since the merge)
                     let f8_dn = !dn_fused_done && l8d.is_some_and(|l| l.in_qkv.is_some());
                     if f8_dn {
                         let l8 = l8d.expect("f8_dn checked above");
-                        if !e4m3_norms {
+                        if !(e4m3_norms || pre_e4m3) {
                             exec.quantize_e4m3(&sc.d_xn, &mut sc.d_pxq, &mut sc.d_exs, b * embd)?;
                         }
                         let (nin, nc) = (w.in_qkv.dims()[0], w.in_qkv.dims()[1]);
@@ -10015,18 +8790,40 @@ impl GpuQwen35 {
                         let fused = bs.d_dn_fused.as_mut().expect("dn fused landing");
                         // One fused 16384-out GEMM (vLLM's DN merge; -48
                         // launches/tick) + row_slice split into mixed/z
-                        exec.f8d_gemm_mma_ks(
-                            l8.in_qkv.as_ref().expect("DeltaNet W8 in_qkv plane"),
+                        exec.f8d_gemm_t(
+                            l8.in_qkv_pair(),
                             nin,
                             nc + nz_,
                             &sc.d_pxq,
-                            &sc.d_exs,
+                            (&sc.d_exs, pre_swz && pre_e4m3),
                             &mut bs.d_ks_part,
                             fused,
                             b,
                         )?;
-                        exec.row_slice(fused, &mut sc.d_mixed, nc + nz_, 0, nc, b)?;
-                        exec.row_slice(fused, &mut sc.d_z, nc + nz_, nc, nz_, b)?;
+                        if dn_cz_strided_on()
+                            && exec.has_conv_step_slots_s()
+                            && exec.has_gated_rmsnorm_s()
+                            && paddock_models::dev_var_os!("PADDOCK_QWEN_GATED_ROW_FUSE").is_none()
+                        {
+                            dn_cz_strided = true;
+                            dn_tot = nc + nz_;
+                            dn_z_off = nc;
+                        } else if qkvn_elect(false) {
+                            // the fused front reads the conv half in place (same loads,
+                            // other addresses): 48 fewer 5 MB copies a tick at depth 128;
+                            // z too where the W8 out_proj's fused norm takes it (slot 878)
+                            dn_c_strided = true;
+                            (dn_tot, dn_z_off) = (nc + nz_, nc);
+                            dn_z_fused = l8d.is_some_and(|l| l.out_w.is_some())
+                                && exec.has_gated_rmsnorm_e4m3()
+                                && exec.has_gated_rmsnorm_e4m3_zs();
+                            if !dn_z_fused {
+                                exec.row_slice(fused, &mut sc.d_z, nc + nz_, nc, nz_, b)?;
+                            }
+                        } else {
+                            exec.row_slice(fused, &mut sc.d_mixed, nc + nz_, 0, nc, b)?;
+                            exec.row_slice(fused, &mut sc.d_z, nc + nz_, nc, nz_, b)?;
+                        }
                     } else if !dn_fused_done {
                         // b=1 in_qkv|gate_w launch merge (entry 317) - the Q8
                         // twin of the fused W8/f8t DN in-proj plane above,
@@ -10047,6 +8844,7 @@ impl GpuQwen35 {
                             (QuantW::Kq(iq), QuantW::Kq(gw))
                                 if tern && (tern_nb || exec.ternary_multi_fits(&[iq, gw])) =>
                             {
+                                xq_ensure!();
                                 if !(xn_staged || qdedup) {
                                     exec.quantize_q8_b128(
                                         &sc.d_xn,
@@ -10063,10 +8861,36 @@ impl GpuQwen35 {
                                 }
                                 dn_z_early = true;
                             }
-                            _ => bmmq!(&w.in_qkv, &sc.d_xn, &mut sc.d_mixed, qdedup),
+                            _ => {
+                                xq_ensure!();
+                                bmmq!(&w.in_qkv, &sc.d_xn, &mut sc.d_mixed, qdedup)
+                            }
                         }
                     }
-                    if dn_strided {
+                    let dn_qkvn = qkvn_elect(dn_strided);
+                    if dn_qkvn {
+                        let (x, x_stride) = if dn_cz_strided || dn_c_strided {
+                            (bs.d_dn_fused.as_ref().expect("dn fused landing"), dn_tot)
+                        } else {
+                            (&sc.d_mixed, conv_dim)
+                        };
+                        exec.conv_step_slots_qkvn(
+                            bs.conv_win[li].as_mut().expect("DeltaNet layer window"),
+                            x,
+                            0,
+                            x_stride,
+                            &w.conv_w.buf,
+                            &mut sc.d_dq,
+                            &mut sc.d_dk,
+                            &mut sc.d_dv,
+                            &bs.d_slots,
+                            b,
+                            n_k_heads,
+                            n_v_heads,
+                            state_size,
+                            conv_k,
+                        )?;
+                    } else if dn_strided || dn_cz_strided {
                         let fused = bs.d_dn_fused.as_ref().expect("dn fused landing");
                         exec.conv_step_slots_s(
                             bs.conv_win[li].as_mut().expect("DeltaNet layer window"),
@@ -10108,6 +8932,22 @@ impl GpuQwen35 {
                             b,
                             n_v_heads,
                         )?;
+                    } else if let Some(ab) = w.ab_f32.as_ref().filter(|_| b >= ab_f32_min_rows()) {
+                        // the unified tick's f32 decay plane: the Q8 pair's plain-mma rung above
+                        // 32 rows is one CTA per 48-wide plane (124 us x2 a layer at b=96, B200)
+                        let (a_, d_) = (&w.ssm_a.buf, &w.dt_bias.buf);
+                        ab_gate(
+                            &exec,
+                            ab,
+                            &sc.d_xn,
+                            &mut sc.d_ab,
+                            a_,
+                            d_,
+                            &mut sc.d_g,
+                            &mut sc.d_beta,
+                            b,
+                            n_v_heads,
+                        )?;
                     } else if let (Some(aw), Some(bw)) = (w.alpha_w.as_ref(), w.beta_w.as_ref()) {
                         // b=1 alpha|beta launch merge: two [embd -> n_v_heads]
                         // GEMVs are pure latency floor (~3 us each for ~0.1 MB
@@ -10120,6 +8960,7 @@ impl GpuQwen35 {
                                 &sc.d_xn,
                             )?;
                         } else {
+                            xq_ensure!();
                             bmm!(aw, &sc.d_xn, &mut sc.d_a, qdedup);
                             bmm!(bw, &sc.d_xn, &mut sc.d_b, qdedup);
                         }
@@ -10197,16 +9038,18 @@ impl GpuQwen35 {
                             state_size,
                         )?;
                     } else {
-                        exec.deltanet_split_gqa_norm(
-                            &sc.d_conv,
-                            &mut sc.d_dq,
-                            &mut sc.d_dk,
-                            &mut sc.d_dv,
-                            b,
-                            n_k_heads,
-                            n_v_heads,
-                            state_size,
-                        )?;
+                        if !dn_qkvn {
+                            exec.deltanet_split_gqa_norm(
+                                &sc.d_conv,
+                                &mut sc.d_dq,
+                                &mut sc.d_dk,
+                                &mut sc.d_dv,
+                                b,
+                                n_k_heads,
+                                n_v_heads,
+                                state_size,
+                            )?;
+                        }
                         exec.gated_delta_recurrent_v2(
                             &sc.d_dq,
                             &sc.d_dk,
@@ -10225,6 +9068,7 @@ impl GpuQwen35 {
                         )?;
                     }
                     if !dn_fused_done && !f8_dn && !dn_z_early {
+                        xq_ensure!();
                         bmmq!(&w.gate_w, &sc.d_xn, &mut sc.d_z, qdedup);
                     }
                     // Gated norm -> row-e4m3 in one kernel when the f8t
@@ -10242,8 +9086,49 @@ impl GpuQwen35 {
                         && n_v_heads % 16 == 0
                         && exec.has_gated_rmsnorm_e4m3_row()
                         && paddock_models::dev_var_os!("PADDOCK_QWEN_GATED_ROW_FUSE").is_some();
-                    if !grer {
-                        if dn_strided {
+                    // the W8 out_proj reads only the e4m3 planes: norm + quantize in one launch
+                    // (the unified tick's gr_fused, bit-identical to the pair; d_core not landed)
+                    let gr_e4m3 = !grer
+                        && !(dn_strided || dn_cz_strided)
+                        && f8t_out_w.is_none()
+                        && f8_dn
+                        && l8d.is_some_and(|l| l.out_w.is_some())
+                        && exec.has_gated_rmsnorm_e4m3();
+                    debug_assert!(!dn_z_fused || gr_e4m3, "z left in the fused plane");
+                    let out_swz = w8_swz_on(&exec, l8d.and_then(|l| l.out_w_t.as_ref()), b);
+                    let zs = dn_z_fused
+                        && exec.gated_rmsnorm_e4m3_zs(
+                            &sc.d_dattn,
+                            bs.d_dn_fused.as_ref().expect("dn fused landing"),
+                            dn_z_off,
+                            dn_tot,
+                            n_v_heads,
+                            &w.ssm_norm.buf,
+                            &mut sc.d_pxq,
+                            (&mut sc.d_exs, out_swz),
+                            b * n_v_heads,
+                            state_size,
+                            eps,
+                        )?;
+                    if dn_z_fused && !zs {
+                        let fused = bs.d_dn_fused.as_ref().expect("dn fused landing");
+                        exec.row_slice(fused, &mut sc.d_z, dn_tot, dn_z_off, dn_tot - dn_z_off, b)?;
+                    }
+                    if zs {
+                    } else if gr_e4m3 {
+                        exec.gated_rmsnorm_e4m3(
+                            &sc.d_dattn,
+                            &sc.d_z,
+                            &w.ssm_norm.buf,
+                            None,
+                            &mut sc.d_pxq,
+                            &mut sc.d_exs,
+                            b * n_v_heads,
+                            state_size,
+                            eps,
+                        )?;
+                    } else if !grer {
+                        if dn_strided || dn_cz_strided {
                             let fused = bs.d_dn_fused.as_ref().expect("dn fused landing");
                             exec.gated_rmsnorm_s(
                                 &sc.d_dattn,
@@ -10303,18 +9188,20 @@ impl GpuQwen35 {
                             b,
                         )?;
                     } else if let Some(w8o) = l8d.and_then(|l| l.out_w.as_ref()).filter(|_| f8_dn) {
-                        exec.quantize_e4m3(
-                            &sc.d_core,
-                            &mut sc.d_pxq,
-                            &mut sc.d_exs,
-                            b * w.out_w.dims()[0],
-                        )?;
-                        exec.f8d_gemm_mma_ks(
-                            w8o,
+                        if !gr_e4m3 {
+                            exec.quantize_e4m3(
+                                &sc.d_core,
+                                &mut sc.d_pxq,
+                                &mut sc.d_exs,
+                                b * w.out_w.dims()[0],
+                            )?;
+                        }
+                        exec.f8d_gemm_t(
+                            (w8o, l8d.and_then(|l| l.out_w_t.as_ref())),
                             w.out_w.dims()[0],
                             w.out_w.dims()[1],
                             &sc.d_pxq,
-                            &sc.d_exs,
+                            (&sc.d_exs, out_swz && zs),
                             &mut bs.d_ks_part,
                             &mut sc.d_proj,
                             b,
@@ -10342,6 +9229,8 @@ impl GpuQwen35 {
                     }
                 }
             }
+            // nvf4_xq_swz: the norm wrote the W4A4 chain's scales swizzled (ops::nvf4_swz_on)
+            let (mut nvf4_xq, mut nvf4_xq_swz) = (false, false);
             // Post-norm -> row-e4m3 in one kernel, same rule as the pre-norm
             // above: legal only when the f8t FFN arm is CERTAIN to take it,
             // since the fused kernel never materialises d_xn in f32 and the
@@ -10376,15 +9265,45 @@ impl GpuQwen35 {
                     eps,
                 )?;
             } else {
-                exec.add_rmsnorm_batch(
-                    &mut sc.d_x,
-                    &sc.d_proj,
-                    &layer.post_norm.buf,
-                    &mut sc.d_xn,
-                    embd,
-                    eps,
-                    b,
-                )?;
+                // the W4A4 FFN's quantize_nvf4 folded into the norm (slot 876, bit-identical)
+                nvf4_xq = matches!(
+                    &layer.ffn,
+                    Ffn::Nvf4Dense {
+                        gu: super::Nvf4Gu::Fused(_),
+                        ..
+                    }
+                ) && rot.is_none()
+                    && b >= super::ops::nvf4_w4a4_min_rows()
+                    && exec.has_nvf4_gemm_f4()
+                    && self
+                        .bs_f8t_ffn
+                        .get(li)
+                        .and_then(|o| o.as_ref())
+                        .is_none_or(|_| b > f8t_dec_bmax())
+                    && {
+                        let (ok, swz) = super::ops::post_norm_nvf4(
+                            &exec,
+                            &layer.ffn,
+                            [&mut sc.d_x, &mut sc.d_xn],
+                            &sc.d_proj,
+                            &layer.post_norm.buf,
+                            (&mut sc.d_pxq, &mut sc.d_nvs),
+                            (embd, eps, b),
+                        )?;
+                        nvf4_xq_swz = swz;
+                        ok
+                    };
+                if !nvf4_xq {
+                    exec.add_rmsnorm_batch(
+                        &mut sc.d_x,
+                        &sc.d_proj,
+                        &layer.post_norm.buf,
+                        &mut sc.d_xn,
+                        embd,
+                        eps,
+                        b,
+                    )?;
+                }
             }
             let pn_staged = rot_stage!(&mut sc.d_xn, embd);
             match &layer.ffn {
@@ -10751,7 +9670,7 @@ impl GpuQwen35 {
                         )?;
                     } else {
                         // above the row band the chain takes the W4A4 arm
-                        nvf4_ffn(
+                        super::ops::nvf4_ffn_staged(
                             &exec,
                             gu,
                             down,
@@ -10767,6 +9686,8 @@ impl GpuQwen35 {
                             &mut sc.d_proj,
                             ff,
                             b,
+                            nvf4_xq,
+                            nvf4_xq_swz,
                         )?;
                     }
                 }
@@ -10964,13 +9885,11 @@ impl GpuQwen35 {
             b >= super::f8_head_min()
                 || paddock_models::dev_var_os!("PADDOCK_QWEN_F8_LMHEAD_LOWB").is_some()
         }) {
-            exec.quantize_e4m3(&sc.d_h, &mut sc.d_pxq, &mut sc.d_exs, b * embd)?;
-            exec.f8d_gemm_mma_ks(
-                p8,
-                *pi,
-                *po,
-                &sc.d_pxq,
-                &sc.d_exs,
+            exec.f8_head_logits(
+                (p8, self.out_f8_t.as_ref()),
+                (*pi, *po),
+                &sc.d_h,
+                (&mut sc.d_pxq, &mut sc.d_exs),
                 &mut bs.d_ks_part,
                 &mut bs.d_logits,
                 b,

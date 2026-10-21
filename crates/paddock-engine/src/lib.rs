@@ -38,6 +38,8 @@ pub mod kv_tier;
 #[cfg(feature = "cuda")]
 pub mod masks;
 pub mod metrics;
+#[cfg(feature = "cuda")]
+pub mod nemotron_asr;
 pub mod pacing;
 pub mod paged_radix;
 pub mod pillow;

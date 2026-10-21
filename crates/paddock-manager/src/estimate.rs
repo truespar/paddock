@@ -1204,10 +1204,21 @@ mod tests {
             for a in m.weights() {
                 let Some(shape) = &a.shape else { continue };
                 let no_decode = shape.kind != paddock_estimator::ModelKind::Generative;
+                // a streaming transducer transcribes with no KV to page: its
+                // decoder state is a few vectors, its encoder's caches are
+                // fixed rings priced in the workspace - an encoder shape
+                // with no KV layers is the honest price
+                let transducer = no_decode
+                    && m.capability.iter().all(|c| c == "transcription")
+                    && shape.kv_layers.is_empty();
                 assert_eq!(
-                    no_decode, single,
+                    no_decode,
+                    single || transducer,
                     "{}/{}: capability {:?} but shape kind {:?}",
-                    m.id, a.id, m.capability, shape.kind
+                    m.id,
+                    a.id,
+                    m.capability,
+                    shape.kind
                 );
                 // and the image kind is reserved for image generation, which
                 // must say so - a render priced as a token encoder would size

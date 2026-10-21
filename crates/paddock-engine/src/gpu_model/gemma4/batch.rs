@@ -23,7 +23,7 @@ use cudarc::driver::sys::CUstreamCaptureMode;
 use crate::gpu::GpuExecutor;
 use crate::kv_plan;
 
-use super::forward::{PF_ROWS, g4_e4m3_glu, pf_mmq};
+use super::forward::{PF_ROWS, g4_e4m3_glu, pf_down_q8, pf_gu_q8_arm, pf_mmq};
 use super::switches::r1_gu_off;
 pub(crate) use super::switches::{
     attn16_on, chunk16_on, f8t16_on, f8t16_wo_in, fae4_on, fae4s_on, fp4_on, gu_fuse_on,
@@ -3853,6 +3853,7 @@ impl GpuGemma4 {
             if moe_fork {
                 exec.side_fork()?;
             }
+            let mut gu_q8 = false; // gate|up landed the down's mmq input (pf_yq_ff)
             if f8r {
                 let gu = lw.f8_gu.as_ref();
                 let d8 = lw.f8_down.as_ref().expect("f8 FFN planes built as a set");
@@ -4480,10 +4481,9 @@ impl GpuGemma4 {
                 )?;
                 exec.glu(&mut sc.pf_gate, &sc.pf_up, r * n_ff, hp.glu_act())?;
             } else if let (Some(g8), Some(u8_)) = (lw.ffn_gate.q8(), lw.ffn_up.q8()) {
-                exec.quantize_q8_mmq(&sc.pf_normed, &mut sc.pf_yq, hp.n_embd, r)?;
-                pf_mmq(exec, g8, &sc.pf_yq, &mut sc.pf_skfix, &mut sc.pf_gate, r)?;
-                pf_mmq(exec, u8_, &sc.pf_yq, &mut sc.pf_skfix, &mut sc.pf_up, r)?;
-                exec.glu(&mut sc.pf_gate, &sc.pf_up, r * n_ff, hp.glu_act())?;
+                // past every e4m3 arm: the down is the mmq arm exactly when r > 192
+                let fuse = r > 192 && lw.ffn_down.q8().is_some();
+                gu_q8 = pf_gu_q8_arm(exec, sc, g8, u8_, hp.n_embd, r, hp.glu_act(), fuse)?;
             } else {
                 // k-quant gate/up: the W4A8 ladder per plane (r == 1 stages
                 // the row twice here; the dense decode walk in forward.rs
@@ -4522,8 +4522,7 @@ impl GpuGemma4 {
                     r,
                 )?;
             } else if let Some(d8) = lw.ffn_down.q8() {
-                exec.quantize_q8_mmq(&sc.pf_gate, &mut sc.pf_yq, n_ff, r)?;
-                pf_mmq(exec, d8, &sc.pf_yq, &mut sc.pf_skfix, &mut sc.pf_proj, r)?;
+                pf_down_q8(exec, sc, d8, r, gu_q8)?;
             } else {
                 lw.ffn_down
                     .gemm(exec, kq_rows!(sc), &sc.pf_gate, &mut sc.pf_proj, r)?;

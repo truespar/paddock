@@ -1230,16 +1230,21 @@ int pd_causal_conv1d_silu_qkv(const void* x, const void* w, void* q_out,
 // consumer (stage1_rs) rounds to bf16 itself today, so the pipeline is
 // BIT-IDENTICAL end to end. Paired with pd_gated_delta_chunked_rs_vl_qkc
 // by the ENGINE (one latch drives both slots - no env mirroring here).
+// win (the WIN twin, slot 873): one RESUMED span - rows are relative to x (the span's first
+// row, row0 0) and the k-1 taps before it come from the slot's conv window win[k-1][conv_dim]
+// (oldest first) instead of the zero pad. The ext build ran the same taps in the same order over
+// [window ++ span]; this reads them in place (no staging copies) and emits the QKC planes.
 template <bool QKC = false>
 __global__ void pd_causal_conv1d_silu_qkv_vl_kernel(
         const float* __restrict__ x, const float* __restrict__ w,
         const uint32_t* __restrict__ row0s, float* __restrict__ q_out,
         float* __restrict__ k_out, float* __restrict__ v_out,
-        uint32_t n_k_heads, uint32_t n_v_heads, uint32_t s, uint32_t k) {
+        uint32_t n_k_heads, uint32_t n_v_heads, uint32_t s, uint32_t k,
+        const float* __restrict__ win = nullptr) {
     const uint32_t row = blockIdx.y;
     const uint32_t j = threadIdx.x;
     if (j >= s) return;
-    const uint32_t row0 = row0s[row];
+    const uint32_t row0 = row0s ? row0s[row] : 0u;
     const uint32_t key_dim = s * n_k_heads;
     const uint32_t conv_dim = 2u * key_dim + s * n_v_heads;
     if (blockIdx.x >= n_k_heads) {
@@ -1256,7 +1261,9 @@ __global__ void pd_causal_conv1d_silu_qkv_vl_kernel(
         } else {
             for (uint32_t kk = 0; kk < k; ++kk) {
                 int64_t ti = (int64_t)row - (int64_t)(k - 1) + (int64_t)kk;
-                if (ti >= (int64_t)row0) av += w[(size_t)cv * k + kk] * x[(uint64_t)ti * conv_dim + cv];
+                const float* xr = ti >= (int64_t)row0 ? x + (uint64_t)ti * conv_dim
+                    : win ? win + (uint64_t)((int64_t)(k - 1) + ti) * conv_dim : nullptr;
+                if (xr) av += w[(size_t)cv * k + kk] * xr[cv];
             }
         }
         const float vj = av / (1.0f + expf(-av));
@@ -1283,8 +1290,9 @@ __global__ void pd_causal_conv1d_silu_qkv_vl_kernel(
     } else {
         for (uint32_t kk = 0; kk < k; ++kk) {
             int64_t ti = (int64_t)row - (int64_t)(k - 1) + (int64_t)kk;
-            if (ti >= (int64_t)row0) {
-                const float* xr = x + (uint64_t)ti * conv_dim;
+            const float* xr = ti >= (int64_t)row0 ? x + (uint64_t)ti * conv_dim
+                : win ? win + (uint64_t)((int64_t)(k - 1) + ti) * conv_dim : nullptr;
+            if (xr) {
                 aq += w[(size_t)cq * k + kk] * xr[cq];
                 ak += w[(size_t)ck * k + kk] * xr[ck];
             }
@@ -1349,6 +1357,23 @@ int pd_causal_conv1d_silu_qkv_vl_qkc(const void* x, const void* w,
     pd_causal_conv1d_silu_qkv_vl_kernel<true><<<grid, s, 0, (cudaStream_t)stream>>>(
         (const float*)x, (const float*)w, (const uint32_t*)row0s,
         (float*)q_out, (float*)k_out, (float*)v_out, n_k_heads, n_v_heads, s, k);
+    return pd_launch_status();
+}
+
+// WIN twin (slot 873): one resumed span, `x` at its first row, `win` at its slot's conv window
+// ([k-1][conv_dim], oldest first); q/k compact bf16 [rows, HK, s], v f32 expanded - the QKC
+// planes for a span the fresh-only vl conv cannot take. The caller updates the window after.
+PD_EXPORT
+int pd_causal_conv1d_silu_qkv_win_qkc(const void* x, const void* w, const void* win,
+                                      void* q_out, void* k_out, void* v_out, uint32_t n_rows,
+                                      uint32_t n_k_heads, uint32_t n_v_heads, uint32_t s,
+                                      uint32_t k, void* stream) {
+    if (n_rows == 0 || n_v_heads == 0 || s == 0) return 0;
+    if (s > 128 || (s & 31u) || win == nullptr) return cudaErrorInvalidValue;
+    dim3 grid(n_k_heads + n_v_heads, n_rows);
+    pd_causal_conv1d_silu_qkv_vl_kernel<true><<<grid, s, 0, (cudaStream_t)stream>>>(
+        (const float*)x, (const float*)w, nullptr, (float*)q_out, (float*)k_out, (float*)v_out,
+        n_k_heads, n_v_heads, s, k, (const float*)win);
     return pd_launch_status();
 }
 
@@ -1494,7 +1519,7 @@ int pd_delta_gate_ab(const void* ab, const void* ssm_a, const void* dt_bias, voi
     if (total == 0) return 0;
     uint32_t threads = 256;
     uint64_t blocks = (total + threads - 1) / threads;
-    pd_delta_gate_ab_kernel<<<(uint32_t)blocks, threads, 0, (cudaStream_t)stream>>>(
+    pd_pdl_go(pd_delta_gate_ab_kernel, (uint32_t)blocks, threads, 0, (cudaStream_t)stream,
         (const float*)ab, (const float*)ssm_a, (const float*)dt_bias, (float*)g,
         (float*)beta, n_tokens, n_heads);
     return pd_launch_status();
@@ -1586,6 +1611,7 @@ __global__ void pd_gated_rmsnorm_kernel(
         const float* __restrict__ weight, float* __restrict__ out,
         uint32_t n_rows, uint32_t d, float eps, uint32_t z_stride,
         uint32_t z_rows_per_b) {
+    PD_PDL_ARM_WAIT();   // programmatic dependent (pd_pdl_go): full predecessor completion
     uint32_t r = blockIdx.x;
     uint32_t j = threadIdx.x;
     if (r >= n_rows || j >= d) return;
@@ -1666,23 +1692,29 @@ __global__ void pd_gated_rmsnorm_e4m3_kernel(
 // __fmul_rn squares forbid FMA contraction like the smem stores did. The
 // per-32 quant reduces the same 32 values in the same shfl_xor butterfly;
 // e/scale math verbatim. Bit parity probed old-vs-new.
-// d == 128 only; kill: PADDOCK_NO_GRNQ_W32.
+// d == 128 only; kill: PADDOCK_NO_GRNQ_W32. z row r sits at (r / heads) * z_bstride +
+// (r % heads) * d: heads = 1, z_bstride = d is the contiguous plane; slot 878 points it into
+// the decode tick's fused in-proj plane (z half, row stride nc + nz) so z never lands split.
+// SW (slot 885): the scales at pd_nvf4_swz_off of the out-proj GEMM's rows (n_w 128-wide rows
+// of this kernel's to one of the GEMM's) instead of row-major - the same bytes.
+template <bool SW = false>
 __global__ void pd_gated_rmsnorm_e4m3_w8r_kernel(
         const float* __restrict__ x, const float* __restrict__ z,
         const float* __restrict__ weight, float* __restrict__ out,
         unsigned char* __restrict__ q, unsigned char* __restrict__ scale,
-        uint32_t n_rows, float eps) {
+        uint32_t n_rows, float eps, uint32_t z_bstride, uint32_t heads, uint32_t n_w) {
     const uint32_t d = 128u;
     const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
     const uint32_t r = blockIdx.x * 8u + warp;
     if (r >= n_rows) return;
     const size_t off = (size_t)r * d;
+    const float* zr = z + (size_t)(r / heads) * z_bstride + (size_t)(r % heads) * d;
     float xj[4], zj[4];
     #pragma unroll
     for (uint32_t p = 0; p < 4; ++p) {
         const uint32_t j = lane + p * 32u;
         xj[p] = x[off + j];
-        zj[p] = z[off + j];
+        zj[p] = zr[j];
     }
     const float s0 = __fmul_rn(xj[0], xj[0]);
     const float s1 = __fmul_rn(xj[1], xj[1]);
@@ -1713,9 +1745,56 @@ __global__ void pd_gated_rmsnorm_e4m3_w8r_kernel(
         }
         const float qinv = ldexpf(1.0f, -e);
         const size_t blk = (off + j) >> 5;
-        if (lane == 0u) scale[blk] = (unsigned char)(e + 127);
+        if (lane == 0u) {
+            if constexpr (SW) scale[pd_nvf4_swz_off(r / n_w, (r % n_w) * 4u + p, n_w)] = (unsigned char)(e + 127);
+            else scale[blk] = (unsigned char)(e + 127);
+        }
         q[off + j] = __nv_fp8_e4m3(v * qinv).__x;
     }
+}
+
+// Slot 878: pd_gated_rmsnorm_e4m3 with z read strided - row r's z at z + (r / heads) *
+// z_bstride + (r % heads) * d (floats). d == 128 only (the w8r kernel; NotSupported otherwise,
+// or with PADDOCK_NO_GRNQ_W32), so the bits are pd_gated_rmsnorm_e4m3's w8r arm's.
+PD_EXPORT
+int pd_gated_rmsnorm_e4m3_zs(const void* x, const void* z, uint32_t z_bstride, uint32_t heads,
+                             const void* weight, void* out, void* q, void* scale,
+                             uint32_t n_rows, uint32_t d, float eps, void* stream) {
+#if defined(PD_BS_HOST)
+    if (n_rows == 0) return 0;
+    static const bool no_w32 = pd_env("PADDOCK_NO_GRNQ_W32") != nullptr;
+    if (d != 128u || heads == 0u || no_w32) return cudaErrorNotSupported;
+    pd_gated_rmsnorm_e4m3_w8r_kernel<false><<<(n_rows + 7u) / 8u, 256, 0, (cudaStream_t)stream>>>(
+        (const float*)x, (const float*)z, (const float*)weight, (float*)out, (unsigned char*)q,
+        (unsigned char*)scale, n_rows, eps, z_bstride, heads, 0u);
+    return pd_launch_status();
+#else
+    (void)x; (void)z; (void)z_bstride; (void)heads; (void)weight; (void)out; (void)q;
+    (void)scale; (void)n_rows; (void)d; (void)eps; (void)stream;
+    return cudaErrorNotSupported;
+#endif
+}
+
+// 885: slot 878 with the scales in the out-proj GEMM's swizzled atom layout (n_w = that GEMM's
+// in_dim / 128 = the 128-wide rows here a GEMM row; scale holds ceil(n_rows / n_w / 128) * 128
+// GEMM rows' worth) for the scale-swizzled W8 entry (887). 878's election otherwise.
+PD_EXPORT
+int pd_gated_rmsnorm_e4m3_zs_sw(const void* x, const void* z, uint32_t z_bstride, uint32_t heads,
+                                const void* weight, void* out, void* q, void* scale,
+                                uint32_t n_rows, uint32_t d, float eps, uint32_t n_w, void* stream) {
+#if defined(PD_BS_HOST)
+    if (n_rows == 0) return 0;
+    static const bool no_w32 = pd_env("PADDOCK_NO_GRNQ_W32") != nullptr;
+    if (d != 128u || heads == 0u || n_w == 0u || n_rows % n_w != 0u || no_w32) return cudaErrorNotSupported;
+    pd_gated_rmsnorm_e4m3_w8r_kernel<true><<<(n_rows + 7u) / 8u, 256, 0, (cudaStream_t)stream>>>(
+        (const float*)x, (const float*)z, (const float*)weight, (float*)out, (unsigned char*)q,
+        (unsigned char*)scale, n_rows, eps, z_bstride, heads, n_w);
+    return pd_launch_status();
+#else
+    (void)x; (void)z; (void)z_bstride; (void)heads; (void)weight; (void)out; (void)q;
+    (void)scale; (void)n_rows; (void)d; (void)eps; (void)n_w; (void)stream;
+    return cudaErrorNotSupported;
+#endif
 }
 
 PD_EXPORT
@@ -1727,10 +1806,10 @@ int pd_gated_rmsnorm_e4m3(const void* x, const void* z, const void* weight,
     if (d & 31u) return cudaErrorInvalidValue;
     static const bool no_w32 = pd_env("PADDOCK_NO_GRNQ_W32") != nullptr;
     if (d == 128u && !no_w32) {
-        pd_gated_rmsnorm_e4m3_w8r_kernel<<<(n_rows + 7u) / 8u, 256,
-                                           0, (cudaStream_t)stream>>>(
+        pd_gated_rmsnorm_e4m3_w8r_kernel<false><<<(n_rows + 7u) / 8u, 256,
+                                                  0, (cudaStream_t)stream>>>(
             (const float*)x, (const float*)z, (const float*)weight, (float*)out,
-            (unsigned char*)q, (unsigned char*)scale, n_rows, eps);
+            (unsigned char*)q, (unsigned char*)scale, n_rows, eps, d, 1u, 0u);
         return pd_launch_status();
     }
     size_t shmem = (size_t)d * sizeof(float);
@@ -1883,7 +1962,7 @@ int pd_gated_rmsnorm(const void* x, const void* z, const void* weight, void* out
                      uint32_t n_rows, uint32_t d, float eps, void* stream) {
     if (n_rows == 0 || d == 0) return 0;
     size_t shmem = (size_t)d * sizeof(float);
-    pd_gated_rmsnorm_kernel<<<n_rows, d, shmem, (cudaStream_t)stream>>>(
+    pd_pdl_go(pd_gated_rmsnorm_kernel, n_rows, d, shmem, (cudaStream_t)stream,
         (const float*)x, (const float*)z, (const float*)weight, (float*)out,
         n_rows, d, eps, d, 1u);
     return pd_launch_status();
@@ -1900,7 +1979,7 @@ int pd_gated_rmsnorm_s(const void* x, const void* z, const void* weight,
     if (z_rows_per_b == 0 || z_stride < z_rows_per_b * d)
         return cudaErrorInvalidValue;
     size_t shmem = (size_t)d * sizeof(float);
-    pd_gated_rmsnorm_kernel<<<n_rows, d, shmem, (cudaStream_t)stream>>>(
+    pd_pdl_go(pd_gated_rmsnorm_kernel, n_rows, d, shmem, (cudaStream_t)stream,
         (const float*)x, (const float*)z, (const float*)weight, (float*)out,
         n_rows, d, eps, z_stride, z_rows_per_b);
     return pd_launch_status();
@@ -2066,6 +2145,7 @@ int pd_imrope(void* x, const void* positions, uint32_t n_tokens, uint32_t n_head
 // Sigmoid output gate, in place: x[i] *= sigmoid(gate[i]). grid ceil(n/256).
 __global__ void pd_mul_sigmoid_kernel(float* __restrict__ x, const float* __restrict__ gate,
                                       uint32_t n) {
+    PD_PDL_ARM_WAIT();   // programmatic dependent (pd_pdl_go): full predecessor completion
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     x[i] *= 1.0f / (1.0f + expf(-gate[i]));
@@ -2106,7 +2186,7 @@ int pd_mul_sigmoid(void* x, const void* gate, uint32_t n, void* stream) {
     }
     uint32_t threads = 256;
     uint32_t blocks = (n + threads - 1) / threads;
-    pd_mul_sigmoid_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+    pd_pdl_go(pd_mul_sigmoid_kernel, blocks, threads, 0, (cudaStream_t)stream,
         (float*)x, (const float*)gate, n);
     return pd_launch_status();
 }
@@ -2272,6 +2352,7 @@ int pd_swiglu_fused_il(const void* fused, void* out, uint32_t ff, uint32_t n_row
 __global__ void pd_row_slice_kernel(const float* __restrict__ src,
                                     float* __restrict__ dst, uint32_t stride,
                                     uint32_t off, uint32_t width, uint32_t n) {
+    PD_PDL_ARM_WAIT();   // programmatic dependent (pd_pdl_go): full predecessor completion
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     uint32_t r = i / width, c = i % width;
@@ -2391,7 +2472,7 @@ int pd_row_slice(const void* src, void* dst, uint32_t src_stride, uint32_t col_o
                  uint32_t width, uint32_t rows, void* stream) {
     if (rows == 0 || width == 0) return 0;
     uint32_t n = rows * width;
-    pd_row_slice_kernel<<<(n + 255u) / 256u, 256, 0, (cudaStream_t)stream>>>(
+    pd_pdl_go(pd_row_slice_kernel, (n + 255u) / 256u, 256, 0, (cudaStream_t)stream,
         (const float*)src, (float*)dst, src_stride, col_off, width, n);
     return pd_launch_status();
 }
@@ -2412,6 +2493,7 @@ int pd_swiglu(void* gate, const void* up, uint32_t n, void* stream) {
 __global__ void pd_split_qg_kernel(const float* __restrict__ qg, float* __restrict__ q_out,
                                    float* __restrict__ gate_out,
                                    uint32_t n_tokens, uint32_t n_heads, uint32_t head_dim) {
+    PD_PDL_ARM_WAIT();   // programmatic dependent (pd_pdl_go): full predecessor completion
     uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t total = (uint64_t)n_tokens * n_heads * head_dim;
     if (idx >= total) return;
@@ -2430,7 +2512,7 @@ int pd_split_qg(const void* qg, void* q_out, void* gate_out,
     if (total == 0) return 0;
     uint32_t threads = 256;
     uint64_t blocks = (total + threads - 1) / threads;
-    pd_split_qg_kernel<<<(uint32_t)blocks, threads, 0, (cudaStream_t)stream>>>(
+    pd_pdl_go(pd_split_qg_kernel, (uint32_t)blocks, threads, 0, (cudaStream_t)stream,
         (const float*)qg, (float*)q_out, (float*)gate_out, n_tokens, n_heads, head_dim);
     return pd_launch_status();
 }

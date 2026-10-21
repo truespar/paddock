@@ -10,7 +10,13 @@ use paddock_models::mapped::MappedGguf;
 /// the same inputs (`pictures::picture_key`), so the two can only disagree on
 /// a 64-bit collision here - and the radix needs rows, not bytes, to hold.
 pub(super) fn image_content_hash(rgb: &[u8], w: usize, h: usize) -> u64 {
-    hash_bytes(rgb) ^ (w as u64).wrapping_mul(31) ^ (h as u64).wrapping_mul(131)
+    // the picture store's BLAKE3 key (dims folded in), first 8 bytes. It was a
+    // byte-serial FNV-1a: ~7 ms over a 1568 px page, taken three times per
+    // picture on the engine thread (would-resume, route, slot begin) - 3.8% of
+    // that thread under the B200 recover load (perf, 2026-10-19), GPU idle
+    // behind it. Keys the in-memory radix only, so the value may change.
+    let k = crate::gpu_model::picture_store::picture_key(rgb, w, h);
+    u64::from_le_bytes(k[..8].try_into().expect("32-byte key"))
 }
 
 impl GpuQwen35 {
@@ -820,46 +826,7 @@ impl GpuQwen35 {
                             )?;
                         }
                     } else {
-                        prefill_mm_pre_any(
-                            &exec,
-                            gate,
-                            &sc.d_pxq,
-                            &sc.d_pxs,
-                            &sc.d_yq,
-                            &mut sc.d_xsums,
-                            &mut sc.d_ssums,
-                            &mut sc.d_skfix,
-                            &mut sc.d_ffn_gate,
-                            r,
-                        )?;
-                        prefill_mm_pre_any(
-                            &exec,
-                            up,
-                            &sc.d_pxq,
-                            &sc.d_pxs,
-                            &sc.d_yq,
-                            &mut sc.d_xsums,
-                            &mut sc.d_ssums,
-                            &mut sc.d_skfix,
-                            &mut sc.d_ffn_up,
-                            r,
-                        )?;
-                        prefill_ffn_down_rot(
-                            &exec,
-                            down,
-                            &mut sc.d_pxq,
-                            &mut sc.d_pxs,
-                            &mut sc.d_yq,
-                            &mut sc.d_xsums,
-                            &mut sc.d_ssums,
-                            &mut sc.d_skfix,
-                            &mut sc.d_ffn_gate,
-                            &sc.d_ffn_up,
-                            &mut sc.d_proj,
-                            ff,
-                            r,
-                            rot,
-                        )?;
+                        prefill_ffn_dense(&exec, sc, gate, up, down, ff, r, rot)?;
                     }
                 }
                 Ffn::Nvf4Dense { gu, down } => {

@@ -241,6 +241,12 @@ enum : uint32_t { PD_DIAR_ROPE = 3u, PD_DIAR_SWIGLU = 4u };
 // blocks), in torch's CUDA operation order: 0.5 x (1 + tanh(sqrt(2 / pi)
 // (x + 0.044715 x^3)))
 enum : uint32_t { PD_DIAR_GELU_TANH = 5u };
+// 6-9: Nemotron 3.5 ASR's conformer (asr/nemotron_asr.cuh, slot 853 only;
+// the diarization and Clef exports still refuse them): 6 SiLU, 7 accumulate
+// half the result into y (the macaron FFN's x + 0.5 f(x)), 8 the
+// convolution module's GLU over rows interleaved as SwiGLU's (row 2j the
+// value j, 2j + 1 its gate: y[m][j] = a * sigmoid(b), N / 2 wide), 9 ReLU
+enum : uint32_t { PD_NASR_SILU = 6u, PD_NASR_HALF_RESID = 7u, PD_NASR_GLU = 8u, PD_NASR_RELU = 9u };
 
 static __device__ __forceinline__ float pd_diar_gelu_tanh(float x) {
     const float cube = __fmul_rn(__fmul_rn(x, x), x);
@@ -546,7 +552,7 @@ pd_diar_gemm_kernel(const float* __restrict__ x, const uint8_t* __restrict__ w,
             return;
         }
     }
-    if (mode == PD_DIAR_SWIGLU) {
+    if (mode == PD_DIAR_SWIGLU || mode == PD_NASR_GLU) {
 #pragma unroll
         for (uint32_t mt = 0; mt < MT; ++mt)
 #pragma unroll
@@ -561,7 +567,9 @@ pd_diar_gemm_kernel(const float* __restrict__ x, const uint8_t* __restrict__ w,
                         g = __fadd_rn(g, bias[n]);
                         u = __fadd_rn(u, bias[n + 1u]);
                     }
-                    y[(size_t)m * (N / 2u) + n / 2u] = pd_glu_act<PD_ACT_SILU>(g) * u;
+                    y[(size_t)m * (N / 2u) + n / 2u] =
+                        mode == PD_NASR_GLU ? __fmul_rn(g, __fdiv_rn(1.0f, __fadd_rn(1.0f, expf(-u))))
+                                            : pd_glu_act<PD_ACT_SILU>(g) * u;
                 }
         return;
     }
@@ -578,8 +586,12 @@ pd_diar_gemm_kernel(const float* __restrict__ x, const uint8_t* __restrict__ w,
                 if (bias) z = __fadd_rn(z, bias[n]);
                 if (mode == PD_KUMO_GELU) z = pd_kumo_gelu(z);
                 else if (mode == PD_DIAR_GELU_TANH) z = pd_diar_gelu_tanh(z);
+                else if (mode == PD_NASR_SILU) z = pd_glu_act<PD_ACT_SILU>(z);
+                else if (mode == PD_NASR_RELU) z = fmaxf(z, 0.f);
                 float* o = y + (size_t)m * N + n;
-                *o = mode == PD_KUMO_RESID ? __fadd_rn(*o, z) : z;
+                *o = mode == PD_KUMO_RESID        ? __fadd_rn(*o, z)
+                     : mode == PD_NASR_HALF_RESID ? __fadd_rn(*o, __fmul_rn(0.5f, z))
+                                                  : z;
             }
 }
 

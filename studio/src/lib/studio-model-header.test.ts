@@ -20,6 +20,7 @@ import endpoints from '../../../apps/macos/Sources/PaddockUI/EndpointsView.swift
 import conversation from '../../../apps/macos/Sources/PaddockUI/StudioConversationView.swift?raw'
 import rendererCommands from '../../../apps/macos/Sources/PaddockUI/StudioRendererCommands.swift?raw'
 import modelPicker from '../../../apps/macos/Sources/PaddockUI/StudioComposerModelPicker.swift?raw'
+import selection from '../../../apps/macos/Sources/PaddockUI/StudioOptionsView.swift?raw'
 import footer from '../../../apps/macos/Sources/PaddockUI/StudioSidebarFooter.swift?raw'
 
 const local: ModelInfo = { id: 'local-qwen', display: 'Qwen 3.8 27B', ownedBy: 'paddock', vendor: 'Alibaba', port: 12481, vision: true, spec: 'MTP', kind: 'chat', status: 'ok' }
@@ -136,10 +137,12 @@ describe('shared web/native model header', () => {
     expect(toolbar).not.toContain('areaPicker')
     expect(composer).toContain('StudioComposerModelPicker(chat: chat')
     expect(modelPicker).toContain('accessibilityIdentifier("composer-model")')
-    expect(modelPicker).toContain('chat.perform("models"')
-    expect(modelPicker).toContain('.disabled(!option.available)')
-    expect(modelPicker).toContain('Button("Compare models…"')
-    expect(composer).toContain('StudioCompareView(chat: chat)')
+    // The picker opens one searchable selection view; Single and Compare are its two tabs.
+    expect(modelPicker).toContain('StudioModelSelectionView(chat: chat')
+    expect(selection).toContain('chat.perform("models"')
+    expect(selection).toContain('.disabled(model.status != "ok")')
+    expect(selection).toContain('Text("Compare").tag(true)')
+    expect(composer).not.toContain('StudioCompareView(')
     expect(workspace).not.toContain('StudioActivityRail(')
     expect(workspace).toContain('StudioSidebarFooter(navigation: $model.navigation)')
     expect(footer).toContain('destination(.settings, title: "Settings")')
@@ -186,9 +189,10 @@ describe('shared web/native model header', () => {
     expect(tools).toContain('Button("Thinking…") { panel = .reasoning }')
     expect(tools).toContain('accessibilityIdentifier("composer-more")')
     expect(overflow).toContain('get: { panel?.usesOverflow == true }')
-    expect(composer).toContain('case .image, .compare: false')
+    expect(composer).toContain('case .image: false')
+    expect(composer).not.toContain('.compare')
     expect(tools).not.toContain('Button("Compare models…")')
-    expect(modelPicker).toContain('Button("Compare models…", action: compare)')
+    expect(modelPicker).not.toContain('Compare models')
   })
   it('keeps samples diagnostic-only and offers no web renderer switch', () => {
     expect(conversation).not.toMatch(/Transcript renderer|NativeMarkdownSamples|pickerStyle\(.segmented\)/)

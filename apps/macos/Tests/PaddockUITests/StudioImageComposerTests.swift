@@ -41,7 +41,7 @@ struct StudioImageComposerTests {
         systemSymbolName: StudioComposerView.pictureSettingsSymbol,
         accessibilityDescription: nil) != nil)
     for panel in StudioComposerView.Panel.allCases {
-      #expect(panel.usesOverflow == (panel != .image && panel != .compare))
+      #expect(panel.usesOverflow == (panel != .image))
     }
   }
   @Test func imageModeOnlyOffersControlsThatTheEndpointCanUse() {

@@ -11,7 +11,7 @@ extension NativeStudioRuntime {
       "draft", "stop", "refresh", "artifactsPane", "tools", "toolQuery", "historyFilter", "preview",
       "openDocument", "closePreview", "graphPanel", "graphArtifact", "toolApproval",
       "preferencesGet", "promptList", "promptGet", "instructionsGet", "transcriptExport",
-      "composerSize", "renderer", "quote",
+      "composerSize", "renderer", "quote", "saveDraft",
     ]
     if !concurrent.contains(kind) {
       try idle()
@@ -28,9 +28,10 @@ extension NativeStudioRuntime {
       switch kind {
       case "refresh":
         try await refreshModels()
-        history = try await transport.listConversations()
+        try await loadHistory()
         try await refreshArtifacts()
       case "draft": draftText = try Self.text(p["text"], limit: 128 * 1024)
+      case "saveDraft": result = try await saveComposerDraft(p)
       case "composerSize", "renderer": break  // Layout/rendering is wholly native.
       case "quote": result["text"] = .string("")  // The selected TextKit view owns selection.
       case "newChat":
@@ -61,32 +62,8 @@ extension NativeStudioRuntime {
         try change { $0["model"] = .string(modelID) }
         documentDisplay = NativeOCRDisplayCache()
       case "open":
-        documentSelectionRevision += 1
-        graphSelectionRevision += 1
         let id = try Self.id(p["id"])
-        var loaded = try await transport.loadConversation(id)
-        loaded.migrateTree()
-        // An app/process interruption must never leave old rows spinning forever.
-        var fields = loaded.fields
-        fields["messages"] = .array(
-          loaded.messages.map { m in
-            var value = m
-            if value["streaming"]?.bool == true {
-              value["streaming"] = .bool(false)
-              value["stopped"] = .bool(true)
-            }
-            return .object(NativeDocumentRunState.recover(value))
-          })
-        document = try .init(fields: fields)
-        documentDisplay = NativeOCRDisplayCache()
-        draft = false
-        staged = [:]
-        previewPart = nil
-        documentPreview = nil
-        graphVisible = false
-        graphArtifact = nil
-        graphGrounding = ""
-        try await refreshArtifacts()
+        try await openConversationAndDraft(id)
       case "models":
         let ids = p["ids"]?.array?.compactMap(\.string) ?? []
         guard (1...4).contains(ids.count), Set(ids).count == ids.count else {
@@ -282,14 +259,22 @@ extension NativeStudioRuntime {
       case "messageAction": result = try await messageAction(p, requestID: id)
       case "renameChat", "pinChat":
         let cid = try Self.id(p["id"])
-        var doc = cid == document?.id ? document! : try await transport.loadConversation(cid)
+        let savedDraft =
+          cid == document?.id
+          ? nil : try await transport.api("api/conversation-drafts/\(cid)").object
+        var doc =
+          cid == document?.id
+          ? document! : try await draftableConversation(cid, savedDraft: savedDraft).document
         if kind == "renameChat" {
           try doc.rename(try Self.text(p["title"], limit: 512))
         } else {
           doc.setPinned(doc.fields["pinned"]?.bool != true)
         }
         try await save(doc)
-        if cid == document?.id { document = doc }
+        if cid == document?.id {
+          document = doc
+          draft = false
+        }
       case "deleteChats":
         guard let ids = p["ids"]?.array, !ids.isEmpty, ids.count <= 100 else {
           throw ConversationFailure.invalid("Select conversations to delete")

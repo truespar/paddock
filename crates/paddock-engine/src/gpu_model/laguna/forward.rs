@@ -816,6 +816,11 @@ impl Generator for GpuLaguna {
     fn release_inactive_slots(&mut self, occupied: &[bool]) {
         self.release_inactive_slots_impl(occupied);
     }
+    fn set_slot_background(&mut self, slot: usize, on: bool) {
+        if let Some(pf) = self.batch.as_mut().and_then(|b| b.prefix.as_mut()) {
+            pf.radix.set_slot_low(slot, on);
+        }
+    }
 
     fn reply_pin_at(&mut self, slot: usize, history: &[u32], pos: u32) {
         // a failed copy costs the next turn its resume, never this reply

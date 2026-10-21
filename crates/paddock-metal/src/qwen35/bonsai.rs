@@ -13,7 +13,16 @@ pub(super) const AFFINE2: u32 = 0x102;
 thread_local! {
     pub(super) static BASELINE_PROJECTIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static BASELINE_PREFILL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BASELINE_MIXED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BASELINE_HALF_STAGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BASELINE_SHORT_HALF_STAGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BASELINE_DEEP_STAGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BASELINE_ATTENTION_AHEAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+#[cfg(test)]
+#[path = "bonsai_perf_tests.rs"]
+mod perf_tests;
 
 fn error(s: impl Into<String>) -> MetalError {
     MetalError::Model(format!("Bonsai MLX: {}", s.into()))
@@ -253,16 +262,68 @@ impl Bonsai {
         let fused = fused && !BASELINE_PROJECTIONS.with(|v| v.get());
         #[cfg(test)]
         let fused = fused && !ternary_add_tests::ADD_PROJECTIONS.with(|v| v.get());
+        let mixed =
+            fused && packed == 2 && planes.len() == 4 && planes[2..].iter().all(|(w, _)| w.ty == 0);
+        #[cfg(test)]
+        let mixed = mixed && !BASELINE_MIXED.get();
+        if mixed {
+            let [(a, ao), (b, bo), (c, co), (d, do_)] = planes else {
+                unreachable!("validated four-plane projection");
+            };
+            cmd.dispatch_at(
+                [
+                    "bonsai_mixed1",
+                    "bonsai_mixed2",
+                    "bonsai_mixed3",
+                    "bonsai_mixed4",
+                ][rows - 1],
+                &[
+                    &a.buffer,
+                    &b.buffer,
+                    &c.buffer,
+                    &d.buffer,
+                    &self.rotated,
+                    input,
+                    ao,
+                    bo,
+                    co,
+                    do_,
+                ],
+                &[
+                    0,
+                    0,
+                    0,
+                    0,
+                    first * k * 4,
+                    first * k * 4,
+                    first * a.n * 4,
+                    first * b.n * 4,
+                    first * c.n * 4,
+                    first * d.n * 4,
+                ],
+                &[
+                    k as u32,
+                    a.n as u32,
+                    b.n as u32,
+                    c.n as u32,
+                    d.n as u32,
+                    rows as u32,
+                ],
+                [planes.iter().map(|(w, _)| w.n.div_ceil(16)).sum(), 1, 1],
+                128,
+            );
+            return;
+        }
         if fused {
             let (a, ao) = planes[0];
             let (b, bo) = planes[1];
             let (c, co) = planes[if packed == 3 { 2 } else { 1 }];
             cmd.dispatch_at(
                 [
-                    "bonsai_multi1",
-                    "bonsai_multi2",
-                    "bonsai_multi3",
-                    "bonsai_multi4",
+                    "bonsai_bits_multi1",
+                    "bonsai_bits_multi2",
+                    "bonsai_bits_multi3",
+                    "bonsai_bits_multi4",
                 ][rows - 1],
                 &[&a.buffer, &b.buffer, &c.buffer, &self.rotated, ao, bo, co],
                 &[
@@ -298,13 +359,59 @@ impl Bonsai {
             let optimized = w.ty == AFFINE2 && cmd.tensor_accelerated();
             #[cfg(test)]
             let optimized = optimized && !BASELINE_PROJECTIONS.with(|v| v.get());
+            // Resumed tool prompts often occupy 32/64-row tiles. Their packed
+            // ternary values are exactly representable in F16 too: stage the
+            // smaller weight tile, not the model or its F32 activations/state.
+            let short_half_staging = optimized;
+            #[cfg(test)]
+            let short_half_staging = short_half_staging && !BASELINE_SHORT_HALF_STAGING.get();
             let (kernel, cols, tile) = if prefill && w.ty == AFFINE2 {
                 if rows <= 16 {
                     ("bonsai_prefill16", 32, 16)
                 } else if rows <= 32 {
-                    ("bonsai_prefill32", 32, 32)
+                    (
+                        if short_half_staging {
+                            "bonsai_prehalf32x128"
+                        } else {
+                            "bonsai_prefill32"
+                        },
+                        32,
+                        32,
+                    )
+                } else if optimized && w.n >= 5120 && (rows >= 256 || (rows == 128 && w.n == 5120))
+                {
+                    let half_staging = true;
+                    #[cfg(test)]
+                    let half_staging = half_staging && !BASELINE_HALF_STAGING.get();
+                    // Only long prompt spans amortize the larger shared tile.
+                    // Keep short resumed prompts and all decode paths intact.
+                    let deep_staging = rows >= 256 && k.is_multiple_of(256);
+                    #[cfg(test)]
+                    let deep_staging = deep_staging && !BASELINE_DEEP_STAGING.get();
+                    // Ternary values are exactly {-scale,0,+scale}, with an
+                    // F16 scale in the original checkpoint. Compact only the
+                    // shared-memory weight tile; keep F32 activations/state.
+                    (
+                        if half_staging && deep_staging {
+                            "bonsai_prehalf128x256"
+                        } else if half_staging {
+                            "bonsai_prehalf128x128"
+                        } else {
+                            "bonsai_prefill128"
+                        },
+                        32,
+                        128,
+                    )
                 } else {
-                    ("bonsai_prefill64", 32, 64)
+                    (
+                        if short_half_staging {
+                            "bonsai_prehalf64x128"
+                        } else {
+                            "bonsai_prefill64"
+                        },
+                        32,
+                        64,
+                    )
                 }
             } else if prefill {
                 // Unquantized F32 gates keep strict arithmetic, including
@@ -313,10 +420,10 @@ impl Bonsai {
             } else if optimized && rows <= 4 {
                 (
                     [
-                        "bonsai_full1",
-                        "bonsai_full2",
-                        "bonsai_full3",
-                        "bonsai_full4",
+                        "bonsai_bits1",
+                        "bonsai_bits2",
+                        "bonsai_bits3",
+                        "bonsai_bits4",
                     ][rows - 1],
                     16,
                     rows,
@@ -423,8 +530,15 @@ impl Qwen35 {
         }
         if decode_rows > 0 {
             let splits = decode_length.div_ceil(128).clamp(16, MAX_SPLITS);
+            let attention_ahead = self.device.tensor_accelerated() && decode_rows == 1;
+            #[cfg(test)]
+            let attention_ahead = attention_ahead && !BASELINE_ATTENTION_AHEAD.get();
             cmd.dispatch(
-                "bonsai_attention_decode",
+                if attention_ahead {
+                    "bonsai_attention_value2"
+                } else {
+                    "bonsai_attention_decode"
+                },
                 &[
                     &s.q,
                     &w.keys,
@@ -475,7 +589,14 @@ mod phase_tests {
         if !device.tensor_accelerated() {
             return;
         }
-        let (k, rows) = (1024usize, 78usize);
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                BASELINE_PROJECTIONS.set(false);
+            }
+        }
+        let _reset = Reset;
+        let (k, rows) = (1024usize, 82usize);
         let upload = |v: &[f32]| {
             device
                 .upload_parts(&[&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>()])
@@ -527,6 +648,16 @@ mod phase_tests {
             n: 67,
             ty: 0,
         };
+        let gate2 = Weight {
+            buffer: upload(
+                &(0..k * 11)
+                    .map(|i| ((i * 31 % 257) as f32 - 128.) / 1031.7)
+                    .collect::<Vec<_>>(),
+            ),
+            k,
+            n: 11,
+            ty: 0,
+        };
         let spans = [
             (0, 2, 1),
             (2, 7, CHUNK),
@@ -534,6 +665,7 @@ mod phase_tests {
             (10, 64, CHUNK),
             (74, 3, 1),
             (77, 1, CHUNK),
+            (78, 4, 1),
         ];
         let singletons = spans
             .iter()
@@ -543,7 +675,8 @@ mod phase_tests {
         for third in [&weights[2], &gate] {
             let mut expected = Vec::new();
             for roles in [&singletons[..], &spans[..]] {
-                let outputs = [19usize, 35, 67].map(|n| upload(&vec![sentinel; rows * n + 16]));
+                BASELINE_PROJECTIONS.set(expected.is_empty());
+                let outputs = [19usize, 35, 67, 11].map(|n| upload(&vec![sentinel; rows * n + 16]));
                 let cmd = device.begin().unwrap();
                 lane.project(
                     &cmd,
@@ -551,13 +684,14 @@ mod phase_tests {
                         (&weights[0], &outputs[0]),
                         (&weights[1], &outputs[1]),
                         (third, &outputs[2]),
+                        (&gate2, &outputs[3]),
                     ],
                     &input,
                     rows,
                     Some(roles),
                 );
                 cmd.finish().unwrap();
-                let actual = [19usize, 35, 67]
+                let actual = [19usize, 35, 67, 11]
                     .into_iter()
                     .zip(&outputs)
                     .map(|(n, o)| {

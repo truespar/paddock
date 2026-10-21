@@ -1954,12 +1954,12 @@ pd_attn_prefill_f16_v3_kernel(
 }
 
 // ---- v3-512: the GQA-fused prefill tile at gemma4's GLOBAL geometry
-// (head_dim 512, GQA 8:1). Same posture as v3 (K/V staged once per tile for
+// (head_dim 512, GQA 8:1 or 16:1). Same posture as v3 (K/V staged once per tile for
 // the q-group, register S/O, FA-2 online softmax) but hd512 doubles both the
 // pinned Q (128 u32) and the O accumulator (256 f32) past the 255-reg cap -
-// so each block takes half the q-group and each head splits across two
+// so each block takes four heads of the q-group and each head splits across two
 // D-half warps: 256 threads = 8 warps = 4 heads x 2 halves,
-// grid (n_kv, rows/NR, 2 head-pairs). Per warp: Q-half 64 regs + O-half 128.
+// grid (n_kv, rows/NR, group/4 head slices). Per warp: Q-half 64 regs + O-half 128.
 // The halves' partial S exchange through one smem pane per head (the only
 // cross-warp traffic; +1 barrier vs v3), softmax then runs REDUNDANTLY in
 // both halves from the summed S - no second exchange. K/V staging costs are
@@ -1986,18 +1986,23 @@ pd_attn_prefill_f16_v3w_kernel(
     const unsigned int* __restrict__ win_pos) {
 #if PD_MMA_OK
     constexpr uint32_t NR = PD_AF3W_NR, TK = PD_AF3W_TK;
-    constexpr uint32_t HB = 4u;        // heads per block (half the 8-group)
+    constexpr uint32_t HB = 4u;        // heads per block (a quarter of a 16-group)
     constexpr uint32_t DH = D / 2u;    // dims per warp
     constexpr uint32_t DPD = D + 8u;
 
+    // the q-group comes from the head counts: 8 on the 31B / 26B-A4B
+    // globals, 16 on the 12B's single kv head. gridDim.z = group / HB, so
+    // each block still serves 4 heads of one kv head - a group of 16 just
+    // re-stages that head's K/V in 4 blocks instead of 2.
+    const uint32_t group = n_heads / n_kv_heads;
     const uint32_t kvh = blockIdx.x;
     const uint32_t row0 = blockIdx.y * NR;
-    const uint32_t pair = blockIdx.z;  // which 4-head half of the q-group
+    const uint32_t pair = blockIdx.z;  // which 4-head slice of the q-group
     const uint32_t tid = threadIdx.x, warp = tid >> 5, lane = tid & 31u;
     const uint32_t g8 = lane >> 2, t4 = lane & 3u;
     const uint32_t hw = warp >> 1;     // head-in-block 0..4
     const uint32_t hf = warp & 1u;     // D-half 0..2
-    const uint32_t h = kvh * 8u + pair * HB + hw;
+    const uint32_t h = kvh * group + pair * HB + hw;
     const uint32_t dbase = hf * DH;    // this warp's dim range [dbase, dbase+DH)
     const uint32_t slot = slots ? slots[0] : 0u;
     const unsigned int* wp = pd_pf_wp(positions, win_pos);

@@ -53,6 +53,7 @@ struct StudioHistoryRow: View {
               if row.pinned == true { Image(systemName: "pin.fill").font(.system(size: 9)) }
             }
             HStack(spacing: 8) {
+              if row.composerDraft == true { Text("Draft").fontWeight(.medium) }
               if !compact {
                 Text(verbatim: row.model).lineLimit(1).truncationMode(.middle)
               }
@@ -165,7 +166,7 @@ struct StudioConversationSidebar: View {
     chat.state?.library?.rows ?? sort.rows(chat.history, search: search)
   }
   private var canNavigate: Bool {
-    !chat.busy && !chat.uploading && !chat.hasAttachments && !hasDraft && !chat.hasMessageEdit
+    chat.canNavigateConversation
   }
   func canOpenConversation(_ id: String) -> Bool {
     canNavigate || chat.conversation?.id == id
@@ -197,17 +198,12 @@ struct StudioConversationSidebar: View {
           .disabled(chat.busy || chat.uploading)
           .accessibilityIdentifier("sidebar-new-chat")
       }
-      HStack(spacing: 8) {
-        Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+      SidebarSearchField(text: $search) {
         TextField("Search chats", text: $search).textFieldStyle(.plain)
           .focused($searchFocused)
           .accessibilityIdentifier("history-search")
           .help("Search chats · ⌘K")
-        if !search.isEmpty {
-          Button("Clear search", systemImage: "xmark") { search = "" }
-            .labelStyle(.iconOnly).buttonStyle(.plain)
-        }
-      }.padding(10).background(PaddockStyle.surface, in: RoundedRectangle(cornerRadius: 8))
+      }
       HStack(spacing: 8) {
         Menu {
           ForEach([StudioHistorySort.newest, .oldest], id: \.self) { order in

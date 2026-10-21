@@ -2,7 +2,7 @@
 //! decode dispatch). Plain fns uniformly pub(crate); shared with qwen3.
 
 use super::*;
-use crate::gpu::{GpuError, GpuExecutor, KvDtype, QuantW, RepackedKQ, RepackedQ8};
+use crate::gpu::{GluAct, GpuError, GpuExecutor, KvDtype, QuantW, RepackedKQ, RepackedQ8};
 use crate::gpu_model::gpt_oss::GpuModelError;
 use cudarc::driver::CudaSlice;
 use paddock_models::gguf::Value;
@@ -190,8 +190,59 @@ pub(crate) fn nvf4_ffn(
 ) -> Result<(), GpuModelError> {
     nvf4_ffn_staged(
         exec, gu, down, xn, xq, xs, part, ffn_gate, ffn_up, ffn_gu, swq_q, swq_s, proj, ff, rows,
-        false,
+        false, false,
     )
+}
+
+/// The decode post-norm with the W4A4 FFN's quantize folded in (slot 876, or
+/// 879 with the scales swizzled where [`nvf4_swz_on`] holds for the layer's
+/// planes): `[x, xn]` the residual and the f32 normed row, `(q, s)` the
+/// staging. Returns (staged, swizzled); not staged = the pack declined, run the
+/// plain norm.
+pub(super) fn post_norm_nvf4(
+    exec: &GpuExecutor,
+    ffn: &super::Ffn,
+    [x, xn]: [&mut CudaSlice<f32>; 2],
+    proj: &CudaSlice<f32>,
+    w: &CudaSlice<f32>,
+    (q, s): (&mut CudaSlice<i8>, &mut CudaSlice<u8>),
+    (embd, eps, b): (usize, f32, usize),
+) -> Result<(bool, bool), GpuModelError> {
+    let swz = match ffn {
+        super::Ffn::Nvf4Dense {
+            gu: super::Nvf4Gu::Fused(gup),
+            down,
+        } => nvf4_swz_on(exec, gup, down, b),
+        _ => false,
+    };
+    let ok = if swz {
+        exec.add_rmsnorm_nvf4_batch_sw(x, proj, w, xn, q, s, embd, eps, b)?
+    } else {
+        exec.add_rmsnorm_nvf4_batch(x, proj, w, xn, q, s, embd, eps, b)?
+    };
+    Ok((ok, ok && swz))
+}
+
+/// The decode band's scale-swizzled W4A4 chain (slots 879 / 880 / 881): the
+/// producers - the post-norm (879) and the swiglu quantizer (880) - write the
+/// activation scales straight into the tcgen05 GEMM's swizzled atom layout,
+/// and the GEMM (881) reads them without its pd_sf_swz128 launch: two launches
+/// fewer a layer, the same bytes and mainloop. Rows 65..=128 (the GEMM's
+/// BN-128 arm; the decode buffers hold one 128-row group), both planes
+/// tc5-tiled. The norm site and the FFN elect through this one predicate - the
+/// scales are not row-major once it holds. Kill: PADDOCK_NO_NVF4_SWZ.
+pub(crate) fn nvf4_swz_on(
+    exec: &GpuExecutor,
+    gup: &crate::gpu::Nvf4Plane,
+    down: &crate::gpu::Nvf4Plane,
+    rows: usize,
+) -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    (65..=128).contains(&rows)
+        && gup.scale_tc5.is_some()
+        && down.scale_tc5.is_some()
+        && exec.has_nvf4_swz_chain()
+        && !*OFF.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_NVF4_SWZ").is_some())
 }
 
 /// `nvf4_ffn` with the activation already quantized: `xq_ready` says the
@@ -199,7 +250,8 @@ pub(crate) fn nvf4_ffn(
 /// (the fused add+rmsnorm+nvf4-quant prenorm on the unified prefill tick,
 /// 2026-09-08), so the W4A4 arms skip their own `quantize_nvf4` - one f32
 /// [rows, embd] read fewer per layer. Ignored where the arm never quantizes
-/// (the W4A16 spine reads `xn`).
+/// (the W4A16 spine reads `xn`). `xs_swz`: those scales are in the swizzled
+/// layout ([`nvf4_swz_on`] held at the producer - the decode post-norm).
 #[allow(clippy::too_many_arguments)]
 #[track_caller]
 pub(crate) fn nvf4_ffn_staged(
@@ -219,16 +271,18 @@ pub(crate) fn nvf4_ffn_staged(
     ff: usize,
     rows: usize,
     xq_ready: bool,
+    xs_swz: bool,
 ) -> Result<(), GpuModelError> {
     let (gate, up) = match gu {
         super::Nvf4Gu::Split { gate, up } => (gate, up),
         super::Nvf4Gu::Fused(gup) => {
             return nvf4_ffn_fused(
                 exec, gup, down, xn, xq, xs, part, ffn_gate, ffn_gu, swq_q, swq_s, proj, ff, rows,
-                xq_ready,
+                xq_ready, xs_swz,
             );
         }
     };
+    debug_assert!(!xs_swz, "the split planes never take the swizzled chain");
     // Site witness. The W4A16 chain below is the software-dequant
     // class the decode lane and the verify walk both left behind; the imax
     // census still shows pd_nvf4_gemm_tcp at 9.4% of the die, so some caller
@@ -307,6 +361,22 @@ pub(crate) fn nvf4_ffn_staged(
 /// scratch grows to the full row cap for it).
 #[allow(clippy::too_many_arguments)]
 #[track_caller]
+/// The tcgen05 SWQ arm (slot 874) is elected: the pack has it and PADDOCK_NVF4_TC5_SWQ asks for
+/// it (bit-identical to the landing arm - bench/nv4_swq_tc5_probe.cu - and at parity with the
+/// unfused chain at 128 rows, but slower at prefill widths: 285.0 / 290.5 pages/min against the
+/// landing arm's 309.5 / 313.5 in the B200 serve A/B), PADDOCK_NO_NVF4_SWQ off.
+/// Re-measured against the swizzled landing chain (2026-10-21, cold weights,
+/// K2 stages on both): 56.0 vs 34.9 us at 120 rows, 40.7 vs 35.2 at 128.
+pub(crate) fn tc5_swq_on(exec: &GpuExecutor) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    exec.has_nvf4_gemm_tc5_swq()
+        && *ON.get_or_init(|| {
+            paddock_models::dev_var_os!("PADDOCK_NVF4_TC5_SWQ").is_some()
+                && paddock_models::dev_var_os!("PADDOCK_NO_NVF4_SWQ").is_none()
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn nvf4_ffn_fused(
     exec: &GpuExecutor,
     gup: &crate::gpu::Nvf4Plane,
@@ -323,12 +393,15 @@ pub(crate) fn nvf4_ffn_fused(
     ff: usize,
     rows: usize,
     xq_ready: bool,
+    xs_swz: bool,
 ) -> Result<(), GpuModelError> {
+    debug_assert!(!xs_swz || (xq_ready && nvf4_swz_on(exec, gup, down, rows)));
     static NO_SWQ: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let no_swq =
         *NO_SWQ.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_NVF4_SWQ").is_some());
     let w4a4 = rows >= nvf4_w4a4_min_rows() && exec.has_nvf4_gemm_f4();
-    let swq = w4a4 && rows >= 128 && !no_swq && exec.has_nvf4_gemm_f4t_swq();
+    // (the SWQ arms read row-major scales: a swizzled staging takes the landing chain)
+    let swq = w4a4 && rows >= 128 && !no_swq && !xs_swz && exec.has_nvf4_gemm_f4t_swq();
     {
         use std::sync::Mutex;
         static SEEN: Mutex<Option<std::collections::HashSet<(&'static str, u32, u8, usize)>>> =
@@ -366,6 +439,15 @@ pub(crate) fn nvf4_ffn_fused(
             }
         }
     }
+    // sm_100: the tcgen05 SWQ (slot 874) serves every W4A4 width (opt-in, tc5_swq_on)
+    if w4a4 && !xs_swz && tc5_swq_on(exec) && gup.scale_tc5.is_some() {
+        if !xq_ready {
+            exec.quantize_nvf4(xn, xq, xs, rows * gup.in_dim)?;
+        }
+        exec.nvf4_gemm_tc5_swq(gup, xq, xs, swq_q, swq_s, rows)?;
+        exec.nvf4_gemm_f4(down, swq_q, swq_s, proj, None, rows, Some(part))?;
+        return Ok(());
+    }
     if swq {
         if !xq_ready {
             exec.quantize_nvf4(xn, xq, xs, rows * gup.in_dim)?;
@@ -384,9 +466,18 @@ pub(crate) fn nvf4_ffn_fused(
         if !xq_ready {
             exec.quantize_nvf4(xn, xq, xs, rows * gup.in_dim)?;
         }
-        exec.nvf4_gemm_f4(gup, xq, xs, ffn_gu, None, rows, Some(part))?;
-        exec.swiglu_fused_nvf4_il(ffn_gu, xq, xs, ff, rows)?;
-        exec.nvf4_gemm_f4(down, xq, xs, proj, None, rows, Some(part))?;
+        if xs_swz {
+            exec.nvf4_gemm_f4_sw(gup, xq, xs, ffn_gu, rows, Some(part))?;
+        } else {
+            exec.nvf4_gemm_f4(gup, xq, xs, ffn_gu, None, rows, Some(part))?;
+        }
+        if nvf4_swz_on(exec, gup, down, rows) {
+            exec.swiglu_fused_nvf4_il_sw(ffn_gu, xq, xs, ff, rows)?;
+            exec.nvf4_gemm_f4_sw(down, xq, xs, proj, rows, Some(part))?;
+        } else {
+            exec.swiglu_fused_nvf4_il(ffn_gu, xq, xs, ff, rows)?;
+            exec.nvf4_gemm_f4(down, xq, xs, proj, None, rows, Some(part))?;
+        }
     } else {
         nvf4_mm(exec, gup, xn, ffn_gu, rows)?;
         exec.swiglu_fused_il(ffn_gu, ffn_gate, ff, rows)?;
@@ -1271,7 +1362,12 @@ pub(crate) fn attn_verify_dispatch(
         return Ok(false);
     }
     let blocks = rows / k1;
-    let scalar_fallback = attn_splits(n_heads, rows, exec.sm_count()) == 1;
+    // "Past the decode dispatch's walk-length boundary" - spelled out rather
+    // than read off attn_splits() == 1, since attn_splits no longer collapses
+    // there (it keeps the GV arm and yields only its count); this arm's
+    // engagement rule stays what it was measured as.
+    let scalar_fallback =
+        n_heads * rows >= 2 * super::attn_fill_blocks(super::attn_boundary_sms(exec.sm_count()));
     // partial scratch holds 2*fill*MAX_ATTN_SPLITS (head,row,split) cells
     let sp_cap = (2 * super::attn_fill_blocks(exec.sm_count()) * super::MAX_ATTN_SPLITS)
         / (n_heads * rows).max(1);
@@ -2616,25 +2712,7 @@ pub(crate) fn prefill_ffn_down_sk(
 ) -> Result<(), GpuModelError> {
     if batch > 64 {
         exec.quantize_q8_mmq_swiglu(gate, up, yq, w.dims[0], batch)?;
-        if batch > mmq_hi_min_batch()
-            && w.dims[0].is_multiple_of(128)
-            && exec.has_q8_0_gemm_mmq_pipe()
-            && let (Some(p), true) = (partials, exec.has_q8_0_gemm_mmq_pipe_sk())
-            && paddock_models::dev_var_os!("PADDOCK_NO_SK").is_none()
-        {
-            exec.q8_0_gemm_mmq_pipe_sk(w, yq, p, y, batch)?;
-            return Ok(());
-        }
-        if batch > mmq_hi_min_batch()
-            && w.dims[0].is_multiple_of(128)
-            && exec.has_q8_0_gemm_mmq_pipe()
-        {
-            exec.q8_0_gemm_mmq_pipe(w, None, yq, y, batch)?;
-        } else if batch > mmq_hi_min_batch() && exec.has_q8_0_gemm_mmq_hi() {
-            exec.q8_0_gemm_mmq_hi(w, yq, y, batch)?;
-        } else {
-            exec.q8_0_gemm_mmq(w, yq, Some(skfix), y, batch)?;
-        }
+        prefill_down_mm_sk(exec, w, yq, skfix, partials, y, batch)?;
     } else {
         exec.swiglu(gate, up, batch * ff)?;
         prefill_quant(exec, xq, xs, yq, gate, w.dims[0], batch)?;
@@ -2756,6 +2834,143 @@ pub(crate) fn prefill_add_norm_quant_rot(
     exec.rmsnorm_batch(x, w, xn, n, eps, batch)?;
     r.rotate(exec, xn, n, batch)?;
     prefill_quant_c(exec, xq, xs, yq, xn, n, batch, r.act128)
+}
+
+/// The down GEMM's rung ladder over an mmq-layout input (> 64 rows): the
+/// stream-K tail split when a partials plane rides along, else pipe / hi
+/// past the mmq_hi band and the sync mmq below it.
+#[allow(clippy::too_many_arguments)]
+fn prefill_down_mm_sk(
+    exec: &GpuExecutor,
+    w: &RepackedQ8,
+    yq: &CudaSlice<u8>,
+    skfix: &mut CudaSlice<f32>,
+    partials: Option<&mut CudaSlice<f32>>,
+    y: &mut CudaSlice<f32>,
+    batch: usize,
+) -> Result<(), GpuModelError> {
+    if batch > mmq_hi_min_batch()
+        && w.dims[0].is_multiple_of(128)
+        && exec.has_q8_0_gemm_mmq_pipe()
+        && let (Some(p), true) = (partials, exec.has_q8_0_gemm_mmq_pipe_sk())
+        && paddock_models::dev_var_os!("PADDOCK_NO_SK").is_none()
+    {
+        exec.q8_0_gemm_mmq_pipe_sk(w, yq, p, y, batch)?;
+        return Ok(());
+    }
+    if batch > mmq_hi_min_batch() && w.dims[0].is_multiple_of(128) && exec.has_q8_0_gemm_mmq_pipe()
+    {
+        exec.q8_0_gemm_mmq_pipe(w, None, yq, y, batch)?;
+    } else if batch > mmq_hi_min_batch() && exec.has_q8_0_gemm_mmq_hi() {
+        exec.q8_0_gemm_mmq_hi(w, yq, y, batch)?;
+    } else {
+        exec.q8_0_gemm_mmq(w, yq, Some(skfix), y, batch)?;
+    }
+    Ok(())
+}
+
+/// The dense SwiGLU FFN's gate / up / down planes when its gate|up may land
+/// the down GEMM's input in one launch (pack slot 865): Q8_0 throughout, no
+/// rotation, a %128 FFN, and past the mmq_hi band - the only widths where
+/// gate and up ride rungs bit-equal to the fused kernel's (pipe / hi; the
+/// sync mmq below it splits K across CTAs on narrow grids, and its bits can
+/// differ). `PADDOCK_QWEN35_NO_GU8=1` pins the chain.
+pub(crate) fn ffn_gu_land<'a>(
+    exec: &GpuExecutor,
+    gate: &'a QuantW,
+    up: &'a QuantW,
+    down: &'a QuantW,
+    rot: Option<&Rotation>,
+    yq_ff: &CudaSlice<u8>,
+    r: usize,
+) -> Option<(&'a RepackedQ8, &'a RepackedQ8, &'a RepackedQ8)> {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let off = *OFF.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_QWEN35_NO_GU8").is_some());
+    let (QuantW::Q8(g), QuantW::Q8(u), QuantW::Q8(d)) = (gate, up, down) else {
+        return None;
+    };
+    let live = g.data.len() > 32 && u.data.len() > 32 && d.data.len() > 32;
+    let ff = g.dims[1];
+    (!off
+        && live
+        && rot.is_none()
+        && r > mmq_hi_min_batch()
+        && u.dims == g.dims
+        && ff.is_multiple_of(128)
+        && g.dims[0].is_multiple_of(128)
+        && yq_ff.len() >= ff / 128 * r.next_multiple_of(128) * 144
+        && exec.has_q8_0_gemm_mmq_gu(GluAct::Silu))
+    .then_some((g, u, d))
+}
+
+/// The dense FFN at prefill over `r` post-norm rows already quantized into
+/// the staging (`d_yq` / `d_pxq`): gate and up, then the SwiGLU-fused down
+/// into `d_proj`. Where [`ffn_gu_land`] admits it, gate|up land the down's
+/// mmq input directly - the bytes the chain's two GEMMs + swiglu quantize
+/// write - and the down rides the same rung either way.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prefill_ffn_dense(
+    exec: &GpuExecutor,
+    sc: &mut Scratch,
+    gate: &QuantW,
+    up: &QuantW,
+    down: &QuantW,
+    ff: usize,
+    r: usize,
+    rot: Option<&Rotation>,
+) -> Result<(), GpuModelError> {
+    if let Some((g, u, d)) = ffn_gu_land(exec, gate, up, down, rot, &sc.d_yq_ff, r) {
+        exec.q8_0_gemm_mmq_gu(g, u, &sc.d_yq, &mut sc.d_yq_ff, r, GluAct::Silu)?;
+        return prefill_down_mm_sk(
+            exec,
+            d,
+            &sc.d_yq_ff,
+            &mut sc.d_skfix,
+            None,
+            &mut sc.d_proj,
+            r,
+        );
+    }
+    prefill_mm_pre_any(
+        exec,
+        gate,
+        &sc.d_pxq,
+        &sc.d_pxs,
+        &sc.d_yq,
+        &mut sc.d_xsums,
+        &mut sc.d_ssums,
+        &mut sc.d_skfix,
+        &mut sc.d_ffn_gate,
+        r,
+    )?;
+    prefill_mm_pre_any(
+        exec,
+        up,
+        &sc.d_pxq,
+        &sc.d_pxs,
+        &sc.d_yq,
+        &mut sc.d_xsums,
+        &mut sc.d_ssums,
+        &mut sc.d_skfix,
+        &mut sc.d_ffn_up,
+        r,
+    )?;
+    prefill_ffn_down_rot(
+        exec,
+        down,
+        &mut sc.d_pxq,
+        &mut sc.d_pxs,
+        &mut sc.d_yq,
+        &mut sc.d_xsums,
+        &mut sc.d_ssums,
+        &mut sc.d_skfix,
+        &mut sc.d_ffn_gate,
+        &sc.d_ffn_up,
+        &mut sc.d_proj,
+        ff,
+        r,
+        rot,
+    )
 }
 
 /// [`prefill_ffn_down_any`] for a model that may be rotated-basis: the down

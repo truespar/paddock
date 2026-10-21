@@ -22,11 +22,16 @@ const GRAM_MAX: usize = 8;
 /// because the newest entry is always the current suffix itself (its
 /// continuation does not exist yet). Keys are FNV-1a hashes (collisions are
 /// safe: every draft is verified, a collision only costs acceptance).
-/// Purely host-side: a push is six map inserts, a lookup up to six probes -
-/// ~1 us against a >5 ms verify pass.
+/// Purely host-side: a push appends, and the first `draft` after pushes
+/// indexes them (six map inserts a token) - so a slot that never drafts
+/// (speculation off, or a batch the ladder holds at K = 0) pays a Vec push
+/// per token, prompt seeding included; a lookup is up to six probes, ~1 us
+/// against a >5 ms verify pass.
 #[derive(Default)]
 pub struct NgramDraft {
     hist: Vec<u32>,
+    /// `hist[..indexed]` is in `grams`.
+    indexed: usize,
     // per suffix length n (index n - GRAM_MIN): gram hash -> (most recent
     // end position, previous end position); "end position" = index just past
     // the gram, where its continuation starts. 0 is a safe "none" sentinel.
@@ -44,18 +49,26 @@ fn gram_hash(gram: &[u32]) -> u64 {
 impl NgramDraft {
     pub fn push(&mut self, t: u32) {
         self.hist.push(t);
-        let end = self.hist.len();
-        for g in GRAM_MIN..=GRAM_MAX.min(end) {
-            let key = gram_hash(&self.hist[end - g..end]);
-            let e = self.grams[g - GRAM_MIN].entry(key).or_insert((0, 0));
-            *e = (end as u32, e.0);
+    }
+
+    /// Index every gram ending past `indexed`, in push order.
+    fn catch_up(&mut self) {
+        while self.indexed < self.hist.len() {
+            self.indexed += 1;
+            let end = self.indexed;
+            for g in GRAM_MIN..=GRAM_MAX.min(end) {
+                let key = gram_hash(&self.hist[end - g..end]);
+                let e = self.grams[g - GRAM_MIN].entry(key).or_insert((0, 0));
+                *e = (end as u32, e.0);
+            }
         }
     }
 
     /// Propose up to `k` tokens continuing the current suffix (may be fewer
     /// if the match runs into the end of history), or empty on no match at
     /// any suffix length. Longest matching suffix wins.
-    pub fn draft(&self, k: usize) -> Vec<u32> {
+    pub fn draft(&mut self, k: usize) -> Vec<u32> {
+        self.catch_up();
         let n = self.hist.len();
         for g in (GRAM_MIN..=GRAM_MAX.min(n)).rev() {
             let key = gram_hash(&self.hist[n - g..n]);

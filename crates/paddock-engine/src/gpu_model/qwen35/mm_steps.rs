@@ -16,7 +16,9 @@
 //!
 //! - A SLOT job (a resumable prompt, a large one, a lone cold one) alternates
 //!   two units: the next pass's pictures (one tower call), then the pass
-//!   itself (`mm_pass_ends`: at most `step_rows`, never inside a picture).
+//!   itself (`mm_pass_ends`: at most `step_rows`, never inside a picture). It
+//!   plans when it reaches the front, so it resumes from whatever the jobs
+//!   ahead of it published.
 //! - A GROUP job batches small cold prompts exactly as the blocking wave does -
 //!   one batched tower call plus one batched pass per group - so concurrent
 //!   image requests still share a pass (the vi8 fix).
@@ -28,7 +30,7 @@
 
 use std::collections::VecDeque;
 
-use super::batch::MmShareCtx;
+use super::mm_ride::MmShareCtx;
 use super::*;
 use crate::generator::MmAdmit;
 use crate::gpu_model::gpt_oss::GpuModelError;
@@ -51,6 +53,53 @@ pub(super) struct MmSlotJob {
     encoded: bool,
 }
 
+impl MmSlotJob {
+    pub(super) fn slot(&self) -> usize {
+        self.slot
+    }
+
+    /// Take what the unified queue needs (`mm_ride_enqueue`): the layout, the
+    /// radix keys, the encoded pictures, the resume row and the planned
+    /// passes. The job is spent afterwards.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn take_ride_parts(
+        &mut self,
+    ) -> (
+        MmLayout,
+        Vec<u32>,
+        Vec<Option<super::pictures::Picture>>,
+        usize,
+        Vec<(usize, bool)>,
+    ) {
+        let lay = MmLayout {
+            ids: std::mem::take(&mut self.lay.ids),
+            mrope: std::mem::take(&mut self.lay.mrope),
+            bound: std::mem::take(&mut self.lay.bound),
+            splices: std::mem::take(&mut self.lay.splices),
+            t_len: self.lay.t_len,
+            final_mrope_pos: self.lay.final_mrope_pos,
+        };
+        (
+            lay,
+            std::mem::take(&mut self.keys),
+            std::mem::take(&mut self.pictures),
+            self.pos,
+            std::mem::take(&mut self.passes).into_iter().collect(),
+        )
+    }
+}
+
+/// What one unit of a slot job produced.
+pub(super) enum MmUnit {
+    /// more units to run
+    More,
+    /// the prompt is prefilled: its last row's logits and its row count
+    Prefilled(Vec<f32>, usize),
+    /// the prompt was handed to the unified queue (`mm_ride`); it finishes as
+    /// a unified finisher, and this job is spent
+    Riding,
+}
+
 /// Small cold prompts batched into groups, one batched pass per group.
 pub(super) struct MmGroupJob {
     /// (slot, placeholder ids) per prompt, `prefill_batch_pass`'s items
@@ -71,6 +120,45 @@ pub(super) enum MmStepJob {
         job: MmGroupJob,
         prompts: Vec<Vec<MmChunk>>,
     },
+    /// A slot job not planned yet: it plans (prefix match, resume, passes)
+    /// when it reaches the front. Jobs run in order, so every job ahead of it
+    /// has published by then, and a prompt sharing their text head resumes
+    /// there instead of prefilling it again - pages of one document pipeline
+    /// arriving a tick apart, or a burst's followers (`shared_head_split`).
+    Deferred {
+        slot: usize,
+        chunks: Vec<MmChunk>,
+        step: usize,
+    },
+}
+
+/// A prompt's text before its first picture, as the radix keys it (a picture
+/// row is keyed by the picture, so nothing past it can be shared).
+fn text_head(chunks: &[MmChunk], grids: &[(usize, usize)]) -> Vec<u32> {
+    build_mm_layout(chunks, grids).map_or_else(
+        |_| Vec::new(),
+        |lay| {
+            let end = lay.splices.first().map_or(lay.t_len, |&(off, _)| off);
+            lay.ids[..end].to_vec()
+        },
+    )
+}
+
+/// A cold burst's leader and the prompts that can resume from it: the first
+/// prompt whose head is long enough to checkpoint (`first_picture_cut`), and
+/// every other one that shares that whole head. A group pass publishes
+/// nothing, so a burst of pages behind the same static instructions used to
+/// leave the cache as cold as it found it. `None` when no two prompts share
+/// a checkpointable head.
+fn shared_head_split(heads: &[Vec<u32>], min: usize) -> Option<(usize, Vec<usize>)> {
+    heads.iter().enumerate().find_map(|(lead, head)| {
+        let cut =
+            crate::gpu_model::prefix_cache::first_picture_cut(0, &[(head.len(), head.len())], min)?;
+        let followers: Vec<usize> = (0..heads.len())
+            .filter(|&i| i != lead && heads[i].len() >= cut && heads[i][..cut] == head[..cut])
+            .collect();
+        (!followers.is_empty()).then_some((lead, followers))
+    })
 }
 
 /// Every picture of a prompt as a tower source, in order.
@@ -82,6 +170,19 @@ fn picture_sources(chunks: &[MmChunk]) -> Vec<(&[u8], usize, usize)> {
             _ => None,
         })
         .collect()
+}
+
+/// Riding slot jobs carried onto the unified queue per encode step
+/// (`mm_steps_run`). PADDOCK_MM_RIDE_JOBS overrides; 0 restores one unit a
+/// tick.
+fn mm_ride_jobs() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        paddock_models::dev_var!("PADDOCK_MM_RIDE_JOBS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4)
+    })
 }
 
 fn failed(e: GpuModelError) -> MmAdmit {
@@ -190,17 +291,21 @@ impl GpuQwen35 {
         &mut self,
         job: &mut MmSlotJob,
         chunks: &[MmChunk],
-    ) -> Result<Option<(Vec<f32>, usize)>, GpuModelError> {
+        ride: bool,
+    ) -> Result<MmUnit, GpuModelError> {
         let (end, checkpoint) = *job
             .passes
             .front()
             .expect("a slot job with no pass left has already finished");
+        // riding the unified tick (`ride`, the stepped lane's choice; the
+        // blocking entry never rides), the whole remaining prompt queues at
+        // once, so this unit encodes every picture from the resume point on
         if !job.encoded {
             job.encoded = true;
             // exactly the pictures this pass splices (the cut rule keeps each
             // one whole inside a single pass), released when it ends
             let need: Vec<usize> = (0..job.img_spans.len())
-                .filter(|&k| job.img_spans[k].0 >= job.pos && job.img_spans[k].1 <= end)
+                .filter(|&k| job.img_spans[k].0 >= job.pos && (ride || job.img_spans[k].1 <= end))
                 .collect();
             if !need.is_empty() {
                 let sources = picture_sources(chunks);
@@ -209,8 +314,12 @@ impl GpuQwen35 {
                 for (k, p) in need.into_iter().zip(got) {
                     job.pictures[k] = Some(p);
                 }
-                return Ok(None);
+                return Ok(MmUnit::More);
             }
+        }
+        if ride {
+            self.mm_ride_enqueue(job)?;
+            return Ok(MmUnit::Riding);
         }
         let logits = self.mm_prefill_span(job.slot, &job.lay, &job.pictures, job.pos, end)?;
         if checkpoint {
@@ -221,7 +330,7 @@ impl GpuQwen35 {
         job.passes.pop_front();
         job.encoded = false;
         if !job.passes.is_empty() {
-            return Ok(None);
+            return Ok(MmUnit::More);
         }
         let t_len = job.lay.t_len;
         // cache every full page of this prompt (idempotent for those inserted
@@ -234,7 +343,7 @@ impl GpuQwen35 {
         )?;
         self.batch.as_mut().expect("batch").mrope_delta[job.slot] =
             job.lay.final_mrope_pos as i64 - t_len as i64;
-        Ok(Some((logits, t_len)))
+        Ok(MmUnit::Prefilled(logits, t_len))
     }
 
     /// How a wave routes one request: `None` = alone in planned passes (a
@@ -405,19 +514,38 @@ impl GpuQwen35 {
                 Ok(Some(grids)) => cold.push((chunks, slot, grids)),
             }
         }
+        // A burst sharing a text head before its pictures (a document
+        // pipeline's static instructions): the leader runs alone and
+        // checkpoints the head, the followers wait for it and resume there,
+        // and only the rest are grouped.
+        let mut deferred: Vec<(usize, Vec<MmChunk>)> = Vec::new();
+        if cold.len() > 1 {
+            let heads: Vec<Vec<u32>> = cold.iter().map(|(c, _, g)| text_head(c, g)).collect();
+            if let Some((lead, followers)) = shared_head_split(&heads, super::min_cache_prefix()) {
+                let mut rest = Vec::with_capacity(cold.len());
+                for (i, (chunks, slot, grids)) in cold.into_iter().enumerate() {
+                    if i == lead {
+                        alone.push((slot, chunks));
+                    } else if followers.contains(&i) {
+                        deferred.push((slot, chunks));
+                    } else {
+                        rest.push((chunks, slot, grids));
+                    }
+                }
+                cold = rest;
+            }
+        }
         // a cohort of one is a slot job, and it also gets to publish its pages
         if cold.len() == 1 {
             let (chunks, slot, _) = cold.pop().expect("len 1");
             alone.push((slot, chunks));
         }
-        for (slot, chunks) in alone {
-            match self.mm_slot_begin(slot, &chunks, step) {
-                Ok(job) => {
-                    self.mm_steps.push_back(MmStepJob::Slot { job, chunks });
-                    out.push((slot, MmAdmit::Encoding));
-                }
-                Err(e) => out.push((slot, failed(e))),
-            }
+        // slot jobs plan at the front (see `MmStepJob::Deferred`), the burst's
+        // followers right behind their leader
+        for (slot, chunks) in alone.into_iter().chain(deferred) {
+            self.mm_steps
+                .push_back(MmStepJob::Deferred { slot, chunks, step });
+            out.push((slot, MmAdmit::Encoding));
         }
         if !cold.is_empty() {
             let slots: Vec<usize> = cold.iter().map(|c| c.1).collect();
@@ -440,21 +568,112 @@ impl GpuQwen35 {
         out
     }
 
-    /// `Generator::encode_step`: run ONE unit of the oldest held job and
-    /// report the slots it finished. A failed unit fails every slot its job
-    /// still held.
+    /// `Generator::encode_step`. Riding the unified tick, the front slot jobs
+    /// go all the way onto the unified queue here - plan, encode, enqueue -
+    /// up to `mm_ride_jobs()` of them; otherwise ONE unit of the oldest job.
+    ///
+    /// One unit per tick made a riding page cost three ticks (plan, tower,
+    /// enqueue) and capped picture admissions at a third of the tick rate:
+    /// 3.8 pages/s at ~11.5 ticks/s on the B200 recover load, with ~40 of 128
+    /// slots waiting here and the decode lane idle around them. A riding
+    /// job's pass work runs later on the unified queue, so the stall this
+    /// pacing bounds is just the tower launch (one picture per tower pass).
+    /// A burst follower still waits for its leader: `ride_head_pending` sees
+    /// the leader in the chunk queue as soon as it is enqueued, so the
+    /// follower stays Deferred and ends the run. A group at the front keeps
+    /// its own pacing - one planned batched pass a step.
     pub(crate) fn mm_steps_run(&mut self) -> Vec<(usize, MmAdmit)> {
-        let Some(mut held) = self.mm_steps.pop_front() else {
+        if mm_ride_jobs() == 0 || !self.mm_ride_on() {
+            return self.mm_steps_unit();
+        }
+        let out = self.mm_steps_ride();
+        if out.is_empty() && matches!(self.mm_steps.front(), Some(MmStepJob::Group { .. })) {
+            return self.mm_steps_unit();
+        }
+        out
+    }
+
+    /// `Generator::encode_step_overlap`: only the riding half of
+    /// `mm_steps_run` - never a group's blocking pass - so the scheduler can
+    /// run it beside an in-flight span, in the host time a queued decode tick
+    /// leaves (the loop-top step idled the decode lane ~20 ms a call).
+    pub(crate) fn mm_steps_run_overlap(&mut self) -> Vec<(usize, MmAdmit)> {
+        if mm_ride_jobs() == 0 || !self.mm_ride_on() {
+            return Vec::new();
+        }
+        self.mm_steps_ride()
+    }
+
+    /// Carry up to `mm_ride_jobs()` riding slot jobs at the front onto the
+    /// unified queue; stops at a group, an empty queue, or a follower still
+    /// waiting on its leader.
+    fn mm_steps_ride(&mut self) -> Vec<(usize, MmAdmit)> {
+        let jobs = mm_ride_jobs();
+        let mut out = Vec::new();
+        let mut done = 0;
+        // a slot job takes at most three units (plan, encode, enqueue)
+        for _ in 0..3 * jobs {
+            let stalled_at = match self.mm_steps.front() {
+                Some(MmStepJob::Deferred { slot, .. }) => Some(*slot),
+                Some(MmStepJob::Slot { .. }) => None,
+                // a group is one planned batched pass a unit: its own pacing
+                Some(MmStepJob::Group { .. }) | None => break,
+            };
+            let before = self.mm_steps.len();
+            out.extend(self.mm_steps_unit());
+            if self.mm_steps.len() < before {
+                done += 1;
+                if done >= jobs {
+                    break;
+                }
+            } else if stalled_at.is_some()
+                && matches!(self.mm_steps.front(),
+                    Some(MmStepJob::Deferred { slot, .. }) if Some(*slot) == stalled_at)
+            {
+                break; // waiting on a leader's head checkpoint
+            }
+        }
+        out
+    }
+
+    /// One unit of the oldest held job; reports the slots it finished. A
+    /// failed unit fails every slot its job still held.
+    fn mm_steps_unit(&mut self) -> Vec<(usize, MmAdmit)> {
+        let Some(held) = self.mm_steps.pop_front() else {
             return Vec::new();
         };
-        let (out, more) = match &mut held {
-            MmStepJob::Slot { job, chunks } => match self.mm_slot_unit(job, chunks) {
-                Ok(None) => (Vec::new(), true),
-                Ok(Some((logits, rows))) => {
-                    (vec![(job.slot, MmAdmit::Prefilled { logits, rows })], false)
+        // a slot job plans now that every job ahead of it has published
+        let mut held = match held {
+            MmStepJob::Deferred { slot, chunks, step } => {
+                if self.ride_head_pending(&chunks) {
+                    self.mm_steps
+                        .push_front(MmStepJob::Deferred { slot, chunks, step });
+                    return Vec::new();
                 }
-                Err(e) => (vec![(job.slot, failed(e))], false),
-            },
+                return match self.mm_slot_begin(slot, &chunks, step) {
+                    Ok(job) => {
+                        self.mm_steps.push_front(MmStepJob::Slot { job, chunks });
+                        Vec::new()
+                    }
+                    Err(e) => vec![(slot, failed(e))],
+                };
+            }
+            other => other,
+        };
+        let (out, more) = match &mut held {
+            MmStepJob::Deferred { .. } => unreachable!("deferred jobs are planned above"),
+            MmStepJob::Slot { job, chunks } => {
+                match self.mm_slot_unit(job, chunks, self.mm_ride_on()) {
+                    Ok(MmUnit::More) => (Vec::new(), true),
+                    Ok(MmUnit::Prefilled(logits, rows)) => {
+                        (vec![(job.slot, MmAdmit::Prefilled { logits, rows })], false)
+                    }
+                    // queued on the unified tick: the scheduler marks the slot
+                    // chunking and finishes it from the fused tick's finishers
+                    Ok(MmUnit::Riding) => (vec![(job.slot, MmAdmit::Queued)], false),
+                    Err(e) => (vec![(job.slot, failed(e))], false),
+                }
+            }
             MmStepJob::Group { job, prompts } => match self.mm_group_unit(job, prompts) {
                 Ok(done) => {
                     let out = done
@@ -497,6 +716,29 @@ impl GpuQwen35 {
         out
     }
 
+    /// Riding the unified tick, the job ahead only QUEUED its prefill, so a
+    /// job reaching the front would plan before that prompt published
+    /// anything - a burst's second page planned cold beside its leader. Wait
+    /// (one encode step per tick, so the leader's spans run meanwhile) while
+    /// a riding prompt that shares this one's text head has not yet landed
+    /// the checkpoint before its first picture.
+    fn ride_head_pending(&self, chunks: &[MmChunk]) -> bool {
+        let Ok(grids) = self.picture_grids(chunks) else {
+            return false;
+        };
+        let head = text_head(chunks, &grids);
+        self.chunked.iter().any(|c| {
+            let Some(mm) = c.mm.as_ref() else {
+                return false;
+            };
+            let first = mm.splices.first().map_or(mm.t_len, |sp| sp.0);
+            let Some(cut) = mm.cuts.iter().copied().filter(|&x| x <= first).max() else {
+                return false;
+            };
+            c.done < cut && head.len() >= cut && head[..cut] == c.tokens[..cut]
+        })
+    }
+
     /// `Generator::encoding_pending`.
     pub(crate) fn mm_steps_pending(&self) -> bool {
         !self.mm_steps.is_empty()
@@ -509,10 +751,11 @@ impl GpuQwen35 {
     /// The scheduler retries next tick; the finished slot is then reported and
     /// released like any other whose client is gone.
     pub(crate) fn mm_steps_abort(&mut self, slot: usize) -> bool {
-        let at = self
-            .mm_steps
-            .iter()
-            .position(|h| matches!(h, MmStepJob::Slot { job, .. } if job.slot == slot));
+        let at = self.mm_steps.iter().position(|h| match h {
+            MmStepJob::Slot { job, .. } => job.slot == slot,
+            MmStepJob::Deferred { slot: s, .. } => *s == slot,
+            MmStepJob::Group { .. } => false,
+        });
         match at {
             Some(i) => {
                 self.mm_steps.remove(i);
@@ -520,5 +763,35 @@ impl GpuQwen35 {
             }
             None => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shared_head_split;
+
+    fn head(fill: u32, n: usize) -> Vec<u32> {
+        vec![fill; n]
+    }
+
+    #[test]
+    fn a_burst_behind_the_same_instructions_gets_a_leader_and_followers() {
+        // three pages behind 3,300 tokens of the same static text, one other
+        let mut other = head(7, 3300);
+        other[100] = 9;
+        let heads = vec![head(7, 3300), head(7, 3300), other, head(7, 3310)];
+        let (lead, followers) = shared_head_split(&heads, 512).expect("a shared head");
+        assert_eq!(lead, 0);
+        // the leader checkpoints at 3296; the 3310-token head shares all of it
+        assert_eq!(followers, vec![1, 3]);
+    }
+
+    #[test]
+    fn short_or_unshared_heads_stay_grouped() {
+        assert_eq!(shared_head_split(&[head(7, 200), head(7, 200)], 512), None);
+        let mut b = head(7, 3300);
+        b[10] = 8;
+        assert_eq!(shared_head_split(&[head(7, 3300), b], 512), None);
+        assert_eq!(shared_head_split(&[head(7, 3300)], 512), None);
     }
 }

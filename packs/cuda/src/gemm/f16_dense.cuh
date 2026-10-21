@@ -863,12 +863,16 @@ __global__ void __launch_bounds__(NWARP * 32) pd_f16_gemm_mma_kernel(
 // The epilogue is exposed per group (D fills all 512 tmem cols - no
 // ping-pong); beta is a store-time read-modify-write as in the mma twin.
 #if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900)
-template <uint32_t S>
+// EPI BIAS_RES: y is the f32 residual stream, y += acc + bias[row] in
+// pd_add_bias_res's order (t first) - the down projection of the tower FFN,
+// whose K (4304) keeps it off tc5p's in_dim % 64 rule.
+template <uint32_t S, uint32_t EPI = PD_F16_EPI_NONE>
 __global__ void __launch_bounds__(320) __cluster_dims__(2, 1, 1)
 pd_f16_gemm_tc5d_kernel(
     const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap xmap,
     float* __restrict__ y, float beta, uint32_t in_dim, uint32_t out_dim,
-    uint32_t batch) {
+    uint32_t batch, const float* __restrict__ bias) {
+    static_assert(EPI == PD_F16_EPI_NONE || EPI == PD_F16_EPI_BIAS_RES, "tc5d landings");
 #if PD_TC5_OK
     extern __shared__ __align__(1024) unsigned char pd_f16t_sh[];
     unsigned char* wt = pd_f16t_sh;                    // S x 16KB W (both tiles)
@@ -1066,7 +1070,24 @@ pd_f16_gemm_tc5d_kernel(
                     if (row < out_dim) {
                         // uniform beta branch - the ternary form compiles to
                         // an unconditional LDG+FSEL RMW (see mma twin note)
-                        if (beta != 0.0f) {
+                        if (EPI == PD_F16_EPI_BIAS_RES) {
+                            // all 32 residual loads in flight before any store
+                            // (an interleaved RMW serializes one round trip a
+                            // column: the stores may alias the next loads)
+                            const float bo = bias[row];
+                            float xo[32];
+                            #pragma unroll
+                            for (uint32_t j = 0; j < 32u; ++j) {
+                                const uint32_t c = col0 + cc * 32u + j;
+                                xo[j] = c < batch ? y[(size_t)c * out_dim + row] : 0.0f;
+                            }
+                            #pragma unroll
+                            for (uint32_t j = 0; j < 32u; ++j) {
+                                const uint32_t c = col0 + cc * 32u + j;
+                                if (c < batch)
+                                    y[(size_t)c * out_dim + row] = xo[j] + (__uint_as_float(r[j]) + bo);
+                            }
+                        } else if (beta != 0.0f) {
                             #pragma unroll
                             for (uint32_t j = 0; j < 32u; ++j) {
                                 const uint32_t c = col0 + cc * 32u + j;
@@ -1105,7 +1126,7 @@ pd_f16_gemm_tc5d_kernel(
         asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, 512;" ::"r"(tmem));
 #else
     (void)wmap; (void)xmap; (void)y; (void)beta;
-    (void)in_dim; (void)out_dim; (void)batch;
+    (void)in_dim; (void)out_dim; (void)batch; (void)bias;
 #endif
 }
 #endif  // __cluster_dims__ guard (host pass || sm_90+)
@@ -1142,12 +1163,21 @@ __device__ unsigned long long pd_tc5p_stamps[128 * 8];
 #endif
 
 #if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900)
-template <uint32_t S, uint32_t KS, uint32_t NT>
+// EPI (unsplit only): GELU_TANHF lands f16(gelu(acc + bias[o])) through an f16
+// ymap, BIAS_RES lands yres + (acc + bias[o]) on the f32 residual stream ymap
+// covers (read here, stored by the same TMA tile store) - the two passes the
+// tower FFN otherwise runs over this GEMM's f32 plane, in their own ops and
+// order (pd_gelu_bias_f16 / pd_add_bias_res), so the bits are theirs.
+template <uint32_t S, uint32_t KS, uint32_t NT, uint32_t EPI = PD_F16_EPI_NONE>
 __global__ void __launch_bounds__(320) __cluster_dims__(2, 1, 1)
 pd_f16_gemm_tc5p_kernel(
     const __grid_constant__ PdTmap wmap, const __grid_constant__ PdTmap xmap,
     const __grid_constant__ PdTmap ymap, float beta, uint32_t in_dim,
-    uint32_t out_dim, uint32_t batch) {
+    uint32_t out_dim, uint32_t batch, const float* __restrict__ bias,
+    const float* __restrict__ yres) {
+    static_assert(EPI == PD_F16_EPI_NONE || EPI == PD_F16_EPI_GELU_TANHF ||
+                      EPI == PD_F16_EPI_BIAS_RES, "tc5p landings");
+    static_assert(EPI == PD_F16_EPI_NONE || KS == 1u, "fused landings are unsplit");
 #if PD_TC5_OK
     constexpr uint32_t XSL = NT * 128u;        // X bytes per 2-slab slot/rank
     extern __shared__ __align__(1024) unsigned char pd_f16p_sh[];
@@ -1392,7 +1422,10 @@ pd_f16_gemm_tc5p_kernel(
             const uint32_t row0 = pair * 256u + crank * 128u;
             const uint32_t col0 = (t % n_cols) * NT + chalf * (NT >> 1);
             // reduce (accumulate into y) unless this is the beta=0 base store
-            const bool red = (KS > 1u && slice > 0u) || beta != 0.0f;
+            const bool red = EPI == PD_F16_EPI_NONE && ((KS > 1u && slice > 0u) || beta != 0.0f);
+            // this thread's output row (D lane rl) and its bias, fused landings
+            const uint32_t orow = row0 + rl;
+            const float obias = (EPI != PD_F16_EPI_NONE && orow < out_dim) ? bias[orow] : 0.0f;
             if (KS > 1u && slice > 0u && leader) {
                 // partial consumer: acquire slice 0's base store (4 leaders)
                 uint32_t v;
@@ -1419,8 +1452,19 @@ pd_f16_gemm_tc5p_kernel(
             {
                 uint32_t ra[16], rb[16];
                 tld(0, ra);
+                // BIAS_RES: slice si's residual loads issue during slice si-1
+                float xc[EPI == PD_F16_EPI_BIAS_RES ? 16 : 1], xn[EPI == PD_F16_EPI_BIAS_RES ? 16 : 1];
+                auto xload = [&](uint32_t si, float* xv) {
+                    const uint32_t c0 = col0 + si * 16u;
+                    #pragma unroll
+                    for (uint32_t jj = 0; jj < 16u; ++jj)
+                        xv[jj] = (orow < out_dim && c0 + jj < batch)
+                            ? yres[(size_t)(c0 + jj) * out_dim + orow] : 0.0f;
+                };
+                if (EPI == PD_F16_EPI_BIAS_RES) xload(0u, xc);
                 #pragma unroll 1
                 for (uint32_t si = 0; si < NS; ++si, ++gsl) {
+                    if (EPI == PD_F16_EPI_BIAS_RES && si + 1u < NS) xload(si + 1u, xn);
                     // staging reuse gate: same-parity TMA two slices back has
                     // read its buffer once <=1 group remains outstanding
                     if (leader && gsl >= 2u)
@@ -1430,11 +1474,36 @@ pd_f16_gemm_tc5p_kernel(
                     uint32_t* r = (si & 1u) ? rb : ra;
                     if (si + 1u < NS) tld(si + 1u, (si & 1u) ? ra : rb);
                     unsigned char* stg = stage0 + (gsl & 1u) * 8192u;
-                    const uint32_t sb = (uint32_t)__cvta_generic_to_shared(stg) + rl * 4u;
-                    #pragma unroll
-                    for (uint32_t jj = 0; jj < 16u; ++jj)
-                        asm volatile("st.shared.b32 [%0], %1;"
-                                     ::"r"(sb + jj * 512u), "r"(r[jj]) : "memory");
+                    if (EPI == PD_F16_EPI_GELU_TANHF) {
+                        // [16 cols][128 rows] halves: the f16 ymap's box
+                        const uint32_t sb = (uint32_t)__cvta_generic_to_shared(stg) + rl * 2u;
+                        #pragma unroll
+                        for (uint32_t jj = 0; jj < 16u; ++jj) {
+                            const __half h = __float2half(
+                                pd_f16_gelu_tanhf(__uint_as_float(r[jj]) + obias));
+                            asm volatile("st.shared.b16 [%0], %1;"
+                                         ::"r"(sb + jj * 256u), "h"(__half_as_ushort(h)) : "memory");
+                        }
+                    } else if (EPI == PD_F16_EPI_BIAS_RES) {
+                        // t = projection + bias, then x + t; every element is
+                        // this thread's alone (unsplit), read before the tile
+                        // store below overwrites it
+                        const uint32_t sb = (uint32_t)__cvta_generic_to_shared(stg) + rl * 4u;
+                        #pragma unroll
+                        for (uint32_t jj = 0; jj < 16u; ++jj) {
+                            const float tv = __uint_as_float(r[jj]) + obias;
+                            asm volatile("st.shared.b32 [%0], %1;"
+                                         ::"r"(sb + jj * 512u), "f"(xc[jj] + tv) : "memory");
+                        }
+                        #pragma unroll
+                        for (uint32_t jj = 0; jj < 16u; ++jj) xc[jj] = xn[jj];
+                    } else {
+                        const uint32_t sb = (uint32_t)__cvta_generic_to_shared(stg) + rl * 4u;
+                        #pragma unroll
+                        for (uint32_t jj = 0; jj < 16u; ++jj)
+                            asm volatile("st.shared.b32 [%0], %1;"
+                                         ::"r"(sb + jj * 512u), "r"(r[jj]) : "memory");
+                    }
                     asm volatile("fence.proxy.async.shared::cta;");
                     asm volatile("bar.sync %0, 128;" ::"r"(1u + chalf));
                     if (leader) {
@@ -1491,7 +1560,7 @@ pd_f16_gemm_tc5p_kernel(
         asm volatile("tcgen05.dealloc.cta_group::2.sync.aligned.b32 %0, 512;" ::"r"(tmem));
 #else
     (void)wmap; (void)xmap; (void)ymap; (void)beta;
-    (void)in_dim; (void)out_dim; (void)batch;
+    (void)in_dim; (void)out_dim; (void)batch; (void)bias; (void)yres;
 #endif
 }
 #endif  // __cluster_dims__ guard (host pass || sm_90+)
@@ -2669,10 +2738,11 @@ static inline bool pd_f16_tc5_on() {
 // same guard as the kernel: device passes below sm_90 never see the kernel
 // symbol, so the referencing launcher must vanish with it
 #if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900)
-template <uint32_t S>
+template <uint32_t S, uint32_t EPI = PD_F16_EPI_NONE>
 static int pd_f16_gemm_tc5d_launch(const __half* w, const __half* x, float* y,
                                    float beta, unsigned in_dim, unsigned out_dim,
-                                   unsigned batch, cudaStream_t st) {
+                                   unsigned batch, cudaStream_t st,
+                                   const float* bias = nullptr) {
     CUtensorMap wm, xm;
     if (!pd_tmap_2d(&wm, w, (uint64_t)in_dim * 2u, out_dim) ||
         !pd_tmap_2d(&xm, x, (uint64_t)in_dim * 2u, batch))
@@ -2680,7 +2750,7 @@ static int pd_f16_gemm_tc5d_launch(const __half* w, const __half* x, float* y,
     const uint32_t smem = 3u * S * 16384u + (3u * S + 2u) * 8u;
     static bool attr = false;
     if (!attr) {
-        cudaFuncSetAttribute((const void*)pd_f16_gemm_tc5d_kernel<S>,
+        cudaFuncSetAttribute((const void*)pd_f16_gemm_tc5d_kernel<S, EPI>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
         attr = true;
     }
@@ -2690,8 +2760,8 @@ static int pd_f16_gemm_tc5d_launch(const __half* w, const __half* x, float* y,
         cudaDeviceGetAttribute(&nn, cudaDevAttrMultiProcessorCount, dev);
         return (uint32_t)(nn & ~1);
     }();
-    pd_f16_gemm_tc5d_kernel<S><<<sgrid, 320, smem, st>>>(
-        wm, xm, y, beta, in_dim, out_dim, batch);
+    pd_f16_gemm_tc5d_kernel<S, EPI><<<sgrid, 320, smem, st>>>(
+        wm, xm, y, beta, in_dim, out_dim, batch, bias);
     return (int)cudaGetLastError();
 }
 #endif  // launcher arch guard
@@ -2717,10 +2787,12 @@ static bool pd_f16t_tmap_3d(CUtensorMap* map, const void* base, uint64_t kbytes,
 }
 
 #if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900)
-template <uint32_t S, uint32_t KS, uint32_t NT>
-static int pd_f16_gemm_tc5p_launch(const __half* w, const __half* x, float* y,
+template <uint32_t S, uint32_t KS, uint32_t NT, uint32_t EPI = PD_F16_EPI_NONE>
+static int pd_f16_gemm_tc5p_launch(const __half* w, const __half* x, void* y,
                                    float beta, unsigned in_dim, unsigned out_dim,
-                                   unsigned batch, cudaStream_t st) {
+                                   unsigned batch, cudaStream_t st,
+                                   const float* bias = nullptr) {
+    constexpr bool H16 = EPI == PD_F16_EPI_GELU_TANHF;   // f16 landing
     const uint32_t nk = (in_dim * 2u + 127u) / 128u;
     if (((nk + 1u) >> 1) < KS) return (int)cudaErrorInvalidValue;
     if (in_dim % 64u || out_dim % 4u) return (int)cudaErrorInvalidValue;
@@ -2734,12 +2806,14 @@ static int pd_f16_gemm_tc5p_launch(const __half* w, const __half* x, float* y,
     {
         pd_tmap_encode_fn enc = pd_tmap_encode();
         if (!enc || ((uintptr_t)y & 15u)) return (int)cudaErrorInvalidValue;
+        if (H16 && (out_dim % 8u)) return (int)cudaErrorInvalidValue;   // 16 B row stride
         const cuuint64_t gdim[2] = {out_dim, batch};
-        const cuuint64_t gstride[1] = {(cuuint64_t)out_dim * 4u};
+        const cuuint64_t gstride[1] = {(cuuint64_t)out_dim * (H16 ? 2u : 4u)};
         const cuuint32_t box[2] = {128u, 16u};
         const cuuint32_t estride[2] = {1u, 1u};
         // FLOAT32 dtype: cp.reduce's add is typed by the map (beta=1, K-split)
-        if (enc(&ym, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 2u, (void*)y, gdim,
+        if (enc(&ym, H16 ? CU_TENSOR_MAP_DATA_TYPE_FLOAT16 : CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+                2u, (void*)y, gdim,
                 gstride, box, estride, CU_TENSOR_MAP_INTERLEAVE_NONE,
                 CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
                 CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) != CUDA_SUCCESS)
@@ -2748,7 +2822,7 @@ static int pd_f16_gemm_tc5p_launch(const __half* w, const __half* x, float* y,
     const uint32_t smem = S * (32768u + NT * 128u) + 1024u + 32768u;
     static bool attr = false;
     if (!attr) {
-        cudaFuncSetAttribute((const void*)pd_f16_gemm_tc5p_kernel<S, KS, NT>,
+        cudaFuncSetAttribute((const void*)pd_f16_gemm_tc5p_kernel<S, KS, NT, EPI>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
         attr = true;
     }
@@ -2758,8 +2832,8 @@ static int pd_f16_gemm_tc5p_launch(const __half* w, const __half* x, float* y,
         cudaDeviceGetAttribute(&nn, cudaDevAttrMultiProcessorCount, dev);
         return (uint32_t)(nn & ~1);
     }();
-    pd_f16_gemm_tc5p_kernel<S, KS, NT><<<sgrid, 320, smem, st>>>(
-        wm, xm, ym, beta, in_dim, out_dim, batch);
+    pd_f16_gemm_tc5p_kernel<S, KS, NT, EPI><<<sgrid, 320, smem, st>>>(
+        wm, xm, ym, beta, in_dim, out_dim, batch, bias, (const float*)y);
     return (int)cudaGetLastError();
 }
 
@@ -2780,9 +2854,14 @@ static int pd_f16_gemm_tc5p_launch(const __half* w, const __half* x, float* y,
 // cover, the 4th slot pays at NT128's 282ns/slot cadence (fc2 26.6->24.6,
 // bit-identical outputs - same smem 230400 as <3,1,256>). NT192/256 keep
 // S=3 (their slot compute already hides the ring; S=4 doesn't fit anyway).
-static int pd_f16_gemm_tc5p_elect(const __half* w, const __half* x, float* y,
+// EPI: a fused landing takes the arm the plain GEMM would, and declines
+// (cudaErrorNotSupported) where that arm is the K-split - its partials reduce
+// in a different order, so the caller runs the unfused pair instead.
+template <uint32_t EPI = PD_F16_EPI_NONE>
+static int pd_f16_gemm_tc5p_elect(const __half* w, const __half* x, void* y,
                                   float beta, unsigned in_dim, unsigned out_dim,
-                                  unsigned batch, cudaStream_t st) {
+                                  unsigned batch, cudaStream_t st,
+                                  const float* bias = nullptr) {
     static const uint32_t ncl = [] {
         int dev = 0, nn = 0;
         cudaGetDevice(&dev);
@@ -2795,16 +2874,18 @@ static int pd_f16_gemm_tc5p_elect(const __half* w, const __half* x, float* y,
     const uint32_t w256 = (u256 + ncl - 1u) / ncl;
     const uint32_t u128 = rp * ((batch + 127u) >> 7);
     if (u128 <= ncl && u256 * 2u <= ncl)
-        return pd_f16_gemm_tc5p_launch<4u, 1u, 128u>(w, x, y, beta, in_dim,
-                                                     out_dim, batch, st);
-    if (nk >= 100u && w256 <= 2u && ((nk + 1u) >> 1) >= 3u)
+        return pd_f16_gemm_tc5p_launch<4u, 1u, 128u, EPI>(w, x, y, beta, in_dim,
+                                                          out_dim, batch, st, bias);
+    if (nk >= 100u && w256 <= 2u && ((nk + 1u) >> 1) >= 3u) {
+        if (EPI != PD_F16_EPI_NONE) return (int)cudaErrorNotSupported;
         return pd_f16_gemm_tc5p_launch<3u, 3u, 256u>(w, x, y, beta, in_dim,
                                                      out_dim, batch, st);
+    }
     if (nk <= 32u && rp * ((batch + 191u) / 192u) <= w256 * ncl)
-        return pd_f16_gemm_tc5p_launch<3u, 1u, 192u>(w, x, y, beta, in_dim,
-                                                     out_dim, batch, st);
-    return pd_f16_gemm_tc5p_launch<3u, 1u, 256u>(w, x, y, beta, in_dim,
-                                                 out_dim, batch, st);
+        return pd_f16_gemm_tc5p_launch<3u, 1u, 192u, EPI>(w, x, y, beta, in_dim,
+                                                          out_dim, batch, st, bias);
+    return pd_f16_gemm_tc5p_launch<3u, 1u, 256u, EPI>(w, x, y, beta, in_dim,
+                                                      out_dim, batch, st, bias);
 }
 #endif  // launcher arch guard (tc5p)
 
@@ -3475,6 +3556,28 @@ PD_EXPORT int pd_f16_gemm_h_silu(const void* w, const void* x, void* y, const vo
 // grids), the per-element wmma stage (ragged K), the tcgen05 routes (cc
 // 10.0) - and there the entries below run the two passes through the
 // caller's f32 scratch plane instead, so every shape lands the unfused bits.
+// On B200 pd_f16_gemm runs a prefill-width tower plane (batch >= 256) on the
+// tcgen05 ::2 arms - tc5p where in_dim % 64 == 0, else tc5d - and those carry
+// the two landings as well (unsplit only), so the fused entries below take
+// the same arm the plain GEMM would. 0 = landed; nonzero = run the unfused pair.
+#if defined(PD_TC5_HOST) && (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900))
+template <uint32_t EPI>
+static int pd_f16_tower_tc5(const __half* w, const __half* x, void* y, const float* bias,
+                            unsigned in_dim, unsigned out_dim, unsigned batch, cudaStream_t st) {
+    if (batch < 256u || (in_dim & 7u) != 0u || pd_f16_wmma_forced() || !pd_f16_tc5_on() ||
+        !pd_f16_ks_gate.load(std::memory_order_relaxed))
+        return (int)cudaErrorNotSupported;
+    static const bool off = std::getenv("PADDOCK_NO_F16TC5_TOWER") != nullptr;   // kill
+    if (off) return (int)cudaErrorNotSupported;
+    if (in_dim % 64u == 0u)
+        return pd_f16_gemm_tc5p_elect<EPI>(w, x, y, 0.0f, in_dim, out_dim, batch, st, bias);
+    if (EPI == PD_F16_EPI_BIAS_RES)
+        return pd_f16_gemm_tc5d_launch<4u, PD_F16_EPI_BIAS_RES>(w, x, (float*)y, 0.0f, in_dim,
+                                                                out_dim, batch, st, bias);
+    return (int)cudaErrorNotSupported;
+}
+#endif
+
 static bool pd_f16_tower_fusable(unsigned in_dim, unsigned out_dim, unsigned batch) {
     if ((in_dim & 7u) != 0u || pd_f16_wmma_forced()) return false;
 #if defined(PD_TC5_HOST) && (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900))
@@ -3496,6 +3599,12 @@ PD_EXPORT int pd_f16_gemm_h_gelu_tanhf(const void* w, const void* x, void* y16, 
                                         unsigned int batch, void* stream) {
     if (out_dim == 0u || batch == 0u) return 0;
     if (bias == nullptr) return (int)cudaErrorInvalidValue;
+#if defined(PD_TC5_HOST) && (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900))
+    if (pd_f16_tower_tc5<PD_F16_EPI_GELU_TANHF>((const __half*)w, (const __half*)x, y16,
+                                                (const float*)bias, in_dim, out_dim, batch,
+                                                (cudaStream_t)stream) == 0)
+        return 0;
+#endif
     if (pd_f16_tower_fusable(in_dim, out_dim, batch))
         return pd_f16_gemm_h_route<PD_F16_EPI_GELU_TANHF>(w, x, y16, (const float*)bias, in_dim,
                                                           out_dim, batch, stream);
@@ -3517,6 +3626,10 @@ PD_EXPORT int pd_f16_gemm_bias_res(const void* w, const void* x, void* y, const 
     float* Y = (float*)y;
     const float* B = (const float*)bias;
     cudaStream_t st = (cudaStream_t)stream;
+#if defined(PD_TC5_HOST) && (!defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900))
+    if (pd_f16_tower_tc5<PD_F16_EPI_BIAS_RES>(W, X, Y, B, in_dim, out_dim, batch, st) == 0)
+        return 0;
+#endif
     if (pd_f16_tower_fusable(in_dim, out_dim, batch)) {
         // pd_f16_gemm_mma_launch's election, arm for arm
         if (!pd_f16_mma_wide_tile(out_dim, batch))

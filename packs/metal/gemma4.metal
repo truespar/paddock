@@ -260,11 +260,14 @@ kernel void gemma_softcap(device float* logits [[buffer(0)]], constant uint* p [
 // Split-K GQA decode: one key tile serves every query head in its group.
 // HD/GQA are compile-time so the compiler sees bounded register footprints.
 // Exact online-softmax state composition, no context-sized score allocation.
-template<uint HD,uint GQA,bool Muse=false,typename KV=half>
+template<uint HD,uint GQA,bool Muse=false,typename KV=half,uint Ahead=1>
 inline void gemma_decode(device const float* q,device const KV* k,device const KV* v,
     device const uint* meta,device const uint* pages,device const uint* rows,device float* out,
     constant uint* p,uint3 g,uint tid,uint lane,uint sg,threadgroup float* scores,threadgroup float* prob,
     threadgroup float* highs,threadgroup float* sums) {
+    // Overlap bounded value loads without changing ascending accumulation,
+    // multiplication order or split boundaries. Moving the correction into
+    // shared probabilities changed rounding under shader instrumentation.
     uint row=rows[g.y],kh=g.x,slot=meta[row*2],length=meta[row*2+1]+1;
     uint low=p[3] && length>p[3]?length-p[3]:0;
     uint span=(length-low+p[5]-1)/p[5],first=low+g.z*span,last=min(first+span,length);
@@ -282,12 +285,25 @@ inline void gemma_decode(device const float* q,device const KV* k,device const K
             if(dl==0)scores[h*32+tid/4]=token<last?dots[h]:-INFINITY;}
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for(uint h=sg;h<GQA;h+=4){float z=scores[h*32+lane],hi=simd_max(z),pr=isfinite(hi)?exp(z-hi):0.0f;
-            float sum=simd_sum(pr);prob[h*32+lane]=pr;if(lane==0){highs[h]=hi;sums[h]=sum;}}
+            float sum=simd_sum(pr);prob[h*32+lane]=pr;
+            if(lane==0){highs[h]=hi;sums[h]=sum;}}
         threadgroup_barrier(mem_flags::mem_threadgroup);
         float mul[GQA];for(uint h=0;h<GQA;++h){float hi=max(maximum[h],highs[h]),old=isfinite(maximum[h])?exp(maximum[h]-hi):0.0f;
             mul[h]=exp(highs[h]-hi);denom[h]=denom[h]*old+sums[h]*mul[h];maximum[h]=hi;
             for(uint d=0;d<HD/128;++d)acc[h][d]*=old;}
-        for(uint j=0;j<min(32u,last-base);++j){ulong vi=(ulong(gemma_physical(pages,slot,base+j,p))*p[1]+kh)*HD+tid;
+        if constexpr(Ahead>1) {
+            uint count=min(32u,last-base);
+            for(uint first_j=0;first_j<count;first_j+=Ahead) {
+                float values[Ahead][HD/128];
+                for(uint j=0;j<Ahead;++j)if(first_j+j<count){
+                    ulong vi=(ulong(gemma_physical(pages,slot,base+first_j+j,p))*p[1]+kh)*HD+tid;
+                    for(uint d=0;d<HD/128;++d)values[j][d]=float(v[vi+d*128]);
+                }
+                for(uint j=0;j<Ahead;++j)if(first_j+j<count)
+                    for(uint d=0;d<HD/128;++d)for(uint h=0;h<GQA;++h)
+                        acc[h][d]+=values[j][d]*(prob[h*32+first_j+j]*mul[h]);
+            }
+        } else for(uint j=0;j<min(32u,last-base);++j){ulong vi=(ulong(gemma_physical(pages,slot,base+j,p))*p[1]+kh)*HD+tid;
             for(uint d=0;d<HD/128;++d){float value=float(v[vi+d*128]);for(uint h=0;h<GQA;++h)acc[h][d]+=value*(prob[h*32+j]*mul[h]);}}
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -316,7 +332,7 @@ kernel void gemma_merge(device const float* parts [[buffer(0)]],device float* ou
 // Broadcast it across the head instead of loading/recomputing exp for every
 // dimension. Both sums retain ascending partition order and F32 arithmetic;
 // empty tail partitions contribute nothing, including when their max is -inf.
-template<uint HD>
+template<uint HD,bool Round=false>
 inline void gemma_merge_vectors(device const float* parts,device float* out,device const uint* rows,
     constant uint* p,uint g,uint lane) {
     uint rh=rows[g/p[0]]*p[0]+g%p[0];ulong base=ulong(g)*p[1]*(HD+2);
@@ -329,12 +345,22 @@ inline void gemma_merge_vectors(device const float* parts,device float* out,devi
             // Partition stride is HD+2, so odd partitions are only 8-byte
             // aligned. packed_float4 avoids an invalid float4-aligned load.
             for(uint d=0;d<HD/128;++d)acc[d]+=float4(*reinterpret_cast<device const packed_float4*>(parts+base+s*(HD+2)+lane*4+d*128))*cs;}}
-    for(uint d=0;d<HD/128;++d)*reinterpret_cast<device float4*>(out+ulong(rh)*HD+lane*4+d*128)=acc[d]/denom;
+    for(uint d=0;d<HD/128;++d){float4 value=acc[d]/denom;
+        if constexpr(Round)value=mlx_bf(value);
+        *reinterpret_cast<device float4*>(out+ulong(rh)*HD+lane*4+d*128)=value;}
 }
 kernel void gemma_merge_shared(device const float* parts [[buffer(0)]],device float* out [[buffer(1)]],device const uint* rows [[buffer(2)]],
     constant uint* p [[buffer(3)]],uint g [[threadgroup_position_in_grid]],uint lane [[thread_index_in_simdgroup]]) {
     if(p[2]==256)gemma_merge_vectors<256>(parts,out,rows,p,g,lane);
     else gemma_merge_vectors<512>(parts,out,rows,p,g,lane);
+}
+// Gemma MLX rounds the merged attention row to BF16 before the output
+// projection. Keep its F32 accumulation, and fold only that storage boundary
+// into the producer. Pure-decode callers can omit the separate rounding walk.
+kernel void gmlx_merge_rounded(device const float* parts [[buffer(0)]],device float* out [[buffer(1)]],device const uint* rows [[buffer(2)]],
+    constant uint* p [[buffer(3)]],uint g [[threadgroup_position_in_grid]],uint lane [[thread_index_in_simdgroup]]) {
+    if(p[2]==256)gemma_merge_vectors<256,true>(parts,out,rows,p,g,lane);
+    else gemma_merge_vectors<512,true>(parts,out,rows,p,g,lane);
 }
 
 // MPP online-softmax prefill, with a smaller key tile for global HD=512.

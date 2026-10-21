@@ -10,6 +10,7 @@ pub mod api;
 pub mod artifacts;
 mod automatic_budget;
 pub mod backend_contract;
+pub mod batch;
 pub mod cloud;
 pub mod cloud_loop;
 pub mod collector;
@@ -308,7 +309,14 @@ pub async fn initialize(
     } else {
         paddock_tls::box_names().into_iter().collect()
     };
+    // Batch inference runs against whatever is serving, under the data root.
+    let batches = Arc::new(batch::Batches::for_supervisor(
+        &data_dir,
+        db.clone(),
+        supervisor.clone(),
+    ));
     let state = Arc::new(AppState {
+        batches,
         db,
         auth_key: auth_key.clone(),
         trusted_proxy: cfg.trusted_proxy,
@@ -338,6 +346,9 @@ pub async fn initialize(
     // server-push watcher: sweeps fleet state only while a Studio tab holds
     // the /api/events stream open, publishing on change (crate::push)
     crate::push::spawn_watcher(state.clone());
+    // Resume every batch that was running when the manager last stopped
+    // (both hosts: the desktop app reads the same store).
+    state.batches.start();
 
     if mode == HostMode::Web {
         let startup = state.clone();

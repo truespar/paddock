@@ -346,6 +346,34 @@ impl Fp8ChannelView<'_> {
     }
 }
 
+/// One f32 scale per output row of an fp8 plane, from `<base>.weight_scale`
+/// in either export's layout: llm-compressor's channel strategy (BF16, one
+/// per row, `[rows]` or `[rows, 1]`) or ModelOpt's per-tensor scale (one F32,
+/// `[]` or `[1]`), broadcast - exact either way, the plane's values are
+/// `e4m3 * scale` per row. `None` for any other shape (a block grid has its
+/// own `_scale_inv` path).
+pub fn fp8_row_scales(st: &ShardedSafetensors, base: &str, rows: usize) -> Option<Vec<f32>> {
+    let (t, b) = st.bytes(&format!("{base}.weight_scale"))?;
+    row_scales_from(t.dtype, &t.shape, b, rows)
+}
+
+fn row_scales_from(dtype: StDtype, shape: &[usize], b: &[u8], rows: usize) -> Option<Vec<f32>> {
+    let n: usize = shape.iter().product();
+    match dtype {
+        StDtype::Bf16 if n == rows && b.len() == rows * 2 => Some(
+            b.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| f32::from_bits((u16::from_le_bytes(*c) as u32) << 16))
+                .collect(),
+        ),
+        StDtype::F32 if n == 1 && b.len() == 4 => {
+            Some(vec![f32::from_le_bytes([b[0], b[1], b[2], b[3]]); rows])
+        }
+        _ => None,
+    }
+}
+
 /// e2m1 magnitude table (3-bit code), sign in bit 3.
 const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
 
@@ -403,6 +431,23 @@ mod tests {
             let got = e2m1_to_f32(code as u8);
             assert_eq!(got.to_bits(), w.to_bits(), "code {code:#x}");
         }
+    }
+
+    #[test]
+    fn fp8_row_scales_read_both_exports() {
+        // llm-compressor channel: one bf16 per row (1.0, 2.0)
+        let bf = [0x80u8, 0x3f, 0x00, 0x40];
+        assert_eq!(
+            row_scales_from(StDtype::Bf16, &[2, 1], &bf, 2),
+            Some(vec![1.0, 2.0])
+        );
+        // ModelOpt per-tensor: one f32, broadcast, bit-exact
+        let s = 0.003_141_592_7f32;
+        let got = row_scales_from(StDtype::F32, &[], &s.to_le_bytes(), 3).unwrap();
+        assert!(got.iter().all(|v| v.to_bits() == s.to_bits()) && got.len() == 3);
+        // anything else is not a row scale
+        assert_eq!(row_scales_from(StDtype::Bf16, &[3, 1], &bf, 2), None);
+        assert_eq!(row_scales_from(StDtype::F32, &[2], &[0u8; 8], 2), None);
     }
 
     #[test]

@@ -15,6 +15,14 @@
 // of DRAM, and a consumer that only wants bf16 rows skips the f32 plane.
 // Accepts only the vec4 add-scale regime (rows >= 256, n % 4, 16 B aligned);
 // -2 elsewhere, and the caller keeps the two launches.
+//
+// Slot 866 adds an mmq-layout copy of xn (section C, yq non-null):
+// pd_quantize_q8_mmq's arithmetic on the values section B forms - the amax of
+// each 32-value block (8 consecutive float4 lanes - order-free), the same
+// scale, reciprocal, round-to-nearest and clamp - so the GEMM's activation
+// bytes come out of the same pass that wrote x, and xn's f32 plane is
+// optional. The grid then spans the 128-padded batch: blocks past `rows`
+// zero their pad rows (the quantize wrote zeros there) and touch nothing else.
 template <int ACC>
 __global__ void pd_rmsnorm_add_scale_norm_kernel(float* __restrict__ x,
                                                  const float* __restrict__ proj,
@@ -22,9 +30,18 @@ __global__ void pd_rmsnorm_add_scale_norm_kernel(float* __restrict__ x,
                                                  const float* __restrict__ wpre,
                                                  float* __restrict__ xn,
                                                  __nv_bfloat16* __restrict__ x16,
-                                                 uint32_t n4, float eps, float s) {
+                                                 uint32_t n4, float eps, float s,
+                                                 uint8_t* __restrict__ yq = nullptr,
+                                                 uint32_t rows = 0u,
+                                                 uint32_t batch_pad = 0u) {
     using A = typename pd_acc_of<ACC>::type;
     const uint32_t b = blockIdx.x;
+    if (yq && b >= rows) {   // a pad row of the mmq layout: zeros, nothing else
+        const uint32_t nch = n4 >> 5;
+        for (uint32_t j = threadIdx.x; j < nch * 36u; j += blockDim.x)
+            reinterpret_cast<uint32_t*>(yq + ((size_t)(j / 36u) * batch_pad + b) * 144u)[j % 36u] = 0u;
+        return;
+    }
     const float4* pb = (const float4*)(proj + (size_t)b * n4 * 4u);
     float4* xb = (float4*)(x + (size_t)b * n4 * 4u);
     const uint32_t tid = threadIdx.x, nth = blockDim.x;
@@ -120,6 +137,25 @@ __global__ void pd_rmsnorm_add_scale_norm_kernel(float* __restrict__ x,
                                   __float2bfloat16(r.z), __float2bfloat16(r.w)};
             *reinterpret_cast<uint2*>(h + 4u * i) = *reinterpret_cast<const uint2*>(t);
         }
+        if (yq) {
+            // ---- section C: the 32-value block is lanes (lane & ~7) .. +7 (n4 % 32
+            // == 0, so every warp runs every trip whole)
+            float a = fmaxf(fmaxf(fabsf(r.x), fabsf(r.y)), fmaxf(fabsf(r.z), fabsf(r.w)));
+            #pragma unroll
+            for (uint32_t sh = 4; sh > 0; sh >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, sh));
+            const float scl = a * (1.0f / 127.0f);
+            const float qinv = scl > 0.0f ? 1.0f / scl : 0.0f;
+            const uint32_t e0 = 4u * i, within = e0 & 127u;
+            uint8_t* blk = yq + ((size_t)(e0 >> 7) * batch_pad + b) * 144u;
+            char4 q;
+            int qi;
+            qi = __float2int_rn(r.x * qinv); q.x = (char)(qi < -127 ? -127 : (qi > 127 ? 127 : qi));
+            qi = __float2int_rn(r.y * qinv); q.y = (char)(qi < -127 ? -127 : (qi > 127 ? 127 : qi));
+            qi = __float2int_rn(r.z * qinv); q.z = (char)(qi < -127 ? -127 : (qi > 127 ? 127 : qi));
+            qi = __float2int_rn(r.w * qinv); q.w = (char)(qi < -127 ? -127 : (qi > 127 ? 127 : qi));
+            *reinterpret_cast<char4*>(blk + 16u + within) = q;
+            if ((lane & 7u) == 0u) reinterpret_cast<float*>(blk)[within >> 5] = scl;
+        }
     }
 }
 
@@ -145,5 +181,34 @@ int pd_rmsnorm_add_scale_norm(void* x, const void* proj, const void* wpost,
     else if (accm == PD_ACC_F64) PD_RASN_GO(PD_ACC_F64);
     else PD_RASN_GO(PD_ACC_F32);
 #undef PD_RASN_GO
+    return pd_launch_status();
+}
+
+// Slot 866: slot 777 with the mmq-quantized xn (section C) - x += rmsnorm(proj)
+// * wpost * s, then yq = quantize_q8_mmq(rmsnorm(x) * wpre); xn's f32 plane only
+// when `xn` is set. Bit-identical to rmsnorm_add_scale + rmsnorm_batch +
+// quantize_q8_mmq at the rows it accepts (>= 256, the add-scale's vec4 regime)
+// and n % 128 == 0; -2 elsewhere, and the caller keeps the chain.
+PD_EXPORT
+int pd_rmsnorm_add_scale_norm_q8(void* x, const void* proj, const void* wpost, const void* wpre,
+                                 void* xn, void* yq, uint32_t n, float eps, float s,
+                                 uint32_t rows, void* stream) {
+    if (n == 0 || rows == 0) return 0;
+    if (rows < 256u || (n & 127u) != 0 || yq == nullptr ||
+        (((uintptr_t)x | (uintptr_t)proj | (uintptr_t)wpost | (uintptr_t)wpre |
+          (uintptr_t)xn | (uintptr_t)yq) & 15u) != 0)
+        return -2;
+    const uint32_t nth = pd_norm_wide_nth_ws(rows);
+    const uint32_t batch_pad = (rows + 127u) & ~127u;
+    const int accm = pd_norm_acc_mode();
+    cudaStream_t st = (cudaStream_t)stream;
+#define PD_RASNQ_GO(ACC)                                                             \
+    pd_rmsnorm_add_scale_norm_kernel<ACC><<<batch_pad, nth, 0, st>>>(                \
+        (float*)x, (const float*)proj, (const float*)wpost, (const float*)wpre,      \
+        (float*)xn, nullptr, n >> 2, eps, s, (uint8_t*)yq, rows, batch_pad)
+    if (accm == PD_ACC_DF) PD_RASNQ_GO(PD_ACC_DF);
+    else if (accm == PD_ACC_F64) PD_RASNQ_GO(PD_ACC_F64);
+    else PD_RASNQ_GO(PD_ACC_F32);
+#undef PD_RASNQ_GO
     return pd_launch_status();
 }

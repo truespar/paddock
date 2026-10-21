@@ -831,6 +831,18 @@ impl<T: XferSink> PoolTier<T> {
             if path.is_empty() {
                 break;
             }
+            // a background-only tail (batch work, `Node::low`) is dropped, not
+            // stored: RAM and disk keep what live sessions come back for. Its
+            // live prefix stays, and demotes on its own turn as a live leaf.
+            if path.last().is_some_and(|e| e.low) {
+                for e in path.iter().rev().take_while(|e| e.low) {
+                    match radix.evict_leaf(e.node, pool) {
+                        Some(_) => evicted += 1,
+                        None => break,
+                    }
+                }
+                continue;
+            }
             // claim checkpoints on the doomed path before eviction recycles
             // them - the family demotes (or recycles) each AuxTaken. Those
             // the tier can take bind their runs first, so the run demotes
@@ -1012,7 +1024,8 @@ impl<T: XferSink> PoolTier<T> {
                 return;
             };
             match e.tkey {
-                Some(key) if e.depth % r == 0 => {
+                // a background-only checkpoint is dropped (pressure_demote)
+                Some(key) if e.depth % r == 0 && !e.low => {
                     // the KV first: root-first, like pressure_demote, so a
                     // probe can walk the chain from its head. Even when the
                     // blob is already in T1 - the slack mirror may have
@@ -2745,6 +2758,36 @@ mod tests {
         let hit = t.probe(&tokens, 0).expect("both runs restorable");
         assert_eq!((hit.start_block, hit.end_block), (0, 8));
         assert_eq!(hit.keys.len(), 2);
+    }
+
+    #[test]
+    fn pressure_drops_a_batch_chain_without_storing_it() {
+        let mut t = tier(256 << 20);
+        let mut pool = KvPool::with_blocks(64);
+        let mut radix = armed_radix(&t);
+        let live = cached_chain(&mut radix, &mut pool, 1, 4);
+        // the batch chain is newer and still goes first - and goes nowhere
+        let batch: Vec<u32> = (0..4 * BLOCK_TOKENS)
+            .map(|i| 2 * 10_000 + i as u32)
+            .chain([9])
+            .collect();
+        let mut tb = BlockTable::new();
+        tb.ensure(4 * BLOCK_TOKENS - 1, &mut pool).unwrap();
+        radix.insert_as(&batch, tb.blocks(), &mut pool, true);
+        tb.clear(&mut pool);
+        assert_eq!(pool.free_blocks(), 56);
+        let (evicted, _) = t.pressure_demote(&mut radix, &mut pool, 60, None);
+        assert_eq!(evicted, 4, "the batch chain alone met the target");
+        assert_eq!(t.stats().2, 0, "and no store was opened for it");
+        assert_eq!(
+            pool.free_blocks(),
+            60,
+            "its pages free at once - no demote pins"
+        );
+        assert_eq!(radix.chain_depth(&live), 4, "the live chain still serves");
+        // past the batch chain, live chains demote as before
+        t.pressure_demote(&mut radix, &mut pool, 64, None);
+        assert_eq!(t.stats().2, 1, "the live chain's run went to the tier");
     }
 
     #[test]

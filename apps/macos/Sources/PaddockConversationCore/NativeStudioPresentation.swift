@@ -32,6 +32,7 @@ extension NativeStudioRuntime {
         "model": row["model"] ?? .string(""), "updatedAt": row["updatedAt"] ?? .number(0),
         "pinned": row["pinned"] ?? .bool(false),
         "kind": row["kind"] ?? .string("chat"),
+        "composerDraft": row["composerDraft"] ?? .bool(false),
         "busy": .bool(row["id"] == fields["id"] && !self.tasks.isEmpty), "titleState": .string(""),
       ])
     }
@@ -130,7 +131,11 @@ extension NativeStudioRuntime {
     settings["connectorIds"] = settings["connectorIds"] ?? .array([])
     return [
       "version": .number(1), "revision": .number(Decimal(revision)),
-      "conversation": draft
+      "composerDraft": .object([
+        "id": fields["id"] ?? .string(""), "text": .string(draftText),
+        "attachments": .array(composerDraftAttachments),
+      ]),
+      "conversation": draft && composerDraftRevision.isEmpty
         ? .null
         : .object([
           "id": fields["id"]!, "title": fields["title"] ?? .string("New conversation"),

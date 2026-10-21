@@ -131,8 +131,7 @@ struct WorkspaceNavigation {
   }
 }
 
-/// Only an in-memory editor draft. No send, transcript, persistence, or credentials
-/// are implied by this shell. Navigation must not throw away what someone typed.
+/// Editor binding only. StudioWorkspace owns the per-conversation durable draft.
 struct StudioDraft {
   var message = ""
   var hasContent: Bool { !message.isEmpty }

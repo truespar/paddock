@@ -18,23 +18,7 @@
 // once at model load on sm_120; lossy (4-bit weights) - model paths gate it
 // on retrieval quality, never on greedy exactness.
 
-// f32 -> e2m1 nibble, round-to-nearest-even on the e2m1 grid
-// {0, .5, 1, 1.5, 2, 3, 4, 6} (ties resolve toward even mantissa, matching
-// IEEE RN semantics). Caller guarantees |v| <= 6 via the block scale.
-__device__ __forceinline__ unsigned pd_e2m1_rn(float v) {
-    unsigned s = v < 0.0f ? 8u : 0u;
-    float a = fabsf(v);
-    unsigned m;
-    if (a <= 0.25f) m = 0u;            // .25 tie -> 0   (mantissa 0 even)
-    else if (a < 0.75f) m = 1u;        // .75 tie -> 1.0 (mantissa 0)
-    else if (a <= 1.25f) m = 2u;       // 1.25 tie -> 1.0
-    else if (a < 1.75f) m = 3u;        // 1.75 tie -> 2.0
-    else if (a <= 2.5f) m = 4u;        // 2.5 tie -> 2.0
-    else if (a < 3.5f) m = 5u;         // 3.5 tie -> 4.0
-    else if (a <= 5.0f) m = 6u;        // 5.0 tie -> 4.0
-    else m = 7u;
-    return s | m;
-}
+// pd_e2m1_rn (f32 -> e2m1 nibble, RN-even): quant/e2m1.cuh
 
 // One warp per 32-element block: dequant Q8_0, pick the smallest power-of-2
 // scale with amax/2^e <= 6 (the e2m1 max, same construction as

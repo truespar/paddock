@@ -2097,6 +2097,80 @@ impl GpuExecutor {
         })
     }
 
+    /// Whether the pack exports the tcgen05 varlen prefill (slot 872) and
+    /// `PADDOCK_NO_PF_TC5` is unset - the caller then builds 128-row items.
+    pub fn has_attn_prefill_tc5_vl(&self) -> bool {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        self.kernels.attn_prefill_tc5_vl.is_some()
+            && !*OFF.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_PF_TC5").is_some())
+    }
+
+    /// [`Self::attn_prefill_f16_paged_vl`]'s arguments at 128-row tiles with
+    /// both attention GEMMs on tcgen05 (slot 872): `items` is stride-4 u32 per
+    /// 128-head-row tile `(q_row0, span_rows, tile_flat_row0, slot)`, tiles
+    /// never crossing spans. The e4m3 class (Q, K, V and the softmax weights
+    /// e4m3, f32 accumulate) the decode lane already runs, not slot 322's f16
+    /// one - serve-gated. hd 256, fp8 pools, G 6; callers keep slot 322 (64-row
+    /// items) as the fallback.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prefill_tc5_vl(
+        &self,
+        q: &CudaSlice<f32>,
+        pool_k: &CudaSlice<u8>,
+        pool_v: &CudaSlice<u8>,
+        sinks: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        positions: &CudaSlice<u32>,
+        items: &CudaSlice<u32>,
+        n_tiles: usize,
+        block_tables: &CudaSlice<u32>,
+        blocks_per_slot: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        swa_window: usize,
+        scale: f32,
+        kv_dtype: KvDtype,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .attn_prefill_tc5_vl
+            .ok_or(GpuError::MissingOp("attn_prefill_tc5_vl"))?;
+        debug_assert!(n_tiles * 4 <= items.len());
+        let (qp, _g1) = q.device_ptr(&self.stream);
+        let (kp, _g2) = pool_k.device_ptr(&self.stream);
+        let (vp, _g3) = pool_v.device_ptr(&self.stream);
+        let (sp, _g4) = sinks.device_ptr(&self.stream);
+        let (op, _g5) = out.device_ptr_mut(&self.stream);
+        let (pp, _g6) = positions.device_ptr(&self.stream);
+        let (ip, _g7) = items.device_ptr(&self.stream);
+        let (btp, _g8) = block_tables.device_ptr(&self.stream);
+        // SAFETY: ABI contract; pools sized [n_blocks, 16, kv_dim] * dtype bytes
+        check(unsafe {
+            f(
+                qp as *const _,
+                kp as *const _,
+                vp as *const _,
+                sp as *const _,
+                op as *mut _,
+                pp as *const _,
+                ip as *const _,
+                n_tiles as u32,
+                btp as *const _,
+                blocks_per_slot as u32,
+                n_heads as u32,
+                n_kv_heads as u32,
+                head_dim as u32,
+                kv_dim as u32,
+                swa_window as u32,
+                scale,
+                kv_dtype as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// Paged f16 WMMA prefill (P4b-2): [`Self::attn_prefill_f16`] over the block
     /// pool (single-slot; head_dim 256/64, fp16 KV). Bit-exact vs the dense f16
     /// prefill; gives paged prefill full perf parity with qwen35's dense default.

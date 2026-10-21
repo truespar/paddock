@@ -282,6 +282,7 @@ async fn run_summary(
         submitted: None, // stamped by Engine::submit
         canvas_read: None,
         user_turn: false,
+        background: false,
     };
     if let Err(e) = model.engine.submit(gen1) {
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e));
@@ -584,7 +585,7 @@ async fn compact_and_submit(
         tokenizer: model.tokenizer.clone(),
         prompt_len: prepared.prompt_ids.len(),
         text_prompt_len: prepared.engine_prompt.len(),
-        media_is_audio: model.supports_audio,
+        audio_rows: crate::chat::audio_rows(model, None),
         dialect: model.dialect,
         thinking_open: prepared.thinking_open,
         hints: prepared.hints.clone(),
@@ -636,6 +637,7 @@ async fn compact_and_submit(
         submitted: None, // stamped by Engine::submit
         canvas_read: None,
         user_turn: false,
+        background: false,
     };
     if let Err(e) = model.engine.submit(gen_req) {
         return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e));
@@ -701,7 +703,7 @@ pub(super) async fn run_compact_trigger(
         tokenizer: model.tokenizer.clone(),
         prompt_len: p1_len,
         text_prompt_len: p1_len,
-        media_is_audio: model.supports_audio,
+        audio_rows: crate::chat::audio_rows(model, None),
         dialect: model.dialect,
         thinking_open: false,
         hints: None,
@@ -916,7 +918,7 @@ pub async fn handle_compact(
         "output": output,
         "usage": {
             "input_tokens": p1_len,
-            "input_tokens_details": paddock_api::completions::Usage::media_details(p1_len, cached1, 0, false),
+            "input_tokens_details": paddock_api::completions::Usage::media_details(p1_len, cached1, 0, 0),
             "output_tokens": out1,
             "output_tokens_details": {"reasoning_tokens": 0},
             "total_tokens": p1_len + out1,

@@ -1377,6 +1377,59 @@ impl GpuExecutor {
         self.kernels.mrope_vision_qkv_h.is_some() && self.kernels.vision_attn_h.is_some()
     }
 
+    /// Whether the pack builds a qwen tower's patch rows on the device ([`Self::qwv_patchify`]).
+    pub fn has_qwv_patchify(&self) -> bool {
+        self.kernels.qwv_patchify.is_some()
+    }
+
+    /// `batch` resized `[th][tw][3]` u8 pictures (back to back in `rgb`) into
+    /// the patch GEMM's f16 rows `[batch * n][3 * patch^2]` in the merged 2x2
+    /// order, normalized by `mean` / `std` - the host `normalize_rgb` + im2col +
+    /// `convert_f32_f16` chain's bits (slot 871).
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwv_patchify(
+        &self,
+        rgb: &CudaSlice<u8>,
+        out: &mut CudaSlice<f16>,
+        (tw, th, patch, batch): (usize, usize, usize, usize),
+        mean: [f32; 3],
+        std: [f32; 3],
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .qwv_patchify
+            .ok_or(GpuError::MissingOp("qwv_patchify"))?;
+        let rows = batch * (tw / patch.max(1)) * (th / patch.max(1));
+        if patch == 0
+            || !tw.is_multiple_of(2 * patch)
+            || !th.is_multiple_of(2 * patch)
+            || rgb.len() < batch * tw * th * 3
+            || out.len() < rows * 3 * patch * patch
+        {
+            return Err(oob("qwv_patchify: buffers under the picture geometry"));
+        }
+        let (rp, _g1) = rgb.device_ptr(&self.stream);
+        let (op, _g2) = out.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slot 871); bounds checked above
+        check(unsafe {
+            f(
+                rp as *const _,
+                op as *mut _,
+                mean[0],
+                mean[1],
+                mean[2],
+                std[0],
+                std[1],
+                std[2],
+                tw as u32,
+                th as u32,
+                patch as u32,
+                batch as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// The tower's three f32 projection planes landed as
     /// [`Self::vision_attn_h`]'s halves in one pass:
     /// `q16 = f16(rope(q + bq) * q_mul)`, `k16 = f16(rope(k + bk))`,
@@ -1786,6 +1839,67 @@ impl GpuExecutor {
                     .map_or(std::ptr::null_mut(), |(p, _)| *p as *mut _),
                 x16.as_ref()
                     .map_or(std::ptr::null_mut(), |(p, _)| *p as *mut _),
+                n as u32,
+                eps,
+                s,
+                rows as u32,
+                self.stream_ptr(),
+            )
+        };
+        if rc == -2 {
+            return Ok(false);
+        }
+        check(rc)?;
+        Ok(true)
+    }
+
+    /// [`Self::rmsnorm_add_scale_norm`] with the next norm landed
+    /// mmq-quantized in `yq` (slot 866) - bytes identical to
+    /// [`Self::rmsnorm_add_scale`] + `rmsnorm_batch` + `quantize_q8_mmq`,
+    /// the pad rows of the 128-padded batch zeroed as the quantize writes
+    /// them. `xn` (the f32 plane) only for a caller that still reads it.
+    /// `Ok(false)` (nothing launched) without the slot or outside its band
+    /// (rows < 256, n % 128, unaligned planes): the caller runs the chain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_add_scale_norm_q8(
+        &self,
+        x: &mut CudaSlice<f32>,
+        proj: &CudaSlice<f32>,
+        w_post: &CudaSlice<f32>,
+        w_pre: &CudaSlice<f32>,
+        xn: Option<&mut CudaSlice<f32>>,
+        yq: &mut CudaSlice<u8>,
+        n: usize,
+        eps: f32,
+        s: f32,
+        rows: usize,
+    ) -> Result<bool, GpuError> {
+        let Some(f) = self.kernels.rmsnorm_add_scale_norm_q8 else {
+            return Ok(false);
+        };
+        if rows < 256
+            || !n.is_multiple_of(128)
+            || yq.len() < n / 128 * rows.next_multiple_of(128) * 144
+        {
+            return Ok(false);
+        }
+        let (xp, _g1) = x.device_ptr_mut(&self.stream);
+        let (pp, _g2) = proj.device_ptr(&self.stream);
+        let (wa, _g3) = w_post.device_ptr(&self.stream);
+        let (wb, _g4) = w_pre.device_ptr(&self.stream);
+        let xn = xn.map(|v| v.device_ptr_mut(&self.stream));
+        let (yp, _g5) = yq.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slot 866); x / proj / xn hold rows * n, yq the
+        // padded mmq layout (checked above)
+        let rc = unsafe {
+            f(
+                xp as *mut _,
+                pp as *const _,
+                wa as *const _,
+                wb as *const _,
+                xn.as_ref()
+                    .map_or(std::ptr::null_mut(), |(p, _)| *p as *mut _),
+                yp as *mut _,
                 n as u32,
                 eps,
                 s,

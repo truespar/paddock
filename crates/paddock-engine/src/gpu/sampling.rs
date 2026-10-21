@@ -170,6 +170,129 @@ impl GpuExecutor {
         self.kernels.add_rmsnorm_quant_nvf4_batch.is_some()
     }
 
+    /// Slot 876: `add_rmsnorm_batch` + `quantize_nvf4` in one launch,
+    /// bit-identical to the pair (`out` keeps the f32 normed row). `Ok(false)`
+    /// when the pack has no slot or declines the width (nothing launched -
+    /// run the pair).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_rmsnorm_nvf4_batch(
+        &self,
+        x: &mut CudaSlice<f32>,
+        proj: &CudaSlice<f32>,
+        w: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        q: &mut CudaSlice<i8>,
+        scale: &mut CudaSlice<u8>,
+        n: usize,
+        eps: f32,
+        batch: usize,
+    ) -> Result<bool, GpuError> {
+        let f = self.kernels.add_rmsnorm_nvf4_batch;
+        self.add_rmsnorm_q_batch(f, (2, 16), x, proj, w, out, q, scale, n, eps, batch)
+    }
+
+    /// Slot 879: [`Self::add_rmsnorm_nvf4_batch`] with the scales in the
+    /// tcgen05 GEMM's swizzled atom layout - `scale` holds ceil(batch / 128) *
+    /// 128 rows' worth - for [`Self::nvf4_gemm_f4_sw`]. Same decline rule.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_rmsnorm_nvf4_batch_sw(
+        &self,
+        x: &mut CudaSlice<f32>,
+        proj: &CudaSlice<f32>,
+        w: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        q: &mut CudaSlice<i8>,
+        scale: &mut CudaSlice<u8>,
+        n: usize,
+        eps: f32,
+        batch: usize,
+    ) -> Result<bool, GpuError> {
+        if scale.len() < batch.next_multiple_of(128) * n / 16 {
+            return Ok(false);
+        }
+        let f = self.kernels.add_rmsnorm_nvf4_batch_sw;
+        self.add_rmsnorm_q_batch(f, (2, 16), x, proj, w, out, q, scale, n, eps, batch)
+    }
+
+    /// Slot 877: [`Self::add_rmsnorm_nvf4_batch`] with `quantize_e4m3`'s
+    /// per-32 linear e4m3 planes (the W8 GEMMs' input); `sw` (slot 884): the
+    /// scales in the tcgen05 GEMM's swizzled atom layout - `scale` holds
+    /// ceil(batch / 128) * 128 rows' worth - for `f8d_gemm_t`'s `xs_sw`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_rmsnorm_e4m3_batch(
+        &self,
+        x: &mut CudaSlice<f32>,
+        proj: &CudaSlice<f32>,
+        w: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        q: &mut CudaSlice<i8>,
+        (scale, sw): (&mut CudaSlice<u8>, bool),
+        n: usize,
+        eps: f32,
+        batch: usize,
+    ) -> Result<bool, GpuError> {
+        if sw && scale.len() < batch.next_multiple_of(128) * n / 32 {
+            return Ok(false);
+        }
+        let f = if sw {
+            self.kernels.add_rmsnorm_e4m3_batch_sw
+        } else {
+            self.kernels.add_rmsnorm_e4m3_batch
+        };
+        self.add_rmsnorm_q_batch(f, (1, 32), x, proj, w, out, q, scale, n, eps, batch)
+    }
+
+    /// Shared body of slots 876 / 877; `(qd, sd)`: elements per q byte / per
+    /// scale byte.
+    #[allow(clippy::too_many_arguments)]
+    fn add_rmsnorm_q_batch(
+        &self,
+        f: Option<paddock_kernels::abi::AddRmsnormNvf4BatchFn>,
+        (qd, sd): (usize, usize),
+        x: &mut CudaSlice<f32>,
+        proj: &CudaSlice<f32>,
+        w: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        q: &mut CudaSlice<i8>,
+        scale: &mut CudaSlice<u8>,
+        n: usize,
+        eps: f32,
+        batch: usize,
+    ) -> Result<bool, GpuError> {
+        let Some(f) = f else {
+            return Ok(false);
+        };
+        if q.len() < batch * n / qd || scale.len() < batch * n / sd {
+            return Ok(false);
+        }
+        let (xp, _g1) = x.device_ptr_mut(&self.stream);
+        let (pp, _g2) = proj.device_ptr(&self.stream);
+        let (wp, _g3) = w.device_ptr(&self.stream);
+        let (op, _g4) = out.device_ptr_mut(&self.stream);
+        let (qp, _g5) = q.device_ptr_mut(&self.stream);
+        let (sp, _g6) = scale.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slots 876 / 877); q / scale sized above, x / out as add_rmsnorm_batch
+        let rc = unsafe {
+            f(
+                xp as *mut _,
+                pp as *const _,
+                wp as *const _,
+                op as *mut _,
+                qp as *mut _,
+                sp as *mut _,
+                n as u32,
+                eps,
+                batch as u32,
+                self.stream_ptr(),
+            )
+        };
+        const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
+        if rc == CUDA_ERROR_NOT_SUPPORTED {
+            return Ok(false);
+        }
+        check(rc).map(|()| true)
+    }
+
     /// Fused residual-add + rmsnorm + Q8_0 quantize (the dp4a-class e4m3
     /// sibling): x += proj is written back, out keeps the f32
     /// plane (router / gemv fallbacks), q/qs get the int8 + per-32 scales.

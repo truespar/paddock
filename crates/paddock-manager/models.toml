@@ -695,6 +695,95 @@ revision = "2026-10-07"
     size = 8513
 
 
+# NVIDIA's streaming speech recognizer, served from its own GGUF (Q8_0
+# projections as NVIDIA converted them; the file carries the vocabulary, the
+# prompt dictionary, the filterbank and the relative-position table). CUDA
+# only: the native engine's cache-aware lane (slots 853-861), files and live
+# sessions on one computation - a stream's tokens are the file's to the bit.
+# weight_bytes is the CUDA lane's resident count (GB10 2026-10-15, int8 rows
+# with the file's f16 block scales, the rest F32); workspace is the window
+# planes plus 32 concurrent sessions' K/V and convolution rings.
+[[model]]
+id = "nemotron-3.5-asr-streaming-0.6b"
+vendor = "NVIDIA"
+display = "Nemotron 3.5 ASR Streaming"
+family = "nemotron-asr"
+capability = ["transcription"]
+license = "openmdw-1.1"
+revision = "2026-10-15"
+
+  [model.specs]
+  published_at = "2026-06-04"
+  published_source = "https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b"
+  params = "600M"
+  context = "Unbounded streams, 80 ms - 1.12 s chunks"
+  homepage = "https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b"
+  about = "NVIDIA's streaming speech recognizer: punctuated, capitalized transcripts in 40 language-locales with automatic language detection, from a cache-aware FastConformer that transcribes live audio as it arrives - every word is final the moment it appears."
+  strengths = ["Native streaming: live text that is never revised", "Multilingual, with automatic language detection", "Hundreds of times real time on one GPU"]
+  tradeoffs = ["CUDA only for now", "Transcription only - no translation or text prompt"]
+
+  [[model.artifact]]
+  id = "q8"
+  kind = "weights"
+  format = "gguf"
+  label = "Full quality"
+  quant = "Q8_0"
+  default = true
+  workspace = 551339784
+
+  [model.artifact.source]
+  repo = "nvidia/nemotron-3.5-asr-streaming-0.6b"
+  base_model = "nvidia/nemotron-3.5-asr-streaming-0.6b"
+  license_url = "https://openmdw.ai/license/1-1/"
+  revision = "ea30d66debe3740a08b573244286791d423d6b3e"
+  license = "openmdw-1.1"
+
+  [model.artifact.runtime]
+  backends = ["cuda"]
+  checkpoint_dir = false
+  companions = []
+  kv_cache_dtype = "auto"
+  default_spec = "off"
+  default_max_ctx = 224
+  default_max_batch = 32
+
+  [model.artifact.runtime.memory]
+  weight_bytes = 709256064
+  source = "measured"
+  max_ctx = 224
+  max_batch = 32
+  full_paged_kv = false
+  kv_reserve_sequences = 0
+  workspace_bytes = 551339784
+
+  [model.artifact.shape]
+  weight_bytes = 709256064
+  kind = "encoder"
+  vocab = 13088
+  max_ctx = 224
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = []
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-ASR-Streaming-0.6B-GGUF/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf"
+    dest = "Nemotron-3.5-ASR-Streaming-0.6B-GGUF/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf"
+    sha256 = "3fc991d3badad7277c11030a7519832cddaf2057aafed6d4b25147e953a070b1"
+    size = 742090464
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-ASR-Streaming-0.6B-GGUF/README.md"
+    dest = "Nemotron-3.5-ASR-Streaming-0.6B-GGUF/README.md"
+    sha256 = "a3344caadf796c084c6b90a9fa5978068fd45e3a019790bebe50489bb3c0f7b7"
+    size = 54239
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-ASR-Streaming-0.6B-GGUF/LICENSE"
+    dest = "Nemotron-3.5-ASR-Streaming-0.6B-GGUF/LICENSE"
+    sha256 = "2ab44b68365473c112f5092211a38f231cb23e50de68b75a13369adbd76a74df"
+    size = 2619
+
+
 # Speaker activity is a separate API, never transcription/chat. R2 mirrors the
 # exact pinned upstream files, with model cards and OpenMDW-1.1 in each bundle.
 # Both artifacts serve on Metal and CUDA from the same files. weight_bytes is
@@ -1425,6 +1514,122 @@ kv_default = "fp8_e4m3"
     dest = "gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-mtp.gguf"
     sha256 = "6326fb9f5e487aa8dcdd313a091e3c67724cb2a666ec3b7d2895b5b26d93ed1b"
     size = 461766816
+
+# Gemma 4 12B (Google, 2026-06 - the "unified" 12B): the gemma4 dense body
+# (48 layers, sliding 1024 with every 6th layer global; the globals put 16
+# query heads on ONE kv head) with NO vision or audio tower - its mmproj
+# holds two small encoder-free embedders (`gemma4uv`: 48 px patches straight
+# into the residual; `gemma4ua`: raw 16 kHz audio in 40 ms frames), so one
+# companion carries both picture and audio input. Same family module,
+# template, tool dialect and drafter design as the 31B. Google ships no Q8_0
+# GGUF (its own is the QAT Q4_0), so the line is unsloth's: Q8_0, mmproj-BF16
+# and the gemma4-assistant drafter. Gated against transformers F32 on these
+# exact files (2026-10-15: embedder rows within 3e-5 of an F64 reference,
+# first tokens equal on text, picture and clip prompts) and llama.cpp b11669
+# greedy parity (17/18 first tokens on the served e4m3 class, 18/18 on Q8).
+[[model]]
+id = "gemma-4-12b"
+vendor = "Google"
+display = "Gemma 4 12B"
+family = "gemma-4"
+capability = ["chat", "vision", "transcription", "reasoning", "speculative", "tools"]
+license = "apache-2.0"
+revision = "2026-10-15"
+# family default, same as the 31B (gpu_model/gemma4/batch.rs alloc_kv)
+kv_default = "fp8_e4m3"
+
+  [model.specs]
+  params = "12B"
+  context = "256K"
+  published_at = "2026-06-03"
+  published_source = "https://blog.google/innovation-and-ai/technology/developers-tools/introducing-gemma-4-12B/"
+  homepage = "https://huggingface.co/google/gemma-4-12B-it"
+  about = "The mid-size Gemma that sees and hears with no separate encoders - pictures and speech go straight into the model, so one 13 GB download chats, reasons, reads images and transcribes audio."
+  strengths = [
+    "Pictures and speech in, with no encoder in the way",
+    "256K context, tools and reasoning",
+    "Apache 2.0 - not the Gemma use-terms license",
+  ]
+  tradeoffs = [
+    "A step below the 31B on the hardest reasoning",
+    "Speech input is for transcription and translation, not voice conversation",
+  ]
+
+  [[model.artifact]]
+  id = "q8"
+  kind = "weights"
+  format = "gguf"
+  label = "Full quality"
+  quant = "Q8_0"
+  default = true
+  runtime = { backends = ["cuda"] }
+  source = { repo = "unsloth/gemma-4-12b-it-GGUF", revision = "fc034cfff751157913579611efad8462ac1be606", base_model = "google/gemma-4-12B-it", license = "apache-2.0", license_url = "https://ai.google.dev/gemma/docs/gemma_4_license" }
+
+  [model.artifact.shape]
+  # measured on GB10 2026-10-15 (the runner's weights_mem, companions off):
+  # the Q8 planes plus the e4m3 attention twins the gemma4 lane builds there
+  weight_bytes = 12313228544
+  kind = "generative"
+  vocab = 262144
+  max_ctx = 262144
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = [
+    { k_dim = 2048, v_dim = 2048, window = 1024, count = 5 },
+    { k_dim = 512, v_dim = 512, count = 1 },
+    { k_dim = 2048, v_dim = 2048, window = 1024, count = 5 },
+    { k_dim = 512, v_dim = 512, count = 1 },
+    { k_dim = 2048, v_dim = 2048, window = 1024, count = 5 },
+    { k_dim = 512, v_dim = 512, count = 1 },
+    { k_dim = 2048, v_dim = 2048, window = 1024, count = 5 },
+    { k_dim = 512, v_dim = 512, count = 1 },
+    { k_dim = 2048, v_dim = 2048, window = 1024, count = 5 },
+    { k_dim = 512, v_dim = 512, count = 1 },
+    { k_dim = 2048, v_dim = 2048, window = 1024, count = 5 },
+    { k_dim = 512, v_dim = 512, count = 1 },
+    { k_dim = 2048, v_dim = 2048, window = 1024, count = 5 },
+    { k_dim = 512, v_dim = 512, count = 1 },
+    { k_dim = 2048, v_dim = 2048, window = 1024, count = 5 },
+    { k_dim = 512, v_dim = 512, count = 1 },
+  ]
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/gemma-4-12B-it-GGUF/gemma-4-12B-it-Q8_0.gguf"
+    dest = "gemma-4-12B-it-GGUF/gemma-4-12B-it-Q8_0.gguf"
+    sha256 = "f20e7ff1be28c283eeeb18fc895733791c56a5851d5cd3fe9691b7f7d12afa72"
+    size = 12669647680
+
+  # one file, both embedders: pictures and audio
+  [[model.artifact]]
+  id = "vision"
+  runtime = { backends = ["cuda"] }
+  kind = "vision"
+  format = "gguf"
+  label = "Picture + audio input"
+  default = true
+  source = { repo = "unsloth/gemma-4-12b-it-GGUF", revision = "fc034cfff751157913579611efad8462ac1be606", base_model = "google/gemma-4-12B-it", license = "apache-2.0", license_url = "https://ai.google.dev/gemma/docs/gemma_4_license" }
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/gemma-4-12B-it-GGUF/gemma-4-12B-it-mmproj-BF16.gguf"
+    dest = "gemma-4-12B-it-GGUF/gemma-4-12B-it-mmproj-BF16.gguf"
+    sha256 = "2e269f906eb15169ee9ce880ea649bd6d42d4964c21f8ede10d0d0efc738bcbb"
+    size = 175115840
+
+  # separate gemma4-assistant drafter - same design as the 31B's
+  [[model.artifact]]
+  id = "drafter"
+  runtime = { backends = ["cuda"] }
+  kind = "drafter"
+  format = "gguf"
+  label = "Faster generation (423M drafter)"
+  default = true
+  source = { repo = "unsloth/gemma-4-12b-it-GGUF", revision = "fc034cfff751157913579611efad8462ac1be606", base_model = "google/gemma-4-12B-it-assistant", license = "apache-2.0", license_url = "https://ai.google.dev/gemma/docs/gemma_4_license" }
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/gemma-4-12B-it-GGUF/gemma-4-12B-it-mtp.gguf"
+    dest = "gemma-4-12B-it-GGUF/gemma-4-12B-it-mtp.gguf"
+    sha256 = "145db9094bc0f85f1701e255a2ed216dcc9800fc8bc8631ad00905b456bd451b"
+    size = 465109248
 
 # DiffusionGemma 26B-A4B (Google, 2026-06): the Gemma 4 26B-A4B body
 # generating by BLOCK DIFFUSION - a 256-token canvas denoised in parallel

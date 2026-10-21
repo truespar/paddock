@@ -151,6 +151,20 @@ pub fn cut_outside_image_spans(mut cut: usize, img_spans: &[(usize, usize)]) -> 
     cut
 }
 
+/// The checkpoint cut at the first picture: the last page boundary at or
+/// before its first row. Document workloads send `[static text, page,
+/// footer]` - every request shares the text and nothing from the page on - so
+/// this is where they diverge. The end-of-prompt cuts only reach it when one
+/// happens to land inside the picture, i.e. when less than two pages of text
+/// follow it; with a footer after the page none did, and every new page
+/// re-prefilled the whole shared text. `None` when the prefill starts at or
+/// past it (a resume) or the shared head is shorter than `min` rows.
+pub fn first_picture_cut(start: usize, img_spans: &[(usize, usize)], min: usize) -> Option<usize> {
+    let first = img_spans.iter().map(|&(a, _)| a).min()?;
+    let cut = first / BLOCK_TOKENS * BLOCK_TOKENS;
+    (cut > start && cut >= min.max(BLOCK_TOKENS)).then_some(cut)
+}
+
 /// Where a multimodal prefill of rows `[start, t_len)` ends each pass, and
 /// whether that end is one of the `ckpt` cuts (snapshot + publish there).
 ///
@@ -214,7 +228,24 @@ pub fn mm_pass_ends(
 
 #[cfg(test)]
 mod span_tests {
-    use super::{BLOCK_TOKENS, cut_outside_image_spans as cut_outside};
+    use super::{BLOCK_TOKENS, cut_outside_image_spans as cut_outside, first_picture_cut};
+
+    #[test]
+    fn a_page_between_static_text_and_a_footer_gets_a_cut_where_pages_diverge() {
+        // 3,300 rows of shared text, a 1,600-row page, a short footer
+        let spans = [(3300usize, 4900usize)];
+        assert_eq!(first_picture_cut(0, &spans, 512), Some(3296));
+        // a resume that already starts there needs no second cut
+        assert_eq!(first_picture_cut(3296, &spans, 512), None);
+        // too little shared text to be worth a snapshot
+        assert_eq!(first_picture_cut(0, &[(300, 1900)], 512), None);
+        // the earliest picture counts, whatever order the spans come in
+        assert_eq!(
+            first_picture_cut(0, &[(5000, 6000), (1040, 2000)], 512),
+            Some(1040)
+        );
+        assert_eq!(first_picture_cut(0, &[], 512), None);
+    }
 
     /// The property the whole guard exists for: an image's rows attend to their
     /// span's last position, so a checkpoint inside a picture would let a later

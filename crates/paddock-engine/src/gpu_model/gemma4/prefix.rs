@@ -361,7 +361,7 @@ impl GpuGemma4 {
             self.gpool.as_mut().expect("prefix requires the pool"),
         );
         let blocks = gp.tables[slot].blocks().to_vec();
-        pf.radix.insert(tokens, &blocks, &mut gp.pool);
+        pf.radix.insert_for(slot, tokens, &blocks, &mut gp.pool);
         // evict-ahead to the free margin (see px_margin): same eviction
         // count at steady state, moved off the admission path - and the
         // freed IDs go through the free list's LIFO reuse. Tier-aware: a

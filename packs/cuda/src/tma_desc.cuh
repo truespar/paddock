@@ -249,3 +249,13 @@ __device__ __forceinline__ uint32_t pd_tc5s_idesc(uint32_t sfid) {
          | ((sfid & 3u) << 29);
 }
 #endif  // PD_TC5_OK
+
+// Byte offset of row r's scale for block bk (16 elements nvf4, 32 for the ue8m0 e4m3 planes) in
+// the 128x4 swizzled atom layout the tcgen05 GEMMs' bulk scale copy reads (pd_sf_swz128): n_w
+// 4-byte words a row, atom (row group g = r / 128, word k = bk / 4) at (g n_w + k) * 512, row
+// r' = r % 128 as lane r' % 32, word r' / 32 of the atom, the block's byte bk % 4 within its
+// word. Here (not quant/e2m1.cuh) so every segment's scale writers see it.
+__device__ __forceinline__ uint32_t pd_nvf4_swz_off(uint32_t r, uint32_t bk, uint32_t n_w) {
+    const uint32_t rr = r & 127u;
+    return ((((r >> 7) * n_w + (bk >> 2)) * 128u + (rr & 31u) * 4u + (rr >> 5)) << 2) + (bk & 3u);
+}

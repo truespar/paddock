@@ -39,8 +39,11 @@ inline int lt_gemm(const void* w, const void* x, void* y, uint32_t in_dim,
     }
     const size_t need = (size_t)batch * in_dim;
     if (need > xb_elems) {
-        if (xb) cudaFree(xb);
-        if (cudaMalloc(&xb, need * 2) != cudaSuccess) return (int)cudaErrorMemoryAllocation;
+        // grow-by-retain: a captured graph may still read the old staging
+        // buffer (the rule is in part_scratch.cuh); the old one is left mapped
+        __nv_bfloat16* nb = nullptr;
+        if (cudaMalloc(&nb, need * 2) != cudaSuccess) return (int)cudaErrorMemoryAllocation;
+        xb = nb;
         xb_elems = need;
     }
     f32_to_bf16_kernel<<<(unsigned)((need + 255) / 256), 256, 0, st>>>(

@@ -1712,177 +1712,6 @@ int pd_gated_delta_chunked_vb16(const void* q, const void* k, const void* v,
                                      stream);
 }
 
-// 323: varlen chunked-GDN (GDN formulation band): one
-// stage1 + walk launch pair covers every eligible span of the tick - the
-// reference varlen class (fla chunk kernels batch all spans and decode
-// rows via chunk_indices; we batch the spans and keep decode rows on the
-// recurrent path). chunk_items = (global row0, chunk len) u32 pairs per
-// launch chunk; span_items = (first launch chunk, span rows, state f32
-// offset, out row0) u32 quads per span. Per-span math is identical to the
-// per-span RS launches (scratch stays launch-chunk-indexed; the walk
-// re-bases every operand off its span item) - only the grid packing
-// changes. RS-route only: mirrors the per-span dispatch's env gates and
-// returns cudaErrorNotSupported when any other arm is elected, so the
-// engine falls back per-span loudly rather than silently misrouting.
-// f32-v only (the mixed-tick producer class this serves).
-static int pd_gdc_rs_vl_go(
-    bool qkc, uint32_t n_k_heads, const void* q, const void* k, const void* v,
-    const void* g, const void* beta, void* state, void* out, void* dw,
-    void* du, void* aqk, void* cg, const void* chunk_items, uint32_t n_chunks,
-    const void* span_items, uint32_t n_spans, uint32_t n_tokens,
-    uint32_t n_heads, uint32_t head_dim, void* stream) {
-    if (n_chunks == 0 || n_spans == 0 || n_heads == 0) return 0;
-    if (head_dim != PD_DNC_D) return cudaErrorInvalidValue;
-    static const bool rs_ok = [] {
-        const char* rse = pd_env("PADDOCK_DNC_RS");
-        const char* s1e = pd_env("PADDOCK_DNC_S1MMA");
-        const char* db = pd_env("PADDOCK_DNC_DWB16");
-        return rse && atoi(rse) != 0 && s1e && atoi(s1e) != 0 &&
-               !(db && atoi(db) != 0) && pd_dns_state_class() != 1 &&
-               !pd_env("PADDOCK_NO_DNC_MMA_V2") && !pd_env("PADDOCK_DNC_SCAN") &&
-               !pd_env("PADDOCK_DNC_FLA") && !pd_env("PADDOCK_DNC_SPLIT");
-    }();
-    if (!rs_ok) return cudaErrorNotSupported;
-    static const uint32_t rs_s1prec = [] {
-        const char* e = pd_env("PADDOCK_DNC_S1PREC");
-        const uint32_t v = e ? (uint32_t)atoi(e) : 3u;
-        return v == 1u ? 1u : 3u;
-    }();
-    static bool vl_attr = false;
-    if (!vl_attr) {
-        cudaFuncSetAttribute(
-            (const void*)pd_dnc_stage1_v2_kernel<1u, float, __nv_bfloat16,
-                                                 float, __nv_bfloat16>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, PD_DNS1_SMEM);
-        cudaFuncSetAttribute(
-            (const void*)pd_dnc_stage1_v2_kernel<3u, float, __nv_bfloat16,
-                                                 float, __nv_bfloat16>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, PD_DNS1_SMEM);
-        cudaFuncSetAttribute((const void*)pd_dnc_walk_rs_kernel<float>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             PD_DNRS_SMEM);
-        cudaFuncSetAttribute((const void*)pd_dnc_walk_rs_kernel<__half>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             PD_DNRS_SMEM);
-        cudaFuncSetAttribute((const void*)pd_dnc_walk_rs_kernel<__nv_fp8_e4m3>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             PD_DNRS_SMEM);
-        cudaFuncSetAttribute((const void*)pd_dnc_stage1_rs_kernel<float>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             PD_DNS1RS_SMEM);
-        cudaFuncSetAttribute(
-            (const void*)pd_dnc_stage1_rs_kernel<float, 0, true>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, PD_DNS1RS_SMEM);
-        cudaFuncSetAttribute((const void*)pd_dnc_walk_rs_kernel<float, true>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             PD_DNRS_SMEM);
-        cudaFuncSetAttribute((const void*)pd_dnc_walk_rs_kernel<__half, true>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             PD_DNRS_SMEM);
-        cudaFuncSetAttribute(
-            (const void*)pd_dnc_walk_rs_kernel<__nv_fp8_e4m3, true>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, PD_DNRS_SMEM);
-        ::fprintf(stderr, "[dnc-vl] ENGAGED (varlen chunked-GDN)\n");
-        vl_attr = true;
-    }
-    const cudaStream_t s = (cudaStream_t)stream;
-    const uint32_t nc = n_chunks;
-    // scratch carving: identical formulas to the per-span RS block, with nc
-    // = the TICK's total launch chunks (buffers sized for it engine-side)
-    const size_t rs_half = (size_t)nc * PD_DNC_C * n_heads * PD_DNC_D;
-    __nv_bfloat16* rs_qb = (__nv_bfloat16*)dw + rs_half;
-    __nv_bfloat16* rs_kb = (__nv_bfloat16*)du + rs_half;
-    float* rs_gsh = (float*)((char*)aqk
-        + (size_t)nc * PD_DNC_C * PD_DNC_C * n_heads * 2u);
-    dim3 g1(nc, n_heads);
-#define PD_RS_VL_S1(P)                                                         \
-    pd_dnc_stage1_v2_kernel<P, float, __nv_bfloat16, float, __nv_bfloat16>     \
-        <<<g1, 256, PD_DNS1_SMEM, s>>>(                                        \
-            (const float*)q, (const float*)k, (const float*)v,                 \
-            (const float*)g, (const float*)beta, (__nv_bfloat16*)dw,           \
-            (__nv_bfloat16*)du, (__nv_bfloat16*)aqk, (double*)cg, n_tokens,    \
-            n_heads, rs_qb, rs_kb, rs_gsh, (const uint32_t*)chunk_items)
-    // QKD (2026-09-08, GB10): on the qkc route the walk reads the compact
-    // plane itself (walk_rs.cuh), so stage1 skips its 25 MB emission
-    // (qb16/kb16 = NULL). PADDOCK_NO_DNC_QKD=1 keeps the copies for A/B.
-    static const bool qkd_off = pd_env("PADDOCK_NO_DNC_QKD") != nullptr;
-    const bool qkd = qkc && !qkd_off;
-#if PD_DNC_PROBE != 2
-    if (qkc) {
-        // compact pair (slot 447): the ENGINE guarantees conv wrote the
-        // compact bf16 planes and that the rs stage1 route is live; a
-        // mispaired call must fail loud, not read garbage.
-        if (!pd_dnc_s1rs_on() || n_k_heads == 0u ||
-            (n_heads % n_k_heads) != 0u)
-            return cudaErrorNotSupported;
-        pd_dnc_stage1_rs_kernel<float, 0, true><<<g1, 256, PD_DNS1RS_SMEM, s>>>(
-            (const float*)q, (const float*)k, (const float*)v, (const float*)g,
-            (const float*)beta, (__nv_bfloat16*)dw, (__nv_bfloat16*)du,
-            (__nv_bfloat16*)aqk, (double*)cg, n_tokens, n_heads,
-            qkd ? nullptr : rs_qb, qkd ? nullptr : rs_kb,
-            rs_gsh, (const uint32_t*)chunk_items, n_k_heads);
-    } else if (pd_dnc_s1rs_on())
-        pd_dnc_stage1_rs_kernel<float><<<g1, 256, PD_DNS1RS_SMEM, s>>>(
-            (const float*)q, (const float*)k, (const float*)v, (const float*)g,
-            (const float*)beta, (__nv_bfloat16*)dw, (__nv_bfloat16*)du,
-            (__nv_bfloat16*)aqk, (double*)cg, n_tokens, n_heads, rs_qb, rs_kb,
-            rs_gsh, (const uint32_t*)chunk_items);
-    else if (rs_s1prec == 1u) PD_RS_VL_S1(1u);
-    else PD_RS_VL_S1(3u);
-#endif
-#undef PD_RS_VL_S1
-    dim3 gw(PD_DNC_D / PD_DNC_G, n_heads, n_spans);   // column groups fastest (walk_rs.cuh note)
-#if PD_DNC_PROBE == 1
-    (void)gw; return pd_launch_status();
-#endif
-    const int vl_cls = pd_dns_state_class();
-    if (qkd) {
-        const __nv_bfloat16* qc = (const __nv_bfloat16*)q;
-        const __nv_bfloat16* kc = (const __nv_bfloat16*)k;
-        if (vl_cls == 3)
-            pd_dnrs_walk_go<__nv_fp8_e4m3, true>(gw, s, rs_qb, rs_kb, (__nv_fp8_e4m3*)state, (const __nv_bfloat16*)dw, (const __nv_bfloat16*)du, rs_gsh, (const __nv_bfloat16*)aqk, (float*)out, n_tokens, n_heads, (const uint32_t*)span_items, qc, kc, n_k_heads);
-        else if (vl_cls == 2)
-            pd_dnrs_walk_go<__half, true>(gw, s, rs_qb, rs_kb, (__half*)state, (const __nv_bfloat16*)dw, (const __nv_bfloat16*)du, rs_gsh, (const __nv_bfloat16*)aqk, (float*)out, n_tokens, n_heads, (const uint32_t*)span_items, qc, kc, n_k_heads);
-        else
-            pd_dnrs_walk_go<float, true>(gw, s, rs_qb, rs_kb, (float*)state, (const __nv_bfloat16*)dw, (const __nv_bfloat16*)du, rs_gsh, (const __nv_bfloat16*)aqk, (float*)out, n_tokens, n_heads, (const uint32_t*)span_items, qc, kc, n_k_heads);
-        return pd_launch_status();
-    }
-    if (vl_cls == 3)
-        pd_dnrs_walk_go<__nv_fp8_e4m3, false>(gw, s, rs_qb, rs_kb, (__nv_fp8_e4m3*)state, (const __nv_bfloat16*)dw, (const __nv_bfloat16*)du, rs_gsh, (const __nv_bfloat16*)aqk, (float*)out, n_tokens, n_heads, (const uint32_t*)span_items, nullptr, nullptr, 0u);
-    else if (vl_cls == 2)
-        pd_dnrs_walk_go<__half, false>(gw, s, rs_qb, rs_kb, (__half*)state, (const __nv_bfloat16*)dw, (const __nv_bfloat16*)du, rs_gsh, (const __nv_bfloat16*)aqk, (float*)out, n_tokens, n_heads, (const uint32_t*)span_items, nullptr, nullptr, 0u);
-    else
-        pd_dnrs_walk_go<float, false>(gw, s, rs_qb, rs_kb, (float*)state, (const __nv_bfloat16*)dw, (const __nv_bfloat16*)du, rs_gsh, (const __nv_bfloat16*)aqk, (float*)out, n_tokens, n_heads, (const uint32_t*)span_items, nullptr, nullptr, 0u);
-    return pd_launch_status();
-}
-
-PD_EXPORT
-int pd_gated_delta_chunked_rs_vl(
-    const void* q, const void* k, const void* v, const void* g,
-    const void* beta, void* state, void* out, void* dw, void* du, void* aqk,
-    void* cg, const void* chunk_items, uint32_t n_chunks,
-    const void* span_items, uint32_t n_spans, uint32_t n_tokens,
-    uint32_t n_heads, uint32_t head_dim, void* stream) {
-    return pd_gdc_rs_vl_go(false, 0u, q, k, v, g, beta, state, out, dw, du,
-                           aqk, cg, chunk_items, n_chunks, span_items, n_spans,
-                           n_tokens, n_heads, head_dim, stream);
-}
-
-// QKC pair entry (slot 447): q/k are the conv qkc twin's COMPACT bf16
-// planes; everything from the stage1 panes on is bit-identical to the
-// expanded pair (see the kernels' comments).
-PD_EXPORT
-int pd_gated_delta_chunked_rs_vl_qkc(
-    const void* q, const void* k, const void* v, const void* g,
-    const void* beta, void* state, void* out, void* dw, void* du, void* aqk,
-    void* cg, const void* chunk_items, uint32_t n_chunks,
-    const void* span_items, uint32_t n_spans, uint32_t n_tokens,
-    uint32_t n_heads, uint32_t n_k_heads, uint32_t head_dim, void* stream) {
-    return pd_gdc_rs_vl_go(true, n_k_heads, q, k, v, g, beta, state, out, dw,
-                           du, aqk, cg, chunk_items, n_chunks, span_items,
-                           n_spans, n_tokens, n_heads, head_dim, stream);
-}
-
 // Row-wise argmax: out[row] = index of the max logit in row (LOWEST index wins
 // ties - matches the host argmax's strict-greater ascending scan). One block per
 // row; used by batched speculative decoding so per-row token picks stay on
@@ -2289,8 +2118,60 @@ __device__ float pd_sr_sum[PD_SR_MAXROWS * PD_SR_C];
 __device__ float pd_sr_gmax[PD_SR_MAXROWS];
 __device__ unsigned int pd_sr_garg[PD_SR_MAXROWS];
 
+// Per-STREAM sampler scratch. The __device__ arrays above (and the t2
+// candidate plane below) were the one copy for the whole process, which the
+// comment above still calls safe: "single stream, no cross-call races". The
+// engine's overlap scheduler ended that: the decode lane's sampler (pipe
+// ticks) and the main lane's finisher sampler (prefill spans) run at the same
+// time over overlapping row indices, so each read the other's per-row partial
+// maxima and candidates - another row's token, a stale own token or garbage
+// committed to live rows, in both directions (text probe under the pump:
+// 30-60% of replies wrong; 0 with the lanes serialized). A sampler launch now
+// gets the scratch of its own stream; the globals remain only as the
+// fallback for a capturing stream, where nothing may be allocated.
+struct PdSrScr {
+    float* max; unsigned int* arg; float* sum; float* gmax; unsigned int* garg;
+    unsigned long long* t2;   // PD_SR_MAXROWS x PD_T2_C x PD_TOPK_HEAD (32 x 64, asserted below)
+};
+static PdSrScr pd_sr_scr(cudaStream_t st) {
+    struct Ent { cudaStream_t st; PdSrScr s; };
+    static Ent live[8] = {};
+    static int used = 0;
+    for (int i = 0; i < used; ++i)
+        if (live[i].st == st) return live[i].s;
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (used < 8 && cudaStreamIsCapturing(st, &cs) == cudaSuccess
+        && cs == cudaStreamCaptureStatusNone) {
+        PdSrScr s{};
+        const size_t nc = (size_t)PD_SR_MAXROWS * PD_SR_C;
+        const bool ok = cudaMalloc((void**)&s.max, nc * 4u) == cudaSuccess
+            && cudaMalloc((void**)&s.arg, nc * 4u) == cudaSuccess
+            && cudaMalloc((void**)&s.sum, nc * 4u) == cudaSuccess
+            && cudaMalloc((void**)&s.gmax, (size_t)PD_SR_MAXROWS * 4u) == cudaSuccess
+            && cudaMalloc((void**)&s.garg, (size_t)PD_SR_MAXROWS * 4u) == cudaSuccess
+            && cudaMalloc((void**)&s.t2, (size_t)PD_SR_MAXROWS * 32u * 64u * 8u) == cudaSuccess;
+        if (ok) {
+            cudaMemset(s.gmax, 0, (size_t)PD_SR_MAXROWS * 4u);
+            cudaMemset(s.garg, 0, (size_t)PD_SR_MAXROWS * 4u);
+            live[used++] = Ent{st, s};
+            return s;
+        }
+        cudaGetLastError();
+    }
+    // fallback: the process-wide arrays (correct only while one stream samples)
+    PdSrScr g{};
+    cudaGetSymbolAddress((void**)&g.max, pd_sr_max);
+    cudaGetSymbolAddress((void**)&g.arg, pd_sr_arg);
+    cudaGetSymbolAddress((void**)&g.sum, pd_sr_sum);
+    cudaGetSymbolAddress((void**)&g.gmax, pd_sr_gmax);
+    cudaGetSymbolAddress((void**)&g.garg, pd_sr_garg);
+    g.t2 = nullptr;   // patched in by pd_sample_rows_t once pd_t2_cand is declared
+    return g;
+}
+
 __global__ void pd_sample_rows_a_kernel(const float* __restrict__ logits,
-                                        const PdSampleRow* __restrict__ ps, uint32_t n) {
+                                        const PdSampleRow* __restrict__ ps, uint32_t n,
+                                        PdSrScr sc) {
     const uint32_t row = blockIdx.x, c = blockIdx.y, tid = threadIdx.x;
     const uint32_t mode = ps[row].mode;
     if (mode != 1u && mode != 2u) return;
@@ -2317,29 +2198,30 @@ __global__ void pd_sample_rows_a_kernel(const float* __restrict__ logits,
     if (tid == 0) {
         for (uint32_t w = 1; w < PD_SAMPLE_TPB / 32u; ++w)
             if (sv[w] > bv || (sv[w] == bv && si[w] < bi)) { bv = sv[w]; bi = si[w]; }
-        pd_sr_max[row * PD_SR_C + c] = bv;
-        pd_sr_arg[row * PD_SR_C + c] = bi;
+        sc.max[row * PD_SR_C + c] = bv;
+        sc.arg[row * PD_SR_C + c] = bi;
     }
 }
 
 __global__ void pd_sample_rows_b_kernel(const float* __restrict__ logits,
                                         const PdSampleRow* __restrict__ ps,
-                                        unsigned int* __restrict__ out, uint32_t n) {
+                                        unsigned int* __restrict__ out, uint32_t n,
+                                        PdSrScr sc) {
     const uint32_t row = blockIdx.x, c = blockIdx.y, tid = threadIdx.x;
     const uint32_t mode = ps[row].mode;
     if (mode != 1u && mode != 2u) return;
     __shared__ float s_m;
     if (tid == 0) {
         // combine the chunk maxima in ascending order (lowest-index ties)
-        float bv = pd_sr_max[row * PD_SR_C];
-        uint32_t bi = pd_sr_arg[row * PD_SR_C];
+        float bv = sc.max[row * PD_SR_C];
+        uint32_t bi = sc.arg[row * PD_SR_C];
         for (uint32_t k = 1; k < PD_SR_C; ++k) {
-            const float v = pd_sr_max[row * PD_SR_C + k];
-            if (v > bv) { bv = v; bi = pd_sr_arg[row * PD_SR_C + k]; }
+            const float v = sc.max[row * PD_SR_C + k];
+            if (v > bv) { bv = v; bi = sc.arg[row * PD_SR_C + k]; }
         }
         if (c == 0) {
-            pd_sr_gmax[row] = bv;
-            pd_sr_garg[row] = bi;
+            sc.gmax[row] = bv;
+            sc.garg[row] = bi;
             if (mode == 1u) out[row] = bi;
         }
         s_m = bv * ps[row].inv_t;
@@ -2365,35 +2247,36 @@ __global__ void pd_sample_rows_b_kernel(const float* __restrict__ logits,
     if (tid == 0) {
         float v = 0.0f;
         for (uint32_t w = 0; w < PD_SAMPLE_TPB / 32u; ++w) v += sw[w];
-        pd_sr_sum[row * PD_SR_C + c] = v;
+        sc.sum[row * PD_SR_C + c] = v;
     }
 }
 
 __global__ void pd_sample_rows_c_kernel(const float* __restrict__ logits,
                                         const PdSampleRow* __restrict__ ps,
-                                        unsigned int* __restrict__ out, uint32_t n) {
+                                        unsigned int* __restrict__ out, uint32_t n,
+                                        PdSrScr sc) {
     const uint32_t row = blockIdx.x, tid = threadIdx.x;
     if (ps[row].mode != 2u) return;
     const float inv_t = ps[row].inv_t;
-    const float m = pd_sr_gmax[row] * inv_t;
+    const float m = sc.gmax[row] * inv_t;
     if (!isfinite(m)) { // degenerate: host-rule argmax fallback
-        if (tid == 0) out[row] = pd_sr_garg[row];
+        if (tid == 0) out[row] = sc.garg[row];
         return;
     }
     __shared__ float s_r;
     __shared__ uint32_t s_lo, s_hi;
     if (tid == 0) {
         float total = 0.0f;
-        for (uint32_t k = 0; k < PD_SR_C; ++k) total += pd_sr_sum[row * PD_SR_C + k];
+        for (uint32_t k = 0; k < PD_SR_C; ++k) total += sc.sum[row * PD_SR_C + k];
         float r = ps[row].u * total;
         if (!(total > 0.0f)) {
-            out[row] = pd_sr_garg[row];
+            out[row] = sc.garg[row];
             s_lo = 0xFFFFFFFFu;
         } else {
             const uint32_t clen = (n + PD_SR_C - 1u) / PD_SR_C;
             uint32_t k = 0;
             for (; k < PD_SR_C - 1u; ++k) {
-                const float cs = pd_sr_sum[row * PD_SR_C + k];
+                const float cs = sc.sum[row * PD_SR_C + k];
                 if (r < cs) break;
                 r -= cs;
             }
@@ -2462,7 +2345,7 @@ __global__ void pd_sample_rows_c_kernel(const float* __restrict__ logits,
                         msk &= (hl == 31u) ? 0xffffffffu : ((2u << hl) - 1u);
                     if (msk) { last = base + (uint32_t)w * 32u + (31u - __clz(msk)); break; }
                 }
-                out[row] = (last != 0xFFFFFFFFu) ? last : pd_sr_garg[row];
+                out[row] = (last != 0xFFFFFFFFu) ? last : sc.garg[row];
             }
             return;
         }
@@ -2473,7 +2356,7 @@ __global__ void pd_sample_rows_c_kernel(const float* __restrict__ logits,
         }
         __syncthreads(); // s_wsum/s_pmask reuse + s_last visibility
     }
-    if (tid == 0) out[row] = (s_last != 0xFFFFFFFFu) ? s_last : pd_sr_garg[row];
+    if (tid == 0) out[row] = (s_last != 0xFFFFFFFFu) ? s_last : sc.garg[row];
 }
 
 PD_EXPORT
@@ -2482,13 +2365,14 @@ int pd_sample_rows(const void* logits, const void* params, void* out,
     if (rows == 0 || n == 0) return 0;
     auto st = (cudaStream_t)stream;
     if (rows <= PD_SR_MAXROWS && n >= 32768u) {
+        const PdSrScr sc = pd_sr_scr(st);
         dim3 gab(rows, PD_SR_C);
         pd_sample_rows_a_kernel<<<gab, PD_SAMPLE_TPB, 0, st>>>(
-            (const float*)logits, (const PdSampleRow*)params, n);
+            (const float*)logits, (const PdSampleRow*)params, n, sc);
         pd_sample_rows_b_kernel<<<gab, PD_SAMPLE_TPB, 0, st>>>(
-            (const float*)logits, (const PdSampleRow*)params, (unsigned int*)out, n);
+            (const float*)logits, (const PdSampleRow*)params, (unsigned int*)out, n, sc);
         pd_sample_rows_c_kernel<<<rows, PD_SAMPLE_TPB, 0, st>>>(
-            (const float*)logits, (const PdSampleRow*)params, (unsigned int*)out, n);
+            (const float*)logits, (const PdSampleRow*)params, (unsigned int*)out, n, sc);
         return pd_launch_status();
     }
     pd_sample_rows_kernel<<<rows, PD_SAMPLE_TPB, 0, st>>>(
@@ -2836,6 +2720,13 @@ pd_sample_rows_t_kernel(const float* __restrict__ logits,
 #define PD_T2_C 32u
 #define PD_T2_ECAP 256u
 __device__ unsigned long long pd_t2_cand[PD_SR_MAXROWS * PD_T2_C * PD_TOPK_HEAD];
+static_assert(PD_T2_C == 32u && PD_TOPK_HEAD == 64u, "pd_sr_scr sizes the per-stream t2 plane for 32 x 64");
+// the per-stream t2 plane, or the legacy global for a capturing stream
+static unsigned long long* pd_t2_plane(cudaStream_t st) {
+    unsigned long long* p = pd_sr_scr(st).t2;
+    if (p == nullptr) cudaGetSymbolAddress((void**)&p, pd_t2_cand);
+    return p;
+}
 
 __device__ __forceinline__ void pd_t2_bitonic(unsigned long long* v,
                                               uint32_t len, uint32_t tid,
@@ -2858,14 +2749,13 @@ __device__ __forceinline__ void pd_t2_bitonic(unsigned long long* v,
 
 __global__ void __launch_bounds__(256) pd_sample_rows_t2a_kernel(
     const float* __restrict__ logits, const PdSampleRow* __restrict__ ps,
-    uint32_t n) {
+    uint32_t n, unsigned long long* __restrict__ t2) {
     const uint32_t row = blockIdx.x, c = blockIdx.y, tid = threadIdx.x;
     if (ps[row].mode != 5u) return;
     const float* x = logits + (size_t)row * n;
     const uint32_t clen = (n + PD_T2_C - 1u) / PD_T2_C;
     const uint32_t lo = c * clen, hi = min(lo + clen, n);
-    unsigned long long* cand =
-        pd_t2_cand + ((size_t)row * PD_T2_C + c) * PD_TOPK_HEAD;
+    unsigned long long* cand = t2 + ((size_t)row * PD_T2_C + c) * PD_TOPK_HEAD;
     if (lo >= hi) { // short-tail empty chunk: all-sentinel, whole block exits
         for (uint32_t j = tid; j < PD_TOPK_HEAD; j += blockDim.x) cand[j] = 0ull;
         return;
@@ -2937,15 +2827,14 @@ __global__ void __launch_bounds__(256) pd_sample_rows_t2a_kernel(
 __global__ void __launch_bounds__(1024) pd_sample_rows_t2f_kernel(
     const float* __restrict__ logits, const PdSampleRow* __restrict__ ps,
     const PdSampleTrunc* __restrict__ pt, unsigned int* __restrict__ out,
-    uint32_t n) {
+    uint32_t n, const unsigned long long* __restrict__ t2) {
     const uint32_t row = blockIdx.x, tid = threadIdx.x;
     if (ps[row].mode != 5u) return;
     const float* x = logits + (size_t)row * n;
     const uint32_t k = min(max(pt[row].k, 1u), PD_TOPK_HEAD);
     const uint32_t K = min(k, n);
     __shared__ unsigned long long s_comp[PD_T2_C * PD_TOPK_HEAD]; // 2048
-    const unsigned long long* cand =
-        pd_t2_cand + (size_t)row * PD_T2_C * PD_TOPK_HEAD;
+    const unsigned long long* cand = t2 + (size_t)row * PD_T2_C * PD_TOPK_HEAD;
     for (uint32_t i = tid; i < PD_T2_C * PD_TOPK_HEAD; i += blockDim.x)
         s_comp[i] = cand[i];
     __syncthreads();
@@ -3051,13 +2940,20 @@ __global__ void __launch_bounds__(1024) pd_sample_rows_t2f_kernel(
 #define PD_TOPK_MB_EK 4738u
 #define PD_TOPK_MB_STRIDE 5312u
 
-static uint32_t* pd_smp_scr(bool make = false) {
-    static uint32_t* scr = nullptr;
-    if (make && !scr) {
-        const size_t bytes = (size_t)PD_TOPK_MB_MAXR * PD_TOPK_MB_STRIDE * 4u;
-        if (cudaMalloc(&scr, bytes) != cudaSuccess) scr = nullptr;
-        else cudaMemset(scr, 0, bytes);
-    }
+// per stream (the rule is at pd_sr_scr): two lanes sampling at once must not
+// share one multi-block scratch
+static uint32_t* pd_smp_scr(cudaStream_t st, bool make = false) {
+    struct Ent { cudaStream_t st; uint32_t* p; };
+    static Ent live[8] = {};
+    static int used = 0;
+    for (int i = 0; i < used; ++i)
+        if (live[i].st == st) return live[i].p;
+    if (!make || used >= 8) return nullptr;
+    const size_t bytes = (size_t)PD_TOPK_MB_MAXR * PD_TOPK_MB_STRIDE * 4u;
+    uint32_t* scr = nullptr;
+    if (cudaMalloc(&scr, bytes) != cudaSuccess) { cudaGetLastError(); return nullptr; }
+    cudaMemset(scr, 0, bytes);
+    live[used++] = Ent{st, scr};
     return scr;
 }
 
@@ -3349,11 +3245,11 @@ static uint32_t* pd_topk_mb_scr(uint32_t rows, uint32_t n, void* stream) {
     if (no_mb < 0) no_mb = pd_env("PADDOCK_NO_TOPK_MB") ? 1 : 0;
     if (no_mb || rows == 0u || rows > PD_TOPK_MB_MAXR || n < 4096u)
         return nullptr;
-    uint32_t* scr = pd_smp_scr();
+    uint32_t* scr = pd_smp_scr((cudaStream_t)stream);
     if (!scr) {
         cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
         cudaStreamIsCapturing((cudaStream_t)stream, &cs);
-        if (cs == cudaStreamCaptureStatusNone) scr = pd_smp_scr(true);
+        if (cs == cudaStreamCaptureStatusNone) scr = pd_smp_scr((cudaStream_t)stream, true);
     }
     static bool said = false;
     if (scr && !said) {
@@ -3424,11 +3320,12 @@ int pd_sample_rows_t(const void* logits, const void* params,
         }
         cudaStream_t st = (cudaStream_t)stream;
         dim3 grid(rows, PD_T2_C);
+        unsigned long long* t2 = pd_t2_plane(st);
         pd_sample_rows_t2a_kernel<<<grid, 256u, 0, st>>>(
-            (const float*)logits, (const PdSampleRow*)params, n);
+            (const float*)logits, (const PdSampleRow*)params, n, t2);
         pd_sample_rows_t2f_kernel<<<rows, 1024u, 0, st>>>(
             (const float*)logits, (const PdSampleRow*)params,
-            (const PdSampleTrunc*)trunc_params, (unsigned int*)out, n);
+            (const PdSampleTrunc*)trunc_params, (unsigned int*)out, n, t2);
         return pd_launch_status();
     }
     if (scr) {
@@ -3866,13 +3763,18 @@ __global__ void __launch_bounds__(1024) pd_sample_rows_p_kernel(
 #define PD_TOPP_MB_STRIDE 5136u
 #define PD_TOPP_REQ_SET 0x80000000u
 
-static uint32_t* pd_topp_scr(bool make = false) {
-    static uint32_t* scr = nullptr;
-    if (make && !scr) {
-        const size_t bytes = (size_t)PD_TOPP_MB_MAXR * PD_TOPP_MB_STRIDE * 4u;
-        if (cudaMalloc(&scr, bytes) != cudaSuccess) scr = nullptr;
-        else cudaMemset(scr, 0, bytes);
-    }
+static uint32_t* pd_topp_scr(cudaStream_t st, bool make = false) {
+    struct Ent { cudaStream_t st; uint32_t* p; };
+    static Ent live[8] = {};
+    static int used = 0;
+    for (int i = 0; i < used; ++i)
+        if (live[i].st == st) return live[i].p;
+    if (!make || used >= 8) return nullptr;
+    const size_t bytes = (size_t)PD_TOPP_MB_MAXR * PD_TOPP_MB_STRIDE * 4u;
+    uint32_t* scr = nullptr;
+    if (cudaMalloc(&scr, bytes) != cudaSuccess) { cudaGetLastError(); return nullptr; }
+    cudaMemset(scr, 0, bytes);
+    live[used++] = Ent{st, scr};
     return scr;
 }
 
@@ -4282,11 +4184,11 @@ static uint32_t* pd_topp_mb_scr(uint32_t rows, uint32_t n, void* stream) {
     static int no_mb = -1;
     if (no_mb < 0) no_mb = pd_env("PADDOCK_NO_TOPP_MB") ? 1 : 0;
     if (no_mb || rows > PD_TOPP_MB_MAXR || n < 4096u) return nullptr;
-    uint32_t* scr = pd_topp_scr();
+    uint32_t* scr = pd_topp_scr((cudaStream_t)stream);
     if (!scr) {
         cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
         cudaStreamIsCapturing((cudaStream_t)stream, &cs);
-        if (cs == cudaStreamCaptureStatusNone) scr = pd_topp_scr(true);
+        if (cs == cudaStreamCaptureStatusNone) scr = pd_topp_scr((cudaStream_t)stream, true);
     }
     static bool said = false;
     if (scr && !said) {
@@ -4823,6 +4725,7 @@ __global__ void pd_conv_step_slots_k4v4_kernel(float* __restrict__ wins,
                                                float* __restrict__ out,
                                                const unsigned int* __restrict__ slots,
                                                uint32_t n4, uint32_t xs4) {
+    PD_PDL_ARM_WAIT();   // programmatic dependent (pd_pdl_go): full predecessor completion
     uint32_t c4 = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t b = blockIdx.y;
     if (c4 >= n4) return;
@@ -4939,7 +4842,7 @@ static int pd_conv_step_slots_impl(void* wins, const void* x_new, const void* w,
     if (v4_ok && k == 4 && (conv_dim & 3u) == 0 && (x_stride & 3u) == 0) {
         uint32_t n4 = conv_dim >> 2;
         dim3 grid((n4 + threads - 1) / threads, batch);
-        pd_conv_step_slots_k4v4_kernel<<<grid, threads, 0, (cudaStream_t)stream>>>(
+        pd_pdl_go(pd_conv_step_slots_k4v4_kernel, grid, threads, 0, (cudaStream_t)stream,
             (float*)wins, (const float*)x_new, (const float*)w, (float*)out,
             (const unsigned int*)slots, n4, x_stride >> 2);
         return pd_launch_status();

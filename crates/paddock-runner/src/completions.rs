@@ -210,6 +210,7 @@ pub(crate) fn apply_stop_strings(text: &str, stops: &[String]) -> (String, bool)
 pub async fn handle(
     State(state): State<Arc<AppState>>,
     scope: Option<axum::Extension<crate::events::EventScope>>,
+    origin: crate::metrics::Origin,
     crate::extract::OaiJson(req): crate::extract::OaiJson<CompletionRequest>,
 ) -> Response {
     let scope = scope.map(|e| e.0).unwrap_or_default();
@@ -285,6 +286,7 @@ pub async fn handle(
             submitted: None, // stamped by Engine::submit
             canvas_read: None,
             user_turn: false,
+            background: origin.background(),
         };
         if let Err(e) = model.engine.submit(gen_req) {
             return err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e);

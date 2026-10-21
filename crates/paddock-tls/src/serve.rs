@@ -99,7 +99,7 @@ async fn handle(
     match (spoke_tls, acceptor) {
         (true, Some(acceptor)) => {
             let tls = acceptor.accept(stream).await?;
-            http1(TokioIo::new(tls), app_service(app, peer)).await
+            http1(TokioIo::new(tls), app_service(app, peer, true)).await
         }
         // A TLS handshake with nothing to answer it. Close: there is no error
         // we could write that a TLS client would be able to read, and feeding
@@ -107,9 +107,9 @@ async fn handle(
         (true, None) => Ok(()),
         // Cleartext from the box itself - or from anyone at all when there is
         // no identity to offer. Serve it exactly as before TLS existed.
-        (false, None) => http1(TokioIo::new(stream), app_service(app, peer)).await,
+        (false, None) => http1(TokioIo::new(stream), app_service(app, peer, false)).await,
         (false, Some(_)) if peer.ip().is_loopback() => {
-            http1(TokioIo::new(stream), app_service(app, peer)).await
+            http1(TokioIo::new(stream), app_service(app, peer, false)).await
         }
         // Cleartext from the network, with https available: send them there.
         (false, Some(_)) => http1(TokioIo::new(stream), redirect_service(app, peer, port)).await,
@@ -137,6 +137,12 @@ where
         .map_err(Into::into)
 }
 
+/// Whether a request arrived over TLS, for the handlers that must hand back an
+/// absolute URL to this server (a batch's `results_url`): one port serves
+/// both schemes, so nothing else in the request says which it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Secure(pub bool);
+
 /// The app, with the peer address attached.
 ///
 /// Re-inserting `ConnectInfo` by hand is what `axum::serve(..)
@@ -147,6 +153,7 @@ where
 fn app_service(
     app: Router,
     peer: SocketAddr,
+    secure: bool,
 ) -> impl hyper::service::Service<
     hyper::Request<Incoming>,
     Response = hyper::Response<axum::body::Body>,
@@ -155,6 +162,7 @@ fn app_service(
 > + Send {
     hyper::service::service_fn(move |mut req: hyper::Request<Incoming>| {
         req.extensions_mut().insert(ConnectInfo(peer));
+        req.extensions_mut().insert(Secure(secure));
         app.clone().call(req)
     })
 }

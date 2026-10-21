@@ -28,6 +28,16 @@ impl GpuQwen35 {
         self.unified_launch_core(&[], budget, &[], fin_plans)?;
         let flushed = self.dflash_flush_pending_append().map_err(Into::into);
         self.unified_span_settle(flushed)?;
+        // The overlap scheduler begins its decode pipe BEFORE the span
+        // (pipe-first). A shared-scratch grow inside the launch drops every
+        // batch graph - the in-flight replay finishes (exec destroy is
+        // deferred), but the pipe's next tick indexes graphs[b], so recapture
+        // it here (decode lane, against the decode arena, not the scratch).
+        let regraph = match self.pipe.as_ref().map(|p| p.b) {
+            Some(b) => self.with_decode_lane(|m| m.ensure_batch_graph(b)),
+            None => Ok(()),
+        };
+        self.unified_span_settle(regraph)?;
         Ok(true)
     }
 

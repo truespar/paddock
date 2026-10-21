@@ -19,6 +19,8 @@ mod forward;
 mod load;
 mod mlx;
 #[cfg(test)]
+mod mlx_attention_tests;
+#[cfg(test)]
 mod mlx_operation_tests;
 #[cfg(test)]
 mod mlx_tests;

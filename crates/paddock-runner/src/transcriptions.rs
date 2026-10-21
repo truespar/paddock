@@ -99,6 +99,14 @@
 const GRANITE_SPEECH_PROMPT: &str =
     "transcribe the speech with proper punctuation and capitalization.";
 
+/// Gemma 4 12B's transcription instruction, verbatim from Google's model card
+/// (the audio part follows it, as the card's example orders them). With a
+/// `language`, "in its original language" names it instead.
+const GEMMA4_ASR_PROMPT: &str = "Transcribe the following speech segment in its original \
+     language. Follow these specific instructions for formatting the answer:\n* Only output the \
+     transcription, with no newlines.\n* When transcribing numbers, write the digits, i.e. write \
+     1.7 and not one point seven, and write 3 instead of three.";
+
 /// granite-speech-plus's word-timestamp instruction, verbatim from IBM's model
 /// card (`TS_PROMPT`) minus the `<|audio|>` marker our envelope supplies
 /// separately. Sent instead of the default when `word` granularity is asked
@@ -1968,7 +1976,7 @@ pub(crate) async fn generative_pass(
     // the mel runs off the async threads for the same reason the file lane's
     // does: host DSP on a runtime worker stalls every other request on it
     let (samples, mel) = tokio::task::spawn_blocking(move || {
-        let mel = frontend.features(&samples)?;
+        let mel = frontend.mel(&samples)?;
         Ok::<_, String>((samples, mel))
     })
     .await
@@ -2003,10 +2011,7 @@ pub(crate) async fn generative_pass(
         events: tx,
         mm_chunks: Some(vec![
             MmChunk::Text(pre_ids),
-            MmChunk::Audio {
-                samples,
-                mel: Some(mel),
-            },
+            MmChunk::Audio { samples, mel },
             MmChunk::Text(post_ids),
         ]),
         constraint: None,
@@ -2016,6 +2021,7 @@ pub(crate) async fn generative_pass(
         submitted: None,
         canvas_read: None,
         user_turn: false,
+        background: false,
     })?;
 
     let mut ids = Vec::new();
@@ -2179,6 +2185,45 @@ pub(crate) fn generative_prompt(
             };
             (ids[..at].to_vec(), ids[at + 1..].to_vec())
         }
+        // Gemma 4 12B: the checkpoint's own template over a user turn of
+        // [instruction, audio] - the card's ASR example - with thinking off,
+        // split at the `<|audio|>` its audio part renders.
+        crate::serving::AudioFrontend::Gemma4Raw => {
+            let instruction = match (context.map(sanitize_user_text), language) {
+                (Some(c), _) if !c.is_empty() => c,
+                (_, Some(code)) => GEMMA4_ASR_PROMPT.replace(
+                    "in its original language",
+                    &format!("in {}", language_name(code)),
+                ),
+                _ => GEMMA4_ASR_PROMPT.to_owned(),
+            };
+            let (Some(template), Some(pad)) = (model.chat_template.as_deref(), model.audio_pad_id)
+            else {
+                return Err("Gemma 4 loaded without its chat template or audio marker".into());
+            };
+            let messages = [serde_json::json!({
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": instruction },
+                    { "type": "audio" },
+                ],
+            })];
+            let kwargs = serde_json::json!({ "enable_thinking": false });
+            let rendered = crate::chat_template::render(template, &messages, None, Some(&kwargs))?;
+            let mut ids = model
+                .tokenizer
+                .encode(&rendered)
+                .map_err(|e| e.to_string())?;
+            if let Some(bos) = model.bos
+                && ids.first() != Some(&bos)
+            {
+                ids.insert(0, bos);
+            }
+            let Some(at) = ids.iter().position(|&t| t == pad) else {
+                return Err("the Gemma 4 template dropped the audio marker".into());
+            };
+            (ids[..at].to_vec(), ids[at + 1..].to_vec())
+        }
         crate::serving::AudioFrontend::None => {
             return Err("this model does not serve transcription".into());
         }
@@ -2186,6 +2231,10 @@ pub(crate) fn generative_prompt(
 }
 
 pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Response {
+    // the native streaming RNN-T lane parses its own form (rnnt_asr.rs)
+    if state.rnnt_asr.is_some() {
+        return crate::rnnt_asr::handle(State(state), mp).await;
+    }
     // Two lanes serve this endpoint with one wire contract: a dedicated
     // whisper-family model (encoder-decoder on its own thread) or the
     // generative Qwen3-ASR family (audio mmproj on the serving model). The
@@ -2674,8 +2723,8 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
         }
         let samples = resample(&wav.samples, wav.sample_rate, 16000)?;
         if !is_whisper {
-            let mel = frontend.features(&samples)?;
-            return Ok((samples, Some(mel), Vec::new()));
+            let mel = frontend.mel(&samples)?;
+            return Ok((samples, mel, Vec::new()));
         }
         // whisper's encoder is a fixed 30 s window, so anything longer is a
         // sequence of them; `whisper_features` zero-pads the tail window
@@ -2932,7 +2981,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
             "no model is loaded",
         );
     };
-    let mel = mel.expect("the generative lane computes mel");
+    // None on the raw-frame lane (Gemma 4 12B), the mel everywhere else
     let frontend = model.audio_frontend;
     let audio_tokens = frontend.prompt_rows(samples.len());
 
@@ -2979,10 +3028,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
     text_ids.extend_from_slice(&post_ids);
     let chunks = vec![
         MmChunk::Text(pre_ids),
-        MmChunk::Audio {
-            samples,
-            mel: Some(mel),
-        },
+        MmChunk::Audio { samples, mel },
         MmChunk::Text(post_ids),
     ];
 
@@ -3009,6 +3055,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
         submitted: None,
         canvas_read: None,
         user_turn: false,
+        background: false,
     };
     if let Err(e) = model.engine.submit(gen_req) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e);
@@ -3213,6 +3260,9 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
         }
         crate::serving::AudioFrontend::GraniteSpeech
         | crate::serving::AudioFrontend::GraniteSpeechMetal => (language.clone(), raw),
+        // Gemma 4 12B answers with the bare transcript (thinking off); like
+        // granite it reports no language, so a hint is echoed, never invented
+        crate::serving::AudioFrontend::Gemma4Raw => (language.clone(), raw),
         crate::serving::AudioFrontend::None => (None, raw),
     };
     let text = text.trim().to_owned();

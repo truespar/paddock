@@ -153,6 +153,16 @@ fn api_allowed(method: &Method, path: &str) -> bool {
         ["api", "reads"] => matches!(*method, Method::GET | Method::POST),
         ["api", "read-history"] => *method == Method::GET,
         ["api", "table-history"] => *method == Method::GET,
+        ["api", "conversation-drafts"] => *method == Method::GET,
+        ["api", "conversation-drafts", id]
+            if !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') =>
+        {
+            matches!(*method, Method::GET | Method::PUT)
+        }
         ["api", "table-history", _] => {
             matches!(*method, Method::GET | Method::PUT | Method::DELETE)
         }
@@ -1148,6 +1158,17 @@ mod tests {
         assert!(!api_allowed(&Method::POST, "/api/runners"));
         assert!(api_allowed(&Method::POST, "/api/runners/1234/v1/responses"));
         assert!(api_allowed(&Method::PUT, "/api/conversations/test"));
+        assert!(api_allowed(&Method::GET, "/api/conversation-drafts"));
+        assert!(api_allowed(&Method::PUT, "/api/conversation-drafts/test"));
+        assert!(!api_allowed(&Method::PUT, "/api/conversation-drafts"));
+        assert!(!api_allowed(
+            &Method::DELETE,
+            "/api/conversation-drafts/test"
+        ));
+        assert!(!api_allowed(
+            &Method::GET,
+            "/api/conversation-drafts/test/export"
+        ));
         assert!(api_allowed(
             &Method::POST,
             "/api/cloud/mcp-approvals/fixture"

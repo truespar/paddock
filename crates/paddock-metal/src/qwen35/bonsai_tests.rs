@@ -1,6 +1,162 @@
 use super::*;
 
 #[test]
+#[ignore = "requires Bonsai MLX; short generated tails restore exact page-boundary state"]
+fn bonsai_short_generated_prefix_is_exact() {
+    let path = std::env::var("PADDOCK_BONSAI_MLX").unwrap();
+    for live in [1, 4] {
+        let mut m = Qwen35::load(Path::new(&path), 1024, live, None).unwrap();
+        let allocated = m.device.allocated_bytes();
+        let capacity = m.cache.len();
+        let prompts = (0..live)
+            .map(|slot| {
+                (0..113)
+                    .map(|i| 1000 + i + slot as u32 * 397)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        for (slot, prompt) in prompts.iter().enumerate() {
+            m.forward_prefill(slot, prompt).unwrap();
+            assert_eq!(
+                retention::mark_anchor(&mut m.cache, prompt, &[], 113),
+                Some(112)
+            );
+        }
+        for pos in 113..144 {
+            m.forward_batch(&vec![7000 + pos; live], &vec![pos; live])
+                .unwrap();
+        }
+        let histories = m.slots[..live]
+            .iter()
+            .map(|s| s.history.clone())
+            .collect::<Vec<_>>();
+        for h in &histories {
+            assert!(m.cache.iter().any(|c| c.history == *h && !c.reserved));
+        }
+        for s in &mut m.slots[..live] {
+            s.prefill_end = 145;
+        }
+        let expected = m
+            .forward_batch(&vec![7999; live], &vec![144; live])
+            .unwrap();
+        m.release_inactive_slots(&[false; 4]);
+        for (slot, h) in histories.iter().enumerate() {
+            let mut next = h.clone();
+            next.push(7999);
+            assert_eq!(m.prepare(slot, &next).unwrap(), 144);
+        }
+        let actual = m
+            .forward_batch(&vec![7999; live], &vec![144; live])
+            .unwrap();
+        assert_eq!(
+            actual, expected,
+            "page-boundary restore changed logits c={live}"
+        );
+        assert_eq!(m.device.allocated_bytes(), allocated);
+        assert_eq!(m.cache.len(), capacity);
+        for prompt in prompts {
+            assert!(m.cache.iter().any(|c| c.history == prompt[..112]));
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires Bonsai MLX; unanchored completions keep both prompt and generated-tail reuse"]
+fn bonsai_generated_prefix_preserves_raw_prompt_reuse() {
+    let path = std::env::var("PADDOCK_BONSAI_MLX").unwrap();
+    let mut m = Qwen35::load(Path::new(&path), 1024, 1, None).unwrap();
+    let prompt = (1000..1113).collect::<Vec<_>>();
+    m.forward_prefill(0, &prompt).unwrap();
+    let expected = m.forward_prefill(0, &prompt).unwrap();
+    assert_eq!(m.take_prefill_reused(0), 112);
+    assert!(m.cache.iter().all(|c| !c.anchor));
+    for pos in 113..256 {
+        m.forward_batch(&[7000 + pos], &[pos]).unwrap();
+    }
+    assert!(m.cache.iter().any(|c| c.history.len() == 256));
+    assert!(m.cache.iter().any(|c| c.history == prompt[..112]));
+    m.release_inactive_slots(&[false]);
+    let actual = m.forward_prefill(0, &prompt).unwrap();
+    assert_eq!(m.take_prefill_reused(0), 112);
+    assert_eq!(
+        actual, expected,
+        "a generated tail must not change prompt reuse"
+    );
+}
+
+#[test]
+#[ignore = "requires Bonsai MLX; exact live-state continuation, release, COW and cancellation"]
+fn bonsai_generated_prefix_is_bounded_and_exact() {
+    let path = std::env::var("PADDOCK_BONSAI_MLX").unwrap();
+    for live in [1, 4] {
+        let mut m = Qwen35::load(Path::new(&path), 4096, live, None).unwrap();
+        let allocated = m.device.allocated_bytes();
+        let capacity = m.cache.len();
+        for slot in 0..live {
+            let prompt = (0..113)
+                .map(|i| 1000 + i + slot as u32 * 397)
+                .collect::<Vec<_>>();
+            m.forward_prefill(slot, &prompt).unwrap();
+            assert_eq!(
+                retention::mark_anchor(&mut m.cache, &prompt, &[], 113),
+                Some(112)
+            );
+        }
+        for pos in 113..256 {
+            m.forward_batch(&vec![7000 + pos; live], &vec![pos; live])
+                .unwrap();
+        }
+        let histories = m.slots[..live]
+            .iter()
+            .map(|s| s.history.clone())
+            .collect::<Vec<_>>();
+        for h in &histories {
+            assert!(m.cache.iter().any(|c| c.history == *h && !c.reserved));
+        }
+        // Both arms process the next request's suffix as prompt work. The
+        // oracle is uninterrupted live state, NOT a differently rounded cold
+        // recomputation of the generated prefix.
+        for s in &mut m.slots[..live] {
+            s.prefill_end = 257;
+        }
+        let expected = m
+            .forward_batch(&vec![7999; live], &vec![256; live])
+            .unwrap();
+        m.release_inactive_slots(&[false; 4]);
+        for (slot, h) in histories.iter().enumerate() {
+            let mut next = h.clone();
+            next.push(7999);
+            assert_eq!(m.prepare(slot, &next).unwrap(), 256);
+        }
+        let actual = m
+            .forward_batch(&vec![7999; live], &vec![256; live])
+            .unwrap();
+        assert_eq!(
+            actual, expected,
+            "restoring generated state changed logits c={live}"
+        );
+        if live == 1 {
+            // The real two-entry single-user cache retains its original
+            // anchor when the generated suffix branches before the tail.
+            let mut branch = histories[0].clone();
+            branch[200] = 12345;
+            branch.push(7999);
+            assert_eq!(m.prepare(0, &branch).unwrap(), 112);
+        }
+        // A cancelled new request must not publish unexecuted tokens.
+        m.release_inactive_slots(&[false; 4]);
+        let cancelled = (19000..19301).collect::<Vec<_>>();
+        m.prefill_begin(live - 1, cancelled.clone()).unwrap();
+        assert!(m.prefill_abort(live - 1));
+        assert!(!m.cache.iter().any(|c| c.history == cancelled));
+        assert_eq!(m.cache.len(), capacity);
+        assert_eq!(m.device.allocated_bytes(), allocated);
+        assert!(m.cache.iter().all(|c| !c.reserved));
+        eprintln!("BONSAI_CONTINUATION_EXACT c={live} tokens=256 allocated={allocated}");
+    }
+}
+
+#[test]
 fn bonsai_prompt_projection_is_slice_stable() {
     let device = MetalDevice::new(None).unwrap();
     if !device.tensor_accelerated() {
@@ -34,25 +190,43 @@ fn bonsai_prompt_projection_is_slice_stable() {
     let sentinel = 12345.0f32;
     let out = device.alloc((n * rows + 16) * 4).unwrap();
     let mut expected = Vec::new();
-    for slice in [129usize, 64, 33, 32, 13, 4, 1] {
+    for (staging, slice) in [129usize, 128, 64, 33, 32, 13, 4, 1]
+        .into_iter()
+        .flat_map(|slice| [(0, slice), (1, slice), (2, slice)])
+    {
         unsafe {
             out.write_u32(&vec![sentinel.to_bits(); n * rows + 16]);
         }
         let cmd = device.begin().unwrap();
         for first in (0..rows).step_by(slice) {
             let count = slice.min(rows - first);
-            let bm = if count <= 16 {
+            let bm = if staging == 2 {
+                128
+            } else if count <= 16 {
                 16
             } else if count <= 32 {
                 32
+            } else if count >= 128 {
+                128
             } else {
                 64
             };
             cmd.dispatch_at(
-                if bm == 16 {
+                if staging == 2 {
+                    "bonsai_prehalf128x256"
+                } else if staging == 1 {
+                    match bm {
+                        16 => "bonsai_prefill16",
+                        32 => "bonsai_prehalf32x128",
+                        64 => "bonsai_prehalf64x128",
+                        _ => "bonsai_prehalf128x128",
+                    }
+                } else if bm == 16 {
                     "bonsai_prefill16"
                 } else if bm == 32 {
                     "bonsai_prefill32"
+                } else if bm == 128 {
+                    "bonsai_prefill128"
                 } else {
                     "bonsai_prefill64"
                 },
@@ -92,7 +266,7 @@ fn bonsai_prompt_projection_is_slice_stable() {
         } else {
             assert_eq!(
                 actual, expected,
-                "prompt contraction changed at slice={slice}"
+                "prompt contraction changed at slice={slice}, staging={staging}"
             );
         }
     }
@@ -181,10 +355,10 @@ fn bonsai_specialized_projections_are_exact_and_bounded() {
         }
         let kernel = if rows <= 4 {
             [
-                "bonsai_full1",
-                "bonsai_full2",
-                "bonsai_full3",
-                "bonsai_full4",
+                "bonsai_bits1",
+                "bonsai_bits2",
+                "bonsai_bits3",
+                "bonsai_bits4",
             ][rows - 1]
         } else if rows <= 32 {
             "bonsai_tile32x32x64"
@@ -227,10 +401,10 @@ fn bonsai_specialized_projections_are_exact_and_bounded() {
             let cmd = device.begin().unwrap();
             cmd.dispatch(
                 [
-                    "bonsai_multi1",
-                    "bonsai_multi2",
-                    "bonsai_multi3",
-                    "bonsai_multi4",
+                    "bonsai_bits_multi1",
+                    "bonsai_bits_multi2",
+                    "bonsai_bits_multi3",
+                    "bonsai_bits_multi4",
                 ][rows - 1],
                 &[
                     &weights[0],
@@ -420,6 +594,8 @@ fn bonsai_projection_cost() {
     for (k, n) in [
         (5120usize, 17408usize),
         (17408, 5120),
+        (6144, 5120),
+        (5120, 10240),
         (5120, 1024),
         (5120, 248320),
     ] {
@@ -470,18 +646,40 @@ fn bonsai_projection_cost() {
             };
             if m == 1 {
                 kernels.push(("bonsai_full1", 16, 1));
+                kernels.push(("bonsai_bits1", 16, 1));
             }
             if m == 4 {
                 kernels.push(("bonsai_full4", 16, 4));
+                kernels.push(("bonsai_bits4", 16, 4));
             }
             if n <= 17408 {
                 kernels.extend([
                     ("bonsai_prefill16", 32, 16),
                     ("bonsai_prefill32", 32, 32),
                     ("bonsai_prefill64", 32, 64),
+                    ("bonsai_prefill128", 32, 128),
+                    ("bonsai_prehalf128x128", 32, 128),
+                    ("bonsai_prehalf32x128", 32, 32),
+                    ("bonsai_prehalf64x128", 32, 64),
+                    ("bonsai_prehalf128x256", 32, 128),
                 ]);
             }
             let mut reference = Vec::new();
+            let prefill_reference = if n <= 17408 {
+                let cmd = device.begin().unwrap();
+                cmd.dispatch(
+                    "bonsai_prefill128",
+                    &[&w, &x, &out],
+                    &[k as u32, n as u32, m as u32, bonsai::AFFINE2],
+                    [n.div_ceil(32), m.div_ceil(128), 1],
+                    128,
+                );
+                cmd.finish().unwrap();
+                // SAFETY: completed dispatch covers all output rows.
+                unsafe { out.read_f32(0, n * m) }
+            } else {
+                Vec::new()
+            };
             for round in 0..4 {
                 for order in 0..kernels.len() {
                     let (kernel, bn, bm) = kernels[(order + round) % kernels.len()];
@@ -499,6 +697,17 @@ fn bonsai_projection_cost() {
                     // SAFETY: completed dispatch covers the entire output.
                     let actual = unsafe { out.read_f32(0, n * m) };
                     assert!(actual.iter().all(|v| v.is_finite()), "{kernel}");
+                    if kernel.starts_with("bonsai_prehalf") {
+                        let changed = actual
+                            .iter()
+                            .zip(&prefill_reference)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count();
+                        assert_eq!(
+                            changed, 0,
+                            "{kernel} k={k} n={n} m={m} changes current prefill arithmetic"
+                        );
+                    }
                     if reference.is_empty() {
                         reference = actual.clone();
                     }
@@ -507,7 +716,10 @@ fn bonsai_projection_cost() {
                         .zip(&reference)
                         .map(|(a, b)| (a - b).abs())
                         .fold(0.0f32, f32::max);
-                    if m <= 4 && !kernel.starts_with("bonsai_prefill") {
+                    if m <= 4
+                        && !kernel.starts_with("bonsai_prefill")
+                        && !kernel.starts_with("bonsai_prehalf")
+                    {
                         assert_eq!(actual, reference, "{kernel}");
                     } else {
                         assert!(max_abs < 0.001, "{kernel} max_abs={max_abs}");

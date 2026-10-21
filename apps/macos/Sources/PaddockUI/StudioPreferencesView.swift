@@ -18,6 +18,7 @@ struct StudioPreferencesView: View {
         VStack(alignment: .leading, spacing: 22) {
           ForEach(layout.sections) { section in
             settingRow(section, layout: layout, stacked: stacked)
+              .settingsSearchAnchor(SettingsAnchor.conversationSection(section.id))
               .accessibilityElement(children: .contain)
               .accessibilityIdentifier("studio-setting-\(section.id)")
             if section.id != layout.sections.last?.id { WorkspaceRule() }

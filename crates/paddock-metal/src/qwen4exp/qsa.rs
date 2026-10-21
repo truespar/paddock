@@ -231,6 +231,7 @@ thread_local! {
     pub(super) static GATHER_ATTENTION_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     pub(super) static VALUE_PITCH_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     pub(super) static DIRECT_RUNS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    pub(super) static VALUE_AHEAD_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 impl Workspace {
     fn partition_units(capacity: usize, slots: usize, mlx: bool) -> usize {
@@ -571,9 +572,21 @@ impl Workspace {
         // the run election to singleton decode or wholly sparse long tails.
         // A mixed call still checks physical contiguity separately per row.
         let direct = direct && n > 8 && plan.meta.chunks_exact(4).any(|m| m[1] < 2048);
+        // Diagnostic only: synthetic GPU gains did not survive repeated
+        // agent serving against a fresh native control. Keep production on
+        // its existing route until real-workload decode costs qualify it.
+        #[cfg(test)]
+        let ahead = value_pitch
+            && !direct
+            && (n >= 128 || (n <= 8 && plan.meta.chunks_exact(4).all(|m| m[1] >= 512)))
+            && VALUE_AHEAD_FOR_TEST.with(|v| v.get());
+        #[cfg(not(test))]
+        let ahead = false;
         cmd.dispatch(
             if direct {
                 "q4b_attention_direct_runs"
+            } else if ahead {
+                "q4b_attention_value_ahead8"
             } else if value_pitch {
                 "q4b_attention_local_vpad1"
             } else if gather_attention {

@@ -33,10 +33,12 @@ mod batch;
 mod dflash;
 mod forward;
 mod load;
+mod mm_ride;
 mod mm_steps;
 mod multimodal;
 mod ops;
 pub mod pictures;
+mod pool_grow;
 mod prefix;
 mod rotation;
 mod span;
@@ -188,6 +190,9 @@ struct ChunkedPrefill {
     /// re-prefilling the shared prefix beside this one. See `chunk_cuts` and
     /// `Generator::prefill_begin_hinted`.
     hints: Vec<usize>,
+    /// A picture prompt riding the unified tick (`mm_ride`): its layout
+    /// extras. `None` for a text prompt.
+    mm: Option<Box<mm_ride::MmRide>>,
 }
 
 /// The checkpoint boundaries a chunked prefill lands spans on: `ckpt_cuts`'s
@@ -200,6 +205,11 @@ struct ChunkedPrefill {
 /// (`prefill_slot_tail_paged`), which SPLITS its pass at every cut, keeps
 /// the trailing two - a third split there is a third weight pass.
 fn chunk_cuts(ch: &ChunkedPrefill, step: usize) -> Vec<usize> {
+    // a picture prompt's cuts are the planner's (page-aligned, outside every
+    // picture - a resume restores a prefix the radix keys by whole pictures)
+    if let Some(m) = &ch.mm {
+        return m.cuts.clone();
+    }
     let len = ch.tokens.len();
     let pair = ckpt_cuts(len, step);
     let mut v: Vec<usize> = pair
@@ -388,6 +398,35 @@ struct LayerW8 {
     in_qkv: Option<RepackedMxfp4>,
     gate_w: Option<RepackedMxfp4>,
     out_w: Option<RepackedMxfp4>,
+    // the decode GEMM planes' scales pre-tiled for the bulk-copy arm (slot 882;
+    // GpuExecutor::f8_tc5_tile at load) - None where the pack lacks it
+    wq_t: Option<CudaSlice<u8>>,
+    wo_t: Option<CudaSlice<u8>>,
+    in_qkv_t: Option<CudaSlice<u8>>,
+    out_w_t: Option<CudaSlice<u8>>,
+}
+
+impl LayerW8 {
+    /// The fused full-attn q|k|v plane with its slot-882 tiles (GpuExecutor::f8d_gemm_t).
+    fn qkv_pair(&self) -> (&RepackedMxfp4, Option<&CudaSlice<u8>>) {
+        (
+            self.wq.as_ref().expect("full-attn W8 qkv plane"),
+            self.wq_t.as_ref(),
+        )
+    }
+
+    /// The fused DeltaNet in_qkv|gate plane with its slot-882 tiles.
+    fn in_qkv_pair(&self) -> (&RepackedMxfp4, Option<&CudaSlice<u8>>) {
+        (
+            self.in_qkv.as_ref().expect("DeltaNet W8 in_qkv plane"),
+            self.in_qkv_t.as_ref(),
+        )
+    }
+
+    /// The tiles of the plane the pre-mixer norm feeds (qkv or in_qkv|gate).
+    fn mixer_t(&self) -> Option<&CudaSlice<u8>> {
+        self.wq_t.as_ref().or(self.in_qkv_t.as_ref())
+    }
 }
 
 /// Batch from which the fp8 W8A8 projection GEMM is chosen over Q8_0 int8-MMA
@@ -1634,6 +1673,9 @@ pub struct GpuQwen35 {
     /// decode logits GEMM on the tile-linear f8 stream (b >= 8 only; b=1 and
     /// small batches keep the exact Q8 ladder).
     out_f8: Option<(RepackedMxfp4, usize, usize)>,
+    /// `out_f8`'s scales pre-tiled for the bulk-copy GEMM arm (slot 883), the
+    /// decode tick's head (GpuExecutor::f8_head_logits); None without the slot.
+    out_f8_t: Option<CudaSlice<u8>>,
     /// f8t TILE-plane twin of `out_f8` (sm_100): the head on the wmma route.
     out_f8t: Option<(crate::gpu::F8TilePlane, usize, usize)>,
     out_norm: DeviceTensor,
@@ -1843,16 +1885,6 @@ struct UnifiedInflight {
     hold_f32: Vec<CudaSlice<f32>>,
     #[allow(dead_code)]
     hold_seg: Vec<(CudaSlice<u32>, CudaSlice<u32>)>,
-}
-
-/// FNV-1a over the raw image bytes (+ dims folded in by the caller).
-fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
 }
 
 /// The token layout of an interleaved multimodal prompt: the placeholder id
@@ -2158,6 +2190,13 @@ struct BatchState {
     d_xs: CudaSlice<f32>,
     /// K-split mma partial planes (8 x batch x max out_dim) for the B>=KS rung
     d_ks_part: CudaSlice<f32>,
+    /// d_ks_part's twin for unified_launch_core's f8t GEMMs: an overlap span
+    /// K-splits (rows <= 128) on the main lane while the decode graph, which
+    /// baked d_ks_part, replays on the decode lane - one shared plane let
+    /// each lane's combine sum the other's partials (sm_100, probe beside
+    /// picture load: 80 wrong of 240 shared, 0 of 240 split). Same rule as
+    /// d_fin_*.
+    d_span_part: CudaSlice<f32>,
     /// Last-CTA arrival counters for the b=1 lin GEMV's fused K-split combine
     /// (non-KV-overhead R2.2). One region per plane SHAPE - the wrap value is
     /// that shape's elected split, so regions must not be shared. Zeroed once
@@ -2967,47 +3006,72 @@ pub(super) fn attn_boundary_sms(sm_count: usize) -> usize {
 /// position-independence also keeps captured graphs replay-safe (the partial
 /// kernel reads each row's position from device at replay).
 ///
-/// Collapse to the single-kernel walk only past 2x the fill target, where the
-/// unsplit grid saturates the die anyway - this also bounds the partial
-/// scratch. Rows crossing that boundary leave the exactness envelope, same
-/// spirit as the B*(K+1) spec ceiling. PADDOCK_NO_ATTN_SPLIT=1 pins the old
-/// single-kernel path for A/B.
+/// Past 2x the fill target the count yields to the partial scratch (halving
+/// until the (head, row, split) cells fit) instead of collapsing to the
+/// single-kernel walk - see the note in the body for why the collapse was
+/// a 2x serving loss at 48 rows. Rows crossing that boundary leave the
+/// exactness envelope, same spirit as the B*(K+1) spec ceiling.
+/// PADDOCK_NO_ATTN_SPLIT=1 pins the single-kernel path for A/B.
 fn attn_splits(n_heads: usize, batch: usize, sm_count: usize) -> usize {
     if paddock_models::dev_var_os!("PADDOCK_NO_ATTN_SPLIT").is_some() {
         return 1;
     }
-    // The collapse boundary is a WALK-LENGTH question, not an occupancy one:
-    // the single kernel gives every (head, row) CTA the row's whole history
-    // serially, so past the boundary the wall is one CTA's walk however many
-    // CTAs the die holds. Scaling the boundary with the SM count made a
-    // 48-SM die (GB10) collapse at 12 rows of 24 heads: the unified tick's
-    // 16-row tail shares after a checkpoint cut ran 942 us per layer over a
-    // 1k history (15 ms of a 500 ms prefill, 2026-09-08), and the spec
-    // gates' pair (r=K+1 vs r=B*(K+1)) straddled it - one side split, the
-    // other walked. Small dies take the 188-SM boundary (1128 CTAs at 24
-    // heads) so they make the RTX PRO's decisions; big dies are unchanged.
-    // The partial scratch (forward.rs) is sized from the same boundary.
-    if n_heads * batch >= 2 * attn_fill_blocks(attn_boundary_sms(sm_count)) {
-        return 1;
-    }
-    if let Some(n) = paddock_models::dev_var!("PADDOCK_ATTN_SPLITS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n >= 1)
-    {
-        return n.min(MAX_ATTN_SPLITS);
-    }
+    // The fixed count whenever splitting engages (the law above).
+    //
     // Big dies took MAX (32) at first; a ladder at a wide serve point with a
     // ~2k prefix and fp8 KV measured 32/16/8/4 as a shallow curve peaking
     // around 8: 32-way splits leave each krs CTA ~64 keys of work and the
     // fixed cost + combine width dominate. 16 banks most of that win while
-    // staying a FIXED constant (the law above), and single-stream long-prompt
+    // staying a FIXED constant, and single-stream long-prompt
     // decode measures flat across the whole range - decode attention is a
     // small share there. The measured optimum 8 is PARKED: landing it costs
     // single-stream parallelism at b=1 unless the count tiers by rows, and a
     // rows-tiered count needs the spec-verify paths pinned to one count first
     // (the B=8 K=4 exact gate compares r=40 batched vs r=5 single-slot).
-    16
+    let fixed = paddock_models::dev_var!("PADDOCK_ATTN_SPLITS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .map_or(16, |n| n.min(MAX_ATTN_SPLITS));
+    let fill = attn_fill_blocks(attn_boundary_sms(sm_count));
+    if n_heads * batch < 2 * fill {
+        return fixed;
+    }
+    // Past the walk-length boundary (n_heads * batch >= 2 * fill: 1128 CTAs
+    // at 24 heads, i.e. 47 rows on a 188-SM die) this used to COLLAPSE to the
+    // single per-(head, row) walk, on the argument that the unsplit grid
+    // already saturates the die and the wall is one CTA's walk however many
+    // CTAs the die holds. That argument compares the two walks as the same
+    // kernel class, and they are not: the partial route is also where the
+    // fp8 tensor-core GV arm lives (pd_attn_decode_batch_partial_paged's
+    // dense-fa8 arm - one KV read per 6 query heads, mma scores), and the
+    // single walk is the scalar per-(q-head, row) kernel that re-reads the
+    // slot's whole KV once per query head. Measured on the RTX PRO 6000
+    // (sm_120, 188 SMs), Qwen3.8-27B NVFP4, fp8 KV, ~6k-token contexts
+    // (nsys, 20 s windows, 2026-10-18): 32 live slots run the GV arm at
+    // 209 us a launch (attention 13% of GPU time); 48 live slots fell to the
+    // walk at 5,105 us a launch - 24x per launch for 1.5x the rows, 76% of
+    // GPU time, the decode step 51 ms -> 107 ms and the serve SLOWER than at
+    // 32 (f32_qkv.cuh's verify-arm note recorded the same fall at >= 47
+    // rows, 42% of GPU time). So the boundary no longer picks the kernel
+    // class: splitting stays on, and only the COUNT yields to the partial
+    // scratch, which forward.rs sizes to 2 * fill * MAX_ATTN_SPLITS
+    // (head, row, split) cells - halve the fixed count until the rows fit
+    // (16 up to 94 rows of 24 heads, 8 up to 188, 4 up to 376 on this die),
+    // and the walk is reached only when even 2 splits do not fit. The
+    // count is still a pure function of (n_heads, batch, sm_count), so a
+    // captured graph's grid stays constant and replay-safe. Rows past the
+    // boundary were already outside the per-slot exactness envelope.
+    // PADDOCK_ATTN_WALK_COLLAPSE=1 restores the collapse for A/B.
+    if paddock_models::dev_var_os!("PADDOCK_ATTN_WALK_COLLAPSE").is_some() {
+        return 1;
+    }
+    let cells = 2 * fill * MAX_ATTN_SPLITS;
+    let mut n = fixed;
+    while n > 1 && n_heads * batch * n > cells {
+        n /= 2;
+    }
+    n
 }
 
 /// [`attn_splits`] for a tick whose rows must score the same at any width (the
@@ -3157,6 +3221,10 @@ struct Scratch {
     // flat mmq-layout activation staging for the P6e GEMM: [chunk][col][4 f32
     // scales + 128 int8], columns padded to a multiple of 128.
     d_yq: CudaSlice<u8>,
+    // the dense FFN down GEMM's mmq input when gate|up land it directly
+    // (ops::ffn_gu_land; d_yq is that launch's input). 32-byte stub when the
+    // landing cannot engage at this cap.
+    d_yq_ff: CudaSlice<u8>,
     // per-32-block activation sums off d_yq ([chunk][col_pad][4] f32) - the
     // W4A8 min-term operand (Q4_K/Q5_K prefill). 1-elem stub on pure-Q8 models.
     d_xsums: CudaSlice<f32>,

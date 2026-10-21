@@ -1049,6 +1049,8 @@ final class RuntimeProtocol: URLProtocol, @unchecked Sendable {
   typealias O = [String: V]
   struct State: Sendable {
     var documents: [String: O] = [:]
+    var drafts: [String: O] = [:]
+    var failDraftSave = false
     var requests: [O] = []
     var failSave = false
     var failImageStore = false
@@ -1211,6 +1213,33 @@ final class RuntimeProtocol: URLProtocol, @unchecked Sendable {
             "max_ctx": .number(4096), "default_max_output_tokens": .number(1024),
             "reasoning": .string("toggle"), "vision": .bool(true),
           ])
+      } else if path == "/api/conversation-drafts" {
+        value = .array(
+          state.drafts.map { id, draft in
+            var row = draft["conversation"]!.object!
+            row["id"] = .string(id)
+            row["composerDraft"] = .bool(true)
+            return .object(row)
+          })
+      } else if path.hasPrefix("/api/conversation-drafts/") {
+        let id = String(path.split(separator: "/").last!)
+        if method == "PUT" {
+          if state.failDraftSave {
+            status = 503
+          } else if (state.drafts[id]?["revision"]?.string ?? "") != body["revision"]?.string {
+            status = 409
+          } else if body["text"] == .string(""), body["attachments"]?.array?.isEmpty == true {
+            state.drafts[id] = nil
+            value = .object(["revision": .string("")])
+          } else {
+            var saved = body.object!
+            saved["revision"] = .string(UUID().uuidString)
+            state.drafts[id] = saved
+            value = .object(["revision": saved["revision"]!])
+          }
+        } else {
+          value = state.drafts[id].map(V.object) ?? .null
+        }
       } else if path == "/api/conversations" {
         value = .array(state.documents.values.map(V.object))
       } else if path.hasSuffix("/artifacts") {
@@ -1218,7 +1247,21 @@ final class RuntimeProtocol: URLProtocol, @unchecked Sendable {
       } else if path.hasPrefix("/api/conversations/") {
         let id = String(path.split(separator: "/").last!)
         if method == "PUT" {
-          if state.failSave { status = 503 } else { state.documents[id] = body.object }
+          if state.failSave {
+            status = 503
+          } else if let consume = request.value(forHTTPHeaderField: "X-Paddock-Consume-Draft"),
+            state.drafts[id]?["revision"]?.string != consume
+          {
+            status = 409
+          } else {
+            state.documents[id] = body.object
+            if request.value(forHTTPHeaderField: "X-Paddock-Consume-Draft") != nil {
+              state.drafts[id] = nil
+            }
+          }
+        } else if method == "DELETE" {
+          state.documents[id] = nil
+          state.drafts[id] = nil
         } else if let doc = state.documents[id] {
           value = .object(doc)
         } else {

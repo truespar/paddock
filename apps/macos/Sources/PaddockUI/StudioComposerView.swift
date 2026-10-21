@@ -15,12 +15,12 @@ struct StudioComposerView: View {
   @State private var composerWidth: CGFloat = 760
   @State private var panel: Panel?
   enum Panel: CaseIterable {
-    case reasoning, tools, instructions, sampling, compare, context, document, image
+    case reasoning, tools, instructions, sampling, context, document, image
     /// Direct controls own their popovers even when the toolbar is compact.
     /// Two presenters observing the same selection cancel each other on macOS.
     var usesOverflow: Bool {
       switch self {
-      case .image, .compare: false
+      case .image: false
       default: true
       }
     }
@@ -119,6 +119,9 @@ struct StudioComposerView: View {
           ) {
             editorHeight = $0
           }
+          // TextKit undo and marked-text state belong to this conversation,
+          // never to whichever chat happened to occupy the editor previously.
+          .id(chat.state?.composerDraft?.id)
           .frame(height: editorHeight)
           .accessibilityLabel("Message draft").accessibilityIdentifier("studio-message")
         }.font(.system(size: StudioDraftEditor.textFontSize)).padding(.horizontal, 8)
@@ -148,13 +151,6 @@ struct StudioComposerView: View {
       $0.size.width
     } action: {
       composerWidth = $0
-    }
-    .task(id: chat.ready ? draft.message : nil) {
-      // AppKit handles each keystroke. Only a settled draft updates the shared
-      // estimate; a superseded task never queues an obsolete bridge command.
-      do { try await Task.sleep(for: .milliseconds(200)) } catch { return }
-      guard !Task.isCancelled else { return }
-      await chat.updateDraft(draft.message)
     }
     .onChange(of: chat.busy) { _, busy in if busy { panel = nil } }
   }
@@ -314,11 +310,8 @@ struct StudioComposerView: View {
   }
   private func composerActions(compact: Bool) -> some View {
     HStack(spacing: 4) {
-      StudioComposerModelPicker(chat: chat, compact: compact) { panel = .compare }
+      StudioComposerModelPicker(chat: chat, compact: compact)
         .layoutPriority(-1)
-        .popover(isPresented: showing(.compare), arrowEdge: .top) {
-          StudioCompareView(chat: chat).studioPopoverSurface()
-        }
       if presentation?.docParser != true, presentation?.imageMode != true {
         StudioMicrophoneButton(chat: chat, draft: $draft, compact: compact)
           .fixedSize()
@@ -386,7 +379,6 @@ struct StudioComposerView: View {
       case .instructions: StudioInstructionControls(chat: chat)
       case .sampling: StudioSamplingControls(chat: chat)
       case .image: StudioImageControls(chat: chat)
-      case .compare: StudioCompareView(chat: chat)
       case .context, .document: StudioContextControls(chat: chat)
       case nil: EmptyView()
       }

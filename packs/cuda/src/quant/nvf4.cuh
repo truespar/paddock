@@ -331,20 +331,7 @@ int pd_mxfp4_gemm_f4(const void* data, const void* scale, const void* xq,
 // (adjacent nibbles, 16 B k-half slices), 4 scale bytes per k64 operand,
 // ue4m3 = the positive-e4m3 byte encoding.
 
-// amax -> (e4m3 scale byte, 1/scale). RN to e4m3 of amax/6 (values then
-// RN-clamp onto the e2m1 grid); zero blocks get scale 0 with inv 0 so the
-// nibbles stay 0 instead of NaN.
-__device__ __forceinline__ unsigned pd_nvf4_scale(float amax, float* inv) {
-    if (amax <= 0.0f) {
-        *inv = 0.0f;
-        return 0u;
-    }
-    __nv_fp8_e4m3 s;
-    s.__x = __nv_fp8_e4m3(amax * (1.0f / 6.0f)).__x;
-    if (s.__x == 0) s.__x = 1;  // smallest subnormal: amax > 0 needs s > 0
-    *inv = 1.0f / (float)s;
-    return s.__x;
-}
+// pd_nvf4_scale (amax -> e4m3 scale byte, 1/scale): quant/e2m1.cuh
 
 // Q8_0 -> packed-adjacent e2m1 + e4m3 per-16 planes (the nvf4 format; the
 // scale plane is numel/16 bytes, twice the mxfp4 plane). One warp per Q8_0
@@ -390,10 +377,11 @@ int pd_q8_0_to_nvf4(const void* q8_data, const void* q8_scale, void* mx_data,
 // f32 -> packed-adjacent e2m1 + e4m3 per-16 (the nvf4 B side). Each thread
 // owns 8 consecutive elements = half an nvf4 block; the pair-lane shfl
 // closes the 16-element amax.
-__device__ __forceinline__ void pd_nvf4_quant8(const float4 v0, const float4 v1,
-                                               uint32_t lane, unsigned char* __restrict__ q,
-                                               unsigned char* __restrict__ scale,
-                                               uint32_t i) {
+// pd_nvf4_quant8 with the scale byte at `si` (row-major: i >> 4)
+__device__ __forceinline__ void pd_nvf4_quant8_at(const float4 v0, const float4 v1,
+                                                  uint32_t lane, unsigned char* __restrict__ q,
+                                                  unsigned char* __restrict__ scale,
+                                                  uint32_t i, uint32_t si) {
     float a = fmaxf(fmaxf(fabsf(v0.x), fabsf(v0.y)), fmaxf(fabsf(v0.z), fabsf(v0.w)));
     a = fmaxf(a, fmaxf(fmaxf(fabsf(v1.x), fabsf(v1.y)), fmaxf(fabsf(v1.z), fabsf(v1.w))));
     const uint32_t gm = 0x3u << (lane & 30u);  // 2-lane group = one 16-block
@@ -405,12 +393,19 @@ __device__ __forceinline__ void pd_nvf4_quant8(const float4 v0, const float4 v1,
                      | (pd_e2m1_rn(v1.x * inv) << 16) | (pd_e2m1_rn(v1.y * inv) << 20)
                      | (pd_e2m1_rn(v1.z * inv) << 24) | (pd_e2m1_rn(v1.w * inv) << 28);
     *(uint32_t*)(q + (i >> 1)) = p;
-    if ((lane & 1u) == 0) scale[i >> 4] = (unsigned char)sb;
+    if ((lane & 1u) == 0) scale[si] = (unsigned char)sb;
+}
+__device__ __forceinline__ void pd_nvf4_quant8(const float4 v0, const float4 v1,
+                                               uint32_t lane, unsigned char* __restrict__ q,
+                                               unsigned char* __restrict__ scale,
+                                               uint32_t i) {
+    pd_nvf4_quant8_at(v0, v1, lane, q, scale, i, i >> 4);
 }
 
 __global__ void pd_quantize_nvf4_kernel(const float* __restrict__ x,
                                         unsigned char* __restrict__ q,
                                         unsigned char* __restrict__ scale, uint32_t n) {
+    PD_PDL_ARM_WAIT();   // programmatic dependent (pd_pdl_go): full predecessor completion
     const uint32_t i = (blockIdx.x * 256u + threadIdx.x) * 8u;
     if (i >= n) return;  // n % 32 == 0: pair groups exit whole
     pd_nvf4_quant8(*(const float4*)(x + i), *(const float4*)(x + i + 4u),
@@ -420,7 +415,7 @@ __global__ void pd_quantize_nvf4_kernel(const float* __restrict__ x,
 PD_EXPORT
 int pd_quantize_nvf4(const void* x, void* q, void* scale, uint32_t n, void* stream) {
     if (n == 0) return 0;
-    pd_quantize_nvf4_kernel<<<(n / 8u + 255u) / 256u, 256u, 0, (cudaStream_t)stream>>>(
+    pd_pdl_go(pd_quantize_nvf4_kernel, (n / 8u + 255u) / 256u, 256u, 0, (cudaStream_t)stream,
         (const float*)x, (unsigned char*)q, (unsigned char*)scale, n);
     return pd_launch_status();
 }
@@ -721,6 +716,7 @@ __global__ void pd_quantize_nvf4_swiglu_kernel(const float* __restrict__ gate,
                                                unsigned char* __restrict__ q,
                                                unsigned char* __restrict__ scale,
                                                uint32_t n) {
+    PD_PDL_ARM_WAIT();   // programmatic dependent (pd_pdl_go): full predecessor completion
     const uint32_t i = (blockIdx.x * 256u + threadIdx.x) * 8u;
     if (i >= n) return;
     float4 v[2];
@@ -1022,49 +1018,13 @@ int pd_swiglu_quant_nvf4_from_parts_il(const void* part, const void* bias, void*
 // width, not an arithmetic change (the shipped from_parts kernel proved this
 // with diffs=0 vs reduce-then-scaled).
 
-// Interleaved twin of pd_swiglu_fused_nvf4: y row = (g0,u0,
-// g1,u1,...) -- Nvf4Plane::gu_pairs. Each thread's 8 outputs are 16
-// consecutive floats; same expression, same pd_nvf4_quant8.
-__global__ void pd_swiglu_fused_nvf4_il_kernel(const float* __restrict__ fused,
-                                               unsigned char* __restrict__ q,
-                                               unsigned char* __restrict__ scale,
-                                               uint32_t ff, uint32_t n) {
-    const uint32_t i = (blockIdx.x * 256u + threadIdx.x) * 8u;
-    if (i >= n) return;
-    const uint32_t tok = i / ff, j = i % ff;
-    const float* row = fused + (size_t)tok * 2u * ff + 2u * j;
-    float4 v[2];
-    #pragma unroll
-    for (uint32_t h = 0; h < 2u; ++h) {
-        const float4 p0 = *(const float4*)(row + h * 8u);        // g,u,g,u
-        const float4 p1 = *(const float4*)(row + h * 8u + 4u);   // g,u,g,u
-        v[h].x = (p0.x / (1.0f + expf(-p0.x))) * p0.y;
-        v[h].y = (p0.z / (1.0f + expf(-p0.z))) * p0.w;
-        v[h].z = (p1.x / (1.0f + expf(-p1.x))) * p1.y;
-        v[h].w = (p1.z / (1.0f + expf(-p1.z))) * p1.w;
-    }
-    pd_nvf4_quant8(v[0], v[1], threadIdx.x & 31u, q, scale, i);
-}
-PD_EXPORT
-int pd_swiglu_fused_nvf4_il(const void* fused, void* q, void* scale, uint32_t ff,
-                            uint32_t n_rows, void* stream) {
-    if (n_rows == 0 || ff == 0) return 0;
-    if (ff & 31u) return cudaErrorInvalidValue;
-    const uint32_t n = n_rows * ff;
-    pd_swiglu_fused_nvf4_il_kernel<<<(n / 8u + 255u) / 256u, 256u, 0,
-                                     (cudaStream_t)stream>>>(
-        (const float*)fused, (unsigned char*)q, (unsigned char*)scale, ff, n);
-    return pd_launch_status();
-}
 
 PD_EXPORT
 int pd_quantize_nvf4_swiglu(const void* gate, const void* up, void* q, void* scale,
                             uint32_t n, void* stream) {
     if (n == 0) return 0;
-    pd_quantize_nvf4_swiglu_kernel<<<(n / 8u + 255u) / 256u, 256u, 0,
-                                     (cudaStream_t)stream>>>(
-        (const float*)gate, (const float*)up, (unsigned char*)q,
-        (unsigned char*)scale, n);
+    pd_pdl_go(pd_quantize_nvf4_swiglu_kernel, (n / 8u + 255u) / 256u, 256u, 0, (cudaStream_t)stream,
+        (const float*)gate, (const float*)up, (unsigned char*)q, (unsigned char*)scale, n);
     return pd_launch_status();
 }
 

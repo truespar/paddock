@@ -23,6 +23,13 @@ pub(super) fn spans(wall: Duration, marks: [Duration; 5]) -> ([Duration; 6], Opt
     (spans, None)
 }
 
+/// Wall-clock microseconds, for trace lines.
+pub(super) fn trace_us() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_micros())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

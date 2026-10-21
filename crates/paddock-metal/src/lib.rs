@@ -35,6 +35,8 @@ pub use whisper::Whisper;
 #[cfg(target_os = "macos")]
 mod affine;
 #[cfg(all(test, target_os = "macos"))]
+mod affine_column_tests;
+#[cfg(all(test, target_os = "macos"))]
 mod affine_few_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod affine_stable_tests;

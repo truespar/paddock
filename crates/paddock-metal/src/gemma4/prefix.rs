@@ -1,5 +1,10 @@
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static FAIL_PUBLISH_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// A snapshot contains only the last ring's tokens, so a matching global KV
 /// prefix is not sufficient. All window positions the next query can address
 /// must still be in this snapshot. Leave a token to recompute selected logits.
@@ -133,12 +138,21 @@ impl Gemma4 {
         }
         // One bounded snapshot per slot. Publication is after GPU completion;
         // aborts never publish partial prompts as completed prefixes.
+        // Invalidate the old owner BEFORE overwriting its ring. If submission
+        // fails after a partial copy, stale metadata must not expose that
+        // partially replaced ring to a later admission.
+        self.cache[slot].history.clear();
+        self.cache[slot].images.clear();
+        self.cache[slot].table.clear(&mut self.pool);
+        #[cfg(test)]
+        if FAIL_PUBLISH_FOR_TEST.get() {
+            return Err(MetalError::Model("injected prefix-copy failure".into()));
+        }
         self.copy_ring(
             slot,
             self.slots.len() + slot,
             self.slots[slot].history.len(),
         )?;
-        self.cache[slot].table.clear(&mut self.pool);
         self.cache[slot]
             .table
             .share_prefix(self.slots[slot].table.blocks(), &mut self.pool);

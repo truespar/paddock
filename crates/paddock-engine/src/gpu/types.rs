@@ -167,6 +167,11 @@ pub struct Nvf4Plane {
     /// consumer of the plane's [rows, 2ff] output must read pairs (the `_il`
     /// twins, slots 534-536). Set only by the granite HF loader.
     pub gu_pairs: bool,
+    /// The scale cells re-ordered for the sm_100 tcgen05 W4A4 GEMM (slot 867):
+    /// one 2 KB canonical block per (128-row tile, 256-K slab), built at upload
+    /// by slot 868 on a die that has the arm (`Row` planes, `in_dim % 256`).
+    /// `scale` stays - the W4A16 spine and the serial gemv read it.
+    pub scale_tc5: Option<CudaSlice<u8>>,
 }
 
 /// MoE expert-plane byte order - the [`Nvf4Layout`] analog for

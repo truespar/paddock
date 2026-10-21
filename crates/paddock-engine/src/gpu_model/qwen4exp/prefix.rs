@@ -419,7 +419,7 @@ impl PrefixCache {
         let Some((radix, pool)) = pages.radix_pool() else {
             return Ok(None);
         };
-        radix.insert(&tokens[..full * BLOCK_TOKENS], &blocks, pool);
+        radix.insert_for(slot, &tokens[..full * BLOCK_TOKENS], &blocks, pool);
         if !(snapshot && upto.is_multiple_of(BLOCK_TOKENS)) {
             return Ok(None);
         }

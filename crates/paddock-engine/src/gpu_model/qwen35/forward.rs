@@ -1,7 +1,7 @@
 //! Qwen3.5/3.6 single-seq step/prefill, graph capture, core forward + geometry.
 
 use super::*;
-use crate::gpu::{GpuError, KvDtype, QuantW};
+use crate::gpu::{GluAct, GpuError, KvDtype, QuantW};
 use crate::gpu_model::gpt_oss::GpuModelError;
 use cudarc::driver::sys::CUstreamCaptureMode;
 
@@ -874,41 +874,46 @@ impl GpuQwen35 {
                         eps,
                         rot,
                     )?;
-                    pmm_pre!(gate, &mut sc.d_ffn_gate);
-                    pmm_pre!(up, &mut sc.d_ffn_up);
-                    dbg_norm!(li, "ffn_gate", &sc.d_ffn_gate, t_len * ff);
-                    dbg_norm!(li, "ffn_up", &sc.d_ffn_up, t_len * ff);
-                    match down {
-                        QuantW::Kq(k) if kq_f32 => {
-                            // exact-f32 fallback: swiglu explicitly, then the
-                            // interim GEMM off the f32 activation
-                            exec.swiglu(&mut sc.d_ffn_gate, &sc.d_ffn_up, t_len * ff)?;
-                            rotate_opt(rot, &exec, &mut sc.d_ffn_gate, ff, t_len)?;
-                            kq_gemm(
+                    if ffn_gu_land(&exec, gate, up, down, rot, &sc.d_yq_ff, t_len).is_some() {
+                        // gate|up land the down's input (no f32 gate/up planes to print)
+                        prefill_ffn_dense(&exec, sc, gate, up, down, ff, t_len, rot)?;
+                    } else {
+                        pmm_pre!(gate, &mut sc.d_ffn_gate);
+                        pmm_pre!(up, &mut sc.d_ffn_up);
+                        dbg_norm!(li, "ffn_gate", &sc.d_ffn_gate, t_len * ff);
+                        dbg_norm!(li, "ffn_up", &sc.d_ffn_up, t_len * ff);
+                        match down {
+                            QuantW::Kq(k) if kq_f32 => {
+                                // exact-f32 fallback: swiglu explicitly, then the
+                                // interim GEMM off the f32 activation
+                                exec.swiglu(&mut sc.d_ffn_gate, &sc.d_ffn_up, t_len * ff)?;
+                                rotate_opt(rot, &exec, &mut sc.d_ffn_gate, ff, t_len)?;
+                                kq_gemm(
+                                    &exec,
+                                    k,
+                                    &sc.d_ffn_gate,
+                                    &mut sc.d_wdq,
+                                    &mut sc.d_proj,
+                                    t_len,
+                                )?;
+                            }
+                            w => prefill_ffn_down_rot(
                                 &exec,
-                                k,
-                                &sc.d_ffn_gate,
-                                &mut sc.d_wdq,
+                                w,
+                                &mut sc.d_pxq,
+                                &mut sc.d_pxs,
+                                &mut sc.d_yq,
+                                &mut sc.d_xsums,
+                                &mut sc.d_ssums,
+                                &mut sc.d_skfix,
+                                &mut sc.d_ffn_gate,
+                                &sc.d_ffn_up,
                                 &mut sc.d_proj,
+                                ff,
                                 t_len,
-                            )?;
+                                rot,
+                            )?,
                         }
-                        w => prefill_ffn_down_rot(
-                            &exec,
-                            w,
-                            &mut sc.d_pxq,
-                            &mut sc.d_pxs,
-                            &mut sc.d_yq,
-                            &mut sc.d_xsums,
-                            &mut sc.d_ssums,
-                            &mut sc.d_skfix,
-                            &mut sc.d_ffn_gate,
-                            &sc.d_ffn_up,
-                            &mut sc.d_proj,
-                            ff,
-                            t_len,
-                            rot,
-                        )?,
                     }
                     dbg_norm!(li, "ffn_proj", &sc.d_proj, t_len * embd);
                 }
@@ -1760,7 +1765,11 @@ impl GpuQwen35 {
             // 128 rows: the wide band (>= 128) never lands (SWQ epilogue) - unless
             // PADDOCK_NO_NVF4_SWQ pins the landing path for A/B, then every width
             d_ffn_gu: e.alloc(if self.nvf4_gu_fused() {
-                let rows = if paddock_models::dev_var_os!("PADDOCK_NO_NVF4_SWQ").is_some() {
+                // ... or the die has no SWQ epilogue (PADDOCK_NVF4_GU_IL), where
+                // every width lands
+                let rows = if paddock_models::dev_var_os!("PADDOCK_NO_NVF4_SWQ").is_some()
+                    || (!e.has_nvf4_gemm_f4t_swq() && !super::ops::tc5_swq_on(e))
+                {
                     cap
                 } else {
                     cap.min(128)
@@ -1885,6 +1894,19 @@ impl GpuQwen35 {
                 },
             )?,
             d_yq: e.alloc_u8(qw.div_ceil(128) * cap.next_multiple_of(128) * 144)?,
+            d_yq_ff: e.alloc_u8(
+                if cap > mmq_hi_min_batch()
+                    && self.ff.is_multiple_of(128)
+                    && e.has_q8_0_gemm_mmq_gu(GluAct::Silu)
+                    && self.layers.iter().any(|l| {
+                        matches!(&l.ffn, Ffn::Dense { gate: QuantW::Q8(g), .. } if g.data.len() > 32)
+                    })
+                {
+                    self.ff / 128 * cap.next_multiple_of(128) * 144
+                } else {
+                    32
+                },
+            )?,
             d_xsums: e.alloc(if self.kq_resident {
                 qw.div_ceil(128) * cap.next_multiple_of(128) * 4
             } else {

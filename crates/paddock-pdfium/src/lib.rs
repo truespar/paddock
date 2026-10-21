@@ -83,7 +83,36 @@ impl Pdfium {
 
     /// Open a document held in memory. The bytes are not copied by pdfium, so
     /// they must outlive the returned document - which the lifetime enforces.
-    pub fn load(&self, bytes: &[u8]) -> Result<Document<'_>, Error> {
+    ///
+    /// The one `'a` on all three is the point, and it has to be written out.
+    /// Elided, `Document<'_>` took `&self`'s lifetime only (the elision rule
+    /// for methods), so the bytes could be freed under an open document from
+    /// safe code - and pdfium reads them long after this call returns, since
+    /// it parses pages and streams lazily out of this very buffer. Keeping
+    /// `&self` in it too keeps what the elided form did get right: a document
+    /// can't outlive the lock guard it was opened through (the threading
+    /// contract above). Both are compile errors:
+    ///
+    /// ```compile_fail,E0597
+    /// // the bytes freed under an open document
+    /// let pdfium = paddock_pdfium::Pdfium::new();
+    /// let doc = {
+    ///     let bytes = std::fs::read("a.pdf").unwrap();
+    ///     pdfium.load(&bytes).unwrap()
+    /// };
+    /// doc.page_count();
+    /// ```
+    ///
+    /// ```compile_fail,E0505
+    /// // the lock let go while the document is still in use
+    /// let pdfium = std::sync::Mutex::new(paddock_pdfium::Pdfium::new());
+    /// let bytes = std::fs::read("a.pdf").unwrap();
+    /// let guard = pdfium.lock().unwrap();
+    /// let doc = guard.load(&bytes).unwrap();
+    /// drop(guard);
+    /// doc.page_count();
+    /// ```
+    pub fn load<'a>(&'a self, bytes: &'a [u8]) -> Result<Document<'a>, Error> {
         // SAFETY: pointer + length describe `bytes`, which outlives the
         // Document by the lifetime bound. A null password is "no password".
         let doc = unsafe {

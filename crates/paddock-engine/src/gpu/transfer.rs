@@ -133,8 +133,9 @@ impl GpuExecutor {
             .try_slice(0..n)
             .ok_or_else(|| oob("to_host_len_after: n out of range"))?;
         self.copy_stream.wait(ev).map_err(drv)?;
-        self.copy_stream.synchronize().map_err(drv)?;
-        self.copy_stream.clone_dtoh(&view).map_err(drv)
+        let v = self.copy_stream.clone_dtoh(&view).map_err(drv)?; // async into an uninit Vec
+        self.copy_stream.synchronize().map_err(drv)?; // the sync belongs after the copy
+        Ok(v)
     }
 
     /// Read `n` u32s at `off` after `ev` fires, via the side stream - the
@@ -151,8 +152,15 @@ impl GpuExecutor {
             .try_slice(off..off + n)
             .ok_or_else(|| oob("to_host_u32_after: range out of bounds"))?;
         self.copy_stream.wait(ev).map_err(drv)?;
+        // clone_dtoh is an async copy into an uninitialized Vec (cudarc's
+        // pageable HostSlice guard is Sync(None): nothing waits), so the
+        // sync belongs AFTER the copy, not before it. The driver stages
+        // pageable device-to-host copies synchronously today, which is why
+        // the old order never misread in practice; the rule is kept
+        // explicit rather than relied on.
+        let v = self.copy_stream.clone_dtoh(&view).map_err(drv)?;
         self.copy_stream.synchronize().map_err(drv)?;
-        self.copy_stream.clone_dtoh(&view).map_err(drv)
+        Ok(v)
     }
 
     pub fn to_device(&self, host: &[f32]) -> Result<CudaSlice<f32>, GpuError> {

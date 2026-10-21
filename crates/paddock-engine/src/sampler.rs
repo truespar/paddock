@@ -560,8 +560,8 @@ impl Sampler {
                     && p.frequency_penalty == 0.0))
     }
 
-    /// Like `sample`, but only tokens passing `legal` can win. Greedy masks
-    /// the argmax and retries (exact). Stochastic filters the surviving
+    /// Like `sample`, but only tokens passing `legal` can win. Greedy visits
+    /// candidates in exact argmax order. Stochastic filters the surviving
     /// candidate set by `legal` before the draw, falling back to the highest-
     /// probability legal token overall. `None` = no legal token exists
     /// (constraint deadlock) - the caller must fail the sequence.
@@ -605,16 +605,7 @@ impl Sampler {
             return Some(draw(&self.scratch[..n], u));
         };
         if self.params.temperature <= 0.0 {
-            loop {
-                let best = argmax(logits);
-                if logits[best as usize] == f32::NEG_INFINITY {
-                    return None; // every token masked
-                }
-                if legal(best) {
-                    return Some(best);
-                }
-                logits[best as usize] = f32::NEG_INFINITY;
-            }
+            return self.highest_legal(logits, legal);
         }
 
         let u = self.next_uniform();
@@ -625,20 +616,57 @@ impl Sampler {
         self.scratch.retain(|c| legal(c.0));
         if self.scratch.is_empty() {
             // nucleus fully illegal: highest-probability legal token overall.
-            // Walk argmax-and-mask in descending order - grammars typically
-            // legalize within a few tokens, so this beats sorting the vocab.
-            loop {
-                let best = argmax(logits);
-                if logits[best as usize] == f32::NEG_INFINITY {
-                    return None;
-                }
-                if legal(best) {
-                    return Some(best);
-                }
-                logits[best as usize] = f32::NEG_INFINITY;
-            }
+            return self.highest_legal(logits, legal);
         }
         Some(draw(&self.scratch, u))
+    }
+
+    /// Keep the common case allocation-free, but bound vocabulary scanning
+    /// when a grammar rejects a long head (e.g. closing empty tool arguments).
+    /// Repeated argmax is O(V * rejected); heapify once makes the cold path
+    /// O(V + rejected * log V), without sorting the entire vocabulary or
+    /// changing callback order, tie-breaking, masking, or RNG consumption.
+    fn highest_legal(
+        &mut self,
+        logits: &mut [f32],
+        legal: &mut dyn FnMut(u32) -> bool,
+    ) -> Option<u32> {
+        for _ in 0..4 {
+            if logits.is_empty() {
+                return None;
+            }
+            let best = argmax(logits);
+            if logits[best as usize] == f32::NEG_INFINITY {
+                return None;
+            }
+            if legal(best) {
+                return Some(best);
+            }
+            logits[best as usize] = f32::NEG_INFINITY;
+        }
+        self.scratch.clear();
+        self.scratch.extend(
+            logits
+                .iter()
+                .enumerate()
+                // argmax ignores NaNs other than at index zero, already
+                // checked above. Negative infinity is the masked sentinel.
+                .filter(|(_, value)| **value > f32::NEG_INFINITY)
+                .map(|(id, &value)| (id as u32, value)),
+        );
+        for root in (0..self.scratch.len() / 2).rev() {
+            legal_heap_sift(&mut self.scratch, root);
+        }
+        while !self.scratch.is_empty() {
+            let best = self.scratch[0].0;
+            if legal(best) {
+                return Some(best);
+            }
+            logits[best as usize] = f32::NEG_INFINITY;
+            self.scratch.swap_remove(0);
+            legal_heap_sift(&mut self.scratch, 0);
+        }
+        None
     }
 
     /// Pick the next token id. `history` is the tokens so far (for the
@@ -888,6 +916,29 @@ fn argmax(logits: &[f32]) -> u32 {
     }
     best as u32
 }
+
+// A max heap with the same numeric comparisons as argmax: +/-0 tie,
+// infinities are ordered normally, and the lowest token ID wins equal logits.
+fn legal_heap_sift(heap: &mut [(u32, f32)], mut root: usize) {
+    let higher = |a: (u32, f32), b: (u32, f32)| a.1 > b.1 || (a.1 == b.1 && a.0 < b.0);
+    while root < heap.len() / 2 {
+        let left = root * 2 + 1;
+        let right = left + 1;
+        let child = if right < heap.len() && higher(heap[right], heap[left]) {
+            right
+        } else {
+            left
+        };
+        if !higher(heap[child], heap[root]) {
+            break;
+        }
+        heap.swap(root, child);
+        root = child;
+    }
+}
+
+#[cfg(test)]
+mod constrained_tests;
 
 /// log_softmax stats of `logits` for the chosen token + top-k alternatives.
 /// Runs on the RAW logits, before any penalty/temperature mutation.

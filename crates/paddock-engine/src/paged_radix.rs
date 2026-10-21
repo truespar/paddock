@@ -85,6 +85,13 @@ struct Node {
     /// namespace via [`PagedRadix::set_tier_root`]. `None` when the tier is
     /// off or the node predates arming - such nodes simply never demote.
     tkey: Option<LogicalKey>,
+    /// Only background (batch) work has inserted this prefix: it goes before
+    /// every live entry - KV leaf, dead leaf, checkpoint - and the tier drops
+    /// it instead of storing it, so a batch running flat out never pushes an
+    /// interactive session's prefix out of the GPU, RAM or disk. A live insert
+    /// clears it on its whole path, so a live node's ancestors are live and
+    /// background nodes only ever form tails (see [`PagedRadix::insert_as`]).
+    low: bool,
 }
 
 /// The prefix-cache hit for a prompt: the shared KV block ids to adopt, plus the
@@ -112,6 +119,8 @@ pub struct LruPathEntry {
     /// State-checkpoint index at this boundary (hybrid families) - what the
     /// tier's demote arm captures before eviction would recycle it.
     pub state_blk: Option<u32>,
+    /// Background-only (`Node::low`): the tier drops it rather than storing.
+    pub low: bool,
 }
 
 /// A radix tree of block-aligned token prefixes over the shared `KvPool`. Node 0
@@ -159,6 +168,9 @@ pub struct PagedRadix {
     /// `Some` when checkpoints live in the KV pool's own pages instead of a
     /// fixed device pool (issue #33, see [`PagedState`]).
     paged: Option<PagedState>,
+    /// The slots serving background work right now ([`Self::set_slot_low`]);
+    /// what [`Self::insert_for`] stamps on the nodes a slot inserts.
+    slot_low: Vec<bool>,
 }
 
 /// Checkpoints as cache, not reservation (issue #33).
@@ -183,6 +195,9 @@ struct PagedState {
     pages: Vec<Vec<BlockId>>,
     /// Pages of indices recycled without the pool; returned by [`PagedRadix::reclaim`].
     released: Vec<BlockId>,
+    /// Indices hanging on a node (cache), as against reserved or claimed by a
+    /// slot or the tier - see [`PagedRadix::evictable_blocks`].
+    attached: Vec<bool>,
 }
 
 impl Default for PagedRadix {
@@ -207,6 +222,7 @@ impl PagedRadix {
                 ckpt_used: 0,
                 anchor: false,
                 tkey: None,
+                low: false,
             }],
             free_nodes: Vec::new(),
             clock: 0,
@@ -216,7 +232,53 @@ impl PagedRadix {
             st_steals: 0,
             st_refused: 0,
             paged: None,
+            slot_low: Vec::new(),
         }
+    }
+
+    /// Slot `slot` now serves background work (`low`) or live work - the
+    /// family forwards `Generator::set_slot_background` here, so its insert
+    /// sites only need to name the slot ([`Self::insert_for`]).
+    pub fn set_slot_low(&mut self, slot: usize, low: bool) {
+        if self.slot_low.len() <= slot {
+            self.slot_low.resize(slot + 1, false);
+        }
+        self.slot_low[slot] = low;
+    }
+
+    /// Does slot `slot` serve background work ([`Self::set_slot_low`])?
+    pub fn slot_is_low(&self, slot: usize) -> bool {
+        self.slot_low.get(slot).copied().unwrap_or(false)
+    }
+
+    /// Where slot `slot`'s chunked prefill joins a family's first-come chunk
+    /// queue (`queued`: the queued prompts' slots, in order) - a live prompt
+    /// ahead of every background one, so the next tick's rows go to it first.
+    /// `None`: at the back (a background prompt, or no background queued).
+    pub fn chunk_queue_at(
+        &self,
+        slot: usize,
+        queued: impl Iterator<Item = usize>,
+    ) -> Option<usize> {
+        if self.slot_is_low(slot) {
+            return None;
+        }
+        queued
+            .enumerate()
+            .find(|&(_, s)| self.slot_is_low(s))
+            .map(|(i, _)| i)
+    }
+
+    /// [`Self::insert_as`] in the class of the slot whose pages these are.
+    pub fn insert_for(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        blocks: &[BlockId],
+        pool: &mut KvPool,
+    ) {
+        let low = self.slot_low.get(slot).copied().unwrap_or(false);
+        self.insert_as(tokens, blocks, pool, low);
     }
 
     /// Enable checkpoints that live in pool pages (see [`PagedState`]): up to
@@ -229,6 +291,7 @@ impl PagedRadix {
             pages_per_ckpt: pages_per_ckpt.max(1),
             pages: vec![Vec::new(); max_ckpts as usize],
             released: Vec::new(),
+            attached: vec![false; max_ckpts as usize],
         });
     }
 
@@ -389,7 +452,7 @@ impl PagedRadix {
     /// The node and its KV page stay.
     pub fn detach_state_at(&mut self, tokens: &[u32], pos: usize) -> Option<u32> {
         let node = self.node_at(tokens, pos)?;
-        self.nodes[node as usize].state_blk.take()
+        self.pull_state(node as usize)
     }
 
     /// Detach the checkpoint at boundary `pos` of `tokens` only if it is
@@ -403,11 +466,10 @@ impl PagedRadix {
         let Some(node) = self.node_at(tokens, pos) else {
             return false;
         };
-        let n = &mut self.nodes[node as usize];
-        if n.state_blk != Some(idx) {
+        if self.nodes[node as usize].state_blk != Some(idx) {
             return false;
         }
-        n.state_blk = None;
+        self.pull_state(node as usize);
         true
     }
 
@@ -476,7 +538,7 @@ impl PagedRadix {
         if node == 0 || self.nodes[node as usize].state_blk.is_some() {
             return false;
         }
-        self.nodes[node as usize].state_blk = Some(idx);
+        self.put_state(node, idx);
         let t = self.tick();
         self.nodes[node as usize].ckpt_used = t;
         true
@@ -497,7 +559,7 @@ impl PagedRadix {
         }
         let node = self.checkpointable_node(tokens, pos)?;
         let sb = self.alloc_state()?;
-        self.nodes[node as usize].state_blk = Some(sb);
+        self.put_state(node, sb);
         let t = self.tick();
         self.nodes[node as usize].ckpt_used = t;
         Some(sb)
@@ -518,7 +580,7 @@ impl PagedRadix {
         }
         let node = self.checkpointable_node(tokens, pos)?;
         let sb = self.alloc_state_paged(pool, node)?;
-        self.nodes[node as usize].state_blk = Some(sb);
+        self.put_state(node, sb);
         let t = self.tick();
         self.nodes[node as usize].ckpt_used = t;
         Some(sb)
@@ -577,16 +639,13 @@ impl PagedRadix {
                 self.st_refused += 1;
                 return None;
             };
-            if self.protect_proven && self.nodes[victim].recurred {
+            if self.protect_proven && self.nodes[victim].recurred && !self.nodes[victim].low {
                 // see alloc_state: hold a fully-recurred resident set
                 self.st_refused += 1;
                 return None;
             }
             self.log_steal(victim, "checkpoint alloc", pool);
-            let idx = self.nodes[victim]
-                .state_blk
-                .take()
-                .expect("victims hold a checkpoint");
+            let idx = self.pull_state(victim).expect("victims hold a checkpoint");
             self.drop_state_pages(idx, pool);
             self.state_free.push(idx);
             self.st_steals += 1;
@@ -683,12 +742,30 @@ impl PagedRadix {
             .filter(|(i, n)| *i != 0 && *i as u32 != spare && n.alive && n.state_blk.is_some())
             .min_by_key(|(_, n)| {
                 (
+                    !n.low,
                     n.anchor,
                     protect && n.recurred,
                     if paged { n.ckpt_used } else { n.last_used },
                 )
             })
             .map(|(i, _)| i)
+    }
+
+    /// Hang checkpoint `idx` on `node`: its pages count as cache from now on.
+    fn put_state(&mut self, node: u32, idx: u32) {
+        self.nodes[node as usize].state_blk = Some(idx);
+        if let Some(p) = self.paged.as_mut() {
+            p.attached[idx as usize] = true;
+        }
+    }
+
+    /// Take `node`'s checkpoint off it (the inverse of [`Self::put_state`]).
+    fn pull_state(&mut self, node: usize) -> Option<u32> {
+        let idx = self.nodes.get_mut(node)?.state_blk.take()?;
+        if let Some(p) = self.paged.as_mut() {
+            p.attached[idx as usize] = false;
+        }
+        Some(idx)
     }
 
     /// Give index `idx`'s pages back to the pool (paged backing; no-op flat).
@@ -711,12 +788,12 @@ impl PagedRadix {
     pub fn evict_dead_leaves(&mut self, pool: &mut KvPool, want: usize, spare: u32) -> usize {
         let mut gone = 0;
         while pool.free_blocks() < want {
-            let mut dead: Vec<(u64, u32)> = self
+            let mut dead: Vec<((bool, u64), u32)> = self
                 .nodes
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| self.is_dead_leaf(*i as u32, pool, spare))
-                .map(|(i, n)| (n.last_used, i as u32))
+                .map(|(i, n)| ((!n.low, n.last_used), i as u32))
                 .collect();
             if dead.is_empty() {
                 break;
@@ -767,7 +844,7 @@ impl PagedRadix {
             }
             if let Some(v) = self.state_victim_any(spare) {
                 self.log_steal(v, "live context needs pages", pool);
-                let idx = self.nodes[v].state_blk.take().expect("victim holds one");
+                let idx = self.pull_state(v).expect("victim holds one");
                 self.drop_state_pages(idx, pool);
                 self.state_free.push(idx);
                 self.st_steals += 1;
@@ -790,7 +867,13 @@ impl PagedRadix {
             .iter()
             .enumerate()
             .filter(|(i, n)| *i != 0 && *i as u32 != spare && n.alive && n.state_blk.is_some())
-            .min_by_key(|(_, n)| (n.anchor, if paged { n.ckpt_used } else { n.last_used }))
+            .min_by_key(|(_, n)| {
+                (
+                    !n.low,
+                    n.anchor,
+                    if paged { n.ckpt_used } else { n.last_used },
+                )
+            })
             .map(|(i, _)| i)
     }
 
@@ -812,6 +895,7 @@ impl PagedRadix {
             block: n.block,
             tkey: n.tkey,
             state_blk: n.state_blk,
+            low: n.low,
         })
     }
 
@@ -843,9 +927,9 @@ impl PagedRadix {
             .iter()
             .enumerate()
             .filter(|(i, n)| *i != 0 && n.alive && n.state_blk.is_some())
-            .min_by_key(|(_, n)| (n.anchor, protect && n.recurred, n.last_used))
+            .min_by_key(|(_, n)| (!n.low, n.anchor, protect && n.recurred, n.last_used))
             .map(|(i, _)| i)?;
-        if self.protect_proven && self.nodes[victim].recurred {
+        if self.protect_proven && self.nodes[victim].recurred && !self.nodes[victim].low {
             // Every resident checkpoint belongs to a prefix that came back, so
             // stealing one only moves the miss around - the cyclic-thrash
             // trade LRU makes by default. Hold the resident set instead.
@@ -854,7 +938,7 @@ impl PagedRadix {
         }
         self.st_writes += 1;
         self.st_steals += 1;
-        self.nodes[victim].state_blk.take()
+        self.pull_state(victim)
     }
 
     /// Cache `tokens`' full 16-token blocks from a slot's `blocks` (logical block
@@ -862,8 +946,16 @@ impl PagedRadix {
     /// node and is RETAINED in `pool` (the tree's reference); a block already
     /// cached just bumps LRU (its node keeps the earlier block - the caller's
     /// duplicate can be released by the slot as usual). `blocks.len()` must cover
-    /// `tokens.len()/16` full blocks.
+    /// `tokens.len()/16` full blocks. A live insert; see [`Self::insert_as`].
     pub fn insert(&mut self, tokens: &[u32], blocks: &[BlockId], pool: &mut KvPool) {
+        self.insert_as(tokens, blocks, pool, false);
+    }
+
+    /// `insert` for a background (`low`) or live request. New nodes take the
+    /// class; a live insert also clears it on every existing node it walks,
+    /// so a prefix a live session shares with the batch is live. A background
+    /// insert never demotes a live node - it only bumps recency, like any use.
+    pub fn insert_as(&mut self, tokens: &[u32], blocks: &[BlockId], pool: &mut KvPool, low: bool) {
         self.reclaim(pool);
         let full = (tokens.len() / BLOCK_TOKENS).min(blocks.len());
         let mut node = 0u32;
@@ -873,7 +965,9 @@ impl PagedRadix {
             if let Some(&child) = self.nodes[node as usize].children.get(&h) {
                 if self.nodes[child as usize].tokens == chunk {
                     let t = self.tick();
-                    self.nodes[child as usize].last_used = t;
+                    let n = &mut self.nodes[child as usize];
+                    n.last_used = t;
+                    n.low &= low;
                     node = child;
                     continue;
                 }
@@ -881,7 +975,7 @@ impl PagedRadix {
                 // trie can't disambiguate) - stop extending this path.
                 break;
             }
-            pool.retain(blocks[bi]); // the tree now holds a reference
+            pool.retain_cached(blocks[bi]); // the tree now holds a reference
             let t = self.tick();
             let nid = self.new_node(Node {
                 parent: node,
@@ -896,6 +990,7 @@ impl PagedRadix {
                 ckpt_used: 0,
                 anchor: false,
                 tkey: self.nodes[node as usize].tkey.map(|k| k.child(chunk)),
+                low,
             });
             self.nodes[node as usize].children.insert(h, nid);
             node = nid;
@@ -917,12 +1012,13 @@ impl PagedRadix {
     /// The `max` least-recently-used leaf paths, oldest first - the
     /// write-through mirror pass walks these: the chains
     /// eviction would pick first are the ones worth pre-storing.
+    /// Background-only leaves are left out: the tier never stores them.
     pub fn lru_leaf_paths(&self, max: usize) -> Vec<Vec<LruPathEntry>> {
         let mut leaves: Vec<(u64, u32)> = self
             .nodes
             .iter()
             .enumerate()
-            .filter(|(i, n)| *i != 0 && n.alive && n.children.is_empty())
+            .filter(|(i, n)| *i != 0 && n.alive && n.children.is_empty() && !n.low)
             .map(|(i, n)| (n.last_used, i as u32))
             .collect();
         leaves.sort_unstable();
@@ -936,12 +1032,13 @@ impl PagedRadix {
     /// Every live checkpoint attachment: (depth-blocks, tier chain key,
     /// state index, node). Bounded by the state-pool capacity, so the blob
     /// write-through can scan it every pass - the LRU leaves are exactly
-    /// the chains whose checkpoints have already recycled.
+    /// the chains whose checkpoints have already recycled. Background-only
+    /// checkpoints are left out (the tier never stores them).
     pub fn state_attachments(&self) -> Vec<(usize, Option<LogicalKey>, u32, u32)> {
         self.nodes
             .iter()
             .enumerate()
-            .filter(|(i, n)| *i != 0 && n.alive && n.state_blk.is_some())
+            .filter(|(i, n)| *i != 0 && n.alive && n.state_blk.is_some() && !n.low)
             .map(|(i, n)| {
                 let mut d = 0usize;
                 let mut node = i as u32;
@@ -960,7 +1057,7 @@ impl PagedRadix {
             .iter()
             .enumerate()
             .filter(|(i, n)| *i != 0 && n.alive && n.children.is_empty())
-            .min_by_key(|(_, n)| n.last_used)
+            .min_by_key(|(_, n)| (!n.low, n.last_used))
             .map(|(i, _)| i as u32)
         else {
             return Vec::new();
@@ -988,6 +1085,7 @@ impl PagedRadix {
                 block: n.block,
                 tkey: n.tkey,
                 state_blk: n.state_blk,
+                low: n.low,
             });
             node = n.parent;
         }
@@ -1055,7 +1153,7 @@ impl PagedRadix {
                 return bi > start_block; // collision - stop; partial publish stands
             }
             debug_assert!(bi >= start_block, "chain_depth guaranteed presence");
-            pool.retain(blocks[bi - start_block]);
+            pool.retain_cached(blocks[bi - start_block]);
             let t = self.tick();
             let tkey = self.nodes[node as usize].tkey.map(|k| k.child(chunk));
             let nid = self.new_node(Node {
@@ -1071,6 +1169,7 @@ impl PagedRadix {
                 ckpt_used: 0,
                 anchor: false,
                 tkey,
+                low: false,
             });
             self.nodes[node as usize].children.insert(h, nid);
             node = nid;
@@ -1084,7 +1183,7 @@ impl PagedRadix {
     /// [`Self::recycle_state`] at store completion. `None` if the node has
     /// no checkpoint (or was already claimed).
     pub fn take_state(&mut self, node: u32) -> Option<u32> {
-        self.nodes.get_mut(node as usize)?.state_blk.take()
+        self.pull_state(node as usize)
     }
 
     /// Return a state index claimed by [`Self::take_state`] to the free list
@@ -1122,7 +1221,7 @@ impl PagedRadix {
             .iter()
             .enumerate()
             .filter(|(i, n)| *i != 0 && n.alive && n.children.is_empty())
-            .min_by_key(|(_, n)| n.last_used)
+            .min_by_key(|(_, n)| (!n.low, n.last_used))
             .map(|(i, _)| i as u32)?;
         Some(self.evict_node(victim, pool))
     }
@@ -1141,7 +1240,7 @@ impl PagedRadix {
             .iter()
             .enumerate()
             .filter(|(i, n)| *i != 0 && *i as u32 != spare && n.alive && n.children.is_empty())
-            .min_by_key(|(_, n)| n.last_used)
+            .min_by_key(|(_, n)| (!n.low, n.last_used))
             .map(|(i, _)| i as u32)?;
         Some(self.evict_node(victim, pool))
     }
@@ -1156,12 +1255,12 @@ impl PagedRadix {
         self.nodes[parent as usize].children.remove(&key);
         self.nodes[victim as usize].alive = false;
         self.nodes[victim as usize].children = HashMap::new();
-        if let Some(sb) = self.nodes[victim as usize].state_blk.take() {
+        if let Some(sb) = self.pull_state(victim as usize) {
             self.drop_state_pages(sb, pool);
             self.state_free.push(sb); // reclaim the checkpoint index
         }
         self.free_nodes.push(victim);
-        pool.release(blk);
+        pool.release_cached(blk);
         blk
     }
 
@@ -1177,7 +1276,30 @@ impl PagedRadix {
     /// retention-heavy workload (salted benches, many one-shot prompts) drives
     /// `free` to ~0 and the admission watermark serializes the whole server
     /// behind slot completions (found live: gemma4 c8 TTFT 3.3 s -> 52 s).
+    ///
+    /// O(attached checkpoints): the KV side is the pool's running count of
+    /// pages only the tree holds ([`KvPool::lone_cached`]), so a pool serves
+    /// one tree.
     pub fn evictable_blocks(&self, pool: &KvPool) -> usize {
+        let ckpt = self.paged.as_ref().map_or(0, |p| {
+            let attached: usize = p
+                .pages
+                .iter()
+                .zip(&p.attached)
+                .filter(|&(_, &on)| on)
+                .map(|(pages, _)| pages.iter().filter(|&&b| pool.refcount(b) == 1).count())
+                .sum();
+            attached + p.released.len()
+        });
+        let n = pool.lone_cached() + ckpt;
+        #[cfg(test)]
+        assert_eq!(n, self.evictable_blocks_scan(pool), "running count drifted");
+        n
+    }
+
+    /// [`Self::evictable_blocks`] by walking every node - the tests' witness.
+    #[cfg(test)]
+    fn evictable_blocks_scan(&self, pool: &KvPool) -> usize {
         let kv = self
             .nodes
             .iter()
@@ -1795,6 +1917,93 @@ mod tests {
     }
 
     #[test]
+    fn the_running_evictable_count_matches_a_full_walk() {
+        // evictable_blocks asserts its running count against the node walk
+        // under cfg(test); drive every refcount and checkpoint move there is
+        // - live slots sharing cached prefixes, inserts, checkpoints attached,
+        // detached, claimed and recycled, tier pins, room made, LRU evicted.
+        let mut pool = KvPool::with_blocks(96);
+        let mut r = PagedRadix::new();
+        r.set_state_paged(24, 2);
+        let mut x = 0x2545_f491_u64;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % n) as usize
+        };
+        let mut live: Vec<(Vec<u32>, BlockTable)> = Vec::new();
+        let mut claimed: Vec<u32> = Vec::new();
+        let mut pins: Vec<BlockId> = Vec::new();
+        for _ in 0..4000 {
+            match rnd(9) {
+                0 | 1 if live.len() < 6 => {
+                    let (seed, n) = (rnd(5) as u32, 1 + rnd(6));
+                    let toks: Vec<u32> = (0..n as u32)
+                        .flat_map(|i| block_toks(seed * 1000 + i))
+                        .chain([7])
+                        .collect();
+                    let hit = r.match_prefix(&toks);
+                    if !r.make_room(&mut pool, n, 0) {
+                        continue;
+                    }
+                    let mut t = BlockTable::new();
+                    t.share_prefix(&hit, &mut pool);
+                    if t.ensure(n * BLOCK_TOKENS - 1, &mut pool).is_err() {
+                        t.clear(&mut pool);
+                        continue;
+                    }
+                    r.insert(&toks, t.blocks(), &mut pool);
+                    live.push((toks, t));
+                }
+                2 if !live.is_empty() => {
+                    let (_, mut t) = live.swap_remove(rnd(live.len() as u64));
+                    t.clear(&mut pool);
+                }
+                3 if !live.is_empty() => {
+                    let toks = live[rnd(live.len() as u64)].0.clone();
+                    let pos = BLOCK_TOKENS * (1 + rnd((toks.len() / BLOCK_TOKENS) as u64));
+                    r.attach_state_with_pool(&toks, pos, &mut pool);
+                }
+                4 if !live.is_empty() => {
+                    let toks = live[rnd(live.len() as u64)].0.clone();
+                    let pos = BLOCK_TOKENS * (1 + rnd((toks.len() / BLOCK_TOKENS) as u64));
+                    if let Some(idx) = r.detach_state_at(&toks, pos) {
+                        claimed.push(idx);
+                    }
+                }
+                5 => {
+                    if let Some(e) = r.stalest_state()
+                        && let Some(idx) = r.take_state(e.node)
+                    {
+                        claimed.push(idx);
+                    }
+                    if let Some(idx) = claimed.pop() {
+                        r.recycle_state(idx);
+                    }
+                }
+                6 => match pins.pop() {
+                    Some(b) => pool.release(b),
+                    None => {
+                        if let Some(e) = r.lru_leaf_path().last() {
+                            pool.retain(e.block);
+                            pins.push(e.block);
+                        }
+                    }
+                },
+                7 => {
+                    r.evict_lru(&mut pool);
+                }
+                _ => {
+                    r.reclaim(&mut pool);
+                }
+            }
+            r.evictable_blocks(&pool);
+        }
+        assert!(r.cached_blocks() > 0, "the walk exercised a populated tree");
+    }
+
+    #[test]
     fn a_stolen_checkpoints_pinned_pages_are_never_reused() {
         let mut pool = KvPool::with_blocks(8);
         let mut r = PagedRadix::new();
@@ -1879,32 +2088,200 @@ mod tests {
         };
         // one conversation growing 3 blocks a turn through a 4-page store
         let conv: Vec<u32> = (0..9).flat_map(block_toks).collect();
-        for sparing in [false, true] {
+        let mut pool = KvPool::with_blocks(4);
+        let mut r = PagedRadix::new();
+        for turn in 1..=3 {
+            publish(&mut r, &mut pool, &conv[..turn * 3 * BLOCK_TOKENS], true);
+        }
+        let blocks = alive_blocks(&r);
+        let mut distinct = blocks.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            blocks.len(),
+            "a page mapped twice: {blocks:?}"
+        );
+        assert!(blocks.len() <= 4, "more nodes than pages: {blocks:?}");
+        // what it kept is the conversation's head, prefix-closed
+        assert_eq!(r.match_full(&conv).blocks.len(), blocks.len());
+        // the unspared form evicts its own tail and re-adopts the ids - the
+        // pool refuses the second cache reference on the page
+        let unspared = std::panic::catch_unwind(|| {
             let mut pool = KvPool::with_blocks(4);
             let mut r = PagedRadix::new();
             for turn in 1..=3 {
-                publish(&mut r, &mut pool, &conv[..turn * 3 * BLOCK_TOKENS], sparing);
+                publish(&mut r, &mut pool, &conv[..turn * 3 * BLOCK_TOKENS], false);
             }
-            let blocks = alive_blocks(&r);
-            let mut distinct = blocks.clone();
-            distinct.sort_unstable();
-            distinct.dedup();
-            if sparing {
-                assert_eq!(
-                    distinct.len(),
-                    blocks.len(),
-                    "a page mapped twice: {blocks:?}"
-                );
-                assert!(blocks.len() <= 4, "more nodes than pages: {blocks:?}");
-                // what it kept is the conversation's head, prefix-closed
-                assert_eq!(r.match_full(&conv).blocks.len(), blocks.len());
-            } else {
-                // the unspared form evicts its own tail and re-adopts the ids
-                assert!(
-                    distinct.len() < blocks.len(),
-                    "expected the aliasing: {blocks:?}"
-                );
-            }
+        });
+        let msg = unspared.expect_err("expected the aliasing");
+        let msg = msg.downcast_ref::<String>().map_or("", String::as_str);
+        assert!(msg.contains("cached twice"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod class_tests {
+    //! Background (batch) entries go before live ones - see `Node::low`.
+    use super::*;
+    use crate::kv_pool::{BlockTable, KvPool};
+
+    fn toks(seeds: &[u32]) -> Vec<u32> {
+        seeds
+            .iter()
+            .flat_map(|&s| (0..BLOCK_TOKENS as u32).map(move |i| s * 100 + i))
+            .collect()
+    }
+
+    /// A finished request's pages: cached in `low`'s class, then released by
+    /// its slot so only the tree holds them.
+    fn cached(r: &mut PagedRadix, pool: &mut KvPool, seeds: &[u32], low: bool) {
+        let mut t = BlockTable::new();
+        t.ensure(seeds.len() * BLOCK_TOKENS - 1, pool)
+            .expect("alloc");
+        r.insert_as(&toks(seeds), t.blocks(), pool, low);
+        t.clear(pool);
+    }
+
+    /// The class of every node on `seeds`' cached path, root first.
+    fn classes(r: &PagedRadix, seeds: &[u32]) -> Vec<bool> {
+        let t = toks(seeds);
+        let mut node = 0u32;
+        let mut out = Vec::new();
+        for chunk in t.chunks(BLOCK_TOKENS) {
+            let Some(&c) = r.nodes[node as usize].children.get(&hash_block(chunk)) else {
+                break;
+            };
+            out.push(r.nodes[c as usize].low);
+            node = c;
         }
+        out
+    }
+
+    #[test]
+    fn a_batch_leaf_goes_before_an_older_live_one() {
+        let mut pool = KvPool::with_blocks(16);
+        let mut r = PagedRadix::new();
+        cached(&mut r, &mut pool, &[1, 2], false); // live, older
+        cached(&mut r, &mut pool, &[3, 4], true); // batch, newer
+        r.evict_lru(&mut pool);
+        r.evict_lru(&mut pool);
+        assert_eq!(classes(&r, &[1, 2]).len(), 2, "the live prefix survives");
+        assert!(
+            classes(&r, &[3, 4]).is_empty(),
+            "the batch prefix went first"
+        );
+    }
+
+    #[test]
+    fn a_live_insert_promotes_its_path_and_a_batch_one_never_demotes() {
+        let mut pool = KvPool::with_blocks(16);
+        let mut r = PagedRadix::new();
+        cached(&mut r, &mut pool, &[1, 2, 3], true);
+        assert_eq!(classes(&r, &[1, 2, 3]), [true, true, true]);
+        // a live session shares the first two pages: they are live now
+        cached(&mut r, &mut pool, &[1, 2, 9], false);
+        assert_eq!(classes(&r, &[1, 2, 3]), [false, false, true]);
+        assert_eq!(classes(&r, &[1, 2, 9]), [false, false, false]);
+        // more batch work over the live path leaves it live
+        cached(&mut r, &mut pool, &[1, 2, 9, 5], true);
+        assert_eq!(classes(&r, &[1, 2, 9, 5]), [false, false, false, true]);
+        // and eviction takes the two batch tails before any live leaf
+        r.evict_lru(&mut pool);
+        r.evict_lru(&mut pool);
+        assert_eq!(classes(&r, &[1, 2, 3]), [false, false]);
+        assert_eq!(classes(&r, &[1, 2, 9]), [false, false, false]);
+    }
+
+    #[test]
+    fn the_tier_sees_batch_entries_marked_and_never_mirrors_them() {
+        let mut pool = KvPool::with_blocks(16);
+        let mut r = PagedRadix::new();
+        cached(&mut r, &mut pool, &[1], false);
+        cached(&mut r, &mut pool, &[2], true);
+        let path = r.lru_leaf_path();
+        assert!(
+            path.last().expect("a leaf").low,
+            "the pressure pass reaches the batch leaf first"
+        );
+        let mirrored = r.lru_leaf_paths(8);
+        assert_eq!(mirrored.len(), 1, "only the live chain is worth storing");
+        assert!(!mirrored[0][0].low);
+    }
+
+    #[test]
+    fn a_checkpoint_steal_takes_the_batch_one_first() {
+        let mut pool = KvPool::with_blocks(16);
+        let mut r = PagedRadix::new();
+        r.set_state_capacity(2);
+        cached(&mut r, &mut pool, &[1, 2], false);
+        cached(&mut r, &mut pool, &[3, 4], true);
+        cached(&mut r, &mut pool, &[5, 6], false);
+        assert!(r.attach_state(&toks(&[1, 2]), 2 * BLOCK_TOKENS).is_some()); // live, oldest
+        assert!(r.attach_state(&toks(&[3, 4]), 2 * BLOCK_TOKENS).is_some()); // batch
+        assert!(r.attach_state(&toks(&[5, 6]), 2 * BLOCK_TOKENS).is_some()); // steals
+        let probe = |s: &[u32]| [toks(s), vec![0]].concat();
+        assert!(
+            r.match_full(&probe(&[1, 2])).ckpt.is_some(),
+            "the live checkpoint stays"
+        );
+        assert!(
+            r.match_full(&probe(&[3, 4])).ckpt.is_none(),
+            "the batch one was taken"
+        );
+        assert!(
+            r.state_attachments()
+                .iter()
+                .all(|&(_, _, _, n)| !r.nodes[n as usize].low)
+        );
+    }
+
+    #[test]
+    fn a_live_prompt_queues_ahead_of_batch_ones() {
+        let mut r = PagedRadix::new();
+        for s in [2, 5] {
+            r.set_slot_low(s, true);
+        }
+        // queue: live 1, batch 2, live 3, batch 5
+        let q = [1usize, 2, 3, 5];
+        assert_eq!(
+            r.chunk_queue_at(7, q.iter().copied()),
+            Some(1),
+            "before the first batch prompt"
+        );
+        assert_eq!(
+            r.chunk_queue_at(5, q.iter().copied()),
+            None,
+            "batch goes to the back"
+        );
+        assert_eq!(
+            r.chunk_queue_at(7, [1usize, 3].into_iter()),
+            None,
+            "no batch queued"
+        );
+    }
+
+    #[test]
+    fn insert_for_stamps_the_slots_class() {
+        let mut pool = KvPool::with_blocks(16);
+        let mut r = PagedRadix::new();
+        r.set_slot_low(3, true);
+        for (slot, seed) in [(3, 1), (0, 2), (7, 4)] {
+            let mut t = BlockTable::new();
+            t.ensure(BLOCK_TOKENS - 1, &mut pool).expect("alloc");
+            r.insert_for(slot, &toks(&[seed]), t.blocks(), &mut pool);
+        }
+        assert_eq!(classes(&r, &[1]), [true]);
+        assert_eq!(classes(&r, &[2]), [false]);
+        assert_eq!(classes(&r, &[4]), [false], "a slot never set is live");
+        r.set_slot_low(3, false);
+        let mut t = BlockTable::new();
+        t.ensure(BLOCK_TOKENS - 1, &mut pool).expect("alloc");
+        r.insert_for(3, &toks(&[1]), t.blocks(), &mut pool);
+        assert_eq!(
+            classes(&r, &[1]),
+            [false],
+            "a live request reusing it promotes it"
+        );
     }
 }

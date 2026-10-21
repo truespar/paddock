@@ -574,6 +574,8 @@ fn attention_local_contracts(benchmark: bool, direct: bool) {
                         "q4b_attention_local_wide",
                         "q4b_attention_local_gather",
                         "q4b_attention_local_vpad1",
+                        "q4b_attention_value_ahead1",
+                        "q4b_attention_value_ahead8",
                     ]
                 };
                 let mut times = vec![Vec::new(); kernels.len()];

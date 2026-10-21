@@ -40,11 +40,13 @@ pub(crate) mod load;
 pub(crate) use load::g4_moe_uniq_arm;
 mod multimodal;
 pub mod muse_vision;
+mod pf_q8;
 pub(crate) mod planes;
 mod prefix;
 mod scratch;
 mod spec;
 mod switches;
+pub mod unified;
 pub mod vision;
 
 use cudarc::driver::CudaSlice;
@@ -802,6 +804,9 @@ pub(crate) struct Scratch {
     /// mmq-quantized activation tile (int8 activations - the same numeric
     /// class as llama.cpp's Q8 prefill, which also int8-quantizes)
     pub pf_yq: CudaSlice<u8>,
+    /// the down GEMM's mmq input when the FFN's gate|up GEMMs land it
+    /// directly (`ScratchDims::q8_gu`; a 32-byte stub otherwise)
+    pub pf_yq_ff: CudaSlice<u8>,
     /// mmq split-tile fixup plane (sizing convention from qwen35)
     pub pf_skfix: CudaSlice<f32>,
     /// strided int8 quant + per-32-block scales for the mma GEMM class -
@@ -1039,6 +1044,9 @@ pub struct GpuGemma4 {
     pub(crate) pictures: crate::gpu_model::picture_store::PictureStore<multimodal::EncodedImage>,
     pub(crate) img_beg_id: Option<u32>,
     pub(crate) img_end_id: Option<u32>,
+    /// the `<|audio>` / `<audio|>` clip markers (the unified mmproj's audio)
+    pub(crate) aud_beg_id: Option<u32>,
+    pub(crate) aud_end_id: Option<u32>,
     /// [n_slots, n_vocab] device logits for the batched head
     pub(crate) batch_logits: Option<CudaSlice<f32>>,
     /// device sampler buffers: ([slots*4] packed params, [slots] out ids)
@@ -1262,6 +1270,11 @@ impl Generator for GpuGemma4 {
     }
     fn tier_stats(&self) -> Option<crate::kv_tier::TierStats> {
         self.prefix.as_ref()?.tier.as_ref().map(|t| t.tier_stats())
+    }
+    fn set_slot_background(&mut self, slot: usize, on: bool) {
+        if let Some(pf) = self.prefix.as_mut() {
+            pf.radix.set_slot_low(slot, on);
+        }
     }
     fn tier_report(&self) -> Option<crate::kv_tier::TierReport> {
         self.prefix

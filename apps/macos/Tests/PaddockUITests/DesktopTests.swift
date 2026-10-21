@@ -161,7 +161,9 @@ struct DesktopTests {
     #expect(model.draft.hasContent)
     await model.handleDesktopRequest(DesktopRequest(.newChat))
     #expect(model.draft.message == "Keep this private draft")
-    #expect(model.desktopError?.contains("Nothing was discarded") == true)
+    // Navigation is now allowed with an unsent draft, but a missing core must
+    // still leave that draft untouched and surface its connection failure.
+    #expect(model.desktopError == "The native conversation service is unavailable.")
     #expect(!model.desktopTransition)
   }
   @Test func anotherDesktopActionClearsThePreviousReadinessError() async {

@@ -50,16 +50,16 @@ kernel void mlx_input_compact(device const float* x [[buffer(0)]],device bfloat*
 // Contiguous packed-word loads; each pair of output columns shares input
 // across requests. A full SIMD group shortens batched K loops without the
 // strided group-major access pattern rejected by the serving measurement.
-template<uint R,uint Lanes>
+template<uint R,uint Lanes,uint Columns=2>
 inline void mlx_affine_rows(device const uchar* w,device const float* x,device float* out,
     uint K,uint N,uint n,uint lane,uint valid) {
     if(n>=N)return;
     device const bfloat* scales=reinterpret_cast<device const bfloat*>(w+ulong(K)*N/2);
     device const bfloat* biases=scales+ulong(K)*N/64;
-    float4 sums[2][R];for(uint c=0;c<2;++c)for(uint r=0;r<R;++r)sums[c][r]=0;
+    float4 sums[Columns][R];for(uint c=0;c<Columns;++c)for(uint r=0;r<R;++r)sums[c][r]=0;
     for(uint k=lane*8;k<K;k+=Lanes*8) {
-        float4 lo[2],hi[2];float scales2[2],biases2[2];
-        for(uint c=0;c<2;++c) {
+        float4 lo[Columns],hi[Columns];float scales2[Columns],biases2[Columns];
+        for(uint c=0;c<Columns;++c) {
             ulong i=ulong(min(n+c,N-1))*K+k;
             uint bits=reinterpret_cast<device const uint*>(w)[i/8];
             float s=float(scales[i/64]),b=float(biases[i/64]);
@@ -72,7 +72,7 @@ inline void mlx_affine_rows(device const uchar* w,device const float* x,device f
             if(r>=valid)continue;
             float4 a=*reinterpret_cast<device const float4*>(x+ulong(r)*K+k);
             float4 b=*reinterpret_cast<device const float4*>(x+ulong(r)*K+k+4);
-            for(uint c=0;c<2;++c) {
+            for(uint c=0;c<Columns;++c) {
                 if constexpr(R==1) {
                     // MLX's one-vector affine contraction reduces the bias
                     // operand in BF16 groups of four before F32 accumulation.
@@ -83,7 +83,7 @@ inline void mlx_affine_rows(device const uchar* w,device const float* x,device f
             }
         }
     }
-    for(uint c=0;c<2;++c)for(uint r=0;r<R;++r) {
+    for(uint c=0;c<Columns;++c)for(uint r=0;r<R;++r) {
         float4 s=sums[c][r];float sum=kquant_sum<Lanes>(s.x+s.y+s.z+s.w);
         if(lane==0 && n+c<N && r<valid)out[ulong(r)*N+n+c]=mlx_bf(sum);
     }
@@ -102,6 +102,113 @@ MLX_AFFINE(3)
 MLX_AFFINE(4)
 MLX_AFFINE(5)
 #undef MLX_AFFINE
+
+// Share each input word and rounded bias sum across four output columns,
+// retaining the eight-lane contraction and every original BF16 boundary.
+kernel void mlx_affine_columns4(device const uchar* w0 [[buffer(0)]],device const uchar* w1 [[buffer(1)]],device const uchar* w2 [[buffer(2)]],
+    device const float* x [[buffer(3)]],device float* o0 [[buffer(4)]],device float* o1 [[buffer(5)]],device float* o2 [[buffer(6)]],
+    constant uint* p [[buffer(7)]],uint g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
+    uint n0=(p[1]+63)/64,n1=(p[2]+63)/64,N=p[1];device const uchar* w=w0;device float* out=o0;
+    if(g>=n0){g-=n0;N=p[2];w=w1;out=o1;if(g>=n1){g-=n1;N=p[3];w=w2;out=o2;}}
+    mlx_affine_rows<1,8,4>(w,x,out,p[0],N,g*64+tid/8*4,tid%8,1);
+}
+kernel void mlx_affine_columns1(device const uchar* w0 [[buffer(0)]],device const uchar* w1 [[buffer(1)]],device const uchar* w2 [[buffer(2)]],
+    device const float* x [[buffer(3)]],device float* o0 [[buffer(4)]],device float* o1 [[buffer(5)]],device float* o2 [[buffer(6)]],
+    constant uint* p [[buffer(7)]],uint g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
+    uint n0=(p[1]+15)/16,n1=(p[2]+15)/16,N=p[1];device const uchar* w=w0;device float* out=o0;
+    if(g>=n0){g-=n0;N=p[2];w=w1;out=o1;if(g>=n1){g-=n1;N=p[3];w=w2;out=o2;}}
+    mlx_affine_rows<1,8,1>(w,x,out,p[0],N,g*16+tid/8,tid%8,1);
+}
+
+// Pipeline independent packed loads without changing the eight-lane reduction
+// or the ascending per-lane accumulation order.
+template<uint Lookahead,bool Complete=false>
+inline void mlx_affine_pipeline(device const uchar* w0,device const uchar* w1,device const uchar* w2,
+    device const float* x,device float* o0,device float* o1,device float* o2,
+    constant uint* p,uint group,uint tid) {
+    uint g=group,n0=(p[1]+15)/16,n1=(p[2]+15)/16,N=p[1],K=p[0];
+    device const uchar* w=w0;device float* out=o0;
+    if(g>=n0){g-=n0;N=p[2];w=w1;out=o1;if(g>=n1){g-=n1;N=p[3];w=w2;out=o2;}}
+    uint n=g*16+tid/8,lane=tid%8;if(n>=N)return;
+    device const bfloat* scales=reinterpret_cast<device const bfloat*>(w+ulong(K)*N/2);
+    device const bfloat* biases=scales+ulong(K)*N/64;float sum=0;
+    for(uint first=lane*8;first<K;first+=64*Lookahead) {
+        float4 a[Lookahead],b[Lookahead];uint bits[Lookahead];float s[Lookahead],z[Lookahead];
+        for(uint j=0;j<Lookahead;++j)if(Complete || first+j*64<K){
+            uint k=first+j*64;ulong i=ulong(n)*K+k;
+            a[j]=*reinterpret_cast<device const float4*>(x+k);
+            b[j]=*reinterpret_cast<device const float4*>(x+k+4);
+            bits[j]=reinterpret_cast<device const uint*>(w)[i/8];
+            s[j]=float(scales[i/64]);z[j]=float(biases[i/64]);}
+        for(uint j=0;j<Lookahead;++j)if(Complete || first+j*64<K){
+            float4 lo=float4((uint4(bits[j])>>uint4(0,4,8,12))&15);
+            float4 hi=float4((uint4(bits[j])>>uint4(16,20,24,28))&15);
+            float sa=mlx_bf(mlx_bf(mlx_bf(a[j].x+a[j].y)+a[j].z)+a[j].w);
+            float sb=mlx_bf(mlx_bf(mlx_bf(b[j].x+b[j].y)+b[j].z)+b[j].w);
+            sum=fma(z[j],sa+sb,fma(s[j],dot(lo,a[j])+dot(hi,b[j]),sum));}
+    }
+    sum=kquant_sum<8>(sum);if(lane==0)out[n]=mlx_bf(sum);
+}
+#define MLX_PIPELINE(U) \
+kernel void mlx_affine_pipeline##U(device const uchar* w0 [[buffer(0)]],device const uchar* w1 [[buffer(1)]],device const uchar* w2 [[buffer(2)]], \
+device const float* x [[buffer(3)]],device float* o0 [[buffer(4)]],device float* o1 [[buffer(5)]],device float* o2 [[buffer(6)]], \
+constant uint* p [[buffer(7)]],uint g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) { \
+mlx_affine_pipeline<U>(w0,w1,w2,x,o0,o1,o2,p,g,tid);}
+MLX_PIPELINE(4)
+#undef MLX_PIPELINE
+
+kernel void mlx_affine_pipeline_full4(device const uchar* w0 [[buffer(0)]],device const uchar* w1 [[buffer(1)]],device const uchar* w2 [[buffer(2)]],
+device const float* x [[buffer(3)]],device float* o0 [[buffer(4)]],device float* o1 [[buffer(5)]],device float* o2 [[buffer(6)]],
+constant uint* p [[buffer(7)]],uint g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
+    mlx_affine_pipeline<4,true>(w0,w1,w2,x,o0,o1,o2,p,g,tid);
+}
+
+#ifdef PADDOCK_KERNEL_DIAGNOSTICS
+// Numerical isolation only, not a production election. Reuse packed weights
+// across requests while retaining the one-vector rounded-bias contraction.
+kernel void mlx_affine_bias8(device const float* x [[buffer(0)]],device float* out [[buffer(1)]],
+    constant uint* p [[buffer(2)]],uint i [[thread_position_in_grid]]) {
+    if(i>=p[0]*p[1]/8)return;
+    float4 a=*reinterpret_cast<device const float4*>(x+ulong(i)*8);
+    float4 b=*reinterpret_cast<device const float4*>(x+ulong(i)*8+4);
+    float sa=mlx_bf(mlx_bf(mlx_bf(a.x+a.y)+a.z)+a.w);
+    float sb=mlx_bf(mlx_bf(mlx_bf(b.x+b.y)+b.z)+b.w);
+    out[i]=sa+sb;
+}
+template<uint R>
+inline void mlx_affine_canonical(device const uchar* w0,device const uchar* w1,device const uchar* w2,
+    device const float* x,device float* o0,device float* o1,device float* o2,device const float* bias_sums,
+    constant uint* p,uint group,uint tid) {
+    uint g=group,n0=(p[1]+15)/16,n1=(p[2]+15)/16,N=p[1],K=p[0];
+    device const uchar* w=w0;device float* out=o0;
+    if(g>=n0){g-=n0;N=p[2];w=w1;out=o1;if(g>=n1){g-=n1;N=p[3];w=w2;out=o2;}}
+    uint n=g*16+tid/8,lane=tid%8;if(n>=N)return;
+    device const bfloat* scales=reinterpret_cast<device const bfloat*>(w+ulong(K)*N/2);
+    device const bfloat* biases=scales+ulong(K)*N/64;
+    float sum[R];for(uint r=0;r<R;++r)sum[r]=0;
+    for(uint k=lane*8;k<K;k+=64) {
+        ulong i=ulong(n)*K+k;uint bits=reinterpret_cast<device const uint*>(w)[i/8];
+        float s=float(scales[i/64]),z=float(biases[i/64]);
+        float4 lo=float4((uint4(bits)>>uint4(0,4,8,12))&15),hi=float4((uint4(bits)>>uint4(16,20,24,28))&15);
+        for(uint r=0;r<R;++r) {
+            float4 a=*reinterpret_cast<device const float4*>(x+ulong(r)*K+k);
+            float4 b=*reinterpret_cast<device const float4*>(x+ulong(r)*K+k+4);
+            float bias_sum=bias_sums[ulong(r)*(K/8)+k/8];
+            sum[r]=fma(z,bias_sum,fma(s,dot(lo,a)+dot(hi,b),sum[r]));
+        }
+    }
+    for(uint r=0;r<R;++r){float v=kquant_sum<8>(sum[r]);if(lane==0)out[ulong(r)*N+n]=mlx_bf(v);}
+}
+#define MLX_CANONICAL(R) \
+kernel void mlx_affine_canonical##R(device const uchar* w0 [[buffer(0)]],device const uchar* w1 [[buffer(1)]],device const uchar* w2 [[buffer(2)]], \
+device const float* x [[buffer(3)]],device float* o0 [[buffer(4)]],device float* o1 [[buffer(5)]],device float* o2 [[buffer(6)]],device const float* bias_sums [[buffer(7)]], \
+constant uint* p [[buffer(8)]],uint g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) { \
+mlx_affine_canonical<R>(w0,w1,w2,x,o0,o1,o2,bias_sums,p,g,tid);}
+MLX_CANONICAL(2)
+MLX_CANONICAL(3)
+MLX_CANONICAL(4)
+#undef MLX_CANONICAL
+#endif
 
 // Fixed F32 arithmetic contract, independent of the number of live requests.
 // Disable implicit regrouping only here; keep each intended FMA explicit.
@@ -256,23 +363,25 @@ MLX_STABLE_DIRECT(5)
 // Single-token bandwidth path: a complete SIMD group shares sixteen input
 // values across four independent output columns. Fewer scale/bias loads and
 // shorter K loops than the small-batch eight-lane layout above.
-kernel void mlx_affine_single(device const uchar* w0 [[buffer(0)]],device const uchar* w1 [[buffer(1)]],device const uchar* w2 [[buffer(2)]],
-    device const float* x [[buffer(3)]],device float* o0 [[buffer(4)]],device float* o1 [[buffer(5)]],device float* o2 [[buffer(6)]],
-    constant uint* p [[buffer(7)]],uint group [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
-    uint g=group,n0=(p[1]+15)/16,n1=(p[2]+15)/16,N=p[1],K=p[0];device const uchar* w=w0;device float* out=o0;
+template<uint Columns>
+inline void mlx_affine_single_columns(device const uchar* w0,device const uchar* w1,device const uchar* w2,
+    device const float* x,device float* o0,device float* o1,device float* o2,
+    constant uint* p,uint group,uint tid) {
+    constexpr uint C=4*Columns;
+    uint g=group,n0=(p[1]+C-1)/C,n1=(p[2]+C-1)/C,N=p[1],K=p[0];device const uchar* w=w0;device float* out=o0;
     if(g>=n0){g-=n0;N=p[2];w=w1;out=o1;if(g>=n1){g-=n1;N=p[3];w=w2;out=o2;}}
-    uint n=g*16+(tid/32)*4,lane=tid%32;
+    uint n=g*C+(tid/32)*Columns,lane=tid%32;
     if(n>=N)return;
     device const bfloat* scales=reinterpret_cast<device const bfloat*>(w+ulong(K)*N/2);
     device const bfloat* biases=scales+ulong(K)*N/64;
-    float sums[4]={0,0,0,0};
+    float sums[Columns];for(uint c=0;c<Columns;++c)sums[c]=0;
     for(uint k=lane*16;k<K;k+=512) {
         float4 a[4];float bias_sum=0;
         for(uint j=0;j<4;++j) {
             a[j]=*reinterpret_cast<device const float4*>(x+k+j*4);
             bias_sum+=mlx_bf(mlx_bf(mlx_bf(a[j].x+a[j].y)+a[j].z)+a[j].w);
         }
-        for(uint c=0;c<4;++c) {
+        for(uint c=0;c<Columns;++c) {
             ulong i=ulong(min(n+c,N-1))*K+k;
             uint2 bits=*reinterpret_cast<device const uint2*>(w+i/2);
             float sum=0;
@@ -283,11 +392,21 @@ kernel void mlx_affine_single(device const uchar* w0 [[buffer(0)]],device const 
             sums[c]+=sum*float(scales[i/64])+bias_sum*float(biases[i/64]);
         }
     }
-    for(uint c=0;c<4;++c) {
+    for(uint c=0;c<Columns;++c) {
         float sum=simd_sum(sums[c]);
         if(lane==0 && n+c<N)out[n+c]=mlx_bf(sum);
     }
 }
+
+#define MLX_SINGLE_COLUMNS(NAME,C) \
+kernel void NAME(device const uchar* w0 [[buffer(0)]],device const uchar* w1 [[buffer(1)]],device const uchar* w2 [[buffer(2)]], \
+device const float* x [[buffer(3)]],device float* o0 [[buffer(4)]],device float* o1 [[buffer(5)]],device float* o2 [[buffer(6)]], \
+constant uint* p [[buffer(7)]],uint g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) { \
+mlx_affine_single_columns<C>(w0,w1,w2,x,o0,o1,o2,p,g,tid);}
+MLX_SINGLE_COLUMNS(mlx_affine_single,4)
+MLX_SINGLE_COLUMNS(mlx_affine_single_columns2,2)
+MLX_SINGLE_COLUMNS(mlx_affine_single_columns1,1)
+#undef MLX_SINGLE_COLUMNS
 
 
 // Bias operands depend only on the activation, not the output column. Prepare
@@ -488,6 +607,9 @@ kernel void NAME(device const uchar* w0 [[buffer(0)]],device const uchar* w1 [[b
 MLX_PREFILL_WIDE(mlx_affine_prefill_wide128,256,8,false)
 MLX_PREFILL_WIDE(mlx_affine_prefill_deep128,384,8,false)
 MLX_PREFILL_WIDE(mlx_affine_prefill_compact128,256,8,true)
+// Gemma's elected shape must also fit the doubled staging reservation under
+// shader instrumentation: 256*32*2 bytes, doubled = the 32 KiB device limit.
+MLX_PREFILL_WIDE(mlx_affine_gemma_prefill128,256,0,false)
 #undef MLX_PREFILL_WIDE
 
 kernel void mlx_affine_prefill_compact256(device const uchar* w0 [[buffer(0)]],device const uchar* w1 [[buffer(1)]],device const uchar* w2 [[buffer(2)]],

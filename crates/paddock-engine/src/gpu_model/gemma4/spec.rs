@@ -802,15 +802,25 @@ impl GpuGemma4 {
         }
 
         exec.rmsnorm_batch(&m.x, &m.output_norm, &mut m.normed, n_embd, m.eps, r)?;
-        exec.quantize_q8(&m.normed, &mut sc.pf_xq, &mut sc.pf_xs, r * n_embd)?;
-        exec.q8_0_gemm_mma_ks(
-            &m.head,
-            &sc.pf_xq,
-            &sc.pf_xs,
-            &mut sc.pf_skfix,
-            &mut m.logits,
-            r,
-        )?;
+        // The vocab head is the drafter's one big plane (262144 x 1024 Q8_0,
+        // ~300 MB a step). Up to 4 rows it streams at DRAM pace through the
+        // repacked GEMV - 1.2 vs 1.65 ms a row on GB10, the int8 mma tile
+        // reaches ~180 GB/s on a one-row M - and its f32 activations are the
+        // finer class besides (drafts only: every one is verified). Wider
+        // rounds share the tile's single weight pass.
+        let gemv =
+            r <= 4 && exec.q8_0_gemv_repacked_rows(&m.head, None, &m.normed, &mut m.logits, r)?;
+        if !gemv {
+            exec.quantize_q8(&m.normed, &mut sc.pf_xq, &mut sc.pf_xs, r * n_embd)?;
+            exec.q8_0_gemm_mma_ks(
+                &m.head,
+                &sc.pf_xq,
+                &sc.pf_xs,
+                &mut sc.pf_skfix,
+                &mut m.logits,
+                r,
+            )?;
+        }
         // next chain h (from the same normed activation quant - but the head
         // GEMM consumed pf_xq; requantize is cheaper than a second xq plane)
         exec.quantize_q8(&m.normed, &mut sc.pf_xq, &mut sc.pf_xs, r * n_embd)?;

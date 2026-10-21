@@ -15,15 +15,17 @@ struct SettingsPage<Content: View>: View {
       // a longer page acquires a scroller. The scroll wrapper centers the lane.
       let gutter = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
       let measure = min(820, max(0, geometry.size.width - 2 * gutter))
-      PaddockScrollView(centersContent: true) {
-        VStack(alignment: .leading, spacing: 28) {
-          PageHeading(title: title) { EmptyView() }
-            .accessibilityIdentifier("settings-page-heading")
-          content(stacked)
-        }
-        .padding(stacked ? 20 : 32)
-        .frame(width: measure, alignment: .leading)
-        .frame(maxWidth: .infinity, alignment: .top)
+      ScrollViewReader { proxy in
+        PaddockScrollView(centersContent: true) {
+          VStack(alignment: .leading, spacing: 28) {
+            PageHeading(title: title) { EmptyView() }
+              .accessibilityIdentifier("settings-page-heading")
+            content(stacked)
+          }
+          .padding(stacked ? 20 : 32)
+          .frame(width: measure, alignment: .leading)
+          .frame(maxWidth: .infinity, alignment: .top)
+        }.modifier(SettingsSearchScroll(proxy: proxy))
       }
     }
     .font(.system(size: 13)).tint(PaddockStyle.accent)

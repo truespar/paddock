@@ -33,6 +33,8 @@ mod doclayout;
 mod embedding_gemma2;
 pub use embedding_gemma2::{EG2_ATTN_ROWS, EG2_LAYERS, EG2_TILE_SHIFT, EG2_WIDTH, mmq_bytes};
 mod embedding_gemma2_audio;
+mod gemma4u;
+pub use gemma4u::{G4U_FRAME, G4U_PATCH};
 mod gemma4v;
 pub use embedding_gemma2_audio::{EG2A_HOP, EG2A_MEL, EG2A_WIDTH, Eg2aMelTables, Eg2aSeam};
 mod encoder;
@@ -40,9 +42,11 @@ pub use encoder::{ENC_ATTN_QTILE, ENC_ATTN_TILE_SHIFT};
 mod error;
 mod fp4;
 mod fp8;
+mod fp8_tiled;
 mod fused_gemv;
 mod graph;
 mod hadamard;
+mod spec_ops;
 pub use canvas::CanvasStatus;
 pub use hadamard::HadamardGdnHeads;
 mod host_plane;
@@ -61,7 +65,12 @@ pub use diarization::{DiarAct, DiarEpi, DiarFrontendPlanes, DiarWeights};
 mod types;
 pub use kquant::q40_to_q8_blocks;
 mod mamba;
+mod nemotron_asr;
 pub use mamba::mamba2_keep_row;
+pub use nemotron_asr::{
+    NASR_JOBS, NASR_PART_BYTES, NASR_STATE_BYTES, NasrDecoderWeights, NasrEpi, NasrJob, NasrSeg,
+    nasr_bytes,
+};
 mod moe_bs;
 mod moe_mxfp4;
 mod moe_q8;
@@ -83,14 +92,35 @@ mod tier_xfer;
 mod transfer;
 mod unified_mem;
 mod upload;
+mod upload_ring;
 mod vae;
 mod w16;
 
 pub use error::GpuError;
 use error::drv;
 pub(crate) use error::from_driver;
+pub(crate) use fp8_tiled::w8_swz_on;
 pub use graph::{CapturedGraph, end_capture_no_flags};
 pub use types::*;
+
+/// Which lane wins CTA dispatch when the overlap decode lane is forked (`GpuExecutor::new`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LanePrio {
+    Spans,
+    Equal,
+    Decode,
+}
+
+fn lane_prio() -> LanePrio {
+    static P: std::sync::OnceLock<LanePrio> = std::sync::OnceLock::new();
+    *P.get_or_init(
+        || match paddock_models::dev_var!("PADDOCK_LANE_PRIO").as_deref() {
+            Ok("decode") => LanePrio::Decode,
+            Ok("equal") => LanePrio::Equal,
+            _ => LanePrio::Spans,
+        },
+    )
+}
 
 /// Owns the CUDA context, stream, cuBLAS handle, and kernel pack - the
 /// execution substrate model graphs build on.
@@ -198,6 +228,8 @@ pub struct GpuExecutor {
     /// measured as reusable, and our pool usage when it did (`unified_mem`).
     /// Shared with forked lanes - one process, one mempool, one measurement.
     retained: std::sync::Arc<std::sync::Mutex<Option<unified_mem::RetainedCredit>>>,
+    /// Pinned staging for large one-shot uploads (`to_device_u8_staged`).
+    upload_ring: std::sync::Mutex<Vec<upload_ring::Stage>>,
 }
 impl GpuExecutor {
     /// See the `dense_iq_seen` field.
@@ -329,8 +361,14 @@ impl GpuExecutor {
         // waves and launch-glue gaps instead of time-slicing whole kernels
         // (route-B v1 measured the time-slice: spans stretched ~2x, c32
         // -4%). Falls back to default priority if the range query fails.
+        // PADDOCK_LANE_PRIO=decode inverts it (this stream least, forked lanes greatest),
+        // =equal gives the forked lanes the greatest too - A/B knobs for the overlap split.
+        // qwen3.8 TIFF recover at d128 (B200, 2026-10-21, ABBA): decode-first 375.4 / 375.4
+        // vs spans-first 373.8 / 372.6 pages/min, p50 page latency equal - inside the sweep's
+        // noise, so the default stays.
         ctx.bind_to_thread().map_err(drv)?;
         let stream = match cudarc::driver::result::stream::get_priority_range() {
+            Ok(_) if lane_prio() == LanePrio::Decode => ctx.new_stream().map_err(drv)?,
             Ok((_least, greatest)) => ctx.new_stream_with_priority(greatest).map_err(drv)?,
             Err(_) => ctx.new_stream().map_err(drv)?,
         };
@@ -414,6 +452,7 @@ impl GpuExecutor {
             staging: std::sync::Mutex::new(None),
             conv_scratch: std::sync::Mutex::new(None),
             retained: Default::default(),
+            upload_ring: std::sync::Mutex::new(Vec::new()),
         };
         exec.preflight()?;
         Ok(exec)
@@ -1006,8 +1045,13 @@ impl GpuExecutor {
     pub fn fork_stream(&self) -> Result<Self, GpuError> {
         self.stream.synchronize().map_err(drv)?;
         // default (least) priority - the parent's greatest-priority compute
-        // stream must win dispatch over forked lanes (see `new`)
-        let stream = self.ctx.new_stream().map_err(drv)?;
+        // stream must win dispatch over forked lanes (see `new`; PADDOCK_LANE_PRIO)
+        let stream = match cudarc::driver::result::stream::get_priority_range() {
+            Ok((_least, greatest)) if lane_prio() != LanePrio::Spans => {
+                self.ctx.new_stream_with_priority(greatest).map_err(drv)?
+            }
+            _ => self.ctx.new_stream().map_err(drv)?,
+        };
         let copy_stream = self.ctx.new_stream().map_err(drv)?;
         let side_stream = self.ctx.new_stream().map_err(drv)?;
         Ok(Self {
@@ -1033,6 +1077,7 @@ impl GpuExecutor {
             staging: std::sync::Mutex::new(None),
             conv_scratch: std::sync::Mutex::new(None),
             retained: self.retained.clone(),
+            upload_ring: std::sync::Mutex::new(Vec::new()),
         })
     }
 

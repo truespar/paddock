@@ -3057,6 +3057,7 @@ dependencies = [
  "http-body-util",
  "image",
  "libc",
+ "md-5",
  "nvml-wrapper",
  "nvml-wrapper-sys",
  "objc2-foundation",

@@ -147,7 +147,13 @@ extension NativeStudioRuntime {
     } else {
       graphGrounding = ""
     }
-    try await save(admitted)
+    try await save(
+      admitted,
+      consumingDraft: action == nil && !composerDraftRevision.isEmpty ? composerDraftRevision : nil)
+    if action == nil {
+      composerDraftRevision = ""
+      composerDraftAttachments = []
+    }
     // Stop may arrive while SQLite admission is awaiting its acknowledgement.
     document = admitted
     draft = false
@@ -171,7 +177,7 @@ extension NativeStudioRuntime {
       }
     }
     for id in ids { staged[id] = nil }
-    draftText = ""
+    if action == nil { draftText = "" }
     previewPart = nil
     documentPreview = nil
     return ["accepted": .bool(true), "requestId": .string(requestID)]

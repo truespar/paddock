@@ -181,6 +181,10 @@ extension CatalogModel {
 
 extension CatalogArtifact {
   var shortFormat: String {
+    if quant?.uppercased() == "MLX-TERNARY-2-G128" { return "MLX · Ternary 2-bit" }
+    if format.lowercased() == "safetensors", quant?.lowercased() == "affine-4/8" {
+      return "MLX · Mixed 4/8-bit"
+    }
     if let quant, quant.uppercased().hasPrefix("MLX-AFFINE-"),
       let bits = quant.split(separator: "-").dropFirst(2).first, Int(bits) != nil
     {

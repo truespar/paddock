@@ -13,7 +13,11 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+mod api_keys;
+mod batches;
+pub use batches::*;
 mod connections;
+mod conversation_drafts;
 mod downloads;
 mod integrations;
 mod mask_history;
@@ -26,6 +30,7 @@ mod read_runs;
 mod reads;
 mod settings;
 pub(crate) use settings::SECRET_PREFIX;
+mod snapshot;
 mod table_history;
 
 pub struct Store {
@@ -309,32 +314,15 @@ pub fn conversation_kind(doc: &Value) -> &'static str {
     if heard { "transcription" } else { "chat" }
 }
 
-impl Store {
-    /// A CONSISTENT copy of the DB written to a fresh temp file (`VACUUM INTO`,
-    /// so no WAL/locking surprises). The caller owns the file - sanitize it,
-    /// read it, then delete it. Used by the sanitized export endpoint.
-    pub fn snapshot_to_temp(&self) -> Result<PathBuf, StoreError> {
-        // The unsanitized snapshot contains credentials. Random exclusive
-        // creation and mode 0600 apply BEFORE SQLite starts writing.
-        let tmp = tempfile::Builder::new()
-            .prefix("paddock-export-")
-            .suffix(".db")
-            .tempfile()
-            .map_err(|e| StoreError::Bad(e.to_string()))?
-            .into_temp_path();
-        let conn = self.lock();
-        conn.execute("VACUUM INTO ?1", params![tmp.to_string_lossy()])?;
-        tmp.keep().map_err(|e| StoreError::Bad(e.to_string()))
-    }
-}
-
-fn hash_key(key: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(key.as_bytes());
-    crate::registry::hex(&h.finalize())
-}
-
 const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS conversation_drafts (
+    id TEXT PRIMARY KEY,
+    revision TEXT NOT NULL,
+    title TEXT NOT NULL,
+    model TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    doc TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS conversations (
     id         TEXT PRIMARY KEY,
     title      TEXT NOT NULL,
@@ -865,6 +853,7 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
         downloads::migrate(&conn)?;
+        batches::migrate(&conn)?;
         connections::migrate(&conn)?;
         table_history::migrate(&conn)?;
         mask_history::migrate(&conn)?;
@@ -1083,6 +1072,14 @@ impl Store {
     }
 
     pub fn put_conversation(&self, doc: &Value) -> Result<(), StoreError> {
+        self.put_conversation_consuming_draft(doc, None)
+    }
+
+    pub fn put_conversation_consuming_draft(
+        &self,
+        doc: &Value,
+        draft_revision: Option<&str>,
+    ) -> Result<(), StoreError> {
         let id = doc
             .get("id")
             .and_then(Value::as_str)
@@ -1103,35 +1100,44 @@ impl Store {
             .unwrap_or(created);
         let kind = conversation_kind(doc);
         let body = serde_json::to_string(doc).map_err(|e| StoreError::Bad(e.to_string()))?;
-        let conn = self.lock();
-        conn.execute(
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(revision) = draft_revision {
+            conversation_drafts::check_revision(&tx, id, revision)?;
+            tx.execute("DELETE FROM conversation_drafts WHERE id=?1", [id])?;
+        }
+        tx.execute(
             "INSERT INTO conversations (id, title, model, pinned, created_at, updated_at, kind, doc)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
              ON CONFLICT(id) DO UPDATE SET
                title=?2, model=?3, pinned=?4, updated_at=?6, kind=?7, doc=?8",
             params![id, title, model, pinned, created, updated, kind, body],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn delete_conversation(&self, id: &str) -> Result<(), StoreError> {
-        let conn = self.lock();
-        conn.execute("DELETE FROM conversations WHERE id = ?1", params![id])?;
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM conversations WHERE id = ?1", params![id])?;
+        tx.execute("DELETE FROM conversation_drafts WHERE id = ?1", params![id])?;
         // Cascade: drop the conversation's attachments so blobs don't orphan.
-        conn.execute(
+        tx.execute(
             "DELETE FROM attachments WHERE conversation_id = ?1",
             params![id],
         )?;
         // Same for artifacts - versions first, since they key off the parent.
-        conn.execute(
+        tx.execute(
             "DELETE FROM artifact_versions WHERE artifact_id IN
                (SELECT id FROM artifacts WHERE conversation_id = ?1)",
             params![id],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM artifacts WHERE conversation_id = ?1",
             params![id],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1660,79 +1666,6 @@ impl Store {
             )
             .optional()?;
         Ok(row)
-    }
-
-    // ── api keys ─────────────────────────────────────────────────────────────
-
-    /// Create a named key. Returns `(public_record, plaintext_key)` - the
-    /// plaintext is shown once and never stored (only its hash).
-    pub fn create_api_key(&self, name: &str) -> Result<(Value, String), StoreError> {
-        let id = Uuid::new_v4().to_string();
-        let key = format!("pk-{}", Uuid::new_v4().simple());
-        let prefix = key.chars().take(9).collect::<String>();
-        let created = now_ms();
-        self.lock().execute(
-            "INSERT INTO api_keys (id, name, key_hash, prefix, created_at) VALUES (?1,?2,?3,?4,?5)",
-            params![id, name, hash_key(&key), prefix, created],
-        )?;
-        let record = json!({ "id": id, "name": name, "prefix": prefix, "createdAt": created, "revoked": false });
-        Ok((record, key))
-    }
-
-    pub fn list_api_keys(&self) -> Result<Vec<Value>, StoreError> {
-        let conn = self.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, name, prefix, created_at, last_used_at, revoked
-             FROM api_keys ORDER BY created_at DESC",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(json!({
-                "id": r.get::<_, String>(0)?,
-                "name": r.get::<_, String>(1)?,
-                "prefix": r.get::<_, String>(2)?,
-                "createdAt": r.get::<_, i64>(3)?,
-                "lastUsedAt": r.get::<_, Option<i64>>(4)?,
-                "revoked": r.get::<_, i64>(5)? != 0,
-            }))
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    }
-
-    pub fn revoke_api_key(&self, id: &str) -> Result<(), StoreError> {
-        self.lock()
-            .execute("UPDATE api_keys SET revoked = 1 WHERE id = ?1", params![id])?;
-        Ok(())
-    }
-
-    /// True if the key matches a non-revoked stored key; also stamps last_used.
-    pub fn verify_api_key(&self, key: &str) -> Result<bool, StoreError> {
-        let hash = hash_key(key);
-        let conn = self.lock();
-        let id: Option<String> = conn
-            .query_row(
-                "SELECT id FROM api_keys WHERE key_hash = ?1 AND revoked = 0",
-                params![hash],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(id) = id {
-            conn.execute(
-                "UPDATE api_keys SET last_used_at = ?2 WHERE id = ?1",
-                params![id, now_ms()],
-            )?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    /// Number of non-revoked keys (used by the auth policy).
-    pub fn active_key_count(&self) -> Result<i64, StoreError> {
-        Ok(self
-            .lock()
-            .query_row("SELECT COUNT(*) FROM api_keys WHERE revoked = 0", [], |r| {
-                r.get(0)
-            })?)
     }
 
     // NOTE: there are deliberately no MCP-server methods here.

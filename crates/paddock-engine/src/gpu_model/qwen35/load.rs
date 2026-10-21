@@ -92,7 +92,23 @@ impl GpuQwen35 {
         // The real fix is to choose per tick on queue depth, not per process
         // (filed) -- so nothing is withheld here.
         const SM100_WITHHOLD: &[&str] = &[];
-        const SM100_SET_KILL: &[&str] = &["PADDOCK_NO_F8W8_TMA"];
+        // PADDOCK_NO_QWEN_F8T -- the f8t tile lane (FFN, mixer projections, lm_head). It
+        //   corrupted decode on sm_100 from the 2026-10-18 bring-up (9029c48d7 benched with the
+        //   kill) to 2026-10-21: plain Q8_0 - probe.py beside picture load returned skipped /
+        //   repeated numbers and HTTP 500s; with the NVFP4 overlay longtext n=110 went WRONG.
+        //   Three defects, all fixed: (1) the DeltaNet fused in-proj plane is 129 row tiles
+        //   (16512 = in_qkv + z + b|a padded) and tc5r, the only route at 65+ rows, refuses odd
+        //   tile counts - the warm wave's first wide tick failed and the serve dropped its
+        //   overlap pipe (f8t_rows_ok); (2) the fused f8t pre-norm landed only the e4m3 rows,
+        //   not the f32 d_xn the rest of the step reads - wrong answers at some prompt lengths
+        //   (slots 888/889 land both); (3) overlap spans K-split into the decode graph's
+        //   d_ks_part while it replayed (d_span_part). Fixed, Qwen3.8-27B, both configs:
+        //   longtext exact at 16 lengths 60-1200, probe beside picture load 0 wrong of 240
+        //   (80 of 240 before (3)). The kill stays the default because the lane only buys
+        //   single-stream speed - Q8_0, max_batch 64, decode-heavy, A B B A, all replies exact:
+        //   per-stream tok/s c1 125.7 -> 136.2 (+8%), c4 121.5 -> 122.2, c16 108.5 -> 102.4
+        //   (-6%), c64 89.4 -> 87.1 (-3%). PADDOCK_QWEN_F8T=1 opts in.
+        const SM100_SET_KILL: &[&str] = &["PADDOCK_NO_F8W8_TMA", "PADDOCK_NO_QWEN_F8T"];
         // (flag, kill switch) pairs -> "1"; value vars -> tuned default
         const FLAGS: &[(&str, &str)] = &[
             ("PADDOCK_QWEN35_MOE_FP4", "PADDOCK_NO_MOE_FP4"),
@@ -263,6 +279,12 @@ impl GpuQwen35 {
         // Explicit env always wins.
         if sm100 && std::env::var_os("PADDOCK_F8T_DEC_BMAX").is_none() {
             crate::envset::set_env("PADDOCK_F8T_DEC_BMAX", "128");
+        }
+        // DeltaNet decay projections on the f32 plane at every width on sm_100: the
+        // Q8 x2 pair below 128 rows was 287 us a launch on the unified tick (6% of
+        // GPU time, depth 64); ab_gate everywhere took recover 144 -> 157 pages/min.
+        if sm100 && std::env::var_os("PADDOCK_AB_F32_MIN").is_none() {
+            crate::envset::set_env("PADDOCK_AB_F32_MIN", "1");
         }
     }
 
@@ -605,28 +627,27 @@ impl GpuQwen35 {
                         return None;
                     }
                     let (rows, cols) = (t.shape[0], t.shape[1]);
-                    // llm-compressor channel-strategy planes (the NVFP4
-                    // export's fp8 islands): `<m>.weight_scale` BF16 [rows, 1]
-                    // per-output-row. Dequant is the same e4m3 x bf16 walk as
-                    // the block grid below with a degenerate 1-wide column
-                    // grid, so reuse that path by synthesizing its geometry.
-                    let (sb, scols) = if let Some((ts, sb)) = st.bytes(&format!("{hf}_scale_inv")) {
-                        if ts.dtype != StDtype::Bf16 || ts.shape.len() != 2 {
-                            return None;
-                        }
-                        let (srows, scols) = (ts.shape[0], ts.shape[1]);
-                        if srows != rows.div_ceil(128) || scols != cols.div_ceil(128) {
-                            return None;
-                        }
-                        (sb, scols)
-                    } else {
-                        let base = hf.strip_suffix(".weight")?;
-                        let (ts, sb) = st.bytes(&format!("{base}.weight_scale"))?;
-                        if ts.dtype != StDtype::Bf16 || ts.shape.iter().product::<usize>() != rows {
-                            return None;
-                        }
-                        (sb, 0usize) // scols=0 marks the channel layout
-                    };
+                    // Per-row planes - llm-compressor's channel strategy (the
+                    // NVFP4 exports' fp8 islands, BF16 [rows, 1]) or
+                    // ModelOpt's per-tensor scale (one F32, broadcast) - carry
+                    // one f32 scale per output row; the block grid below its
+                    // bf16 bytes. scols=0 marks the per-row layout.
+                    let (sb, scols, rowsc): (&[u8], usize, Vec<f32>) =
+                        if let Some((ts, sb)) = st.bytes(&format!("{hf}_scale_inv")) {
+                            if ts.dtype != StDtype::Bf16 || ts.shape.len() != 2 {
+                                return None;
+                            }
+                            let (srows, scols) = (ts.shape[0], ts.shape[1]);
+                            if srows != rows.div_ceil(128) || scols != cols.div_ceil(128) {
+                                return None;
+                            }
+                            (sb, scols, Vec::new())
+                        } else {
+                            let base = hf.strip_suffix(".weight")?;
+                            let rowsc = paddock_models::modelopt::fp8_row_scales(st, base, rows)?;
+                            (&[], 0usize, rowsc)
+                        };
+                    let rowsc = &rowsc;
                     let mut out = vec![0u8; rows * cols * 2];
                     let nthreads = std::thread::available_parallelism()
                         .map(|n| n.get().min(16))
@@ -639,16 +660,20 @@ impl GpuQwen35 {
                                 for (rr, orow) in chunk.chunks_mut(cols * 2).enumerate() {
                                     let r = r0 + rr;
                                     let wrow = &b[r * cols..(r + 1) * cols];
-                                    // scols=0: channel layout, one scale per row
+                                    // scols=0: per-row layout, one f32 scale per row
                                     let srow = if scols == 0 {
-                                        &sb[r * 2..]
+                                        &sb[..0]
                                     } else {
                                         &sb[(r / 128) * scols * 2..]
                                     };
                                     for c in 0..cols {
-                                        let si = if scols == 0 { 0 } else { (c / 128) * 2 };
-                                        let sc16 = u16::from_le_bytes([srow[si], srow[si + 1]]);
-                                        let scale = f32::from_bits((sc16 as u32) << 16);
+                                        let scale = if scols == 0 {
+                                            rowsc[r]
+                                        } else {
+                                            let si = (c / 128) * 2;
+                                            let sc16 = u16::from_le_bytes([srow[si], srow[si + 1]]);
+                                            f32::from_bits((sc16 as u32) << 16)
+                                        };
                                         let v = e4m3_to_f32(wrow[c]) * scale;
                                         let bits = v.to_bits();
                                         // f32 -> bf16 round-to-nearest-even
@@ -666,8 +691,9 @@ impl GpuQwen35 {
             }
         };
         // Raw fp8-channel plane out of the same snapshot: the e4m3 bytes as
-        // STORED plus the per-output-row `weight_scale` (BF16 [rows, 1]) as
-        // f32 - the f8row class's own layout, no dequant, no requant. None
+        // STORED plus the per-output-row `weight_scale` (BF16 [rows, 1], or a
+        // ModelOpt per-tensor F32 broadcast to every row) as f32 - the f8row
+        // class's own layout, no dequant, no requant. None
         // for bf16 tensors, block-scale (`_scale_inv` grid) checkpoints, and
         // anything whose scale vector does not match its row count.
         let st_f8row = |gguf_name: &str| -> Option<(&[u8], Vec<f32>, usize, usize)> {
@@ -683,19 +709,8 @@ impl GpuQwen35 {
                 return None;
             }
             let base = hf.strip_suffix(".weight")?;
-            let (ts, sb) = st.bytes(&format!("{base}.weight_scale"))?;
-            if ts.dtype != StDtype::Bf16
-                || ts.shape.iter().product::<usize>() != rows
-                || sb.len() != rows * 2
-            {
-                return None;
-            }
-            let scales: Vec<f32> = sb
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|c| f32::from_bits((u16::from_le_bytes(*c) as u32) << 16))
-                .collect();
+            // channel (llm-compressor) or per-tensor (ModelOpt) scales
+            let scales = paddock_models::modelopt::fp8_row_scales(st, base, rows)?;
             Some((b, scales, rows, cols))
         };
         let mut layers = Vec::with_capacity(n_layers);
@@ -1059,8 +1074,18 @@ impl GpuQwen35 {
                 // epilogue applies one scale2; this checkpoint has 56/56
                 // equal - a checkpoint that differs keeps the split planes,
                 // exactly as before). PADDOCK_NO_NVF4_GU_FUSE=1 keeps them too.
-                let fuse_ok = super::nvf4_wide_w4a4(&exec)
-                    && exec.has_nvf4_gemm_f4t_swq()
+                // The fused plane on a die without the cc12 SWQ epilogue (cc 10.0:
+                // f4t / f4t_swq are cc12 SASS): every width takes the interleaved
+                // landing arm - one gate|up GEMM + swiglu_fused_nvf4_il, the
+                // landing sized for the full cap (the tcgen05 SWQ, slot 874, only
+                // with PADDOCK_NVF4_TC5_SWQ). B200 depth-128 A/B, four pairs: split
+                // 298.5 / 308.0 / 308.0 / 309.5, fused 303.0 / 313.5 / 309.5 / 313.5
+                // pages/min (tc5 SWQ 285.0 / 290.5). Kill: PADDOCK_NO_NVF4_GU_IL.
+                let il_only = exec.has_nvf4_gemm_f4()
+                    && !exec.has_nvf4_gemm_f4t_swq()
+                    && paddock_models::dev_var_os!("PADDOCK_NO_NVF4_GU_IL").is_none();
+                let fuse_ok = ((super::nvf4_wide_w4a4(&exec) && exec.has_nvf4_gemm_f4t_swq())
+                    || il_only)
                     && exec.has_swiglu_fused_nvf4_il()
                     && exec.has_swiglu_fused_il()
                     && paddock_models::dev_var_os!("PADDOCK_NO_NVF4_GU_FUSE").is_none();
@@ -2112,13 +2137,23 @@ impl GpuQwen35 {
                         use paddock_models::safetensors::StDtype;
                         let st = fp8_native.as_ref()?;
                         let (t, wb) = st.bytes("lm_head.weight")?;
-                        if t.dtype != StDtype::F8E4m3 || t.shape != [o, i] {
-                            return None;
-                        }
-                        let (ts, sb) = st.bytes("lm_head.weight_scale")?;
-                        if ts.dtype != StDtype::Bf16 || ts.shape.iter().product::<usize>() != o {
-                            return None;
-                        }
+                        // An NVFP4 head (ModelOpt exports quantize it too): its
+                        // own e2m1 values, decoded and served in the f8 head
+                        // class - the 4-bit quantization the checkpoint chose,
+                        // re-encoded onto the f8 grid this engine's head runs.
+                        let nv4 = (t.dtype == StDtype::U8)
+                            .then(|| paddock_models::modelopt::nvfp4_view(st, "lm_head").ok())
+                            .flatten()
+                            .filter(|v| v.n == o && v.k == i);
+                        let rowsc = if nv4.is_some() {
+                            Vec::new()
+                        } else {
+                            if t.dtype != StDtype::F8E4m3 || t.shape != [o, i] {
+                                return None;
+                            }
+                            paddock_models::modelopt::fp8_row_scales(st, "lm_head", o)?
+                        };
+                        let (nv4, rowsc) = (&nv4, &rowsc);
                         let n_bytes = o * i * 2;
                         let mut staged = exec.alloc_u8(n_bytes).ok()?;
                         let band = 65536usize.min(o);
@@ -2137,12 +2172,13 @@ impl GpuQwen35 {
                                     scp.spawn(move || {
                                         for (rr, orow) in hchunk.chunks_mut(i * 2).enumerate() {
                                             let r = rb + rr;
-                                            let wrow = &wb[r * i..(r + 1) * i];
-                                            let sc16 =
-                                                u16::from_le_bytes([sb[r * 2], sb[r * 2 + 1]]);
-                                            let scale = f32::from_bits((sc16 as u32) << 16);
+                                            let nv4_row =
+                                                nv4.as_ref().map(|v| v.dequant_row_f32(r));
                                             for c in 0..i {
-                                                let v = e4m3_to_f32(wrow[c]) * scale;
+                                                let v = match &nv4_row {
+                                                    Some(row) => row[c],
+                                                    None => e4m3_to_f32(wb[r * i + c]) * rowsc[r],
+                                                };
                                                 let bits = v.to_bits();
                                                 let bf = ((bits + 0x7FFF + ((bits >> 16) & 1))
                                                     >> 16)
@@ -2158,7 +2194,10 @@ impl GpuQwen35 {
                             r0 += rows;
                         }
                         let w = exec.bf16_to_f8w_dev(&staged, n_bytes).ok()?;
-                        tracing::info!("qwen35: f8 lm_head from checkpoint fp8 plane ({i}x{o})");
+                        tracing::info!(
+                            "qwen35: f8 lm_head from checkpoint {} plane ({i}x{o})",
+                            if nv4.is_some() { "nvfp4" } else { "fp8" }
+                        );
                         Some(w)
                     })();
                     let w = match ck {
@@ -2318,6 +2357,44 @@ impl GpuQwen35 {
                 "qwen35: fp8 W8A8 dense-proj planes built for {} layers (PADDOCK_QWEN35_W8, min batch {})",
                 bs_w8.len(),
                 w8_min_batch()
+            );
+        }
+        // the decode GEMM planes' scales tiled for the bulk-copy arm (slot 882): embd is the
+        // in_dim of wq / in_qkv and the out_dim of wo / out_w; a plane whose scale is not a
+        // plain per-32 plane (or a pack without the slot) keeps None and the plain arm
+        let mut tiled_bytes = 0usize;
+        for w8 in bs_w8.iter_mut() {
+            let tile = |p: &Option<RepackedMxfp4>, embd_in: bool| match p {
+                Some(p) if !p.data.is_empty() => {
+                    let n = p.data.len();
+                    let (out, inn) = if embd_in {
+                        (n / embd, embd)
+                    } else {
+                        (embd, n / embd)
+                    };
+                    exec.f8_tc5_tile(&p.scale, out, inn)
+                }
+                _ => Ok(None),
+            };
+            w8.wq_t = tile(&w8.wq, true)?;
+            w8.wo_t = tile(&w8.wo, false)?;
+            w8.in_qkv_t = tile(&w8.in_qkv, true)?;
+            w8.out_w_t = tile(&w8.out_w, false)?;
+            tiled_bytes += [&w8.wq_t, &w8.wo_t, &w8.in_qkv_t, &w8.out_w_t]
+                .iter()
+                .filter_map(|t| t.as_ref().map(|t| t.len()))
+                .sum::<usize>();
+        }
+        // ...and the vocab head's (248320 x 5120 on qwen3.8: 320 -> 234 us at 128 rows)
+        let out_f8_t = match &out_f8 {
+            Some((p, pi, po)) => exec.f8_tc5_tile(&p.scale, *po, *pi)?,
+            None => None,
+        };
+        tiled_bytes += out_f8_t.as_ref().map_or(0, |t| t.len());
+        if tiled_bytes > 0 {
+            tracing::info!(
+                "qwen35: W8 decode scales tiled for the bulk-copy GEMM arm ({:.1} MB)",
+                tiled_bytes as f64 / 1e6
             );
         }
         if proj_replaced > 0 {
@@ -2860,6 +2937,7 @@ impl GpuQwen35 {
             bs_f8row_ffn: bs_f8row_ffn_planes,
             bs_f8t_attn: bs_f8t_attn_planes,
             out_f8,
+            out_f8_t,
             out_f8t,
             out_norm,
             output,
@@ -3002,7 +3080,7 @@ impl GpuQwen35 {
             + ckpt_pool
             + 2 * n_lin * state_win * 4
             + self.pf_bufs_bytes(chunk, chunk, requested)
-            + super::batch::graph_pools_headroom_bytes();
+            + super::pool_grow::graph_pools_headroom_bytes();
         // per slot: recurrent+conv state, the pool's per-slot block floor,
         // a batched logits row, and the block-table row
         let per_slot: u64 =

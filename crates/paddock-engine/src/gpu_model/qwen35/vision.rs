@@ -103,6 +103,16 @@ pub struct VisionModel {
     /// grid) - bilinearly resized + merge-reordered per image, then uploaded.
     pos_embd: Vec<f32>,
     n_side: usize,
+    /// Learned pos-embd resized to a patch grid, keyed by (pw, ph): the
+    /// resample costs 11-22 ms of the engine thread per image and the pages
+    /// this serves come in a handful of grid sizes. Cleared when the resize
+    /// semantics change (`set_align_corners`).
+    pe_cache: std::sync::Mutex<std::collections::HashMap<(usize, usize), Arc<Vec<f32>>>>,
+    /// The same planes resident on the device, keyed by (pw, ph, pictures in
+    /// the pass) - a 1568 px page's plane is 32 MB, re-uploaded every encode
+    /// until this (B200: most of the encode's 5.5 ms upload, engine thread).
+    /// Bounded at `PE_DEV_ENTRIES`, oldest out; off with the host cache.
+    pe_dev: std::sync::Mutex<Vec<((usize, usize, usize), Arc<CudaSlice<f32>>)>>,
     /// Resize the pos-embd grid with `align_corners` (on) or half-pixel
     /// centres (off). On since 2026-10-09, because that is the reference:
     /// transformers' Qwen3.5 tower samples `linspace(0, side - 1, n)`
@@ -304,6 +314,8 @@ impl VisionModel {
             eps,
             pos_embd: pos_host,
             n_side,
+            pe_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pe_dev: std::sync::Mutex::new(Vec::new()),
             align_corners: true,
             deepstack,
             image_mean: arr3("clip.vision.image_mean"),
@@ -332,6 +344,14 @@ impl VisionModel {
     /// (Qwen3-VL's tower; see the field).
     pub fn set_align_corners(&mut self, on: bool) {
         self.align_corners = on;
+        self.pe_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.pe_dev
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// How many DeepStack streams an encode returns.
@@ -368,9 +388,65 @@ impl VisionModel {
             + taps
     }
 
+    /// The pos-embd plane for a (pw, ph) grid, resampled once per grid size
+    /// and shared from the cache after that (the plane is read-only once built).
+    fn pos_embd_for(&self, pw: usize, ph: usize) -> Arc<Vec<f32>> {
+        if !host_prep_on() {
+            return Arc::new(self.pos_embd_resample(pw, ph));
+        }
+        if let Some(pe) = self
+            .pe_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(pw, ph))
+        {
+            return pe.clone();
+        }
+        let pe = Arc::new(self.pos_embd_resample(pw, ph));
+        let mut cache = self.pe_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= 16 {
+            cache.clear();
+        }
+        cache.entry((pw, ph)).or_insert(pe).clone()
+    }
+
+    /// [`Self::pos_embd_for`]'s plane on the device, repeated per picture of a
+    /// `b`-picture pass - uploaded once per (grid, b) instead of every encode.
+    fn pos_embd_dev(
+        &self,
+        pw: usize,
+        ph: usize,
+        b: usize,
+    ) -> Result<Arc<CudaSlice<f32>>, GpuModelError> {
+        let key = (pw, ph, b);
+        if let Some((_, d)) = self
+            .pe_dev
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(k, _)| *k == key)
+        {
+            return Ok(d.clone());
+        }
+        let pe = self.pos_embd_for(pw, ph);
+        let d = Arc::new(if b == 1 {
+            self.exec.to_device(&pe)?
+        } else {
+            self.exec.to_device(&pe.repeat(b))?
+        });
+        if host_prep_on() {
+            let mut cache = self.pe_dev.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.len() >= PE_DEV_ENTRIES {
+                cache.remove(0);
+            }
+            cache.push((key, d.clone()));
+        }
+        Ok(d)
+    }
+
     /// Bilinearly resize the learned pos-embd grid to (ph, pw), then reorder into
     /// the merged 2×2-block patch order. Identity gather when the grid matches.
-    fn pos_embd_for(&self, pw: usize, ph: usize) -> Vec<f32> {
+    fn pos_embd_resample(&self, pw: usize, ph: usize) -> Vec<f32> {
         let (e, s) = (self.embd, self.n_side);
         // source grid row-major [s, s, e] -> target [ph, pw, e]
         let sample = |gy: usize, gx: usize| -> &[f32] {
@@ -468,17 +544,46 @@ impl VisionModel {
         &self,
         imgs: &[(&[f32], usize, usize)],
     ) -> Result<Vec<VisionOutput>, GpuModelError> {
-        let b = imgs.len();
+        self.encode_pass(TowerIn::Planar(imgs))
+    }
+
+    /// [`Self::encode_batch`] from resized u8 canvases ([`Self::resize_rgb`]):
+    /// the normalize and the im2col run on the device (slot 871) and land the
+    /// host chain's bits, so the engine thread uploads 3 bytes a pixel instead
+    /// of building and uploading 4 per channel. Callers check
+    /// [`Self::device_patchify`].
+    pub fn encode_batch_rgb(
+        &self,
+        imgs: &[(&[u8], usize, usize)],
+    ) -> Result<Vec<VisionOutput>, GpuModelError> {
+        self.encode_pass(TowerIn::Rgb(imgs))
+    }
+
+    /// Whether [`Self::encode_batch_rgb`] can run: the pack ships slot 871
+    /// and `PADDOCK_NO_QWV_PATCHIFY` is unset.
+    pub fn device_patchify(&self) -> bool {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        self.exec.has_qwv_patchify()
+            && !*OFF
+                .get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_QWV_PATCHIFY").is_some())
+    }
+
+    fn encode_pass(&self, input: TowerIn<'_>) -> Result<Vec<VisionOutput>, GpuModelError> {
+        let dims: Vec<(usize, usize, usize)> = match input {
+            TowerIn::Planar(v) => v.iter().map(|(i, w, h)| (i.len(), *w, *h)).collect(),
+            TowerIn::Rgb(v) => v.iter().map(|(i, w, h)| (i.len(), *w, *h)).collect(),
+        };
+        let b = dims.len();
         assert!(b > 0);
-        let (_, w, h) = imgs[0];
+        let (_, w, h) = dims[0];
         let (patch, e) = (self.patch, self.embd);
         assert!(
             w % (patch * 2) == 0 && h % (patch * 2) == 0,
             "image must be 32-aligned"
         );
-        for (img, iw, ih) in imgs {
-            assert_eq!((*iw, *ih), (w, h), "encode_batch group must share dims");
-            assert_eq!(img.len(), 3 * w * h);
+        for &(len, iw, ih) in &dims {
+            assert_eq!((iw, ih), (w, h), "encode_batch group must share dims");
+            assert_eq!(len, 3 * w * h);
         }
         let (pw, ph) = (w / patch, h / patch);
         let n = pw * ph;
@@ -490,56 +595,26 @@ impl VisionModel {
         // fill), images concatenated row-wise; pos/pos-embd repeat per image
         let t_phase = std::time::Instant::now();
         let k2 = patch * patch;
-        let mut patches = vec![0f32; rows * 3 * k2];
         let mut pos = vec![0u32; 4 * rows];
-        for (bi, (img, _, _)) in imgs.iter().enumerate() {
-            let mut ptr = 0usize;
-            let base = bi * n;
+        // positions: axis-major over the whole batch ([4, rows]) - the mrope
+        // kernel reads y at [row] and x at [rows+row] with the call's total row
+        // count as the stride
+        for bi in 0..b {
+            let mut ptr = bi * n;
             for yb in (0..ph).step_by(2) {
                 for xb in (0..pw).step_by(2) {
                     for dy in 0..2 {
                         for dx in 0..2 {
-                            let (py, px) = (yb + dy, xb + dx);
-                            let row = base + ptr;
-                            let dst = &mut patches[row * 3 * k2..(row + 1) * 3 * k2];
-                            for c in 0..3 {
-                                for ky in 0..patch {
-                                    let src = c * w * h + (py * patch + ky) * w + px * patch;
-                                    dst[c * k2 + ky * patch..c * k2 + ky * patch + patch]
-                                        .copy_from_slice(&img[src..src + patch]);
-                                }
-                            }
-                            // axis-major over the whole batch ([4, rows]): the
-                            // mrope kernel reads y at [row] and x at [rows+row]
-                            // with the call's total row count as the stride
-                            pos[base + ptr] = py as u32;
-                            pos[rows + base + ptr] = px as u32;
-                            pos[2 * rows + base + ptr] = py as u32;
-                            pos[3 * rows + base + ptr] = px as u32;
+                            pos[ptr] = (yb + dy) as u32;
+                            pos[rows + ptr] = (xb + dx) as u32;
+                            pos[2 * rows + ptr] = (yb + dy) as u32;
+                            pos[3 * rows + ptr] = (xb + dx) as u32;
                             ptr += 1;
                         }
                     }
                 }
             }
         }
-
-        let t_im2col = t_phase.elapsed();
-
-        let t_phase = std::time::Instant::now();
-        let pe = self.pos_embd_for(pw, ph);
-        let mut pe_rep = Vec::with_capacity(b * pe.len());
-        for _ in 0..b {
-            pe_rep.extend_from_slice(&pe);
-        }
-        let t_pos = t_phase.elapsed();
-
-        let t_phase = std::time::Instant::now();
-        let d_patches = exec.to_device(&patches)?;
-        let d_pos = exec.to_device_u32(&pos)?;
-        let d_pe = exec.to_device(&pe_rep)?;
-        let t_upload = t_phase.elapsed();
-        let t_phase = std::time::Instant::now();
-
         // One f16 staging buffer for every GEMM's activations, sized by the
         // widest row this tower feeds a GEMM (the merger's 4·embd) and
         // rewritten in sequence. The conversions are the price of an f32
@@ -553,16 +628,80 @@ impl VisionModel {
         let stage = (rows * ffn.max(e).max(self.patch_w0.dims[0]))
             .max((rows / 4) * self.mm0.dims[0].max(self.mm0.dims[1]));
         let mut s16 = exec.alloc_f16(stage)?;
+        // the patch rows into s16: the device patchify off the u8 canvases, or
+        // the host im2col (a pair of patch rows of one image - 2·pw rows of
+        // `patches`, in the merged order - is one independent band, fanned out
+        // over scoped threads) uploaded as f32 and converted
+        assert_eq!(
+            self.patch_w0.dims[0],
+            3 * k2,
+            "patch GEMM input is 3 x patch^2"
+        );
+        let (t_im2col, t_upload_in) = match input {
+            TowerIn::Rgb(imgs) => {
+                let t_up = std::time::Instant::now();
+                let parts: Vec<&[u8]> = imgs.iter().map(|(i, _, _)| &i[..]).collect();
+                let d_rgb = exec.to_device_u8_staged(&parts)?;
+                let t_up = t_up.elapsed();
+                exec.qwv_patchify(
+                    &d_rgb,
+                    &mut s16,
+                    (w, h, patch, b),
+                    self.image_mean,
+                    self.image_std,
+                )?;
+                (t_phase.elapsed() - t_up, t_up)
+            }
+            TowerIn::Planar(imgs) => {
+                let mut patches = vec![0f32; rows * 3 * k2];
+                let band_rows = 2 * pw;
+                let band_fill = |band: usize, dst: &mut [f32]| {
+                    let (bi, yb) = (band / (ph / 2), (band % (ph / 2)) * 2);
+                    let img = imgs[bi].0;
+                    let mut ptr = 0usize;
+                    for xb in (0..pw).step_by(2) {
+                        for dy in 0..2 {
+                            for dx in 0..2 {
+                                let (py, px) = (yb + dy, xb + dx);
+                                let d = &mut dst[ptr * 3 * k2..(ptr + 1) * 3 * k2];
+                                for c in 0..3 {
+                                    for ky in 0..patch {
+                                        let src = c * w * h + (py * patch + ky) * w + px * patch;
+                                        d[c * k2 + ky * patch..c * k2 + ky * patch + patch]
+                                            .copy_from_slice(&img[src..src + patch]);
+                                    }
+                                }
+                                ptr += 1;
+                            }
+                        }
+                    }
+                };
+                par_bands(&mut patches, band_rows * 3 * k2, &band_fill);
+                let t_im2col = t_phase.elapsed();
+                let t_up = std::time::Instant::now();
+                let d_patches = exec.to_device(&patches)?;
+                exec.convert_f32_f16(&d_patches, &mut s16, rows * 3 * k2)?;
+                (t_im2col, t_up.elapsed())
+            }
+        };
+
+        let t_phase = std::time::Instant::now();
+        let d_pe = self.pos_embd_dev(pw, ph, b)?;
+        let t_pos = t_phase.elapsed();
+
+        let t_phase = std::time::Instant::now();
+        let d_pos = exec.to_device_u32(&pos)?;
+        let t_upload = t_upload_in + t_phase.elapsed();
+        let t_phase = std::time::Instant::now();
 
         // dual patch conv (still image: both convs on the same pixels, summed)
         let mut d_x = exec.alloc(rows * e)?;
         let mut d_t = exec.alloc(rows * e)?;
-        exec.convert_f32_f16(&d_patches, &mut s16, rows * self.patch_w0.dims[0])?;
         exec.matvec_batch_f16(&self.patch_w0, &s16, &mut d_x, rows)?;
         exec.matvec_batch_f16(&self.patch_w1, &s16, &mut d_t, rows)?;
         exec.add(&mut d_x, &d_t, rows * e)?;
         exec.bias_add(&mut d_x, &self.patch_bias, rows, e)?;
-        exec.add(&mut d_x, &d_pe, rows * e)?;
+        exec.add(&mut d_x, &*d_pe, rows * e)?;
 
         // scratch
         let mut d_n = exec.alloc(rows * e)?;
@@ -830,14 +969,37 @@ impl VisionModel {
     pub fn normalize_rgb(&self, rgb: &[u8], w: usize, h: usize) -> Vec<f32> {
         assert_eq!(rgb.len(), 3 * w * h);
         let mut out = vec![0f32; 3 * w * h];
-        for y in 0..h {
-            for x in 0..w {
-                for c in 0..3 {
+        // one band = 64 rows of one channel plane; identical arithmetic per
+        // element to the serial loop, fanned out over scoped threads
+        let band_h = 64usize;
+        let bands_per_plane = h.div_ceil(band_h);
+        let (mean, std) = (self.image_mean, self.image_std);
+        let fill = |band: usize, dst: &mut [f32]| {
+            let (c, y0) = (band / bands_per_plane, (band % bands_per_plane) * band_h);
+            for (i, row) in dst.chunks_mut(w).enumerate() {
+                let y = y0 + i;
+                for (x, o) in row.iter_mut().enumerate() {
                     let v = rgb[(y * w + x) * 3 + c] as f32 / 255.0;
-                    out[c * w * h + y * w + x] = (v - self.image_mean[c]) / self.image_std[c];
+                    *o = (v - mean[c]) / std[c];
                 }
             }
+        };
+        // planes are h*w long; a band never crosses a plane because the last
+        // band of a plane is short exactly when h % 64 != 0
+        let mut off = 0usize;
+        let mut slices: Vec<&mut [f32]> = Vec::with_capacity(3 * bands_per_plane);
+        let mut rest: &mut [f32] = &mut out;
+        for _ in 0..3 {
+            for bnd in 0..bands_per_plane {
+                let rows_here = band_h.min(h - bnd * band_h);
+                let (a, r) = rest.split_at_mut(rows_here * w);
+                slices.push(a);
+                rest = r;
+                off += rows_here * w;
+            }
         }
+        debug_assert_eq!(off, 3 * w * h);
+        par_slices(slices, &fill);
         out
     }
 
@@ -932,27 +1094,38 @@ impl VisionModel {
     /// normalization. Returns the planar f32 image `encode` takes plus its
     /// (32-aligned) pixel dims.
     pub fn preprocess_rgb(&self, rgb: &[u8], w: usize, h: usize) -> (Vec<f32>, usize, usize) {
+        let (canvas, tw, th) = self.resize_rgb(rgb, w, h);
+        let t1 = std::time::Instant::now();
+        let img = self.normalize_rgb(&canvas, tw, th);
+        if phase_timing() {
+            tracing::info!("qwen35-vis: normalize {:.1} ms", ms(t1.elapsed()));
+        }
+        (img, tw, th)
+    }
+
+    /// [`Self::preprocess_rgb`]'s resize alone - the smart-resize target and the
+    /// letterboxed Pillow bicubic - as the u8 canvas [`Self::encode_batch_rgb`]
+    /// takes (borrowed when the picture already sits on its target).
+    pub fn resize_rgb<'a>(
+        &self,
+        rgb: &'a [u8],
+        w: usize,
+        h: usize,
+    ) -> (std::borrow::Cow<'a, [u8]>, usize, usize) {
         let t0 = std::time::Instant::now();
         let (tw, th) = smart_resize_target(w, h, self.patch, self.budget);
-        let (canvas, t_resize) = if (tw, th) == (w, h) {
-            (None, t0.elapsed())
+        let canvas = if (tw, th) == (w, h) {
+            std::borrow::Cow::Borrowed(rgb)
         } else {
-            let c = resize_pad_black(rgb, w, h, tw, th);
-            (Some(c), t0.elapsed())
-        };
-        let t1 = std::time::Instant::now();
-        let img = match &canvas {
-            Some(c) => self.normalize_rgb(c, tw, th),
-            None => self.normalize_rgb(rgb, w, h),
+            std::borrow::Cow::Owned(resize_pad_black(rgb, w, h, tw, th))
         };
         if phase_timing() {
             tracing::info!(
-                "qwen35-vis: preprocess {w}x{h} -> {tw}x{th}  resize {:.1} ms  normalize {:.1} ms",
-                ms(t_resize),
-                ms(t1.elapsed())
+                "qwen35-vis: preprocess {w}x{h} -> {tw}x{th}  resize {:.1} ms",
+                ms(t0.elapsed())
             );
         }
-        (img, tw, th)
+        (canvas, tw, th)
     }
 }
 
@@ -1058,6 +1231,70 @@ pub fn smart_resize_target(
 /// moved to Pillow bicubic, which is also the filter Qwen's own processor
 /// names (`resample: 3`), and the parity gate is the newest release.
 pub use crate::pillow::resize_pad_black;
+
+/// Run `f(band, chunk)` over `buf` split into `chunk_len`-long bands, fanned
+/// out over scoped threads when there is enough work to pay for them. Each
+/// band is independent, so the bytes are identical to the serial order.
+fn par_bands(buf: &mut [f32], chunk_len: usize, f: &(impl Fn(usize, &mut [f32]) + Sync)) {
+    let slices: Vec<&mut [f32]> = buf.chunks_mut(chunk_len).collect();
+    par_slices(slices, f);
+}
+
+fn par_slices(slices: Vec<&mut [f32]>, f: &(impl Fn(usize, &mut [f32]) + Sync)) {
+    let total: usize = slices.iter().map(|s| s.len()).sum();
+    let nt = if host_prep_on() {
+        std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(8)
+    } else {
+        1
+    };
+    if nt < 2 || slices.len() < 2 || total < 262_144 {
+        for (i, s) in slices.into_iter().enumerate() {
+            f(i, s);
+        }
+        return;
+    }
+    let per = slices.len().div_ceil(nt);
+    std::thread::scope(|sc| {
+        let mut slices = slices;
+        let mut first = 0usize;
+        while !slices.is_empty() {
+            let take = per.min(slices.len());
+            let mine: Vec<&mut [f32]> = slices.drain(..take).collect();
+            let start = first;
+            first += take;
+            sc.spawn(move || {
+                for (i, s) in mine.into_iter().enumerate() {
+                    f(start + i, s);
+                }
+            });
+        }
+    });
+}
+
+/// `PADDOCK_VIS_HOSTPREP=0` runs the picture host prep the old way (serial
+/// loops, the pos-embd plane resampled per image) for an A/B against the
+/// cached, fanned-out path.
+/// What one tower pass encodes: normalized planar f32 pictures (the host
+/// chain) or resized u8 canvases (normalized and patched on the device).
+#[derive(Clone, Copy)]
+enum TowerIn<'a> {
+    Planar(&'a [(&'a [f32], usize, usize)]),
+    Rgb(&'a [(&'a [u8], usize, usize)]),
+}
+
+/// Device pos-embd planes kept (`pe_dev`): a serve's pages come in a few grids.
+const PE_DEV_ENTRIES: usize = 4;
+
+fn host_prep_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        paddock_models::dev_var!("PADDOCK_VIS_HOSTPREP")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
 
 #[cfg(test)]
 mod tests {

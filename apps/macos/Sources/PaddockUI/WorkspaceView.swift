@@ -13,9 +13,11 @@ public struct WorkspaceView: View {
     get { model.draft }
     nonmutating set { model.draft = newValue }
   }
-  @State private var confirmNewChat = false
   @State private var startSelection: StartSelection?
   @State private var downloadSelection: StartSelection?
+  @State private var settingsQuery = ""
+  @State private var settingsHighlight: String?
+  @State private var settingsRequest: SettingsSearchRequest?
   private struct StartSelection: Identifiable {
     let id = UUID()
     var model: String?
@@ -119,6 +121,16 @@ public struct WorkspaceView: View {
     .background(PaddockStyle.canvas)
     .containerBackground(PaddockStyle.canvas, for: .window)
     .preferredColorScheme(appearance.colorScheme)
+    .environment(\.settingsSearchRequest, settingsRequest)
+    .onChange(of: navigation.manager) { _, destination in
+      if settingsRequest?.entry.destination != destination { settingsRequest = nil }
+    }
+    .onChange(of: navigation.mode) { _, mode in
+      if mode != .manager {
+        settingsQuery = ""
+        settingsRequest = nil
+      }
+    }
     // The actual native title bar, not a second in-content header. AppKit owns
     // traffic lights, window dragging and full-screen placement.
     .toolbar {
@@ -169,18 +181,6 @@ public struct WorkspaceView: View {
           navigation.showManager(.downloads)
         }
       }
-    }
-    .confirmationDialog(
-      "Start a new chat?", isPresented: $confirmNewChat, titleVisibility: .visible
-    ) {
-      Button("Discard draft", role: .destructive) {
-        draft = StudioDraft()
-        navigation.studio = .newChat
-        Task { await model.chat.newChat() }
-      }
-      Button("Keep draft", role: .cancel) { navigation.studio = .newChat }
-    } message: {
-      Text("The current draft has not been saved. Starting a new chat will clear it.")
     }
   }
 
@@ -314,35 +314,61 @@ public struct WorkspaceView: View {
 
   private var managerSidebar: some View {
     VStack(alignment: .leading, spacing: 0) {
-      PaddockScrollView {
-        VStack(spacing: 4) {
-          Text("Settings").font(.system(size: 18, weight: .semibold))
-            .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10).padding(
-              .bottom, 16)
-          ForEach([ManagerDestination.general, .application, .storage]) { item in
-            navigationRow(item.rawValue, symbol: item.symbol, selected: navigation.manager == item)
-            {
-              navigation.manager = item
+      VStack(alignment: .leading, spacing: 12) {
+        Text("Settings").font(.system(size: 18, weight: .semibold))
+          .frame(height: 32, alignment: .leading).padding(.horizontal, 10)
+        SidebarSearchField(text: $settingsQuery) {
+          NativeSearchField(
+            text: $settingsQuery, prompt: "Search settings", editorOnly: true,
+            onMove: {
+              settingsHighlight = SearchNavigation.moved(
+                settingsHighlight, in: SettingsSearchIndex.search(settingsQuery).map(\.id), by: $0)
+            },
+            onSubmit: {
+              let entries = SettingsSearchIndex.search(settingsQuery)
+              if let entry = entries.first(where: { $0.id == settingsHighlight }) ?? entries.first {
+                openSetting(entry)
+              }
             }
-          }
-          sidebarSection("Local models").padding(.top, 24)
-          ForEach([ManagerDestination.runners, .models, .downloads, .insights, .benchmarks]) {
-            item in
-            navigationRow(item.rawValue, symbol: item.symbol, selected: navigation.manager == item)
-            {
-              navigation.manager = item
+          )
+          .accessibilityIdentifier("settings-search")
+        }
+      }.padding(.horizontal, 10).padding(.top, 18).padding(.bottom, 12)
+      if !settingsQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        SettingsSearchResults(
+          entries: SettingsSearchIndex.search(settingsQuery), highlighted: settingsHighlight,
+          select: openSetting)
+      } else {
+        PaddockScrollView {
+          VStack(spacing: 4) {
+            ForEach([ManagerDestination.general, .application, .storage]) { item in
+              navigationRow(
+                item.rawValue, symbol: item.symbol, selected: navigation.manager == item
+              ) {
+                openSetting(SettingsSearchEntry(destination: item))
+              }
             }
-          }
-          sidebarSection("Connections").padding(.top, 22)
-          ForEach([ManagerDestination.cloudProviders, .customEndpoints, .connectors, .clients]) {
-            item in
-            navigationRow(item.rawValue, symbol: item.symbol, selected: navigation.manager == item)
-            {
-              navigation.manager = item
+            sidebarSection("Local models").padding(.top, 24)
+            ForEach([ManagerDestination.runners, .models, .downloads, .insights, .benchmarks]) {
+              item in
+              navigationRow(
+                item.rawValue, symbol: item.symbol, selected: navigation.manager == item
+              ) {
+                openSetting(SettingsSearchEntry(destination: item))
+              }
             }
-          }
-        }.padding(.horizontal, 10).padding(.top, 18).padding(.bottom, 20)
-      }.clipped()
+            sidebarSection("Connections").padding(.top, 22)
+            ForEach([ManagerDestination.cloudProviders, .customEndpoints, .connectors, .clients]) {
+              item in
+              navigationRow(
+                item.rawValue, symbol: item.symbol, selected: navigation.manager == item
+              ) {
+                openSetting(SettingsSearchEntry(destination: item))
+              }
+            }
+          }.padding(.horizontal, 10).padding(.bottom, 20)
+        }.clipped()
+      }
       VStack(alignment: .leading, spacing: 12) {
         if let snapshot = model.snapshot {
           Label(
@@ -355,13 +381,23 @@ public struct WorkspaceView: View {
         navigationRow(
           "This Mac", symbol: "laptopcomputer", selected: navigation.manager == .overview
         ) {
-          navigation.manager = .overview
+          openSetting(SettingsSearchEntry(destination: .overview))
         }
       }.padding(.horizontal, 10).padding(.top, 12).padding(.bottom, 18)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(PaddockStyle.sidebar).zIndex(1)
     }.frame(maxHeight: .infinity).background(PaddockStyle.sidebar)
       .accessibilityIdentifier("settings-sidebar")
+      .onChange(of: settingsQuery) { _, query in
+        settingsHighlight = SettingsSearchIndex.search(query).first?.id
+      }
+  }
+
+  private func openSetting(_ entry: SettingsSearchEntry) {
+    navigation.manager = entry.destination
+    settingsRequest = entry.anchor == nil ? nil : SettingsSearchRequest(entry: entry)
+    settingsQuery = ""
+    settingsHighlight = nil
   }
 
   private func navigationRow(
@@ -393,12 +429,8 @@ public struct WorkspaceView: View {
       model.desktopError = "Send or cancel the message edit first. Nothing was discarded."
       return
     }
-    if draft.hasContent || model.chat.hasAttachments {
-      confirmNewChat = true
-    } else {
-      navigation.studio = .newChat
-      Task { await model.chat.newChat() }
-    }
+    navigation.studio = .newChat
+    Task { await model.chat.newChat() }
   }
 
   private var loading: some View {

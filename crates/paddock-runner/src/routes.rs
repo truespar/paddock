@@ -293,6 +293,9 @@ pub struct AppState {
     pub clef: Option<crate::systemone::clef::ClefModel>,
     pub tabular: Option<crate::tabular::TabularModel>,
     pub diarization: Option<crate::diarizations::DiarizationModel>,
+    /// Nemotron 3.5 ASR (the native streaming RNN-T lane): serves
+    /// `/v1/audio/transcriptions` and the realtime transcription session.
+    pub rnnt_asr: Option<crate::rnnt_asr::RnntAsrModel>,
     /// The loaded image-generation model (Qwen-Image), if one was configured
     /// - serves `/v1/images/*` only.
     pub image: Option<crate::serving::ImageModel>,
@@ -431,6 +434,7 @@ impl AppState {
             clef: None,
             tabular: None,
             diarization: None,
+            rnnt_asr: None,
             image: None,
             max_ctx: 8192,
             vad_gate: false,
@@ -931,13 +935,14 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
         // mmproj, or a dedicated whisper-family model with no generative
         // model loaded at all - so this is a plain bool, not the serving
         // model's own flag.
-        "audio": state.serving.as_ref().is_some_and(|s| s.supports_audio) || state.asr.is_some(),
+        "audio": state.serving.as_ref().is_some_and(|s| s.supports_audio) || state.asr.is_some() || state.rnnt_asr.is_some(),
         "realtime_transcription": crate::realtime::capabilities(
             state.asr.is_some() || state.serving.as_ref().is_some_and(|s| s.supports_audio),
             state.asr.is_some(),
             state.serving.as_ref().filter(|s| s.supports_audio).and_then(|s| s.audio_frontend.max_clip_s(state.max_ctx.saturating_sub(512))),
         ),
-        "asr": state.asr.as_ref().map(|a| a.id.clone()),
+        "asr": state.asr.as_ref().map(|a| a.id.clone())
+            .or_else(|| state.rnnt_asr.as_ref().map(|m| m.id.clone())),
         // Forced-alignment model id: POST /v1/audio/alignments works iff this
         // is set. Same one-call model-card rule as `asr` - an aligner-only
         // runner has no `model`, no `embedder`, no `asr`, and without its own
@@ -1491,6 +1496,26 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
             ),
         );
     }
+    if let Some(m) = &state.rnnt_asr {
+        data.push(
+            ModelObject::new(m.id.clone(), 0, "paddock").with_listing_meta(
+                serde_json::json!({
+                    "input_modalities": ["audio"],
+                    "output_modalities": ["text"],
+                    "modality": "audio->text",
+                }),
+                m.capabilities(),
+                vec![
+                    "language".to_owned(),
+                    "response_format".to_owned(),
+                    "timestamp_granularities".to_owned(),
+                    "stream".to_owned(),
+                    "paddock_latency_ms".to_owned(),
+                ],
+                0,
+            ),
+        );
+    }
     if let Some(al) = &state.aligner {
         // forced alignment only: audio + an existing transcript in, word
         // times out - /v1/audio/alignments and nothing else
@@ -1667,6 +1692,27 @@ async fn openapi_spec() -> Response {
 }
 
 pub(crate) async fn not_found(uri: axum::http::Uri) -> Response {
+    // The vendors' batch APIs are a MANAGER surface: a batch outlives any one
+    // runner (it waits out restarts and model switches), so it cannot live in
+    // one. Say where it is instead of a bare 404 a client cannot act on.
+    let path = uri.path();
+    let batch = ["/v1/batches", "/v1/files", "/v1/messages/batches"]
+        .iter()
+        .any(|p| path == *p || path.starts_with(&format!("{p}/")));
+    if batch {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorBody::new(
+                "not_found_error",
+                format!(
+                    "{path} is served by the paddock manager, not by a model's endpoint: point \
+                     the client at the manager's address (where the Studio is) and it runs the \
+                     batch on this model"
+                ),
+            )),
+        )
+            .into_response();
+    }
     (
         StatusCode::NOT_FOUND,
         Json(ErrorBody::not_found(format!("route {uri}"))),

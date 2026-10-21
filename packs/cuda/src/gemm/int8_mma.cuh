@@ -933,6 +933,8 @@ __global__ void pd_q8_0_gemm_mma_ks_combine_kernel(const float* __restrict__ par
     y[i] = acc;
 }
 
+#include "q8_sb.cuh"  // the decode-band streamer (b <= 16), elected by the ks launcher below
+
 // K-split mma GEMM: the 64x64-tile kernel with grid.z K-ranges writing partial
 // planes into `part` (>= nz * out_dim * batch f32; the stream-k fixup scratch
 // is big enough for every dense shape), then a fixed-order combine into y.
@@ -998,6 +1000,19 @@ static int pd_q8_0_gemm_mma_ks_impl(const void* data, const void* scale, const v
     // bias rides the final writer: the combine when K is split, the GEMM
     // epilogue when nz collapsed to 1 (partial planes stay unbiased).
     const float* kbias = nz > 1u ? nullptr : (const float*)bias;
+    // b <= 16: the warp-per-fragment streamer (q8_sb.cuh) - same slices, same
+    // fold, bit-identical; it combines in-register (writing y) unless the
+    // plane is too narrow, then leaves partial planes like the tile. The tile
+    // below keeps every other width
+    if (pd_q8sb_elect(data, scale, xq, xs, n_blocks, batch)) {
+        if (!pd_q8_0_gemm_sb_go(data, scale, xq, xs, (const float*)bias, (float*)part,
+                                (float*)y, in_dim, out_dim, batch, nz, st)) {
+            uint32_t n = out_dim * batch;
+            pd_q8_0_gemm_mma_ks_combine_kernel<<<(n + 255u) / 256u, 256, 0, st>>>(
+                (const float*)part, (const float*)bias, (float*)y, n, nz, out_dim);
+        }
+        return pd_launch_status();
+    }
     // 2-stage cp.async pipeline on the serving rungs (the single-buffer
     // walk parked every warp on DRAM latency - long_sb 14.9/issue). The 4B
     // scale copies need an even n_blocks; odd keeps the synchronous walk.
@@ -2216,6 +2231,7 @@ __global__ void pd_deltanet_split_gqa_norm_kernel(
         const float* __restrict__ conv, float* __restrict__ q_out,
         float* __restrict__ k_out, float* __restrict__ v_out,
         uint32_t n_k_heads, uint32_t n_v_heads, uint32_t s) {
+    PD_PDL_ARM_WAIT();   // programmatic dependent (pd_pdl_go): full predecessor completion
     const uint32_t hv = blockIdx.x;
     const uint32_t row = blockIdx.y;
     const uint32_t j = threadIdx.x;
@@ -2254,7 +2270,7 @@ int pd_deltanet_split_gqa_norm(const void* conv, void* q_out, void* k_out, void*
     if (n_rows == 0 || n_v_heads == 0 || s == 0) return 0;
     if (s > 128 || (s & 31u)) return cudaErrorInvalidValue;
     dim3 grid(n_v_heads, n_rows);
-    pd_deltanet_split_gqa_norm_kernel<<<grid, s, 0, (cudaStream_t)stream>>>(
+    pd_pdl_go(pd_deltanet_split_gqa_norm_kernel, grid, s, 0, (cudaStream_t)stream,
         (const float*)conv, (float*)q_out, (float*)k_out, (float*)v_out,
         n_k_heads, n_v_heads, s);
     return pd_launch_status();
@@ -2484,6 +2500,7 @@ pd_gated_delta_recurrent_v2w_kernel(
         __half* __restrict__ states, __half* __restrict__ snap,
         float* __restrict__ out, uint32_t batch, uint32_t n_tokens,
         uint32_t n_heads) {
+    PD_PDL_ARM_WAIT();   // programmatic dependent (pd_pdl_go): full predecessor completion
     constexpr uint32_t D = PD_DN2_D;
     const uint32_t h = blockIdx.x;
     const uint32_t b = blockIdx.y;
@@ -2567,6 +2584,128 @@ pd_gated_delta_recurrent_v2w_kernel(
     }
 }
 
+// ---- v2x: the v2w decode step (n_tokens == 1, no snapshot), 8 columns a warp ----
+// v2w at the serve's decode width is ISSUE-bound, not DRAM-bound: ncu at B=128 shows 260
+// warp-instructions an item, the LSU data pipe at 84-88% and DRAM at ~45% (v2w's own access
+// shape alone streams the band at 6.2 TB/s = 65 us; v2w takes 91). Two levers, both free of
+// rounding changes:
+//   - the decode form drops v2w's token loop, snapshot branch and its 8 B spill;
+//   - a warp takes TWO of v2w's column quads (cols col0 .. col0+7), so the per-item cost - the
+//     index math, the gate loads and expf, and above all k / q - is paid once for both. k / q
+//     are loaded ONCE a warp (lane l: floats 4l .. 4l+3, no hw-duplicate sectors) and lane l16's
+//     8-row shard comes back by shuffle from lanes 2 l16 / 2 l16 + 1.
+// Every product, FMA chain and butterfly is v2w's AS COMPILED (pinned with _rn intrinsics: the
+// compiler seeds each 8-term dot with a.y*k.y and folds a.x*k.x in by FMA - a "natural" source
+// order regenerates differently and misses bits), so out and the states are v2w's bits (probed
+// word for word, B 1..128). B=128 cold: 91 -> 70 us; B=16: 14.6 -> 12.6 us.
+// FALSIFIED alongside (2026-10-21): the gates in-kernel from the alpha|beta plane (dropping
+// delta_gate_ab's launch) - bit-identical, but expf + log1pf + the divide take v2w 48 -> 64 regs
+// (v2x 64 -> 79) and the lost residency costs more than the launch: 98.4 vs 95.6 us for the pair
+// at B=128, and forcing 48 regs spills (101.3). And a persistent form staging the next item's
+// operands into smem by cp.async while computing this one: bit-identical, no faster (95 vs 92 us)
+// - the LSU pipe, not latency, is what binds.
+// Also measured: issuing the state loads ahead of the PDL wait (the gate kernel ahead triggers at
+// its top) - bit-identical, but 72 -> 79 us at B=128 and +0.36 ms a serve tick: the reordered
+// load stream schedules worse than the overlap buys.
+__device__ __forceinline__ float pd_dn2x_dot(const float4 a0, const float4 a1, const float4 k0,
+                                             const float4 k1) {
+    float r = __fmul_rn(a0.y, k0.y);
+    r = __fmaf_rn(a0.x, k0.x, r); r = __fmaf_rn(a0.z, k0.z, r); r = __fmaf_rn(a0.w, k0.w, r);
+    r = __fmaf_rn(a1.x, k1.x, r); r = __fmaf_rn(a1.y, k1.y, r); r = __fmaf_rn(a1.z, k1.z, r);
+    return __fmaf_rn(a1.w, k1.w, r);
+}
+__device__ __forceinline__ void pd_dn2x_scale(float4& a0, float4& a1, float g) {
+    a0.x = __fmul_rn(a0.x, g); a0.y = __fmul_rn(a0.y, g); a0.z = __fmul_rn(a0.z, g); a0.w = __fmul_rn(a0.w, g);
+    a1.x = __fmul_rn(a1.x, g); a1.y = __fmul_rn(a1.y, g); a1.z = __fmul_rn(a1.z, g); a1.w = __fmul_rn(a1.w, g);
+}
+__device__ __forceinline__ void pd_dn2x_axpy(float4& a0, float4& a1, const float4 k0, const float4 k1,
+                                             float d) {
+    a0.x = __fmaf_rn(k0.x, d, a0.x); a0.y = __fmaf_rn(k0.y, d, a0.y);
+    a0.z = __fmaf_rn(k0.z, d, a0.z); a0.w = __fmaf_rn(k0.w, d, a0.w);
+    a1.x = __fmaf_rn(k1.x, d, a1.x); a1.y = __fmaf_rn(k1.y, d, a1.y);
+    a1.z = __fmaf_rn(k1.z, d, a1.z); a1.w = __fmaf_rn(k1.w, d, a1.w);
+}
+__device__ __forceinline__ float4 pd_dn2x_shfl4(const float4 x, uint32_t src) {
+    return make_float4(__shfl_sync(0xffffffffu, x.x, src), __shfl_sync(0xffffffffu, x.y, src),
+                       __shfl_sync(0xffffffffu, x.z, src), __shfl_sync(0xffffffffu, x.w, src));
+}
+#define PD_DN2X_NQ 2u   // v2w column quads a warp (1: no amortization, 4: 102 regs - both slower)
+__global__ void __launch_bounds__(32 * PD_DN2_WARPS)
+pd_gated_delta_recurrent_v2x_kernel(
+        const float* __restrict__ q, const float* __restrict__ k,
+        const float* __restrict__ v, const float* __restrict__ g,
+        const float* __restrict__ beta, const unsigned int* __restrict__ slots,
+        __half* __restrict__ states, float* __restrict__ out, uint32_t n_heads) {
+    PD_PDL_ARM_WAIT();   // programmatic dependent (pd_pdl_go): full predecessor completion
+    constexpr uint32_t D = PD_DN2_D, NQ = PD_DN2X_NQ;
+    const uint32_t h = blockIdx.x, b = blockIdx.y, lane = threadIdx.x;
+    const uint32_t col0 = (blockIdx.z * PD_DN2_WARPS + threadIdx.y) * (4u * NQ);
+    const uint32_t l16 = lane & 15u, hw = lane >> 4;
+    const uint32_t slot = slots ? slots[b] : b;
+    __half* s_head = states + ((size_t)slot * n_heads + h) * (size_t)D * D + (size_t)col0 * D;
+    // quad j: s[j][0..1] = my shard of column col0+4j+hw, s[j][2..3] = of column col0+4j+2+hw
+    float4 s[NQ][4];
+#pragma unroll
+    for (uint32_t j = 0; j < NQ; ++j) {
+        pd_dn2w_ld8(s_head + 4u * j * D + lane * 8u, s[j][0], s[j][1]);
+        pd_dn2w_ld8(s_head + (4u * j + 2u) * D + lane * 8u, s[j][2], s[j][3]);
+    }
+    const size_t base = ((size_t)b * n_heads + h) * (size_t)D;
+    const float4 km = *reinterpret_cast<const float4*>(k + base + lane * 4u);
+    const float4 qm = *reinterpret_cast<const float4*>(q + base + lane * 4u);
+    const float4 k0 = pd_dn2x_shfl4(km, 2u * l16), k1 = pd_dn2x_shfl4(km, 2u * l16 + 1u);
+    const float4 q0 = pd_dn2x_shfl4(qm, 2u * l16), q1 = pd_dn2x_shfl4(qm, 2u * l16 + 1u);
+    float4 vq[NQ];
+#pragma unroll
+    for (uint32_t j = 0; j < NQ; ++j) vq[j] = *reinterpret_cast<const float4*>(v + base + col0 + 4u * j);
+    const size_t gb = (size_t)b * n_heads + h;
+    const float g_t = expf(g[gb]);
+    const float beta_t = beta[gb];
+    float u[NQ][2];
+#pragma unroll
+    for (uint32_t j = 0; j < NQ; ++j) {
+        pd_dn2x_scale(s[j][0], s[j][1], g_t);
+        pd_dn2x_scale(s[j][2], s[j][3], g_t);
+        u[j][0] = pd_dn2x_dot(s[j][0], s[j][1], k0, k1);
+        u[j][1] = pd_dn2x_dot(s[j][2], s[j][3], k0, k1);
+    }
+#pragma unroll
+    for (uint32_t off = 8; off > 0; off >>= 1) {
+#pragma unroll
+        for (uint32_t j = 0; j < NQ; ++j) {
+            u[j][0] = __fadd_rn(u[j][0], __shfl_xor_sync(0xffffffffu, u[j][0], off));
+            u[j][1] = __fadd_rn(u[j][1], __shfl_xor_sync(0xffffffffu, u[j][1], off));
+        }
+    }
+    float o[NQ][2];
+#pragma unroll
+    for (uint32_t j = 0; j < NQ; ++j) {
+        const float da = __fmul_rn(beta_t, __fsub_rn(hw ? vq[j].y : vq[j].x, u[j][0]));
+        const float db = __fmul_rn(beta_t, __fsub_rn(hw ? vq[j].w : vq[j].z, u[j][1]));
+        pd_dn2x_axpy(s[j][0], s[j][1], k0, k1, da);
+        pd_dn2x_axpy(s[j][2], s[j][3], k0, k1, db);
+        o[j][0] = pd_dn2x_dot(s[j][0], s[j][1], q0, q1);
+        o[j][1] = pd_dn2x_dot(s[j][2], s[j][3], q0, q1);
+    }
+#pragma unroll
+    for (uint32_t off = 8; off > 0; off >>= 1) {
+#pragma unroll
+        for (uint32_t j = 0; j < NQ; ++j) {
+            o[j][0] = __fadd_rn(o[j][0], __shfl_xor_sync(0xffffffffu, o[j][0], off));
+            o[j][1] = __fadd_rn(o[j][1], __shfl_xor_sync(0xffffffffu, o[j][1], off));
+        }
+    }
+#pragma unroll
+    for (uint32_t j = 0; j < NQ; ++j) {
+        if (l16 == 0) {
+            out[base + col0 + 4u * j + hw] = o[j][0];
+            out[base + col0 + 4u * j + 2u + hw] = o[j][1];
+        }
+        pd_dn2w_st8(s_head + 4u * j * D + lane * 8u, s[j][0], s[j][1]);
+        pd_dn2w_st8(s_head + (4u * j + 2u) * D + lane * 8u, s[j][2], s[j][3]);
+    }
+}
+
 PD_EXPORT
 int pd_gated_delta_recurrent_v2(const void* q, const void* k, const void* v,
                                 const void* g, const void* beta, const void* slots,
@@ -2606,17 +2745,24 @@ int pd_gated_delta_recurrent_v2(const void* q, const void* k, const void* v,
             cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
             return major == 10;
         }();
-        if (v2w) {
+        // the decode step rides v2x (bit-identical, above) from 3 rows - below that its half-size
+        // grid ties or trails v2w by ~0.5 us; kill: PADDOCK_NO_DN_V2X
+        static const bool v2x = pd_env("PADDOCK_NO_DN_V2X") == nullptr;
+        if (v2w && v2x && !cs && n_tokens == 1 && snap == nullptr && batch >= 3u) {
+            dim3 gridx(n_heads, batch, PD_DN2_D / (4u * PD_DN2X_NQ * PD_DN2_WARPS));
+            pd_pdl_go(pd_gated_delta_recurrent_v2x_kernel, gridx, block, 0, (cudaStream_t)stream,
+                      (const float*)q, (const float*)k, (const float*)v, (const float*)g,
+                      (const float*)beta, (const unsigned int*)slots, (__half*)states, (float*)out,
+                      n_heads);
+        } else if (v2w) {
             dim3 gridw(n_heads, batch, PD_DN2_D / (4u * PD_DN2_WARPS));
             if (cs)
-                pd_gated_delta_recurrent_v2w_kernel<true>
-                    <<<gridw, block, 0, (cudaStream_t)stream>>>(
+                pd_pdl_go(pd_gated_delta_recurrent_v2w_kernel<true>, gridw, block, 0, (cudaStream_t)stream,
                         (const float*)q, (const float*)k, (const float*)v, (const float*)g,
                         (const float*)beta, (const unsigned int*)slots, (__half*)states,
                         (__half*)snap, (float*)out, batch, n_tokens, n_heads);
             else
-                pd_gated_delta_recurrent_v2w_kernel<false>
-                    <<<gridw, block, 0, (cudaStream_t)stream>>>(
+                pd_pdl_go(pd_gated_delta_recurrent_v2w_kernel<false>, gridw, block, 0, (cudaStream_t)stream,
                         (const float*)q, (const float*)k, (const float*)v, (const float*)g,
                         (const float*)beta, (const unsigned int*)slots, (__half*)states,
                         (__half*)snap, (float*)out, batch, n_tokens, n_heads);

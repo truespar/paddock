@@ -263,6 +263,13 @@ impl KvPages {
         self.radix.as_mut().map(|r| (r, pool))
     }
 
+    /// `Generator::set_slot_background`: the class `slot`'s inserts carry.
+    pub(super) fn set_slot_low(&mut self, slot: usize, low: bool) {
+        if let Some(r) = self.radix.as_mut() {
+            r.set_slot_low(slot, low);
+        }
+    }
+
     /// `Generator::anchor_at`: hold the user turn's prompt-end checkpoint.
     pub(super) fn anchor(&mut self, tokens: &[u32], upto: usize) {
         if let Some(at) = self

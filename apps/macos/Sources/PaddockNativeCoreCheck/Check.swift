@@ -96,6 +96,7 @@ import PaddockConversationCore
       print(
         "PASS: native Studio coordinator startup, full-document open and acknowledged history mutation through Rust"
       )
+      try await composerDraftChecks(runtime: runtime, transport: transport, host: host)
       try await networkChecks()
       let libraries = (0..<_dyld_image_count()).compactMap { index in
         _dyld_get_image_name(index).map { String(cString: $0) }

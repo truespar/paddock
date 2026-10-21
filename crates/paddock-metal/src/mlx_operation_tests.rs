@@ -4,16 +4,27 @@ use std::path::Path;
 
 #[test]
 fn recurrent_input_reuse_preserves_outputs_state_and_checkpoints() {
-    recurrent_input_reuse(false);
+    recurrent_input_reuse(false, false);
 }
 
 #[test]
 #[ignore = "GPU kernel election only; NOT end-to-end serving throughput"]
 fn recurrent_input_reuse_election() {
-    recurrent_input_reuse(true);
+    recurrent_input_reuse(true, false);
 }
 
-fn recurrent_input_reuse(measure: bool) {
+#[test]
+fn bonsai_recurrent_packing_preserves_f32_state_and_checkpoints() {
+    recurrent_input_reuse(false, true);
+}
+
+#[test]
+#[ignore = "Bonsai F32 packed recurrence: alternating stage costs, not serving throughput"]
+fn bonsai_recurrent_packing_cost() {
+    recurrent_input_reuse(true, true);
+}
+
+fn recurrent_input_reuse(measure: bool, full: bool) {
     let device = MetalDevice::new(Some(512 << 20)).expect("Metal device for recurrent reuse check");
     let upload_u = |values: &[u32]| {
         device
@@ -37,11 +48,20 @@ fn recurrent_input_reuse(measure: bool) {
     };
     let value = |i: usize| {
         let bits = (i as u32).wrapping_mul(1664525).wrapping_add(1013904223);
-        half::bf16::from_f32(((bits ^ bits.rotate_left(13)) % 2048) as f32 / 16384. - 0.0625)
-            .to_f32()
+        if full {
+            ((bits ^ bits.rotate_left(13)) % 65536) as f32 / 513717. - 0.0625
+        } else {
+            half::bf16::from_f32(((bits ^ bits.rotate_left(13)) % 2048) as f32 / 16384. - 0.0625)
+                .to_f32()
+        }
     };
     let shapes = [
         vec![(0usize, 1usize, 0usize)],
+        vec![(2, 2, 37)],
+        vec![(2, 4, 37)],
+        vec![(2, 8, 37)],
+        vec![(2, 16, 37)],
+        vec![(3, 1, 37), (0, 1, 128), (1, 1, 13), (2, 1, 4095)],
         vec![(1, 31, 11), (0, 33, 0)],
         vec![(2, 32, 73)],
         vec![(0, 512, 0)],
@@ -86,7 +106,13 @@ fn recurrent_input_reuse(measure: bool) {
                 f32::from_bits((bits & 0x807fffff) | ((115 + bits % 15) << 23))
             })
             .collect();
-        let names = if device.tensor_accelerated() {
+        let names = if full {
+            if device.tensor_accelerated() {
+                &["bonsai_dn_recurrent", "bonsai_dn_recurrent_packed"][..]
+            } else {
+                &["bonsai_dn_recurrent"][..]
+            }
+        } else if device.tensor_accelerated() {
             &[
                 "mlx_dn_recurrent",
                 "mlx_dn_recurrent_quad",
@@ -115,7 +141,15 @@ fn recurrent_input_reuse(measure: bool) {
                     &cuts,
                 ],
                 &p,
-                [[32, 8, 4][route], 48, shape.len()],
+                [
+                    if full {
+                        [8, 4][route]
+                    } else {
+                        [32, 8, 4][route]
+                    },
+                    48,
+                    shape.len(),
+                ],
                 128,
             );
             cmd.finish().expect("finish recurrent candidate dispatch")

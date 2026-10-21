@@ -4,6 +4,12 @@ import Foundation
 /// document. Raw Responses objects and credentials stay out. The isolated
 /// native renderer trial opts into a bounded projection of active-path text.
 public struct StudioState: Decodable, Sendable {
+  public struct ComposerDraft: Decodable, Sendable {
+    public let id: String
+    public let text: String
+    public let attachments: [StudioAttachment]
+  }
+  public let composerDraft: ComposerDraft?
   public struct Audio: Decodable, Sendable {
     public struct Menu: Decodable, Sendable {
       public let offered: Bool
@@ -357,6 +363,7 @@ public struct StudioState: Decodable, Sendable {
     public let kind: String?
     public let busy: Bool?
     public let titleState: String?
+    public let composerDraft: Bool?
   }
   public let historyTotal: Int?
   public let autoTitle: Bool?
@@ -519,7 +526,7 @@ public enum StudioValue: Codable, Sendable, Equatable {
   public var array: [StudioValue]? { if case .array(let v) = self { v } else { nil } }
 }
 
-public struct StudioAttachment: Identifiable, Sendable {
+public struct StudioAttachment: Identifiable, Codable, Sendable {
   public let id: String
   public let name: String
   public let mime: String

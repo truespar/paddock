@@ -69,6 +69,44 @@ pub(super) fn replacement(
     keep_from: usize,
     pending_cut: bool,
 ) -> Option<usize> {
+    replacement_excluding(cache, history, images, keep_from, pending_cut, None)
+}
+
+/// Generated tails must not destroy ordinary prompt reuse. Chat user-turn
+/// anchors already provide that protection. Raw completions have no anchor:
+/// keep their latest prompt snapshot and rotate only the second same-branch
+/// entry (or an empty entry). Never steal a peer's state for this optional work.
+pub(super) fn continuation_replacement(
+    cache: &[Checkpoint],
+    history: &[u32],
+    images: &[multimodal::ImageKey],
+    prefill_end: usize,
+) -> Option<usize> {
+    let protected = if cache.iter().any(|c| c.anchor && covers(c, history, images)) {
+        None
+    } else {
+        Some(
+            cache
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    !c.reserved && c.history.len() <= prefill_end && covers(c, history, images)
+                })
+                .max_by_key(|(_, c)| c.history.len())?
+                .0,
+        )
+    };
+    replacement_excluding(cache, history, images, history.len(), false, protected)
+}
+
+fn replacement_excluding(
+    cache: &[Checkpoint],
+    history: &[u32],
+    images: &[multimodal::ImageKey],
+    keep_from: usize,
+    pending_cut: bool,
+    protected: Option<usize>,
+) -> Option<usize> {
     // Under a full cache, an anchored conversation's second trailing cut is
     // optional. Do not evict another conversation just to keep three cuts of
     // this one: max_batch * 2 entries must still serve max_batch conversations.
@@ -84,8 +122,10 @@ pub(super) fn replacement(
     cache
         .iter()
         .enumerate()
-        .filter(|(_, c)| {
-            !c.reserved
+        .filter(|(i, c)| {
+            protected != Some(*i)
+                && (protected.is_none() || c.history.is_empty() || covers(c, history, images))
+                && !c.reserved
                 && !c.anchor
                 && !(c.history.len() >= keep_from && covers(c, history, images))
                 && (!has_trailing
@@ -132,6 +172,50 @@ mod tests {
             history: vec![token; n],
             touched,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn generated_tails_keep_unanchored_prompts_and_do_not_steal_peers() {
+        let mut cache = vec![checkpoint(1, 96, 1), checkpoint(1, 112, 2)];
+        for cut in (128..1024).step_by(64) {
+            let i = continuation_replacement(&cache, &vec![1; cut], &[], 113).unwrap();
+            assert_eq!(
+                i, 0,
+                "keep the prompt snapshot even without a user-turn anchor"
+            );
+            cache[i] = checkpoint(1, cut, cut as u64);
+            assert_eq!(cache[1].history.len(), 112);
+        }
+        cache[0].reserved = true;
+        cache.push(checkpoint(2, 96, 0));
+        assert_eq!(continuation_replacement(&cache, &[1; 1088], &[], 113), None);
+        assert_eq!(continuation_replacement(&cache, &[3; 1088], &[], 113), None);
+        // An existing conversation anchor keeps the earlier retention policy.
+        cache[0].reserved = false;
+        cache[1].anchor = true;
+        assert_eq!(
+            continuation_replacement(&cache, &[1; 1088], &[], 113),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn four_unanchored_decode_loops_keep_prompt_and_tail_with_eight_entries() {
+        let mut cache = (1..=4)
+            .flat_map(|token| [checkpoint(token, 96, 1), checkpoint(token, 112, 2)])
+            .collect::<Vec<_>>();
+        let mut lengths = [128; 4];
+        for branch in [0, 1, 2, 3, 0, 0, 2, 0, 3, 1, 1, 3] {
+            let cut = lengths[branch];
+            let history = vec![branch as u32 + 1; cut];
+            let i = continuation_replacement(&cache, &history, &[], 113).unwrap();
+            cache[i] = checkpoint(branch as u32 + 1, cut, cut as u64);
+            lengths[branch] += 64;
+            for peer in 1..=4 {
+                assert!(cache.iter().any(|c| c.history == vec![peer; 112]));
+                assert_eq!(cache.iter().filter(|c| c.history[0] == peer).count(), 2);
+            }
         }
     }
 

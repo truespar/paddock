@@ -1444,22 +1444,35 @@ fn flash_next_mlx_fused_gate_up_execution_cost() {
 #[test]
 #[ignore = "full checkpoint and watchdog; shared expert input, exact vocabularies and rotated GPU costs"]
 fn flash_next_mlx_shared_expert_input_execution_cost() {
-    expert_input_execution_cost(false);
+    exact_staging_execution_cost(StagingOptimization::SharedExpertInput);
 }
 
 #[test]
 #[ignore = "full checkpoint and watchdog; hoisted routed addresses, exact vocabularies and rotated long-prompt GPU costs"]
 fn flash_next_mlx_hoisted_expert_input_execution_cost() {
-    expert_input_execution_cost(true);
+    exact_staging_execution_cost(StagingOptimization::HoistedExpertInput);
 }
 
-fn expert_input_execution_cost(hoisted: bool) {
-    use super::super::moe;
+#[test]
+#[ignore = "full checkpoint and watchdog; attention value overlap, exact vocabularies and rotated long-prompt GPU costs"]
+fn flash_next_mlx_attention_value_ahead_execution_cost() {
+    exact_staging_execution_cost(StagingOptimization::AttentionValueAhead);
+}
+
+enum StagingOptimization {
+    SharedExpertInput,
+    HoistedExpertInput,
+    AttentionValueAhead,
+}
+
+fn exact_staging_execution_cost(comparison: StagingOptimization) {
+    use super::super::{moe, qsa};
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
             moe::SHARE_EXPERT_INPUT_FOR_TEST.with(|v| v.set(true));
             moe::HOIST_EXPERT_INPUT_FOR_TEST.with(|v| v.set(true));
+            qsa::VALUE_AHEAD_FOR_TEST.with(|v| v.set(false));
         }
     }
     let _reset = Reset;
@@ -1468,8 +1481,10 @@ fn expert_input_execution_cost(hoisted: bool) {
         .unwrap()
         .parse()
         .unwrap();
-    let context = if hoisted { 16384 } else { 8192 };
-    let prompt = if hoisted { 8192 } else { 4096 };
+    let hoisted = matches!(comparison, StagingOptimization::HoistedExpertInput);
+    let attention = matches!(comparison, StagingOptimization::AttentionValueAhead);
+    let context = if hoisted || attention { 16384 } else { 8192 };
+    let prompt = if hoisted || attention { 8192 } else { 4096 };
     let mut m = FlashNext::load(Path::new(&path), context, 4, Some(budget)).unwrap();
     m.prefix.clear(&mut m.pool);
     let _prefix = std::mem::take(&mut m.prefix);
@@ -1479,8 +1494,9 @@ fn expert_input_execution_cost(hoisted: bool) {
         for round in 0..4 {
             for index in 0..2 {
                 let shared = (round + index) % 2 == 1;
-                moe::SHARE_EXPERT_INPUT_FOR_TEST.with(|v| v.set(hoisted || shared));
+                moe::SHARE_EXPERT_INPUT_FOR_TEST.with(|v| v.set(hoisted || attention || shared));
                 moe::HOIST_EXPERT_INPUT_FOR_TEST.with(|v| v.set(!hoisted || shared));
+                qsa::VALUE_AHEAD_FOR_TEST.with(|v| v.set(attention && shared));
                 m.reset();
                 let started = std::time::Instant::now();
                 let mut prompt_gpu = 0.;
@@ -1539,7 +1555,7 @@ fn expert_input_execution_cost(hoisted: bool) {
                 eprintln!(
                     "FLASH_EXPERT_INPUT {}",
                     serde_json::json!({
-                        "comparison": if hoisted { "hoisted_addresses" } else { "shared_conversion" },
+                        "comparison": if attention { "attention_value_ahead" } else if hoisted { "hoisted_addresses" } else { "shared_conversion" },
                         "slots": slots, "round": round, "shared": shared,
                         "prefill_gpu_seconds": prompt_gpu, "decode_gpu_seconds": decode_gpu,
                         "wall_seconds": started.elapsed().as_secs_f64(),

@@ -95,9 +95,16 @@ struct Call {
 #[derive(Default)]
 pub(crate) struct Calls {
     open: Option<Call>,
+    completed: Vec<Value>,
 }
 
 impl Calls {
+    /// The terminal snapshot must reuse the exact item and call IDs emitted
+    /// on the wire, including a call completed only by ToolStream::finish.
+    pub(crate) fn into_items(self) -> Vec<Value> {
+        self.completed
+    }
+
     /// One tool event as Responses events; `first`: the output index of
     /// call 0 (after the reasoning and message items, when there are any).
     pub(crate) fn event(&mut self, ev: ToolEv, first: usize, sq: &mut Seq) -> Events {
@@ -133,21 +140,25 @@ impl Calls {
                 None => Vec::new(),
             },
             ToolEv::Stop { .. } => match self.open.take() {
-                Some(c) => vec![
-                    (
-                        "response.function_call_arguments.done",
-                        json!({
+                Some(c) => {
+                    let item = json!({"type":"function_call","id":c.fc_id,"call_id":c.call_id,
+                        "name":c.name,"arguments":c.args,"status":"completed"});
+                    self.completed.push(item.clone());
+                    vec![
+                        (
+                            "response.function_call_arguments.done",
+                            json!({
                         "type":"response.function_call_arguments.done","sequence_number":sq.next(),
                         "item_id":c.fc_id,"output_index":c.idx,"arguments":c.args}),
-                    ),
-                    (
-                        "response.output_item.done",
-                        json!({
+                        ),
+                        (
+                            "response.output_item.done",
+                            json!({
                         "type":"response.output_item.done","sequence_number":sq.next(),"output_index":c.idx,
-                        "item":{"type":"function_call","id":c.fc_id,"call_id":c.call_id,
-                                "name":c.name,"arguments":c.args,"status":"completed"}}),
-                    ),
-                ],
+                        "item":item}),
+                        ),
+                    ]
+                }
                 None => Vec::new(),
             },
         }

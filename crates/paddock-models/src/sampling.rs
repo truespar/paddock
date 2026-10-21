@@ -206,7 +206,8 @@ pub fn elected(arch: &str) -> Option<Elected> {
             },
             instruct: None,
             source: "google/gemma-4-31B-it generation_config.json and model card \
-                     §1 Sampling Parameters; gemma-4-26B-A4B-it ships the same",
+                     §1 Sampling Parameters; gemma-4-26B-A4B-it and gemma-4-12B-it \
+                     ship the same",
         },
         // Muse Glimmer's card and generation_config.json agree exactly.
         "muse-glimmer" => Elected {

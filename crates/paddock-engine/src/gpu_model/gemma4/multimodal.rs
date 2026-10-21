@@ -37,6 +37,9 @@ use super::{Arch, GpuGemma4};
 pub(crate) enum VisionTower {
     Gemma4(Box<super::vision::VisionModel>),
     Muse(Box<super::muse_vision::VisionModel>),
+    /// Gemma 4 12B: no tower at all - the encoder-free picture and audio
+    /// embedders of a `gemma4uv` + `gemma4ua` mmproj (see `unified`)
+    Unified(Box<super::unified::UnifiedEmbedder>),
 }
 
 impl VisionTower {
@@ -45,6 +48,7 @@ impl VisionTower {
         match self {
             VisionTower::Gemma4(v) => v.llm_embd(),
             VisionTower::Muse(v) => v.llm_embd(),
+            VisionTower::Unified(v) => v.llm_embd(),
         }
     }
 
@@ -52,6 +56,7 @@ impl VisionTower {
         match self {
             VisionTower::Gemma4(v) => v.budget(),
             VisionTower::Muse(v) => v.budget(),
+            VisionTower::Unified(v) => v.budget(),
         }
     }
 
@@ -60,6 +65,7 @@ impl VisionTower {
         match self {
             VisionTower::Gemma4(v) => v.weight_bytes(),
             VisionTower::Muse(v) => v.weight_bytes(),
+            VisionTower::Unified(v) => v.weight_bytes(),
         }
     }
 
@@ -68,6 +74,7 @@ impl VisionTower {
         match self {
             VisionTower::Gemma4(v) => v.tokens_for(w, h),
             VisionTower::Muse(v) => v.tokens_for(w, h),
+            VisionTower::Unified(v) => v.tokens_for(w, h),
         }
     }
 
@@ -93,6 +100,19 @@ impl VisionTower {
                     n_tokens: o.n_tokens,
                 })
             }
+            VisionTower::Unified(v) => {
+                let (embd, n_tokens) = v.encode_picture(rgb, w, h)?;
+                Ok(EncodedImage { embd, n_tokens })
+            }
+        }
+    }
+
+    /// The unified embedder's audio half, when this tower is one and serves
+    /// audio.
+    fn audio(&self) -> Option<&super::unified::UnifiedEmbedder> {
+        match self {
+            VisionTower::Unified(v) if v.has_audio() => Some(v),
+            VisionTower::Gemma4(_) | VisionTower::Muse(_) | VisionTower::Unified(_) => None,
         }
     }
 }
@@ -109,6 +129,8 @@ enum Row {
     Token(u32),
     /// (image index, row within that image's encoded embeddings)
     Image(usize, usize),
+    /// a clip frame - causal, encoded per pass from the clip's row span
+    Audio,
 }
 
 /// FNV-1a over the raw image bytes (dims folded in by the caller).
@@ -160,12 +182,41 @@ impl GpuGemma4 {
         map: &paddock_models::mapped::MappedGguf,
         max_image_tokens: Option<usize>,
     ) -> Result<(), GpuError> {
+        self.attach_media(map, max_image_tokens, true)
+    }
+
+    /// [`Self::attach_vision_with`], and whether a unified mmproj's audio
+    /// half is served (`false` = the endpoint's `audio = false`; every other
+    /// mmproj carries no audio and ignores it).
+    pub fn attach_media(
+        &mut self,
+        map: &paddock_models::mapped::MappedGguf,
+        max_image_tokens: Option<usize>,
+        audio: bool,
+    ) -> Result<(), GpuError> {
         // one picture prefills in one pass, and no pass is wider than PF_ROWS
         let max_image_tokens = max_image_tokens.map(|t| t.min(super::forward::PF_ROWS));
         // The tower is elected by the TEXT model's arch, not by the mmproj's
         // projector string: they must agree, and the text side is what already
-        // decided every other constant.
+        // decided every other constant. The one exception is inside gemma4:
+        // the 12B's text file is plain gemma4 and only its mmproj says it is
+        // the encoder-free (`gemma4uv`) checkpoint.
         let vm = match self.hp.arch {
+            Arch::Gemma4 if super::unified::is_unified(map) => {
+                let u = super::unified::UnifiedEmbedder::load(
+                    self.exec.clone(),
+                    map,
+                    max_image_tokens,
+                    audio,
+                )?;
+                if u.has_audio() && (self.aud_beg_id.is_none() || self.aud_end_id.is_none()) {
+                    return Err(GpuError::Driver(
+                        "vocab lacks the <|audio>/<audio|> markers - not the 12B's text file"
+                            .into(),
+                    ));
+                }
+                VisionTower::Unified(Box::new(u))
+            }
             // DiffusionGemma's config carries Gemma 4's vision config verbatim
             // (27 layers, 1152 wide, 280 tokens); its processor is
             // Gemma4Processor. No mmproj ships for it yet, but the tower
@@ -327,16 +378,42 @@ impl GpuGemma4 {
         let mut sources: Vec<(&[u8], usize, usize)> = Vec::new();
         let mut n_tok: Vec<usize> = Vec::new();
         let mut hashes: Vec<u64> = Vec::new();
+        // clips (the 12B's audio): samples, frames, and a content hash for
+        // the radix keys - frames are encoded per pass, a clip never whole
+        let mut clips: Vec<&[f32]> = Vec::new();
+        let mut clip_rows: Vec<usize> = Vec::new();
+        let mut clip_hashes: Vec<u64> = Vec::new();
         {
             let vision = self
                 .vision
                 .as_ref()
                 .ok_or_else(|| GpuError::Driver("no mmproj attached".into()))?;
             for ch in chunks {
-                if let MmChunk::Image { rgb, w, h } = ch {
-                    sources.push((rgb, *w, *h));
-                    n_tok.push(vision.tokens_for(*w, *h));
-                    hashes.push(Self::picture_hash(rgb, *w, *h));
+                match ch {
+                    MmChunk::Image { rgb, w, h } => {
+                        sources.push((rgb, *w, *h));
+                        n_tok.push(vision.tokens_for(*w, *h));
+                        hashes.push(Self::picture_hash(rgb, *w, *h));
+                    }
+                    MmChunk::Audio { samples, .. } => {
+                        if vision.audio().is_none() {
+                            return Err(GpuError::Driver(
+                                "this endpoint serves no audio input (the 12B's unified \
+                                 mmproj, audio on, is the only gemma4 that takes clips)"
+                                    .into(),
+                            ));
+                        }
+                        let n = super::unified::UnifiedEmbedder::audio_rows(samples.len());
+                        if n == 0 {
+                            return Err(GpuError::Driver("an empty audio clip".into()));
+                        }
+                        clips.push(samples);
+                        clip_rows.push(n);
+                        // the f32 bits, salted so a clip never keys like a picture
+                        let bytes: Vec<u8> = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
+                        clip_hashes.push(hash_bytes(&bytes) ^ 0xa0d1_0c11_95a3_5eed);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -347,6 +424,8 @@ impl GpuGemma4 {
         // soft-token row range of each picture, for the mid-span guard
         let mut img_spans: Vec<(usize, usize)> = Vec::new();
         let mut img_k = 0usize;
+        // clip frame row ranges (causal: they never bound a pass or a cut)
+        let mut clip_spans: Vec<(usize, usize)> = Vec::new();
         for ch in chunks {
             match ch {
                 MmChunk::Text(ids) => {
@@ -366,9 +445,20 @@ impl GpuGemma4 {
                     img_k += 1;
                 }
                 MmChunk::Audio { .. } => {
-                    return Err(GpuError::Driver(
-                        "gemma4 serves images, not audio - routing bug".into(),
-                    ));
+                    let k = clip_spans.len();
+                    let (b, e) = (
+                        self.aud_beg_id.expect("markers checked at audio attach"),
+                        self.aud_end_id.expect("markers checked at audio attach"),
+                    );
+                    rows.push(Row::Token(b));
+                    keys.push(b);
+                    let first = rows.len();
+                    let n = clip_rows[k];
+                    rows.extend((0..n).map(|_| Row::Audio));
+                    keys.extend((0..n).map(|r| image_key_row(clip_hashes[k], r)));
+                    clip_spans.push((first, first + n));
+                    rows.push(Row::Token(e));
+                    keys.push(e);
                 }
                 MmChunk::OcrCrop(_) => {
                     return Err(GpuError::Driver(
@@ -469,7 +559,7 @@ impl GpuGemma4 {
                 .iter()
                 .enumerate()
                 .map(|(i, row)| match row {
-                    Row::Token(_) => (base + i) as u32,
+                    Row::Token(_) | Row::Audio => (base + i) as u32,
                     Row::Image(img, _) => span_end[*img].max(base + i) as u32,
                 })
                 .collect();
@@ -524,6 +614,25 @@ impl GpuGemma4 {
                         .copy_region(src, ir * n_embd, &mut sc.pf_x, i * n_embd, n_embd)?;
                 }
             }
+            // the pass's clip frames, encoded now: a clip's rows are one
+            // contiguous run, so each overlap is a single encode + copy
+            if let Some(au) = self.vision.as_ref().and_then(|v| v.audio()) {
+                for (k, &(s0, e0)) in clip_spans.iter().enumerate() {
+                    let (lo, hi) = (s0.max(base), e0.min(end));
+                    if lo >= hi {
+                        continue;
+                    }
+                    let src = au.encode_audio(clips[k], lo - s0, hi - s0)?;
+                    let sc = &mut self.scratch;
+                    self.exec.copy_region(
+                        &src,
+                        0,
+                        &mut sc.pf_x,
+                        (lo - base) * n_embd,
+                        (hi - lo) * n_embd,
+                    )?;
+                }
+            }
             // After the image splice, deliberately: the reference norms
             // `inpL` once, and mtmd has already substituted the projected
             // image rows into it by then - so image rows get normalized too.
@@ -576,6 +685,25 @@ impl GpuGemma4 {
             last_len = r;
         }
         let logits = self.logits_from_pf_row(last_len - 1)?;
+        // Hand the MTP drafter its h for the first decode round. The layer
+        // walk wiped the row map (it never records rows), so every picture or
+        // clip prompt used to decode its first round with no drafts at all -
+        // on a 25-token answer one round in ten. `normed` now holds the last
+        // prompt row's post-output-norm hidden (the head's input, the
+        // drafter's h); pf_normed row 0 takes it, and the map points there
+        // at the row's KV position. Any tick before the round overwrites
+        // pf_normed and rewrites the whole map, so a stale row is never read.
+        if self.mtp.is_some() {
+            let sc = &mut self.scratch;
+            self.exec
+                .copy_region(&sc.normed, 0, &mut sc.pf_normed, 0, self.hp.n_embd)?;
+            for e in self.spec_rows.iter_mut() {
+                *e = None;
+            }
+            if let Some(e) = self.spec_rows.get_mut(slot) {
+                *e = Some(((rows.len() - 1) as u32, 0));
+            }
+        }
         self.prefix_insert(slot, &keys, cut)?;
         Ok((logits, rows.len()))
     }

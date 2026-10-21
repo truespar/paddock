@@ -73,6 +73,7 @@ pub(crate) const SHADER_SOURCE: &str = concat!(
     include_str!("../../../packs/metal/gemma_mlx_vision.metal"),
     include_str!("../../../packs/metal/qwen_mlx_vision_nax.metal"),
     include_str!("../../../packs/metal/qwen_mlx_attention_nax.metal"),
+    include_str!("../../../packs/metal/gemma_mlx_attention_nax.metal"),
     include_str!("../../../packs/metal/qwen_mlx_vision.metal"),
     "\n",
     include_str!("../../../packs/metal/granite_vision.metal"),
@@ -958,6 +959,7 @@ impl MetalDevice {
             "mlx_dn_recurrent",
             "mlx_dn_recurrent_quad",
             "mlx_dn_recurrent_packed",
+            "bonsai_dn_recurrent_packed",
             "mlx_dn_verify",
             "mlx_dn_verify_commit",
             "mlx_dn_gated_norm",
@@ -1031,6 +1033,18 @@ impl MetalDevice {
             "bonsai_full2",
             "bonsai_full3",
             "bonsai_full4",
+            "bonsai_bits1",
+            "bonsai_bits2",
+            "bonsai_bits3",
+            "bonsai_bits4",
+            "bonsai_bits_multi1",
+            "bonsai_bits_multi2",
+            "bonsai_bits_multi3",
+            "bonsai_bits_multi4",
+            "bonsai_mixed1",
+            "bonsai_mixed2",
+            "bonsai_mixed3",
+            "bonsai_mixed4",
             "bonsai_multi1",
             "bonsai_multi2",
             "bonsai_multi3",
@@ -1042,6 +1056,11 @@ impl MetalDevice {
             "bonsai_prefill32",
             "bonsai_prefill64",
             "bonsai_prefill16",
+            "bonsai_prefill128",
+            "bonsai_prehalf128x128",
+            "bonsai_prehalf128x256",
+            "bonsai_prehalf32x128",
+            "bonsai_prehalf64x128",
             "bonsai_rms",
             "bonsai_residual_rms",
             "bonsai_rms_selected",
@@ -1049,6 +1068,7 @@ impl MetalDevice {
             "bonsai_dn_gated_norm",
             "bonsai_dn_recurrent",
             "bonsai_attention_decode",
+            "bonsai_attention_value2",
             "bonsai_knorm_store",
             "bonsai_attention_prefill",
             "q4a_gather",
@@ -1209,6 +1229,10 @@ impl MetalDevice {
             #[cfg(test)]
             "q4b_attention_direct_values",
             #[cfg(test)]
+            "q4b_attention_value_ahead1",
+            #[cfg(test)]
+            "q4b_attention_value_ahead8",
+            #[cfg(test)]
             "q4b_attention_pair_pack",
             #[cfg(test)]
             "q4b_attention_pairs",
@@ -1303,6 +1327,7 @@ impl MetalDevice {
             "mmlx_store",
             "gmlx_decode128",
             "gmlx_decode256",
+            "gmlx_value2_256",
             "gmlx_decode512",
             "gmlx_prefill128",
             "gmlx_prefill256",
@@ -1327,6 +1352,20 @@ impl MetalDevice {
             "gmlx_mv_qkv",
             "gmlx_mv_attention",
             "mlx_affine_single",
+            "mlx_affine_single_columns2",
+            "mlx_affine_single_columns1",
+            "mlx_affine_columns4",
+            "mlx_affine_columns1",
+            "mlx_affine_pipeline4",
+            "mlx_affine_pipeline_full4",
+            #[cfg(test)]
+            "mlx_affine_bias8",
+            #[cfg(test)]
+            "mlx_affine_canonical2",
+            #[cfg(test)]
+            "mlx_affine_canonical3",
+            #[cfg(test)]
+            "mlx_affine_canonical4",
             "mlx_affine_verify_single4",
             "mlx_affine_verify_single2",
             "mlx_affine_verify_single3",
@@ -1473,6 +1512,7 @@ impl MetalDevice {
             "mlx_affine_prefill_wide128",
             "mlx_affine_prefill_deep128",
             "mlx_affine_prefill_compact128",
+            "mlx_affine_gemma_prefill128",
             "mlx_swiglu_compact",
             "mlx_affine_parts",
             "mlx_affine_parts_padded",
@@ -1540,6 +1580,7 @@ impl MetalDevice {
             "gemma_decode512",
             "gemma_merge",
             "gemma_merge_shared",
+            "gmlx_merge_rounded",
             "gemma_draft_advance",
             "gemma_verify8",
             "gemma_full5",
@@ -1738,7 +1779,9 @@ impl MetalDevice {
                     | "mlx_affine_prefill_wide128"
                     | "mlx_affine_prefill_deep128"
                     | "mlx_affine_prefill_compact128"
+                    | "mlx_affine_gemma_prefill128"
                     | "mlx_dn_recurrent_packed"
+                    | "bonsai_dn_recurrent_packed"
                     | "mlx_attention_prefill_gqa"
             ) && !raw.supportsFamily(MTLGPUFamily::Apple10)
             {
@@ -1788,7 +1831,12 @@ impl MetalDevice {
         }
         let profile = paddock_models::dev_var_os!("PADDOCK_METAL_PROFILE").is_some();
         if raw.supportsFamily(MTLGPUFamily::Apple10) {
-            for name in ["mlx_attention_prefill_nax", "nemo_mlx_prefill_nax"] {
+            for name in [
+                "mlx_attention_prefill_nax",
+                "nemo_mlx_prefill_nax",
+                "gmlx_nax_prefill256",
+                "gmlx_nax_prefill512",
+            ] {
                 let fun = lib
                     .newFunctionWithName(&NSString::from_str(name))
                     .ok_or_else(|| MetalError::Device(format!("missing kernel {name}")))?;
@@ -2221,6 +2269,7 @@ impl Commands<'_> {
                 || name.starts_with("splash_affine")
                 || name.starts_with("bonsai_vectors")
                 || name.starts_with("bonsai_full")
+                || (name.starts_with("bonsai_bits") && !name.starts_with("bonsai_bits_multi"))
                 || name.starts_with("bonsai_mm")
                 || name.starts_with("bonsai_tile")
                 || name.starts_with("bonsai_prefill")
@@ -2238,11 +2287,20 @@ impl Commands<'_> {
                 format!("{name}[k={},n={},m={}]", params[0], params[1], params[2])
             } else if name.starts_with("mlx_affine_prefill")
                 || name.starts_with("mlx_affine_tile")
+                || name.starts_with("mlx_affine_columns")
+                || name.starts_with("mlx_affine_pipeline")
+                || name.starts_with("mlx_affine_single")
                 || name.starts_with("bonsai_multi")
+                || name.starts_with("bonsai_bits_multi")
             {
                 format!(
                     "{name}[k={},n={}+{}+{},m={}]",
                     params[0], params[1], params[2], params[3], params[4]
+                )
+            } else if name.starts_with("bonsai_mixed") {
+                format!(
+                    "{name}[k={},n={}+{}+{}+{},m={}]",
+                    params[0], params[1], params[2], params[3], params[4], params[5]
                 )
             } else {
                 name.to_owned()
@@ -2784,6 +2842,39 @@ mod tests {
                     <= d.raw.maxThreadgroupMemoryLength(),
                 "{name}"
             );
+        }
+    }
+
+    #[test]
+    fn gemma_staging_fits_threadgroup_memory() {
+        let d = MetalDevice::new(Some(32 << 20)).unwrap();
+        if d.tensor_accelerated() {
+            let bytes = d.kernels["mlx_affine_gemma_prefill128"].staticThreadgroupMemoryLength();
+            eprintln!(
+                "Gemma staging: {bytes}/{} bytes",
+                d.raw.maxThreadgroupMemoryLength()
+            );
+            assert!(bytes <= d.raw.maxThreadgroupMemoryLength());
+        }
+    }
+
+    #[test]
+    fn bonsai_staging_fits_threadgroup_memory() {
+        let d = MetalDevice::new(Some(32 << 20)).unwrap();
+        if d.tensor_accelerated() {
+            for name in [
+                "bonsai_prehalf32x128",
+                "bonsai_prehalf64x128",
+                "bonsai_prehalf128x128",
+                "bonsai_prehalf128x256",
+            ] {
+                let bytes = d.kernels[name].staticThreadgroupMemoryLength();
+                eprintln!(
+                    "{name}: {bytes}/{} threadgroup bytes",
+                    d.raw.maxThreadgroupMemoryLength()
+                );
+                assert!(bytes <= d.raw.maxThreadgroupMemoryLength(), "{name}");
+            }
         }
     }
 

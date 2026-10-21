@@ -186,7 +186,7 @@ impl GpuNemotron {
             return;
         };
         let blocks = bs.tables[slot].blocks().to_vec();
-        radix.insert(keys, &blocks, &mut bs.pool);
+        radix.insert_for(slot, keys, &blocks, &mut bs.pool);
         self.prefix_press_margin();
     }
 
@@ -236,7 +236,7 @@ impl GpuNemotron {
             Some(b) => b.to_vec(),
             None => return,
         };
-        radix.insert(&keys[..cut], &blocks, &mut bs.pool);
+        radix.insert_for(slot, &keys[..cut], &blocks, &mut bs.pool);
         let Some(idx) = radix.attach_state_with_pool(keys, cut, &mut bs.pool) else {
             return;
         };
@@ -805,7 +805,7 @@ impl GpuNemotron {
                 let filed = match bs.tables[slot].blocks().get(..cut / BLOCK_TOKENS) {
                     Some(blocks) => {
                         let blocks = blocks.to_vec();
-                        radix.insert(&seq[..cut], &blocks, &mut bs.pool);
+                        radix.insert_for(slot, &seq[..cut], &blocks, &mut bs.pool);
                         radix.attach_state_at(seq, cut, idx)
                     }
                     None => false,

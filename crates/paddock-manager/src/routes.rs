@@ -67,6 +67,8 @@ pub struct AppState {
     /// The update download, while it runs. One per process; a second request
     /// joins it rather than racing onto the same file.
     pub update_dl: std::sync::Mutex<Option<Arc<crate::updates::Download>>>,
+    /// Batch inference (`crate::batch`): the job store's runtime and the run.
+    pub batches: Arc<crate::batch::Batches>,
     /// This box's TLS facts, for the trust page and the root download.
     /// None when the identity could not be established and the manager
     /// fell back to cleartext - the UI says so rather than offering a
@@ -86,14 +88,20 @@ impl AppState {
     /// Minimal state for tests (in-memory db, telemetry disabled).
     #[doc(hidden)]
     pub fn for_tests() -> Self {
+        let db = Arc::new(
+            crate::store::Store::open(&std::path::PathBuf::from(":memory:")).expect("mem test db"),
+        );
         AppState {
             // tests bind loopback, so the real bind-derived list would only be
             // noise here
             mcp_allowed_hosts: vec!["localhost".into(), "127.0.0.1".into(), "::1".into()],
-            db: Arc::new(
-                crate::store::Store::open(&std::path::PathBuf::from(":memory:"))
-                    .expect("mem test db"),
-            ),
+            batches: Arc::new(crate::batch::Batches::new(
+                std::env::temp_dir().join(format!("paddock-test-batches-{}", uuid::Uuid::new_v4())),
+                db.clone(),
+                Arc::new(crate::batch::NoFleet),
+                crate::batch::Tuning::default(),
+            )),
+            db,
             auth_key: None,
             trusted_proxy: false,
             push: crate::push::Hub::new(),
@@ -407,6 +415,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         // Studio store surface (conversations, prompts, settings, keys, MCP) +
         // the embedded SPA; API misses still return the OpenAI-shaped JSON 404.
         .merge(crate::api::routes())
+        // The vendors' batch APIs, at their own paths so an SDK needs only a
+        // base URL (crate::batch).
+        .merge(crate::batch::routes())
         .fallback(crate::static_assets::serve)
         // The runner relays carry whole attachments base64-inlined in chat
         // bodies; axum's 2 MB default cut the connection mid-upload for any
@@ -3565,13 +3576,16 @@ async fn auth_mw(
     if let Some(required) = &state.auth_key {
         let local = peer_is_local(&req, state.trusted_proxy);
         let path = req.uri().path();
-        if !local && path.starts_with("/api/") {
+        if !local && (path.starts_with("/api/") || path.starts_with("/v1/")) {
             let verify = |k: &str| k == required || state.db.verify_api_key(k).unwrap_or(false);
+            // Bearer for OpenAI-style clients; `x-api-key` is how the
+            // Anthropic SDKs send theirs (the batch surface speaks both)
             let bearer_ok = req
                 .headers()
                 .get(axum::http::header::AUTHORIZATION)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.strip_prefix("Bearer "))
+                .or_else(|| req.headers().get("x-api-key").and_then(|v| v.to_str().ok()))
                 .is_some_and(verify);
             // The Studio's key-gate session: a browser cannot attach Bearer
             // headers to every fetch/SSE the SPA makes, so /auth/login turns

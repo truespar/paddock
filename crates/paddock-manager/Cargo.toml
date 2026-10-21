@@ -24,7 +24,7 @@ path = "src/main.rs"
 
 [dependencies]
 zeroize = "1.9.0"
-axum = { workspace = true, features = ["ws"] }
+axum = { workspace = true, features = ["ws", "multipart"] }
 # The box's own https identity and the one-port listener that serves both
 # schemes. Its own crate rather than a module here, because the
 # RUNNER is the likely second consumer and rcgen has no business in a binary
@@ -35,13 +35,17 @@ paddock-tls = { path = "../paddock-tls" }
 tokio-tungstenite = "0.30"
 tokio = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# raw_value: a batch line's body is sent to the runner byte for byte, never
+# parsed into a Value (a body is mostly base64 picture)
+serde_json = { workspace = true, features = ["raw_value"] }
 toml = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
+# the optional checksum on an Upload's completion (OpenAI's Uploads API)
+md-5 = "0.11"
 futures = { workspace = true }
 async-stream = { workspace = true }
 futures-util = { workspace = true }

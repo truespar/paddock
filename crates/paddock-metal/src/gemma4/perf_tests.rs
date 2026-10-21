@@ -1,6 +1,621 @@
 use super::*;
 
 #[test]
+#[ignore = "requires Gemma MLX: isolate batch-dependent projection and attention arithmetic"]
+fn mlx_batch_arithmetic_diagnostic() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            forward::FIXED_DECODE_SPLITS_FOR_TEST.set(false);
+            forward::SINGLE_DECODE_PROJECTION_FOR_TEST.set(false);
+            forward::BATCH_TRACE_FOR_TEST.with(|v| *v.borrow_mut() = None);
+        }
+    }
+    let _reset = Reset;
+    let path = std::env::var("PADDOCK_MM_MLX").unwrap();
+    let mut model = Gemma4::load(Path::new(&path), 4096, 5, None).unwrap();
+    assert!(
+        model.mlx
+            && model.width == 5376
+            && model.moe_scratch.is_none()
+            && model.diffusion.is_none()
+    );
+    for mode in 0..4 {
+        forward::FIXED_DECODE_SPLITS_FOR_TEST.set(mode & 1 != 0);
+        forward::SINGLE_DECODE_PROJECTION_FOR_TEST.set(mode & 2 != 0);
+        model.reset();
+        let prompt = (0..1024u32)
+            .map(|i| 1000 + (i * 17) % 16000)
+            .collect::<Vec<_>>();
+        let mut initial = None;
+        for slot in 0..5 {
+            while model.evict() {}
+            let row = model.forward_prefill(slot, &prompt).unwrap();
+            if let Some(expected) = &initial {
+                assert_eq!(&row, expected);
+            } else {
+                initial = Some(row);
+            }
+        }
+        let mut changes = 0usize;
+        let mut max_abs = 0.0f32;
+        let mut times = [Vec::new(), Vec::new()];
+        let mut picks = 0usize;
+        for step in 0..16u32 {
+            let mut rows = [Vec::new(), Vec::new()];
+            let mut traces = [Vec::new(), Vec::new()];
+            for at in 0..2 {
+                let batch = (step as usize + at) % 2;
+                let input = if batch == 0 {
+                    vec![(0, 7000 + step, 1024 + step)]
+                } else {
+                    // Slot 1 follows the isolated control. Other peers join
+                    // and leave with their own KV positions.
+                    (1..=2 + step as usize % 3)
+                        .map(|slot| (slot, 7000 + step, model.slots[slot].history.len() as u32))
+                        .collect()
+                };
+                let start = std::time::Instant::now();
+                if step == 0 {
+                    forward::BATCH_TRACE_FOR_TEST.with(|v| *v.borrow_mut() = Some(Vec::new()));
+                }
+                rows[batch] = model.execute(&input, &[0]).unwrap();
+                times[batch].push(start.elapsed().as_secs_f64());
+                if step == 0 {
+                    traces[batch] =
+                        forward::BATCH_TRACE_FOR_TEST.with(|v| v.borrow_mut().take().unwrap());
+                }
+            }
+            if step == 0 {
+                for ((name, a), (_, b)) in traces[0].iter().zip(&traces[1]) {
+                    eprintln!(
+                        "GEMMA_BATCH_STAGE mode={mode} stage={name} different={} max={}",
+                        a.iter()
+                            .zip(b)
+                            .filter(|(a, b)| a.to_bits() != b.to_bits())
+                            .count(),
+                        a.iter()
+                            .zip(b)
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0f32, f32::max)
+                    );
+                }
+            }
+            changes += rows[0]
+                .iter()
+                .zip(&rows[1])
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            max_abs = rows[0]
+                .iter()
+                .zip(&rows[1])
+                .map(|(a, b)| (a - b).abs())
+                .fold(max_abs, f32::max);
+            let pick = |v: &[f32]| {
+                v.iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .unwrap()
+                    .0
+            };
+            picks += usize::from(pick(&rows[0]) == pick(&rows[1]));
+        }
+        eprintln!(
+            "GEMMA_BATCH_ARITHMETIC {}",
+            serde_json::json!({"mode":mode,"batch_cycle":[2,3,4],"different":changes,"max_abs":max_abs,"argmax_matches":picks,"seconds":times})
+        );
+        if mode == 3 {
+            assert_eq!(
+                changes, 0,
+                "fixed attention and one-vector projections must isolate batch occupancy"
+            );
+        }
+    }
+}
+
+#[test]
+fn decode_ahead_is_exact_and_bounded() {
+    decode_ahead(false);
+}
+
+#[test]
+#[ignore = "Gemma bounded attention load overlap: alternating GPU timings, not serving throughput"]
+fn decode_ahead_cost() {
+    decode_ahead(true);
+}
+
+fn decode_ahead(timed: bool) {
+    let d = MetalDevice::new(None).unwrap();
+    let upload = |v: &[u32]| {
+        d.upload(&v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>())
+            .unwrap()
+    };
+    let (hd, kh, window) = (256usize, 16usize, 1024usize);
+    for live in [1usize, 4] {
+        for length in if timed {
+            vec![512usize, 2048, 8192]
+        } else {
+            vec![1usize, 31, 129, 1025]
+        } {
+            let stride = length.div_ceil(16) + 1;
+            let ring = if window > 0 { 1536 } else { 0 };
+            let tokens = if window > 0 {
+                ring * live
+            } else {
+                stride * live * 16
+            };
+            let kv = |salt: usize| {
+                d.upload(
+                    &(0..tokens * kh * hd)
+                        .flat_map(|i| {
+                            half::bf16::from_f32(((i * salt + i / hd) % 101) as f32 / 97. - 0.5)
+                                .to_bits()
+                                .to_le_bytes()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap()
+            };
+            let keys = kv(13);
+            let values = kv(37);
+            let query = d
+                .upload(
+                    &(0..(live + 2) * 32 * hd)
+                        .flat_map(|i| {
+                            half::bf16::from_f32(((i * 19) % 127) as f32 / 117. - 0.5)
+                                .to_f32()
+                                .to_le_bytes()
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            let mut metadata = vec![0u32; (live + 2) * 2];
+            let mut selected = Vec::new();
+            for slot in 0..live {
+                let row = live - slot;
+                selected.push(row as u32);
+                metadata[row * 2] = slot as u32;
+                metadata[row * 2 + 1] = (length.saturating_sub(slot * 7).max(1) - 1) as u32;
+            }
+            let meta = upload(&metadata);
+            let rows = upload(&selected);
+            let pages = upload(
+                &(0..stride * live)
+                    .rev()
+                    .map(|p| p as u32)
+                    .collect::<Vec<_>>(),
+            );
+            for splits in if timed {
+                vec![
+                    length
+                        .min(if window > 0 { window } else { length })
+                        .div_ceil(128)
+                        .max(16usize.div_ceil(live))
+                        .clamp(1, 32),
+                ]
+            } else {
+                vec![1usize, 3, 16, 32]
+            } {
+                let elements = live * 32 * splits * (hd + 2);
+                let output = d.alloc((elements + 32) * 4).unwrap();
+                let mut expected: Option<Vec<u32>> = None;
+                let variants = 2;
+                let mut seconds = vec![Vec::new(); variants];
+                for round in 0..if timed { 7 } else { 1 } {
+                    for order in 0..variants {
+                        let mode = (order + round) % variants;
+                        unsafe {
+                            output.write_u32(&vec![u32::MAX; elements + 32]);
+                        }
+                        let cmd = d.begin().unwrap();
+                        let repeats = if timed { 16 } else { 1 };
+                        for _ in 0..repeats {
+                            cmd.dispatch_at(
+                                match mode {
+                                    0 => "gmlx_decode256",
+                                    _ => "gmlx_value2_256",
+                                },
+                                &[&query, &keys, &values, &meta, &pages, &rows, &output],
+                                &[0, 0, 0, 0, 0, 0, 32],
+                                &[
+                                    32,
+                                    kh as u32,
+                                    stride as u32,
+                                    window as u32,
+                                    ring as u32,
+                                    splits as u32,
+                                ],
+                                [kh, live, splits],
+                                128,
+                            );
+                        }
+                        let elapsed = cmd.finish().unwrap() / repeats as f64;
+                        let actual = unsafe { output.read_u32(elements + 32) };
+                        assert!(
+                            actual[..8]
+                                .iter()
+                                .chain(&actual[elements + 8..])
+                                .all(|v| *v == u32::MAX)
+                        );
+                        if let Some(expected) = &expected {
+                            let differences =
+                                actual.iter().zip(expected).filter(|(a, b)| a != b).count();
+                            assert_eq!(
+                                differences, 0,
+                                "hd={hd} live={live} length={length} splits={splits} mode={mode}"
+                            );
+                        } else {
+                            expected = Some(actual);
+                        }
+                        if round > 0 {
+                            seconds[mode].push(elapsed);
+                        }
+                    }
+                }
+                if timed {
+                    eprintln!(
+                        "GEMMA_DECODE_AHEAD {}",
+                        serde_json::json!({"hd":hd,"live":live,"length":length,"splits":splits,"seconds":seconds})
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn rounded_merge_is_exact_and_bounded() {
+    rounded_merge_check(false);
+}
+
+#[test]
+#[ignore = "paired attention merge/store costs, not serving throughput"]
+fn rounded_merge_cost() {
+    rounded_merge_check(true);
+}
+
+fn rounded_merge_check(timed: bool) {
+    let d = MetalDevice::new(Some(256 << 20)).unwrap();
+    for hd in [256usize, 512] {
+        for live in [1usize, 4] {
+            let indices = [4u32, 0, 2, 1];
+            let rows = d
+                .upload(
+                    &indices[..live]
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            let size = 6 * HEADS * hd;
+            let sentinel = 12352.0f32.to_bits(); // exactly BF16, including the untouched rows
+            let outputs = [
+                d.alloc((size + 16) * 4).unwrap(),
+                d.alloc((size + 16) * 4).unwrap(),
+            ];
+            for splits in [1usize, 3, 16, 32] {
+                let parts = d
+                    .upload(
+                        &(0..live * HEADS * splits * (hd + 2))
+                            .flat_map(|i| {
+                                let split = i / (hd + 2) % splits;
+                                let empty = split > 0 && split % 3 != 0;
+                                let value = match i % (hd + 2) {
+                                    at if at == hd => {
+                                        if empty {
+                                            f32::NEG_INFINITY
+                                        } else {
+                                            (i % 19) as f32 / 7. - 2.
+                                        }
+                                    }
+                                    at if at == hd + 1 => {
+                                        if empty {
+                                            0.
+                                        } else {
+                                            (i % 7 + 1) as f32 / 3.
+                                        }
+                                    }
+                                    _ => ((i * 13 + i / (hd + 2)) % 997) as f32 / 117. - 3.,
+                                };
+                                value.to_le_bytes()
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+                let mut times = [Vec::new(), Vec::new()];
+                for round in 0..if timed { 9 } else { 1 } {
+                    for order in 0..2 {
+                        let at = (order + round) % 2;
+                        unsafe {
+                            outputs[at].write_u32(&vec![sentinel; size + 16]);
+                        }
+                        let cmd = d.begin().unwrap();
+                        let repeats = if timed { 60 } else { 1 };
+                        for _ in 0..repeats {
+                            cmd.dispatch_at(
+                                if at == 0 {
+                                    "gemma_merge_shared"
+                                } else {
+                                    "gmlx_merge_rounded"
+                                },
+                                &[&parts, &outputs[at], &rows],
+                                &[0, 32, 0],
+                                &[HEADS as u32, splits as u32, hd as u32],
+                                [HEADS * live, 1, 1],
+                                32,
+                            );
+                            if at == 0 {
+                                cmd.dispatch_at(
+                                    "gmlx_round",
+                                    &[&outputs[at]],
+                                    &[32],
+                                    &[size as u32],
+                                    [size.div_ceil(256), 1, 1],
+                                    256,
+                                );
+                            }
+                        }
+                        let seconds = cmd.finish().unwrap() / repeats as f64;
+                        if round > 0 {
+                            times[at].push(seconds);
+                        }
+                    }
+                    let old = unsafe { outputs[0].read_u32(size + 16) };
+                    let new = unsafe { outputs[1].read_u32(size + 16) };
+                    let differences = old.iter().zip(&new).filter(|(a, b)| a != b).count();
+                    assert_eq!(differences, 0, "hd={hd} live={live} splits={splits}");
+                    assert!(
+                        new[..8]
+                            .iter()
+                            .chain(&new[size + 8..])
+                            .all(|v| *v == sentinel)
+                    );
+                    for row in 0..6 {
+                        if !indices[..live].contains(&(row as u32)) {
+                            assert!(
+                                new[8 + row * HEADS * hd..8 + (row + 1) * HEADS * hd]
+                                    .iter()
+                                    .all(|v| *v == sentinel)
+                            );
+                        }
+                    }
+                    assert!(new.iter().all(|v| f32::from_bits(*v).is_finite()));
+                }
+                if timed {
+                    eprintln!(
+                        "ROUNDED_MERGE_COST {}",
+                        serde_json::json!({"hd":hd,"live":live,"splits":splits,"seconds":times})
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires Gemma MLX: in-process paired model costs and full-logit equality"]
+fn mlx_speed_paired_cost() {
+    mlx_paired_cost(PairedChange::SmallColumns, 512);
+}
+
+#[test]
+#[ignore = "requires Gemma MLX: paired wide-input projection election and full-logit equality"]
+fn mlx_wide_columns_paired_cost() {
+    mlx_paired_cost(PairedChange::WideColumns, 512);
+}
+
+#[test]
+#[ignore = "requires Gemma MLX: in-process fused attention rounding comparison"]
+fn mlx_rounded_merge_paired_cost() {
+    mlx_paired_cost(PairedChange::RoundedMerge, 512);
+}
+
+#[test]
+#[ignore = "requires Gemma MLX: paired pipelined projection cost and full-logit equality"]
+fn mlx_pipeline_paired_cost() {
+    mlx_paired_cost(PairedChange::Pipeline, 512);
+}
+
+#[test]
+#[ignore = "requires Gemma MLX: long-prompt paired pipelined projections"]
+fn mlx_pipeline_long_paired_cost() {
+    mlx_paired_cost(PairedChange::Pipeline, 2048);
+}
+
+enum PairedChange {
+    SmallColumns,
+    WideColumns,
+    RoundedMerge,
+    Pipeline,
+    Aligned,
+    Attention,
+}
+
+#[test]
+#[ignore = "requires Gemma MLX: bounded value-load overlap, complete logits and paired cost"]
+fn mlx_decode_ahead_paired_cost() {
+    mlx_paired_cost(PairedChange::Attention, 2048);
+}
+
+#[test]
+#[ignore = "requires Gemma MLX: bounded value-load overlap on identical independent slots"]
+fn mlx_decode_ahead_paired_steps() {
+    mlx_paired_steps(PairedChange::Attention);
+}
+
+#[test]
+#[ignore = "requires Gemma MLX: paired aligned projection costs and full vocabulary equality"]
+fn mlx_aligned_paired_cost() {
+    mlx_paired_cost(PairedChange::Aligned, 2048);
+}
+
+#[test]
+#[ignore = "requires Gemma MLX: alternate aligned kernels on independent identical live slots"]
+fn mlx_aligned_paired_steps() {
+    mlx_paired_steps(PairedChange::Aligned);
+}
+
+fn mlx_paired_steps(change: PairedChange) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::affine::BASELINE_GEMMA_ALIGNED_FOR_TEST.set(false);
+            forward::BASELINE_DECODE_AHEAD_FOR_TEST.set(false);
+        }
+    }
+    let _reset = Reset;
+    let path = std::env::var("PADDOCK_MM_MLX").unwrap();
+    let mut model = Gemma4::load(Path::new(&path), 8192, 2, None).unwrap();
+    let allocated = model.device.allocated_bytes();
+    for length in [512u32, 2048, 4096] {
+        model.reset();
+        let prompt = (0..length)
+            .map(|i| 1000 + (i * 17) % 16000)
+            .collect::<Vec<_>>();
+        let mut initial: Option<Vec<f32>> = None;
+        for slot in 0..2 {
+            // Both controls must be cold: warm reuse can select a different
+            // final-prompt contraction even when token histories match.
+            while model.evict() {}
+            let row = model.forward_prefill(slot, &prompt).unwrap();
+            if let Some(expected) = &initial {
+                assert_eq!(&row, expected, "cold controls differ");
+            } else {
+                initial = Some(row);
+            }
+        }
+        let mut wall = [Vec::new(), Vec::new()];
+        let mut gpu = [Vec::new(), Vec::new()];
+        for step in 0..64u32 {
+            let mut expected: Option<Vec<u32>> = None;
+            for order in 0..2 {
+                let slot = (step as usize + order) % 2;
+                if matches!(change, PairedChange::Attention) {
+                    forward::BASELINE_DECODE_AHEAD_FOR_TEST.set(slot == 0);
+                } else {
+                    crate::affine::BASELINE_GEMMA_ALIGNED_FOR_TEST.set(slot == 0);
+                }
+                let start = std::time::Instant::now();
+                let row = model
+                    .execute(&[(slot, 7000 + step, length + step)], &[0])
+                    .unwrap();
+                let seconds = start.elapsed().as_secs_f64();
+                if step >= 8 {
+                    wall[slot].push(seconds);
+                    gpu[slot].push(model.last_gpu_seconds);
+                }
+                assert!(row.iter().all(|v| v.is_finite()));
+                let bits = row.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+                if let Some(previous) = &expected {
+                    let differences = bits.iter().zip(previous).filter(|(a, b)| a != b).count();
+                    assert_eq!(differences, 0, "prompt={length} step={step}");
+                } else {
+                    expected = Some(bits);
+                }
+                assert_eq!(model.device.allocated_bytes(), allocated);
+            }
+        }
+        eprintln!(
+            "GEMMA_PAIRED_STEPS {}",
+            serde_json::json!({"change":if matches!(change, PairedChange::Attention) {"decode_ahead"} else {"aligned_projection"},"prompt":length,"wall_seconds":wall,"gpu_seconds":gpu,"allocated":allocated})
+        );
+    }
+}
+
+fn mlx_paired_cost(change: PairedChange, prompt: u32) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            crate::affine::BASELINE_GEMMA_SPEED_FOR_TEST.set(false);
+            crate::affine::BASELINE_GEMMA_PIPELINE_FOR_TEST.set(false);
+            crate::affine::BASELINE_GEMMA_ALIGNED_FOR_TEST.set(false);
+            crate::affine::BASELINE_GEMMA_WIDE_FOR_TEST.set(false);
+            forward::BASELINE_ROUNDED_MERGE_FOR_TEST.set(false);
+            forward::BASELINE_DECODE_AHEAD_FOR_TEST.set(false);
+        }
+    }
+    let _reset = Reset;
+    let path = std::env::var("PADDOCK_MM_MLX").unwrap();
+    let mut m = Gemma4::load(Path::new(&path), 4096, 4, None).unwrap();
+    let allocated = m.device.allocated_bytes();
+    for live in [1, 4] {
+        let mut expected = None;
+        for round in 0..5 {
+            for at in 0..2 {
+                let old = (at + round) % 2 == 0;
+                match change {
+                    PairedChange::Attention => forward::BASELINE_DECODE_AHEAD_FOR_TEST.set(old),
+                    PairedChange::Aligned => {
+                        crate::affine::BASELINE_GEMMA_ALIGNED_FOR_TEST.set(old)
+                    }
+                    PairedChange::Pipeline => {
+                        crate::affine::BASELINE_GEMMA_PIPELINE_FOR_TEST.set(old)
+                    }
+                    PairedChange::RoundedMerge => forward::BASELINE_ROUNDED_MERGE_FOR_TEST.set(old),
+                    PairedChange::WideColumns => {
+                        crate::affine::BASELINE_GEMMA_WIDE_FOR_TEST.set(old)
+                    }
+                    PairedChange::SmallColumns => {
+                        crate::affine::BASELINE_GEMMA_SPEED_FOR_TEST.set(old)
+                    }
+                }
+                m.reset();
+                while m.evict() {}
+                for slot in 0..live {
+                    m.prefill_begin(
+                        slot,
+                        (0..prompt)
+                            .map(|i| 1000 + (i * 17 + slot as u32 * 41) % 16000)
+                            .collect(),
+                    )
+                    .unwrap();
+                }
+                let mut logits = vec![Vec::new(); live];
+                let start = std::time::Instant::now();
+                let mut done = 0;
+                while done < live {
+                    for (slot, row, _) in m.forward_mixed(&[], 512).unwrap().1 {
+                        logits[slot] = row;
+                        done += 1;
+                    }
+                }
+                let prefill = start.elapsed().as_secs_f64();
+                let mut hash = blake3::Hasher::new();
+                for row in &logits {
+                    for v in row {
+                        hash.update(&v.to_bits().to_le_bytes());
+                    }
+                }
+                let mut times = Vec::new();
+                for step in 0..16 {
+                    let tokens: Vec<_> = (0..live).map(|slot| 7000 + step + slot as u32).collect();
+                    let start = std::time::Instant::now();
+                    let row = m
+                        .forward_batch(&tokens, &vec![prompt + step; live])
+                        .unwrap();
+                    times.push(start.elapsed().as_secs_f64());
+                    assert!(row.iter().all(|v| v.is_finite()));
+                    for v in row {
+                        hash.update(&v.to_bits().to_le_bytes());
+                    }
+                }
+                let digest = hash.finalize().to_hex().to_string();
+                assert_eq!(m.device.allocated_bytes(), allocated);
+                if let Some(expected) = &expected {
+                    assert_eq!(&digest, expected);
+                } else {
+                    expected = Some(digest.clone());
+                }
+                eprintln!(
+                    "GEMMA_PAIRED_COST {}",
+                    serde_json::json!({"round":round,"live":live,"prompt":prompt,"baseline":old,"prefill_s":prefill,"decode_s":times,"logits_blake3":digest,"allocated":m.device.allocated_bytes()})
+                );
+            }
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires PADDOCK_GEMMA4_GGUF; GPU prefill tile election"]
 fn prefill_projection_election() {
     let path = std::env::var("PADDOCK_GEMMA4_GGUF").unwrap();

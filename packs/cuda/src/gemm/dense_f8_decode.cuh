@@ -857,8 +857,8 @@ static int pd_f8t_gemm_impl(const void* wtiles, const void* wrs, const void* xq,
             t_on = e && atoi(e) != 0 ? 1 : 0;
         }
         const uint32_t nk_t = (in_dim + 127u) / 128u;
-        if (t_on && nk_t >= 8u && pd_tc5q_ctr()) {
-            uint32_t* qctr = pd_tc5q_ctr();
+        if (t_on && nk_t >= 8u && pd_tc5q_ctr(st)) {
+            uint32_t* qctr = pd_tc5q_ctr(st);
             static int nsm_t = 0;
             if (nsm_t == 0) {
                 int d = 0;
@@ -1333,8 +1333,8 @@ static int pd_f8t_gemm_impl(const void* wtiles, const void* wrs, const void* xq,
         q_min = e ? atoi(e) : 0;
         if (q_min <= 0) q_min = 256;
     }
-    if (!no_q && tiles >= (uint32_t)q_min && nk_all >= 10u && pd_tc5q_ctr()) {
-        uint32_t* qctr = pd_tc5q_ctr();
+    if (!no_q && tiles >= (uint32_t)q_min && nk_all >= 10u && pd_tc5q_ctr(st)) {
+        uint32_t* qctr = pd_tc5q_ctr(st);
         constexpr uint32_t QS = 6u, QD = 5u;
         const uint32_t qsmem = QS * 24576u + 2u * QS * 8u + 16u;
         static int no_efq = -1;
@@ -1615,7 +1615,7 @@ static int pd_f8t_gemm_impl(const void* wtiles, const void* wrs, const void* xq,
         if (z1 >= 1u) nz = z1;
     }
     float* dst = nz > 1u ? (float*)part : (float*)y;
-    uint32_t* fctr = want_fold ? pd_tc5p_fctr() : nullptr;
+    uint32_t* fctr = want_fold ? pd_tc5p_fctr(st) : nullptr;
     // PDL: launch as a programmatic dependent so the kernel starts
     // inside the predecessor's execution - the dep-free W prologue streams
     // during the elementwise that produces our Y (triggers in the e4m3 row
@@ -3504,9 +3504,9 @@ int pd_quantize_e4m3_row(const void* x, void* q, void* rscale, uint32_t n_dim,
     if (pd_rowq_1p<float>(x, q, rscale, n_dim, batch, (cudaStream_t)stream))
         return pd_launch_status();
     {
-        const uint32_t C = pd_rowq_chunks(batch);
+        const uint32_t C = pd_rowq_chunks(batch, (cudaStream_t)stream);
         if (C > 1u) {
-            float* scr = pd_rowq_scr();
+            float* scr = pd_rowq_scr((cudaStream_t)stream);
             pd_pdl_go(pd_rowmax_part_kernel<float>, dim3(batch, C), 256, 0u,
                       (cudaStream_t)stream, (const float*)x, scr, n_dim, 1u);
             pd_pdl_go(pd_quantize_e4m3_row2_kernel<float>, dim3(batch, C), 256, 0u,
@@ -3534,9 +3534,9 @@ int pd_quantize_e4m3_row_i16(const void* x, void* q, void* rscale, uint32_t n_di
     if (pd_rowq_1p<__half>(x, q, rscale, n_dim, batch, (cudaStream_t)stream))
         return pd_launch_status();
     {
-        const uint32_t C = pd_rowq_chunks(batch);
+        const uint32_t C = pd_rowq_chunks(batch, (cudaStream_t)stream);
         if (C > 1u) {
-            float* scr = pd_rowq_scr();
+            float* scr = pd_rowq_scr((cudaStream_t)stream);
             pd_pdl_go(pd_rowmax_part_kernel<__half>, dim3(batch, C), 256, 0u,
                       (cudaStream_t)stream, (const __half*)x, scr, n_dim, 1u);
             pd_pdl_go(pd_quantize_e4m3_row2_kernel<__half>, dim3(batch, C), 256, 0u,
@@ -4694,17 +4694,13 @@ int pd_f8row_gemm(const void* data, const void* w_rowscale, const void* xq,
                 if (nz < 1u) nz = 1u;
             }
             if (nz > 1u) {
-                // grow-once partial planes (nz * y); launchers run under the
-                // engine's per-stream serialization, so the statics are safe
-                static float* part = nullptr;
-                static size_t part_sz = 0;
+                // partial planes (nz * y): per-stream, grow-by-retain
+                // (part_scratch.cuh) - two lanes run, and a captured graph
+                // keeps the plane it was recorded with
                 const size_t need = (size_t)nz * out_dim * batch * 4u;
-                if (need > part_sz) {
-                    if (part) cudaFree(part);
-                    if (cudaMalloc(&part, need) != cudaSuccess) { part = nullptr; part_sz = 0; }
-                    else part_sz = need;
-                }
-                if (part) {
+                size_t part_sz = 0;
+                float* part = pd_part_scratch((cudaStream_t)stream, need, &part_sz);
+                if (part && need <= part_sz) {
                     pd_f8row_gemm_tc5_kt<TS><<<dim3(nt, nz), 128, smem, (cudaStream_t)stream>>>(
                         wm, ym, (const float*)w_rowscale, (const float*)x_rowscale,
                         part, in_dim, out_dim, batch);
@@ -4915,16 +4911,9 @@ int pd_f8row_gemm(const void* data, const void* w_rowscale, const void* xq,
             if (nz > max_nz) nz = max_nz;
             if (nz > 8u) nz = 8u;
             if (nz < 1u) nz = 1u;
-            static float* part2 = nullptr;
-            static size_t part2_sz = 0;
-            cudaStreamCaptureStatus cap2 = cudaStreamCaptureStatusNone;
-            cudaStreamIsCapturing(st, &cap2);
             const size_t want2 = (size_t)8u * out_dim * 192u * 4u;
-            if (cap2 == cudaStreamCaptureStatusNone && nz > 1u && want2 > part2_sz) {
-                if (part2) cudaFree(part2);
-                if (cudaMalloc(&part2, want2) != cudaSuccess) { part2 = nullptr; part2_sz = 0; }
-                else part2_sz = want2;
-            }
+            size_t part2_sz = 0;
+            float* part2 = nz > 1u ? pd_part_scratch(st, want2, &part2_sz) : nullptr;
             if (nz >= 2u && (!part2 || (size_t)nz * out_dim * batch * 4u > part2_sz))
                 nz = 1u;
             constexpr uint32_t KPADm = PD_MMA_KT + 16u;
@@ -4959,8 +4948,8 @@ int pd_f8row_gemm(const void* data, const void* w_rowscale, const void* xq,
         }
     }
     {
-        static float* part = nullptr;
-        static size_t part_sz = 0;
+        float* part = nullptr;
+        size_t part_sz = 0;
         static int nsm = 0;
         if (nsm == 0) {
             int dev = 0;
@@ -4970,14 +4959,10 @@ int pd_f8row_gemm(const void* data, const void* w_rowscale, const void* xq,
         }
         static const bool off = pd_env("PADDOCK_NO_F8R_KSPLIT") != nullptr;
         if (!off) {
-            cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
-            cudaStreamIsCapturing(st, &cap);
+            // per-stream, grow-by-retain (part_scratch.cuh): the plane a captured
+            // decode graph baked stays mapped, and the two lanes never share one
             const size_t want = (size_t)8u * out_dim * 64u * 4u;
-            if (cap == cudaStreamCaptureStatusNone && want > part_sz) {
-                if (part) cudaFree(part);
-                if (cudaMalloc(&part, want) != cudaSuccess) { part = nullptr; part_sz = 0; }
-                else part_sz = want;
-            }
+            part = pd_part_scratch(st, want, &part_sz);
             // mma-tile decode arm (mamba proj rung,
             // first in the ladder - the CT=32 null-A/B trap): the BM=64
             // f32-scale twin pd_f8row_gemm_mma_kernel. Rung 1 priced the

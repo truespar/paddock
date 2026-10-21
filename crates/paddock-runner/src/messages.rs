@@ -1365,6 +1365,7 @@ async fn run_anth_web(
 pub async fn handle(
     State(state): State<Arc<AppState>>,
     scope: Option<axum::Extension<crate::events::EventScope>>,
+    origin: crate::metrics::Origin,
     crate::extract::AnthJson(mut req): crate::extract::AnthJson<MessagesRequest>,
 ) -> Response {
     let scope = scope.map(|e| e.0).unwrap_or_default();
@@ -1616,6 +1617,7 @@ pub async fn handle(
         submitted: None, // stamped by Engine::submit
         canvas_read: None,
         user_turn: crate::user_turn::anthropic(&req.messages),
+        background: origin.background(),
     };
     if let Err(e) = model.engine.submit(gen_req) {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "api_error", e);
@@ -2744,6 +2746,7 @@ async fn run_mcp_agent(
             submitted: None, // stamped by Engine::submit
             canvas_read: None,
             user_turn: false,
+            background: false,
         };
         if let Err(e) = model.engine.submit(gen_req) {
             return err(StatusCode::INTERNAL_SERVER_ERROR, "api_error", e);
@@ -3253,7 +3256,7 @@ fn stream_mcp_agent(
             let gen_req = GenRequest {
                 prompt: prepared.engine_prompt, max_tokens: prepared.max_tokens, sampler: prepared.sampler,
                 stop_tokens: prepared.stop_tokens, events: tx, mm_chunks: prepared.mm_chunks, constraint, logprobs: None,
-                submitted: None, canvas_read: None, user_turn: false };
+                submitted: None, canvas_read: None, user_turn: false, background: false };
             if let Err(e) = model.engine.submit(gen_req) {
                 yield ev("error", json!({"type":"error","error":{"type":"api_error","message":e}}));
                 return;

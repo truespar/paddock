@@ -12,6 +12,14 @@ public struct EndpointRow: Identifiable {
   public var id: UInt16 { port }
   var title: String { runner?.title ?? configured?.title ?? "Endpoint \(port)" }
   var baseURL: String { "http://127.0.0.1:\(port)/v1" }
+  var isActive: Bool { runner != nil || configured?.running == true || job?.isActive == true }
+
+  func matches(_ search: String) -> Bool {
+    let fields = [title, String(port), configured?.model ?? "", configured?.artifact ?? "", status]
+    return search.split(whereSeparator: \.isWhitespace).allSatisfy { term in
+      fields.contains { $0.localizedStandardContains(String(term)) }
+    }
+  }
   var status: String {
     if let job, job.isActive {
       switch job.action {
@@ -61,10 +69,15 @@ struct EndpointsView: View {
     EndpointRow.rows(snapshot: snapshot, latestJob: workspace.latestJob)
   }
   @State private var copiedPort: UInt16?
+  @State private var search = ""
+  @State private var activeOnly = false
+  private var visibleRows: [EndpointRow] {
+    rows.filter { (!activeOnly || $0.isActive) && $0.matches(search) }
+  }
 
   var body: some View {
     PaddockScrollView {
-      VStack(alignment: .leading, spacing: 28) {
+      VStack(alignment: .leading, spacing: 20) {
         PageHeading(title: ManagerDestination.runners.rawValue) {
           Button("Add instance", systemImage: "plus", action: onCreate)
             .modifier(PrimaryAction()).disabled(!workspace.canSubmit || creation != nil)
@@ -73,6 +86,17 @@ struct EndpointsView: View {
         if let creation {
           creation.accessibilityIdentifier("instance-creation")
         }
+        if !rows.isEmpty {
+          HStack(spacing: 16) {
+            NativeSearchField(text: $search, prompt: "Search instances")
+              .accessibilityIdentifier("instances-search")
+            Picker("Instances", selection: $activeOnly) {
+              Text("All").tag(false)
+              Text("Active").tag(true)
+            }.pickerStyle(.segmented).labelsHidden().frame(width: 140)
+              .accessibilityIdentifier("instances-filter")
+          }
+        }
         if rows.isEmpty && creation == nil {
           VStack(spacing: 14) {
             Image(systemName: "terminal").font(.system(size: 30, weight: .light))
@@ -80,9 +104,13 @@ struct EndpointsView: View {
             Text("No instances yet").font(.system(size: 18, weight: .medium))
           }.frame(maxWidth: .infinity, minHeight: 320)
         } else {
-          LazyVStack(spacing: 10) {
-            ForEach(rows) { row in
+          LazyVStack(spacing: 6) {
+            ForEach(visibleRows) { row in
               endpoint(row)
+            }
+            if visibleRows.isEmpty && !rows.isEmpty {
+              Text("No matching instances").foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, minHeight: 100)
             }
           }
         }
@@ -126,7 +154,7 @@ struct EndpointsView: View {
         }
       }
     }
-    .padding(16)
+    .padding(.horizontal, 14).padding(.vertical, 12)
     .background(PaddockStyle.surface, in: RoundedRectangle(cornerRadius: PaddockStyle.Radius.card))
   }
 
@@ -137,24 +165,26 @@ struct EndpointsView: View {
       selection = row.port
       workspace.openEndpoint(row)
     } label: {
-      HStack(alignment: .top, spacing: 12) {
-        ModelAvatar(vendor: model?.vendor, size: 36)
-        VStack(alignment: .leading, spacing: 7) {
-          Text(row.title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
-            .truncationMode(.middle)
+      HStack(alignment: .center, spacing: 12) {
+        ModelAvatar(vendor: model?.vendor, size: 30)
+        VStack(alignment: .leading, spacing: 5) {
+          HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(row.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+              .truncationMode(.middle)
+            Text(":\(String(row.port))").font(.system(size: 10, design: .monospaced))
+              .foregroundStyle(.secondary).fixedSize()
+          }
           HStack(spacing: 8) {
             EndpointStatusView(row: row)
             Text("·").accessibilityHidden(true)
             Text(artifact?.shortFormat ?? row.configured?.artifact ?? "Native runner")
               .lineLimit(1).truncationMode(.middle)
           }.font(.system(size: 11)).foregroundStyle(.secondary)
-          Text(row.baseURL).font(.system(size: 11, design: .monospaced))
-            .foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
         }
         Spacer(minLength: 0)
       }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
     }.buttonStyle(.plain)
-      .help("View \(row.title) details and logs")
+      .help("\(row.title)\n\(row.baseURL)\n\(artifact?.quant ?? row.configured?.artifact ?? "")")
       .accessibilityIdentifier("select-endpoint-\(row.port)")
   }
 
@@ -218,16 +248,6 @@ struct EndpointsView: View {
         .accessibilityLabel("Actions for \(row.title) on port \(String(row.port))")
         .accessibilityIdentifier("endpoint-actions-\(row.port)")
         .help("Model actions")
-      if let review = EndpointRemovalReview(row) {
-        Button("Remove configuration…", systemImage: "trash", role: .destructive) {
-          removing = review
-        }.labelStyle(.iconOnly).buttonStyle(QuietButtonStyle())
-          .frame(width: 32, height: 32)
-          .disabled(!workspace.canRemoveEndpoint(review))
-          .accessibilityLabel("Remove \(row.title) configuration on port \(String(row.port))")
-          .accessibilityIdentifier("endpoint-remove-\(row.port)")
-          .help("Remove configuration; keep model files")
-      }
     }.fixedSize()
   }
 }

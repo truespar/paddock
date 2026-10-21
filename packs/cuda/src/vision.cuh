@@ -1075,12 +1075,26 @@ int pd_vision_attn_h(const void* q, const void* k, const void* v, void* out, uin
     cudaDeviceGetAttribute(&cc, cudaDevAttrComputeCapabilityMajor, dev);
     cudaDeviceGetAttribute(&ccm, cudaDevAttrComputeCapabilityMinor, dev);
     if (cc < 8) return cudaErrorInvalidValue;
+#if defined(PD_TC5_HOST)
+    // cc 10.0, hd 72 self-attention: the tcgen05 kernel (vision_tc5.cuh, 0.375 ms vs 1.43 a
+    // qwen3.8 page layer on B200). It declines every other shape, which lands below.
+    {
+        const int rc = pd_vision_attn_tc5(q, k, v, out, nq, nkv, n_heads, head_dim, n_batch,
+                                          (cudaStream_t)stream);
+        if (rc != (int)cudaErrorNotSupported) return rc;
+    }
+#endif
     const uint32_t dp = (head_dim + 15u) & ~15u;
     // 64-row blocks on cc 12.0 (measured, see the kernel note) and cc 12.1
     // (GB10, Gemma 4's picture tower, 2394 rows x 12 heads x hd 64, one
     // sequence 307 -> 289 us, four 1273 -> 1099; bench/vis_attn_h2_bench.cu,
     // 0 mismatches); 128 elsewhere
-    const bool qw4 = (cc == 12 && (ccm == 0 || ccm == 1));
+    // PADDOCK_VIS_QW=4|8 pins the block shape for A/B on dies not yet measured (B200)
+    static const int qw_pin = [] {
+        const char* e = pd_env("PADDOCK_VIS_QW");
+        return e ? atoi(e) : 0;
+    }();
+    const bool qw4 = qw_pin ? qw_pin == 4 : (cc == 12 && (ccm == 0 || ccm == 1));
     const uint32_t qw = qw4 ? 4u : PD_VM_QW;
     dim3 grid((nq + qw * 16u - 1u) / (qw * 16u), n_heads, n_batch);
     const uint32_t nth = 32u * qw;
@@ -2137,5 +2151,42 @@ int pd_ocr_patches_u8(const void* pixels, void* out, float m0, float m1,
                                (cudaStream_t)stream>>>(
         (const uint8_t*)pixels, (__half*)out, m0, m1, m2, s0, s1, s2, g,
         patch, px, n);
+    return pd_launch_status();
+}
+
+// ------------------------------------------------------------------ 871 qwen tower patchify
+// The qwen3-vl / qwen3.5 tower's input on the device: `batch` resized [th][tw][3] u8 pictures,
+// back to back, into the patch GEMM's f16 rows [batch * n][3 * p * p] in the merged 2 x 2 order
+// (encode_batch's host im2col: row r of a picture is block r / 4 of the (pw/2)-wide block grid,
+// quadrant r % 4 = (dy, dx)), each value f16((u8 / 255 - mean[c]) / std[c]) - normalize_rgb's
+// division, subtraction and division with explicit _rn ops, then convert_f32_f16's rounding, so
+// the rows are the host chain's bits. The host chain held 12 ms of the engine thread a page on
+// B200 (normalize + im2col) plus a 21 MB f32 upload, with the GPU idle behind it.
+__global__ void pd_qwv_patchify_kernel(const uint8_t* __restrict__ rgb, __half* __restrict__ out,
+                                       float m0, float m1, float m2, float s0, float s1, float s2,
+                                       uint32_t tw, uint32_t th, uint32_t p) {
+    const uint32_t gw = tw / p, n = gw * (th / p), r = blockIdx.x, pp = p * p;
+    const uint32_t blk = r >> 2, q = r & 3u, hw = gw >> 1;
+    const uint32_t py = 2u * (blk / hw) + (q >> 1), px = 2u * (blk % hw) + (q & 1u);
+    const uint8_t* src = rgb + (size_t)blockIdx.y * tw * th * 3u;
+    __half* dst = out + ((size_t)blockIdx.y * n + r) * 3u * pp;
+    for (uint32_t e = threadIdx.x; e < 3u * pp; e += blockDim.x) {
+        const uint32_t c = e / pp, rr = e % pp, ky = rr / p, kx = rr % p;
+        const float mean = c == 0u ? m0 : (c == 1u ? m1 : m2);
+        const float sd = c == 0u ? s0 : (c == 1u ? s1 : s2);
+        const float v = __fdiv_rn((float)src[((size_t)(py * p + ky) * tw + px * p + kx) * 3u + c], 255.0f);
+        dst[e] = __float2half(__fdiv_rn(__fsub_rn(v, mean), sd));
+    }
+}
+
+PD_EXPORT
+int pd_qwv_patchify(const void* rgb, void* out, float m0, float m1, float m2, float s0, float s1,
+                    float s2, uint32_t tw, uint32_t th, uint32_t patch, uint32_t batch,
+                    void* stream) {
+    if (patch == 0 || tw % (2u * patch) || th % (2u * patch)) return cudaErrorInvalidValue;
+    const uint32_t n = (tw / patch) * (th / patch);
+    if (n == 0 || batch == 0) return 0;
+    pd_qwv_patchify_kernel<<<dim3(n, batch), 256, 0, (cudaStream_t)stream>>>(
+        (const uint8_t*)rgb, (__half*)out, m0, m1, m2, s0, s1, s2, tw, th, patch);
     return pd_launch_status();
 }

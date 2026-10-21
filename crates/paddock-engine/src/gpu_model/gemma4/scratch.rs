@@ -18,6 +18,50 @@ use cudarc::driver::CudaSlice;
 use super::Scratch;
 use crate::gpu::{GpuError, GpuExecutor};
 
+/// Batched-prefill chunk rows. 2048 (llama's ubatch class) puts the mmq
+/// GEMMs above the pipe rung's 1024-row floor; widest scratch row set is
+/// ~1 GB - noise next to the 33 GB of weights.
+// 8192: SGLang's B200 heuristic runs 16384-token prefill chunks -
+// at our old 2048 cap every full-weight pass amortized over 8x fewer
+// tokens and the BM=128 expert-sort PAD fraction sat at ~2x (255 blocks
+// for 128 experts). The tick stays 2048 by DEFAULT (decode cadence);
+// PADDOCK_G4_TICK_ROWS raises it per deployment up to this cap.
+pub(crate) const PF_ROWS: usize = 8192;
+
+/// Rows the prefill scratch is actually allocated for on this server - and
+/// therefore the size every prefill lane chunks at. The two must never
+/// diverge: the scratch planes are `[rows, dim]`, so a chunk wider than the
+/// allocation is an out-of-bounds write, not a slow path.
+///
+/// PF_ROWS above is a CEILING, not a size. It was raised 2048 -> 8192 for
+/// B200 muse waves, and allocating the full 8192 unconditionally costs every
+/// server ~5.0 GiB on gemma-4-31B - even a 4096-context serve, which can
+/// never present more than 4096 rows in one chunk. That unusable half of the
+/// scratch is enough to push the batch pool to zero slots and drop the model
+/// onto the serial engine.
+///
+/// Two things bound a chunk, and the wider wins:
+///  - a single-sequence bulk prefill, at most `max_ctx` rows;
+///  - one serving tick - the mixed prefill budget plus every live slot's
+///    spec-verify rows. [`pf_rows_floor`] covers the budget plus 1024 rows of
+///    verify, i.e. any width up to ~113 slots.
+///
+/// This is where a server STARTS. `enable_batch` steps it down the halving
+/// ladder when the KV plan cannot seat the configured context beside it, so
+/// `GpuGemma4::pf_rows` - not this - is the width every lane must read.
+pub(crate) fn pf_rows(max_ctx: usize) -> usize {
+    PF_ROWS.min(max_ctx.next_multiple_of(128).max(pf_rows_floor()))
+}
+
+/// The narrowest chunk this server may run: one serving tick - the mixed
+/// prefill budget plus 1024 rows of spec verify.
+///
+/// Below it a tick overruns the planes, which is an out-of-bounds write and
+/// not a slow path, so this is where `batch::set_pf_rows`'s ladder stops.
+pub(crate) fn pf_rows_floor() -> usize {
+    (super::batch::mixed_tick_rows() + 1024).next_multiple_of(128)
+}
+
 /// Everything the scratch planes are sized from, resolved once at load.
 ///
 /// The per-layer maxima are precomputed deliberately: they are the only thing
@@ -54,6 +98,9 @@ pub(crate) struct ScratchDims {
     pub kq_dense: bool,
     /// the routed experts are k-quant seats: their sums + grouped CSR planes
     pub kq_moe: bool,
+    /// the dense FFN's live Q8 gate/up planes land straight into the down
+    /// GEMM's input at prefill (pack slot 865): size `pf_yq_ff` for it
+    pub q8_gu: bool,
     /// Raw (non-pool) accumulator for the uniq-routing diagnostic, armed once
     /// by the loader. Carried rather than re-armed because `g4_moe_uniq_arm`
     /// leaks its buffer by design (process lifetime) - arming it per rebuild
@@ -179,6 +226,15 @@ pub(crate) fn build(
                 n_ff.max(n_embd).max(max_q).div_ceil(128) * pf_rows.next_multiple_of(128) * 144,
             )
             .map_err(|e| name("pf_yq", &e))?,
+        // the down GEMM's mmq input when gate|up land it directly (pf_yq is
+        // that launch's input, so it cannot take the output)
+        pf_yq_ff: exec
+            .alloc_u8(if d.q8_gu {
+                n_ff.div_ceil(128) * pf_rows.next_multiple_of(128) * 144
+            } else {
+                32
+            })
+            .map_err(|e| name("pf_yq_ff", &e))?,
         // skfix also holds the ks K-split partial planes: the M-col rung
         // (wide-spec verify, <=192 rows) peaks at nz*out*rows = 2*21504*192 f32
         // (gate/up) - 9M covers every dense shape

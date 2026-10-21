@@ -49,6 +49,13 @@ pub struct KvPool {
     /// handed out again, whether to a sequence or to a tier restore that
     /// refills only the pool's own planes.
     tenant: Vec<u32>,
+    /// Blocks the prefix cache holds a reference to ([`Self::retain_cached`]),
+    /// and how many of those nobody else references (refcount 1) - what the
+    /// cache could free right now. Counted on every refcount move so the
+    /// admission figure is O(1): it was a walk of the whole radix tree,
+    /// several times a scheduler pass and once a pipelined decode tick.
+    cached: Vec<bool>,
+    lone_cached: usize,
 }
 
 impl KvPool {
@@ -60,6 +67,8 @@ impl KvPool {
             // for tests + locality); order is otherwise immaterial.
             free: (0..n_blocks).rev().collect(),
             tenant: vec![0; n_blocks as usize],
+            cached: vec![false; n_blocks as usize],
+            lone_cached: 0,
         }
     }
 
@@ -90,9 +99,13 @@ impl KvPool {
     /// Allocate a fresh block (refcount -> 1). `Err` = pool exhausted.
     pub fn alloc(&mut self) -> Result<BlockId, PoolExhausted> {
         let b = self.free.pop().ok_or(PoolExhausted)?;
-        debug_assert_eq!(
+        // Hard invariants, not debug_asserts: a violated one hands a block to
+        // two owners and the serve keeps running on corrupted KV - the failure
+        // then surfaces as wrong tokens far from the cause. A panic here names
+        // the caller instead.
+        assert_eq!(
             self.refcount[b as usize], 0,
-            "free block had nonzero refcount"
+            "kv pool: free block {b} had nonzero refcount"
         );
         self.refcount[b as usize] = 1;
         let g = &mut self.tenant[b as usize];
@@ -109,18 +122,54 @@ impl KvPool {
     /// Add a reference to an already-allocated block (refcount++). Used when a new
     /// sequence adopts a shared prefix block.
     pub fn retain(&mut self, b: BlockId) {
-        debug_assert!(self.refcount[b as usize] > 0, "retain of a free block");
+        assert!(
+            self.refcount[b as usize] > 0,
+            "kv pool: retain of free block {b}"
+        );
+        if self.cached[b as usize] && self.refcount[b as usize] == 1 {
+            self.lone_cached -= 1;
+        }
         self.refcount[b as usize] += 1;
     }
 
     /// Drop a reference (refcount--). At 0 the block returns to the free-list.
     pub fn release(&mut self, b: BlockId) {
         let rc = &mut self.refcount[b as usize];
-        debug_assert!(*rc > 0, "double free / release of a free block");
+        assert!(*rc > 0, "kv pool: double release of block {b}");
         *rc -= 1;
+        if self.cached[b as usize] {
+            assert!(*rc > 0, "kv pool: block {b} freed under the prefix cache");
+            if *rc == 1 {
+                self.lone_cached += 1;
+            }
+        }
         if *rc == 0 {
             self.free.push(b);
         }
+    }
+
+    /// [`Self::retain`] on behalf of the prefix cache: from now on the block
+    /// counts toward [`Self::lone_cached`] whenever the cache is its only
+    /// holder. One cache reference per block.
+    pub fn retain_cached(&mut self, b: BlockId) {
+        assert!(!self.cached[b as usize], "kv pool: block {b} cached twice");
+        self.retain(b);
+        self.cached[b as usize] = true;
+    }
+
+    /// The prefix cache dropping the reference [`Self::retain_cached`] took.
+    pub fn release_cached(&mut self, b: BlockId) {
+        assert!(self.cached[b as usize], "kv pool: block {b} not cached");
+        if self.refcount[b as usize] == 1 {
+            self.lone_cached -= 1;
+        }
+        self.cached[b as usize] = false;
+        self.release(b);
+    }
+
+    /// Blocks only the prefix cache references - freed the moment it evicts them.
+    pub fn lone_cached(&self) -> usize {
+        self.lone_cached
     }
 
     /// Copy-on-write before writing to a block you reference. If `b` is unshared

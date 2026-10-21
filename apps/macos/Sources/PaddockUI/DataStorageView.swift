@@ -73,7 +73,7 @@ struct DataStorageView: View {
         if let error = model.error {
           Text(error).foregroundStyle(PaddockStyle.caution).textSelection(.enabled)
         }
-      }
+      }.settingsSearchAnchor(.backup)
       if let registry = snapshot.identity.registry {
         SettingsGroup(title: "Models") {
           HStack {
@@ -86,7 +86,7 @@ struct DataStorageView: View {
           Button("Open models folder", systemImage: "folder") {
             NSWorkspace.shared.open(URL(fileURLWithPath: registry.modelsDir, isDirectory: true))
           }
-        }
+        }.settingsSearchAnchor(.modelsFolder)
       }
       if let inventoryError { Text(inventoryError).foregroundStyle(PaddockStyle.caution) }
       if let inventory {

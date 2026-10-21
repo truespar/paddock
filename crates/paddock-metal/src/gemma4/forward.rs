@@ -1,5 +1,18 @@
 use super::*;
 
+#[cfg(test)]
+type BatchTrace = Vec<(String, Vec<f32>)>;
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static NAX_PREFILL_FOR_TEST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    pub(super) static BASELINE_ROUNDED_MERGE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static BASELINE_DECODE_AHEAD_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static FIXED_DECODE_SPLITS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static SINGLE_DECODE_PROJECTION_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static BATCH_TRACE_FOR_TEST: std::cell::RefCell<Option<BatchTrace>> = const { std::cell::RefCell::new(None) };
+}
+
 // Do not trade padded arithmetic for another weight sweep. Retain the shared
 // ladder for narrow rows, full chunks and every other model. The 129..192 and
 // 257..288 tails use the same number of weight tiles but 25% fewer matrix rows.
@@ -88,6 +101,50 @@ impl Gemma4 {
             return;
         }
         if self.mlx {
+            #[cfg(test)]
+            if (2..=4).contains(&m) && SINGLE_DECODE_PROJECTION_FOR_TEST.get() {
+                if planes[0].0.k == 5376 {
+                    let (a, ao) = planes[0];
+                    let (b, bo) = *planes.get(1).unwrap_or(&planes[0]);
+                    let (c, co) = *planes.get(2).unwrap_or(&planes[0]);
+                    cmd.dispatch(
+                        "mlx_affine_bias8",
+                        &[input, &self.scratch.gemm],
+                        &[a.k as u32, m as u32],
+                        [(m * a.k / 8).div_ceil(256), 1, 1],
+                        256,
+                    );
+                    cmd.dispatch(
+                        [
+                            "mlx_affine_canonical2",
+                            "mlx_affine_canonical3",
+                            "mlx_affine_canonical4",
+                        ][m - 2],
+                        &[
+                            &a.buffer,
+                            &b.buffer,
+                            &c.buffer,
+                            input,
+                            ao,
+                            bo,
+                            co,
+                            &self.scratch.gemm,
+                        ],
+                        &[
+                            a.k as u32,
+                            a.n as u32,
+                            if planes.len() > 1 { b.n as u32 } else { 0 },
+                            if planes.len() > 2 { c.n as u32 } else { 0 },
+                            m as u32,
+                        ],
+                        [planes.iter().map(|(w, _)| w.n.div_ceil(16)).sum(), 1, 1],
+                        128,
+                    );
+                    return;
+                }
+                crate::affine::project_verify(cmd, planes, input, m, &self.scratch.gemm, true);
+                return;
+            }
             crate::affine::project(cmd, planes, input, m, &self.scratch.gemm);
             return;
         }
@@ -434,7 +491,9 @@ impl Gemma4 {
         macro_rules! capture {
             ($name:expr, $buffer:expr, $count:expr) => {{
                 #[cfg(test)]
-                if self.diffusion.is_some() && std::env::var_os("PADDOCK_DG_TRACE").is_some() {
+                if (self.diffusion.is_some() && std::env::var_os("PADDOCK_DG_TRACE").is_some())
+                    || BATCH_TRACE_FOR_TEST.with(|v| v.borrow().is_some())
+                {
                     let count = $count;
                     let buffer = self.device.alloc(count * 4)?;
                     copy_words(&cmd, $buffer, &buffer, 0, 0, count);
@@ -587,6 +646,14 @@ impl Gemma4 {
         {
             self.dflash_tap(&cmd, i, m);
             let hd = l.hd();
+            let rounded_merge = self.mlx
+                && !self.muse
+                && l.attn_gate.is_none()
+                && self.device.tensor_accelerated()
+                && decode.len() == m
+                && matches!(hd, 256 | 512);
+            #[cfg(test)]
+            let rounded_merge = rounded_merge && !BASELINE_ROUNDED_MERGE_FOR_TEST.get();
             let kh = l.kh();
             let heads = l.heads;
             let planes = if let Some(v) = &l.v {
@@ -685,6 +752,35 @@ impl Gemma4 {
                 );
             } else if !tiles.is_empty() {
                 let strict = self.mlx || self.moe_scratch.is_some();
+                // Qualified dense 31B text geometry only. Keep vision,
+                // diffusion, MoE, speculative serving and Apple7–9 on
+                // their existing arithmetic contracts. No runtime opt-in.
+                let nax = self.mlx
+                    && !self.muse
+                    && self.diffusion.is_none()
+                    && self.moe_scratch.is_none()
+                    && self.spec.is_none()
+                    && !self.verifying
+                    && self.width == 5376
+                    && self.layers.len() == 60
+                    && rows
+                        .iter()
+                        .all(|&(slot, _, _)| self.slots[slot].mm.is_none())
+                    && !image_batch
+                    && matches!(hd, 256 | 512)
+                    && cmd.tensor_accelerated();
+                #[cfg(test)]
+                let nax = nax && NAX_PREFILL_FOR_TEST.get().unwrap_or(true);
+                if nax {
+                    assert!(s.gemm.len() >= m * heads * hd * 2);
+                    cmd.dispatch(
+                        "mlx_input_compact",
+                        &[&s.q, &s.gemm],
+                        &[(heads * hd) as u32, m as u32],
+                        [(m * heads * hd).div_ceil(256), 1, 1],
+                        256,
+                    );
+                }
                 if !strict {
                     cmd.dispatch(
                         "attention_query",
@@ -695,7 +791,7 @@ impl Gemma4 {
                     );
                 }
                 let mut buffers = vec![
-                    if strict { &s.q } else { &s.gemm },
+                    if strict && !nax { &s.q } else { &s.gemm },
                     &l.keys,
                     &l.values,
                     &s.meta,
@@ -707,7 +803,13 @@ impl Gemma4 {
                     buffers.push(&s.limits);
                 }
                 cmd.dispatch(
-                    if self.mlx {
+                    if nax {
+                        if hd == 256 {
+                            "gmlx_nax_prefill256"
+                        } else {
+                            "gmlx_nax_prefill512"
+                        }
+                    } else if self.mlx {
                         match (image_batch, hd) {
                             (true, 256) => "gmlx_image_prefill256",
                             (true, 512) => "gmlx_image_prefill512",
@@ -734,7 +836,7 @@ impl Gemma4 {
                     },
                     &buffers,
                     &p,
-                    [heads, tiles.len() / 2, 1],
+                    [heads, tiles.len() / 2, if nax && hd == 512 { 2 } else { 1 }],
                     128,
                 );
             }
@@ -756,10 +858,27 @@ impl Gemma4 {
                         .max(16usize.div_ceil(decode.len()))
                         .clamp(1, SPLITS)
                 };
+                #[cfg(test)]
+                let splits = if FIXED_DECODE_SPLITS_FOR_TEST.get() {
+                    visible.div_ceil(128).clamp(16, SPLITS)
+                } else {
+                    splits
+                };
                 p.push(splits as u32);
+                let decode_ahead = self.mlx
+                    && !self.muse
+                    && self.width == 5376
+                    && self.moe_scratch.is_none()
+                    && self.diffusion.is_none()
+                    && self.device.tensor_accelerated()
+                    && decode.len() == 4
+                    && visible >= 1024;
+                #[cfg(test)]
+                let decode_ahead = decode_ahead && !BASELINE_DECODE_AHEAD_FOR_TEST.get();
                 cmd.dispatch(
                     if self.mlx {
                         match hd {
+                            256 if decode_ahead => "gmlx_value2_256",
                             128 => "gmlx_decode128",
                             256 => "gmlx_decode256",
                             _ => "gmlx_decode512",
@@ -794,6 +913,8 @@ impl Gemma4 {
                 cmd.dispatch(
                     if self.muse {
                         "muse_merge"
+                    } else if rounded_merge {
+                        "gmlx_merge_rounded"
                     } else {
                         "gemma_merge_shared"
                     },
@@ -813,7 +934,7 @@ impl Gemma4 {
                     256,
                 );
             }
-            if self.mlx && l.attn_gate.is_none() {
+            if self.mlx && l.attn_gate.is_none() && !rounded_merge {
                 cmd.dispatch(
                     "gmlx_round",
                     &[&s.attn],
@@ -969,6 +1090,14 @@ impl Gemma4 {
             self.pool.release(source);
         }
         self.last_gpu_seconds = completed?;
+        #[cfg(test)]
+        BATCH_TRACE_FOR_TEST.with(|v| {
+            if let Some(trace) = v.borrow_mut().as_mut() {
+                for (name, buffer, count) in &diagnostic {
+                    trace.push((name.clone(), unsafe { buffer.read_f32(0, *count / m) }));
+                }
+            }
+        });
         #[cfg(test)]
         if let Some(root) = std::env::var_os("PADDOCK_DG_TRACE") {
             let root = std::path::Path::new(&root);

@@ -92,7 +92,7 @@ import UniformTypeIdentifiers
     }
     guard !workspace.desktopNavigationBlocked else {
       error =
-        "Studio already has unfinished work. Your question is kept here. Finish or clear the Studio draft first."
+        "Finish the active response, upload or edit in Studio first. Your question is kept here."
       return false
     }
     transferring = true

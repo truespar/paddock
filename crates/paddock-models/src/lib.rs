@@ -27,6 +27,7 @@ pub mod meminfo;
 pub mod mlx;
 pub mod modelopt;
 pub mod nemotron;
+pub mod nemotron_asr;
 pub mod probe;
 pub mod qwen4exp;
 pub mod safetensors;

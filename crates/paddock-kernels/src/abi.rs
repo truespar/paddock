@@ -9083,7 +9083,258 @@ pub struct KernelTableV1 {
     /// Same arguments and `part` contract as `kquant_gemm_mma_ks`, which it
     /// hands b > 8 and the i-quant family to. Reorder-equal to ks / dp4a.
     pub kquant_gemm_w4a8_sb: Option<KquantGemmMmaKsFn>,
+    /// Slot 853: `pd_nasr_gemm` - Nemotron 3.5 ASR's projections: slot 722's
+    /// F32-class GEMM (the activation split three ways in bf16 against the
+    /// exact int8 weight) on Q8_0 kept as stored - int8 rows `[N][K]` and the
+    /// file's f16 block scales `[K/32][N]` - with the conformer's epilogues:
+    /// 0 store, 2 accumulate, 6 SiLU, 7 accumulate half (the macaron FFN), 8
+    /// GLU over interleaved rows (`N / 2` wide), 9 ReLU.
+    pub nasr_gemm: Option<NasrGemmFn>,
+    /// Slot 854: `pd_nasr_sub_stem` - the x8 subsampler's causal 3x3 stride-2
+    /// stem conv (1 -> 256 channels, frequency padded (2, 1)) + ReLU over a
+    /// window's rows at absolute mel-frame coordinates, `[t][65][256]`.
+    pub nasr_sub_stem: Option<NasrSubStemFn>,
+    /// Slot 855: `pd_nasr_sub_dw` - a separable stage's causal depthwise 3x3
+    /// stride-2 conv over `[t][f][256]`, ReLU on read optional (the previous
+    /// pointwise GEMM's activation).
+    pub nasr_sub_dw: Option<NasrSubDwFn>,
+    /// Slot 856: `pd_nasr_sub_flatten` - ReLU and `[t][17][256]` ->
+    /// `[t][256 * 17]`, channel-major (the reference's flatten).
+    pub nasr_sub_flatten: Option<NasrSubFlattenFn>,
+    /// Slot 857: `pd_nasr_attention` - Transformer-XL relative-position
+    /// attention (8 heads of 128, content and position biases, the layer's
+    /// relative-key table over distances -13..69) under the chunked_limited
+    /// mask over every segment of a pass (`PdNasrSeg`: each stream's rows,
+    /// frames, chunk and rings), keys from the stream's 56-slot K/V rings and
+    /// its window's qkv rows; one CTA a (chunk, head).
+    pub nasr_attention: Option<NasrAttentionFn>,
+    /// Slot 858: `pd_nasr_ring_put` - each segment's last rows into its
+    /// layer's rings (0 the K ring, 1 the V ring, 2 the convolution's) at
+    /// slot `frame % slots`.
+    pub nasr_ring_put: Option<NasrRingPutFn>,
+    /// Slot 859: `pd_nasr_dwconv` - the convolution module's causal kernel-9
+    /// depthwise conv (each stream's 8-slot ring of previous rows) +
+    /// LayerNorm + SiLU over a pass's rows.
+    pub nasr_dwconv: Option<NasrDwconvFn>,
+    /// Slot 860: `pd_nasr_greedy` - the RNN-T greedy walk of up to 32 streams
+    /// on one cooperative grid, products on the tensor cores at F32 class: a
+    /// step scores up to 32 (stream, frame) rows against each stream's
+    /// decoder state (frame-speculative - the state only changes on a token),
+    /// the 10-symbol frame cap, the LSTM and projection for the streams that
+    /// emitted.
+    pub nasr_greedy: Option<NasrGreedyFn>,
+    /// Slot 861: `pd_nasr_prompt_relu` - `y = ReLU(y + table[prompt])` per
+    /// pass row, the prompt its segment's (the prompt projector's first
+    /// layer, each one-hot column folded into a bias row at load).
+    pub nasr_prompt_relu: Option<NasrPromptReluFn>,
+    /// Slot 862: `pd_g4u_patches` - Gemma 4 12B's picture input: a resized
+    /// u8 picture's 48 px patches (raster order) as 6912-wide f32 rows in
+    /// the mmproj's CHW order (`c * 2304 + y * 48 + x`), scaled by the
+    /// processor's 1/255 factor, through `patch_ln1` (LayerNorm with bias).
+    pub g4u_patches: Option<G4uPatchesFn>,
+    /// Slot 863: `pd_g4u_post` - in place over the patch projection's rows
+    /// (bias already added): `patch_ln2`, the factorized position
+    /// `pos_x[col] + pos_y[row]` from the `[2][pos_size][dim]` table,
+    /// `pos_norm`, then the multimodal embedder's weightless RMS norm.
+    pub g4u_post: Option<G4uPostFn>,
+    /// Slot 864: `pd_g4u_audio` - raw 16 kHz samples as 640-sample frames
+    /// (the last one zero-padded), each through the weightless RMS norm.
+    pub g4u_audio: Option<G4uAudioFn>,
+    /// Slot 865: `pd_q8_0_gemm_mmq_gu` - the FFN's gate and up Q8_0 mmq
+    /// GEMMs in one launch, landing `glu(gate) * up` quantized in the mmq
+    /// activation layout (the down GEMM's input) - bytes identical to the
+    /// two `mmq_pipe` GEMMs + `quantize_q8_mmq_geglu` / `_swiglu`. `act` 0
+    /// (tanh GELU) or 1 (SiLU); anything else is refused.
+    pub q8_0_gemm_mmq_gu: Option<Q8GemmMmqGuFn>,
+    /// Slot 866: `pd_rmsnorm_add_scale_norm_q8` - slot 777's sandwich
+    /// post-norm + next norm with the next norm landed mmq-quantized in `yq`
+    /// (the Q8_0 prefill GEMMs' activation layout; `xn` optional) - bytes
+    /// identical to `rmsnorm_add_scale` + `rmsnorm_batch` + `quantize_q8_mmq`.
+    /// Rows >= 256 and n % 128; -2 elsewhere.
+    pub rmsnorm_add_scale_norm_q8: Option<RmsnormAddScaleNormQ8Fn>,
+    /// Slot 867: `pd_nvf4_gemm_tc5w` - the checkpoint-plane W4A4 GEMM on
+    /// tcgen05 `kind::mxf4nvf4` (sm_100a, gemm/dense_nvf4_tc5.cuh): slot 426's
+    /// contract (`y = scale2 * W4.X4^T + bias`, xq/xs from the nvf4
+    /// quantizers) with the weight scales pre-tiled by slot 868. `part`
+    /// (`part_floats` f32) holds K-split partials; null = unsplit. NULL off
+    /// cc 10.0 and without the TMA encode.
+    pub nvf4_gemm_tc5w: Option<Nvf4GemmTc5wFn>,
+    /// Slot 868: `pd_nvf4_tc5_tile_scales` - load-time repack of a weight
+    /// plane's e4m3 scale cells into slot 867's canonical tile order
+    /// (`ceil(out/128) * in/256 * 2048` bytes).
+    pub nvf4_tc5_tile_scales: Option<Nvf4Tc5TileScalesFn>,
+    /// Slot 869: `pd_f8_gemm_tc5x` - the W8 plane GEMM (e4m3 + ue8m0 per 32,
+    /// both operands) on tcgen05 `kind::mxf8f6f4` with hardware block
+    /// scaling: `f8d_gemm_mma_ks`'s contract (xq/xs from `quantize_e4m3`),
+    /// `part` (`part_floats` f32) for K-split partials. NULL off cc 10.0.
+    pub f8_gemm_tc5x: Option<F8GemmTc5xFn>,
+    /// Slot 870: `pd_f8row_gemm_tc5x` - the per-row-scale e4m3 GEMM on the same
+    /// tcgen05 pipeline: `f8row_gemm`'s contract (f32 scale per weight row and
+    /// per activation row, applied in the epilogue). NULL off cc 10.0.
+    pub f8row_gemm_tc5x: Option<F8rowGemmTc5xFn>,
+    /// Slot 871: `pd_qwv_patchify` - the qwen-family tower's input on the
+    /// device: `batch` resized `[th][tw][3]` u8 pictures (back to back) into
+    /// the patch GEMM's f16 rows `[batch * n][3 * patch^2]` in the merged 2x2
+    /// order, `f16((u8 / 255 - mean[c]) / std[c])` with the host chain's
+    /// rounding (normalize + im2col + convert_f32_f16, bit for bit).
+    pub qwv_patchify: Option<QwvPatchifyFn>,
+    /// Slot 872: `pd_attn_prefill_tc5_vl` - slot 322's varlen packed prefill
+    /// (same arguments) at 128-row tiles with both attention GEMMs on tcgen05
+    /// in the e4m3 class (Q, K, V, P e4m3, f32 accumulate). hd 256, fp8
+    /// pools, G 6. NULL off cc 10.0.
+    pub attn_prefill_tc5_vl: Option<AttnPrefillTc5VlFn>,
+    /// Slot 873: `pd_causal_conv1d_silu_qkv_win_qkc` - slot 446 for one
+    /// RESUMED span: `x` at the span's first row, the k-1 taps before it read
+    /// from the slot's conv window (`[k-1][conv_dim]`, oldest first); q/k
+    /// land compact bf16, v f32 expanded. The caller updates the window.
+    pub causal_conv1d_silu_qkv_win_qkc: Option<ConvSiluQkvWinQkcFn>,
+    /// Slot 874: `pd_nvf4_gemm_tc5_swq` - slot 533's interleaved gate|up
+    /// GEMM with the swiglu + nvf4-quant epilogue (the down GEMM's `q`
+    /// `[batch, ff/2]` / `qs` `[batch, ff/16]`, no f32 landing) on tcgen05,
+    /// reading the tc5w-tiled weight scales. NULL off cc 10.0.
+    pub nvf4_gemm_tc5_swq: Option<Nvf4GemmTc5SwqFn>,
+    /// Slot 875: `pd_conv_step_slots_qkvn` - the decode DeltaNet front in one
+    /// launch: conv step over each slot's window (shifted in place) + silu +
+    /// q/k/v split + q, k l2 norms + GQA widening, `x_new` rows `x_stride`
+    /// floats apart. Bit-identical to `conv_step_slots_s` +
+    /// `deltanet_split_gqa_norm`. k = 4 only (NotSupported otherwise).
+    pub conv_step_slots_qkvn: Option<ConvStepSlotsQkvnFn>,
+    /// Slot 876: `pd_add_rmsnorm_nvf4_batch` - `add_rmsnorm_batch` +
+    /// `quantize_nvf4` in one launch: `x += proj`, `out` = the f32 normed
+    /// row, (`q`, `qs`) its nvf4 bytes. Bit-identical to the pair;
+    /// NotSupported where `add_rmsnorm_batch` would not take its register-row
+    /// kernel.
+    pub add_rmsnorm_nvf4_batch: Option<AddRmsnormNvf4BatchFn>,
+    /// Slot 877: `pd_add_rmsnorm_e4m3_batch` - slot 876 with
+    /// `quantize_e4m3`'s per-32 linear e4m3 planes (`q` `[batch, n]`, `qs`
+    /// `[batch, n / 32]`). Same contract and decline rule.
+    pub add_rmsnorm_e4m3_batch: Option<AddRmsnormNvf4BatchFn>,
+    /// Slot 878: `pd_gated_rmsnorm_e4m3_zs` - `gated_rmsnorm_e4m3` with z
+    /// read strided: row r's z at `(r / heads) * z_bstride + (r % heads) * d`
+    /// floats (the decode tick's fused in-proj plane, z half). d == 128 only.
+    pub gated_rmsnorm_e4m3_zs: Option<GatedRmsnormE4m3ZsFn>,
+    /// Slot 879: `pd_add_rmsnorm_nvf4_batch_sw` - `add_rmsnorm_nvf4_batch` with
+    /// the scales in the tcgen05 GEMM's swizzled atom layout (`qs` holds
+    /// ceil(batch / 128) * 128 rows' worth); n % 64 == 0. For slot 881.
+    pub add_rmsnorm_nvf4_batch_sw: Option<AddRmsnormNvf4BatchFn>,
+    /// Slot 880: `pd_swiglu_fused_nvf4_il_sw` - `swiglu_fused_nvf4_il` with the
+    /// scales swizzled likewise; ff % 64 == 0.
+    pub swiglu_fused_nvf4_il_sw: Option<SwigluFusedNvf4Fn>,
+    /// Slot 881: `pd_nvf4_gemm_tc5w_sw` - `nvf4_gemm_tc5w` reading pre-swizzled
+    /// activation scales (slots 879 / 880), no swizzle launch. NotSupported at
+    /// batch <= 64.
+    pub nvf4_gemm_tc5w_sw: Option<Nvf4GemmTc5wFn>,
+    /// Slot 882: `pd_f8_gemm_tc5x_t` - `f8_gemm_tc5x` with the weight scales
+    /// pre-tiled by slot 883: both operands' scale tiles by bulk copy, the same
+    /// bits. NotSupported at batch <= 64.
+    pub f8_gemm_tc5x_t: Option<F8GemmTc5xFn>,
+    /// Slot 883: `pd_f8_tc5_tile_scales` (scale, tiled, in, out, stream) - a W8
+    /// plane's ue8m0 cells into slot 882's tile order; `tiled` holds
+    /// ceil(out / 128) * (in / 128) * 512 bytes.
+    pub f8_tc5_tile_scales: Option<Nvf4Tc5TileScalesFn>,
+    /// Slot 884: `pd_add_rmsnorm_e4m3_batch_sw` - slot 877 with the scales in
+    /// the tcgen05 GEMM's swizzled atom layout (`qs` holds ceil(batch / 128) *
+    /// 128 rows' worth) for slot 887. n % 128 == 0.
+    pub add_rmsnorm_e4m3_batch_sw: Option<AddRmsnormNvf4BatchFn>,
+    /// Slot 885: `pd_gated_rmsnorm_e4m3_zs_sw` - slot 878 with the scales
+    /// swizzled for the out-proj GEMM (`n_w` = its in_dim / 128).
+    pub gated_rmsnorm_e4m3_zs_sw: Option<GatedRmsnormE4m3ZsSwFn>,
+    /// Slot 886: `pd_quantize_e4m3_sw` (x, q, scale, n_row, rows, stream) -
+    /// `quantize_e4m3` with the scales swizzled; n_row % 128 == 0.
+    pub quantize_e4m3_sw: Option<QuantizeE4m3SwFn>,
+    /// Slot 887: `pd_f8_gemm_tc5x_tsw` - slot 882 with the activation scales
+    /// already swizzled (884-886): no swizzle launch, the same bits.
+    /// NotSupported at batch <= 64.
+    pub f8_gemm_tc5x_tsw: Option<F8GemmTc5xFn>,
+    /// Slot 888: `pd_rmsnorm_e4m3_row_xn` (x, w, xn, q, rscale, n, eps, rows,
+    /// stream) - `rmsnorm_e4m3_row` also landing the f32 normed row in `xn`.
+    pub rmsnorm_e4m3_row_xn: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            f32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 889: `pd_add_rmsnorm_e4m3_row_xn` (x, proj, w, xn, q, rscale, n,
+    /// eps, rows, stream) - the same for `add_rmsnorm_e4m3_row`.
+    pub add_rmsnorm_e4m3_row_xn: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            f32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
 }
+
+/// See [`KernelTableV1::gated_rmsnorm_e4m3_zs_sw`].
+pub type GatedRmsnormE4m3ZsSwFn = unsafe extern "C" fn(
+    x: *const core::ffi::c_void,
+    z: *const core::ffi::c_void,
+    z_bstride: u32,
+    heads: u32,
+    weight: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    q: *mut core::ffi::c_void,
+    scale: *mut core::ffi::c_void,
+    n_rows: u32,
+    d: u32,
+    eps: f32,
+    n_w: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::quantize_e4m3_sw`].
+pub type QuantizeE4m3SwFn = unsafe extern "C" fn(
+    x: *const core::ffi::c_void,
+    q: *mut core::ffi::c_void,
+    scale: *mut core::ffi::c_void,
+    n_row: u32,
+    rows: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::gated_rmsnorm_e4m3_zs`].
+pub type GatedRmsnormE4m3ZsFn = unsafe extern "C" fn(
+    x: *const core::ffi::c_void,
+    z: *const core::ffi::c_void,
+    z_bstride: u32,
+    heads: u32,
+    weight: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    q: *mut core::ffi::c_void,
+    scale: *mut core::ffi::c_void,
+    n_rows: u32,
+    d: u32,
+    eps: f32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::add_rmsnorm_nvf4_batch`].
+pub type AddRmsnormNvf4BatchFn = unsafe extern "C" fn(
+    x: *mut core::ffi::c_void,
+    proj: *const core::ffi::c_void,
+    w: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    q: *mut core::ffi::c_void,
+    qs: *mut core::ffi::c_void,
+    n: u32,
+    eps: f32,
+    batch: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
 
 /// See [`KernelTableV1::rmsnorm_add_scale_norm`].
 pub type RmsnormAddScaleNormFn = unsafe extern "C" fn(
@@ -11025,7 +11276,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 838;
+pub const KERNEL_TABLE_SLOTS: usize = 875;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,
@@ -14312,6 +14563,335 @@ pub type DlRefStepFn = unsafe extern "C" fn(
     delta: *const core::ffi::c_void,
     ref16: *mut core::ffi::c_void,
     q: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::nasr_gemm`].
+pub type NasrGemmFn = unsafe extern "C" fn(
+    x: *const core::ffi::c_void,
+    w: *const core::ffi::c_void,
+    scale: *const core::ffi::c_void,
+    bias: *const core::ffi::c_void,
+    y: *mut core::ffi::c_void,
+    k: u32,
+    n: u32,
+    m: u32,
+    mode: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::nasr_sub_stem`].
+pub type NasrSubStemFn = unsafe extern "C" fn(
+    mel: *const core::ffi::c_void,
+    base: i64,
+    rows: u32,
+    valid: i64,
+    w: *const core::ffi::c_void,
+    b: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    first: i64,
+    count: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::nasr_sub_dw`].
+pub type NasrSubDwFn = unsafe extern "C" fn(
+    input: *const core::ffi::c_void,
+    base: i64,
+    rows: u32,
+    valid: i64,
+    fin: u32,
+    w: *const core::ffi::c_void,
+    b: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    first: i64,
+    count: u32,
+    relu_in: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::nasr_sub_flatten`].
+pub type NasrSubFlattenFn = unsafe extern "C" fn(
+    input: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    rows: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::nasr_attention`].
+pub type NasrAttentionFn = unsafe extern "C" fn(
+    qkv: *const core::ffi::c_void,
+    segs: *const core::ffi::c_void,
+    nseg: u32,
+    chunks: u32,
+    layer: u32,
+    rel: *const core::ffi::c_void,
+    bu: *const core::ffi::c_void,
+    bv: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    scale: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::nasr_ring_put`].
+pub type NasrRingPutFn = unsafe extern "C" fn(
+    src: *const core::ffi::c_void,
+    ld: u32,
+    col0: u32,
+    segs: *const core::ffi::c_void,
+    nseg: u32,
+    layer: u32,
+    which0: u32,
+    count: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::nasr_dwconv`].
+pub type NasrDwconvFn = unsafe extern "C" fn(
+    g: *const core::ffi::c_void,
+    segs: *const core::ffi::c_void,
+    nseg: u32,
+    rows: u32,
+    layer: u32,
+    w: *const core::ffi::c_void,
+    nw: *const core::ffi::c_void,
+    nb: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::nasr_greedy`].
+pub type NasrGreedyFn = unsafe extern "C" fn(
+    w: *const *const core::ffi::c_void,
+    proj: *const core::ffi::c_void,
+    jobs: *mut core::ffi::c_void,
+    count: u32,
+    tokens: *mut core::ffi::c_void,
+    frames: *mut core::ffi::c_void,
+    part: *mut core::ffi::c_void,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::nasr_prompt_relu`].
+pub type NasrPromptReluFn = unsafe extern "C" fn(
+    y: *mut core::ffi::c_void,
+    n: u32,
+    rows: u32,
+    segs: *const core::ffi::c_void,
+    nseg: u32,
+    table: *const core::ffi::c_void,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::g4u_patches`].
+pub type G4uPatchesFn = unsafe extern "C" fn(
+    rgb: *const core::ffi::c_void,
+    w: u32,
+    gw: u32,
+    n: u32,
+    ln_w: *const core::ffi::c_void,
+    ln_b: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    eps: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::g4u_post`].
+pub type G4uPostFn = unsafe extern "C" fn(
+    h: *mut core::ffi::c_void,
+    ln2_w: *const core::ffi::c_void,
+    ln2_b: *const core::ffi::c_void,
+    pos: *const core::ffi::c_void,
+    pos_size: u32,
+    gw: u32,
+    ln3_w: *const core::ffi::c_void,
+    ln3_b: *const core::ffi::c_void,
+    n: u32,
+    dim: u32,
+    eps_ln: f32,
+    eps_rms: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::g4u_audio`].
+pub type G4uAudioFn = unsafe extern "C" fn(
+    samples: *const core::ffi::c_void,
+    n_samples: u32,
+    n_tok: u32,
+    out: *mut core::ffi::c_void,
+    eps: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::nvf4_gemm_tc5w`].
+pub type Nvf4GemmTc5wFn = unsafe extern "C" fn(
+    data: *const core::ffi::c_void,
+    scale_tiled: *const core::ffi::c_void,
+    bias: *const core::ffi::c_void,
+    xq: *const core::ffi::c_void,
+    xs: *const core::ffi::c_void,
+    y: *mut core::ffi::c_void,
+    scale2: f32,
+    in_dim: u32,
+    out_dim: u32,
+    batch: u32,
+    part: *mut core::ffi::c_void,
+    part_floats: u64,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::conv_step_slots_qkvn`].
+pub type ConvStepSlotsQkvnFn = unsafe extern "C" fn(
+    wins: *mut core::ffi::c_void,
+    x_new: *const core::ffi::c_void,
+    w: *const core::ffi::c_void,
+    q_out: *mut core::ffi::c_void,
+    k_out: *mut core::ffi::c_void,
+    v_out: *mut core::ffi::c_void,
+    slots: *const core::ffi::c_void,
+    batch: u32,
+    x_stride: u32,
+    n_k_heads: u32,
+    n_v_heads: u32,
+    s: u32,
+    conv_k: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::nvf4_gemm_tc5_swq`].
+pub type Nvf4GemmTc5SwqFn = unsafe extern "C" fn(
+    data: *const core::ffi::c_void,
+    scale_tiled: *const core::ffi::c_void,
+    xq: *const core::ffi::c_void,
+    xs: *const core::ffi::c_void,
+    q: *mut core::ffi::c_void,
+    qs: *mut core::ffi::c_void,
+    scale2: f32,
+    in_dim: u32,
+    out_dim: u32,
+    batch: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::causal_conv1d_silu_qkv_win_qkc`].
+pub type ConvSiluQkvWinQkcFn = unsafe extern "C" fn(
+    x: *const core::ffi::c_void,
+    w: *const core::ffi::c_void,
+    win: *const core::ffi::c_void,
+    q_out: *mut core::ffi::c_void,
+    k_out: *mut core::ffi::c_void,
+    v_out: *mut core::ffi::c_void,
+    n_rows: u32,
+    n_k_heads: u32,
+    n_v_heads: u32,
+    s: u32,
+    conv_k: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::attn_prefill_tc5_vl`] (slot 322's argument list).
+pub type AttnPrefillTc5VlFn = unsafe extern "C" fn(
+    q: *const core::ffi::c_void,
+    pool_k: *const core::ffi::c_void,
+    pool_v: *const core::ffi::c_void,
+    sinks: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    positions: *const core::ffi::c_void,
+    items: *const core::ffi::c_void,
+    n_tiles: u32,
+    block_tables: *const core::ffi::c_void,
+    blocks_per_slot: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    kv_dim: u32,
+    swa_window: u32,
+    scale: f32,
+    kv_dtype: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::qwv_patchify`].
+pub type QwvPatchifyFn = unsafe extern "C" fn(
+    rgb: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    m0: f32,
+    m1: f32,
+    m2: f32,
+    s0: f32,
+    s1: f32,
+    s2: f32,
+    tw: u32,
+    th: u32,
+    patch: u32,
+    batch: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::f8row_gemm_tc5x`].
+pub type F8rowGemmTc5xFn = unsafe extern "C" fn(
+    data: *const core::ffi::c_void,
+    w_rowscale: *const core::ffi::c_void,
+    xq: *const core::ffi::c_void,
+    x_rowscale: *const core::ffi::c_void,
+    y: *mut core::ffi::c_void,
+    in_dim: u32,
+    out_dim: u32,
+    batch: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::f8_gemm_tc5x`].
+pub type F8GemmTc5xFn = unsafe extern "C" fn(
+    data: *const core::ffi::c_void,
+    scale: *const core::ffi::c_void,
+    xq: *const core::ffi::c_void,
+    xs: *const core::ffi::c_void,
+    y: *mut core::ffi::c_void,
+    in_dim: u32,
+    out_dim: u32,
+    batch: u32,
+    part: *mut core::ffi::c_void,
+    part_floats: u64,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::nvf4_tc5_tile_scales`].
+pub type Nvf4Tc5TileScalesFn = unsafe extern "C" fn(
+    scale: *const core::ffi::c_void,
+    tiled: *mut core::ffi::c_void,
+    in_dim: u32,
+    out_dim: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::rmsnorm_add_scale_norm_q8`].
+pub type RmsnormAddScaleNormQ8Fn = unsafe extern "C" fn(
+    x: *mut core::ffi::c_void,
+    proj: *const core::ffi::c_void,
+    wpost: *const core::ffi::c_void,
+    wpre: *const core::ffi::c_void,
+    xn: *mut core::ffi::c_void,
+    yq: *mut core::ffi::c_void,
+    n: u32,
+    eps: f32,
+    s: f32,
+    rows: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::q8_0_gemm_mmq_gu`].
+pub type Q8GemmMmqGuFn = unsafe extern "C" fn(
+    gate_data: *const core::ffi::c_void,
+    gate_scale: *const core::ffi::c_void,
+    up_data: *const core::ffi::c_void,
+    up_scale: *const core::ffi::c_void,
+    yq: *const core::ffi::c_void,
+    yo: *mut core::ffi::c_void,
+    in_dim: u32,
+    n_ff: u32,
+    batch: u32,
+    act: u32,
     stream: *mut core::ffi::c_void,
 ) -> KernelStatus;
 

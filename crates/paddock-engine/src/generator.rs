@@ -875,6 +875,13 @@ pub trait Generator: Send {
     /// once per batched tick; idempotent. Default no-op.
     fn release_inactive_slots(&mut self, _occupied: &[bool]) {}
 
+    /// Slot `slot` now serves background work (`GenRequest::background`, the
+    /// manager's batch queue) or live work - called whenever a sequence is
+    /// seated, admission and recompute resume alike. Backends with a prefix
+    /// cache stamp it on what that slot inserts (`PagedRadix::insert_as`), so
+    /// batch prefixes are evicted before live ones and never tiered.
+    fn set_slot_background(&mut self, _slot: usize, _on: bool) {}
+
     /// Free KV blocks in the paged budget pool, or `None` when the backend has
     /// no pool (admit by slots only). Drives the P5b watermark: the scheduler
     /// stops admitting new sequences while the pool is nearly full and resumes as
@@ -1176,6 +1183,15 @@ pub trait Generator: Send {
     /// step and this is dead weight for it - which is the point: an encoder
     /// budget is a backend capability, not a scheduler policy.
     fn encode_step(&mut self) -> Vec<(usize, MmAdmit)> {
+        Vec::new()
+    }
+
+    /// `encode_step`'s non-blocking half, safe beside an in-flight prefill
+    /// span: advances only work that queues GPU work and returns (riding
+    /// slot jobs - plan, tower launch, enqueue); never a blocking prefill
+    /// pass. Empty when nothing such is at the front. The overlap scheduler
+    /// calls it in the host time a queued decode tick leaves.
+    fn encode_step_overlap(&mut self) -> Vec<(usize, MmAdmit)> {
         Vec::new()
     }
 
@@ -1692,6 +1708,9 @@ impl Generator for crate::gpu_model::qwen35::GpuQwen35 {
     fn encode_step(&mut self) -> Vec<(usize, MmAdmit)> {
         self.mm_steps_run()
     }
+    fn encode_step_overlap(&mut self) -> Vec<(usize, MmAdmit)> {
+        self.mm_steps_run_overlap()
+    }
     fn encoding_pending(&self) -> bool {
         self.mm_steps_pending()
     }
@@ -1832,6 +1851,9 @@ impl Generator for crate::gpu_model::qwen35::GpuQwen35 {
     }
     fn anchor_at(&mut self, _slot: usize, tokens: &[u32], upto: usize) {
         crate::gpu_model::qwen35::GpuQwen35::anchor_at(self, tokens, upto)
+    }
+    fn set_slot_background(&mut self, slot: usize, on: bool) {
+        crate::gpu_model::qwen35::GpuQwen35::set_slot_background(self, slot, on)
     }
     fn set_page_reader(&mut self, on: bool) {
         crate::gpu_model::qwen35::GpuQwen35::set_page_reader(self, on)
@@ -2023,6 +2045,9 @@ impl Generator for crate::gpu_model::gpt_oss::GpuGptOss {
     }
     fn release_inactive_slots(&mut self, occupied: &[bool]) {
         crate::gpu_model::gpt_oss::GpuGptOss::release_inactive_slots(self, occupied);
+    }
+    fn set_slot_background(&mut self, slot: usize, on: bool) {
+        crate::gpu_model::gpt_oss::GpuGptOss::set_slot_background(self, slot, on);
     }
     fn pool_free_blocks(&self) -> Option<usize> {
         crate::gpu_model::gpt_oss::GpuGptOss::pool_free_blocks(self)

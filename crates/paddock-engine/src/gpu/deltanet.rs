@@ -441,6 +441,75 @@ impl GpuExecutor {
         })
     }
 
+    /// Slot 873: [`Self::causal_conv1d_silu_qkv_vl_qkc_at`] for one RESUMED
+    /// span - the k-1 taps before row `in_row_off` come from the slot's conv
+    /// window (`win` at element `win_off`, `[k-1][conv_dim]` oldest first)
+    /// instead of the ext build's staging copies. q/k land compact bf16 at
+    /// `out_row_off`, v f32 expanded. The caller commits the new window after.
+    #[allow(clippy::too_many_arguments)]
+    pub fn causal_conv1d_silu_qkv_win_qkc_at(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &CudaSlice<f32>,
+        win: &CudaSlice<f32>,
+        win_off: usize,
+        q: &mut CudaSlice<f32>,
+        k: &mut CudaSlice<f32>,
+        v: &mut CudaSlice<f32>,
+        in_row_off: usize,
+        out_row_off: usize,
+        n_tokens: usize,
+        n_k_heads: usize,
+        n_v_heads: usize,
+        s: usize,
+        conv_k: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .causal_conv1d_silu_qkv_win_qkc
+            .ok_or(GpuError::MissingOp("causal_conv1d_silu_qkv_win_qkc"))?;
+        let conv_dim = (2 * n_k_heads + n_v_heads) * s;
+        if win_off + conv_k.saturating_sub(1) * conv_dim > win.len() {
+            return Err(GpuError::Unsupported(format!(
+                "conv win qkc: window {} elements, {} asked",
+                win.len(),
+                win_off + conv_k.saturating_sub(1) * conv_dim
+            )));
+        }
+        let (xp, _g1) = x.device_ptr(&self.stream);
+        let (wp, _g2) = w.device_ptr(&self.stream);
+        let (winp, _g3) = win.device_ptr(&self.stream);
+        let (qp, _g4) = q.device_ptr_mut(&self.stream);
+        let (kp, _g5) = k.device_ptr_mut(&self.stream);
+        let (vp, _g6) = v.device_ptr_mut(&self.stream);
+        let f32b = std::mem::size_of::<f32>();
+        let xp = xp + (in_row_off * conv_dim * f32b) as u64;
+        let winp = winp + (win_off * f32b) as u64;
+        // compact bf16 rows: n_k_heads * s * 2 bytes per row
+        let qk_off = (out_row_off * n_k_heads * s * 2) as u64;
+        let v_off = (out_row_off * n_v_heads * s * f32b) as u64;
+        check(unsafe {
+            f(
+                xp as *const _,
+                wp as *const _,
+                winp as *const _,
+                (qp + qk_off) as *mut _,
+                (kp + qk_off) as *mut _,
+                (vp + v_off) as *mut _,
+                n_tokens as u32,
+                n_k_heads as u32,
+                n_v_heads as u32,
+                s as u32,
+                conv_k as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    pub fn has_conv_silu_qkv_win_qkc(&self) -> bool {
+        self.kernels.causal_conv1d_silu_qkv_win_qkc.is_some()
+    }
+
     /// DeltaNet gate math: `beta = sigmoid(b)`, `g = ssm_a·softplus(a+dt_bias)`.
     /// `a`/`b` are [n_tokens, n_heads]; `ssm_a`/`dt_bias` are [n_heads].
     #[allow(clippy::too_many_arguments)]
@@ -839,6 +908,159 @@ impl GpuExecutor {
 
     /// True when the pack ships all three P71-R2 fused-plane strided ops
     /// (slots 438-440) - the DN split launch can then disappear at decode.
+    /// Slot 875: the decode DeltaNet front in one launch - `conv_step_slots_s`
+    /// (x_new rows `x_stride` floats apart from element `x_off`) fused with
+    /// `deltanet_split_gqa_norm` into the expanded q / k / v planes;
+    /// bit-identical to that pair. conv_k 4 only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv_step_slots_qkvn(
+        &self,
+        wins: &mut CudaSlice<f32>,
+        x_new: &CudaSlice<f32>,
+        x_off: usize,
+        x_stride: usize,
+        w: &CudaSlice<f32>,
+        q: &mut CudaSlice<f32>,
+        k: &mut CudaSlice<f32>,
+        v: &mut CudaSlice<f32>,
+        slots: &CudaSlice<u32>,
+        batch: usize,
+        n_k_heads: usize,
+        n_v_heads: usize,
+        s: usize,
+        conv_k: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .conv_step_slots_qkvn
+            .ok_or(GpuError::MissingOp("conv_step_slots_qkvn"))?;
+        let rows = batch * n_v_heads * s;
+        if x_off + batch.saturating_sub(1) * x_stride + (2 * n_k_heads + n_v_heads) * s
+            > x_new.len()
+            || q.len() < rows
+            || k.len() < rows
+            || v.len() < rows
+        {
+            return Err(GpuError::Unsupported(format!(
+                "conv_step_slots_qkvn: {batch} rows overrun x ({}) or the q/k/v planes",
+                x_new.len()
+            )));
+        }
+        let (wp, _g1) = wins.device_ptr_mut(&self.stream);
+        let (xp, _g2) = x_new.device_ptr(&self.stream);
+        let (cwp, _g3) = w.device_ptr(&self.stream);
+        let (qp, _g4) = q.device_ptr_mut(&self.stream);
+        let (kp, _g5) = k.device_ptr_mut(&self.stream);
+        let (vp, _g6) = v.device_ptr_mut(&self.stream);
+        let (slp, _g7) = slots.device_ptr(&self.stream);
+        let xp = xp + (x_off * std::mem::size_of::<f32>()) as u64;
+        check(unsafe {
+            f(
+                wp as *mut _,
+                xp as *const _,
+                cwp as *const _,
+                qp as *mut _,
+                kp as *mut _,
+                vp as *mut _,
+                slp as *const _,
+                batch as u32,
+                x_stride as u32,
+                n_k_heads as u32,
+                n_v_heads as u32,
+                s as u32,
+                conv_k as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// Slot 878: [`Self::gated_rmsnorm_e4m3`] (no f32 landing) with z read
+    /// strided - row r's z at `(r / heads) * z_bstride + (r % heads) * d`
+    /// floats from `z_off` into `z`: the decode tick's fused in-proj plane, so
+    /// the z half never lands split. d == 128 only; `Ok(false)` when the pack
+    /// has no slot or declines (nothing launched). `sw` (slot 885): the scales
+    /// in the out-proj GEMM's swizzled atom layout (its rows = `heads` rows
+    /// here; `scale` holds ceil(n_rows / heads / 128) * 128 of them).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_rmsnorm_e4m3_zs(
+        &self,
+        x: &CudaSlice<f32>,
+        z: &CudaSlice<f32>,
+        z_off: usize,
+        z_bstride: usize,
+        heads: usize,
+        w: &CudaSlice<f32>,
+        q: &mut CudaSlice<i8>,
+        (scale, sw): (&mut CudaSlice<u8>, bool),
+        n_rows: usize,
+        d: usize,
+        eps: f32,
+    ) -> Result<bool, GpuError> {
+        let (plain, swz) = (
+            self.kernels.gated_rmsnorm_e4m3_zs,
+            self.kernels.gated_rmsnorm_e4m3_zs_sw,
+        );
+        // the swizzled plane holds whole 128-row groups of the GEMM's rows (`heads` rows here each)
+        let s_rows = match sw {
+            true if heads > 0 => n_rows.div_ceil(heads).next_multiple_of(128) * heads,
+            _ => n_rows,
+        };
+        if (if sw { swz.is_none() } else { plain.is_none() })
+            || heads == 0
+            || x.len() < n_rows * d
+            || q.len() < n_rows * d
+            || scale.len() < s_rows * d / 32
+            || z.len() < z_off + n_rows.div_ceil(heads).saturating_sub(1) * z_bstride + heads * d
+        {
+            return Ok(false);
+        }
+        let (xp, _g1) = x.device_ptr(&self.stream);
+        let (zp, _g2) = z.device_ptr(&self.stream);
+        let (wp, _g3) = w.device_ptr(&self.stream);
+        let (qp, _g4) = q.device_ptr_mut(&self.stream);
+        let (sp, _g5) = scale.device_ptr_mut(&self.stream);
+        let (xp, wp, qp, sp) = (xp as *const _, wp as *const _, qp as *mut _, sp as *mut _);
+        // SAFETY: z offset within the strided extent checked above
+        let zp = unsafe { (zp as *const f32).add(z_off) } as *const _;
+        let (zb, hd, nr, dd, st) = (
+            z_bstride as u32,
+            heads as u32,
+            n_rows as u32,
+            d as u32,
+            self.stream_ptr(),
+        );
+        let out = core::ptr::null_mut();
+        // SAFETY: ABI contract (slots 878 / 885); x / q / scale / the strided z extent checked above
+        let rc = unsafe {
+            match (plain, swz) {
+                (_, Some(f)) if sw => f(xp, zp, zb, hd, wp, out, qp, sp, nr, dd, eps, hd, st),
+                (Some(f), _) => f(xp, zp, zb, hd, wp, out, qp, sp, nr, dd, eps, st),
+                _ => return Ok(false),
+            }
+        };
+        const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
+        if rc == CUDA_ERROR_NOT_SUPPORTED {
+            return Ok(false);
+        }
+        check(rc).map(|()| true)
+    }
+
+    pub fn has_gated_rmsnorm_e4m3_zs(&self) -> bool {
+        self.kernels.gated_rmsnorm_e4m3_zs.is_some()
+    }
+
+    pub fn has_conv_step_slots_qkvn(&self) -> bool {
+        self.kernels.conv_step_slots_qkvn.is_some()
+    }
+
+    pub fn has_conv_step_slots_s(&self) -> bool {
+        self.kernels.conv_step_slots_s.is_some()
+    }
+
+    pub fn has_gated_rmsnorm_s(&self) -> bool {
+        self.kernels.gated_rmsnorm_s.is_some()
+    }
+
     pub fn has_dn_fused_strided(&self) -> bool {
         self.kernels.conv_step_slots_s.is_some()
             && self.kernels.gated_rmsnorm_s.is_some()

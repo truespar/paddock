@@ -68,7 +68,7 @@ kernel void bonsai_mv(device const uchar* w [[buffer(0)]],device const float* x 
 // A lane owns a complete packed word, so its 16 codes load once. Eight lanes
 // own one scale group. Concurrent requests reuse the decoded word in registers
 // instead of launching independent full-weight walks for each request.
-template<uint R,bool Full=false>
+template<uint R,bool Full=false,bool Bits=false>
 inline void bonsai_vectors(device const uchar* w,device const float* x,device float* out,
     uint K,uint N,uint M,uint type,uint2 g,uint tid) {
     #pragma clang fp reassociate(off)
@@ -83,7 +83,16 @@ inline void bonsai_vectors(device const uchar* w,device const float* x,device fl
         } else {
             ulong i=ulong(n)*K+k;uint word=reinterpret_cast<device const uint*>(w)[i/16];
             float scale=float(reinterpret_cast<device const half*>(w+ulong(K)*N/4)[i/128]);
-            for(uint j=0;j<4;++j)weights[j]=(float4((uint4(word)>>uint4(j*8,j*8+2,j*8+4,j*8+6))&3)-1.0f)*scale;
+            for(uint j=0;j<4;++j) {
+                uint4 codes=(uint4(word)>>uint4(j*8,j*8+2,j*8+4,j*8+6))&3;
+                if constexpr(Bits) {
+                    // Validated ternary codes select {-scale, signed zero,
+                    // scale} by bits. No integer-to-float conversion or
+                    // per-weight scale multiplication; preserve signed zero.
+                    uint4 value=select(uint4(as_type<uint>(scale)),uint4(as_type<uint>(scale)&0x80000000u),codes==1);
+                    weights[j]=as_type<float4>(value^select(uint4(0),uint4(0x80000000u),codes==0));
+                } else { weights[j]=(float4(codes)-1.0f)*scale; }
+            }
         }
         for(uint r=0;r<R;++r)if(Full || first+r<M) {
             for(uint j=0;j<4;++j) {
@@ -114,27 +123,57 @@ BONSAI_FULL(2)
 BONSAI_FULL(3)
 BONSAI_FULL(4)
 #undef BONSAI_FULL
+#define BONSAI_BITS(R) \
+kernel void bonsai_bits##R(device const uchar* w [[buffer(0)]],device const float* x [[buffer(1)]],device float* out [[buffer(2)]], \
+constant uint* p [[buffer(3)]],uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {bonsai_vectors<R,true,true>(w,x,out,p[0],p[1],p[2],p[3],g,tid);}
+BONSAI_BITS(1)
+BONSAI_BITS(2)
+BONSAI_BITS(3)
+BONSAI_BITS(4)
+#undef BONSAI_BITS
+
 // Concatenate independent Q/K/V or gate/up dispatch domains, not their
 // buffers. Narrow projections occupy the GPU alongside their wider peers.
-#define BONSAI_MULTI(R) \
-kernel void bonsai_multi##R(device const uchar* w0 [[buffer(0)]],device const uchar* w1 [[buffer(1)]],device const uchar* w2 [[buffer(2)]], \
+#define BONSAI_MULTI(NAME,R,BITS) \
+kernel void NAME(device const uchar* w0 [[buffer(0)]],device const uchar* w1 [[buffer(1)]],device const uchar* w2 [[buffer(2)]], \
 device const float* x [[buffer(3)]],device float* o0 [[buffer(4)]],device float* o1 [[buffer(5)]],device float* o2 [[buffer(6)]], \
 constant uint* p [[buffer(7)]],uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) { \
 uint N=p[1],nx=(N+15)/16;device const uchar* w=w0;device float* out=o0; \
 if(g.x>=nx){g.x-=nx;N=p[2];nx=(N+15)/16;w=w1;out=o1; \
 if(g.x>=nx){g.x-=nx;N=p[3];w=w2;out=o2;}} \
-bonsai_vectors<R,true>(w,x,out,p[0],N,p[4],0x102,g,tid);}
-BONSAI_MULTI(1)
-BONSAI_MULTI(2)
-BONSAI_MULTI(3)
-BONSAI_MULTI(4)
+bonsai_vectors<R,true,BITS>(w,x,out,p[0],N,p[4],0x102,g,tid);}
+BONSAI_MULTI(bonsai_multi1,1,false)
+BONSAI_MULTI(bonsai_multi2,2,false)
+BONSAI_MULTI(bonsai_multi3,3,false)
+BONSAI_MULTI(bonsai_multi4,4,false)
+BONSAI_MULTI(bonsai_bits_multi1,1,true)
+BONSAI_MULTI(bonsai_bits_multi2,2,true)
+BONSAI_MULTI(bonsai_bits_multi3,3,true)
+BONSAI_MULTI(bonsai_bits_multi4,4,true)
 #undef BONSAI_MULTI
-template<uint BM,uint BN=16,uint BK=128,bool Relaxed=false>
+// Recurrent input: two independent packed planes and two small F32 gates.
+// Schedule their disjoint output domains together. F32 gates read the
+// original activation; only packed weights consume the rotated activation.
+#define BONSAI_MIXED(R) \
+kernel void bonsai_mixed##R(device const uchar* w0 [[buffer(0)]],device const uchar* w1 [[buffer(1)]],device const uchar* w2 [[buffer(2)]],device const uchar* w3 [[buffer(3)]], \
+device const float* rotated [[buffer(4)]],device const float* x [[buffer(5)]],device float* o0 [[buffer(6)]],device float* o1 [[buffer(7)]],device float* o2 [[buffer(8)]],device float* o3 [[buffer(9)]], \
+constant uint* p [[buffer(10)]],uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) { \
+uint a=(p[1]+15)/16,b=(p[2]+15)/16,c=(p[3]+15)/16; \
+if(g.x<a){bonsai_vectors<R,true,true>(w0,rotated,o0,p[0],p[1],p[5],0x102,g,tid);return;}g.x-=a; \
+if(g.x<b){bonsai_vectors<R,true,true>(w1,rotated,o1,p[0],p[2],p[5],0x102,g,tid);return;}g.x-=b; \
+if(g.x<c){bonsai_vectors<R>(w2,x,o2,p[0],p[3],p[5],0,g,tid);return;}g.x-=c; \
+bonsai_vectors<R>(w3,x,o3,p[0],p[4],p[5],0,g,tid);}
+BONSAI_MIXED(1)
+BONSAI_MIXED(2)
+BONSAI_MIXED(3)
+BONSAI_MIXED(4)
+#undef BONSAI_MIXED
+template<uint BM,uint BN=16,uint BK=128,bool Relaxed=false,typename W=float,uint Padding=4>
 inline void bonsai_mm(device const uchar* w,device float* x,device float* out,constant uint* p,
-    uint2 g,uint tid,threadgroup float* weights) {
+    uint2 g,uint tid,threadgroup W* weights) {
     uint K=p[0],N=p[1],M=p[2],n=g.x*BN,m=g.y*BM;
     auto input=tensor(x,dextents<int,2>(K,M),array<int,2>{1,int(K)});
-    auto b=tensor(weights,extents<int,BK,BN>(),array<int,2>{1,BK+4});
+    auto b=tensor(weights,extents<int,BK,BN>(),array<int,2>{1,BK+Padding});
     auto output=tensor(out,dextents<int,2>(N,M),array<int,2>{1,int(N)});
     constexpr auto desc=matmul2d_descriptor(BM,BN,BK,false,true,Relaxed,matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc,execution_simdgroups<4>> op;
@@ -145,12 +184,12 @@ inline void bonsai_mm(device const uchar* w,device float* x,device float* out,co
         for(uint index=tid;index<BN*BK/16;index+=128) {
         uint col=n+index/(BK/16),k=base+(index%(BK/16))*16;
         if(p[3]==0) {
-            for(uint j=0;j<16;++j)weights[(index/(BK/16))*(BK+4)+(index%(BK/16))*16+j]=col<N?
+            for(uint j=0;j<16;++j)weights[(index/(BK/16))*(BK+Padding)+(index%(BK/16))*16+j]=col<N?
                 reinterpret_cast<device const float*>(w)[ulong(col)*K+k+j]:0.0f;
         } else {
             uint word=col<N?reinterpret_cast<device const uint*>(w)[(ulong(col)*K+k)/16]:0;
             float scale=col<N?float(reinterpret_cast<device const half*>(w+ulong(K)*N/4)[(ulong(col)*K+k)/128]):0.0f;
-            for(uint j=0;j<16;++j)weights[(index/(BK/16))*(BK+4)+(index%(BK/16))*16+j]=float(int((word>>(j*2))&3)-1)*scale;
+            for(uint j=0;j<16;++j)weights[(index/(BK/16))*(BK+Padding)+(index%(BK/16))*16+j]=float(int((word>>(j*2))&3)-1)*scale;
         }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -185,7 +224,20 @@ threadgroup float weights[32*68];bonsai_mm<M,32,64,true>(w,x,out,p,g,tid,weights
 BONSAI_PREFILL(32)
 BONSAI_PREFILL(64)
 BONSAI_PREFILL(16)
+BONSAI_PREFILL(128)
 #undef BONSAI_PREFILL
+#define BONSAI_PREHALF(M,K) \
+kernel void bonsai_prehalf##M##x##K(device const uchar* w [[buffer(0)]],device float* x [[buffer(1)]],device float* out [[buffer(2)]],constant uint* p [[buffer(3)]],uint2 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) { \
+constexpr uint Pad=K==256?0:4;threadgroup half weights[32*(K+Pad)];bonsai_mm<M,32,K,true,half,Pad>(w,x,out,p,g,tid,weights);}
+BONSAI_PREHALF(32,128)
+BONSAI_PREHALF(64,128)
+BONSAI_PREHALF(128,128)
+// Longer prompt tiles amortize staging/barriers over two exact F16 scale
+// groups. Decoder and short prompt elections keep their prior tile.
+// No padding on the deep tile: even the doubled shader-instrumentation
+// reservation must fit the 32 KiB threadgroup limit.
+BONSAI_PREHALF(128,256)
+#undef BONSAI_PREHALF
 
 template<bool Residual,bool Selected>
 inline void bonsai_rms_impl(device float* x,device const float* delta,device const float* w,

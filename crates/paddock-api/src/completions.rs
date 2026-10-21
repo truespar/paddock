@@ -175,16 +175,18 @@ impl Usage {
         prompt_tokens: usize,
         cached: usize,
         media_tokens: usize,
-        is_audio: bool,
+        audio_tokens: usize,
     ) -> Option<serde_json::Value> {
         let mut v = Self::cached_details(prompt_tokens, cached)?;
-        if media_tokens > 0 {
-            let key = if is_audio {
-                "audio_tokens"
-            } else {
-                "image_tokens"
-            };
-            v[key] = serde_json::json!(media_tokens);
+        // `audio_tokens` of the media rows are a clip's (all of them on the
+        // audio-only families, which pass usize::MAX), the rest a picture's -
+        // Gemma 4 12B takes both in one request
+        let audio = audio_tokens.min(media_tokens);
+        if audio > 0 {
+            v["audio_tokens"] = serde_json::json!(audio);
+        }
+        if media_tokens > audio {
+            v["image_tokens"] = serde_json::json!(media_tokens - audio);
         }
         Some(v)
     }

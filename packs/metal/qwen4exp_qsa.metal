@@ -313,13 +313,14 @@ Q4S_ATTENTION(q4b_attention_compact,bfloat,true,true,true)
 // 2 = 128-bit vectors with SIMD-shared physical addresses for K and V.
 // K keeps an aligned vector pitch; V's independent pitch spreads its scalar
 // transposed writes without changing logical tensors, contractions or joins.
-template<uint Pad,uint Load=0,uint VPad=Pad,uint Direct=0>
+template<uint Pad,uint Load=0,uint VPad=Pad,uint Direct=0,uint Ahead=0>
 inline void q4b_attention_local_impl(device float* q,device const bfloat* kc,
  device const bfloat* vc,device const uint4* meta,device const uint* pages,
  device const uint* selected,device const uint* counts,
  device float* parts,constant uint* p,uint3 g,uint tid,threadgroup bfloat* kv,
  threadgroup float* scores,threadgroup float* prob,threadgroup float* maxima,
  threadgroup float* denom,threadgroup float* correction) {
+    static_assert(Ahead<=8 && (Ahead==0 || (Load==2 && Direct==0)));
     uint row=g.y,kh=g.x,split=g.z,blocks=(meta[row].y+1)/4;
     uint length=min(blocks,512u)*4+(meta[row].y+1)%4;
     uint splits=((p[5+meta[row].x/32]>>(meta[row].x%32))&1) ? 4u : 1u;
@@ -377,6 +378,16 @@ inline void q4b_attention_local_impl(device float* q,device const bfloat* kc,
             }
         }
         if(!direct)threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Diagnostic: overlap bounded, read-only value loads with QK work.
+        // Tensor types, tile boundaries and softmax arithmetic stay fixed.
+        uint4 value_ahead[Ahead ? Ahead : 1];
+        for(uint a=0;a<Ahead;++a) {
+            uint i=tid*8+a*1024;
+            uint physical=simd_shuffle(physical_lane,i/256);
+            value_ahead[a]=0;
+            if(base+i/256<last)
+                value_ahead[a]=*reinterpret_cast<device const uint4*>(vc+ulong(physical)*512+kh*256+i%256);
+        }
         auto dot=qk.get_destination_cooperative_tensor<decltype(tq),decltype(tk),float>();
         if(direct) {
             // MPP input tensor element types must be unqualified. The cast
@@ -398,7 +409,8 @@ inline void q4b_attention_local_impl(device float* q,device const bfloat* kc,
             for(uint i=tid*8;i<8192;i+=1024) {
                 uint physical=Load==2 ? simd_shuffle(physical_lane,i/256) : 0;
                 uint4 bits=0;
-                if(base+i/256<last) {
+                if(i/1024<Ahead)bits=value_ahead[i/1024];
+                else if(base+i/256<last) {
                     if(Load==1) {
                         uint token=q4s_token(selected,row,base+i/256,blocks);
                         physical=pages[meta[row].x*p[0]+token/16]*16+token%16;
@@ -451,23 +463,25 @@ inline void q4b_attention_local_impl(device float* q,device const bfloat* kc,
     if(tid<12){ulong dst=q4s_part_base<true>(row,kh*12+tid,split,meta,p);
         parts[dst+256]=maxima[tid];parts[dst+257]=counts[row]<=512 ? denom[tid] : NAN;}
 }
-#define Q4B_ATTENTION_LOCAL(Name,Pad,Load,VPad,Direct) \
+#define Q4B_ATTENTION_LOCAL(Name,Pad,Load,VPad,Direct,Ahead) \
 kernel void Name(device float* q [[buffer(0)]],device const bfloat* kc [[buffer(1)]], \
  device const bfloat* vc [[buffer(2)]],device const uint4* meta [[buffer(3)]],device const uint* pages [[buffer(4)]], \
  device const uint* selected [[buffer(5)]],device const uint* counts [[buffer(6)]],device float* scratch [[buffer(7)]], \
  device float* parts [[buffer(8)]],constant uint* p [[buffer(9)]],uint3 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) { \
     alignas(16) threadgroup bfloat kv[32*(256+Pad)>256*(32+VPad) ? 32*(256+Pad) : 256*(32+VPad)]; \
     threadgroup float scores[512],prob[512],maxima[16],denom[16],correction[16]; \
-    q4b_attention_local_impl<Pad,Load,VPad,Direct>(q,kc,vc,meta,pages,selected,counts,parts,p,g,tid,kv,scores,prob,maxima,denom,correction); }
-Q4B_ATTENTION_LOCAL(q4b_attention_local,0,0,0,false)
-Q4B_ATTENTION_LOCAL(q4b_attention_local_pad,8,0,8,false)
-Q4B_ATTENTION_LOCAL(q4b_attention_local_wide,8,1,8,false)
-Q4B_ATTENTION_LOCAL(q4b_attention_local_gather,8,2,8,false)
-Q4B_ATTENTION_LOCAL(q4b_attention_local_vpad1,8,2,1,false)
-Q4B_ATTENTION_LOCAL(q4b_attention_direct_runs,8,2,1,3)
+    q4b_attention_local_impl<Pad,Load,VPad,Direct,Ahead>(q,kc,vc,meta,pages,selected,counts,parts,p,g,tid,kv,scores,prob,maxima,denom,correction); }
+Q4B_ATTENTION_LOCAL(q4b_attention_local,0,0,0,false,0)
+Q4B_ATTENTION_LOCAL(q4b_attention_local_pad,8,0,8,false,0)
+Q4B_ATTENTION_LOCAL(q4b_attention_local_wide,8,1,8,false,0)
+Q4B_ATTENTION_LOCAL(q4b_attention_local_gather,8,2,8,false,0)
+Q4B_ATTENTION_LOCAL(q4b_attention_local_vpad1,8,2,1,false,0)
+Q4B_ATTENTION_LOCAL(q4b_attention_direct_runs,8,2,1,3,0)
 #ifdef PADDOCK_KERNEL_DIAGNOSTICS
-Q4B_ATTENTION_LOCAL(q4b_attention_direct_keys,8,2,1,1)
-Q4B_ATTENTION_LOCAL(q4b_attention_direct_values,8,2,1,2)
+Q4B_ATTENTION_LOCAL(q4b_attention_direct_keys,8,2,1,1,0)
+Q4B_ATTENTION_LOCAL(q4b_attention_direct_values,8,2,1,2,0)
+Q4B_ATTENTION_LOCAL(q4b_attention_value_ahead1,8,2,1,0,1)
+Q4B_ATTENTION_LOCAL(q4b_attention_value_ahead8,8,2,1,0,8)
 #endif
 #undef Q4B_ATTENTION_LOCAL
 

@@ -34,6 +34,11 @@ impl CapturedGraph {
     /// Replay onto a different stream (the whisper admission
     /// graph overlaps the decode tick from a side stream - graph exec
     /// handles are stream-agnostic; only capture is stream-bound).
+    /// The stream this graph replays on (the one that captured it).
+    pub fn stream_ptr(&self) -> usize {
+        self.stream.cu_stream() as usize
+    }
+
     pub fn launch_on(&self, stream: &Arc<CudaStream>) -> Result<(), DriverError> {
         stream.context().bind_to_thread()?;
         unsafe { result::graph::launch(self.cu_graph_exec, stream.cu_stream()) }

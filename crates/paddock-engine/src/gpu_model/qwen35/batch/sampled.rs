@@ -356,3 +356,135 @@ impl GpuQwen35 {
         self.stop.take(&self.exec)
     }
 }
+
+impl super::GpuQwen35 {
+    /// Which shares are FUSED CKPT shares (their tail share of the same
+    /// chunk follows immediately in the same tick), and which d_ckpt_stage
+    /// blob each owns. Single source of truth: the launch-side per-layer
+    /// stage copies and the finish-side staged snapshot both recompute this
+    /// from the shares list (deterministic - adjacency + the 2-blob cap).
+    pub(super) fn fused_stage_map(
+        shares: &[(usize, usize, usize, usize, bool, Vec<u32>)],
+    ) -> Vec<Option<usize>> {
+        let mut map = vec![None; shares.len()];
+        let mut stg = 0usize;
+        for i in 0..shares.len().saturating_sub(1) {
+            if shares[i].0 == shares[i + 1].0 && stg < 2 {
+                map[i] = Some(stg);
+                stg += 1;
+            }
+        }
+        map
+    }
+}
+
+/// P65: fill TruncCat rows' ids from the device top-64 head plane
+/// (`head` = the dtoh'd [rows, 64, 2] u32 (id, raw-logit bits) plane;
+/// `plans[i]` indexes row i). Sentinel id u32::MAX = n < 64 padding.
+pub(in crate::gpu_model::qwen35) fn trunc_fill_ids(
+    head: &[u32],
+    plans: &[crate::generator::RowSample],
+    ids: &mut [u32],
+) {
+    use crate::generator::RowSample;
+    use crate::sampler::DevicePlan;
+    // engagement witness (bisect-trap law): once per process
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let n = plans
+            .iter()
+            .filter(|p| matches!(p, RowSample::Device(DevicePlan::TruncCat { .. })))
+            .count();
+        eprintln!("[trunc-head] engaged: rows={n} (device top-64 + host head sampling)");
+    });
+    for (i, p) in plans.iter().enumerate() {
+        if let RowSample::Device(DevicePlan::TruncCat {
+            inv_t,
+            u,
+            k,
+            top_p,
+            min_p,
+        }) = *p
+        {
+            let base = i * 128;
+            let pairs: Vec<(u32, f32)> = (0..64usize)
+                .filter_map(|j| {
+                    let id = head[base + j * 2];
+                    (id != u32::MAX).then(|| (id, f32::from_bits(head[base + j * 2 + 1])))
+                })
+                .collect();
+            if !pairs.is_empty() {
+                ids[i] = crate::sampler::sample_trunc_head(&pairs, inv_t, u, k, top_p, min_p);
+            }
+        }
+    }
+}
+
+/// P65 small-b twin of the device prefilter: top-64 by f32 total order from
+/// a full host row (identical head to pd_topk_rows modulo boundary-tie
+/// choice, which was never contractual). Used at b <= 2 where the one-block
+/// binary-search kernel is DRAM-latency-bound (c1 measured -13% before this
+/// fallback existed).
+pub(in crate::gpu_model::qwen35) fn host_top64(row: &[f32]) -> Vec<(u32, f32)> {
+    let k = 64.min(row.len());
+    let mut idx: Vec<u32> = (0..row.len() as u32).collect();
+    if k < idx.len() {
+        idx.select_nth_unstable_by(k - 1, |&a, &b| row[b as usize].total_cmp(&row[a as usize]));
+        idx.truncate(k);
+    }
+    idx.into_iter().map(|i| (i, row[i as usize])).collect()
+}
+
+/// Pack per-row sampler params exactly like `batch_sampled_impl` (Host/Hole
+/// are skip - the pipe never runs with Host rows). Returns (par, tpar,
+/// any_base, any5, any6): TruncCat rows pack mode 5 - the pipe only ever
+/// receives them when the pack ships slot 435 (the service gates on
+/// supports_device_trunc), so full-device is the only pipe form.
+pub(in crate::gpu_model::qwen35) fn pack_samp_par(
+    plans: &[crate::generator::RowSample],
+) -> (Vec<u32>, Vec<u32>, bool, bool, bool) {
+    use crate::generator::RowSample;
+    use crate::sampler::DevicePlan;
+    let mut par = vec![0u32; plans.len() * 4];
+    let mut tpar = vec![0u32; plans.len() * 4];
+    let (mut any_base, mut any5, mut any6) = (false, false, false);
+    for (i, p) in plans.iter().enumerate() {
+        match p {
+            RowSample::Hole | RowSample::Host => {}
+            RowSample::Device(DevicePlan::Greedy) => {
+                par[i * 4 + 2] = 1;
+                any_base = true;
+            }
+            RowSample::Device(DevicePlan::Categorical { inv_t, u }) => {
+                par[i * 4] = inv_t.to_bits();
+                par[i * 4 + 1] = u.to_bits();
+                par[i * 4 + 2] = 2;
+                any_base = true;
+            }
+            // P67b: full-device truncation sampling in the pipe
+            RowSample::Device(DevicePlan::TruncCat {
+                inv_t,
+                u,
+                k,
+                top_p,
+                min_p,
+            }) => {
+                par[i * 4] = inv_t.to_bits();
+                par[i * 4 + 1] = u.to_bits();
+                par[i * 4 + 2] = if *k >= 1 && *k <= 64 { 5 } else { 6 };
+                tpar[i * 4] = *k;
+                tpar[i * 4 + 1] = top_p.to_bits();
+                tpar[i * 4 + 2] = min_p.to_bits();
+                if *k >= 1 && *k <= 64 {
+                    any5 = true
+                } else {
+                    any6 = true
+                }
+            }
+            // RS plans are gemma4-only (supports_spec_rs); skip-safe
+            RowSample::Device(DevicePlan::RsVerify { .. })
+            | RowSample::Device(DevicePlan::RsTrunc { .. }) => {}
+        }
+    }
+    (par, tpar, any_base, any5, any6)
+}

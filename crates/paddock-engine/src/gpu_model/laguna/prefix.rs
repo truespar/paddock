@@ -304,7 +304,7 @@ impl GpuLaguna {
             return Ok(());
         };
         let blocks = bs.tables[slot].blocks().to_vec();
-        pf.radix.insert(tokens, &blocks, &mut bs.pool);
+        pf.radix.insert_for(slot, tokens, &blocks, &mut bs.pool);
         // evict-ahead to the free margin: same steady-state eviction count,
         // moved off the admission path; freed IDs reuse via the LIFO list
         let margin = crate::gpu_model::prefix_cache::evict_ahead_margin(
@@ -410,7 +410,8 @@ impl GpuLaguna {
                 return Ok(());
             }
             let blocks = bs.tables[slot].blocks()[..cut / BLOCK_TOKENS].to_vec();
-            pf.radix.insert(&history[..cut], &blocks, &mut bs.pool);
+            pf.radix
+                .insert_for(slot, &history[..cut], &blocks, &mut bs.pool);
             // None: the boundary is already checkpointed (a prompt cut) or
             // the state pool is off - nothing to add
             let Some(idx) = pf.radix.attach_state(&history[..cut], cut) else {

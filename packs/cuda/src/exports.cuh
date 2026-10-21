@@ -478,6 +478,12 @@ int pd_swiglu_quant_e4m3_row(const void* gate, const void* up, void* q, void* rs
     return pd_launch_status();
 }
 
+// the register-row kernel's envelope: <= 256 threads (its launch bounds) and the row in <= 8 float4
+// a thread
+static inline bool pd_add_rmsnorm_r_fits(uint32_t n, uint32_t nth) {
+    return nth <= 256u && (n & 3u) == 0u && (n >> 2) <= 8u * nth;
+}
+
 PD_EXPORT
 int pd_add_rmsnorm_batch(void* x, const void* proj, const void* w, void* out,
                          uint32_t n, float eps, uint32_t batch, void* stream) {
@@ -490,8 +496,72 @@ int pd_add_rmsnorm_batch(void* x, const void* proj, const void* w, void* out,
     // llama.cpp knife-edge gates, not a fixed sum order.
     // decode width overridable per die -- see pd_norm_decode_nth (the 1536-
     // thread-SM premise above is sm_120's, not B200's)
-    pd_pdl_go(pd_add_rmsnorm_batch_kernel, batch, (batch >= 64u ? pd_norm_wide_nth(batch) : pd_norm_decode_nth()), 0u, (cudaStream_t)stream,
-        (float*)x, (const float*)proj, (const float*)w, (float*)out, n, eps, 1.0f);
+    const uint32_t nth = batch >= 64u ? pd_norm_wide_nth(batch) : pd_norm_decode_nth();
+    pd_pdl_go(pd_add_rmsnorm_r_fits(n, nth) ? pd_add_rmsnorm_batch_r_kernel : pd_add_rmsnorm_batch_kernel,
+              batch, nth, 0u, (cudaStream_t)stream,
+              (float*)x, (const float*)proj, (const float*)w, (float*)out, n, eps, 1.0f);
+    return pd_launch_status();
+}
+
+// 876: pd_add_rmsnorm_batch + pd_quantize_nvf4 in one launch (pd_add_rmsnorm_nvf4_r_kernel):
+// the decode tick's pre-FFN norm feeding the W4A4 gate|up GEMM. Same width election as
+// pd_add_rmsnorm_batch; declines (cudaErrorNotSupported) where that would not take the r
+// kernel, so the bits are always the pair's. out still lands the f32 normed row.
+PD_EXPORT
+int pd_add_rmsnorm_nvf4_batch(void* x, const void* proj, const void* w, void* out, void* q,
+                              void* qs, uint32_t n, float eps, uint32_t batch, void* stream) {
+    if (n == 0 || batch == 0) return 0;
+    if ((n & 15u) != 0u || proj == nullptr) return (int)cudaErrorInvalidValue;
+    const uint32_t nth = batch >= 64u ? pd_norm_wide_nth(batch) : pd_norm_decode_nth();
+    if (!pd_add_rmsnorm_r_fits(n, nth) || (nth & 31u) != 0u) return (int)cudaErrorNotSupported;
+    pd_pdl_go(pd_add_rmsnorm_q_r_kernel<false>, batch, nth, 0u, (cudaStream_t)stream, (float*)x,
+              (const float*)proj, (const float*)w, (float*)out, (unsigned char*)q,
+              (unsigned char*)qs, n, eps, 1.0f);
+    return pd_launch_status();
+}
+
+// 879: 876 with the scales in the tcgen05 GEMM's swizzled atom layout (pd_nvf4_swz_off; qs holds
+// ceil(batch / 128) * 128 rows' worth) for the scale-swizzled W4A4 entry (881). n % 64 == 0.
+PD_EXPORT
+int pd_add_rmsnorm_nvf4_batch_sw(void* x, const void* proj, const void* w, void* out, void* q,
+                                 void* qs, uint32_t n, float eps, uint32_t batch, void* stream) {
+    if (n == 0 || batch == 0) return 0;
+    if ((n & 63u) != 0u || proj == nullptr) return (int)cudaErrorInvalidValue;
+    const uint32_t nth = batch >= 64u ? pd_norm_wide_nth(batch) : pd_norm_decode_nth();
+    if (!pd_add_rmsnorm_r_fits(n, nth) || (nth & 31u) != 0u) return (int)cudaErrorNotSupported;
+    pd_pdl_go(pd_add_rmsnorm_q_r_kernel<false, true>, batch, nth, 0u, (cudaStream_t)stream, (float*)x,
+              (const float*)proj, (const float*)w, (float*)out, (unsigned char*)q,
+              (unsigned char*)qs, n, eps, 1.0f);
+    return pd_launch_status();
+}
+
+// 877: pd_add_rmsnorm_batch + pd_quantize_e4m3 (the per-32 linear e4m3 planes the W8 GEMMs
+// read) in one launch - the decode tick's pre-mixer norm. 876's election and contract.
+PD_EXPORT
+int pd_add_rmsnorm_e4m3_batch(void* x, const void* proj, const void* w, void* out, void* q,
+                              void* qs, uint32_t n, float eps, uint32_t batch, void* stream) {
+    if (n == 0 || batch == 0) return 0;
+    if ((n & 31u) != 0u || proj == nullptr) return (int)cudaErrorInvalidValue;
+    const uint32_t nth = batch >= 64u ? pd_norm_wide_nth(batch) : pd_norm_decode_nth();
+    if (!pd_add_rmsnorm_r_fits(n, nth) || (nth & 31u) != 0u) return (int)cudaErrorNotSupported;
+    pd_pdl_go(pd_add_rmsnorm_q_r_kernel<true>, batch, nth, 0u, (cudaStream_t)stream, (float*)x,
+              (const float*)proj, (const float*)w, (float*)out, (unsigned char*)q,
+              (unsigned char*)qs, n, eps, 1.0f);
+    return pd_launch_status();
+}
+
+// 884: 877 with the scales in the tcgen05 GEMM's swizzled atom layout (pd_nvf4_swz_off; qs holds
+// ceil(batch / 128) * 128 rows' worth) for the scale-swizzled W8 entry (887). n % 128 == 0.
+PD_EXPORT
+int pd_add_rmsnorm_e4m3_batch_sw(void* x, const void* proj, const void* w, void* out, void* q,
+                                 void* qs, uint32_t n, float eps, uint32_t batch, void* stream) {
+    if (n == 0 || batch == 0) return 0;
+    if ((n & 127u) != 0u || proj == nullptr) return (int)cudaErrorInvalidValue;
+    const uint32_t nth = batch >= 64u ? pd_norm_wide_nth(batch) : pd_norm_decode_nth();
+    if (!pd_add_rmsnorm_r_fits(n, nth) || (nth & 31u) != 0u) return (int)cudaErrorNotSupported;
+    pd_pdl_go(pd_add_rmsnorm_q_r_kernel<true, true>, batch, nth, 0u, (cudaStream_t)stream, (float*)x,
+              (const float*)proj, (const float*)w, (float*)out, (unsigned char*)q,
+              (unsigned char*)qs, n, eps, 1.0f);
     return pd_launch_status();
 }
 
@@ -510,8 +580,10 @@ int pd_add_rmsnorm_scaled_batch(void* x, const void* proj, const void* w, void* 
     // llama.cpp knife-edge gates, not a fixed sum order.
     // decode width overridable per die -- see pd_norm_decode_nth (the 1536-
     // thread-SM premise above is sm_120's, not B200's)
-    pd_pdl_go(pd_add_rmsnorm_batch_kernel, batch, (batch >= 64u ? pd_norm_wide_nth(batch) : pd_norm_decode_nth()), 0u, (cudaStream_t)stream,
-        (float*)x, (const float*)proj, (const float*)w, (float*)out, n, eps, pscale);
+    const uint32_t nth = batch >= 64u ? pd_norm_wide_nth(batch) : pd_norm_decode_nth();
+    pd_pdl_go(pd_add_rmsnorm_r_fits(n, nth) ? pd_add_rmsnorm_batch_r_kernel : pd_add_rmsnorm_batch_kernel,
+              batch, nth, 0u, (cudaStream_t)stream,
+              (float*)x, (const float*)proj, (const float*)w, (float*)out, n, eps, pscale);
     return pd_launch_status();
 }
 
@@ -1922,6 +1994,43 @@ static const KernelTableV1 PD_KERNELS = {
     pd_stop_mask_rows,
     pd_kquant_gemm_w4a8_pipe4,
     pd_kquant_gemm_w4a8_sb,
+    pd_nasr_gemm,
+    pd_nasr_sub_stem,
+    pd_nasr_sub_dw,
+    pd_nasr_sub_flatten,
+    pd_nasr_attention,
+    pd_nasr_ring_put,
+    pd_nasr_dwconv,
+    pd_nasr_greedy,
+    pd_nasr_prompt_relu,
+    pd_g4u_patches,
+    pd_g4u_post,
+    pd_g4u_audio,
+    pd_q8_0_gemm_mmq_gu,
+    pd_rmsnorm_add_scale_norm_q8,
+    pd_nvf4_gemm_tc5w,
+    pd_nvf4_tc5_tile_scales,
+    pd_f8_gemm_tc5x,
+    pd_f8row_gemm_tc5x,
+    pd_qwv_patchify,
+    pd_attn_prefill_tc5_vl,
+    pd_causal_conv1d_silu_qkv_win_qkc,
+    pd_nvf4_gemm_tc5_swq,
+    pd_conv_step_slots_qkvn,
+    pd_add_rmsnorm_nvf4_batch,
+    pd_add_rmsnorm_e4m3_batch,
+    pd_gated_rmsnorm_e4m3_zs,
+    pd_add_rmsnorm_nvf4_batch_sw,
+    pd_swiglu_fused_nvf4_il_sw,
+    pd_nvf4_gemm_tc5w_sw,
+    pd_f8_gemm_tc5x_t,
+    pd_f8_tc5_tile_scales,
+    pd_add_rmsnorm_e4m3_batch_sw,
+    pd_gated_rmsnorm_e4m3_zs_sw,
+    pd_quantize_e4m3_sw,
+    pd_f8_gemm_tc5x_tsw,
+    pd_rmsnorm_e4m3_row_xn,
+    pd_add_rmsnorm_e4m3_row_xn,
 };
 
 PD_EXPORT const PackInfo* paddock_pack_info(void) {
@@ -1975,6 +2084,17 @@ PD_EXPORT const KernelTableV1* paddock_pack_kernels_v1(void) {
             t.nvf4_gemm_f4t = NULL;
             t.nvf4_gemm_f4t4 = NULL;
             t.nvf4_gemm_f4tn = NULL;
+            // the rest of the same mma.sync kind::mxf4nvf4 family: block-scale
+            // SASS, empty off cc12 like the entries above. Unreachable on B200
+            // while nothing there elected W4A4; once slot 867 lit the W4A4
+            // chain on cc 10.0, the live f4t_swq entry served the fused gate|up
+            // epilogue as an empty kernel (a 371-token prompt answered "# # #")
+            t.nvf4_gemm_f4c_raw = NULL;
+            t.nvf4_gemm_f4cn = NULL;
+            t.nvf4_gemm_f4cn_raw = NULL;
+            t.nvf4_gemm_f4cd = NULL;
+            t.nvf4_gemm_f4cd_raw = NULL;
+            t.nvf4_gemm_f4t_swq = NULL;
             t.q8_0_to_nvf4_rot = NULL;
             t.mxfp4_gemm_bs_gu = NULL;
             t.q8_0_to_nvf4_smooth = NULL;
@@ -2079,6 +2199,15 @@ PD_EXPORT const KernelTableV1* paddock_pack_kernels_v1(void) {
             // to keep.
             t.lowm_gemm = NULL;
             t.lowm_warmup = NULL;
+            // slots 867/868: the NVFP4 tcgen05 GEMM is sm_100a SASS (PD_TC5_OK);
+            // its launcher declines elsewhere too, but a NULL keeps the engine
+            // from electing the W4A4 chain on a die that has no arm for it
+            t.nvf4_gemm_tc5w = NULL;
+            t.nvf4_tc5_tile_scales = NULL;
+            t.f8_gemm_tc5x = NULL;
+            t.f8row_gemm_tc5x = NULL;
+            t.attn_prefill_tc5_vl = NULL;
+            t.nvf4_gemm_tc5_swq = NULL;
         }
         if (cma < 9 && !(cma == 8 && cmi >= 9)) {
             t.add_rmsnorm_e4m3_xn_b16 = NULL;
@@ -2161,6 +2290,14 @@ PD_EXPORT const KernelTableV1* paddock_pack_kernels_v1(void) {
             t.q8_0_moe_down_mma2t = NULL;
             t.lowm_gemm = NULL;
             t.lowm_warmup = NULL;
+            // the NVFP4 tcgen05 GEMM stages both operands through TMA; its
+            // scale tiler has no other consumer
+            t.nvf4_gemm_tc5w = NULL;
+            t.nvf4_tc5_tile_scales = NULL;
+            t.f8_gemm_tc5x = NULL;
+            t.f8row_gemm_tc5x = NULL;
+            t.attn_prefill_tc5_vl = NULL;
+            t.nvf4_gemm_tc5_swq = NULL;
         }
         resolved = 1;
     }

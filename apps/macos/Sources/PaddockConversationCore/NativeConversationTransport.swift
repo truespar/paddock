@@ -148,8 +148,16 @@ public actor NativeConversationTransport: ConversationStorage {
     return doc
   }
   public func saveConversation(_ document: ConversationDocument) async throws {
+    try await saveConversation(document, consumingDraft: nil)
+  }
+  func saveConversation(_ document: ConversationDocument, consumingDraft: String?) async throws {
+    var req = try request(
+      "api/conversations/\(document.id)", method: "PUT", body: document.encoded())
+    if let consumingDraft {
+      req.setValue(consumingDraft, forHTTPHeaderField: "X-Paddock-Consume-Draft")
+    }
     _ = try await data(
-      request("api/conversations/\(document.id)", method: "PUT", body: document.encoded()),
+      req,
       maximum: 1024 * 1024)
   }
   public func listConversations() async throws -> [[String: ConversationValue]] {

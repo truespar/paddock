@@ -197,7 +197,7 @@ const MIN_CHUNK_S: f32 = 1.0;
 /// one window, so this is the backstop for the shapes trimming cannot reach -
 /// a client that never commits under manual turns, mostly. Ten minutes is far
 /// past any dictation and far short of a problem.
-const MAX_BUFFER_S: f32 = 600.0;
+pub(crate) const MAX_BUFFER_S: f32 = 600.0;
 
 /// File word timestamps do not imply live enrichment (Granite Plus emits
 /// them under a different instruction). Both clients consume this explicit
@@ -224,7 +224,7 @@ const WINDOW_S: f32 =
 /// something else must SAY so (see `Session::rate`) - we resample rather than
 /// refuse, because a browser's AudioContext hands out 44.1 or 48 kHz and
 /// making every caller resample in JS is worse than doing it here.
-const DEFAULT_RATE: u32 = 24000;
+pub(crate) const DEFAULT_RATE: u32 = 24000;
 
 /// `server_vad`'s defaults, straight from the API reference - a client that
 /// sends `{"type": "server_vad"}` and nothing else gets these.
@@ -267,6 +267,10 @@ pub async fn handle(
                 q.intent
             ),
         );
+    }
+    if state.rnnt_asr.is_some() {
+        // the native streaming RNN-T lane: no agreement policy (rnnt_realtime.rs)
+        return ws.on_upgrade(move |socket| crate::rnnt_realtime::run(socket, state));
     }
     let lane = match (state.asr.as_ref(), state.serving.as_ref()) {
         (Some(asr), _) => Lane {
@@ -379,7 +383,7 @@ impl Context {
     }
 }
 
-fn id(prefix: &str) -> String {
+pub(crate) fn id(prefix: &str) -> String {
     format!("{prefix}_{}", uuid::Uuid::new_v4().simple())
 }
 
@@ -691,18 +695,18 @@ struct Pass {
 /// units so `session.updated` can hand the client back exactly what it sent;
 /// samples are derived against the session rate at the point of use.
 #[derive(Clone, Copy)]
-struct VadConfig {
-    threshold: f32,
-    prefix_ms: u32,
-    silence_ms: u32,
-    idle_ms: Option<u32>,
+pub(crate) struct VadConfig {
+    pub(crate) threshold: f32,
+    pub(crate) prefix_ms: u32,
+    pub(crate) silence_ms: u32,
+    pub(crate) idle_ms: Option<u32>,
 }
 
 impl VadConfig {
     fn samples(ms: u32, rate: u32) -> usize {
         (ms as u64 * rate as u64 / 1000) as usize
     }
-    fn prefix(&self, rate: u32) -> usize {
+    pub(crate) fn prefix(&self, rate: u32) -> usize {
         Self::samples(self.prefix_ms, rate)
     }
 }
@@ -713,10 +717,10 @@ impl VadConfig {
 /// `VAD_ONSET_FRAMES` of speech, closes when `silence` has passed since the
 /// last speech frame, and - when nobody has said anything for `idle` - says so
 /// without closing anything.
-struct Turns {
+pub(crate) struct Turns {
     silence: usize,
     idle: Option<usize>,
-    speaking: bool,
+    pub(crate) speaking: bool,
     /// consecutive speech frames seen while not yet speaking
     onset: usize,
     /// absolute sample index just past the last frame that held speech
@@ -730,7 +734,7 @@ struct Turns {
 /// counted from the first sample of the session, the same space the detector's
 /// frames use and the same one `audio_start_ms` is defined in.
 #[derive(Debug, PartialEq)]
-enum Turn {
+pub(crate) enum Turn {
     Started { at: usize },
     Stopped { at: usize },
     Idle { from: usize, to: usize },
@@ -795,7 +799,7 @@ impl Turns {
 
     /// The client committed by hand while the detector thought someone was
     /// talking. The client wins - it knows things a microphone does not.
-    fn yield_to_client(&mut self, at: usize) {
+    pub(crate) fn yield_to_client(&mut self, at: usize) {
         self.speaking = false;
         self.onset = 0;
         self.last_speech = at;
@@ -809,15 +813,15 @@ impl Turns {
 /// thresholds mid-session, which means a new detector - and the frame
 /// positions it counts from zero have to keep meaning the same thing as the
 /// `audio_start_ms` the client has already been shown.
-struct Detector {
-    cfg: VadConfig,
+pub(crate) struct Detector {
+    pub(crate) cfg: VadConfig,
     vad: paddock_engine::audio::vad::Vad,
-    turns: Turns,
+    pub(crate) turns: Turns,
     base: usize,
 }
 
 impl Detector {
-    fn new(cfg: VadConfig, rate: u32, base: usize) -> Self {
+    pub(crate) fn new(cfg: VadConfig, rate: u32, base: usize) -> Self {
         Self {
             vad: paddock_engine::audio::vad::Vad::new(rate, cfg.threshold),
             turns: Turns::new(&cfg, rate, base),
@@ -826,7 +830,7 @@ impl Detector {
         }
     }
 
-    fn feed(&mut self, pcm: &[f32]) -> Vec<Turn> {
+    pub(crate) fn feed(&mut self, pcm: &[f32]) -> Vec<Turn> {
         let mut frames = self.vad.feed(pcm);
         for f in &mut frames {
             f.start += self.base;
@@ -1484,11 +1488,11 @@ fn hold(det: &Option<Detector>) -> bool {
 }
 
 /// An absolute sample index as the wire's milliseconds-since-session-start.
-fn ms(samples: usize, rate: u32) -> u64 {
+pub(crate) fn ms(samples: usize, rate: u32) -> u64 {
     samples as u64 * 1000 / rate.max(1) as u64
 }
 
-fn committed_event(item: &str) -> Value {
+pub(crate) fn committed_event(item: &str) -> Value {
     json!({
         "type": "input_audio_buffer.committed",
         "event_id": id("event"),
@@ -1497,7 +1501,7 @@ fn committed_event(item: &str) -> Value {
     })
 }
 
-async fn send(socket: &mut WebSocket, ev: Value) -> Result<(), ()> {
+pub(crate) async fn send(socket: &mut WebSocket, ev: Value) -> Result<(), ()> {
     socket
         .send(Message::Text(ev.to_string().into()))
         .await
@@ -1570,7 +1574,7 @@ fn delta_event(item: &str, delta: &str, lead_space: bool) -> Value {
     })
 }
 
-fn error_event(kind: &str, message: &str) -> Value {
+pub(crate) fn error_event(kind: &str, message: &str) -> Value {
     json!({
         "type": "error",
         "event_id": id("event"),
@@ -1680,7 +1684,7 @@ fn apply_update_inner(
 /// One `turn_detection` object. Everything it can hold is either served or
 /// refused by name - a client that asks for semantic turn-taking must not be
 /// quietly given the energy detector instead.
-fn parse_vad(td: &Value) -> Result<VadConfig, String> {
+pub(crate) fn parse_vad(td: &Value) -> Result<VadConfig, String> {
     match td.get("type").and_then(Value::as_str) {
         Some("server_vad") | None => {}
         Some("semantic_vad") => {
@@ -1730,7 +1734,7 @@ fn parse_vad(td: &Value) -> Result<VadConfig, String> {
 }
 
 /// base64 -> little-endian PCM16 -> f32 in [-1, 1].
-fn decode_pcm16(b64: &str) -> Result<Vec<f32>, String> {
+pub(crate) fn decode_pcm16(b64: &str) -> Result<Vec<f32>, String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
         .map_err(|e| format!("`audio` is not valid base64: {e}"))?;

@@ -406,6 +406,7 @@ async fn read_once(
             reply: reply_tx,
         }),
         user_turn: false,
+        background: false,
     };
     if let Err(e) = model.engine.submit(req) {
         return Err(Box::new(err(
@@ -749,6 +750,7 @@ pub async fn think(
         submitted: None,
         canvas_read: None,
         user_turn: false,
+        background: false,
     };
     if let Err(e) = model.engine.submit(req) {
         return Err(Box::new(err(

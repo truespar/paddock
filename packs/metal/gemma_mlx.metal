@@ -108,6 +108,12 @@ GMLX_ATTN(128,16,true)
 GMLX_ATTN(256,2,false)
 GMLX_ATTN(512,8,false)
 #undef GMLX_ATTN
+
+#define GMLX_PIPE(HD,GQA,A) \
+kernel void gmlx_value##A##_##HD(device const float* q [[buffer(0)]],device const bfloat* k [[buffer(1)]],device const bfloat* v [[buffer(2)]],device const uint* meta [[buffer(3)]],device const uint* pages [[buffer(4)]],device const uint* rows [[buffer(5)]],device float* out [[buffer(6)]],constant uint* p [[buffer(7)]],uint3 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint sg [[simdgroup_index_in_threadgroup]]) { \
+threadgroup float scores[GQA*32],prob[GQA*32],highs[GQA],sums[GQA];gemma_decode<HD,GQA,false,bfloat,A>(q,k,v,meta,pages,rows,out,p,g,tid,lane,sg,scores,prob,highs,sums); }
+GMLX_PIPE(256,2,2)
+#undef GMLX_PIPE
 kernel void gmlx_gate(device float* out [[buffer(0)]],device const float* gate [[buffer(1)]],constant uint* p [[buffer(2)]],uint i [[thread_position_in_grid]]) {
     if(i<p[0])out[i]=mlx_bf(mlx_bf(out[i])*mlx_sigmoid_bf(gate[i]));
 }

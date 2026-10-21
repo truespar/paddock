@@ -1690,6 +1690,11 @@ impl Generator for GpuNemotron {
     fn anchor_at(&mut self, _slot: usize, tokens: &[u32], upto: usize) {
         GpuNemotron::anchor_at(self, tokens, upto);
     }
+    fn set_slot_background(&mut self, slot: usize, on: bool) {
+        if let Some(radix) = self.batch.as_mut().and_then(|b| b.prefix.as_mut()) {
+            radix.set_slot_low(slot, on);
+        }
+    }
     fn tier_prefix_loading(&mut self, slot: usize, tokens: &[u32]) -> bool {
         self.tier_consult_impl(slot, tokens)
     }

@@ -163,9 +163,32 @@ pub enum AudioFrontend {
     GraniteSpeech,
     /// Same extractor, bounded by the experimental native Metal tower.
     GraniteSpeechMetal,
+    /// Gemma 4 12B's `Gemma4UnifiedAudioFeatureExtractor`: no spectrogram at
+    /// all - the engine takes the raw clip in 640-sample (40 ms) frames, one
+    /// prompt row each.
+    Gemma4Raw,
 }
 
 impl AudioFrontend {
+    /// The clip's features as `MmChunk::Audio` carries them: the mel for the
+    /// spectrogram families, None for the raw-frame one (whose engine reads
+    /// the samples themselves).
+    pub fn mel(
+        self,
+        samples: &[f32],
+    ) -> Result<Option<paddock_engine::audio::MelFeatures>, String> {
+        match self {
+            AudioFrontend::Gemma4Raw => {
+                if samples.is_empty() {
+                    Err("audio clip holds no samples".into())
+                } else {
+                    Ok(None)
+                }
+            }
+            _ => self.features(samples).map(Some),
+        }
+    }
+
     /// Run this frontend over a 16 kHz mono clip.
     pub fn features(self, samples: &[f32]) -> Result<paddock_engine::audio::MelFeatures, String> {
         match self {
@@ -180,6 +203,9 @@ impl AudioFrontend {
             }
             AudioFrontend::GraniteSpeech | AudioFrontend::GraniteSpeechMetal => {
                 paddock_engine::audio::granite::speech_features(samples)
+            }
+            AudioFrontend::Gemma4Raw => {
+                Err("Gemma 4 12B takes raw audio frames, not a spectrogram".into())
             }
             AudioFrontend::None => Err("this model does not take audio input".into()),
         }
@@ -196,6 +222,7 @@ impl AudioFrontend {
             AudioFrontend::GraniteSpeech | AudioFrontend::GraniteSpeechMetal => {
                 paddock_engine::audio::granite::audio_tokens_for_samples(len)
             }
+            AudioFrontend::Gemma4Raw => len.div_ceil(640),
             AudioFrontend::None => 0,
         }
     }
@@ -1334,6 +1361,17 @@ pub fn is_encoder_arch(arch: &str) -> bool {
 /// True when the companion mmproj GGUF carries an audio tower
 /// (`clip.has_audio_encoder`) - the discriminator that routes arch `qwen3`
 /// to the ASR generative family instead of the embeddings encoder.
+/// Gemma 4 12B's (encoder-free) mmproj with its audio half: `gemma4ua`
+/// beside the `gemma4uv` picture embedder in one file.
+pub fn mmproj_is_gemma4_unified_audio(path: &Path) -> bool {
+    MappedGguf::open(path).is_ok_and(|m| {
+        matches!(
+            m.gguf().metadata.get("clip.audio.projector_type"),
+            Some(paddock_models::gguf::Value::Str(s)) if s == "gemma4ua"
+        )
+    })
+}
+
 pub fn mmproj_is_audio(path: &Path) -> bool {
     MappedGguf::open(path).is_ok_and(|m| {
         matches!(
@@ -2258,7 +2296,12 @@ pub(crate) fn load_with_residency(
     // checkpoint's own template stands. Serving one variant's envelope to the
     // other cost -plus its entire system block.
     let granite_audio = arch == "granite" && mmproj.is_some_and(mmproj_is_audio);
-    let audio_serving = mmproj.is_some() && (arch == "qwen3vl" || granite_audio);
+    // Gemma 4 12B: the text file is plain gemma4, its unified mmproj carries
+    // the audio embedder; clips render through the checkpoint's own
+    // template (its audio parts become `<|audio|>`), so nothing below swaps
+    // the template or inlines a marker for it
+    let g4u_audio = arch == "gemma4" && mmproj.is_some_and(mmproj_is_gemma4_unified_audio);
+    let audio_serving = mmproj.is_some() && (arch == "qwen3vl" || granite_audio || g4u_audio);
     // Which granite-speech sibling this is. IBM's own conversion stamps
     // `general.finetune = "plus"` on the -plus weights and leaves the field off
     // the base one, so the checkpoint says which it is and we never have to
@@ -2281,7 +2324,7 @@ pub(crate) fn load_with_residency(
     // LightOnOCR-3 is a qwen35 file, so only its identity can say it reads
     // pages; its own template (thinking off by default) serves unchanged.
     let lightonocr = crate::lighton_ocr::is_checkpoint(&arch, map.gguf());
-    let chat_template = if granite_audio {
+    let chat_template = if granite_audio || g4u_audio {
         tokenizer.chat_template.clone()
     } else if audio_serving {
         Some(crate::chat_template::QWEN3_ASR_AUDIO_TEMPLATE.to_owned())
@@ -2433,6 +2476,8 @@ pub(crate) fn load_with_residency(
             AudioFrontend::GraniteSpeechMetal
         } else if granite_audio {
             AudioFrontend::GraniteSpeech
+        } else if g4u_audio {
+            AudioFrontend::Gemma4Raw
         } else if device == "metal" {
             AudioFrontend::Qwen3AsrMetal
         } else {

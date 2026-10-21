@@ -32,7 +32,10 @@ public final class WorkspaceModel {
   let dataStorage: DataStorageModel
   public var maintenanceInProgress: Bool { dataStorage.exporting || benchmarks.running }
   let speech: StudioSpeechModels
-  var draft = StudioDraft()
+  var draft: StudioDraft {
+    get { StudioDraft(message: chat.composerText) }
+    set { chat.composerText = newValue.message }
+  }
   var navigation = WorkspaceNavigation()
   var showsRendererSamples = false
   var showsGPUMetrics = false

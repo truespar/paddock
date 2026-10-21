@@ -55,8 +55,7 @@ extension WorkspaceModel {
   }
 
   var desktopNavigationBlocked: Bool {
-    draft.hasContent || chat.busy || chat.uploading || chat.hasAttachments
-      || chat.hasMessageEdit
+    !chat.canNavigateConversation
       || chat.state?.unsavedEdits == true
       || chat.hasArtifactEdits
   }
@@ -169,7 +168,7 @@ extension WorkspaceModel {
     if case .conversation(let id) = request.action, id == chat.conversation?.id { return }
     guard !desktopNavigationBlocked else {
       desktopError =
-        "Your current work is still open. Send or clear the draft, finish uploads, and save artifact edits before opening another conversation. Nothing was discarded."
+        "Finish the current response or upload, and save artifact edits before opening another conversation. Your draft is kept."
       return
     }
     desktopTransition = true

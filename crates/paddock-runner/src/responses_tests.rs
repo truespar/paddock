@@ -1,5 +1,139 @@
 use super::*;
 
+#[test]
+fn streamed_snapshot_preserves_tool_and_prose_identity() {
+    use crate::responses_stream::{Calls, Seq};
+    for reasoning in [false, true] {
+        for message in [false, true] {
+            let parsed = Parsed {
+                reasoning: reasoning.then(|| "Inspect the file.".into()),
+                content: message.then(|| "Applying a fix.".into()),
+                ..Parsed::default()
+            };
+            let base = 3; // compaction plus two enrichment items
+            let first = base + usize::from(reasoning) + usize::from(message);
+            let mut sq = Seq::default();
+            let mut calls = Calls::default();
+            let mut events = Vec::new();
+            for k in 0..2 {
+                events.extend(calls.event(
+                    ToolEv::Start {
+                        k,
+                        name: "write".into(),
+                    },
+                    first,
+                    &mut sq,
+                ));
+                for chunk in ["{\"text\":\"", "å😀", "\\n", "\"}"] {
+                    events.extend(calls.event(
+                        ToolEv::Args {
+                            k,
+                            json: chunk.into(),
+                        },
+                        first,
+                        &mut sq,
+                    ));
+                }
+                events.extend(calls.event(ToolEv::Stop { k }, first, &mut sq));
+            }
+            let logprobs =
+                [json!({"token":"fix","logprob":-0.1,"bytes":[102,105,120],"top_logprobs":[]})];
+            let items = streamed_output_items(
+                &parsed,
+                Some(&logprobs),
+                reasoning.then_some("rs_kept"),
+                message.then_some("msg_kept"),
+                calls,
+            );
+            for (_, event) in &events {
+                let index = event["output_index"].as_u64().unwrap() as usize - base;
+                match event["type"].as_str().unwrap() {
+                    "response.output_item.added" => {
+                        assert_eq!(event["item"]["id"], items[index]["id"]);
+                        assert_eq!(event["item"]["call_id"], items[index]["call_id"]);
+                    }
+                    "response.output_item.done" => assert_eq!(event["item"], items[index]),
+                    _ => assert_eq!(event["item_id"], items[index]["id"]),
+                }
+            }
+            assert!(
+                events.windows(2).all(
+                    |p| p[0].1["sequence_number"].as_u64() < p[1].1["sequence_number"].as_u64()
+                )
+            );
+            if reasoning {
+                assert_eq!(items[0]["id"], "rs_kept");
+            }
+            if message {
+                let item = &items[usize::from(reasoning)];
+                assert_eq!(item["id"], "msg_kept");
+                assert_eq!(item["content"][0]["logprobs"], json!(logprobs));
+            }
+            assert_ne!(
+                items[first - base]["call_id"],
+                items[first - base + 1]["call_id"]
+            );
+        }
+    }
+}
+
+#[test]
+fn streamed_snapshot_does_not_shift_calls_for_empty_or_late_prose() {
+    use crate::responses_stream::{Calls, Seq};
+    let mut calls = Calls::default();
+    let mut sq = Seq::default();
+    calls.event(
+        ToolEv::Start {
+            k: 0,
+            name: "read".into(),
+        },
+        0,
+        &mut sq,
+    );
+    calls.event(
+        ToolEv::Args {
+            k: 0,
+            json: "{}".into(),
+        },
+        0,
+        &mut sq,
+    );
+    let done = calls.event(ToolEv::Stop { k: 0 }, 0, &mut sq);
+    let parsed = Parsed {
+        reasoning: Some(String::new()),
+        content: Some("After the call.".into()),
+        ..Parsed::default()
+    };
+    let items = streamed_output_items(&parsed, None, None, None, calls);
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0], done.last().unwrap().1["item"]);
+    assert_eq!(items[1]["content"][0]["text"], "After the call.");
+}
+
+#[test]
+fn streamed_snapshot_keeps_calls_discovered_at_finish() {
+    use crate::responses_stream::{Calls, Seq};
+    let parsed = Parsed {
+        tool_calls: vec![crate::parsers::ToolCallRaw {
+            name: "read".into(),
+            arguments: "{\"path\":\"a.rs\"}".into(),
+        }],
+        ..Parsed::default()
+    };
+    let mut tools = crate::tool_stream::ToolStream::default();
+    let mut calls = Calls::default();
+    let mut sq = Seq::default();
+    let events: Vec<_> = tools
+        .finish(&parsed)
+        .into_iter()
+        .flat_map(|e| calls.event(e, 0, &mut sq))
+        .collect();
+    let items = streamed_output_items(&parsed, None, None, None, calls);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0], events.last().unwrap().1["item"]);
+    assert_eq!(items[0]["arguments"], parsed.tool_calls[0].arguments);
+}
+
 #[tokio::test]
 async fn quiet_response_stream_sends_comments_without_fabricating_events() {
     use http_body_util::BodyExt;

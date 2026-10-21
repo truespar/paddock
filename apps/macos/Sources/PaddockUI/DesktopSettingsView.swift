@@ -65,6 +65,7 @@ struct DesktopSettingsContent: View {
       group("Startup & menu bar") {
         switchRow("Show in menu bar", isOn: $preferences.showMenuBar)
           .accessibilityIdentifier("application-menu-bar")
+          .settingsSearchAnchor(.menuBar)
         VStack(alignment: .leading, spacing: 10) {
           switchRow(
             "Launch at login",
@@ -73,6 +74,7 @@ struct DesktopSettingsContent: View {
               set: { value in Task { await preferences.setLogin(value) } })
           ).disabled(preferences.loginBusy)
             .accessibilityIdentifier("application-login")
+            .settingsSearchAnchor(.login)
           if preferences.loginNeedsApproval {
             Button("Allow in Login Items…") { SMAppService.openSystemSettingsLoginItems() }
               .accessibilityIdentifier("application-login-approval")
@@ -103,7 +105,7 @@ struct DesktopSettingsContent: View {
           }
         }
         if let error = preferences.shortcutError { errorText(error) }
-      }
+      }.settingsSearchAnchor(.shortcut)
       group("Notifications") {
         switchRow("Notify about background work", isOn: $notify)
           .disabled(notificationBusy)
@@ -119,7 +121,7 @@ struct DesktopSettingsContent: View {
           .disabled(!notify || notificationBusy)
           .accessibilityIdentifier("application-notification-previews")
         if let error = notificationError { errorText(error) }
-      }
+      }.settingsSearchAnchor(.notifications)
     }
   }
 

@@ -18,6 +18,10 @@ enum Arithmetic {
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static BASELINE_GEMMA_SPEED_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static BASELINE_GEMMA_PIPELINE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static BASELINE_GEMMA_ALIGNED_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(crate) static BASELINE_GEMMA_WIDE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static BASELINE_PACKED_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // Numerical isolation only: fix the reference prefill contraction width.
     // Not a serving election or a performance-qualified implementation.
@@ -472,6 +476,34 @@ fn project_group(
         contraction_rows
     };
     let single = decode.unwrap_or(rows == 1) && k.is_multiple_of(512) && !fast_contract;
+    // Gemma's 5376-wide single vector retains the eight-lane arithmetic.
+    // One output column per lane partition reduces live registers; widening
+    // to four regressed the measured FFN and vocabulary-head projections.
+    let gemma_decode = matches!(arithmetic, Arithmetic::Adaptive)
+        && cmd.tensor_accelerated()
+        && k == 5376
+        && rows == 1;
+    #[cfg(test)]
+    let gemma_decode = gemma_decode && !BASELINE_GEMMA_SPEED_FOR_TEST.get();
+    let gemma_pipeline = gemma_decode;
+    #[cfg(test)]
+    let gemma_pipeline = gemma_pipeline && !BASELINE_GEMMA_PIPELINE_FOR_TEST.get();
+    // K=5376 is exactly 21 four-group tiles: the qualified entry omits
+    // per-load tail predicates without changing the arithmetic or buffers.
+    let gemma_aligned = gemma_pipeline;
+    #[cfg(test)]
+    let gemma_aligned = gemma_aligned && !BASELINE_GEMMA_ALIGNED_FOR_TEST.get();
+    // Wide Gemma output/down projections: fewer independent accumulators
+    // lower register pressure without changing the 32-lane K walk or sums.
+    // Keep other models, concurrent rows and older Apple GPUs unchanged.
+    let gemma_wide = single
+        && rows == 1
+        && cmd.tensor_accelerated()
+        && matches!(arithmetic, Arithmetic::Adaptive)
+        && matches!(k, 8192 | 16384 | 21504)
+        && planes.iter().all(|(w, _)| w.n == 5376);
+    #[cfg(test)]
+    let gemma_wide = gemma_wide && !BASELINE_GEMMA_WIDE_FOR_TEST.get();
     // Minimize weight re-reads, then balance the last vector tile: six rows
     // use 3+3, not 5+1. The reference uses this same arithmetic grouping.
     let vector_rows = rows.div_ceil(rows.div_ceil(5));
@@ -495,12 +527,22 @@ fn project_group(
     // Broad complete tiles and qualified nearly-full tails amortize the
     // packed-weight loader. Other ragged, narrow and short batches keep the
     // small tile. This changes storage/reuse, not the K reduction tree.
+    let gemma_bulk = matches!(arithmetic, Arithmetic::Adaptive)
+        && compact_prefill_rows(rows)
+        && match k {
+            5376 => planes.iter().all(|(w, _)| w.n >= 1024),
+            8192 | 16384 | 21504 => planes.iter().all(|(w, _)| w.n == 5376),
+            _ => false,
+        };
+    #[cfg(test)]
+    let gemma_bulk = gemma_bulk && !BASELINE_GEMMA_SPEED_FOR_TEST.get();
     let wide_staging = prefill
         && cmd.tensor_accelerated()
-        && cmd.affine_prefill_rows() == Some(512)
-        && compact_prefill_rows(rows)
-        && matches!(k, 5120 | 6144 | 17408)
-        && planes.iter().all(|(w, _)| w.n >= 1024);
+        && (gemma_bulk
+            || (cmd.affine_prefill_rows() == Some(512)
+                && compact_prefill_rows(rows)
+                && matches!(k, 5120 | 6144 | 17408)
+                && planes.iter().all(|(w, _)| w.n >= 1024)));
     #[cfg(test)]
     let wide_staging = wide_staging && !BASELINE_STAGING_FOR_TEST.with(|v| v.get());
     #[cfg(test)]
@@ -601,9 +643,17 @@ fn project_group(
     let small_admission = small_admission && !BASELINE_ADMISSION_FOR_TEST.with(|v| v.get());
     #[cfg(test)]
     let bulk_store = bulk_store && !BASELINE_STORE_FOR_TEST.with(|v| v.get());
+    let columns = if gemma_decode {
+        16
+    } else if gemma_wide {
+        if k == 21504 { 4 } else { 8 }
+    } else {
+        columns
+    };
     let kernel = if prefill {
         match tile {
             128 if compact => "mlx_affine_prefill_compact128",
+            128 if gemma_bulk => "mlx_affine_gemma_prefill128",
             128 if k == 6144 => "mlx_affine_prefill_deep128",
             128 => "mlx_affine_prefill_wide128",
             32 if small_admission => "mlx_affine_prefill_load32_m32",
@@ -613,6 +663,18 @@ fn project_group(
             256 => "mlx_affine_prefill_rows256",
             _ if !cmd.tensor_accelerated() => "mlx_affine_prefill64",
             _ => "mlx_affine_prefill_load32",
+        }
+    } else if gemma_aligned {
+        "mlx_affine_pipeline_full4"
+    } else if gemma_pipeline {
+        "mlx_affine_pipeline4"
+    } else if gemma_decode {
+        "mlx_affine_columns1"
+    } else if gemma_wide {
+        if k == 21504 {
+            "mlx_affine_single_columns1"
+        } else {
+            "mlx_affine_single_columns2"
         }
     } else if single {
         match (verify_rows, verify_columns) {

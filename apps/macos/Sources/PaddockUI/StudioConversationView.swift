@@ -16,8 +16,9 @@ struct StudioConversationView: View {
   @Environment(\.workspaceLeadingPaneInset) private var leadingPaneInset
   @State private var measuredComposerHeight: CGFloat = 172
   @State private var dropTargeted = false
-  private var welcome: Bool {
-    chat.conversation == nil
+  var welcome: Bool {
+    // Saving an unsent draft must not move the composer while someone types.
+    (chat.conversation?.messageCount ?? 0) == 0
   }
   private var graphOpen: Bool { chat.state?.nativeGraph?.visible == true }
   private var artifact: StudioState.Artifact? {

@@ -26,9 +26,11 @@ use crate::sampler::{
 use crate::spec::NgramDraft;
 use crate::spec_policy::{RoundTally, SpecController, SpecPolicy, synchronous_draft_budget};
 
+mod admission;
+use admission::preempt_or_fail_mixed;
 mod commit;
 mod dump;
-use commit::{commit_device_token, sample_slot_row, send_stop_masks, send_verify_masks};
+use commit::{commit_device_token, sample_slot_row, send_stop_masks, send_verify_masks, tok_trace};
 mod finish;
 mod overlap_gate;
 use overlap_gate::pipe_min_live;
@@ -36,6 +38,7 @@ use overlap_gate::pipe_min_live;
 mod scheduler_tests;
 mod timing;
 pub use finish::{FinishReason, next_event};
+use timing::trace_us;
 
 /// Serving spec-decode row budget per round: total rows (1 pending + drafts
 /// per slot) must fit the models' verify-pass cap. Default 32 matches
@@ -447,6 +450,10 @@ pub struct GenRequest {
     /// tool results): its prompt-end checkpoint is held as an anchor
     /// (`Generator::anchor_at`) - where the next user turn's re-render resumes.
     pub user_turn: bool,
+    /// Background work (the manager's batch queue): admitted after every
+    /// waiting live request, and a live request that finds no free slot takes
+    /// this one's (it is recomputed later) - see `service/admission.rs`.
+    pub background: bool,
 }
 
 /// The structured read's inputs and its reply channel (see
@@ -1167,6 +1174,7 @@ impl Engine {
                             submitted: None,
                             canvas_read: None,
                             user_turn: false,
+                            background: false,
                         },
                         &metrics,
                     );
@@ -1210,6 +1218,7 @@ impl Engine {
                             submitted: None,
                             canvas_read: None,
                             user_turn: false,
+                            background: false,
                         });
                     }
                     drop(wtx);
@@ -2576,12 +2585,16 @@ struct Slot {
     /// A user-turn prompt's last position, held for `Generator::anchor_at`
     /// once its first prefill lands (text prompts only).
     anchor_upto: Option<usize>,
+    /// `GenRequest::background`
+    background: bool,
 }
 
 impl Slot {
     fn new(mut req: GenRequest, metrics: Arc<EngineMetrics>) -> Self {
         let constraint_free = req.constraint.as_ref().is_none_or(|c| c.free_now());
-        let anchor_upto = (req.user_turn && req.mm_chunks.is_none()).then(|| req.prompt.len() - 1);
+        // batch lines never anchor: the anchor cap would hand theirs a live session's place
+        let anchor_upto = (req.user_turn && !req.background && req.mm_chunks.is_none())
+            .then(|| req.prompt.len() - 1);
         Slot {
             history: req.prompt.clone(),
             prompt: req.prompt,
@@ -2610,6 +2623,7 @@ impl Slot {
             reply_pin_due: false,
             reply_pinned: false,
             anchor_upto,
+            background: req.background,
         }
     }
 
@@ -2692,7 +2706,8 @@ impl Slot {
             self.prompt = self.history[..keep].to_vec();
         }
         self.prefilled = false;
-        self.recompute = true;
+        // ...and is a fresh admission again: it must sample its first token
+        self.recompute = keep > 0;
         self.prompt.len().div_ceil(crate::kv_pool::BLOCK_TOKENS)
     }
 
@@ -2714,6 +2729,10 @@ impl Slot {
         self.history.push(next);
         self.generated += 1;
         self.metrics.tokens_generated.fetch_add(1, Relaxed);
+        if finish::degenerate_run(&self.history, self.generated) {
+            finish::stop_degenerate(&self.events, self.pos, self.generated);
+            return false;
+        }
         if self
             .events
             .send(TokenEvent::Token { id: next, logprobs })
@@ -2768,12 +2787,6 @@ fn shares_inflight(
 /// adopts everything the leader publishes; the cap only bounds the clone a
 /// 100k-token admission would otherwise make of itself.
 const PREFIX_LCP_CAP: usize = 8192;
-
-fn trace_us() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_micros())
-}
 
 fn finish_prefill(
     generator: &mut dyn Generator,
@@ -2994,54 +3007,6 @@ fn abort_backend_chunks(
     chunking.clear();
 }
 
-/// G4b mixed-tick preemption: a mixed (chunked-prefill + decode) pass couldn't
-/// grow the budget pool. Preempt the NEWEST active DECODE slot - never a
-/// chunking slot, whose prefill is making progress - so the retried tick fits
-/// with its blocks freed; `chunking` stays intact and the reconcile at the next
-/// tick top returns the victim's blocks. No KV half-advanced: a mixed pass hits
-/// PoolExhausted inside ensure_pool_rows, before run_layers writes anything. If
-/// every active slot is mid-prefill (no decode victim to relieve the pool - a
-/// watermark-should-prevent pathological case), fail the stuck chunking slots so
-/// the server recovers instead of spinning.
-fn preempt_or_fail_mixed(
-    generator: &mut dyn Generator,
-    slots: &mut [Option<Slot>],
-    preempted: &mut Vec<Slot>,
-    chunking: &mut std::collections::HashSet<usize>,
-    pool_stats: bool,
-) {
-    let victim = (0..slots.len())
-        .rev()
-        .find(|&k| slots[k].is_some() && !chunking.contains(&k));
-    match victim {
-        Some(k) => {
-            let need = slots[k].as_mut().expect("present").preempt_for_recompute();
-            preempted.push(slots[k].take().expect("present"));
-            if pool_stats {
-                tracing::warn!(
-                    "pool: PREEMPTED slot {k} (mixed) for recompute ({need} blocks), {} queued",
-                    preempted.len()
-                );
-            }
-        }
-        None => {
-            let stuck: Vec<usize> = chunking.iter().copied().collect();
-            tracing::warn!(
-                "serve: mixed pool-exhausted with no decode victim; failing {} chunking slot(s)",
-                stuck.len()
-            );
-            for k in stuck {
-                if let Some(s) = slots[k].take() {
-                    let _ = s.events.send(TokenEvent::Error(EngineError::overloaded(
-                        "the KV cache pool is exhausted under the current load; retry shortly",
-                    )));
-                }
-            }
-            abort_backend_chunks(generator, chunking);
-        }
-    }
-}
-
 /// Settle a multimodal admission verdict that is not `Encoding` - the slot is
 /// on the chunked queue now, prefilled by the backend's own stepped passes
 /// (finished here exactly as a blocking multimodal prefill is), or its request
@@ -3106,7 +3071,7 @@ fn debit_pool_budget(budget: &mut Option<usize>, req: &GenRequest) {
 fn admit(
     slots: &mut [Option<Slot>],
     req: GenRequest,
-    generator: &dyn Generator,
+    generator: &mut dyn Generator,
     metrics: &Arc<EngineMetrics>,
 ) -> bool {
     let max_ctx = generator.max_context();
@@ -3150,7 +3115,7 @@ fn admit(
     }
     let mut req = req;
     req.max_tokens = req.max_tokens.min(room);
-    for s in slots.iter_mut() {
+    for (k, s) in slots.iter_mut().enumerate() {
         if s.is_none() {
             let mut slot = Slot::new(req, metrics.clone());
             // a backend that masks stops on device keeps a reasoning reply's
@@ -3158,6 +3123,7 @@ fn admit(
             if generator.supports_stop_mask() {
                 slot.sampler.arm_stop_mask(&slot.stop_tokens);
             }
+            generator.set_slot_background(k, slot.background);
             *s = Some(slot);
             return true;
         }
@@ -3351,6 +3317,8 @@ fn run_batched(
     metrics: &Arc<EngineMetrics>,
     ctl: &ShutdownCtl,
 ) {
+    // live requests before background ones; reads like the channel it wraps
+    let rx = &mut admission::Inbox::new(rx);
     let mut slots: Vec<Option<Slot>> = (0..max_batch).map(|_| None).collect();
     // last refresh of the published device ledger (see `refresh_model_mem`)
     let mut mem_seen: Option<std::time::Instant> = None;
@@ -3516,6 +3484,10 @@ fn run_batched(
     // left to offer) nor the text lane, which would otherwise prefill it from
     // the prompt the wave builder cleared.
     let mut mm_encoding: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // The overlap block hosts the encoder (riding steps under a queued decode
+    // tick); set when it could not, or its steps moved nothing (a group at the
+    // front) - the loop top then runs the full step once.
+    let mut enc_stalled = false;
     // Issue-ahead: finished-prefill work deferred one round - it
     // runs inside the next mixed round's GPU window (between begin and
     // finish) instead of stalling the stream (~1.4ms pure-host pick_next +
@@ -3627,6 +3599,15 @@ fn run_batched(
     let stall_warn_ms = static_env_u64("PADDOCK_TICK_STALL_WARN_MS", 750);
     let mut tick_t0 = std::time::Instant::now();
     let mut held_at_start = 0usize; // decoding slots when `tick_t0` was set
+    // A quiet-phase pipe segment is one loop iteration holding many ticks
+    // (the segment runs until an arrival, a host row or a death re-shapes
+    // the batch), so loop-top to loop-top it reads as one giant tick: a
+    // 108-tick segment under a client that had nothing to send for 3 s
+    // logged "tick-stall: 3143 ms ... decode 3142" while every row inside
+    // it ticked at ~28 ms and every completion was reported on its tick.
+    // The segment leaves its own figures here and the report below judges
+    // the LONGEST tick inside it instead: (ticks, longest tick, total).
+    let mut seg_report: Option<(usize, std::time::Duration, std::time::Duration)> = None;
     // Phase marks for the straggler self-report. A stall used to name only its
     // total, which is not actionable: an excursion is a handful of ~1 s ticks
     // (100x a normal tick) and an external profiler cannot attribute it -
@@ -3728,51 +3709,66 @@ fn run_batched(
         // took `tick_wall`. active > 0 keeps legit quiet paths (mm exclusive
         // runs, shutdown) silent; 1/s throttle keeps a wedged config readable.
         let tick_wall = tick_t0.elapsed();
+        let seg = seg_report.take();
+        let judged = seg.map_or(tick_wall, |(_, longest, _)| longest);
         if stall_warn_ms > 0
-            && tick_wall.as_millis() as u64 >= stall_warn_ms
+            && judged.as_millis() as u64 >= stall_warn_ms
             && active > 0
             && last_stall_warn.is_none_or(|t| t.elapsed().as_secs() >= 1)
         {
             last_stall_warn = Some(std::time::Instant::now());
-            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
-            let (phase, early_exit_phase) = timing::spans(
-                tick_wall,
-                [ph_admit, ph_prefill, ph_mixed, ph_spec, ph_decode],
-            );
-            let phases = format!(
-                "admit {:.0} prefill {:.0} mixed {:.0} spec {:.0} decode {:.0} sample+emit {:.0} ms",
-                ms(phase[0]),
-                ms(phase[1]),
-                ms(phase[2]),
-                ms(phase[3]),
-                ms(phase[4]),
-                ms(phase[5]),
-            );
-            let wall_ms = tick_wall.as_secs_f64() * 1e3;
-            // Who waited on this tick: sequences already decoding when it began,
-            // and the preempted ones queued for recompute. Anyone else spent the
-            // tick on its own prefill - long chunk ticks by design (a 178K prompt
-            // put ~120 WARNs in a customer log), and the tick that finishes a
-            // prompt, which read as a held client once its slot left `chunking`
-            // (267 of another customer's 302 WARNs) - so those go to debug.
-            let waiting = held_at_start + preempted.len();
-            if waiting > 0 {
+            if let Some((ticks, longest, total)) = seg {
+                // a pipe tick that blew the budget: the segment's own
+                // figures (the phase marks describe the outer loop only)
                 tracing::warn!(
-                    ?early_exit_phase,
-                    "tick-stall phases: {phases} (unfinished branch includes its emit work)"
-                );
-                tracing::warn!(
-                    "tick-stall: {wall_ms:.0} ms wall (live {active}, chunking {}, preempted {})",
+                    "tick-stall: pipe segment: longest tick {:.0} ms of {ticks} ticks in {:.0} ms \
+                     (live {active}, chunking {}, preempted {})",
+                    longest.as_secs_f64() * 1e3,
+                    total.as_secs_f64() * 1e3,
                     chunking.len(),
                     preempted.len()
                 );
             } else {
-                tracing::debug!(
-                    ?early_exit_phase,
-                    "tick-stall (prefill only, nobody waiting): {wall_ms:.0} ms wall (live \
-                     {active}, chunking {}): {phases}",
-                    chunking.len()
+                let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+                let (phase, early_exit_phase) = timing::spans(
+                    tick_wall,
+                    [ph_admit, ph_prefill, ph_mixed, ph_spec, ph_decode],
                 );
+                let phases = format!(
+                    "admit {:.0} prefill {:.0} mixed {:.0} spec {:.0} decode {:.0} sample+emit {:.0} ms",
+                    ms(phase[0]),
+                    ms(phase[1]),
+                    ms(phase[2]),
+                    ms(phase[3]),
+                    ms(phase[4]),
+                    ms(phase[5]),
+                );
+                let wall_ms = tick_wall.as_secs_f64() * 1e3;
+                // Who waited on this tick: sequences already decoding when it began,
+                // and the preempted ones queued for recompute. Anyone else spent the
+                // tick on its own prefill - long chunk ticks by design (a 178K prompt
+                // put ~120 WARNs in a customer log), and the tick that finishes a
+                // prompt, which read as a held client once its slot left `chunking`
+                // (267 of another customer's 302 WARNs) - so those go to debug.
+                let waiting = held_at_start + preempted.len();
+                if waiting > 0 {
+                    tracing::warn!(
+                        ?early_exit_phase,
+                        "tick-stall phases: {phases} (unfinished branch includes its emit work)"
+                    );
+                    tracing::warn!(
+                        "tick-stall: {wall_ms:.0} ms wall (live {active}, chunking {}, preempted {})",
+                        chunking.len(),
+                        preempted.len()
+                    );
+                } else {
+                    tracing::debug!(
+                        ?early_exit_phase,
+                        "tick-stall (prefill only, nobody waiting): {wall_ms:.0} ms wall (live \
+                     {active}, chunking {}): {phases}",
+                        chunking.len()
+                    );
+                }
             }
         }
         tick_t0 = std::time::Instant::now();
@@ -3801,7 +3797,9 @@ fn run_batched(
         // P5b free-on-completion: return finished slots' KV blocks to the paged
         // pool the moment their sequence ends (idempotent; no-op unless a budget
         // pool is active). Without this a completed slot pins its blocks until
-        // the slot is next reused by a new admission.
+        // the slot is next reused by a new admission. A background slot that
+        // just yielded to a live request is returned here too.
+        admission::preempt_for_live(&mut slots, &mut preempted, &chunking, rx);
         occupied.clear();
         occupied.extend(slots.iter().map(|s| s.is_some()));
         generator.release_inactive_slots(&occupied);
@@ -3836,11 +3834,15 @@ fn run_batched(
             .pool_admission_blocks()
             .map(|f| f.saturating_sub(committed));
         // P5b-3: re-admit preempted (recompute) sequences before new arrivals -
-        // they are already-accepted in-flight work. Each needs room for its
+        // they are already-accepted in-flight work (a background one waits
+        // while a live request does). Each needs room for its
         // recompute prefill (history[0..pos]); gate on the same watermark and a
         // free slot, else leave it queued and retry as completions free blocks.
-        while let Some(front) = preempted.first() {
-            let need = front.prompt.len().div_ceil(crate::kv_pool::BLOCK_TOKENS);
+        while let Some(i) = admission::next_resume(&preempted, rx) {
+            let need = preempted[i]
+                .prompt
+                .len()
+                .div_ceil(crate::kv_pool::BLOCK_TOKENS);
             let fits = admit_budget.is_none_or(|b| need + POOL_WATERMARK_BLOCKS <= b);
             let free = slots.iter().position(Option::is_none);
             match (fits, free) {
@@ -3848,7 +3850,9 @@ fn run_batched(
                     if let Some(b) = admit_budget.as_mut() {
                         *b = b.saturating_sub(need);
                     }
-                    slots[k] = Some(preempted.remove(0));
+                    let slot = preempted.remove(i);
+                    generator.set_slot_background(k, slot.background);
+                    slots[k] = Some(slot);
                     if pool_stats {
                         tracing::warn!("pool: RESUMED preempted seq into slot {k} ({need} blocks)");
                     }
@@ -3902,7 +3906,7 @@ fn run_batched(
                 }
                 Ok(req) => {
                     debit_pool_budget(&mut admit_budget, &req);
-                    admit(&mut slots, req, &*generator, metrics);
+                    admit(&mut slots, req, &mut *generator, metrics);
                     admitted_now += 1;
                     ticks_since_admit = 0;
                     // a fresh prefill re-warms the draft head - make spec
@@ -3991,7 +3995,7 @@ fn run_batched(
                 }
                 Ok(req) => {
                     debit_pool_budget(&mut admit_budget, &req);
-                    admit(&mut slots, req, &*generator, metrics);
+                    admit(&mut slots, req, &mut *generator, metrics);
                     admitted_now += 1;
                     {
                         ticks_since_admit = 0;
@@ -4053,7 +4057,7 @@ fn run_batched(
                     }
                     Ok(req) => {
                         debit_pool_budget(&mut admit_budget, &req);
-                        admit(&mut slots, req, &*generator, metrics);
+                        admit(&mut slots, req, &mut *generator, metrics);
                         ticks_since_admit = 0;
                         spec_retry_at = spec_ticks;
                         quiet = std::time::Instant::now();
@@ -4201,25 +4205,27 @@ fn run_batched(
                     slots[k] = None;
                 }
             }
-            if generator.encoding_pending() {
+            let enc_host = !enc_stalled
+                && unified_ok
+                && generator.supports_overlap()
+                && slots.iter().flatten().any(|s| s.prefilled);
+            if generator.encoding_pending() && !enc_host {
                 metrics.phase.store(PHASE_PREFILL, Relaxed);
-                let seg_t = std::time::Instant::now();
-                for (k, res) in generator.encode_step() {
-                    mm_encoding.remove(&k);
-                    admit_mm(
-                        generator,
-                        &mut slots,
-                        &mut chunking,
-                        &mut st_adm,
-                        k,
-                        res,
-                        metrics,
-                    );
-                }
-                if crate::tickseg::on() {
-                    crate::tickseg::enc(seg_t.elapsed());
-                }
+                overlap_gate::encode_admit(
+                    generator,
+                    &mut slots,
+                    &mut chunking,
+                    &mut mm_encoding,
+                    &mut st_adm,
+                    metrics,
+                    false,
+                );
+                enc_stalled = false;
             }
+            // A background prompt starts its prefill only while no live request
+            // is in the engine - its chunks would ride every tick the live one
+            // decodes in. Chunks already running finish; the batch fills the gaps.
+            let hold_bg = slots.iter().flatten().any(|s| !s.background);
             if generator.supports_chunked_multimodal() && !co_hold {
                 let room = max_chunks_inflight()
                     .saturating_sub(chunking.len().saturating_sub(mix_deferred.len()));
@@ -4232,6 +4238,7 @@ fn run_batched(
                         && !slot.prefilled
                         && !chunking.contains(&k)
                         && slot.mm.is_some()
+                        && !(hold_bg && slot.background)
                     {
                         slot.prompt.clear();
                         wave.push((k, slot.mm.take().expect("is_some")));
@@ -4322,6 +4329,7 @@ fn run_batched(
                             && s.as_ref().is_some_and(|sl| {
                                 !sl.prefilled
                                     && sl.mm.is_none()
+                                    && !(hold_bg && sl.background)
                                     // Park/wake (KVFlow): a prefix being
                                     // restored from the KV tier parks its
                                     // request - the batch runs other work and
@@ -4564,8 +4572,13 @@ fn run_batched(
                 }
             }
         }
+        // nothing chunking: still a mixed round when it can host the encoder
         let run_mixed = if chunking.is_empty() {
-            false
+            !enc_stalled
+                && unified_ok
+                && generator.encoding_pending()
+                && generator.supports_overlap()
+                && slots.iter().flatten().any(|s| s.prefilled)
         } else {
             static DPC: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
             let dpc = *DPC.get_or_init(|| {
@@ -4590,6 +4603,9 @@ fn run_batched(
                 true
             }
         };
+        if !run_mixed && generator.encoding_pending() {
+            enc_stalled = true; // no pump hosts it this round
+        }
         if run_mixed {
             // Report the phase honestly (same rule as the classic batched
             // prefill above): a mixed tick exists because a chunked prefill is
@@ -4688,8 +4704,41 @@ fn run_batched(
                     trunc_pipe_ok,
                 );
             }
+            if !overlap_ok {
+                // the encoder rides no pump this round - the loop top runs it
+                enc_stalled = true;
+                if chunking.is_empty() {
+                    continue; // only here to host the encoder
+                }
+            }
             if overlap_ok {
-                // finisher plans: same peek rules as the fused tick below
+                let t0 = std::time::Instant::now();
+                // Pipe first (overlap_gate::pipe_first): tick 0 replays on the
+                // decode lane while the host enqueues the span's eager launches.
+                let pipe_first = overlap_gate::pipe_first();
+                let mut pipe = if pipe_first {
+                    overlap_gate::pipe_begin(generator, &mut slots, &dec, trunc_pipe_ok)
+                } else {
+                    None
+                };
+                // Encoder host: nothing chunking yet, so the riding admissions
+                // advance under tick 0 and this span carries them - not a
+                // classic tick idling the main lane while they wait on the
+                // loop top (~25% of decode ticks on the B200 recover load).
+                let mut enc_n = 0;
+                if chunking.is_empty() {
+                    enc_n = overlap_gate::encode_admit(
+                        generator,
+                        &mut slots,
+                        &mut chunking,
+                        &mut mm_encoding,
+                        &mut st_adm,
+                        metrics,
+                        true,
+                    );
+                }
+                // finisher plans (after the host step: its riders may finish in
+                // this span): same peek rules as the fused tick below
                 // (finishers sample in the span's own buffers - TruncCat is
                 // legal there whenever the backend has the trunc finish,
                 // independent of the trunc-pipe gate)
@@ -4715,10 +4764,30 @@ fn run_batched(
                         Some((k, plan))
                     })
                     .collect();
-                let t0 = std::time::Instant::now();
-                let launched = match generator
-                    .unified_span_launch(mixed_tick_budget(dec.len()), &fin_plans)
-                {
+                let launched =
+                    generator.unified_span_launch(mixed_tick_budget(dec.len()), &fin_plans);
+                if !pipe_first && matches!(launched, Ok(true)) {
+                    pipe = overlap_gate::pipe_begin(generator, &mut slots, &dec, trunc_pipe_ok);
+                }
+                if let Some(prev_plans) = pipe {
+                    enc_n += overlap_gate::pump(
+                        generator,
+                        &mut slots,
+                        &dec,
+                        prev_plans,
+                        trunc_pipe_ok,
+                        max_batch,
+                        &mut chunking,
+                        &mut mm_encoding,
+                        &mut st_adm,
+                        &mut st_ovl,
+                        metrics,
+                    );
+                }
+                // riding steps that moved nothing (a group at the front, a
+                // follower on its leader): the loop top runs the full step
+                enc_stalled = enc_n == 0 && generator.encoding_pending();
+                let launched = match launched {
                     Ok(l) => l,
                     Err(crate::generator::GenError::PoolExhausted) => {
                         preempt_or_fail_mixed(
@@ -4742,148 +4811,6 @@ fn run_batched(
                     }
                 };
                 if launched {
-                    // pump the decode lane while the span runs on the main
-                    // lane. Same protocol as the quiet-phase pipe: plans for
-                    // tick N+1 are drawn before tick N's ids come back
-                    // (`prev_plans`), dead rows keep ticking as dummies, and
-                    // the drain collects the last in-flight tick.
-                    let slots_v: Vec<u32> = dec.iter().map(|&(k, _, _)| k as u32).collect();
-                    let toks: Vec<u32> = dec.iter().map(|&(_, t, _)| t).collect();
-                    let pos: Vec<u32> = dec.iter().map(|&(_, _, p)| p).collect();
-                    let plans0: Vec<RowSample> = dec
-                        .iter()
-                        .map(|&(k, _, _)| {
-                            let sl = slots[k].as_mut().expect("live decode row");
-                            match if trunc_pipe_ok {
-                                sl.sampler.device_plan_trunc()
-                            } else {
-                                sl.sampler.device_plan()
-                            } {
-                                Some(p) => RowSample::Device(p),
-                                None => RowSample::Hole, // plannable-gated above
-                            }
-                        })
-                        .collect();
-                    let mut pipe_alive =
-                        match generator.decode_pipe_begin_slots(&slots_v, &toks, &pos, &plans0) {
-                            Ok(()) => true,
-                            Err(e) => {
-                                static ONCE: std::sync::Once = std::sync::Once::new();
-                                ONCE.call_once(|| {
-                                tracing::warn!(
-                                    "serve: overlap decode pipe unavailable, span-only ticks: {e}"
-                                );
-                            });
-                                false
-                            }
-                        };
-                    if pipe_alive {
-                        let mut prev_plans = plans0;
-                        let mut ovl_ticks = 0usize;
-                        loop {
-                            // stop pumping when the span completes, the pool
-                            // runs low, a row needs host sampling, or every
-                            // row died - the drain collects the in-flight tick
-                            let all_dead = dec.iter().all(|&(k, _, _)| slots[k].is_none());
-                            let low_headroom = !generator
-                                .pool_free_blocks()
-                                .is_none_or(|f| f > max_batch + POOL_WATERMARK_BLOCKS);
-                            // dead rows tick on too: none may step past its context
-                            let near_end = pos
-                                .iter()
-                                .any(|&p| p as usize + ovl_ticks + 3 >= generator.max_context());
-                            if generator.unified_span_done() || low_headroom || all_dead || near_end
-                            {
-                                overlap_gate::log_pipe_exit(
-                                    &*generator,
-                                    ovl_ticks,
-                                    low_headroom,
-                                    all_dead,
-                                    near_end,
-                                );
-                                break;
-                            }
-                            let mut host_row = false;
-                            let next_plans: Vec<RowSample> = dec
-                                .iter()
-                                .map(|&(k, _, _)| match &mut slots[k] {
-                                    // died mid-pump: dummy row keeps ticking,
-                                    // ids discarded (quiet-pipe trick)
-                                    None => RowSample::Hole,
-                                    Some(sl)
-                                        if sl.constraint.is_none() && sl.logprobs.is_none() =>
-                                    {
-                                        match if trunc_pipe_ok {
-                                            sl.sampler.device_plan_trunc()
-                                        } else {
-                                            sl.sampler.device_plan()
-                                        } {
-                                            Some(p) => RowSample::Device(p),
-                                            None => {
-                                                host_row = true;
-                                                RowSample::Host
-                                            }
-                                        }
-                                    }
-                                    Some(_) => {
-                                        host_row = true;
-                                        RowSample::Host
-                                    }
-                                })
-                                .collect();
-                            if host_row {
-                                break;
-                            }
-                            ovl_ticks += 1;
-                            match generator.decode_pipe_next(&next_plans) {
-                                Ok(ids) => {
-                                    st_ovl += 1;
-                                    for (i, &(k, _, _)) in dec.iter().enumerate() {
-                                        if matches!(prev_plans[i], RowSample::Device(_)) {
-                                            commit_device_token(&mut slots[k], ids[i], false);
-                                        }
-                                    }
-                                    prev_plans = next_plans;
-                                }
-                                Err(e) => {
-                                    // the decode rows' state is compromised;
-                                    // the span (chunking slots) is not - fail
-                                    // only the riders, keep the prefills
-                                    tracing::warn!("serve: overlap decode_pipe_next failed: {e}");
-                                    for &(k, _, _) in &dec {
-                                        if let Some(s) = slots[k].take() {
-                                            let _ = s
-                                                .events
-                                                .send(TokenEvent::Error(EngineError::from_gen(&e)));
-                                        }
-                                    }
-                                    pipe_alive = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if pipe_alive {
-                            match generator.decode_pipe_drain() {
-                                Ok(ids) => {
-                                    for (i, &(k, _, _)) in dec.iter().enumerate() {
-                                        if matches!(prev_plans[i], RowSample::Device(_)) {
-                                            commit_device_token(&mut slots[k], ids[i], false);
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!("serve: overlap decode_pipe_drain failed: {e}");
-                                    for &(k, _, _) in &dec {
-                                        if let Some(s) = slots[k].take() {
-                                            let _ = s
-                                                .events
-                                                .send(TokenEvent::Error(EngineError::from_gen(&e)));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
                     // complete the span (blocks until the main lane finishes)
                     match generator.unified_span_finish() {
                         Ok(finished) => {
@@ -5555,6 +5482,7 @@ fn run_batched(
                             match plans[i] {
                                 RowSample::Hole => {}
                                 RowSample::Device(_) => {
+                                    tok_trace(k, &slots[k], step.ids[i], "fused");
                                     commit_device_token(
                                         &mut slots[k],
                                         step.ids[i],
@@ -5880,7 +5808,7 @@ fn run_batched(
                 };
                 let mut reqs: Vec<(usize, usize, Vec<u32>)> = Vec::with_capacity(live.len());
                 for (i, &k) in live.iter().enumerate() {
-                    let slot = slots[k].as_ref().expect("live");
+                    let slot = slots[k].as_mut().expect("live");
                     let mut chunk = vec![slot.pending];
                     if k_budget > 0 {
                         match model_drafts.as_ref() {
@@ -6278,12 +6206,18 @@ fn run_batched(
                                     let mut alive = true;
                                     loop {
                                         if alive && inflight < 2 {
+                                            // take an arrival only into a free slot (admit
+                                            // has nowhere else to put it); a live one
+                                            // blocked by background slots ends the pipe
                                             if pipe_admit.is_none()
+                                                && slots.iter().any(Option::is_none)
                                                 && let Ok(req) = rx.try_recv()
                                             {
                                                 pipe_admit = Some(req);
                                             }
-                                            let par: Option<Vec<u32>> = if pipe_admit.is_some() {
+                                            let par: Option<Vec<u32>> = if pipe_admit.is_some()
+                                                || admission::live_blocked(&slots, &chunking, rx)
+                                            {
                                                 None
                                             } else {
                                                 (|| {
@@ -6409,7 +6343,7 @@ fn run_batched(
                                     }
                                     if let Some(req) = pipe_admit {
                                         debit_pool_budget(&mut admit_budget, &req);
-                                        admit(&mut slots, req, &*generator, metrics);
+                                        admit(&mut slots, req, &mut *generator, metrics);
                                         ticks_since_admit = 0;
                                     }
                                 }
@@ -6876,6 +6810,8 @@ fn run_batched(
                 // whose ids the next decode_pipe_next/drain call returns.
                 let mut prev_plans = plans;
                 let mut seg_ticks = 0usize;
+                let seg_t0 = std::time::Instant::now();
+                let mut seg_longest = std::time::Duration::ZERO;
                 loop {
                     // Draw the next tick's plans first (per-slot RNG order is
                     // identical to the classic path - draws don't depend on
@@ -6969,7 +6905,21 @@ fn run_batched(
                     let near_end = positions
                         .iter()
                         .any(|&p| p as usize + seg_ticks + 3 >= generator.max_context());
-                    if host_row || admit_req.is_some() || low_headroom || near_end {
+                    let live_blocked = admission::live_blocked(&slots, &chunking, rx);
+                    // a shutdown request too: the outer loop is the only
+                    // place that honours it, and a segment under a client
+                    // that stopped sending ends only when its last row does
+                    let stopping = ctl.stop_requested();
+                    if host_row
+                        || admit_req.is_some()
+                        || low_headroom
+                        || near_end
+                        || live_blocked
+                        || stopping
+                    {
+                        // the exit is the segment's last "tick" for the stall
+                        // report: an overlapped admission prefill plus the drain
+                        let break_t0 = std::time::Instant::now();
                         if paddock_models::dev_var_os!("PADDOCK_REQ_TRACE").is_some() {
                             tracing::info!(
                                 "req-trace: pipe-break host={host_row} arrival={} lowroom={low_headroom} at {}",
@@ -7010,7 +6960,7 @@ fn run_batched(
                                 let Some(req) = admit_req.take() else { break };
                                 let free_k = slots.iter().position(|s| s.is_none());
                                 debit_pool_budget(&mut admit_budget, &req);
-                                admit(&mut slots, req, &*generator, metrics);
+                                admit(&mut slots, req, &mut *generator, metrics);
                                 {
                                     ticks_since_admit = 0;
                                 }
@@ -7080,8 +7030,10 @@ fn run_batched(
                         pipe_seg_ticks = 0;
                         match generator.decode_pipe_drain() {
                             Ok(ids) => {
+                                seg_longest = seg_longest.max(break_t0.elapsed());
                                 for (k, plan) in prev_plans.iter().enumerate() {
                                     if matches!(plan, RowSample::Device(_)) {
+                                        tok_trace(k, &slots[k], ids[k], "pipe-next");
                                         commit_device_token(&mut slots[k], ids[k], false);
                                     }
                                 }
@@ -7102,7 +7054,7 @@ fn run_batched(
                                 mm_pending = Some(req);
                             } else {
                                 debit_pool_budget(&mut admit_budget, &req);
-                                admit(&mut slots, req, &*generator, metrics);
+                                admit(&mut slots, req, &mut *generator, metrics);
                                 {
                                     ticks_since_admit = 0;
                                 }
@@ -7117,11 +7069,13 @@ fn run_batched(
                         Ok(ids) => {
                             st[0].0 += 1;
                             st[0].1 += t0.elapsed().as_nanos() as u64;
+                            seg_longest = seg_longest.max(t0.elapsed());
                             ticks_since_admit = ticks_since_admit.saturating_add(1);
                             pipe_seg_ticks = pipe_seg_ticks.saturating_add(1);
                             let mut died = false;
                             for (k, plan) in prev_plans.iter().enumerate() {
                                 if matches!(plan, RowSample::Device(_)) {
+                                    tok_trace(k, &slots[k], ids[k], "pipe-drain");
                                     commit_device_token(&mut slots[k], ids[k], false);
                                     if slots[k].is_none() {
                                         died = true;
@@ -7151,10 +7105,13 @@ fn run_batched(
                                 // still batched - commit the survivors' ids,
                                 // discard the rest (None guard), and let the
                                 // outer loop re-shape the batch
+                                let drain_t0 = std::time::Instant::now();
                                 match generator.decode_pipe_drain() {
                                     Ok(ids) => {
+                                        seg_longest = seg_longest.max(drain_t0.elapsed());
                                         for (k, plan) in prev_plans.iter().enumerate() {
                                             if matches!(plan, RowSample::Device(_)) {
+                                                tok_trace(k, &slots[k], ids[k], "pipe-drain2");
                                                 commit_device_token(&mut slots[k], ids[k], false);
                                             }
                                         }
@@ -7185,6 +7142,7 @@ fn run_batched(
                         }
                     }
                 }
+                seg_report = Some((seg_ticks, seg_longest, seg_t0.elapsed()));
                 continue;
             }
             // tickseg: same wiring as the mixed-sampled pass above - the
@@ -7213,6 +7171,7 @@ fn run_batched(
                         match plan {
                             RowSample::Hole => {}
                             RowSample::Device(_) => {
+                                tok_trace(k, &slots[k], step.ids[k], "classic");
                                 commit_device_token(
                                     &mut slots[k],
                                     step.ids[k],
@@ -7242,7 +7201,7 @@ fn run_batched(
                     // off the preemption target - no livelock. A sampled step that
                     // hit PoolExhausted did so in ensure_pool_rows before any KV
                     // write (growth precedes run_layers), so no row half-advanced.
-                    if let Some(k) = slots[..high_water].iter().rposition(|s| s.is_some()) {
+                    if let Some(k) = admission::pressure_victim(&slots[..high_water], |_| true) {
                         let need = slots[k].as_mut().expect("present").preempt_for_recompute();
                         preempted.push(slots[k].take().expect("present"));
                         if pool_stats {
@@ -7280,7 +7239,7 @@ fn run_batched(
                 // the retried step then fits. Re-admission (above) resumes it.
                 // Preempting the newest keeps recompute sequences (which re-admit
                 // into low slots) from being re-preempted - avoiding livelock.
-                if let Some(k) = slots[..high_water].iter().rposition(|s| s.is_some()) {
+                if let Some(k) = admission::pressure_victim(&slots[..high_water], |_| true) {
                     let need = slots[k].as_mut().expect("present").preempt_for_recompute();
                     preempted.push(slots[k].take().expect("present"));
                     if pool_stats {
@@ -7412,6 +7371,7 @@ mod diffusion_billing_tests {
                 submitted: None,
                 canvas_read: None,
                 user_turn: false,
+                background: false,
             })
             .unwrap();
         }
@@ -7495,6 +7455,7 @@ mod reply_pin_tests {
                 submitted: None,
                 canvas_read: None,
                 user_turn: false,
+                background: false,
             },
             Arc::new(EngineMetrics::default()),
         )
@@ -7578,6 +7539,7 @@ mod usage_tests {
                     submitted: None,
                     canvas_read: None,
                     user_turn: false,
+                    background: false,
                 },
                 metrics.clone(),
             );
@@ -7619,6 +7581,7 @@ mod usage_tests {
                 submitted: None,
                 canvas_read: None,
                 user_turn: false,
+                background: false,
             },
             metrics.clone(),
         );
@@ -7707,6 +7670,7 @@ mod usage_tests {
                     submitted: None,
                     canvas_read: None,
                     user_turn: false,
+                    background: false,
                 },
                 Arc::new(EngineMetrics::default()),
             )
@@ -7781,6 +7745,7 @@ mod usage_tests {
                 submitted: None,
                 canvas_read: None,
                 user_turn: false,
+                background: false,
             },
             &metrics,
         );
@@ -7930,6 +7895,7 @@ mod serial_pipe_tests {
                 submitted: None,
                 canvas_read: None,
                 user_turn: false,
+                background: false,
             },
             &metrics,
         );

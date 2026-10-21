@@ -247,10 +247,10 @@ kernel void bonsai_dn_recurrent(device const float* qkv [[buffer(0)]],device con
 // by two row-local shuffles reproduces the reference's ascending reduction
 // on the qualified Apple10 compiler; do not elect on other GPU families.
 #ifndef PADDOCK_APPLE9
-kernel void mlx_dn_recurrent_packed(device const float* qkv [[buffer(0)]],device const float* gates [[buffer(1)]],
-    device float* state [[buffer(2)]],device const uint* spans [[buffer(3)]],device const uint* meta [[buffer(4)]],
-    device float* out [[buffer(5)]],device const uint* checkpoints [[buffer(6)]],constant uint* p [[buffer(7)]],
-    uint3 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) {
+template<bool Full=false>
+inline void mlx_dn_packed(device const float* qkv,device const float* gates,
+    device float* state,device const uint* spans,device const uint* meta,
+    device float* out,device const uint* checkpoints,constant uint* p,uint3 g,uint tid) {
     #pragma clang fp reassociate(off)
     #pragma clang fp contract(off)
     uint first=spans[g.z*4],count=spans[g.z*4+1],slot=spans[g.z*4+2],h=g.y;
@@ -284,7 +284,7 @@ kernel void mlx_dn_recurrent_packed(device const float* qkv [[buffer(0)]],device
         }
         sum=((part[0]+part[1])+(part[2]+part[3]))+((part[4]+part[5])+(part[6]+part[7]));
         sum+=simd_shuffle_xor(sum,1);sum+=simd_shuffle_xor(sum,2);
-        if(tid%4==0)out[(ulong(r)*p[1]+h)*128+v]=mlx_bf(sum);
+        if(tid%4==0)out[(ulong(r)*p[1]+h)*128+v]=Full?sum:mlx_bf(sum);
         if(checkpoints[r]!=0) {
             ulong cache=((ulong(p[5])*p[4]+checkpoints[r]-1)*p[1]+h)*128*128+v*128+d;
             #pragma unroll
@@ -294,6 +294,15 @@ kernel void mlx_dn_recurrent_packed(device const float* qkv [[buffer(0)]],device
     #pragma unroll
     for(uint j=0;j<8;++j)*reinterpret_cast<device float4*>(state+offset+j*4)=cells[j];
 }
+#define MLX_DN_PACKED(NAME,FULL) \
+kernel void NAME(device const float* qkv [[buffer(0)]],device const float* gates [[buffer(1)]], \
+device float* state [[buffer(2)]],device const uint* spans [[buffer(3)]],device const uint* meta [[buffer(4)]], \
+device float* out [[buffer(5)]],device const uint* checkpoints [[buffer(6)]],constant uint* p [[buffer(7)]], \
+uint3 g [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]]) { \
+mlx_dn_packed<FULL>(qkv,gates,state,spans,meta,out,checkpoints,p,g,tid);}
+MLX_DN_PACKED(mlx_dn_recurrent_packed,false)
+MLX_DN_PACKED(bonsai_dn_recurrent_packed,true)
+#undef MLX_DN_PACKED
 #endif
 
 // Transactional counterpart of mlx_dn_recurrent. Preserve its head mapping,

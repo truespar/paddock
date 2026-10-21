@@ -52,7 +52,14 @@ __global__ void __launch_bounds__(256) pd_attn_decode_tc5e_kernel(
     constexpr uint32_t CH = HD == 256u ? 192u : 96u;
     constexpr uint32_t BPC = CH / 16u;    // KV blocks per chunk (12 / 6)
     constexpr uint32_t CPB = CH * 128u;   // bytes per partition slab
-    constexpr uint32_t MAXT = 128u, MAXC = 16u;
+    // MAXT: the tick table is two bytes a tick, so its cap is cheap; what pinned it
+    // at 128 was the per-tick block-table cache (MAXT*BPC words of static smem),
+    // and the host's worst-case bound (cpc * chunks-of-the-window <= MAXT) then
+    // declined the arm past 37 decode rows on a 148-SM die at a 16k window
+    // (cpc 2) - every qwen3.8 decode step at depth >= 38 fell to the mma.sync
+    // krs walk at ~1.2 TB/s. The cache is gone (stage_k/v read the block
+    // table directly - a few L2-resident words per staged chunk).
+    constexpr uint32_t MAXT = 1024u, MAXC = 16u;
     constexpr uint32_t QSZ = 8u * HD;     // per-cell Q slab (8-row M tile)
     // TMEM columns: two S slots (one per team; 2 halves only when CH>128)
     // then two O parity regions of NP*8 cols each.
@@ -97,8 +104,7 @@ __global__ void __launch_bounds__(256) pd_attn_decode_tc5e_kernel(
     __shared__ uint32_t tmem_slot[1], s_ntick;
     __shared__ uint16_t s_tick[MAXT];
     __shared__ uint32_t s_ckvh[MAXC], s_cb[MAXC], s_cglo[MAXC], s_cghi[MAXC],
-                        s_cB0[MAXC], s_cnblk[MAXC], s_cnch[MAXC];
-    __shared__ uint32_t s_btw[MAXT * BPC];
+                        s_cB0[MAXC], s_cnblk[MAXC], s_cnch[MAXC], s_cslot[MAXC];
 
     if (tid == 0) {
         #pragma unroll
@@ -130,6 +136,7 @@ __global__ void __launch_bounds__(256) pd_attn_decode_tc5e_kernel(
         const uint32_t nblk = ((ghi + 15u) >> 4) - B0;
         s_ckvh[lane] = kvh; s_cb[lane] = b; s_cglo[lane] = glo;
         s_cghi[lane] = ghi; s_cB0[lane] = B0; s_cnblk[lane] = nblk;
+        s_cslot[lane] = slots ? slots[b] : b;
         s_cnch[lane] = (nblk + (BPC - 1u)) / BPC;
     }
     if (tid < 32u) {
@@ -150,17 +157,6 @@ __global__ void __launch_bounds__(256) pd_attn_decode_tc5e_kernel(
         s_ntick = nt;
     }
     __syncthreads();
-    if (tid < 128u)
-        for (uint32_t i = tid; i < s_ntick * BPC; i += 128u) {
-            const uint32_t t = i / BPC, j = i % BPC;
-            const uint32_t ci = s_tick[t] >> 8, ch = s_tick[t] & 0xffu;
-            const uint32_t nbc = min(BPC, s_cnblk[ci] - ch * BPC);
-            if (j < nbc) {
-                const uint32_t slot = slots ? slots[s_cb[ci]] : s_cb[ci];
-                s_btw[t * BPC + j] = __ldg(block_tables
-                    + (size_t)slot * blocks_per_slot + s_cB0[ci] + ch * BPC + j);
-            }
-        }
     __syncthreads();
     const uint32_t ntick = s_ntick;
 
@@ -185,7 +181,7 @@ __global__ void __launch_bounds__(256) pd_attn_decode_tc5e_kernel(
             }
         }
     };
-    // stage lambdas: warp-agnostic (caller = one warp); tick-indexed s_btw
+    // stage lambdas: warp-agnostic (caller = one warp); block table read per chunk
     auto stage_k = [&](uint32_t t) {
         const uint32_t ci = s_tick[t] >> 8, ch = s_tick[t] & 0xffu;
         const uint32_t sl = t & 1u;
@@ -196,7 +192,8 @@ __global__ void __launch_bounds__(256) pd_attn_decode_tc5e_kernel(
                          ::"r"(mk), "r"(nbc * NP * 2048u));
         __syncwarp();
         if (lane < nbc * NP) {
-            const uint32_t blk = s_btw[t * BPC + lane / NP];
+            const uint32_t blk = __ldg(block_tables + (size_t)s_cslot[ci] * blocks_per_slot
+                                       + s_cB0[ci] + ch * BPC + lane / NP);
             const uint32_t p = lane % NP;
             const int y = (int)(blk * 16u);
             // kvh_div: VIRTUAL kv heads (G=12 split as two G=6 cells - qwen4exp
@@ -222,7 +219,8 @@ __global__ void __launch_bounds__(256) pd_attn_decode_tc5e_kernel(
                          ::"r"(mv), "r"(nbc * NP * 2048u));
         __syncwarp();
         if (lane < nbc * NP) {
-            const uint32_t blk = s_btw[t * BPC + lane / NP];
+            const uint32_t blk = __ldg(block_tables + (size_t)s_cslot[ci] * blocks_per_slot
+                                       + s_cB0[ci] + ch * BPC + lane / NP);
             const uint32_t p = lane % NP;
             const int y = (int)(blk * 16u);
             const int x = (int)((s_ckvh[ci] / kvh_div) * HD + p * 128u);
@@ -697,7 +695,53 @@ int pd_attn_decode_tc5_paged(const void* q, const void* pool_k, const void* pool
         }
         return -2;
     }
-    // one-wave cell packing: cpc cells/CTA, tick table capped at 128 ticks
+    if (dns5 && pd_env("PADDOCK_NO_TC5D") == nullptr) {
+        // qwen3.8 G6: the decoupled-ring kernel (decode_tc5d.cuh) - whole cells, no tick
+        // table, so none of the cpc / MAXT bounds below apply
+        static const uint32_t nsm_d = [] {
+            int dev = 0, n = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+            return (uint32_t)(n > 0 ? n : 1);
+        }();
+        static const uint32_t lpt_d = pd_env("PADDOCK_NO_TC5D_LPT") != nullptr ? 0u : 1u;
+        static int attr_d = -1;
+        if (attr_d < 0)
+            attr_d = cudaFuncSetAttribute((const void*)pd_attn_decode_tc5d_kernel<6u>,
+                                          cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                          (int)PD_TC5D_SMEM) == cudaSuccess ? 1 : 0;
+        if (attr_d) {
+            struct PdTmEntD { const void* p; uint32_t kd; CUtensorMap m; };
+            static PdTmEntD tdc[64];
+            static uint32_t tdn = 0;
+            auto get_tmd = [&](const void* base) -> const CUtensorMap* {
+                for (uint32_t i = 0; i < tdn; ++i)
+                    if (tdc[i].p == base && tdc[i].kd == kv_dim) return &tdc[i].m;
+                if (tdn >= 64u) tdn = 0;
+                if (!pd_attn_tmap_kv_f8s(&tdc[tdn].m, base, kv_dim)) return nullptr;
+                tdc[tdn].p = base; tdc[tdn].kd = kv_dim;
+                return &tdc[tdn++].m;
+            };
+            const CUtensorMap* tkd = get_tmd(pool_k);
+            const CUtensorMap* tvd = tkd ? get_tmd(pool_v) : nullptr;
+            if (tkd && tvd) {
+                const uint32_t cells = batch * n_kv_heads;
+                const uint32_t grid = cells < nsm_d ? cells : nsm_d;
+                static bool wit = false;
+                if (!wit) {
+                    fprintf(stderr, "[tc5-attn] elected tc5d: hd=%u g=%u cells=%u grid=%u smem=%u window=%u\n",
+                            head_dim, group, cells, grid, (uint32_t)PD_TC5D_SMEM, swa_window);
+                    wit = true;
+                }
+                pd_pdl_go(pd_attn_decode_tc5d_kernel<6u>, grid, 192u, PD_TC5D_SMEM, (cudaStream_t)stream,
+                          *tkd, *tvd, (const float*)q, (float*)out, (const unsigned int*)positions,
+                          (const unsigned int*)slots, (const uint32_t*)block_tables, blocks_per_slot,
+                          swa_window, scale, n_kv_heads, batch, kvh_div, lpt_d);
+                return pd_launch_status();
+            }
+        }
+    }
+    // one-wave cell packing: cpc cells/CTA, tick table capped at 1024 ticks
     // and 16 cells (kernel MAXT/MAXC) - swa_window bounds nch so both caps
     // are host-checkable without reading positions
     static const uint32_t nsm = [] {
@@ -714,7 +758,7 @@ int pd_attn_decode_tc5_paged(const void* q, const void* pool_k, const void* pool
     const uint32_t bpc = head_dim == 256u ? 12u : 6u;
     const uint32_t qsz = 8u * head_dim;
     const uint32_t nch_max = ((swa_window >> 4) + 1u + bpc - 1u) / bpc;
-    if (cpc > 16u || cpc * nch_max > 128u) return -2;
+    if (cpc > 16u || cpc * nch_max > 1024u) return -2;   // kernel MAXC / MAXT
     const uint32_t smem5 = 2u * 2u * 49152u + cpc * qsz + 2u * 2048u + 1024u;
     static int smem_cap = -1;
     if (smem_cap < 0)

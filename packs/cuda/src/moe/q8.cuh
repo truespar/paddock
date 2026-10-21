@@ -2825,71 +2825,7 @@ int pd_shexp_gate_add(void* dst, const void* src, const void* x, const void* w,
 }
 
 
-// Fused residual-add + RMSNorm for the decode/serving paths: x += proj
-// (written back), out = rmsnorm(x, w). Bit-identical to the add-then-norm
-// two-kernel sequence (same add, same square-sum order over the summed
-// values) - it just removes one graph-node drain per layer (the b=1 tail
-// measured ~2-4 us per small launch; the mid-layer add+norm pair is 2 of
-// the ~9 tail launches on every DeltaNet layer).
-// `pscale` folds a residual MULTIPLIER into the fused add (granite's
-// `residual_multiplier`). It exists because granite was the one
-// family that could not use this kernel: its residual is `x += res_s * proj`,
-// so it paid pd_scale_add + pd_rmsnorm_batch as two launches -- ~80 extra
-// launches per decode tick on the 8b, measured at 82 us/token of pure
-// scale_add. fmaf(1, p, v) is exactly p + v, so `pd_add_rmsnorm_batch` passing
-// 1.0f keeps every existing caller bit-identical, and the granite chain is
-// bit-identical too because pd_scale_add_kernel's `x[i] += w * y[i]`
-// contracts to the same fma.
-__global__ void pd_add_rmsnorm_batch_kernel(float* __restrict__ x,
-                                            const float* __restrict__ proj,
-                                            const float* __restrict__ w,
-                                            float* __restrict__ out, uint32_t n,
-                                            float eps, float pscale) {
-    // cascade (laguna chain): proj is the predecessor
-    // wo-GEMV's output. No-op under plain launches / pre-sm90.
-    PD_PDL_ARM();
-    const uint32_t b = blockIdx.x;
-    float* xb = x + (size_t)b * n;
-    const float* pb = proj + (size_t)b * n;
-    float* ob = out + (size_t)b * n;
-    const uint32_t tid = threadIdx.x, nth = blockDim.x;
-    __shared__ float wsum[32];
-    __shared__ float s_inv;
-    float acc = 0.0f;
-    const bool vec = (n & 3u) == 0;
-    if (vec) {
-        const uint32_t n4 = n >> 2;
-        float4* x4 = reinterpret_cast<float4*>(xb);
-        const float4* p4 = reinterpret_cast<const float4*>(pb);
-        for (uint32_t i = tid; i < n4; i += nth) {
-            float4 v = x4[i];
-            const float4 pv = p4[i];
-            v.x = fmaf(pscale, pv.x, v.x); v.y = fmaf(pscale, pv.y, v.y);
-            v.z = fmaf(pscale, pv.z, v.z); v.w = fmaf(pscale, pv.w, v.w);
-            x4[i] = v;
-            acc += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
-        }
-    } else {
-        for (uint32_t i = tid; i < n; i += nth) {
-            const float v = fmaf(pscale, pb[i], xb[i]);
-            xb[i] = v;
-            acc += v * v;
-        }
-    }
-    for (uint32_t sh = 16; sh > 0; sh >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, sh);
-    const uint32_t warp = tid >> 5, lane = tid & 31u;
-    if (lane == 0) wsum[warp] = acc;
-    __syncthreads();
-    if (tid == 0) {
-        float sum = 0.0f;
-        const uint32_t nwarps = (nth + 31u) >> 5;
-        for (uint32_t wi = 0; wi < nwarps; ++wi) sum += wsum[wi];
-        s_inv = 1.0f / sqrtf(sum / (float)n + eps);
-    }
-    __syncthreads();
-    const float inv = s_inv;
-    for (uint32_t i = tid; i < n; i += nth) ob[i] = xb[i] * inv * w[i];
-}
+// pd_add_rmsnorm_batch_kernel / _r_kernel (fused residual add + RMSNorm): norm/add_rmsnorm.cuh
 
 // pd_add_rmsnorm_scaled_batch's twin that consumes RAW split-K partials in
 // place of a pre-reduced `proj` (the nvf4 reduce-fold): the

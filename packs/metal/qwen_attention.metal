@@ -57,7 +57,7 @@ kernel void qwen_attn_gate(device float* x [[buffer(0)]],device const float* qga
 // Split-K supplies parallelism at c=1;
 // the stable (numerator,max,denominator) merge also handles empty splits.
 // p: heads, KV heads, page stride, scale, splits. selected row IDs at buffer 5.
-template<typename KV,uint GQA,bool Verify=false>
+template<typename KV,uint GQA,bool Verify=false,uint Ahead=1>
 inline void qwen_decode_impl(device const float* q,device const KV* keys,device const KV* values,
     device const uint* meta,device const uint* pages,device const uint* rows,device float* out,
     device const uint* limits,constant uint* p,uint3 group,uint tid,uint lane,uint sg,
@@ -99,7 +99,20 @@ inline void qwen_decode_impl(device const float* q,device const KV* keys,device 
             multiplier[h]=exp(highs[h]-next);acc[h]*=old;
             denom[h]=denom[h]*old+sums[h]*multiplier[h];maximum[h]=next;
         }
-        for(uint j=0;j<min(32u,last-base);++j) {
+        if constexpr(Ahead>1) {
+            uint count=min(32u,last-base);
+            for(uint first_j=0;first_j<count;first_j+=Ahead) {
+                float2 vv[Ahead];
+                for(uint j=0;j<Ahead;++j)if(first_j+j<count) {
+                    uint t=base+first_j+j,physical=pages[slot*p[2]+t/16]*16+t%16;
+                    ulong vi=(ulong(physical)*p[1]+kh)*256+tid;
+                    vv[j]=float2(values[vi],values[vi+128]);
+                }
+                for(uint j=0;j<Ahead;++j)if(first_j+j<count)
+                    for(uint h=0;h<GQA;++h)
+                        acc[h]+=vv[j]*(prob[h*32+first_j+j]*multiplier[h]);
+            }
+        } else for(uint j=0;j<min(32u,last-base);++j) {
             uint t=base+j,physical=pages[slot*p[2]+t/16]*16+t%16;
             ulong vi=(ulong(physical)*p[1]+kh)*256+tid;
             float2 v=float2(values[vi],values[vi+128]);
@@ -130,6 +143,12 @@ QWEN_DECODE(mlx_attention_stable,bfloat,6,true)
 QWEN_DECODE(mlx_attention_stable_gqa4,bfloat,4,true)
 QWEN_DECODE(bonsai_attention_decode,float,6,true)
 #undef QWEN_DECODE
+
+#define BONSAI_ATTENTION(A) \
+kernel void bonsai_attention_value##A(device const float* q [[buffer(0)]],device const float* keys [[buffer(1)]],device const float* values [[buffer(2)]],device const uint* meta [[buffer(3)]],device const uint* pages [[buffer(4)]],device const uint* rows [[buffer(5)]],device float* out [[buffer(6)]],device const uint* limits [[buffer(7)]],constant uint* p [[buffer(8)]],uint3 group [[threadgroup_position_in_grid]],uint tid [[thread_index_in_threadgroup]],uint lane [[thread_index_in_simdgroup]],uint sg [[simdgroup_index_in_threadgroup]]) { \
+threadgroup float scores[6*32],prob[6*32],highs[6],sums[6];qwen_decode_impl<float,6,true,A>(q,keys,values,meta,pages,rows,out,limits,p,group,tid,lane,sg,scores,prob,highs,sums);}
+BONSAI_ATTENTION(2)
+#undef BONSAI_ATTENTION
 kernel void qwen_attention_merge(device const float* parts [[buffer(0)]],device float* out [[buffer(1)]],
                                  device const uint* rows [[buffer(2)]],constant uint* p [[buffer(3)]],
                                  uint group [[threadgroup_position_in_grid]],uint lane [[thread_index_in_simdgroup]]) {

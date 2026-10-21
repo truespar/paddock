@@ -116,6 +116,6 @@ struct DesktopUpdateSettings: View {
       if let error = updater.error {
         Text(error).foregroundStyle(PaddockStyle.caution).font(.caption)
       }
-    }
+    }.settingsSearchAnchor(.updates)
   }
 }

@@ -2,11 +2,13 @@
 //! request ends with a `Done` or an `Error`, shutdown included; a stream that
 //! closes bare was cut off, and `next_event` hands it to the caller as one.
 
-use std::sync::mpsc::Receiver;
-
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use super::admission::Inbox;
 use super::{EngineError, GenRequest, Slot, TokenEvent};
+
+/// Tokens of the vocabulary's first id in a row that mark a dead stream.
+pub(super) const DEGENERATE_RUN: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinishReason {
@@ -59,7 +61,7 @@ pub(super) fn fail_held_requests(
     slots: &mut [Option<Slot>],
     preempted: &mut Vec<Slot>,
     mm_pending: Option<GenRequest>,
-    rx: &Receiver<GenRequest>,
+    rx: &mut Inbox<'_>,
 ) {
     let err = || {
         TokenEvent::Error(EngineError::overloaded(
@@ -73,9 +75,42 @@ pub(super) fn fail_held_requests(
     {
         let _ = s.events.send(err());
     }
-    for req in mm_pending.into_iter().chain(rx.try_iter()) {
+    for req in mm_pending.into_iter().chain(rx.drain()) {
         let _ = req.events.send(err());
     }
+}
+
+/// Did this stream just emit [`DEGENERATE_RUN`] id-0 tokens in a row? That is
+/// what a non-finite logit row samples to: an argmax over NaN lands on index 0
+/// (on Qwen's vocab, "!"). No real text spends 32 tokens on id 0 - repeated
+/// punctuation merges into longer tokens - so the run is a numerical fault's
+/// signature, not something a model writes.
+pub(super) fn degenerate_run(history: &[u32], generated: usize) -> bool {
+    generated >= DEGENERATE_RUN
+        && history.len() >= DEGENERATE_RUN
+        && history[history.len() - DEGENERATE_RUN..]
+            .iter()
+            .all(|&t| t == 0)
+}
+
+/// End a degenerate stream as an engine fault: a 500, so the caller (an SDK,
+/// the batch run) retries it, rather than garbage streamed to max_tokens - a
+/// 6000-token runaway holds a slot for minutes and still answers nothing.
+pub(super) fn stop_degenerate(
+    events: &tokio::sync::mpsc::UnboundedSender<TokenEvent>,
+    pos: u32,
+    generated: usize,
+) {
+    tracing::warn!(
+        pos,
+        generated,
+        "degenerate stream: {DEGENERATE_RUN} consecutive id-0 tokens - non-finite logits; the \
+         request is stopped as an engine fault"
+    );
+    let _ = events.send(TokenEvent::Error(EngineError::internal(
+        "the engine produced an invalid token stream (non-finite logits) and stopped this \
+         request; retrying it is safe",
+    )));
 }
 
 #[cfg(test)]
@@ -100,6 +135,7 @@ mod tests {
             submitted: None,
             canvas_read: None,
             user_turn: false,
+            background: false,
         }
     }
 
@@ -154,11 +190,11 @@ mod tests {
                 4096
             }
         }
-        assert!(admit(&mut slots, req(live_tx), &Ctx, &metrics));
+        assert!(admit(&mut slots, req(live_tx), &mut Ctx, &metrics));
         let (queue_tx, queue) = std::sync::mpsc::channel();
         let (waiting_tx, mut waiting_rx) = tokio::sync::mpsc::unbounded_channel();
         queue_tx.send(req(waiting_tx)).unwrap();
-        fail_held_requests(&mut slots, &mut Vec::new(), None, &queue);
+        fail_held_requests(&mut slots, &mut Vec::new(), None, &mut Inbox::new(&queue));
         assert!(slots.iter().all(Option::is_none), "the slot is released");
         assert!(overloaded(&mut live_rx), "the live request");
         assert!(overloaded(&mut waiting_rx), "the queued request");

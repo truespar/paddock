@@ -1087,6 +1087,251 @@ int pd_q8_0_gemm_mmq_pipe(const void* data, const void* scale, const void* yq,
     return pd_launch_status();
 }
 
+// ---------------------------------------- mmq_pipe gate|up + GLU landing (slot 865)
+// The FFN's gate and up GEMMs in ONE launch whose landing is the down GEMM's
+// input: v = glu(gate) * up (tanh GELU or SiLU), quantized straight into the
+// mmq layout.
+// The 3-launch chain it replaces (gate pipe, up pipe, then
+// pd_quantize_q8_mmq_geglu) wrote both f32 planes and read them back - 252
+// MB a 2048-row chunk of a 3840 -> 15360 FFN - and the fused form runs that
+// chunk 1.35x faster with the same bytes out.
+//
+// A CTA's 128 tile rows are 64 gate rows (tile rows 0-63) over the SAME 64 up
+// rows (64-127), so mmq_pipe's warp map hands warp w (gate) and warp w + 4
+// (up) matching (row, column) accumulators lane for lane; the up warps pass
+// theirs through shared memory once the K loop is done. The main loop is
+// mmq_pipe's verbatim (same staging, fragments and per-k32 fold), so gate and
+// up are mmq_pipe's bits; v takes pd_geglu's / pd_swiglu's formula, and the quantize
+// pd_quantize_q8_mmq's scale math (amax over the 32-row block - order-free -
+// then the same rn + clamp). A warp's 32 rows are exactly one quantize block:
+// for each of its columns the block's 32 values sit 4 a lane in the 8 lanes
+// sharing t. Pad columns (>= batch) quantize to 0 as the chain wrote them.
+// n_ff % 128 == 0 (every chunk of the output fully covered).
+__device__ __forceinline__ void pd_mmqgu_issue_w(
+    int* __restrict__ wbuf, const int8_t* __restrict__ gd, const __half* __restrict__ gs,
+    const int8_t* __restrict__ ud, const __half* __restrict__ us, uint32_t f0, uint32_t n_ff,
+    uint32_t n_k32, uint32_t n_blocks, uint32_t in_dim, uint32_t kc, uint32_t tid) {
+#if PD_MMA_OK
+    #pragma unroll
+    for (uint32_t it = 0; it < 4u; ++it) {  // 4*256 == 128 rows * 8 segments
+        const uint32_t i = it * 256u + tid;
+        const uint32_t row = i >> 3, seg = i & 7u, gk4 = kc * 32u + seg * 4u;
+        const uint32_t fr = f0 + (row & 63u);
+        const int8_t* d = row < 64u ? gd : ud;
+        const bool ok = gk4 < n_k32 && fr < n_ff;
+        pd_cpa16p(wbuf + row * PD_MMQ_PIPE_WK + seg * 4u,
+                  (const char*)d + (size_t)fr * in_dim + (size_t)(kc * 128u + seg * 16u), ok);
+    }
+    if (tid < 128u) {  // the rows' 4 f16 scales, split 2+2 as pd_mmqp_issue_w does
+        const uint32_t gb = kc * 4u, fr = f0 + (tid & 63u);
+        const bool row_ok = fr < n_ff;
+        const __half* sc = tid < 64u ? gs : us;
+        char* dst = (char*)(wbuf + tid * PD_MMQ_PIPE_WK + 32u);
+        const char* src = (const char*)(sc + (size_t)fr * n_blocks + gb);
+        pd_cpa4p(dst, src, row_ok && (gb + 1u < n_blocks));
+        pd_cpa4p(dst + 4u, src + 4u, row_ok && (gb + 3u < n_blocks));
+    }
+#endif
+}
+
+template <int ACT>
+__global__ void __launch_bounds__(256, 1) pd_q8_0_gemm_mmq_gu_kernel(
+        const int8_t* __restrict__ gd, const __half* __restrict__ gs,
+        const int8_t* __restrict__ ud, const __half* __restrict__ us,
+        const uint8_t* __restrict__ yq, uint8_t* __restrict__ yo,
+        uint32_t in_dim, uint32_t n_ff, uint32_t batch) {
+#if PD_MMA_OK
+    extern __shared__ int pd_mmqgu_sh[];
+    int* wbuf0 = pd_mmqgu_sh;
+    int* wbuf1 = wbuf0 + 128 * PD_MMQ_PIPE_WK;
+    int* ybuf0 = wbuf1 + 128 * PD_MMQ_PIPE_WK;
+    int* ybuf1 = ybuf0 + 128 * PD_MMQ_YK;
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u, warp = tid >> 5;
+    const uint32_t g = lane >> 2, t = lane & 3u;
+    const uint32_t i0 = (warp >> 1) * 32u;
+    const uint32_t joff = (warp & 1u) * 8u;
+    const uint32_t batch_pad = (batch + 127u) & ~127u;
+    const uint32_t n_k32 = in_dim >> 2;
+    const uint32_t n_blocks = in_dim >> 5;
+    const uint32_t n_chunks = (in_dim + 127u) >> 7;
+    const uint32_t nct = batch_pad >> 7;
+    const uint32_t tile = blockIdx.x;
+    const uint32_t f0 = (tile / nct) * 64u;
+    const uint32_t col_base = (tile % nct) * 128u;
+
+    float acc[16][4] = {};
+    pd_mmqgu_issue_w(wbuf0, gd, gs, ud, us, f0, n_ff, n_k32, n_blocks, in_dim, 0u, tid);
+    {
+        const int* by0 = (const int*)(yq + ((size_t)0u * batch_pad + col_base) * 144u);
+        #pragma unroll
+        for (uint32_t it = 0; it < 5u; ++it)
+            if (it * 256u + tid < 1152u)
+                pd_cpa16p(ybuf0 + (it * 256u + tid) * 4u,
+                          (const char*)by0 + (size_t)(it * 256u + tid) * 16u, true);
+    }
+    asm volatile("cp.async.commit_group;");
+
+    for (uint32_t kc = 0; kc < n_chunks; ++kc) {
+        int* tw = (kc & 1u) ? wbuf1 : wbuf0;
+        int* ty = (kc & 1u) ? ybuf1 : ybuf0;
+        if (kc + 1u < n_chunks) {
+            int* nw = (kc & 1u) ? wbuf0 : wbuf1;
+            int* ny = (kc & 1u) ? ybuf0 : ybuf1;
+            pd_mmqgu_issue_w(nw, gd, gs, ud, us, f0, n_ff, n_k32, n_blocks, in_dim, kc + 1u, tid);
+            const int* by1 = (const int*)(yq + ((size_t)(kc + 1u) * batch_pad + col_base) * 144u);
+            #pragma unroll
+            for (uint32_t it = 0; it < 5u; ++it)
+                if (it * 256u + tid < 1152u)
+                    pd_cpa16p(ny + (it * 256u + tid) * 4u,
+                              (const char*)by1 + (size_t)(it * 256u + tid) * 16u, true);
+            asm volatile("cp.async.commit_group;");
+            asm volatile("cp.async.wait_group 1;");
+        } else {
+            asm volatile("cp.async.wait_group 0;");
+        }
+        __syncthreads();
+
+        int A[2][4][4];
+        float dA[2][2][4];
+        #pragma unroll
+        for (uint32_t n = 0; n < 2u; ++n) {
+            const uint32_t r0 = (i0 + n * 16u + g) * PD_MMQ_PIPE_WK;
+            const uint32_t r8 = (i0 + n * 16u + 8u + g) * PD_MMQ_PIPE_WK;
+            #pragma unroll
+            for (uint32_t kk = 0; kk < 4u; ++kk) {
+                const uint32_t ko = kk * 8u;
+                A[n][kk][0] = tw[r0 + ko + t];
+                A[n][kk][1] = tw[r8 + ko + t];
+                A[n][kk][2] = tw[r0 + ko + 4u + t];
+                A[n][kk][3] = tw[r8 + ko + 4u + t];
+                dA[n][0][kk] = __half2float(((const __half*)(tw + r0 + 32u))[kk]);
+                dA[n][1][kk] = __half2float(((const __half*)(tw + r8 + 32u))[kk]);
+            }
+        }
+        #pragma unroll
+        for (uint32_t j0 = 0; j0 < 128u; j0 += 16u) {
+            const uint32_t jc = j0 + joff;
+            #pragma unroll
+            for (uint32_t kk = 0; kk < 4u; ++kk) {
+                const uint32_t ko = kk * 8u;
+                const int b0 = ty[(jc + g) * PD_MMQ_YK + 4u + ko + t];
+                const int b1 = ty[(jc + g) * PD_MMQ_YK + 4u + ko + 4u + t];
+                const float dB0 = ((const float*)ty)[(jc + 2u * t) * PD_MMQ_YK + kk];
+                const float dB1 = ((const float*)ty)[(jc + 2u * t + 1u) * PD_MMQ_YK + kk];
+                #pragma unroll
+                for (uint32_t n = 0; n < 2u; ++n) {
+                    int d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+                    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+r"(d0), "+r"(d1), "+r"(d2), "+r"(d3)
+                        : "r"(A[n][kk][0]), "r"(A[n][kk][1]), "r"(A[n][kk][2]),
+                          "r"(A[n][kk][3]), "r"(b0), "r"(b1));
+                    acc[(j0 >> 3) + n][0] += dA[n][0][kk] * dB0 * (float)d0;
+                    acc[(j0 >> 3) + n][1] += dA[n][0][kk] * dB1 * (float)d1;
+                    acc[(j0 >> 3) + n][2] += dA[n][1][kk] * dB0 * (float)d2;
+                    acc[(j0 >> 3) + n][3] += dA[n][1][kk] * dB1 * (float)d3;
+                }
+            }
+        }
+        __syncthreads();  // this buffer free before chunk kc+2 prefetches into it
+    }
+
+    // the up warps' accumulators to the gate warps: [4 warps][16][4][32 lanes]
+    // f32 = 32 KB over the (drained) staging buffers
+    float* xch = reinterpret_cast<float*>(pd_mmqgu_sh);
+    if (warp >= 4u) {
+        #pragma unroll
+        for (uint32_t q = 0; q < 16u; ++q)
+            #pragma unroll
+            for (uint32_t e = 0; e < 4u; ++e)
+                xch[(((warp - 4u) * 16u + q) * 4u + e) * 32u + lane] = acc[q][e];
+    }
+    __syncthreads();
+    if (warp >= 4u) return;
+    #pragma unroll
+    for (uint32_t q = 0; q < 16u; ++q)
+        #pragma unroll
+        for (uint32_t e = 0; e < 4u; ++e) {
+            const float gv = acc[q][e];
+            const float uv = xch[((warp * 16u + q) * 4u + e) * 32u + lane];
+            if (ACT == PD_ACT_SILU) {
+                acc[q][e] = (gv / (1.0f + expf(-gv))) * uv;  // == pd_swiglu
+            } else {
+                const float gelu = 0.5f * gv
+                    * (1.0f + tanhf(0.79788456080286535587989211986876f * gv
+                                    * (1.0f + 0.044715f * gv * gv)));  // == pd_geglu
+                acc[q][e] = gelu * uv;
+            }
+        }
+    // this warp's 32 rows are one quantize block: (chunk, block in chunk)
+    const uint32_t fblk = f0 + i0;
+    const uint32_t kco = fblk >> 7, bi = (fblk & 127u) >> 5;
+    #pragma unroll
+    for (uint32_t j0 = 0; j0 < 128u; j0 += 16u) {
+        #pragma unroll
+        for (uint32_t c = 0; c < 2u; ++c) {  // column 2t + c of the warp's 8-col group
+            // rows g, g + 8 (n = 0) and 16 + g, 24 + g (n = 1)
+            const float v0 = acc[(j0 >> 3)][c], v1 = acc[(j0 >> 3)][2u + c];
+            const float v2 = acc[(j0 >> 3) + 1u][c], v3 = acc[(j0 >> 3) + 1u][2u + c];
+            float a = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+            #pragma unroll
+            for (uint32_t s = 4; s < 32u; s <<= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, s));
+            const float scl = a * (1.0f / 127.0f);
+            const float inv = scl > 0.0f ? 1.0f / scl : 0.0f;
+            auto q8 = [&](float v) -> char {
+                const int qi = __float2int_rn(v * inv);
+                return (char)(qi < -127 ? -127 : (qi > 127 ? 127 : qi));
+            };
+            const uint32_t col = col_base + j0 + joff + 2u * t + c;
+            uint8_t* blk = yo + ((size_t)kco * batch_pad + col) * 144u;
+            char* dq = reinterpret_cast<char*>(blk + 16u + bi * 32u);
+            dq[g] = q8(v0);
+            dq[8u + g] = q8(v1);
+            dq[16u + g] = q8(v2);
+            dq[24u + g] = q8(v3);
+            if (g == 0u) reinterpret_cast<float*>(blk)[bi] = scl;
+        }
+    }
+#else
+    (void)gd; (void)gs; (void)ud; (void)us; (void)yq; (void)yo;
+    (void)in_dim; (void)n_ff; (void)batch;
+#endif
+}
+
+// gate|up GEMM + GLU + mmq quantize: yq is the FFN input in the mmq layout
+// (pd_quantize_q8_mmq over in_dim), yo the down GEMM's input in the same
+// layout over n_ff (n_ff / 128 chunks x the 128-padded batch, 144 B each).
+// act: PD_ACT_GELU (tanh form, == pd_quantize_q8_mmq_geglu's) or PD_ACT_SILU
+// (== pd_quantize_q8_mmq_swiglu's); anything else is refused.
+PD_EXPORT
+int pd_q8_0_gemm_mmq_gu(const void* gate_data, const void* gate_scale, const void* up_data,
+                        const void* up_scale, const void* yq, void* yo, uint32_t in_dim,
+                        uint32_t n_ff, uint32_t batch, uint32_t act, void* stream) {
+    if (n_ff == 0 || batch == 0) return 0;
+    if (act != PD_ACT_GELU && act != PD_ACT_SILU) return cudaErrorNotSupported;
+    if ((in_dim & 31u) || (n_ff & 127u)) return cudaErrorInvalidValue;
+    auto kern = act == PD_ACT_SILU ? pd_q8_0_gemm_mmq_gu_kernel<PD_ACT_SILU>
+                                   : pd_q8_0_gemm_mmq_gu_kernel<PD_ACT_GELU>;
+    static cudaError_t attr = [] {
+        cudaError_t e = cudaFuncSetAttribute((const void*)pd_q8_0_gemm_mmq_gu_kernel<PD_ACT_GELU>,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                             (int)PD_MMQ_PIPE_SMEM);
+        if (e != cudaSuccess) return e;
+        return cudaFuncSetAttribute((const void*)pd_q8_0_gemm_mmq_gu_kernel<PD_ACT_SILU>,
+                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    (int)PD_MMQ_PIPE_SMEM);
+    }();
+    if (attr != cudaSuccess) return attr;
+    const uint32_t nct = ((batch + 127u) & ~127u) >> 7;
+    const uint32_t ntiles = (n_ff / 64u) * nct;
+    kern<<<ntiles, 256, PD_MMQ_PIPE_SMEM, (cudaStream_t)stream>>>(
+        (const int8_t*)gate_data, (const __half*)gate_scale, (const int8_t*)up_data,
+        (const __half*)up_scale, (const uint8_t*)yq, (uint8_t*)yo, in_dim, n_ff, batch);
+    return pd_launch_status();
+}
+
 // ---------------------------------------- mmq_pipe + hyper-connection mix (slot 605)
 // The hyper-connection up ([lowrank -> 4 * hidden] Q8_0) and its gated mix
 //   out[d] = (1/4) sum_s sigmoid(gate[s*hidden + d]) * xn[s*hidden + d]

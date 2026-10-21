@@ -2175,17 +2175,7 @@ pd_f8row_gemm_c2col_kt(
 }
 #endif  // __cluster_dims__ guard (host pass || sm_90+)
 
-// tc5q work counter: allocated at plane-build time because the decode step
-// is CUDA-graph-captured and cudaMalloc is illegal inside capture (error
-// 900). The graph replays memsetAsync(0) + kernel, so reuse is capture-safe.
-static uint32_t* pd_tc5q_ctr(bool make = false) {
-    static uint32_t* ctr = nullptr;
-    if (make && !ctr) {
-        if (cudaMalloc(&ctr, 4) != cudaSuccess) ctr = nullptr;
-        else cudaMemset(ctr, 0, 4);   // kernel resets it thereafter
-    }
-    return ctr;
-}
+// tc5q work counter: per-stream, from tc5_lanes.cuh (graph capture + two-lane safe)
 
 // ---- two-stage row-quant widening -----------------------------------------
 // The per-row quant kernels run one block per row (r<=64 -> 32 blocks on a
@@ -2294,24 +2284,12 @@ __global__ void pd_quantize_e4m3_row2_kernel(const TI* __restrict__ x,
     }
 }
 
-// scratch for the row-partial maxes: alloc'd outside graph capture (the
-// decode step is captured; cudaMalloc is illegal inside). 64 rows x 8
-// chunks covers every widened shape - wider rows keep the single-block path.
-static float* pd_rowq_scr(bool make = false) {
-    static float* scr = nullptr;
-    if (make && !scr) {
-        if (cudaMalloc(&scr, 64 * 8 * sizeof(float)) != cudaSuccess) scr = nullptr;
-        else cudaMemset(scr, 0, 64 * 8 * sizeof(float));
-    }
-    return scr;
-}
-
 // chunk count: ~2 blocks/SM target, capped by the scratch layout (C<=8) and
 // only when the single-block grid would starve the die
-static uint32_t pd_rowq_chunks(uint32_t rows) {
+static uint32_t pd_rowq_chunks(uint32_t rows, cudaStream_t st) {
     static int no2 = -1;
     if (no2 < 0) no2 = pd_env("PADDOCK_NO_ROWQ2") ? 1 : 0;
-    if (no2 || rows > 48u || !pd_rowq_scr()) return 1u;
+    if (no2 || rows > 48u || !pd_rowq_scr(st)) return 1u;
     static int nsm = 0;
     if (nsm == 0) {
         int dev = 0;
@@ -2325,29 +2303,18 @@ static uint32_t pd_rowq_chunks(uint32_t rows) {
     return c;
 }
 
-// per-tile K-split fold counters (tc5p last-CTA combine fold): zeroed once
-// at alloc. Each launch's folder CTA resets its slot to 0 after folding, so
-// no per-launch memset - same-stream kernels serialize completely, so the
-// next launch never observes a mid-flight counter. 256 slots covers every
-// tc5p shape (tiles = out_dim/128 <= 168; tiles >= 256 goes tc5q).
-static uint32_t* pd_tc5p_fctr(bool make = false) {
-    static uint32_t* ctr = nullptr;
-    if (make && !ctr) {
-        if (cudaMalloc(&ctr, 1024) != cudaSuccess) ctr = nullptr;
-        else cudaMemset(ctr, 0, 1024);
-    }
-    return ctr;
-}
-
+static void pd_lin_pool_prepare();   // f8_lin.cuh (included after this file)
 PD_EXPORT
 int pd_f8_repack_tiles(const void* rowmajor, void* tiles,
                        uint32_t in_dim, uint32_t out_dim, void* stream) {
     if ((in_dim & 127u) || (out_dim & 127u)) return -1;
-    pd_tc5q_ctr(true);
-    pd_tc5p_fctr(true);
-    pd_rowq_scr(true);
-    pd_smp_scr(true);   // P71b multi-block sampler scratch (capture-safe)
-    pd_topp_scr(true);  // mode-6 multi-block truncation scratch (capture-safe)
+    pd_tc5_pool_prepare();   // per-stream tc5q / fold / row-quant scratch
+    // sampler scratch for this (the load-time, main) stream, allocated before
+    // any capture; the decode lane allocates its own at its first eager call
+    (void)pd_sr_scr((cudaStream_t)stream);
+    pd_lin_pool_prepare();   // KT-lane per-stream flags + planes (f8_lin.cuh, included later)
+    pd_smp_scr((cudaStream_t)stream, true);   // P71b multi-block sampler scratch
+    pd_topp_scr((cudaStream_t)stream, true);  // mode-6 multi-block truncation scratch
     const uint64_t nchunk = ((uint64_t)in_dim >> 4) * out_dim;
     const uint32_t nb = (uint32_t)((nchunk + 255u) / 256u);
     pd_f8_tiles_repack_kernel<<<nb, 256, 0, (cudaStream_t)stream>>>(
@@ -3528,7 +3495,7 @@ static inline int pd_quantize_e4m3_glu2_row_launch(const void* gu, void* q,
     if (rows == 0) return 0;
     if ((n_ff & 31u) || nzp == 0) return cudaErrorInvalidValue;
     {
-        const uint32_t C = pd_rowq_chunks(rows);
+        const uint32_t C = pd_rowq_chunks(rows, (cudaStream_t)stream);
 #if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 900)
         // C == 8 is the only cluster-legal width (the dims are literal), and
         // pd_rowq_chunks caps at 8, so this covers every decode shape with
@@ -3541,7 +3508,7 @@ static inline int pd_quantize_e4m3_glu2_row_launch(const void* gu, void* q,
         }
 #endif
         if (C > 1u) {
-            float* scr = pd_rowq_scr();
+            float* scr = pd_rowq_scr((cudaStream_t)stream);
             pd_pdl_go(pd_rowmax_glu2_part_kernel<ACT>, dim3(rows, C), 256, 0u,
                       (cudaStream_t)stream, (const float*)gu, scr, n_ff, nzp);
             pd_pdl_go(pd_quantize_e4m3_glu2_row2_kernel<ACT>, dim3(rows, C), 256, 0u,

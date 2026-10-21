@@ -39,6 +39,9 @@ public actor NativeStudioRuntime {
   var audio: O = [:]
   var search = "", sort = "newest", page = 1
   var draftText = "", error = ""
+  var composerDraftRevision = ""
+  var composerDraftAttachments: [V] = []
+  var latestComposerDraftID: String?
   var revision = 0
   var closed = false, mutating = false
   var tasks: [String: Task<Void, Never>] = [:]
@@ -80,16 +83,19 @@ public actor NativeStudioRuntime {
     self.rasterPDF = rasterPDF
     self.openPDF = openPDF
   }
-  public func start() async throws {
+  public func start(resumeDraft: Bool = true) async throws {
     try checkOpen()
     let settings = try await transport.api("api/settings")
     try checkOpen()
     preferences = settings["macos_studio_preferences"]?.object ?? [:]
-    history = try await transport.listConversations()
+    try await loadHistory()
     try checkOpen()
     try await refreshModels()
     try checkOpen()
     try newDocument()
+    if resumeDraft, let recent = latestComposerDraftID {
+      try await openConversationAndDraft(recent)
+    }
     await emit()
     try checkOpen()
     polling = Task { [weak self] in
@@ -138,6 +144,8 @@ public actor NativeStudioRuntime {
     draft = true
     staged = [:]
     draftText = ""
+    composerDraftRevision = ""
+    composerDraftAttachments = []
     documentPreview = nil
     previewPart = nil
     artifacts = []
@@ -187,17 +195,22 @@ public actor NativeStudioRuntime {
   }
   /// Snapshot writes are queued in admission order, including Compare lanes.
   /// A failed terminal save leaves the full document in memory and a visible error.
-  func save(_ doc: ConversationDocument) async throws {
+  func save(_ doc: ConversationDocument, consumingDraft: String? = nil) async throws {
     let previous = writeTail
     let transport = transport
     let task = Task {
       _ = try? await previous?.value
-      try await transport.saveConversation(doc)
+      try await transport.saveConversation(doc, consumingDraft: consumingDraft)
     }
     writeTail = task
     try await task.value
+    let retainedDraft =
+      consumingDraft == nil
+      && history.first(where: { $0["id"]?.string == doc.id })?["composerDraft"]?.bool == true
     history.removeAll { $0["id"]?.string == doc.id }
-    history.append(doc.fields.filter { $0.key != "messages" })
+    var row = doc.fields.filter { $0.key != "messages" }
+    row["composerDraft"] = .bool(retainedDraft)
+    history.append(row)
   }
   func persist() async throws { if !draft, let document { try await save(document) } }
   func schedulePublish() {
@@ -223,6 +236,7 @@ public actor NativeStudioRuntime {
     revision += 1
     await publish(presentation())
   }
+  public func publishNow() async { await emit() }
   public func close() async {
     let summarizing = compactionTask
     cancelCompaction()

@@ -53,7 +53,12 @@ async fn identify(State(s): State<Arc<AdminState>>) -> Response {
         port: s.port,
         model: s.app.serving.as_ref().map(|m| m.id.clone()),
         embedder: s.app.embedder.as_ref().map(|e| e.id.clone()),
-        asr: s.app.asr.as_ref().map(|a| a.id.clone()),
+        asr: s
+            .app
+            .asr
+            .as_ref()
+            .map(|a| a.id.clone())
+            .or_else(|| s.app.rnnt_asr.as_ref().map(|m| m.id.clone())),
         aligner: s.app.aligner.as_ref().map(|a| a.id.clone()),
         image: s.app.image.as_ref().map(|m| m.id.clone()),
         reader: s

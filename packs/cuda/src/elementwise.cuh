@@ -1666,6 +1666,7 @@ __global__ void pd_kv_append_batch_paged_kernel(const float* __restrict__ kv, KV
                                                 const uint32_t* __restrict__ block_tables,
                                                 uint32_t blocks_per_slot,
                                                 uint32_t kv_dim, uint32_t batch) {
+    PD_PDL_ARM_WAIT();   // programmatic dependent (pd_pdl_go): full predecessor completion
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t b = blockIdx.y;
     if (i >= kv_dim || b >= batch) return;
@@ -2188,7 +2189,7 @@ __global__ void pd_lag_qk_nra_rows_kernel(
     uint32_t blocks_per_slot, uint32_t n_head, uint32_t n_kv, float eps,
     float theta_scale, float freq_scale, float corr_low, float corr_high,
     float ext_factor, float mscale, uint32_t s0, uint32_t s1, uint32_t s2,
-    uint32_t s3, uint32_t rows) {
+    uint32_t s3, uint32_t rows, int acc_mode) {
     // cascade: q/k/v planes come straight from the predecessor GEMV
     PD_PDL_ARM();
     const uint32_t nslots = n_head + 2u * n_kv;
@@ -2221,6 +2222,58 @@ __global__ void pd_lag_qk_nra_rows_kernel(
         // ascending - identical bits at every rmsnorm launch width.
         static_assert(HD == 128u || HD == 256u,
                       "reduction mirrors rmsnorm_batch at hd128/hd256");
+        // acc_mode = pd_norm_acc_mode(), the chain's accumulator election
+        // (pd_rmsnorm_batch_kernel_t<ACC>): f32 products everywhere; DF
+        // (default) accumulates each thread's float4 in double-float, DF warp
+        // trees, the warp partials merged in order, one f64 divide; F64 the
+        // same in double. Warp (f4 0..31) then (32..63) are the chain's warps
+        // 0 and 1; its further warps hold exact zeros.
+        float inv;
+        if (acc_mode != PD_ACC_F32) {
+            const float4 va = *(const float4*)(src + 4u * lane);
+            const float4 vb = HD == 256u ? *(const float4*)(src + 4u * (32u + lane)) : va;
+            double total;
+            if (acc_mode == PD_ACC_DF) {
+                auto quad = [](const float4 v) {
+                    pd_df a;
+                    a.hi = 0.0f; a.lo = 0.0f;
+                    pd_df_add(a, v.x * v.x);
+                    pd_df_add(a, v.y * v.y);
+                    pd_df_add(a, v.z * v.z);
+                    pd_df_add(a, v.w * v.w);
+                    return a;
+                };
+                auto tree = [](pd_df a) {
+                    for (uint32_t sh = 16; sh > 0; sh >>= 1) {
+                        pd_df o;
+                        o.hi = __shfl_down_sync(0xffffffffu, a.hi, sh);
+                        o.lo = __shfl_down_sync(0xffffffffu, a.lo, sh);
+                        a = pd_df_merge(a, o);
+                    }
+                    a.hi = __shfl_sync(0xffffffffu, a.hi, 0);
+                    a.lo = __shfl_sync(0xffffffffu, a.lo, 0);
+                    return a;
+                };
+                pd_df sm;
+                sm.hi = 0.0f; sm.lo = 0.0f;
+                sm = pd_df_merge(sm, tree(quad(va)));
+                if (HD == 256u) sm = pd_df_merge(sm, tree(quad(vb)));
+                total = (double)sm.hi + (double)sm.lo;
+            } else {
+                auto tree = [](double a) {
+                    for (uint32_t sh = 16; sh > 0; sh >>= 1) a += __shfl_down_sync(0xffffffffu, a, sh);
+                    return __shfl_sync(0xffffffffu, a, 0);
+                };
+                double a = 0.0, b2 = 0.0;
+                a += va.x * va.x + va.y * va.y + va.z * va.z + va.w * va.w;
+                b2 += vb.x * vb.x + vb.y * vb.y + vb.z * vb.z + vb.w * vb.w;
+                double sm = 0.0;
+                sm += tree(a);
+                if (HD == 256u) sm += tree(b2);
+                total = sm;
+            }
+            inv = 1.0f / sqrtf((float)(total / (double)HD) + eps);
+        } else {
         float sum;
         if constexpr (HD == 128u) {
             float acc = 0.0f;
@@ -2244,7 +2297,8 @@ __global__ void pd_lag_qk_nra_rows_kernel(
             const float w1 = __shfl_sync(0xffffffffu, ab, 0);
             sum = w0 + w1;
         }
-        const float inv = 1.0f / sqrtf(sum / (float)HD + eps);
+        inv = 1.0f / sqrtf(sum / (float)HD + eps);
+        }
         const float* w = is_q ? qw : kw;
         #pragma unroll
         for (uint32_t j = 0; j < NV; ++j) {
@@ -2354,7 +2408,8 @@ int pd_lag_qk_nra_rows(const void* q_src, uint32_t q_off, uint32_t q_stride,
             (const unsigned int*)positions, (const unsigned int*)slots,        \
             (const unsigned int*)mpos, (const uint32_t*)block_tables,          \
             blocks_per_slot, n_head, n_kv, eps, theta_scale, freq_scale,       \
-            corr_low, corr_high, ext_factor, mscale, s0, s1, s2, s3, rows)
+            corr_low, corr_high, ext_factor, mscale, s0, s1, s2, s3, rows,     \
+            pd_norm_acc_mode())
     if (kv_dtype == PD_KV_FP8_E4M3) {
         if (mpos) PD_LQKNRA_GO(__nv_fp8_e4m3, true);
         else PD_LQKNRA_GO(__nv_fp8_e4m3, false);
@@ -2409,7 +2464,8 @@ int pd_q36_qkg_nra_rows(const void* qkg, uint32_t q_off, uint32_t row_stride,
             (const unsigned int*)positions, (const unsigned int*)slots,        \
             (const unsigned int*)mpos, (const uint32_t*)block_tables,          \
             blocks_per_slot, n_head, n_kv, eps, theta_scale, freq_scale,       \
-            corr_low, corr_high, ext_factor, mscale, s0, s1, s2, s3, rows)
+            corr_low, corr_high, ext_factor, mscale, s0, s1, s2, s3, rows,     \
+            pd_norm_acc_mode())
     if (kv_dtype == PD_KV_FP8_E4M3) PD_Q36NRA_GO(__nv_fp8_e4m3);
     else PD_Q36NRA_GO(__half);
     #undef PD_Q36NRA_GO

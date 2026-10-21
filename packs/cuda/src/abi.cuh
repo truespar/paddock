@@ -4067,6 +4067,162 @@ struct KernelTableV1 {
     int (*kquant_gemm_w4a8_sb)(const void*, const void*, const void*, const void*,
                                const void*, void*, void*, uint32_t, uint32_t,
                                uint32_t, uint32_t, void*);
+    // 853-861: Nemotron 3.5 ASR (asr/nemotron_asr.cuh), F32 class.
+    // 853: nasr_gemm (x, w, scale, bias, y, K, N, M, mode, stream) - slot 722's F32-class GEMM on
+    // Q8_0 kept as stored (int8 rows + the file's f16 block scales) with the conformer epilogues
+    // (0 store, 2 accumulate, 6 SiLU, 7 accumulate half, 8 interleaved GLU, 9 ReLU)
+    int (*nasr_gemm)(const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t,
+                     uint32_t, uint32_t, void*);
+    // 854: nasr_sub_stem (mel, base, rows, valid, w, b, out, first, count, stream) - the
+    // subsampler's causal 3x3/2 stem conv + ReLU at absolute frame coordinates
+    int (*nasr_sub_stem)(const void*, int64_t, uint32_t, int64_t, const void*, const void*, void*,
+                         int64_t, uint32_t, void*);
+    // 855: nasr_sub_dw (in, base, rows, valid, fin, w, b, out, first, count, relu_in, stream) - a
+    // separable stage's causal depthwise 3x3/2 conv, ReLU on read optional
+    int (*nasr_sub_dw)(const void*, int64_t, uint32_t, int64_t, uint32_t, const void*, const void*,
+                       void*, int64_t, uint32_t, uint32_t, void*);
+    // 856: nasr_sub_flatten (in, out, rows, stream) - ReLU + [t][17][256] -> [t][256 * 17]
+    int (*nasr_sub_flatten)(const void*, void*, uint32_t, void*);
+    // 857: nasr_attention (qkv, segs, nseg, chunks, layer, rel, bu, bv, out, scale, stream) -
+    // Transformer-XL relative-position attention under chunked_limited over every segment of a
+    // pass: each stream's K/V rings + its window's rows, one CTA a (chunk, head)
+    int (*nasr_attention)(const void*, const void*, uint32_t, uint32_t, uint32_t, const void*,
+                          const void*, const void*, void*, float, void*);
+    // 858: nasr_ring_put (src, ld, col0, segs, nseg, layer, which0, count, stream) - each
+    // segment's last rows into its rings (0 K, 1 V, 2 conv) at slot frame % slots
+    int (*nasr_ring_put)(const void*, uint32_t, uint32_t, const void*, uint32_t, uint32_t, uint32_t,
+                         uint32_t, void*);
+    // 859: nasr_dwconv (g, segs, nseg, rows, layer, w, nw, nb, out, stream) - the convolution
+    // module's causal kernel-9 depthwise conv + LayerNorm + SiLU over a pass's rows
+    int (*nasr_dwconv)(const void*, const void*, uint32_t, uint32_t, uint32_t, const void*,
+                       const void*, const void*, void*, void*);
+    // 860: nasr_greedy (w[19], proj, jobs, B, tokens, frames, part, stream) - the batched RNN-T
+    // greedy walk of up to 32 streams, frame-speculative, one cooperative grid
+    int (*nasr_greedy)(const void* const*, const void*, void*, uint32_t, void*, void*, void*, void*);
+    // 861: nasr_prompt_relu (y, n, rows, segs, nseg, table, stream) - y = ReLU(y + the row's
+    // segment's prompt bias row)
+    int (*nasr_prompt_relu)(void*, uint32_t, uint32_t, const void*, uint32_t, const void*, void*);
+    // 862-864: Gemma 4 12B's encoder-free media embedders (gemma4u.cuh), F32 class; the
+    // projections between them are slot 722.
+    // 862: g4u_patches (rgb, w, gw, n, ln_w, ln_b, out, eps, stream) - a resized u8 picture's
+    // 48 px patches as 6912-wide rows in the file's CHW order, x 1/255, then patch_ln1
+    int (*g4u_patches)(const void*, uint32_t, uint32_t, uint32_t, const void*, const void*, void*,
+                       float, void*);
+    // 863: g4u_post (h, ln2_w, ln2_b, pos, pos_size, gw, ln3_w, ln3_b, n, dim, eps_ln, eps_rms,
+    // stream) - in place: patch_ln2, + pos_x[col] + pos_y[row], pos_norm, weightless RMS norm
+    int (*g4u_post)(void*, const void*, const void*, const void*, uint32_t, uint32_t,
+                    const void*, const void*, uint32_t, uint32_t, float, float, void*);
+    // 864: g4u_audio (samples, n_samples, n_tok, out, eps, stream) - 640-sample frames (the last
+    // zero-padded) through the weightless RMS norm
+    int (*g4u_audio)(const void*, uint32_t, uint32_t, void*, float, void*);
+    // 865: q8_0_gemm_mmq_gu (gate_data, gate_scale, up_data, up_scale, yq, yo, in_dim, n_ff,
+    // batch, act, stream) - the FFN's gate and up mmq GEMMs in one launch, landing
+    // glu(gate) * up quantized in the mmq layout (the down GEMM's input); act PD_ACT_GELU or
+    // PD_ACT_SILU
+    int (*q8_0_gemm_mmq_gu)(const void*, const void*, const void*, const void*, const void*,
+                            void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 866: rmsnorm_add_scale_norm_q8 (x, proj, wpost, wpre, xn, yq, n, eps, s, rows, stream) -
+    // slot 777's sandwich post-norm + next norm with the next norm landed mmq-quantized in yq
+    // (xn optional); rows >= 256 and n % 128, -2 elsewhere
+    int (*rmsnorm_add_scale_norm_q8)(void*, const void*, const void*, const void*, void*, void*,
+                                     uint32_t, float, float, uint32_t, void*);
+    // 867: nvf4_gemm_tc5w (data, scale_tiled, bias, xq, xs, y, scale2, in, out, batch, part,
+    // part_floats, stream) - the W4A4 GEMM on tcgen05 kind::mxf4nvf4 (gemm/dense_nvf4_tc5.cuh),
+    // pd_nvf4_gemm_f4's contract with the weight scales pre-tiled by 868; cc 10.0 only
+    int (*nvf4_gemm_tc5w)(const void*, const void*, const void*, const void*, const void*, void*,
+                          float, uint32_t, uint32_t, uint32_t, void*, uint64_t, void*);
+    // 868: nvf4_tc5_tile_scales (scale, tiled, in, out, stream) - load-time repack of a weight
+    // plane's e4m3 scale cells into 867's canonical tile order
+    int (*nvf4_tc5_tile_scales)(const void*, void*, uint32_t, uint32_t, void*);
+    // 869: f8_gemm_tc5x (data, scale, xq, xs, y, in, out, batch, part, part_floats, stream) -
+    // the W8 (e4m3 + ue8m0-per-32) GEMM on tcgen05 kind::mxf8f6f4 (dense_nvf4_tc5.cuh's F8
+    // instantiation), f8d_gemm_mma_ks's contract; cc 10.0 only
+    int (*f8_gemm_tc5x)(const void*, const void*, const void*, const void*, void*, uint32_t,
+                        uint32_t, uint32_t, void*, uint64_t, void*);
+    // 870: f8row_gemm_tc5x (data, w_rowscale, xq, x_rowscale, y, in, out, batch, stream) - the
+    // per-row-scale e4m3 GEMM on the same tcgen05 pipeline (ROW instantiation), pd_f8row_gemm's
+    // contract; cc 10.0 only
+    int (*f8row_gemm_tc5x)(const void*, const void*, const void*, const void*, void*, uint32_t,
+                           uint32_t, uint32_t, void*);
+    // 871: qwv_patchify (rgb, out, m0, m1, m2, s0, s1, s2, tw, th, patch, batch, stream) - the
+    // qwen tower's resized u8 pictures -> f16 patch rows in the merged 2x2 order, normalized
+    int (*qwv_patchify)(const void*, void*, float, float, float, float, float, float, uint32_t,
+                        uint32_t, uint32_t, uint32_t, void*);
+    // 872: attn_prefill_tc5_vl - attn_prefill_f16_paged_vl's contract (same arguments) at 128-row
+    // tiles with both GEMMs on tcgen05 (e4m3 class); hd 256 fp8 G 6, cc 10.0 only
+    int (*attn_prefill_tc5_vl)(const void*, const void*, const void*, const void*, void*,
+                               const void*, const void*, uint32_t, const void*, uint32_t,
+                               uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, uint32_t,
+                               void*);
+    // 873: causal_conv1d_silu_qkv_win_qkc (x, w, win, q, k, v, rows, HK, HV, s, k, stream) - slot
+    // 446 for one RESUMED span: the taps before x come from the slot's conv window
+    int (*causal_conv1d_silu_qkv_win_qkc)(const void*, const void*, const void*, void*, void*,
+                                          void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                                          uint32_t, void*);
+    // 874: nvf4_gemm_tc5_swq (data, scale_tiled, xq, xs, q, qs, scale2, in, out = 2 ff, batch,
+    // stream) - slot 533's interleaved gate|up SWQ contract on tcgen05 (tc5w's tiled weight
+    // scales); cc 10.0 only
+    int (*nvf4_gemm_tc5_swq)(const void*, const void*, const void*, const void*, void*, void*,
+                             float, uint32_t, uint32_t, uint32_t, void*);
+    // 875: conv_step_slots_qkvn (wins, x_new, w, q, k, v, slots, batch, x_stride, HK, HV, s, k,
+    // stream) - the decode DeltaNet front (conv step + silu + split + q/k norms + GQA widening)
+    // in one launch, bit-identical to conv_step_slots_s + deltanet_split_gqa_norm; k = 4 only
+    int (*conv_step_slots_qkvn)(void*, const void*, const void*, void*, void*, void*, const void*,
+                                uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 876: add_rmsnorm_nvf4_batch (x, proj, w, out, q, qs, n, eps, batch, stream) -
+    // add_rmsnorm_batch + quantize_nvf4 in one launch, bit-identical to the pair; NotSupported
+    // where add_rmsnorm_batch would not take its register-row kernel
+    int (*add_rmsnorm_nvf4_batch)(void*, const void*, const void*, void*, void*, void*, uint32_t,
+                                  float, uint32_t, void*);
+    // 877: add_rmsnorm_e4m3_batch - 876 with quantize_e4m3's per-32 linear e4m3 planes
+    int (*add_rmsnorm_e4m3_batch)(void*, const void*, const void*, void*, void*, void*, uint32_t,
+                                  float, uint32_t, void*);
+    // 878: gated_rmsnorm_e4m3_zs (x, z, z_bstride, heads, weight, out, q, scale, n_rows, d, eps,
+    // stream) - gated_rmsnorm_e4m3 with row r's z at (r / heads) * z_bstride + (r % heads) * d;
+    // d == 128 only (NotSupported otherwise)
+    int (*gated_rmsnorm_e4m3_zs)(const void*, const void*, uint32_t, uint32_t, const void*, void*,
+                                 void*, void*, uint32_t, uint32_t, float, void*);
+    // 879: add_rmsnorm_nvf4_batch_sw - 876 with the scales in the tcgen05 GEMM's swizzled atom
+    // layout (qs: ceil(batch / 128) * 128 rows' worth); n % 64 == 0
+    int (*add_rmsnorm_nvf4_batch_sw)(void*, const void*, const void*, void*, void*, void*, uint32_t,
+                                     float, uint32_t, void*);
+    // 880: swiglu_fused_nvf4_il_sw - swiglu_fused_nvf4_il with the scales swizzled likewise
+    int (*swiglu_fused_nvf4_il_sw)(const void*, void*, void*, uint32_t, uint32_t, void*);
+    // 881: nvf4_gemm_tc5w_sw - nvf4_gemm_tc5w reading pre-swizzled activation scales (879 / 880)
+    // with no swizzle launch; NotSupported at batch <= 64
+    int (*nvf4_gemm_tc5w_sw)(const void*, const void*, const void*, const void*, const void*, void*,
+                             float, uint32_t, uint32_t, uint32_t, void*, uint64_t, void*);
+    // 882: f8_gemm_tc5x_t (data, scale_tiled, xq, xs, y, in, out, batch, part, part_floats, stream)
+    // - f8_gemm_tc5x with the weight scales pre-tiled by 883, both operands' scale tiles by bulk
+    // copy; NotSupported at batch <= 64
+    int (*f8_gemm_tc5x_t)(const void*, const void*, const void*, const void*, void*, uint32_t,
+                          uint32_t, uint32_t, void*, uint64_t, void*);
+    // 883: f8_tc5_tile_scales (scale, tiled, in, out, stream) - a W8 plane's ue8m0 cells into 882's
+    // tile order; tiled = ceil(out / 128) * (in / 128) * 512 bytes
+    int (*f8_tc5_tile_scales)(const void*, void*, uint32_t, uint32_t, void*);
+    // 884: add_rmsnorm_e4m3_batch_sw - 877 with the scales in the swizzled atom layout (qs holds
+    // ceil(batch / 128) * 128 rows' worth) for 887; n % 128 == 0
+    int (*add_rmsnorm_e4m3_batch_sw)(void*, const void*, const void*, void*, void*, void*, uint32_t, float,
+                                     uint32_t, void*);
+    // 885: gated_rmsnorm_e4m3_zs_sw (x, z, z_bstride, heads, weight, out, q, scale, n_rows, d, eps,
+    // n_w, stream) - 878 with the scales swizzled for the out-proj GEMM (n_w = its in_dim / 128)
+    int (*gated_rmsnorm_e4m3_zs_sw)(const void*, const void*, uint32_t, uint32_t, const void*, void*, void*,
+                                    void*, uint32_t, uint32_t, float, uint32_t, void*);
+    // 886: quantize_e4m3_sw (x, q, scale, n_row, rows, stream) - quantize_e4m3 with the scales
+    // swizzled; n_row % 128 == 0
+    int (*quantize_e4m3_sw)(const void*, void*, void*, uint32_t, uint32_t, void*);
+    // 887: f8_gemm_tc5x_tsw - 882 with the activation scales already swizzled (884-886): no
+    // swizzle launch; NotSupported at batch <= 64
+    int (*f8_gemm_tc5x_tsw)(const void*, const void*, const void*, const void*, void*, uint32_t,
+                            uint32_t, uint32_t, void*, uint64_t, void*);
+    // 888: rmsnorm_e4m3_row_xn (x, w, xn, q, rscale, n, eps, rows, stream) - rmsnorm_e4m3_row also
+    // landing the f32 normed row in xn
+    int (*rmsnorm_e4m3_row_xn)(const void*, const void*, void*, void*, void*, uint32_t, float, uint32_t,
+                               void*);
+    // 889: add_rmsnorm_e4m3_row_xn (x, proj, w, xn, q, rscale, n, eps, rows, stream) - the same for
+    // add_rmsnorm_e4m3_row
+    int (*add_rmsnorm_e4m3_row_xn)(void*, const void*, const void*, void*, void*, void*, uint32_t, float,
+                                   uint32_t, void*);
 };
 
 } // extern "C"
