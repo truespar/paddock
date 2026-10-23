@@ -233,6 +233,35 @@ pub(crate) struct ThinkBudget {
 pub(crate) const THINK_EXIT_PHRASE: &str = "\n\nConsidering the limited time by the user, \
      I have to give the solution based on the thinking directly now.\n";
 
+/// Encode a rendered chat prompt: `shielded` are the byte ranges
+/// `render_shielded` reported (encoded as text), the rest in cached,
+/// parallel pieces with the whole-string ids (`GgufTokenizer::encode_prompt`).
+/// PADDOCK_TOKENIZE_VERIFY=1 re-encodes an unshielded prompt whole and logs
+/// any difference - the live check of the piece path.
+pub(crate) fn encode_chat_prompt(
+    model: &ServingModel,
+    prompt: &str,
+    shielded: &[std::ops::Range<usize>],
+) -> Result<Vec<u32>, String> {
+    let ids = model
+        .tokenizer
+        .encode_prompt(prompt, shielded)
+        .map_err(|e| e.to_string())?;
+    if shielded.is_empty() && paddock_models::dev_var_os!("PADDOCK_TOKENIZE_VERIFY").is_some() {
+        let whole = model.tokenizer.encode(prompt).map_err(|e| e.to_string())?;
+        if whole != ids {
+            tracing::error!(
+                "tokenize-verify: piece ids differ from the whole-string encode ({} vs {} ids)",
+                ids.len(),
+                whole.len()
+            );
+            return Ok(whole);
+        }
+        tracing::info!("tokenize-verify: {} ids identical", ids.len());
+    }
+    Ok(ids)
+}
+
 /// Resolve a requested thinking budget against this model. `knob` is the
 /// surface's own spelling (`thinking.budget_tokens`, `reasoning.max_tokens`)
 /// so the refusal quotes what the caller actually sent.
@@ -1445,6 +1474,12 @@ fn prepare(
         chat_template::inline_late_system_messages(&req.messages, model.late_system_native)?;
     let mut messages = chat_template::normalize_messages(&inlined);
     chat_template::strip_reasoning_close_newline(model.reasoning_close_nl, &mut messages);
+    // the client's control-token strings render as text (content_shield):
+    // masked here, before any marker of our own goes into the messages
+    let mut shield = model.content_shield();
+    if let Some(s) = shield.as_mut() {
+        messages.iter_mut().for_each(|m| s.mask(m));
+    }
     if let Some(marker) = model.audio_inline_marker.as_deref() {
         chat_template::inline_audio_content(&mut messages, marker);
     }
@@ -1459,9 +1494,10 @@ fn prepare(
         &images,
         true,
     )?;
-    let mut prompt = chat_template::render_with_specials(
+    let (mut prompt, shielded) = chat_template::render_shielded(
+        shield.as_mut(),
         template,
-        &messages,
+        &mut messages,
         tools,
         kwargs.as_ref(),
         &model.template_specials(),
@@ -1512,7 +1548,7 @@ fn prepare(
     // encode with specials: the rendered prompt contains <|start|> etc. which
     // must map to their single ids
     let t1 = std::time::Instant::now();
-    let mut prompt_ids = model.tokenizer.encode(&prompt).map_err(|e| e.to_string())?;
+    let mut prompt_ids = encode_chat_prompt(model, &prompt, &shielded)?;
     if trace {
         eprintln!(
             "req-trace: encode {:.1} ms ({} tokens), send at {}",
@@ -2220,7 +2256,14 @@ pub async fn handle(
         Err(e) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
     };
     scope.tokenized(t_prep.elapsed());
-    if let Some(o) = prepared.ocr.as_ref().filter(|o| o.mode == Some("document")) {
+    // PaddleOCR-VL's region pipeline answers its `document` mode; another
+    // parser's mode of the same name (Nemotron 3.5 Parse reads a whole page
+    // in one pass) is an ordinary generation
+    if let Some(o) = prepared
+        .ocr
+        .as_ref()
+        .filter(|o| o.mode == Some("document") && model.paddleocr)
+    {
         let pages = prepared.mm_chunks.clone().unwrap_or_default();
         return crate::paddle_layout::respond(&state, &req, o.clone(), pages).await;
     }

@@ -52,6 +52,9 @@ fn model_or_400(state: &AppState) -> Result<&EmbedModel, Response> {
 fn parse_input(input: &Value, m: &EmbedModel, task: Option<&str>) -> Result<Vec<Vec<u32>>, String> {
     let prefix = match task {
         Some(task) if m.embedding_gemma2 => crate::embedding_gemma2::task_prefix(task)?,
+        Some(_) if m.nemotron.is_some() => {
+            return Err("task is only supported with text input, not token ids".into());
+        }
         Some(_) => return Err("this embedding model does not support task prompts".into()),
         None => "",
     };
@@ -192,22 +195,61 @@ pub async fn embeddings(
             );
         }
     };
-    if let Some(dimensions) = req.dimensions
-        && (!m.embedding_gemma2 || !matches!(dimensions, 128 | 256 | 512 | 768))
-    {
+    if !m.embeds() {
         return err(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            if m.embedding_gemma2 {
-                "EmbeddingGemma 2 dimensions must be 128, 256, 512 or 768"
-            } else {
-                "this model does not support the dimensions parameter"
-            },
+            "this model is a reranker: score pairs with /v1/rerank",
         );
+    }
+    if let Some(dimensions) = req.dimensions {
+        let ok = if m.embedding_gemma2 {
+            matches!(dimensions, 128 | 256 | 512 | 768)
+        } else if let Some(f) = &m.nemotron {
+            (1..=f.cfg.d_model).contains(&dimensions)
+        } else {
+            false
+        };
+        if !ok {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                if m.embedding_gemma2 {
+                    "EmbeddingGemma 2 dimensions must be 128, 256, 512 or 768".to_owned()
+                } else if let Some(f) = &m.nemotron {
+                    format!(
+                        "Nemotron 3.5 Embed dimensions must be within 1..={} (a prefix, \
+                         re-normalized)",
+                        f.cfg.d_model
+                    )
+                } else {
+                    "this model does not support the dimensions parameter".to_owned()
+                },
+            );
+        }
     }
     // EmbeddingGemma 2's content-part items carry pictures; decoding them is
     // request-thread work too heavy for the async runtime
-    let parsed = if m.embedding_gemma2 && crate::embedding_gemma2::has_media_items(&req.input) {
+    let parsed = if m.nemotron.is_some() && !is_token_ids(&req.input) {
+        // the checkpoint's template, pictures decoded off the async runtime
+        let st = state.clone();
+        let input = req.input.clone();
+        let task = req.task.clone();
+        tokio::task::spawn_blocking(move || {
+            let m = st.embedder.as_ref().expect("checked above");
+            let fam = m.nemotron.as_ref().expect("checked above");
+            let (seqs, media) = crate::nemotron_embed::embed_inputs(
+                &input,
+                &m.tokenizer,
+                fam,
+                m.max_input_tokens,
+                task.as_deref(),
+            )?;
+            Ok::<_, String>((seqs, Some(media)))
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("input decode failed: {e}")))
+    } else if m.embedding_gemma2 && crate::embedding_gemma2::has_media_items(&req.input) {
         let st = state.clone();
         let input = req.input.clone();
         let task = req.task.clone();
@@ -266,6 +308,36 @@ pub async fn embeddings(
     }
 }
 
+/// Whether an `input` is pre-tokenized (`[int]` or `[[int]]`) - used
+/// verbatim, never through a template.
+fn is_token_ids(input: &Value) -> bool {
+    match input {
+        Value::Array(items) => {
+            !items.is_empty()
+                && (items.iter().all(Value::is_number)
+                    || items
+                        .iter()
+                        .all(|i| i.as_array().is_some_and(|a| a.iter().all(Value::is_number))))
+        }
+        _ => false,
+    }
+}
+
+/// A yes/no judge's document text: a string or `{"text": ...}`.
+fn doc_text(doc: &Value) -> Result<&str, String> {
+    match doc {
+        Value::String(s) => Ok(s),
+        Value::Object(o) => o
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|_| o.len() == 1)
+            .ok_or_else(|| {
+                "this reranker reads text documents: a string or {\"text\": ...}".into()
+            }),
+        _ => Err("a document must be a string or {\"text\": ...}".into()),
+    }
+}
+
 pub(crate) const DEFAULT_INSTRUCT: &str =
     "Given a web search query, retrieve relevant passages that answer the query";
 
@@ -292,13 +364,6 @@ pub async fn rerank(
         Err(resp) => return resp,
     };
     scope.model(&m.id);
-    let (Some(yes), Some(no)) = (m.yes_id, m.no_id) else {
-        return err(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "this model's vocabulary lacks the yes/no tokens a reranker needs",
-        );
-    };
     if req.documents.is_empty() {
         return err(
             StatusCode::BAD_REQUEST,
@@ -306,15 +371,28 @@ pub async fn rerank(
             "documents must not be empty",
         );
     }
+    if m.nemotron.is_some() {
+        return rerank_score_head(state.clone(), scope, req).await;
+    }
+    let (Some(yes), Some(no)) = (m.yes_id, m.no_id) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "this model's vocabulary lacks the yes/no tokens a reranker needs",
+        );
+    };
+    let docs: Vec<&str> = match req.documents.iter().map(doc_text).collect() {
+        Ok(d) => d,
+        Err(e) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+    };
     let instruction = req.instruction.as_deref().unwrap_or(DEFAULT_INSTRUCT);
     let t_tok = std::time::Instant::now();
     // rerank prompts are long (~120+ tokens); tokenize a batch in parallel
     // like the embeddings handler - serial BPE here cost ~35 ms of a
     // 128-doc round trip
-    let chunk = req.documents.len().div_ceil(16).max(1);
+    let chunk = docs.len().div_ceil(16).max(1);
     let results: Vec<Result<Vec<Vec<u32>>, String>> = std::thread::scope(|s| {
-        let handles: Vec<_> = req
-            .documents
+        let handles: Vec<_> = docs
             .chunks(chunk)
             .map(|docs| {
                 s.spawn(|| {
@@ -333,7 +411,7 @@ pub async fn rerank(
             .map(|h| h.join().expect("tokenize thread"))
             .collect()
     });
-    let mut seqs = Vec::with_capacity(req.documents.len());
+    let mut seqs = Vec::with_capacity(docs.len());
     for r in results {
         match r {
             Ok(batch) => seqs.extend(batch),
@@ -362,6 +440,90 @@ pub async fn rerank(
                     t_enc.elapsed().as_secs_f64() * 1e3
                 );
             }
+            results.sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
+            if let Some(n) = req.top_n {
+                results.truncate(n);
+            }
+            Json(RerankResponse {
+                model: req.model,
+                results,
+                usage: EmbeddingUsage {
+                    prompt_tokens,
+                    total_tokens: prompt_tokens,
+                },
+            })
+            .into_response()
+        }
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e),
+    }
+}
+
+/// `/v1/rerank` on a score-head reranker (Nemotron 3.5 Rerank): the pairs
+/// through the checkpoint's template, picture documents included; the raw
+/// logit is the relevance score (higher is more relevant).
+async fn rerank_score_head(
+    state: Arc<AppState>,
+    scope: crate::events::EventScope,
+    req: RerankRequest,
+) -> Response {
+    let m = state.embedder.as_ref().expect("checked by the caller");
+    let fam = m.nemotron.as_ref().expect("checked by the caller");
+    if !m.reranks() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "this model is an embedder: /v1/rerank needs a reranker",
+        );
+    }
+    if req.instruction.is_some() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Nemotron 3.5 Rerank takes no instruction: it scores query and document as given",
+        );
+    }
+    let parsed = if crate::nemotron_embed::has_pictures(&req.documents) {
+        let st = state.clone();
+        let (query, docs) = (req.query.clone(), req.documents.clone());
+        tokio::task::spawn_blocking(move || {
+            let m = st.embedder.as_ref().expect("checked above");
+            let fam = m.nemotron.as_ref().expect("checked above");
+            crate::nemotron_embed::rerank_inputs(
+                &query,
+                &docs,
+                &m.tokenizer,
+                fam,
+                m.max_input_tokens,
+            )
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("input decode failed: {e}")))
+    } else {
+        crate::nemotron_embed::rerank_inputs(
+            &req.query,
+            &req.documents,
+            &m.tokenizer,
+            fam,
+            m.max_input_tokens,
+        )
+    };
+    let (seqs, media) = match parsed {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+    };
+    let prompt_tokens: usize = seqs.iter().map(Vec::len).sum();
+    scope.usage(prompt_tokens, 0);
+    match m.encoder.rerank_media(seqs, media, 0, 0).await {
+        Ok(scores) => {
+            let mut results: Vec<RerankResult> = scores
+                .into_iter()
+                .enumerate()
+                .map(|(index, relevance_score)| RerankResult {
+                    index,
+                    relevance_score,
+                    document: req.return_documents.then(|| req.documents[index].clone()),
+                })
+                .collect();
             results.sort_by(|a, b| b.relevance_score.total_cmp(&a.relevance_score));
             if let Some(n) = req.top_n {
                 results.truncate(n);

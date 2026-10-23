@@ -527,6 +527,13 @@ pub trait Generator: Send {
         Ok(None)
     }
 
+    /// The last draft chain's per-position log p(top1), one entry per drafted
+    /// row in chain order - the confidence census (dev; None when unarmed or
+    /// unsupported). A host readback: call it after the round.
+    fn spec_draft_conf(&self) -> Option<Vec<Vec<f32>>> {
+        None
+    }
+
     /// True when this backend runs the canonical rejection-sampling spec arm
     /// (PADDOCK_SPEC_RS): drafts SAMPLED from the drafter softmax
     /// + full-q accept/recover on verify. The service then stashes per-slot
@@ -1554,6 +1561,7 @@ impl Generator for crate::gpu_model::qwen35::GpuQwen35 {
     fn enable_batch(&mut self, max_batch: usize) -> Result<usize, GenError> {
         // to_gen_err so a Config reject stays typed (fatal at startup, never
         // width-halved into a config the user didn't ask for)
+        self.elect_mtp_width();
         crate::gpu_model::qwen35::GpuQwen35::enable_batch(self, max_batch).map_err(to_gen_err)
     }
     fn spec_capable(&self) -> bool {
@@ -1634,6 +1642,11 @@ impl Generator for crate::gpu_model::qwen35::GpuQwen35 {
     }
     fn spec_draft_fetch(&mut self) -> Result<Option<Vec<Vec<u32>>>, GenError> {
         crate::gpu_model::qwen35::GpuQwen35::spec_draft_fetch_mtp(self).map_err(to_gen_err)
+    }
+    fn spec_draft_conf(&self) -> Option<Vec<Vec<f32>>> {
+        crate::gpu_model::qwen35::GpuQwen35::spec_draft_conf_mtp(self)
+            .ok()
+            .flatten()
     }
     // Rung G: the DFlash2 lane samples its selector walk at the
     // request temperature and resolves drafted rows with the truncation-
@@ -1828,6 +1841,9 @@ impl Generator for crate::gpu_model::qwen35::GpuQwen35 {
     }
     fn spec_live_cap(&self) -> usize {
         crate::gpu_model::qwen35::GpuQwen35::spec_live_cap_mtp(self)
+    }
+    fn spec_batch_draft_budget(&self, live: usize) -> Option<usize> {
+        crate::gpu_model::qwen35::GpuQwen35::mtp_width_depth(self, live)
     }
     fn forward_spec_verify(
         &mut self,

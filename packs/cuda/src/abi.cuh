@@ -3405,8 +3405,8 @@ struct KernelTableV1 {
                                   const void*, const void*, const void*, const void*,
                                   const void*, const void*, const void*, void*, uint32_t,
                                   uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
-    // 682: its dense half - bf16 / e4m3 weights x 16-bit activations over rows,
-    // batch-invariant (gemm/dense_w16.cuh). Pure append.
+    // 682: its dense half - bf16 / e4m3 / f16 weights (dtype 0 / 1 / 2) x 16-bit
+    // activations over rows, batch-invariant (gemm/dense_w16.cuh). Pure append.
     int (*dense_w16)(const void*, const void*, const void*, void*, uint32_t, uint32_t,
                      uint32_t, uint32_t, uint32_t, uint32_t, void*);
     // 683: the rows partial on fixed key splits (attn/rows.cuh) - 679's
@@ -4223,6 +4223,66 @@ struct KernelTableV1 {
     // add_rmsnorm_e4m3_row
     int (*add_rmsnorm_e4m3_row_xn)(void*, const void*, const void*, void*, void*, void*, uint32_t, float,
                                    uint32_t, void*);
+    // 890: np_patch_u8 (canvas, out16, h, w, mean0..2, std0..2, stream) - Nemotron 3.5 Parse's
+    // pixels: an RGB8 h x w canvas (both % 16) -> /255, CLIP-normalized, one f16 row of 768 per
+    // 16x16 patch in (c, ky, kx) order, patches raster over the canvas
+    int (*np_patch_u8)(const void*, void*, uint32_t, uint32_t, float, float, float, float, float,
+                       float, void*);
+    // 891: np_pen_argmax (logits, seen, row_slot, extra, n_extra, penalty, vocab, words, rows,
+    // write_back, out_ids, stream) - HF repetition penalty over a slot's seen-id bitmap plus
+    // n_extra per-row ids (UINT32_MAX = none), then argmax (lowest id on ties); write_back != 0
+    // leaves the penalized logits in place
+    int (*np_pen_argmax)(void*, const void*, const void*, const void*, uint32_t, float, uint32_t,
+                         uint32_t, uint32_t, uint32_t, void*, void*);
+    // 892: np_seen_or (seen, slots, toks, n, words, stream) - set toks[i]'s bit in slot slots[i]'s
+    // bitmap (words u32 a slot)
+    int (*np_seen_or)(void*, const void*, const void*, uint32_t, uint32_t, void*);
+    // 893: np_vit_attn (q, k, v, out, n, n_heads, in_stride, bq, bv, qscale, stream) - unmasked
+    // self-attention over one page's n rows at head_dim 72 exactly: q/k/v rows in_stride halves
+    // apart (the fused qkv landing works directly), bq non-null = q gets (q + bq) * qscale at its
+    // load (else q arrives scaled by log2(e)/sqrt(72)), bv non-null = added in the epilogue;
+    // out [row][head][72] f16; cc 8.0+
+    int (*np_vit_attn)(const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t,
+                       const void*, const void*, float, void*);
+    // 894: f16_gemm_ring (w, x, y, bias, in_dim, out_dim, batch, epi, stream) - the f32-landing
+    // f16 GEMM on the unsplit mma rings only (never the GEMV band or the K-split), so a row's bits
+    // do not depend on the call's row count; epi 0 = y = W x, 1 = y += W x + bias; in_dim % 8 == 0
+    int (*f16_gemm_ring)(const void*, const void*, void*, const void*, uint32_t, uint32_t,
+                         uint32_t, uint32_t, void*);
+    // 895: f16_gemm_h_swiglu (w, x, y, in_dim, out_dim, batch, stream) - the f16 landing of
+    // silu(gate) * up off a 16-row-block re-laid gate|up weight (gate rows first), y [batch][out/2];
+    // the mma rings only, so a row's bits do not depend on the row count; out_dim % 16 == 0
+    int (*f16_gemm_h_swiglu)(const void*, const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+    // 896: ne_patch_u8 (canvas, out16, h, w, m0..2, s0..2, stream) - Nemotron 3.5 Embed's pixels: an
+    // RGB8 h x w canvas (both % 14) -> (u - m) / s (mean / std pre-multiplied by 255), one f16 row
+    // of 592 (588 + zero pad) per 14x14 patch in (c, ky, kx) order, patches raster
+    int (*ne_patch_u8)(const void*, void*, uint32_t, uint32_t, float, float, float, float, float,
+                       float, void*);
+    // 897: ne_rms_h (x, w, out16, rows, d, eps, stream) - f16(x * rsqrt(mean(x^2) + eps) * w) over
+    // [rows][d] f32, d in {1024, 2048, 4096}, one fixed block shape a row
+    int (*ne_rms_h)(const void*, const void*, void*, uint32_t, uint32_t, float, void*);
+    // 898: ne_embed_rows (src, emb, pic, out, rows, d, stream) - out[r] = the bf16 embedding row
+    // src[r] widened, or (top bit set) pic row src[r] & 0x7fffffff; d % 8 == 0
+    int (*ne_embed_rows)(const void*, const void*, const void*, void*, uint32_t, uint32_t, void*);
+    // 899: ne_rope_qk (qkv, pos, cos, sin, rows, nh, nkv, hd, stride, qscale, l4_beta, l4_orig,
+    // stream) - in-place rotate-half rope on the q and k heads at each row's start (tables
+    // [*][hd/2] f32 at row pos[r]), q then x qscale x (1 + l4_beta ln(1 + floor(pos / l4_orig)))
+    int (*ne_rope_qk)(void*, const void*, const void*, const void*, uint32_t, uint32_t, uint32_t,
+                      uint32_t, uint32_t, float, float, uint32_t, void*);
+    // 900: ne_attn (qkv, cu, tiles, n_tiles, out, nh, nkv, hd, stream) - bidirectional packed-varlen
+    // GQA attention off the fused landing [rows][(nh + 2 nkv) hd] (q pre-scaled in the log2
+    // domain), one block a (query tile, kv head); out f16 [rows][nh][hd]; (hd, nh / nkv) in
+    // {(128, 4), (64, 1)}; sm_80+
+    int (*ne_attn)(const void*, const void*, const void*, uint32_t, void*, uint32_t, uint32_t,
+                   uint32_t, void*);
+    // 901: ne_pool (x, cu, score, mean_out, out, n_seq, d, dims, stream) - per sequence the f64
+    // row-order mean of x [rows][d] f32 (mean_out optional), then out [n_seq][dims] = the first
+    // dims components unit-normed (score null) or out [n_seq] = mean . score
+    int (*ne_pool)(const void*, const void*, const void*, void*, void*, uint32_t, uint32_t,
+                   uint32_t, void*);
+    // 902: ne_add_rms_h (x, proj, w, out16, rows, d, eps, stream) - x += proj over [rows][d] f32,
+    // then (w non-null) out16 = 897's RMSNorm of the updated rows; d in {1024, 2048, 4096}
+    int (*ne_add_rms_h)(void*, const void*, const void*, void*, uint32_t, uint32_t, float, void*);
 };
 
 } // extern "C"

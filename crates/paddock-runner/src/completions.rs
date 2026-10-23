@@ -116,9 +116,12 @@ fn prepare(
             (ids.to_vec(), text)
         }
         None => {
+            // a raw prompt is the caller's own formatting: its control
+            // tokens are meant, so nothing is shielded - the piece encoder
+            // only makes a long one faster (same ids)
             let mut ids = model
                 .tokenizer
-                .encode(req.prompt.first())
+                .encode_prompt(req.prompt.first(), &[])
                 .map_err(|e| e.to_string())?;
             // base-completion convention: lead with BOS when the model has one
             if let Some(bos) = model.bos

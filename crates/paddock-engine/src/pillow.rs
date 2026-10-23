@@ -1,7 +1,7 @@
 //! Pillow-compatible separable image resampling - the reference preprocessing
-//! filter for every tower whose HF processor says `resample: 1` (LANCZOS) or
-//! `resample: 3` (BICUBIC), and what llama.cpp's `mtmd-image.cpp` implements as
-//! `resize_pillow`.
+//! filter for every tower whose HF processor says `resample: 1` (LANCZOS),
+//! `resample: 2` (BILINEAR) or `resample: 3` (BICUBIC), and what llama.cpp's
+//! `mtmd-image.cpp` implements as `resize_pillow`.
 //!
 //! This is the exact integer path, not an approximation of it: 22-bit
 //! fixed-point weights, the `+0.5`-then-truncate rounding Pillow uses (which is
@@ -24,6 +24,11 @@
 pub enum Filter {
     /// `resample: 1`, support radius 3. Muse Glimmer's processor_config.
     Lanczos3,
+    /// `resample: 2`, support radius 1 - Pillow's triangle filter. Nemotron
+    /// 3.5 Parse's processor (`Image.resize(..., BILINEAR)`); on a downscale
+    /// the support stretches by the scale like every other filter here, which
+    /// is Pillow's antialiasing, not a plain 2-tap lerp.
+    Bilinear,
     /// `resample: 3`, support radius 2, Pillow's a = -0.5 (not torch/ggml's
     /// -0.75).
     Bicubic,
@@ -33,6 +38,7 @@ impl Filter {
     fn support(self) -> f64 {
         match self {
             Filter::Lanczos3 => 3.0,
+            Filter::Bilinear => 1.0,
             Filter::Bicubic => 2.0,
         }
     }
@@ -51,6 +57,11 @@ impl Filter {
                     pv.sin() / pv
                 }
                 sinc(x) * sinc(x / 3.0)
+            }
+            // Pillow's bilinear_filter: 1 - |x| inside the unit support
+            Filter::Bilinear => {
+                let x = x.abs();
+                if x < 1.0 { 1.0 - x } else { 0.0 }
             }
             Filter::Bicubic => {
                 const A: f64 = -0.5;

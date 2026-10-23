@@ -2970,6 +2970,8 @@ impl GpuQwen35 {
             spec_batch: None,
             spec_pending: None,
             spec_chain: None,
+            draft_conf: None,
+            chain_run: usize::MAX,
             spec_warm_wanted: true,
             spec_ring_probed: false,
             spec_live_vram_cap: None,

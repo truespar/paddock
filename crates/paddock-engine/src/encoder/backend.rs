@@ -91,6 +91,22 @@ pub trait EncoderBackend {
         no: u32,
         lane: usize,
     ) -> Result<Self::Pending, String>;
+    /// [`Self::rerank_submit`] with pictures (`media` as
+    /// [`Self::embed_submit_media`]'s); a text-only backend takes the text
+    /// path and refuses any.
+    fn rerank_submit_media(
+        &mut self,
+        seqs: &[Vec<u32>],
+        media: &[Vec<crate::service::MmChunk>],
+        yes: u32,
+        no: u32,
+        lane: usize,
+    ) -> Result<Self::Pending, String> {
+        if media.iter().any(|m| !m.is_empty()) {
+            return Err("this reranker scores text only".into());
+        }
+        self.rerank_submit(seqs, yes, no, lane)
+    }
     fn rerank_collect(
         &mut self,
         pending: &Self::Pending,
@@ -286,5 +302,108 @@ impl EncoderBackend for crate::gpu_model::qwen3::GpuQwen3 {
     }
     fn export_smooth(&self) -> Result<Option<Vec<u8>>, String> {
         self.export_smooth().map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl EncoderBackend for crate::gpu_model::nemotron_embed::GpuNemotronEmbed {
+    type Pending = crate::gpu_model::nemotron_embed::PendingNemotron;
+    fn media_kinds(&self) -> (bool, bool, bool) {
+        (self.serves_images(), false, false)
+    }
+    fn weights_mem_bytes(&self) -> Option<u64> {
+        self.weights_mem_bytes()
+    }
+    fn device_mem_used(&self) -> Option<u64> {
+        self.device_mem_used()
+    }
+    fn idle_reclaim_after(&self) -> Option<std::time::Duration> {
+        self.idle_reclaim_after()
+    }
+    fn reclaim_idle(&mut self) {
+        self.reclaim_idle();
+    }
+    fn coalesce_row_budget(&self) -> usize {
+        self.coalesce_row_budget()
+    }
+    /// An 8B pass is tens of milliseconds even for one query: what arrives
+    /// while one is in flight merges into the next anyway, so an idle GPU
+    /// launches at once.
+    fn burst_windows(&self) -> Option<(std::time::Duration, std::time::Duration)> {
+        None
+    }
+    fn validate(&self, seqs: &[Vec<u32>]) -> Result<(), String> {
+        self.validate(seqs)
+    }
+    fn validate_media(
+        &self,
+        seqs: &[Vec<u32>],
+        media: &[Vec<crate::service::MmChunk>],
+    ) -> Result<(), String> {
+        self.validate_media(seqs, media)
+    }
+    fn lanes(&mut self) -> usize {
+        1
+    }
+    fn pool_ready(&self, p: &Self::Pending) -> bool {
+        self.pool_ready(p)
+    }
+    fn validate_dimensions(&self, dims: Option<usize>) -> Result<(), String> {
+        self.validate_dimensions(dims)
+    }
+    fn embed_submit(&mut self, s: &[Vec<u32>], lane: usize) -> Result<Self::Pending, String> {
+        EncoderBackend::embed_submit_media(self, s, &[], lane, None)
+    }
+    fn embed_submit_dimensions(
+        &mut self,
+        s: &[Vec<u32>],
+        lane: usize,
+        dims: Option<usize>,
+    ) -> Result<Self::Pending, String> {
+        EncoderBackend::embed_submit_media(self, s, &[], lane, dims)
+    }
+    fn embed_submit_media(
+        &mut self,
+        seqs: &[Vec<u32>],
+        media: &[Vec<crate::service::MmChunk>],
+        lane: usize,
+        dims: Option<usize>,
+    ) -> Result<Self::Pending, String> {
+        use crate::gpu_model::nemotron_embed::Output;
+        if lane != 0 {
+            return Err("invalid embedding lane".into());
+        }
+        let dims = dims.unwrap_or(self.cfg.d_model);
+        self.submit_media(seqs, media, Output::Embed { dims })
+    }
+    fn embed_collect(&mut self, p: &Self::Pending) -> Result<Vec<Vec<f32>>, String> {
+        self.collect(p)
+    }
+    fn rerank_submit(
+        &mut self,
+        s: &[Vec<u32>],
+        yes: u32,
+        no: u32,
+        lane: usize,
+    ) -> Result<Self::Pending, String> {
+        EncoderBackend::rerank_submit_media(self, s, &[], yes, no, lane)
+    }
+    /// The score head's logit; the yes / no ids are a judge's and unused.
+    fn rerank_submit_media(
+        &mut self,
+        seqs: &[Vec<u32>],
+        media: &[Vec<crate::service::MmChunk>],
+        _: u32,
+        _: u32,
+        lane: usize,
+    ) -> Result<Self::Pending, String> {
+        use crate::gpu_model::nemotron_embed::Output;
+        if lane != 0 {
+            return Err("invalid rerank lane".into());
+        }
+        self.submit_media(seqs, media, Output::Score)
+    }
+    fn rerank_collect(&mut self, p: &Self::Pending, _: u32, _: u32) -> Result<Vec<f32>, String> {
+        Ok(self.collect(p)?.into_iter().map(|v| v[0]).collect())
     }
 }

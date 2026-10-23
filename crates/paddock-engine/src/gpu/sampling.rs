@@ -14,6 +14,10 @@ impl GpuExecutor {
         self.kernels.argmax_rows.is_some()
     }
 
+    pub fn has_argmax_top2_rows(&self) -> bool {
+        self.kernels.argmax_top2_rows.is_some()
+    }
+
     /// True when the pack ships the pipelined-decode advance kernel.
     pub fn has_pipe_advance(&self) -> bool {
         self.kernels.pipe_advance.is_some()

@@ -196,6 +196,34 @@ impl GpuExecutor {
         self.dense_w16_raw(wp, sp, xg, y, in_dim, out_dim, y_stride, rows, 1, pre)
     }
 
+    /// `dense_w16` on an f16 plane (house dims `[in, out]`, rows contiguous)
+    /// against f16 activations already cast (`x16` `[rows][in]`): `y[t][o]`
+    /// at row stride `y_stride`, the f16 mma - the same class as
+    /// [`Self::matvec_batch_f16`], batch-invariant. Needs a pack whose slot
+    /// 682 takes dtype 2.
+    pub fn dense_w16_f16(
+        &self,
+        w: &super::HalfTensor,
+        x16: &CudaSlice<half::f16>,
+        y: &mut CudaSlice<f32>,
+        y_stride: usize,
+        rows: usize,
+    ) -> Result<(), GpuError> {
+        let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
+        if w.buf.len() < in_dim * out_dim
+            || x16.len() < rows * in_dim
+            || y_stride < out_dim
+            || (rows > 0 && y.len() < (rows - 1) * y_stride + out_dim)
+        {
+            return Err(super::error::oob(
+                "dense_w16_f16: buffers under the GEMM geometry",
+            ));
+        }
+        let (wp, _g1) = w.buf.device_ptr(&self.stream);
+        let (xp, _g2) = x16.device_ptr(&self.stream);
+        self.dense_w16_raw(wp, 0, xp, y, in_dim, out_dim, y_stride, rows, 2, true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn dense_w16_raw(
         &self,

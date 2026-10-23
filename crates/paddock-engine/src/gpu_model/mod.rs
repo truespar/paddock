@@ -17,6 +17,8 @@ pub mod laguna;
 pub mod laya;
 pub mod nemotron;
 pub mod nemotron_asr;
+pub mod nemotron_embed;
+pub mod nemotron_parse;
 pub mod paddleocr_vl;
 pub mod picture_store;
 // host-side and backend-neutral, so it lives at the crate root (the runner

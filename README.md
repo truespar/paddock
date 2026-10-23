@@ -99,7 +99,7 @@ Every model below runs on the engine today. Sizes are the checkpoint's own, and
 **Text, vision and tool use**
 
 - **Qwen** - 3.5 9B, 3.6 27B, 3.6 35B-A3B, 3.8 27B, and 3.8 Flash Next
-- **Gemma 4** - 31B and 26B-A4B
+- **Gemma 4** - 31B, 26B-A4B, and 12B, which also takes speech
 - **DiffusionGemma** - 26B-A4B, which writes a whole block of text per step
 - **GPT-OSS** - 20B and 120B
 - **Bonsai 2** - 27B, in ternary weights
@@ -144,6 +144,8 @@ Every model below runs on the engine today. Sizes are the checkpoint's own, and
   labelled blocks with their boxes
 - **PaddleOCR-VL** 1.6
 - **Unlimited-OCR** 3B
+- **Nemotron 3.5 Parse** (NVIDIA) - 0.6B; turns a page into its blocks in
+  reading order, each with its box, kind and text. NVIDIA GPUs for now
 
 **Speech**
 
@@ -152,6 +154,8 @@ Every model below runs on the engine today. Sizes are the checkpoint's own, and
 - **Nemotron 3 Diarization** (NVIDIA) - who spoke when, overlapping speakers
   included, in recordings up to 10 minutes; the Studio draws it as a speaker
   timeline
+- **Nemotron 3.5 ASR Streaming** (NVIDIA) - 0.6B; live transcripts that are
+  never revised, in 40 languages and locales. NVIDIA GPUs for now
 - **Whisper Large** fine-tunes - KB-Whisper (Swedish), NB-Whisper (Norwegian),
   Røst v3 (Danish)
 
@@ -161,6 +165,8 @@ Every model below runs on the engine today. Sizes are the checkpoint's own, and
 - **EmbeddingGemma 2** - text, pictures and audio in one vector space, in over
   100 languages
 - **Qwen 3 Reranker** - 0.6B, 4B, 8B
+- **Nemotron 3.5 Embed** and **Rerank** (NVIDIA) - 8B; text and pictures of
+  pages in one vector space. NVIDIA GPUs for now
 
 ## What it contains
 

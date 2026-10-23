@@ -51,6 +51,8 @@ pub(super) struct KneeSearch {
     settled: bool,
     /// knee ticks since the knee settled
     since: u64,
+    /// knee ticks observed in all (a learning mark for the calibration file)
+    seen: u64,
 }
 
 fn aligned_half(n: usize) -> usize {
@@ -68,6 +70,7 @@ impl KneeSearch {
             cand: aligned_half(full),
             best: full,
             next: full,
+            seen: self.seen,
             ..Self::default()
         };
         if self.cand < ROW_ALIGN {
@@ -85,6 +88,27 @@ impl KneeSearch {
         (s < full).then_some(s)
     }
 
+    /// A settled search: (full share, the share it settled on - the full
+    /// share itself when no smaller one passed).
+    pub(super) fn settled(&self) -> Option<(usize, usize)> {
+        (self.settled && self.full > 0).then_some((self.full, self.best))
+    }
+
+    /// Take a previous run's settled knee against `full`; it holds until
+    /// the next re-check, like one this process settled.
+    pub(super) fn adopt(&mut self, full: usize, best: usize) {
+        if full == 0 || best == 0 || best > full {
+            return;
+        }
+        self.restart(full);
+        self.best = best;
+        self.settled = true;
+    }
+
+    pub(super) fn samples(&self) -> u64 {
+        self.seen
+    }
+
     /// The settled knee, if the search found one below the full share.
     #[cfg(test)]
     pub(super) fn knee(&self) -> Option<usize> {
@@ -93,6 +117,7 @@ impl KneeSearch {
 
     /// A knee tick against `full` ran `rows` prefill rows in `wall_ms`.
     pub(super) fn observe(&mut self, full: usize, rows: usize, wall_ms: f64) {
+        self.seen += 1;
         if self.full != full {
             self.restart(full);
         }

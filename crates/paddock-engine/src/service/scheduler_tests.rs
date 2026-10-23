@@ -66,6 +66,7 @@ fn cache_only_pages_allow_concurrent_admission_but_active_pages_do_not() {
             2,
             &Arc::new(EngineMetrics::default()),
             &ShutdownCtl::new(),
+            None,
         );
         assert_eq!(generator.waves, expected);
         assert_eq!(
@@ -241,6 +242,7 @@ fn a_live_request_takes_a_background_slot_and_the_batch_still_finishes() {
         2,
         &Arc::new(EngineMetrics::default()),
         &ShutdownCtl::new(),
+        None,
     );
     // the live prompt is prefilled within a step of arriving, not after a
     // background request's remaining ~35 tokens

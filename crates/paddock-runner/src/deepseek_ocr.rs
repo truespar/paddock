@@ -693,6 +693,9 @@ pub fn regions_json(raw: &str) -> Option<Value> {
     if rs.is_empty() {
         rs = crate::lighton_ocr::parse_blocks(raw);
     }
+    if rs.is_empty() {
+        rs = crate::nemotron_parse::parse_blocks(raw);
+    }
     (!rs.is_empty()).then(|| Value::Array(rs.iter().map(Region::to_json).collect()))
 }
 

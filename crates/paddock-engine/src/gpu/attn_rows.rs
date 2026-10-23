@@ -20,7 +20,7 @@ impl GpuExecutor {
     /// tile is read once per group - the decode partial reads it once per
     /// ROW. `pool_k/v` is the paged block pool (`block_tables` Some) or a
     /// dense f16 cache `[slots, max_ctx, kv_dim]` (None). `window` > 0 bounds
-    /// each row to its last `window` keys (0 = full). hd128, G <= 16.
+    /// each row to its last `window` keys (0 = full). hd 128 or 64, G <= 16.
     /// Partials pair with [`Self::attn_combine_batch`] at `batch = n_rows`:
     /// `out_o` >= n_heads * n_rows * n_splits * 128 floats, `out_ml` twice
     /// n_heads * n_rows * n_splits.

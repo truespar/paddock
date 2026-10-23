@@ -6276,6 +6276,201 @@ revision = "2026-10-09"
     size = 6722759
 
 
+
+# Nemotron 3.5 Parse (NVIDIA, Oct 2026) - the page parser: C-RADIOv4-SO400M
+# tower + neck into a 10-layer mBART decoder used decoder-only over a causal
+# picture prefix, plus one trained MTP head. Answers are the page's elements in
+# reading order, each `<x><y>text<x><y><class_..>` (tables as LaTeX tabular).
+#
+# Sourcing: NVIDIA's own release, mirrored unchanged at the pinned revision -
+# the F32 safetensors, the processor/generation configs, the tokenizer and
+# chat template, and the licence, attribution, notices and model-card files
+# (every byte verified against the revision's LFS ids / blobs, 2026-10-22).
+# The release's Python, Docker and evaluation material is not mirrored - the
+# engine reads none of it. OpenMDW-1.1 for the model; the tokenizer is MIT
+# (TOKENIZER_ATTRIBUTION.md rides with it).
+#
+# CUDA only: served from the checkpoint directory by the native family
+# (f16 operands, f32 accumulation/residual/norms - closer to F64 than the
+# vendor's BF16 serving), batch-invariant (a page reads byte-identically at
+# any concurrency, with MTP on or off). `weight_bytes` is the measured
+# resident set (GB10): the f16 planes, the f32 x32 embedding gather table, the
+# MTP draft's e4m3 head copy and the tower - smaller than the F32 file.
+[[model]]
+id = "nemotron-3.5-parse"
+# KV stays f16, the family's pin (its hd 64 prefill tile and invariant walk read f16 caches)
+kv_default = "f16"
+mtp_in_file = true
+vendor = "NVIDIA"
+display = "Nemotron 3.5 Parse"
+family = "nemotron-parse"
+capability = ["chat", "documents", "speculative"]
+license = "openmdw-1.1"
+revision = "2026-10-22"
+
+  [model.specs]
+  params = "0.63B"
+  context = "16K"
+  published_at = "2026-10-17"
+  published_source = "https://huggingface.co/nvidia/Nemotron-3.5-Parse"
+  homepage = "https://huggingface.co/nvidia/Nemotron-3.5-Parse"
+  about = "NVIDIA's page parser - turns a scanned page, a photo of a document or a PDF page into its elements in reading order, each with its box on the page, its kind (title, text, table, chart, caption...) and its text."
+  strengths = [
+    "The page's layout as well as its words: every block with its box and class, in reading order",
+    "Small and fast - about 1.6 GB resident, an A4 page in a second or two",
+    "The same page reads byte for byte the same however busy the server is",
+  ]
+  tradeoffs = [
+    "A document specialist - one page per request, and it does not chat",
+    "Tables come back as LaTeX tabular rather than HTML",
+  ]
+
+  [[model.artifact]]
+  id = "f32"
+  kind = "weights"
+  format = "safetensors"
+  label = "Full quality"
+  quant = "F32"
+  default = true
+  # Device bytes beyond the weights and the KV pool at the default 32 slots
+  # (GB10): the tower's fixed pass workspace (two A4 pages a pass) and the
+  # decoder's batch scratch, measured at 1,268,300,224 B, plus the picture
+  # prefix planes of 32 queued pages at the largest page (3329 rows x 4 KB =
+  # 13.6 MB each) and the tower's position fields for up to four page shapes
+  # (61.3 MB each at the largest page). The 64-page c32 battery from the R2
+  # artifact peaked 0.90 GiB over warm, host side included.
+  workspace = 1950005696
+
+  [model.artifact.source]
+  repo = "nvidia/Nemotron-3.5-Parse"
+  base_model = "nvidia/Nemotron-3.5-Parse"
+  license_url = "https://openmdw.ai/license/1-1/"
+  revision = "62cb1e4ba153d113ff64aaf2be6e068c377cf53c"
+  license = "openmdw-1.1"
+
+  [model.artifact.runtime]
+  backends = ["cuda"]
+  checkpoint_dir = true
+  embedded_vision = true
+  companions = []
+  kv_cache_dtype = "f16"
+  default_max_ctx = 16384
+  default_max_batch = 32
+
+  [model.artifact.shape]
+  weight_bytes = 1596373700
+  kind = "generative"
+  vocab = 72512
+  max_ctx = 16384
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = [
+    { k_dim = 512, v_dim = 512, count = 10 },
+  ]
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Parse/model.safetensors"
+    dest = "Nemotron-3.5-Parse/model.safetensors"
+    sha256 = "81dd7609c589f3694ce75520c25af5010953231358de6aec4d03e8c6aac787e9"
+    size = 2523266640
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Parse/LICENSE"
+    dest = "Nemotron-3.5-Parse/LICENSE"
+    sha256 = "3375384ee1050a54d69c98c74d6499841166cd7db823ed90358f430df8c39856"
+    size = 3051
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Parse/README.md"
+    dest = "Nemotron-3.5-Parse/README.md"
+    sha256 = "5a449f1bd9f6f00577c741cf2782579c99600d6315cd1ea54d82db6264003376"
+    size = 26235
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Parse/THIRD_PARTY_NOTICES.md"
+    dest = "Nemotron-3.5-Parse/THIRD_PARTY_NOTICES.md"
+    sha256 = "3ffde205eb8d5d6458dcd1b6bc3d59b2b92d650b95e1e56f75dbed2bbed78b64"
+    size = 730187
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Parse/TOKENIZER_ATTRIBUTION.md"
+    dest = "Nemotron-3.5-Parse/TOKENIZER_ATTRIBUTION.md"
+    sha256 = "9a1cb165c21860d78a05a8b4aacb24de025719e2c3ed33ee86d1722ccaec442a"
+    size = 1963
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Parse/bias.md"
+    dest = "Nemotron-3.5-Parse/bias.md"
+    sha256 = "7cebb1424b21a309c900c0b0859197d76edbdad1af8aed48ad8dfb7eb15d609c"
+    size = 684
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Parse/chat_template.jinja"
+    dest = "Nemotron-3.5-Parse/chat_template.jinja"
+    sha256 = "86e90f392a2779c96c96b5848248981a05750e7a11e0380b092a8c35e2c3e32f"
+    size = 212
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Parse/config.json"
+    dest = "Nemotron-3.5-Parse/config.json"
+    sha256 = "bff3460ae530573ad2e276627be86cab1b6859754b76e8b196410f17e7f0b7d5"
+    size = 5735
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Parse/explainability.md"
+    dest = "Nemotron-3.5-Parse/explainability.md"
+    sha256 = "9a7902862c6d93192d15a6dbb23850eaedff6c55821e988aa908b0a8e3023d93"
+    size = 2587
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Parse/generation_config.json"
+    dest = "Nemotron-3.5-Parse/generation_config.json"
+    sha256 = "0ec0669b5d3df6c4f2fcbf41334c3d64f44fdee1d1e5f158a33b112edf1646c3"
+    size = 284
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Parse/preprocessor_config.json"
+    dest = "Nemotron-3.5-Parse/preprocessor_config.json"
+    sha256 = "16d54d73fc265b31f3771caf39770dc85213cae7594823ba7a6ac3f085315ada"
+    size = 950
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Parse/privacy.md"
+    dest = "Nemotron-3.5-Parse/privacy.md"
+    sha256 = "aef79c14dd81b1ef2b44df8b0419650ff8f9c0c4787c79ff8958704c6e5c2225"
+    size = 201
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Parse/processor_config.json"
+    dest = "Nemotron-3.5-Parse/processor_config.json"
+    sha256 = "b3e2ff2cc94f3d9412f179acf06d8bc5543305ec27966617977b3bd47fee9e5e"
+    size = 287
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Parse/safety.md"
+    dest = "Nemotron-3.5-Parse/safety.md"
+    sha256 = "7c75f148aa8c120d6ba08c4955c652e0e666c687375fa0ec4dc96d8448313f07"
+    size = 1428
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Parse/special_tokens_map.json"
+    dest = "Nemotron-3.5-Parse/special_tokens_map.json"
+    sha256 = "7073bb56328d2b66724495a7cf53841fccdcc9efcafb1e1b7cc916baa80e3c8c"
+    size = 747
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Parse/tokenizer.json"
+    dest = "Nemotron-3.5-Parse/tokenizer.json"
+    sha256 = "34f566e728995769d971fc2707596bfb92c83298d357bc6ec29a7a1d3d12a74a"
+    size = 7627412
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Parse/tokenizer_config.json"
+    dest = "Nemotron-3.5-Parse/tokenizer_config.json"
+    sha256 = "701dad9bcc5f964a6fa020e7d5018c71efc93aad79d471cfca541b9bb4f6d012"
+    size = 414355
+
+
 # Muse Glimmer 30B (Meta, Aug 2026). Served by the gemma4 family module with
 # its own arch constants - same fp8-e4m3 KV pool, so kv_default matches.
 #
@@ -7775,6 +7970,187 @@ revision = "2026-10-08"
     sha256 = "7d8681a0a27d61cbad9b25bf788bc553a1345f153860c4b31c98b10906bbcac1"
     size = 2417
 
+# Nemotron 3.5 Embed 8B (NVIDIA, Oct 2026): the multimodal embedder - a
+# Pixtral picture tower and Mistral 3's projector in front of a
+# bidirectional Ministral 3 8B body, mean-pooled and L2-normalized
+# (Matryoshka prefixes re-normalized). Served from NVIDIA's own BF16
+# checkpoint directory on CUDA, every GEMM in f16 widened exactly from the
+# bf16 weights: vectors 16-60x closer to the F64 reference than the release's
+# own BF16 serving, bit-identical at any concurrency. 17 files mirrored under
+# models/Nemotron-3.5-Embed-8B-BF16/ - the four shards and their index, the
+# configs, tokenizer, chat template and model card, every byte checked
+# against revision 781e779e's LFS ids / blobs. That revision ships no LICENSE
+# file (its card names OpenMDW-1.1 and the Apache-2.0 Ministral 3 base), so
+# the sibling Rerank release's own LICENSE (OpenMDW-1.1, NVIDIA) and NOTICE
+# (the base model's Apache-2.0 notice) are mirrored beside it, unchanged.
+# weight_bytes and workspace are COMPUTED, not measured (source = "probed"):
+# weight_bytes is the loader's own byte count (the bf16 embedding 1.07 GB,
+# the f16 body and tower planes, f32 norms); workspace is a 32768-row pass's
+# planes (90 KB a row), picture rows filling the context, the tower's
+# 16384-patch pass and its resize staging, ~4.31 GB, rounded up for the
+# allocator. Replace both with a measured run.
+[[model]]
+id = "nemotron-3.5-embed-8b"
+vendor = "NVIDIA"
+display = "Nemotron 3.5 Embed 8B"
+family = "nemotron-embed"
+capability = ["embeddings"]
+license = "openmdw-1.1"
+revision = "2026-10-23"
+
+  [model.specs]
+  params = "8.38B"
+  context = "32K"
+  dims = "4096, any prefix (Matryoshka)"
+  published_at = "2026-10-20"
+  published_source = "https://huggingface.co/nvidia/Nemotron-3.5-Embed-8B-BF16"
+  homepage = "https://huggingface.co/nvidia/Nemotron-3.5-Embed-8B-BF16"
+  about = "Turns text and document pages - their text or a picture of the page - into vectors in one space, for search and RAG over large document collections."
+  strengths = [
+    "Text and page pictures in one vector space · multilingual",
+    "Served closer to the full-precision model than its BF16 release, and the same vector however busy the server is",
+  ]
+  tradeoffs = [
+    "8B - about 17 GB resident; slower per input than the small embedders",
+    "Pictures are scaled to 1120 px on the long edge",
+  ]
+
+  [[model.artifact]]
+  id = "bf16"
+  kind = "weights"
+  format = "safetensors"
+  label = "Full quality"
+  quant = "BF16"
+  default = true
+  workspace = 4563402752
+
+  [model.artifact.source]
+  repo = "nvidia/Nemotron-3.5-Embed-8B-BF16"
+  base_model = "mistralai/Ministral-3-8B-Instruct-2512-BF16"
+  license_url = "https://openmdw.ai/license/1-1/"
+  revision = "781e779ee4ca9c2d2a4f38321993556baeab49a1"
+  license = "openmdw-1.1"
+
+  [model.artifact.runtime]
+  backends = ["cuda"]
+  checkpoint_dir = true
+  embedded_vision = true
+  companions = []
+  default_max_ctx = 32768
+
+  [model.artifact.shape]
+  weight_bytes = 16762986496
+  kind = "encoder"
+  vocab = 131072
+  max_ctx = 32768
+  nextn_bytes = 0
+  source = "probed"
+  kv_layers = [
+    { k_dim = 1024, v_dim = 1024, count = 34 },
+  ]
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Embed-8B-BF16/model-00001-of-00004.safetensors"
+    dest = "Nemotron-3.5-Embed-8B-BF16/model-00001-of-00004.safetensors"
+    sha256 = "ff109302de487b8f876e96df935c76c0445ee6a7d41c710e86829af0809d9f0f"
+    size = 4884098864
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Embed-8B-BF16/1_Pooling/config.json"
+    dest = "Nemotron-3.5-Embed-8B-BF16/1_Pooling/config.json"
+    sha256 = "d742ebb19220beff3a54db52f8f65db6a078b51238ccd3deb8b80dc03684056c"
+    size = 298
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Embed-8B-BF16/LICENSE"
+    dest = "Nemotron-3.5-Embed-8B-BF16/LICENSE"
+    sha256 = "5ae76a0d16eef67e28c81bfdb0b3c8687d14e9b57094090151e7541aac457ae9"
+    size = 2796
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Embed-8B-BF16/NOTICE"
+    dest = "Nemotron-3.5-Embed-8B-BF16/NOTICE"
+    sha256 = "d10a0b32690cf0f1195d12cdd8ef2205a16d7277fd3dbeb877748c87f1a6ec0f"
+    size = 1387
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Embed-8B-BF16/README.md"
+    dest = "Nemotron-3.5-Embed-8B-BF16/README.md"
+    sha256 = "d37a4c510cf95f56a1179b898cbbd7e44e8404f44e4eca692a74bef5b940fbcd"
+    size = 31059
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Embed-8B-BF16/chat_template.jinja"
+    dest = "Nemotron-3.5-Embed-8B-BF16/chat_template.jinja"
+    sha256 = "7fb10981445a4370aa951758f066ddbd1846fe26da85110f940b1433440d6c55"
+    size = 2863
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Embed-8B-BF16/config.json"
+    dest = "Nemotron-3.5-Embed-8B-BF16/config.json"
+    sha256 = "03b3e791b5c4e1f2d880394ad82d617c0406ff6b84fe134c33b0dd63efb4ab1d"
+    size = 2711
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Embed-8B-BF16/config_sentence_transformers.json"
+    dest = "Nemotron-3.5-Embed-8B-BF16/config_sentence_transformers.json"
+    sha256 = "f38c4712d0f1d622942eb62421e85b3a67a399ce439f219af90c4ae405ad1e85"
+    size = 140
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Embed-8B-BF16/model-00002-of-00004.safetensors"
+    dest = "Nemotron-3.5-Embed-8B-BF16/model-00002-of-00004.safetensors"
+    sha256 = "a1389777201608a2cf471d44621390e0e52a582b5860a2e03f845dc88266fb82"
+    size = 4932506728
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Embed-8B-BF16/model-00003-of-00004.safetensors"
+    dest = "Nemotron-3.5-Embed-8B-BF16/model-00003-of-00004.safetensors"
+    sha256 = "a13f09bade45a923e8a8802c8efa4af5c78f9d30b79cc2122193c52b21b01d3c"
+    size = 4932506744
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Embed-8B-BF16/model-00004-of-00004.safetensors"
+    dest = "Nemotron-3.5-Embed-8B-BF16/model-00004-of-00004.safetensors"
+    sha256 = "9939bcaed29ca11ef784296e2bcac01a8f3be27eaad30aec089706d66c11decc"
+    size = 2013267064
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Embed-8B-BF16/model.safetensors.index.json"
+    dest = "Nemotron-3.5-Embed-8B-BF16/model.safetensors.index.json"
+    sha256 = "c90ef3f1417422145f18579f237b0093f944dc09db8dbc147c5be646319ab146"
+    size = 50718
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Embed-8B-BF16/modules.json"
+    dest = "Nemotron-3.5-Embed-8B-BF16/modules.json"
+    sha256 = "21ddb3037a55ebf4549eb5c1dc44c3f28f10b56ec7f1335c92fd90e5b30d88ac"
+    size = 350
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Embed-8B-BF16/processor_config.json"
+    dest = "Nemotron-3.5-Embed-8B-BF16/processor_config.json"
+    sha256 = "a06f54b1cdc97ba9f114b9fa304c554ebfd2385ddbc3ffe5247d8e3782642c34"
+    size = 697
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Embed-8B-BF16/sentence_bert_config.json"
+    dest = "Nemotron-3.5-Embed-8B-BF16/sentence_bert_config.json"
+    sha256 = "4be9f1206a84977b5aba5ec02aeb9159e48df30e53296ab82419b1e438d94b8a"
+    size = 449
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Embed-8B-BF16/tokenizer.json"
+    dest = "Nemotron-3.5-Embed-8B-BF16/tokenizer.json"
+    sha256 = "b78fc125e4896d169ab6683914ba1e9515eed36a65faffa2421d4cdb3061de02"
+    size = 21525042
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Embed-8B-BF16/tokenizer_config.json"
+    dest = "Nemotron-3.5-Embed-8B-BF16/tokenizer_config.json"
+    sha256 = "384291712b80958e8c039a8c8afc318a11b0a7d7231f082381050f9a0ea6cad0"
+    size = 21263
+
 # ── rerankers ────────────────────────────────────────────────────────────────
 
 [[model]]
@@ -7924,6 +8300,186 @@ revision = "2026-08-01"
     dest = "Qwen3-Reranker-8B-GGUF/Qwen3-Reranker-8B.Q8_0.gguf"
     sha256 = "ba16c501a74929b6c9f71033420172c028b85e216f8d03bef1c9a758fbf3f71a"
     size = 8707188736
+
+# Nemotron 3.5 Rerank 8B (NVIDIA, Oct 2026): the Embed 8B graph scored -
+# one score row on the mean - over its query / document template (a
+# document may carry one picture). The relevance is the raw logit, higher
+# more relevant (the release's own head is Identity). Served like the
+# embedder; logits within 3e-5..3e-4 of the F64 reference against the
+# release's BF16 6e-4..1.1e-2. 18 files mirrored under
+# models/Nemotron-3.5-Rerank-8B-BF16/ at revision f88f8d91 - shards, index,
+# configs, tokenizer, template, model card, LICENSE, NOTICE and
+# THIRD_PARTY_NOTICES, every byte checked against the revision; its model.py
+# (the Transformers wrapper) and 2_Dense (a copy of the score row the
+# engine reads from the shards) are not mirrored. weight_bytes and workspace
+# are COMPUTED as for the embedder (+ the f32 score row); replace with a
+# measured run.
+[[model]]
+id = "nemotron-3.5-rerank-8b"
+vendor = "NVIDIA"
+display = "Nemotron 3.5 Rerank 8B"
+family = "nemotron-embed"
+capability = ["rerank"]
+license = "openmdw-1.1"
+revision = "2026-10-23"
+
+  [model.specs]
+  params = "8.38B"
+  context = "32K"
+  published_at = "2026-10-20"
+  published_source = "https://huggingface.co/nvidia/Nemotron-3.5-Rerank-8B-BF16"
+  homepage = "https://huggingface.co/nvidia/Nemotron-3.5-Rerank-8B-BF16"
+  about = "Scores how well each document - its text, a picture of the page, or both - answers a query: the precision step after a vector search."
+  strengths = [
+    "Ranks page pictures and text with the same model · multilingual",
+    "Scores served closer to the full-precision model than its BF16 release, the same at any concurrency",
+  ]
+  tradeoffs = [
+    "One picture per document; no task instruction",
+    "8B - about 17 GB resident",
+  ]
+
+  [[model.artifact]]
+  id = "bf16"
+  kind = "weights"
+  format = "safetensors"
+  label = "Full quality"
+  quant = "BF16"
+  default = true
+  workspace = 4563402752
+
+  [model.artifact.source]
+  repo = "nvidia/Nemotron-3.5-Rerank-8B-BF16"
+  base_model = "mistralai/Ministral-3-8B-Instruct-2512-BF16"
+  license_url = "https://openmdw.ai/license/1-1/"
+  revision = "f88f8d9104726747791283ab156d2fcdb29e90a7"
+  license = "openmdw-1.1"
+
+  [model.artifact.runtime]
+  backends = ["cuda"]
+  checkpoint_dir = true
+  embedded_vision = true
+  companions = []
+  default_max_ctx = 32768
+
+  [model.artifact.shape]
+  weight_bytes = 16763002880
+  kind = "encoder"
+  vocab = 131072
+  max_ctx = 32768
+  nextn_bytes = 0
+  source = "probed"
+  kv_layers = [
+    { k_dim = 1024, v_dim = 1024, count = 34 },
+  ]
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Rerank-8B-BF16/model-00001-of-00004.safetensors"
+    dest = "Nemotron-3.5-Rerank-8B-BF16/model-00001-of-00004.safetensors"
+    sha256 = "168bb9a6ed4c491909e25b74f173a2ba4cf603b8bbcf5c7a175e0ff3e4f39d2e"
+    size = 4884101488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Rerank-8B-BF16/1_Pooling/config.json"
+    dest = "Nemotron-3.5-Rerank-8B-BF16/1_Pooling/config.json"
+    sha256 = "5f8662962e40ea3b51c3f4d3a362943dfe1cda5b2046ed0e9d14276d9a7abfd8"
+    size = 86
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Rerank-8B-BF16/LICENSE"
+    dest = "Nemotron-3.5-Rerank-8B-BF16/LICENSE"
+    sha256 = "5ae76a0d16eef67e28c81bfdb0b3c8687d14e9b57094090151e7541aac457ae9"
+    size = 2796
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Rerank-8B-BF16/NOTICE"
+    dest = "Nemotron-3.5-Rerank-8B-BF16/NOTICE"
+    sha256 = "d10a0b32690cf0f1195d12cdd8ef2205a16d7277fd3dbeb877748c87f1a6ec0f"
+    size = 1387
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Rerank-8B-BF16/README.md"
+    dest = "Nemotron-3.5-Rerank-8B-BF16/README.md"
+    sha256 = "77c6e603226b58c5271bbed03c7f437962300fe7d0097110d82a34a3d3f30346"
+    size = 31206
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Rerank-8B-BF16/THIRD_PARTY_NOTICES.md"
+    dest = "Nemotron-3.5-Rerank-8B-BF16/THIRD_PARTY_NOTICES.md"
+    sha256 = "b6f5cbc23ede9725a4f8139baab72f81fd7eca06df12f1085025cd28d7bd3e39"
+    size = 35145
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Rerank-8B-BF16/chat_template.jinja"
+    dest = "Nemotron-3.5-Rerank-8B-BF16/chat_template.jinja"
+    sha256 = "f2fb4bb2c72df2255ca5b7047d8dc38842302fed3860b67ec161144cb71e39e3"
+    size = 4608
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Rerank-8B-BF16/config.json"
+    dest = "Nemotron-3.5-Rerank-8B-BF16/config.json"
+    sha256 = "e1f442a21c464cf54259e7ca2ab09f6777f50a61fbf017efed8e6044894b4303"
+    size = 3074
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Rerank-8B-BF16/config_sentence_transformers.json"
+    dest = "Nemotron-3.5-Rerank-8B-BF16/config_sentence_transformers.json"
+    sha256 = "9e040fde77575f8b68e8ad5fa518406e6ecc32cd952e97caaca355fbe5694b63"
+    size = 186
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Rerank-8B-BF16/model-00002-of-00004.safetensors"
+    dest = "Nemotron-3.5-Rerank-8B-BF16/model-00002-of-00004.safetensors"
+    sha256 = "4b29b8557a524338d5007baa42f743caabdf74530c10f1b2b164f787c5028afe"
+    size = 4932506976
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Rerank-8B-BF16/model-00003-of-00004.safetensors"
+    dest = "Nemotron-3.5-Rerank-8B-BF16/model-00003-of-00004.safetensors"
+    sha256 = "dbf35a70df816d1ccfd625c369ccfb67a129b2dcc37136d3012b3c7ce41c51e7"
+    size = 4932507000
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Rerank-8B-BF16/model-00004-of-00004.safetensors"
+    dest = "Nemotron-3.5-Rerank-8B-BF16/model-00004-of-00004.safetensors"
+    sha256 = "fd2380450420fe71b6476b95148c70bb8d4be30275d12bc8bb4d53e2285b3a48"
+    size = 2013275416
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Rerank-8B-BF16/model.safetensors.index.json"
+    dest = "Nemotron-3.5-Rerank-8B-BF16/model.safetensors.index.json"
+    sha256 = "e393acf4755990784568ec2bc8de5d67f94f36b86d056c370b090084e80ea51e"
+    size = 53969
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Rerank-8B-BF16/modules.json"
+    dest = "Nemotron-3.5-Rerank-8B-BF16/modules.json"
+    sha256 = "cceb0ad29e6528231468e23c257b40971d09223282f67983f702bcd2c58e8846"
+    size = 402
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Rerank-8B-BF16/processor_config.json"
+    dest = "Nemotron-3.5-Rerank-8B-BF16/processor_config.json"
+    sha256 = "a06f54b1cdc97ba9f114b9fa304c554ebfd2385ddbc3ffe5247d8e3782642c34"
+    size = 697
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Rerank-8B-BF16/sentence_bert_config.json"
+    dest = "Nemotron-3.5-Rerank-8B-BF16/sentence_bert_config.json"
+    sha256 = "541de51a9b42745961ca7128be0a4b884b4bc80fade8de66a9000618a2b51108"
+    size = 492
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Rerank-8B-BF16/tokenizer.json"
+    dest = "Nemotron-3.5-Rerank-8B-BF16/tokenizer.json"
+    sha256 = "541bd0794d6befaeb1c68899c51ee47ff082898ab3cd9f45b6a7edafb2d3757e"
+    size = 17077723
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Nemotron-3.5-Rerank-8B-BF16/tokenizer_config.json"
+    dest = "Nemotron-3.5-Rerank-8B-BF16/tokenizer_config.json"
+    sha256 = "384291712b80958e8c039a8c8afc318a11b0a7d7231f082381050f9a0ea6cad0"
+    size = 21263
 
 # ── decision models ──────────────────────────────────────────────────────────
 # Laya (ConvAI Innovations): ModernBERT under a trained head that scores each

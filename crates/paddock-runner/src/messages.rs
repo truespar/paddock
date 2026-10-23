@@ -565,6 +565,12 @@ fn render_prompt(
     let images = model.decode_images(image_refs)?;
     let mut msgs = chat_template::normalize_messages(&msgs);
     chat_template::strip_reasoning_close_newline(model.reasoning_close_nl, &mut msgs);
+    // the client's control-token strings render as text (content_shield):
+    // masked here, before any marker of our own goes into the messages
+    let mut shield = model.content_shield();
+    if let Some(s) = shield.as_mut() {
+        msgs.iter_mut().for_each(|m| s.mask(m));
+    }
     if let Some(marker) = model.audio_inline_marker.as_deref() {
         chat_template::inline_audio_content(&mut msgs, marker);
     }
@@ -616,9 +622,10 @@ fn render_prompt(
     // field is the only form here.
     let ocr = model.resolve_ocr(ocr_req, None, &mut msgs, &images)?;
 
-    let mut prompt = chat_template::render_with_specials(
+    let (mut prompt, shielded) = chat_template::render_shielded(
+        shield.as_mut(),
         template,
-        &msgs,
+        &mut msgs,
         tools,
         kwargs.as_ref(),
         &model.template_specials(),
@@ -645,7 +652,7 @@ fn render_prompt(
     {
         prompt.push_str(crate::parsers::G_THOUGHT_CLOSED);
     }
-    let mut prompt_ids = model.tokenizer.encode(&prompt).map_err(|e| e.to_string())?;
+    let mut prompt_ids = crate::chat::encode_chat_prompt(model, &prompt, &shielded)?;
     // BOS-leading families (gemma4): chat templates emit text only - the
     // leading BOS is the tokenizer's job, same as the raw-completions path
     if let Some(bos) = model.bos

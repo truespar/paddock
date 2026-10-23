@@ -12,7 +12,10 @@
 //! id shows up as a logit mismatch on the first forward pass.
 
 mod pre_tokenizer;
+mod prompt;
 pub mod sam3;
+
+pub use prompt::Shield;
 
 use paddock_models::gguf::{GgufFile, Value};
 use tokenizers::models::bpe::BPE;
@@ -68,6 +71,9 @@ pub struct GgufTokenizer {
     /// GGUF `tokenizer.chat_template` (Jinja), if present.
     pub chat_template: Option<String>,
     pub vocab_size: usize,
+    /// Prompt-encoding state (`prompt.rs`): the added-token index, the
+    /// shielded-text tokenizer and the piece cache, built on first use.
+    prompt: prompt::PromptState,
 }
 
 impl GgufTokenizer {
@@ -178,6 +184,7 @@ impl GgufTokenizer {
             add_bos,
             chat_template,
             vocab_size: tokens.len(),
+            prompt: Default::default(),
         })
     }
 
@@ -189,8 +196,7 @@ impl GgufTokenizer {
     /// (sot/lang/task) built by the transcription path, so `add_bos` is
     /// permanently false and no chat template exists.
     fn from_embedded_json(f: &GgufFile, json: &str) -> Result<Self, TokenizerError> {
-        let inner = Tokenizer::from_bytes(json.as_bytes())
-            .map_err(|e| TokenizerError::Library(e.to_string()))?;
+        let inner = from_json(json.as_bytes())?;
         let vocab_size = inner.get_vocab_size(true);
         let eos_id = f
             .metadata
@@ -207,6 +213,7 @@ impl GgufTokenizer {
             add_bos: false,
             chat_template: None,
             vocab_size,
+            prompt: Default::default(),
         })
     }
 
@@ -232,8 +239,7 @@ impl GgufTokenizer {
                 let path = weights_dir.join("tokenizer.json");
                 let bytes = std::fs::read(&path)
                     .map_err(|_| TokenizerError::MissingSidecar(path.display().to_string()))?;
-                let inner = Tokenizer::from_bytes(&bytes)
-                    .map_err(|e| TokenizerError::Library(e.to_string()))?;
+                let inner = from_json(&bytes)?;
                 let id_meta = |key: &str| {
                     f.metadata
                         .get(key)
@@ -258,6 +264,7 @@ impl GgufTokenizer {
                         .and_then(Value::as_str)
                         .map(str::to_owned),
                     vocab_size: get_str_array(f, "tokenizer.ggml.tokens")?.len(),
+                    prompt: Default::default(),
                 })
             }
             other => other,
@@ -283,8 +290,7 @@ impl GgufTokenizer {
         let tok_path = dir.join("tokenizer.json");
         let bytes = std::fs::read(&tok_path)
             .map_err(|_| TokenizerError::MissingSidecar(tok_path.display().to_string()))?;
-        let inner =
-            Tokenizer::from_bytes(&bytes).map_err(|e| TokenizerError::Library(e.to_string()))?;
+        let inner = from_json(&bytes)?;
 
         let json = |name: &str| -> Option<serde_json::Value> {
             serde_json::from_slice(&std::fs::read(dir.join(name)).ok()?).ok()
@@ -370,6 +376,7 @@ impl GgufTokenizer {
             add_bos,
             chat_template,
             vocab_size,
+            prompt: Default::default(),
         })
     }
 
@@ -605,6 +612,21 @@ fn build_spm_bpe(f: &GgufFile, tokens: &[&str]) -> Result<Tokenizer, TokenizerEr
     Ok(inner)
 }
 
+/// Parse a tokenizer.json with its truncation and padding switched off.
+/// Those are training-time batch settings, and `encode` applies them: a
+/// checkpoint that ships `"truncation": {"max_length": 2048}` (one of the
+/// Qwen3.8-27B NVFP4 exports does) would otherwise cut every prompt to 2048
+/// tokens without a word. Prompt length is the serving layer's to bound.
+fn from_json(bytes: &[u8]) -> Result<Tokenizer, TokenizerError> {
+    let mut inner =
+        Tokenizer::from_bytes(bytes).map_err(|e| TokenizerError::Library(e.to_string()))?;
+    inner
+        .with_truncation(None)
+        .map_err(|e| TokenizerError::Library(e.to_string()))?;
+    inner.with_padding(None);
+    Ok(inner)
+}
+
 fn build_vocab(tokens: &[&str]) -> tokenizers::models::bpe::Vocab {
     tokens
         .iter()
@@ -652,5 +674,7 @@ fn get_str_array<'a>(f: &'a GgufFile, key: &'static str) -> Result<Vec<&'a str>,
     }
 }
 
+#[cfg(test)]
+mod prompt_tests;
 #[cfg(test)]
 mod tests;

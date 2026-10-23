@@ -858,13 +858,13 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
         // iff the vocab carries the yes/no relevance tokens. The Studio's
         // Embeddings page picks its MODE from this - without it every encoder
         // read as an embedder, and a reranker landed on the wrong page.
-        "reranker": state.embedder.as_ref().map(|e| e.yes_id.is_some() && e.no_id.is_some()),
+        "reranker": state.embedder.as_ref().map(|e| e.reranks()),
         // what an /v1/embeddings item may carry beside text - EmbeddingGemma
         // 2's towers, as built (the Embeddings page offers pictures / clips
         // only when the endpoint takes them)
         "embedder_inputs": state.embedder.as_ref().map(|e| {
             let mut kinds = vec!["text"];
-            if e.image_budget.is_some() {
+            if e.takes_images() {
                 kinds.push("image");
             }
             if e.audio {
@@ -875,8 +875,25 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
             }
             kinds
         }),
-        "embedder_dimensions": state.embedder.as_ref().filter(|e| e.embedding_gemma2).map(|_| [128,256,512,768]),
-        "embedder_tasks": state.embedder.as_ref().filter(|e| e.embedding_gemma2).map(|_| ["query","document","classification","clustering","code_retrieval","fact_checking","question_answering","sentence_similarity"]),
+        "embedder_dimensions": state.embedder.as_ref().and_then(|e| {
+            if e.embedding_gemma2 {
+                Some(vec![128, 256, 512, 768])
+            } else if e.nemotron.is_some() && e.embeds() {
+                // any prefix re-normalized; the card names 1024 and 512
+                Some(vec![512, 1024, 2048, 4096])
+            } else {
+                None
+            }
+        }),
+        "embedder_tasks": state.embedder.as_ref().and_then(|e| {
+            if e.embedding_gemma2 {
+                Some(vec!["query","document","classification","clustering","code_retrieval","fact_checking","question_answering","sentence_similarity"])
+            } else if e.nemotron.is_some() && e.embeds() {
+                Some(vec!["query", "document"])
+            } else {
+                None
+            }
+        }),
         "reasoning": reasoning,
         "reasoning_levels": caps.map(|c| c.levels.clone()),
         "reasoning_default": caps.and_then(|c| c.default_level.clone()),
@@ -1421,13 +1438,14 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
     }
     if let Some(e) = &state.embedder {
         let capabilities = serde_json::json!({
-            "embeddings": true,
+            "embeddings": e.embeds(),
             // functional truth: rerank works iff the vocab carries the yes/no
-            // relevance tokens, not what the file names itself
-            "reranker": e.yes_id.is_some() && e.no_id.is_some(),
+            // relevance tokens or the model has a score head, not what the
+            // file names itself
+            "reranker": e.reranks(),
         });
         let mut inputs = vec!["text"];
-        if e.image_budget.is_some() {
+        if e.takes_images() {
             inputs.push("image");
         }
         if e.audio {
@@ -1436,18 +1454,25 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
         let architecture = serde_json::json!({
             "input_modalities": inputs,
             "output_modalities": [],
-            "modality": format!("{}->embedding", inputs.join("+")),
+            // a score-head reranker pools no vector: it answers a score
+            "modality": format!(
+                "{}->{}",
+                inputs.join("+"),
+                if e.embeds() { "embedding" } else { "score" }
+            ),
         });
         data.push(
             ModelObject::new(e.id.clone(), 0, "paddock").with_listing_meta(
                 architecture,
                 capabilities,
-                if e.embedding_gemma2 {
+                if e.embedding_gemma2 || (e.nemotron.is_some() && e.embeds()) {
                     vec![
                         "dimensions".to_owned(),
                         "encoding_format".to_owned(),
                         "task".to_owned(),
                     ]
+                } else if !e.embeds() {
+                    vec!["top_n".to_owned(), "return_documents".to_owned()]
                 } else {
                     vec!["encoding_format".to_owned()]
                 },

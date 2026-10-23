@@ -113,6 +113,29 @@ pub fn resolve_device(selector: &str) -> Result<usize, CudaError> {
     }
 }
 
+/// "name sm_XY Nsm" for device `ordinal` - the same tag
+/// `GpuExecutor::device_tag` gives a measurement that outlives the process,
+/// asked before any executor exists (the scheduler calibration's key). None
+/// without a driver or a device at that ordinal.
+pub fn device_tag(ordinal: usize) -> Option<String> {
+    if !driver_present() {
+        return None;
+    }
+    use cudarc::driver::sys::CUdevice_attribute as A;
+    let ctx = CudaContext::new(ordinal).ok()?;
+    let name = ctx.name().ok()?;
+    let major = ctx
+        .attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
+        .ok()?;
+    let minor = ctx
+        .attribute(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+        .ok()?;
+    let sms = ctx
+        .attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+        .ok()?;
+    Some(format!("{name} sm_{major}{minor} {sms}sm"))
+}
+
 impl CudaBackend {
     /// Probe device `ordinal`. Failure means "this machine can't do CUDA" -
     /// callers surface that honestly and move on (CPU backend, other devices).

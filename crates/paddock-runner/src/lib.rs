@@ -46,6 +46,8 @@ mod messages_blocks;
 pub mod messages_system;
 pub mod metrics;
 pub mod muse;
+mod nemotron_embed;
+pub mod nemotron_parse;
 mod paddle_layout;
 pub mod paddle_ocr;
 pub mod parsers;
@@ -785,6 +787,28 @@ pub async fn run(
             )?;
             tracing::info!(model = %m.id, "speech-to-text model ready");
             asr = Some(m);
+        } else if let Some(dir) = nemotron_embed::directory(path) {
+            // Nemotron 3.5 Embed / Rerank: BF16 safetensors, the Pixtral
+            // tower built unless `vision = false`; `max_ctx` caps a sequence
+            // (pictures included) at most at the checkpoint's 32768
+            let m = nemotron_embed::load(
+                cfg.served_model_name.clone().unwrap_or(id),
+                &dir,
+                &cfg.device,
+                gpu_ordinal,
+                cfg.kernel_pack.as_deref(),
+                cfg.max_ctx,
+                cfg.vram_budget.map(|mib| mib << 20),
+                cfg.vision != Some(false),
+            )?;
+            tracing::info!(
+                model = %m.id,
+                reranker = m.reranks(),
+                pictures = m.takes_images(),
+                context = m.max_input_tokens,
+                "Nemotron 3.5 retrieval model ready"
+            );
+            embedder = Some(m);
         } else if let Some(dir) = embedding_gemma2::directory(path) {
             let m = embedding_gemma2::load(
                 cfg.served_model_name.clone().unwrap_or(id),
@@ -1175,7 +1199,7 @@ pub async fn run(
     // A checkpoint trained at a fixed page size reads PDFs at it: its own
     // client renders straight to that edge, whatever the page's point size, so
     // the DPI cap that bounds odd tiny pages for everyone else is lifted too.
-    if let Some(edge) = serving.as_ref().and_then(|s| s.page_edge()) {
+    if let Some(edge) = serving.as_ref().and_then(|s| s.pdf_edge()) {
         pdf_cfg.long_edge = edge;
         pdf_cfg.max_dpi = f32::INFINITY;
     }

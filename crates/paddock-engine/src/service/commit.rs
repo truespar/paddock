@@ -239,7 +239,7 @@ mod tests {
         drop(send);
         let mut g = Masked::default();
         let metrics = Arc::new(EngineMetrics::default());
-        run_batched(&mut g, &requests, 2, 8, &metrics, &ShutdownCtl::new());
+        run_batched(&mut g, &requests, 2, 8, &metrics, &ShutdownCtl::new(), None);
         let (mut ids, mut done) = (Vec::new(), None);
         while let Ok(e) = rx.try_recv() {
             match e {

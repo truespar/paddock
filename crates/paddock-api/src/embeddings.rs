@@ -67,11 +67,14 @@ pub struct EmbeddingResponse {
 pub struct RerankRequest {
     pub model: String,
     pub query: String,
-    pub documents: Vec<String>,
+    /// Each a string, or an object: `{"text": ...}` (Cohere / Jina), or a
+    /// `{"content": [parts]}` item in the chat part shape for a reranker that
+    /// reads pictures (text and `image_url` parts).
+    pub documents: Vec<serde_json::Value>,
     /// Return only the top-N results (default: all).
     #[serde(default)]
     pub top_n: Option<usize>,
-    /// Echo each document's text back in the results.
+    /// Echo each document back in the results, as it was sent.
     #[serde(default)]
     pub return_documents: bool,
     /// Optional task instruction for the relevance judge.
@@ -84,7 +87,7 @@ pub struct RerankResult {
     pub index: usize,
     pub relevance_score: f32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub document: Option<String>,
+    pub document: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]

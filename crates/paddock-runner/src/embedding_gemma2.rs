@@ -108,6 +108,7 @@ pub(crate) fn load(
         max_input_tokens: context,
         image_budget,
         audio,
+        nemotron: None,
         metrics,
     })
 }

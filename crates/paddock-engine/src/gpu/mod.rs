@@ -66,6 +66,9 @@ mod types;
 pub use kquant::q40_to_q8_blocks;
 mod mamba;
 mod nemotron_asr;
+mod nemotron_embed;
+pub use nemotron_embed::{NE_EMB_PIC, NE_PATCH_K, NE_TILE_SHIFT, ne_attn_rows};
+mod nemotron_parse;
 pub use mamba::mamba2_keep_row;
 pub use nemotron_asr::{
     NASR_JOBS, NASR_PART_BYTES, NASR_STATE_BYTES, NasrDecoderWeights, NasrEpi, NasrJob, NasrSeg,

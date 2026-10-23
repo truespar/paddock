@@ -61,7 +61,7 @@ thiserror = "2.0.20"
 clap = { version = "4.6.6", features = ["derive"] }
 # HF's reference tokenization library - fancy-regex backend (pure Rust, supports
 # the original tokenizer.json regexes incl. (?i:) groups and lookahead)
-tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 # HTML5 character-reference decoding - SAM 3's prompt cleaning (Meta unescapes twice)
 htmlize = { version = "1.1.0", default-features = false, features = ["unescape"] }
 # Python's character model for the Laya router port (general category for
@@ -92,6 +92,8 @@ half = "2.7.1"
 # because the checksum sits on the restore hot path: it must keep up with NVMe
 # read rate.
 blake3 = "1.8.7"
+# Added-token matching for chat-prompt pieces (paddock-tokenizer prompt.rs).
+aho-corasick = "1.1.5"
 rand = "0.10.2"
 rand_chacha = "0.10.0"
 rand_core = "0.10.1"

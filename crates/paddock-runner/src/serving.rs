@@ -125,6 +125,9 @@ pub struct ServingModel {
     /// sampling row all key off this (see `crate::lighton_ocr`). Read off the
     /// file's identity, because the arch string is Qwen's.
     pub lightonocr: bool,
+    /// Nemotron 3.5 Parse is serving: its `ocr` object (document / layout),
+    /// the one-page turn rewrite and the block parse (`crate::nemotron_parse`).
+    pub nemotron_parse: bool,
     /// This model only reads documents (deepseek2-ocr, paddleocr, LightOnOCR-3): its decoder
     /// was trained to transcribe pages, and a text-only prompt is
     /// out-of-distribution - it free-runs transcription-vocabulary noise to
@@ -297,6 +300,27 @@ impl ServingModel {
         ]
     }
 
+    /// The shield for one chat request's content (`paddock_tokenizer::Shield`):
+    /// control-token strings the client sent inside messages or tools render
+    /// as text, not as turn markers. None for the document parsers, whose
+    /// published prompts put `<image>` and grounding tokens in the request
+    /// text on purpose. The media placeholders a model card writes inside
+    /// text (`<|audio|>` on granite-speech, the image/audio pads) pass
+    /// through: a stray one still meets the media-count checks downstream.
+    pub fn content_shield(&self) -> Option<paddock_tokenizer::Shield<'_>> {
+        if self.document_parser {
+            return None;
+        }
+        let pads: Vec<String> = [self.image_pad_id, self.audio_pad_id]
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.tokenizer.id_to_token(id))
+            .chain(self.audio_inline_marker.clone())
+            .collect();
+        let exempt: Vec<&str> = pads.iter().map(String::as_str).collect();
+        self.tokenizer.shield(&exempt)
+    }
+
     /// The request's template kwargs with this checkpoint's own defaults
     /// filled in under the caller's: the family table, plus LightOnOCR-3's
     /// thinking-off - its template thinks whenever `enable_thinking` is
@@ -324,6 +348,8 @@ impl ServingModel {
             Some(crate::paddle_ocr::caps_json(self.layout.is_some()))
         } else if self.lightonocr {
             Some(crate::lighton_ocr::caps_json())
+        } else if self.nemotron_parse {
+            Some(crate::nemotron_parse::caps_json())
         } else {
             None
         }
@@ -350,6 +376,16 @@ impl ServingModel {
     /// pages render to it and larger pictures are fitted down to it.
     pub fn page_edge(&self) -> Option<u32> {
         self.lightonocr.then_some(crate::lighton_ocr::PAGE_EDGE)
+    }
+
+    /// The long edge PDF pages render to, when the checkpoint fixes one. Only
+    /// LightOnOCR-3 also FITS pictures to its edge ([`Self::page_edge`]):
+    /// Nemotron 3.5 Parse resizes pictures itself with its processor's own
+    /// filter, so only its PDFs are rendered to its height cap.
+    pub fn pdf_edge(&self) -> Option<u32> {
+        self.page_edge().or(self
+            .nemotron_parse
+            .then_some(crate::nemotron_parse::PDF_EDGE))
     }
 
     /// Decode a request's image parts for this model - the shared decode,
@@ -412,6 +448,9 @@ impl ServingModel {
                 Ok(())
             };
             crate::paddle_ocr::resolve(messages, mode, images.len(), document)
+        } else if self.nemotron_parse {
+            let mode = crate::nemotron_parse::opts_from_request(top, kwargs)?;
+            crate::nemotron_parse::resolve(messages, mode, images.len())
         } else if self.lightonocr {
             let mode = crate::lighton_ocr::opts_from_request(top, kwargs)?;
             crate::lighton_ocr::resolve(messages, mode, images.len())
@@ -445,12 +484,38 @@ pub struct EmbedModel {
     pub image_budget: Option<usize>,
     /// EmbeddingGemma 2 with its audio tower built: `input_audio` parts.
     pub audio: bool,
+    /// Nemotron 3.5 Embed / Rerank: the checkpoint's template contract
+    /// (`crate::nemotron_embed`), pictures included.
+    pub nemotron: Option<crate::nemotron_embed::Family>,
     /// The encoder's memory counters, so `/api/stats` has an `engine`
     /// block on an embedding/rerank runner too. Only the memory rows are
     /// filled - an encoder emits no tokens, so tok/s and phase are
     /// honestly zero. Before an encoder lane published
     /// `"engine": null` and the Studio's memory breakdown was blank.
     pub metrics: Arc<paddock_engine::metrics::EngineMetrics>,
+}
+
+impl EmbedModel {
+    /// Whether `/v1/rerank` works: a yes/no judge's two tokens, or a score head.
+    pub fn reranks(&self) -> bool {
+        (self.yes_id.is_some() && self.no_id.is_some())
+            || self
+                .nemotron
+                .as_ref()
+                .is_some_and(|f| f.kind() == paddock_models::nemotron_embed::Kind::Rerank)
+    }
+
+    /// Whether `/v1/embeddings` works (a score-head reranker pools no vector).
+    pub fn embeds(&self) -> bool {
+        self.nemotron
+            .as_ref()
+            .is_none_or(|f| f.kind() == paddock_models::nemotron_embed::Kind::Embed)
+    }
+
+    /// Whether inputs may carry pictures.
+    pub fn takes_images(&self) -> bool {
+        self.image_budget.is_some() || self.nemotron.as_ref().is_some_and(|f| f.pictures)
+    }
 }
 
 /// A speech-to-text served model (the whisper family): serves
@@ -1696,6 +1761,7 @@ pub fn load_embedder(
         max_input_tokens: max_ctx,
         image_budget: None,
         audio: false,
+        nemotron: None,
         metrics,
     })
 }
@@ -2492,6 +2558,7 @@ pub(crate) fn load_with_residency(
         ocr: deepseek_ocr,
         paddleocr: arch == "paddleocr",
         lightonocr,
+        nemotron_parse: false,
         document_parser: deepseek_ocr || arch == "paddleocr" || lightonocr,
         layout: None,
         vocab_cache: std::sync::OnceLock::new(),
@@ -2597,6 +2664,17 @@ fn load_hf_dir(
                 .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
             "qwen35".to_owned()
         }
+        "nemotron_parse" => {
+            if device != "cuda" {
+                return Err(ServeError::Open(
+                    dir.to_path_buf(),
+                    format!("Nemotron 3.5 Parse serves on CUDA only (got {device:?})"),
+                ));
+            }
+            paddock_models::nemotron_parse::NemotronParseConfig::read(dir)
+                .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
+            crate::nemotron_parse::ARCH.to_owned()
+        }
         "nemotron_h" => {
             paddock_models::nemotron::NemotronConfig::read(dir)
                 .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
@@ -2675,12 +2753,16 @@ fn load_hf_dir(
             crate::reasoning::probe(t, dialect)
         });
     let bonsai = model_type == "prism_hadamard_qwen35";
-    let supports_vision = device == "metal"
-        && (splash
-            || bonsai
-            || small_mlx_vision
-            || matches!(arch.as_str(), "gemma4" | "muse-glimmer" | "diffusion-gemma"));
-    let image_pad_id = if supports_vision {
+    let nemotron_parse = arch == crate::nemotron_parse::ARCH;
+    let supports_vision = nemotron_parse
+        || device == "metal"
+            && (splash
+                || bonsai
+                || small_mlx_vision
+                || matches!(arch.as_str(), "gemma4" | "muse-glimmer" | "diffusion-gemma"));
+    let image_pad_id = if nemotron_parse {
+        tokenizer.token_to_id(crate::nemotron_parse::IMAGE_MARKER)
+    } else if supports_vision {
         tokenizer.token_to_id(if splash || bonsai || small_mlx_vision {
             "<|image_pad|>"
         } else if arch == "muse-glimmer" {
@@ -2752,10 +2834,79 @@ fn load_hf_dir(
         ocr: false,
         paddleocr: false,
         lightonocr,
-        document_parser: lightonocr,
+        nemotron_parse,
+        document_parser: lightonocr || nemotron_parse,
         layout: None,
         vocab_cache: std::sync::OnceLock::new(),
     })
+}
+
+/// Where this engine's scheduler calibration lives
+/// (`paddock_engine::tick_calibration`): `<data root>/calibration`, keyed by
+/// every input a step time depends on - this build, the GPU, the model and
+/// its companions (`[mmproj, drafter, fp8 planes]`), the kernel pack, batch
+/// width, context and KV format. CUDA only: the key names the GPU by its own
+/// tag. Elsewhere the scheduler learns from cold, as it always did.
+#[allow(clippy::too_many_arguments)]
+fn step_calibration(
+    arch: &str,
+    path: &Path,
+    device: &str,
+    gpu: usize,
+    pack: Option<&Path>,
+    max_ctx: usize,
+    max_batch: usize,
+    companions: [Option<&Path>; 3],
+) -> Option<paddock_engine::tick_calibration::Home> {
+    if device != "cuda" {
+        return None;
+    }
+    let gpu_tag = paddock_engine::cuda::device_tag(gpu)?;
+    // a file by name and size; a checkpoint directory by name and the sizes
+    // of its files
+    let id = |p: &Path| -> String {
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let bytes: u64 = if p.is_dir() {
+            std::fs::read_dir(p)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter_map(|e| e.metadata().ok())
+                        .filter(|m| m.is_file())
+                        .map(|m| m.len())
+                        .sum()
+                })
+                .unwrap_or(0)
+        } else {
+            std::fs::metadata(p).map_or(0, |m| m.len())
+        };
+        format!("{name} {bytes}")
+    };
+    let [mmproj, drafter, fp8] = companions.map(|p| p.map_or_else(|| "-".to_owned(), id));
+    // a pack file is rebuilt in place, so it is known by its mtime too
+    let pack = pack.map_or_else(
+        || "built-in".to_owned(),
+        |p| {
+            let mtime = std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            format!("{} {mtime}", id(p))
+        },
+    );
+    let kv = std::env::var("PADDOCK_KV_CACHE_DTYPE").unwrap_or_else(|_| "auto".to_owned());
+    let key = format!(
+        "runner {}\ndevice {gpu_tag}\narch {arch}\nmodel {}\nmmproj {mmproj}\n\
+         drafter {drafter}\nfp8 {fp8}\npack {pack}\nmax_batch {max_batch}\n\
+         max_ctx {max_ctx}\nkv {kv}",
+        paddock_admin::version::LONG,
+        id(path),
+    );
+    let dir = paddock_admin::data_root().join("calibration");
+    Some(paddock_engine::tick_calibration::Home::new(&dir, key))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2816,6 +2967,16 @@ fn build_engine(
     };
     let resident_path = path.clone();
     let resident_device = device.to_owned();
+    let calibration = step_calibration(
+        arch,
+        &path,
+        device,
+        gpu,
+        pack.as_deref(),
+        max_ctx,
+        max_batch,
+        [mmproj.as_deref(), mtp.as_deref(), fp8_native.as_deref()],
+    );
     let arch = arch.to_owned();
     let device = device.to_owned();
 
@@ -2837,24 +2998,29 @@ fn build_engine(
             mtp.clone(),
             fp8_native.clone(),
         );
-        Engine::spawn_with_metrics(max_batch, loaded_metrics.clone(), move || {
-            let mut generator = build_generator(
-                &arch,
-                &path,
-                &device,
-                gpu,
-                pack.as_deref(),
-                max_ctx,
-                max_batch,
-                mmproj.as_deref(),
-                mtp.as_deref(),
-                fp8_native.as_deref(),
-                vram_budget,
-                max_image_tokens,
-            )?;
-            generator.set_page_reader(page_reader);
-            Ok(generator)
-        })
+        Engine::spawn_with_calibration(
+            max_batch,
+            loaded_metrics.clone(),
+            calibration.clone(),
+            move || {
+                let mut generator = build_generator(
+                    &arch,
+                    &path,
+                    &device,
+                    gpu,
+                    pack.as_deref(),
+                    max_ctx,
+                    max_batch,
+                    mmproj.as_deref(),
+                    mtp.as_deref(),
+                    fp8_native.as_deref(),
+                    vram_budget,
+                    max_image_tokens,
+                )?;
+                generator.set_page_reader(page_reader);
+                Ok(generator)
+            },
+        )
     };
     if let Some(options) = residency {
         crate::generation_residency::configure(
@@ -3280,6 +3446,25 @@ fn build_generator(
                 )
                 .map_err(|e| e.to_string())?;
                 apply_kv_dtype(|d| model.set_kv_dtype(d));
+                Ok(Box::new(model) as Box<dyn Generator>)
+            }
+            "nemotron-parse" => {
+                // f16 KV is the class the F64 gate passed; fp8 is not
+                // measured on this lane yet, so a KV8 config serves f16 and
+                // says so rather than running an unvalidated class
+                let mut kv = paddock_engine::gpu::KvDtype::Fp16;
+                apply_kv_dtype(|d| kv = d);
+                if !matches!(kv, paddock_engine::gpu::KvDtype::Fp16) {
+                    tracing::warn!(
+                        "nemotron-parse: KV {kv:?} requested - serving f16 KV, the class its \
+                         oracle gate passed"
+                    );
+                    kv = paddock_engine::gpu::KvDtype::Fp16;
+                }
+                let model = paddock_engine::gpu_model::nemotron_parse::GpuNemotronParse::load_dir(
+                    exec, path, max_ctx, kv,
+                )
+                .map_err(|e| e.to_string())?;
                 Ok(Box::new(model) as Box<dyn Generator>)
             }
             "granite" => {

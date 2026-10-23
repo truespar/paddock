@@ -1351,6 +1351,13 @@ mod tests {
             let has_vision = m.artifacts.iter().any(|a| a.kind == ArtifactKind::Vision);
             let has_audio = m.artifacts.iter().any(|a| a.kind == ArtifactKind::Audio);
             let has_tower = has_vision || has_audio;
+            // A weights artifact can carry its tower inside the checkpoint
+            // (Nemotron 3.5 Parse on CUDA): no tower file to charge - its bytes
+            // are in the artifact's measured `weight_bytes` - but it takes
+            // images all the same.
+            let embedded_vision = m.weights().any(|a| {
+                a.runtime.embedded_vision && a.runtime.backends.iter().any(|b| b == "cuda")
+            });
             assert_eq!(
                 has_tower,
                 tower > 0,
@@ -1406,16 +1413,21 @@ mod tests {
                 .filter(|c| IMAGE_CAPS.contains(&c.as_str()))
                 .count();
             let generates_images = m.capability.iter().any(|c| c == "image-generation");
-            if generates_images || embeds {
+            // a reranker that reads picture documents is the embedding case
+            // again: the pictures become scores, not image chat (Nemotron 3.5
+            // Rerank, its tower embedded in the checkpoint)
+            let reranks = m.capability.iter().any(|c| c == "rerank");
+            if generates_images || embeds || reranks {
                 assert_eq!(
                     claims_images, 0,
-                    "{}: an image-generation or embedding row must not also claim image chat input",
+                    "{}: an image-generation, embedding or rerank row must not also claim image \
+                     chat input",
                     m.id
                 );
             } else {
                 assert_eq!(
                     claims_images,
-                    usize::from(has_vision),
+                    usize::from(has_vision || embedded_vision),
                     "{}: exactly one image capability ({IMAGE_CAPS:?}) goes with a vision artifact",
                     m.id
                 );

@@ -251,6 +251,16 @@ pub struct Plan {
     pub knee: bool,
 }
 
+/// What a pacer learned, for `tick_calibration`: its timed ticks (the fit
+/// is rebuilt from them) and a settled knee.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PacerSnapshot {
+    /// (rows, attention work, wall ms, deepest share's depth), oldest first
+    pub obs: Vec<(f64, f64, f64, usize)>,
+    /// a settled knee search: (full share, the share it settled on)
+    pub knee: Option<(usize, usize)>,
+}
+
 /// One tick kind's pacer: records timed ticks, keeps the fit, sizes budgets.
 #[derive(Debug, Default)]
 pub struct TickPacer {
@@ -272,6 +282,39 @@ impl TickPacer {
     /// The trusted model, if the fit has established its terms.
     pub fn model(&self) -> Option<CostModel> {
         self.model
+    }
+
+    pub fn snapshot(&self) -> PacerSnapshot {
+        let mut obs: Vec<&Obs> = self.obs.iter().collect();
+        obs.sort_by_key(|o| o.seq);
+        PacerSnapshot {
+            obs: obs
+                .iter()
+                .map(|o| (o.rows, o.attn, o.wall_ms, o.depth))
+                .collect(),
+            knee: self.knee.settled(),
+        }
+    }
+
+    /// Start from a previous run (`tick_calibration`): its ticks replay
+    /// through `record` - same stratification, same fit - so they are the
+    /// oldest in every cell and the first live ticks of a shape replace
+    /// them; a settled knee holds until its next re-check.
+    pub fn seed(&mut self, s: &PacerSnapshot) {
+        for &(rows, attn, wall_ms, depth) in &s.obs {
+            if rows >= 1.0 && wall_ms > 0.0 {
+                let wall = Duration::from_secs_f64(wall_ms / 1e3);
+                self.record(rows as usize, attn, depth, wall);
+            }
+        }
+        if let Some((full, best)) = s.knee {
+            self.knee.adopt(full, best);
+        }
+    }
+
+    /// Moves whenever the pacer learns something (tick or knee sample).
+    fn marks(&self) -> u64 {
+        self.seq + self.knee.samples()
     }
 
     /// A tick of `rows` total rows (riders + prefill) with `attn` prefill
@@ -563,6 +606,33 @@ pub(crate) struct Pacers {
 }
 
 impl Pacers {
+    pub(crate) fn snapshot(&self) -> Vec<PacerSnapshot> {
+        [&self.unified, &self.mixed, &self.spec]
+            .iter()
+            .map(|p| p.snapshot())
+            .collect()
+    }
+
+    /// Seed each kind's pacer from a previous run, in `snapshot` order.
+    pub(crate) fn seed(&mut self, s: &[PacerSnapshot]) {
+        for (p, s) in [&mut self.unified, &mut self.mixed, &mut self.spec]
+            .into_iter()
+            .zip(s)
+        {
+            p.seed(s);
+        }
+    }
+
+    /// Moves whenever any pacer learns something.
+    pub(crate) fn marks(&self) -> u64 {
+        self.unified.marks() + self.mixed.marks() + self.spec.marks()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mixed_model(&self) -> Option<CostModel> {
+        self.mixed.model()
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             unified: TickPacer::new(),
@@ -762,9 +832,29 @@ fn invert3(m: [[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
     ])
 }
 
+/// A mixed pacer warmed on the GB10 law, for other modules' tests.
 #[cfg(test)]
-mod tests {
+pub(crate) fn warm_for_tests(p: &mut Pacers) {
+    p.mixed = tests::warmed_gb10();
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
+
+    pub(super) fn warmed_gb10() -> TickPacer {
+        warmed(GB10, 180_000)
+    }
+
+    /// Two fits of the same ticks, to rounding.
+    pub(crate) fn same_fit(a: Option<CostModel>, b: Option<CostModel>) -> bool {
+        let close = |x: f64, y: f64| (x - y).abs() <= 1e-9 * x.abs().max(y.abs());
+        match (a, b) {
+            (Some(a), Some(b)) => close(a.c0, b.c0) && close(a.c1, b.c1) && close(a.c2, b.c2),
+            (None, None) => true,
+            _ => false,
+        }
+    }
 
     /// A batch wider than the knee's: the depth pacing alone.
     const WIDE: usize = KNEE_STREAMS + 1;
@@ -1193,6 +1283,39 @@ mod tests {
             .begin(TickKind::Mixed, &mut g, 2, 2, 8190, 2)
             .expect("prepare");
         assert_eq!((b, t.is_none(), g.prepared), (8190, true, 1));
+    }
+
+    /// A fresh process seeded with a warm one's ticks has the warm one's
+    /// model before its first tick, and its own ticks then take over.
+    #[test]
+    fn a_seeded_pacer_starts_with_the_saved_fit() {
+        let warm = warmed(GB10, 180_000);
+        let mut fresh = TickPacer::new();
+        fresh.seed(&warm.snapshot());
+        // the same ticks; the store's order (and so the fit's last bits) may differ
+        assert!(same_fit(fresh.model(), warm.model()), "{:?}", fresh.model());
+        assert_eq!(fresh.snapshot().obs, warm.snapshot().obs);
+        // a slower machine's live ticks replace the seeded ones cell by cell
+        let slower = CostModel {
+            c0: 150.0,
+            c1: 0.9,
+            c2: 18.0,
+        };
+        let mut k = 0u32;
+        for _ in 0..PER_CELL {
+            for &rows in &[128, 258, 398, 518, 698, 898, 1024, 1298, 1598, 2048] {
+                for depth in [0, 1500, 3000] {
+                    tick(&mut fresh, slower, rows, depth, &mut k);
+                }
+            }
+            let mut depth = 0;
+            while depth < 180_000 {
+                tick(&mut fresh, slower, 1024, depth, &mut k);
+                depth += 1024;
+            }
+        }
+        let m = fresh.model().expect("model");
+        assert!((m.c2 - slower.c2).abs() / slower.c2 < 0.05, "{m:?}");
     }
 
     #[test]

@@ -7445,9 +7445,10 @@ pub struct KernelTableV1 {
     /// Slot 681: `pd_nvf4_moe_down_part_w16` - the matching down into
     /// [rows][k + 1][embd] pre-weighted partials for `moe_slot_combine`.
     pub nvf4_moe_down_part_w16: Option<Nvf4MoeDownPartW16Fn>,
-    /// Slot 682: `pd_dense_w16` - the class's dense half: bf16 (dtype 0) or
-    /// e4m3-with-row-scale (dtype 1) weights against 16-bit activations over
-    /// rows, batch-invariant; `x16` = activations already 16-bit.
+    /// Slot 682: `pd_dense_w16` - the class's dense half: bf16 (dtype 0),
+    /// e4m3-with-row-scale (dtype 1) or f16 (dtype 2) weights against 16-bit
+    /// activations over rows, batch-invariant; `x16` = activations already
+    /// 16-bit. A pack from before dtype 2 refuses it (invalid value).
     pub dense_w16: Option<DenseW16Fn>,
     /// Slot 683: `pd_attn_rows_partial_fixed` - [`Self::attn_rows_partial`]
     /// on fixed key splits (`split_keys`, trailing): a row's partials depend
@@ -9274,6 +9275,223 @@ pub struct KernelTableV1 {
             u32,
             f32,
             u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 890: `pd_np_patch_u8` (canvas, out16, h, w, mean0..2, std0..2,
+    /// stream) - Nemotron 3.5 Parse's pixels: an RGB8 `h` x `w` canvas (both
+    /// multiples of 16) to one CLIP-normalized f16 row of 768 per 16x16 patch,
+    /// (c, ky, kx) order, patches raster over the canvas.
+    pub np_patch_u8: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            f32,
+            f32,
+            f32,
+            f32,
+            f32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 891: `pd_np_pen_argmax` (logits, seen, row_slot, extra, n_extra,
+    /// penalty, vocab, words, rows, write_back, out_ids, stream) - the HF
+    /// repetition penalty over a slot's seen-id bitmap plus `n_extra` per-row
+    /// ids (`u32::MAX` = none), then the greedy pick (lowest id on ties);
+    /// `write_back` leaves the penalized logits in place.
+    pub np_pen_argmax: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            f32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 892: `pd_np_seen_or` (seen, slots, toks, n, words, stream) - set
+    /// `toks[i]`'s bit in slot `slots[i]`'s bitmap (`words` u32 a slot).
+    pub np_seen_or: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 893: `pd_np_vit_attn` (q, k, v, out, n, n_heads, in_stride, bq,
+    /// bv, qscale, stream) - unmasked self-attention over one page's `n`
+    /// rows at head_dim 72 exactly. q/k/v rows sit `in_stride` halves apart
+    /// (the fused qkv landing reads directly); non-null `bq` makes q
+    /// `(q + bq) * qscale` at its load, non-null `bv` lands in the epilogue;
+    /// out `[row][head][72]` f16; cc 8.0+.
+    pub np_vit_attn: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 894: `pd_f16_gemm_ring` (w, x, y, bias, in_dim, out_dim, batch,
+    /// epi, stream) - the f32-landing f16 GEMM on the unsplit mma rings
+    /// only, never the GEMV band or the K-split, so a row's bits do not
+    /// depend on how many rows share the call. `epi` 0 = `y = W x`, 1 =
+    /// `y += W x + bias` (bias required); in_dim % 8 == 0.
+    pub f16_gemm_ring: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 895: `pd_f16_gemm_h_swiglu` (w, x, y, in_dim, out_dim, batch,
+    /// stream) - the f16 landing of `silu(gate) * up` off a gate|up weight
+    /// re-laid in 16-row blocks (gate rows first), y `[batch][out / 2]`; the
+    /// mma rings only, so a row's bits do not depend on the row count.
+    pub f16_gemm_h_swiglu: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 896: `pd_ne_patch_u8` (canvas, out16, h, w, m0..2, s0..2,
+    /// stream) - Nemotron 3.5 Embed's pixels: an RGB8 canvas (sides % 14) to
+    /// one f16 row of 592 (588 + zero pad) per 14x14 patch, (c, ky, kx).
+    pub ne_patch_u8: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            f32,
+            f32,
+            f32,
+            f32,
+            f32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 897: `pd_ne_rms_h` (x, w, out16, rows, d, eps, stream) - RMSNorm
+    /// of f32 rows into f16, d in {1024, 2048, 4096}.
+    pub ne_rms_h: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 898: `pd_ne_embed_rows` (src, emb, pic, out, rows, d, stream) -
+    /// bf16 embedding rows widened, or (top bit) picture rows.
+    pub ne_embed_rows: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 899: `pd_ne_rope_qk` (qkv, pos, cos, sin, rows, nh, nkv, hd,
+    /// stride, qscale, l4_beta, l4_orig, stream) - in-place rope on the q and
+    /// k heads of the fused landing, q then scaled (Llama 4's factor too).
+    pub ne_rope_qk: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            f32,
+            f32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 900: `pd_ne_attn` (qkv, cu, tiles, n_tiles, out, nh, nkv, hd,
+    /// stream) - bidirectional packed-varlen GQA attention off the fused
+    /// landing, one block a (query tile, kv head).
+    pub ne_attn: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 901: `pd_ne_pool` (x, cu, score, mean_out, out, n_seq, d, dims,
+    /// stream) - per-sequence f64 mean, then the unit vector over `dims` or
+    /// the score dot.
+    pub ne_pool: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 902: `pd_ne_add_rms_h` (x, proj, w, out16, rows, d, eps,
+    /// stream): `x += proj` over f32 rows, then (w non-null) slot 897's
+    /// RMSNorm of the updated rows into f16.
+    pub ne_add_rms_h: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            f32,
             *mut core::ffi::c_void,
         ) -> i32,
     >,
@@ -11276,7 +11494,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 875;
+pub const KERNEL_TABLE_SLOTS: usize = 888;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,

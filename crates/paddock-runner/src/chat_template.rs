@@ -36,6 +36,53 @@ pub(crate) fn family_defaults(
     Some(kwargs)
 }
 
+/// [`render_with_specials`] for a chat request whose `messages` the caller
+/// already ran through `shield.mask` (right after normalizing them, before
+/// any of our own markers go in): masks a copy of `tools` too, renders, and
+/// returns the prompt with the byte ranges the shielded strings occupy, for
+/// `GgufTokenizer::encode_prompt`. A template that altered a placeholder
+/// gets the request rendered unshielded - the old encoding, never a mangled
+/// prompt - and says so in the log.
+pub fn render_shielded(
+    shield: Option<&mut paddock_tokenizer::Shield<'_>>,
+    template: &str,
+    messages: &mut [serde_json::Value],
+    tools: Option<&[serde_json::Value]>,
+    kwargs: Option<&serde_json::Value>,
+    specials: &[(&str, String)],
+) -> Result<(String, Vec<std::ops::Range<usize>>), String> {
+    let plain = |messages: &[serde_json::Value]| {
+        render_with_specials(template, messages, tools, kwargs, specials).map(|p| (p, Vec::new()))
+    };
+    let Some(shield) = shield else {
+        return plain(messages);
+    };
+    // tools also feed the grammar compiler, so only the render sees a mask
+    let masked_tools = tools
+        .filter(|t| t.iter().any(|x| shield.finds(x)))
+        .map(|t| {
+            let mut t = t.to_vec();
+            t.iter_mut().for_each(|x| shield.mask(x));
+            t
+        });
+    if shield.masked() == 0 {
+        return plain(messages);
+    }
+    let rendered = render_with_specials(
+        template,
+        messages,
+        masked_tools.as_deref().or(tools),
+        kwargs,
+        specials,
+    )?;
+    if let Some(done) = shield.unmask(rendered) {
+        return Ok(done);
+    }
+    tracing::warn!("chat template altered a shielded placeholder; this request renders unshielded");
+    messages.iter_mut().for_each(|m| shield.restore(m));
+    plain(messages)
+}
+
 /// [`render`] with the tokenizer's special-token strings bound as template
 /// globals - `bos_token`, `eos_token` - the way transformers and llama.cpp's
 /// minja both do it. A template that writes `{{ bos_token }}` (MiniCPM5 opens
@@ -1296,6 +1343,10 @@ fn scan_tag_literals(template: &str, limit: usize) -> Vec<String> {
     }
     out
 }
+
+#[cfg(test)]
+#[path = "shield_tests.rs"]
+mod shield_tests;
 
 #[cfg(test)]
 mod tests {

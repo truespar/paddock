@@ -34,18 +34,23 @@ use commit::{commit_device_token, sample_slot_row, send_stop_masks, send_verify_
 mod finish;
 mod overlap_gate;
 use overlap_gate::pipe_min_live;
+mod admit_knobs;
+use admit_knobs::{
+    adm_max_hold_ms, adm_min_free, adm_predict_h, adm_predict_k, adm_resync, overlap_admit_max,
+};
+mod conf_census;
 #[cfg(test)]
 mod scheduler_tests;
+mod spec_budget;
+use spec_budget::{
+    async_spec_on, backend_spec_k_budget, serve_spec_k_budget, serve_spec_k_floor,
+    serve_spec_max_k, serve_spec_max_rows, serve_spec_mixed_k_cap, serve_spec_policy, slot_spec_k,
+    spec_book_mixed,
+};
 mod timing;
 pub use finish::{FinishReason, next_event};
 use timing::trace_us;
 
-/// Serving spec-decode row budget per round: total rows (1 pending + drafts
-/// per slot) must fit the models' verify-pass cap. Default 32 matches
-/// gpt-oss's SPEC_BATCH_MAX_ROWS and qwen35's alloc; backends whose verify
-/// path holds a whole wide round raise it via PADDOCK_SPEC_MAX_ROWS at load
-/// (gemma4+MTP sets 160 = 32 slots × (1+4 drafts) - the wide-batch spec
-/// rung). Read once: model load runs before the serve loop starts.
 /// Admit full-device truncation rows to the decode pipe and overlap tick.
 /// DEFAULT ON. Gotcha: a quiet-pipe in-loop draw must not call
 /// device_plan(), or the pipe ends every tick and the whole thing looks
@@ -54,246 +59,6 @@ use timing::trace_us;
 fn trunc_pipe_env() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_TRUNC_PIPE").is_none())
-}
-
-fn serve_spec_max_rows() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("PADDOCK_SPEC_MAX_ROWS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(32)
-    })
-}
-
-/// Per-slot draft-length ceiling (the round's row budget shrinks it further
-/// when many slots are active). Default 7 keeps the measured qwen35/gpt-oss
-/// behavior; gemma4+MTP raises to 15 at attach (deep chains at low live
-/// concurrency).
-fn serve_spec_max_k() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("PADDOCK_SPEC_MAX_K")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(7)
-    })
-}
-
-/// Per-round draft budget. For raised row budgets (>32: the gemma4 wide-spec
-/// path) this is TWO-TIER: prefer the half-budget round - 32 rows ride the
-/// GEMM class's single weight pass (mma_ks BN32 col-tile; 33..64 rows read
-/// weights twice) - and take the full budget only when the half-budget
-/// yields zero drafts (wide live counts, where 2x weights for k=1 still
-/// pays off). Budget <=32 keeps the classic single-tier formula
-/// (qwen35/gpt-oss behavior unchanged).
-/// Post-miss draft-depth floor: the classic rule drops k_now to the
-/// accepted length after any miss - right for weak drafters, but a
-/// ~78%/token MTP drafter spends most rounds re-climbing the ladder.
-/// Backends with strong drafters raise it (env; default 1 = classic).
-fn serve_spec_k_floor() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("PADDOCK_SPEC_K_MISS_FLOOR")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1)
-    })
-}
-
-/// draft-length cap for MIXED ticks only (chunk in flight). The wide-spec
-/// loss lives entirely in the mixed regime (a per-tick drafter prologue plus
-/// extra whole-weight-stream passes) while wide PURE rounds gain - so mixed
-/// and pure rounds get independent width policies. Default MAX = one shared
-/// policy (status quo).
-fn serve_spec_mixed_k_cap() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        paddock_models::dev_var!("PADDOCK_SPEC_MIXED_K")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(usize::MAX)
-    })
-}
-
-/// Mixed rounds book a k-independent prompt-chunk surcharge into the Auto
-/// controller's lat cells (lives 17..32 share one bucket), which drags the
-/// goodput argmax down and leaves a chunk of the PURE rounds running
-/// under-depth. Default: mixed rounds skip observe(); =1 restores the old
-/// booking.
-fn spec_book_mixed() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        paddock_models::dev_var!("PADDOCK_SPEC_BOOK_MIXED")
-            .map(|v| v != "0")
-            .unwrap_or(false)
-    })
-}
-
-/// Async spec round kill: PADDOCK_NO_ASYNC_SPEC=1 restores the
-/// synchronous drafts-then-verify sequence (the A/B surface for the
-/// chain->verify boundary elimination).
-fn async_spec_on() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_ASYNC_SPEC").is_none())
-}
-
-/// Narrow-tier 64-row boundary for live 9..=16.
-/// PADDOCK_SPEC_NARROW64=0 restores the flat 32-row pin.
-fn spec_narrow64_on() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        paddock_models::dev_var!("PADDOCK_SPEC_NARROW64")
-            .map(|v| v != "0")
-            .unwrap_or(true)
-    })
-}
-
-/// Verify-row boundary of the narrow tier's 9..=16 band (the "64" in
-/// NARROW64). Drafter-class dependent: the MTP chain measures k=3 best there
-/// (128 rows overshoot the band), while the qwen35 block drafter measures
-/// k=7 best once the >64-row GEMM wall fell, so its attach sets 128 here
-/// (PADDOCK_SPEC_NARROW_ROWS, gemma4-style env election; explicit env wins).
-/// Default 64 = every other backend unchanged.
-fn spec_narrow_rows() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("PADDOCK_SPEC_NARROW_ROWS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n| n >= 32)
-            .unwrap_or(64)
-    })
-}
-
-/// Verify-row boundary of the live <= 8 tier. Chain drafters keep the
-/// 32-row pin (k3 and k7 measure flat on the MTP chain at c8). A BLOCK
-/// drafter's round is one forward over `block` positions per slot, and at
-/// the rejection-sampling acceptance the deeper round pays all the way to
-/// the block - so the tier is `8 * block` there. PADDOCK_SPEC_LOW_ROWS
-/// pins either for the A/B.
-fn spec_low_rows(block: Option<usize>) -> usize {
-    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    let pin = *V.get_or_init(|| {
-        std::env::var("PADDOCK_SPEC_LOW_ROWS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n| n >= 16)
-    });
-    pin.unwrap_or_else(|| block.map_or(32, |b| 8 * b.max(4)))
-}
-
-fn serve_spec_k_budget(live: usize, block: Option<usize>) -> usize {
-    let b = serve_spec_max_rows();
-    let deep_live_max: usize = std::env::var("PADDOCK_SPEC_DEEP_LIVE_MAX")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0); // deep tier off by default: k15 measured worse than k7
-    let k = if b > 32 {
-        // low live: take the full budget - deep chains repay the wider round
-        // now that the 33..64-row GEMM band is pipelined (BN64-ST2), and the
-        // drafter's per-token acceptance compounds (what deep chains buy is
-        // depth, not drafter quality)
-        if live <= deep_live_max {
-            (b / live).saturating_sub(1)
-        } else {
-            // narrow tier, two-step verify-row boundary: 32 rows (the
-            // single-BN32-pass GEMM class) for live <= 8, 64 rows (the
-            // BN64-ST2 pipelined band) for 9..=16. The flat 32-row pin put
-            // live 11..16 at k=1 - a depth cliff bottoming exactly at 16
-            // slots while 17 got (b/live)-1 = 6. k=3 recovers that whole
-            // valley; k=7 overshoots the band (128 verify rows), and at
-            // c8 k3 and k7 are flat. Kill: PADDOCK_SPEC_NARROW64=0 restores
-            // the flat 32-row pin.
-            let boundary = if live <= 8 {
-                spec_low_rows(block)
-            } else if !spec_narrow64_on() {
-                32
-            } else {
-                spec_narrow_rows()
-            };
-            let narrow = if live <= 16 {
-                (boundary / live).saturating_sub(1)
-            } else {
-                0
-            };
-            if narrow >= 1 {
-                narrow
-            } else {
-                (b / live).saturating_sub(1)
-            }
-        }
-    } else {
-        (b / live).saturating_sub(1)
-    };
-    k.min(serve_spec_max_k())
-}
-
-/// The row budget's depth, as the backend qualifies it.
-///
-/// Narrowed last by whatever depth the backend has measured its drafter to be
-/// worth (`spec_depth_cap`). The row budget is a width argument and knows
-/// nothing about what a verify row costs on this board, so a backend with a
-/// measured depth curve gets the final say downward - never upward, since the
-/// rows still have to fit.
-fn backend_spec_k_budget(generator: &dyn Generator, live: usize) -> usize {
-    if live == 0 || live > generator.spec_live_cap() || generator.spec_deferred() {
-        return 0;
-    }
-    let qualified = generator
-        .spec_fixed_draft_depth()
-        .unwrap_or_else(|| serve_spec_k_budget(live, generator.spec_block_width()));
-    let qualified = generator
-        .spec_depth_cap()
-        .map_or(qualified, |cap| qualified.min(cap));
-    generator
-        .spec_batch_draft_budget(live)
-        .map_or(qualified, |cap| cap.min(qualified))
-}
-
-fn slot_spec_k(requested: usize, budget: usize, fixed_depth: Option<usize>) -> usize {
-    fixed_depth.unwrap_or(requested).min(budget)
-}
-
-#[test]
-fn fixed_block_depth_bypasses_chain_ramp_but_respects_round_budget() {
-    for requested in [0usize, 1, 2, 7, 15, 31] {
-        for budget in [0usize, 3, 7, 15, 31] {
-            assert_eq!(slot_spec_k(requested, budget, None), requested.min(budget));
-            assert_eq!(slot_spec_k(requested, budget, Some(15)), 15.min(budget));
-        }
-    }
-}
-
-/// The operator's speculation policy, from the runner's `spec` config key
-/// (threaded in as PADDOCK_SPEC). Read once - it is a serving-envelope choice,
-/// not something to re-evaluate per tick.
-///
-/// Unset = `Ladder`, i.e. exactly the behavior that predates the controller.
-/// The legacy kill switches still win outright: an operator who wrote
-/// PADDOCK_NO_SPEC meant it, and having a new key quietly outrank an existing
-/// "off" would be the worst kind of surprise.
-fn serve_spec_policy() -> SpecPolicy {
-    static V: std::sync::OnceLock<SpecPolicy> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        if std::env::var_os("PADDOCK_NO_SPEC").is_some()
-            || paddock_models::dev_var_os!("PADDOCK_NO_SERVE_SPEC").is_some()
-        {
-            return SpecPolicy::Off;
-        }
-        match std::env::var("PADDOCK_SPEC") {
-            Ok(v) => match v.parse::<SpecPolicy>() {
-                Ok(p) => p,
-                Err(e) => {
-                    // A malformed policy must not silently pick a behavior -
-                    // say so and keep the status quo (no silent failures).
-                    tracing::warn!("{e}; keeping the default ladder");
-                    SpecPolicy::Ladder
-                }
-            },
-            Err(_) => SpecPolicy::Ladder,
-        }
-    })
 }
 
 /// Prefill rows per MIXED tick (chunked prefill): each tick advances the
@@ -920,6 +685,20 @@ impl Engine {
     where
         F: FnOnce() -> Result<Box<dyn Generator>, String> + Send + 'static,
     {
+        Self::spawn_with_calibration(max_batch, metrics, None, build)
+    }
+
+    /// [`Self::spawn_with_metrics`] whose scheduler starts from, and keeps,
+    /// the step-time calibration at `calibration` (`tick_calibration`).
+    pub fn spawn_with_calibration<F>(
+        max_batch: usize,
+        metrics: Arc<EngineMetrics>,
+        calibration: Option<crate::tick_calibration::Home>,
+        build: F,
+    ) -> Result<Self, String>
+    where
+        F: FnOnce() -> Result<Box<dyn Generator>, String> + Send + 'static,
+    {
         let (tx, rx) = std::sync::mpsc::channel::<GenRequest>();
         // Ok carries the generator's vision budget (None = no tower) - the one
         // fact the outside needs from the generator itself, read on the engine
@@ -1227,7 +1006,9 @@ impl Engine {
                     if diffusion {
                         run_batched_diffusion(generator.as_mut(), &wrx, n, &metrics, &ctl);
                     } else {
-                        run_batched(generator.as_mut(), &wrx, n, vocab, &metrics, &ctl);
+                        // the warm wave runs cold graphs: it neither reads
+                        // nor writes the calibration
+                        run_batched(generator.as_mut(), &wrx, n, vocab, &metrics, &ctl, None);
                     }
                     drop(keep_rx);
                     tracing::info!(
@@ -1272,7 +1053,15 @@ impl Engine {
                     run_batched_diffusion(generator.as_mut(), &rx, cap.max(1), &metrics, &ctl);
                 } else if batched {
                     let vocab = generator.vocab();
-                    run_batched(generator.as_mut(), &rx, cap.max(1), vocab, &metrics, &ctl);
+                    run_batched(
+                        generator.as_mut(),
+                        &rx,
+                        cap.max(1),
+                        vocab,
+                        &metrics,
+                        &ctl,
+                        calibration,
+                    );
                 } else {
                     let mut mem_seen = None;
                     loop {
@@ -3213,96 +3002,6 @@ mod cohort_grace_tests {
     }
 }
 
-fn overlap_admit_max() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        paddock_models::dev_var!("PADDOCK_OVERLAP_ADMIT_MAX")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            // default off (falsified): with the pipe live, an overlapped
-            // prefill stalls decode past the 2 queued ticks and churn-shaped
-            // load loses badly. The mixed flow keeps decode rows riding the
-            // admission pass; arrivals drain the pipe instead.
-            .unwrap_or(0)
-    })
-}
-
-/// Min-free admission gate (PADDOCK_ADM_MIN_FREE=K, opt-in, default 0=off).
-/// At high concurrency the steady state staggers completions, so admissions
-/// sprinkle: ~every decode round carries a prefill chunk, and each mixed pass
-/// re-streams the touched experts' weights no matter how few prompt rows ride
-/// it. The observed fast serving mode BUNCHES refills instead.
-/// This gate holds admissions until K slots are free
-/// (or ADM_MAX_HOLD_MS passes), so a refill lands as one shared wave - the
-/// mixed-tick budget (8192 rows, 32 chunks) swallows it in a single pass.
-/// Engages only when the server has >= 2K slots; c1..c32 serving is
-/// unaffected unless explicitly armed.
-fn adm_min_free() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        paddock_models::dev_var!("PADDOCK_ADM_MIN_FREE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
-    })
-}
-
-/// Predictive admission bunching (PADDOCK_ADM_PREDICT_K, default 0 = off):
-/// under ignore_eos the per-slot remaining tokens are exact, so when fewer
-/// than K slots are free but at least K will be free within H rounds
-/// (PADDOCK_ADM_PREDICT_H), hold the refill and admit the bunch together -
-/// one shared prefill wave instead of a sprinkle. The hold self-expires (the
-/// counted slots complete within H rounds by construction), bounding the
-/// added TTFT at ~H rounds worst-case and ~zero once the cohort phase-locks
-/// (the wm3 fast-mode evidence: bunched boots ran -2.5ms/round ITL).
-fn adm_predict_k() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        paddock_models::dev_var!("PADDOCK_ADM_PREDICT_K")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
-    })
-}
-
-fn adm_predict_h() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        paddock_models::dev_var!("PADDOCK_ADM_PREDICT_H")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(16)
-    })
-}
-
-fn adm_max_hold_ms() -> u64 {
-    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        paddock_models::dev_var!("PADDOCK_ADM_MAX_HOLD_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(25)
-    })
-}
-
-/// In-leg cohort resync (PADDOCK_ADM_RESYNC=R, default 0 = off): the K=16
-/// pipe gate keeps an aligned cohort but cannot FORCE alignment from a
-/// staggered start (pipe-gate A/B: 1 lock / 6 legs, the lock born from a
-/// full-drain wave). This forces it once per leg: after the cohort first
-/// FILLS, hold the pipe poll until R slots are free, admit them as one
-/// giant wave (a manufactured drain), then fall back to K maintenance.
-/// Re-arms only when the server drains (leg boundary), so steady serving
-/// pays the hold exactly once per leg.
-fn adm_resync() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        paddock_models::dev_var!("PADDOCK_ADM_RESYNC")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
-    })
-}
-
 /// The continuous-batching scheduler. New sequences are bulk-prefilled on
 /// admission (whole prompt in one pass -> first token), then every tick runs one
 /// `forward_batch` decode step over all active sequences (weights read once for
@@ -3316,6 +3015,7 @@ fn run_batched(
     vocab: usize,
     metrics: &Arc<EngineMetrics>,
     ctl: &ShutdownCtl,
+    calibration: Option<crate::tick_calibration::Home>,
 ) {
     // live requests before background ones; reads like the channel it wraps
     let rx = &mut admission::Inbox::new(rx);
@@ -3402,12 +3102,9 @@ fn run_batched(
     let mut resync_armed = adm_resync() > 0;
     let mut resync_hold = false;
     // Device-sampled spec engages only up to this live count. 8 is the
-    // measured boundary: with the rebuilt round (ragged rounds + per-live
-    // graphs + async draft chain + qwen35's forward_mixed_spec_plans
-    // actually implemented) c4 and c8 both gain, while cap 16 measures
-    // worse than dense - the round->span serialization doesn't repay at that
-    // width. c16+ keep the fusion until the overlapped round (begin/finish
-    // split) or span riders land.
+    // default boundary (c4/c8 gain, cap 16 measured worse than dense on the
+    // rebuilt round); backends whose rounds repay at width raise it at load
+    // (gemma4, the qwen35 block drafter, qwen35 MTP on GB10: spec_width.rs).
     let dev_spec_live_max: usize = std::env::var("PADDOCK_QWEN35_SPEC_PLANS_LIVE_MAX")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -3462,6 +3159,9 @@ fn run_batched(
     let mut chunking: std::collections::HashSet<usize> = std::collections::HashSet::new();
     // time-budgeted mixed ticks at long context, every family (crate::pacing)
     let mut pacers = crate::pacing::Pacers::new();
+    // both learners start from the last run's step times, when there is one
+    // for this exact configuration (docs: crate::tick_calibration)
+    let mut calib = crate::tick_calibration::Saver::open(calibration, &mut pacers, &mut spec_ctl);
     // In-flight shared-prefix dedupe - SGLang's in-batch prefix caching in
     // the form a DeltaNet hybrid needs. A cohort that arrives together and
     // shares a prefix (one system prompt, N users; a benchmark's shared
@@ -3873,7 +3573,9 @@ fn run_batched(
         // requests freed - once, not every 250 ms wake.
         if active > 0 {
             idle_released = false;
+            calib.tick(false, &pacers, &spec_ctl);
         } else if !idle_released {
+            calib.tick(true, &pacers, &spec_ctl);
             generator.release_idle_memory();
             // and the ledger with it: it refreshes on busy passes only, so an
             // idle server would keep publishing its last busy reading
@@ -3889,8 +3591,11 @@ fn run_batched(
                             tracing::info!(
                                 "engine: shutdown requested - leaving the scheduler (idle)"
                             );
+                            calib.finish(&pacers, &spec_ctl);
                             return;
                         }
+                        // idle wakes save what the last busy stretch learned
+                        calib.tick(true, &pacers, &spec_ctl);
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                         break Err(std::sync::mpsc::RecvError);
@@ -5835,6 +5540,7 @@ fn run_batched(
                 // still run: the verify re-points cold slots' heads.)
                 let nothing_to_verify =
                     !generator.spec_capable() && reqs.iter().all(|r| r.2.len() == 1);
+                let t_host = std::time::Instant::now();
                 let res = if nothing_to_verify {
                     Ok(None)
                 } else {
@@ -5844,6 +5550,8 @@ fn run_batched(
                 let pr = generator.take_stop_pressure();
                 match res {
                     Ok(Some(picks)) => {
+                        let drafted = vec![model_drafts.is_some(); reqs.len()];
+                        conf_census::plans_round(&*generator, &drafted, &reqs, &picks, t_host);
                         let mut base = 0usize;
                         let mut accs: Vec<usize> = Vec::with_capacity(live.len());
                         for (ri, &k) in live.iter().enumerate() {
@@ -6108,8 +5816,16 @@ fn run_batched(
                         .iter()
                         .any(|&k| slots[k].as_ref().is_some_and(|s| s.sampler.in_reasoning()));
                     if async_k.is_some() && generator.supports_spec_strip() && !in_block {
+                        let t_strip = std::time::Instant::now();
                         match generator.forward_spec_batch_strip(&reqs, &plans) {
                             Ok(Some(strip)) => {
+                                conf_census::strip_round(
+                                    &*generator,
+                                    &warm,
+                                    &reqs,
+                                    &strip,
+                                    t_strip,
+                                );
                                 let mut dead: Vec<usize> = Vec::new();
                                 for (ri, &k) in live.iter().enumerate() {
                                     let sa = &strip[ri];
@@ -6370,6 +6086,7 @@ fn run_batched(
                         }
                     } else {
                         send_verify_masks(generator, &slots, &reqs);
+                        let t_plans = std::time::Instant::now();
                         let res = generator.forward_spec_batch_plans(&reqs, &plans);
                         let pr = generator.take_stop_pressure();
                         match res {
@@ -6398,6 +6115,13 @@ fn run_batched(
                                         }
                                     }
                                 }
+                                conf_census::plans_round(
+                                    &*generator,
+                                    &warm,
+                                    &reqs,
+                                    &picks,
+                                    t_plans,
+                                );
                                 let mut dead: Vec<usize> = Vec::new();
                                 let mut base = 0usize;
                                 for (ri, &k) in live.iter().enumerate() {

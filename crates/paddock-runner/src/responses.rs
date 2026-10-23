@@ -444,6 +444,12 @@ fn prepare(
     // arguments-strings -> objects, or templates drop them from history
     let mut messages = chat_template::normalize_messages(&inlined);
     chat_template::strip_reasoning_close_newline(model.reasoning_close_nl, &mut messages);
+    // the client's control-token strings render as text (content_shield):
+    // masked here, before any marker of our own goes into the messages
+    let mut shield = model.content_shield();
+    if let Some(s) = shield.as_mut() {
+        messages.iter_mut().for_each(|m| s.mask(m));
+    }
     if let Some(marker) = model.audio_inline_marker.as_deref() {
         chat_template::inline_audio_content(&mut messages, marker);
     }
@@ -576,9 +582,10 @@ fn prepare(
     // before render (see ServingModel::resolve_ocr).
     let ocr = model.resolve_ocr(req.ocr.as_ref(), kwargs.as_ref(), &mut messages, &images)?;
 
-    let prompt = chat_template::render_with_specials(
+    let (prompt, shielded) = chat_template::render_shielded(
+        shield.as_mut(),
         template,
-        &messages,
+        &mut messages,
         tools.as_deref(),
         kwargs.as_ref(),
         &model.template_specials(),
@@ -591,7 +598,7 @@ fn prepare(
     let think_budget = budget_req
         .map(|n| crate::chat::think_budget(model, n, thinking_open, "reasoning.max_tokens"))
         .transpose()?;
-    let mut prompt_ids = model.tokenizer.encode(&prompt).map_err(|e| e.to_string())?;
+    let mut prompt_ids = crate::chat::encode_chat_prompt(model, &prompt, &shielded)?;
     // BOS-leading families (gemma4): chat templates emit text only - the
     // leading BOS is the tokenizer's job, same as the raw-completions path
     if let Some(bos) = model.bos

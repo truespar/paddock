@@ -1843,12 +1843,13 @@ impl GpuQwen35 {
             }
         }
         self.stage_spec_rows(&pos, &slots)?;
+        self.ensure_draft_conf(b)?; // the census planes, before any capture
         if paddock_models::dev_var_os!("PADDOCK_SPEC_NOGRAPH").is_some() {
             self.record_spec_draft()?; // eager A/B path - identical launches
         } else {
-            // the draft chain's shape keys on live alone (it unrolls n_draft
-            // steps regardless of the ROUND's ragged k1) - constant second key
-            let live = (b, 0usize);
+            // the draft chain's shape keys on live and the steps this round
+            // verifies (`chain_steps`), never on its ragged per-slot chunks
+            let live = (b, self.chain_steps());
             if !self
                 .spec_batch
                 .as_ref()
@@ -1936,7 +1937,7 @@ impl GpuQwen35 {
         // (see SpecBatchState::chain_depth).
         let (b, k) = {
             let sb = self.spec_batch.as_ref().expect("spec batch");
-            (sb.batch, sb.chain_depth)
+            (sb.batch, self.chain_steps())
         };
         for i in 0..k {
             {
@@ -1992,7 +1993,16 @@ impl GpuQwen35 {
                         b,
                     )?;
                 }
-                exec.argmax_rows(&sb.d_logits_chunk, &mut sb.d_mtp_tok, b, vocab)?;
+                let (logits, conf) = (&sb.d_logits_chunk, self.draft_conf.as_mut());
+                super::spec_conf::pick_draft_step(
+                    &exec,
+                    conf,
+                    logits,
+                    &mut sb.d_mtp_tok,
+                    i,
+                    b,
+                    vocab,
+                )?;
                 exec.copy_region(&sb.d_mtp_tok, 0, &mut sb.d_draft, i * b, b)?;
             }
         }
@@ -3483,6 +3493,7 @@ impl GpuQwen35 {
         // (rows chain_depth..n_draft of d_draft are never written then)
         let n_draft = self.spec_batch.as_ref().expect("spec batch").chain_depth;
         let k1 = n_draft + 1;
+        self.chain_run = n_draft;
 
         // prefill each slot, then warm its MTP KV while sc.d_h still holds the
         // slot's prompt h rows; pending_h starts zeroed for fresh sequences
@@ -3643,56 +3654,6 @@ impl GpuQwen35 {
     pub(super) fn spec_snapshot_verify(&self) -> bool {
         paddock_models::dev_var_os!("PADDOCK_QWEN35_SPEC_SNAPSHOT").is_some()
             || !self.exec.has_gated_delta_commit_walk()
-    }
-
-    /// Draft-state live preference fed to the width sizer (which degrades
-    /// live before width under VRAM pressure - the election here is a CAP,
-    /// not a reservation). Drafter-conditional (rung B): 32 with a
-    /// block drafter attached - the batched round + 64-row budget make
-    /// width drafting pay (b32r64: c16 856 / c32 913 vs dense 838) and the
-    /// snapshot-free verify prices 32 rows at ~1.45 GiB on 27B. MTP-only
-    /// lanes (qwen3.5-9b, qwen3.6) keep 8: their chain at width measured
-    /// worse than dense (cap-16 A/B, service.rs:1850 history) and no width
-    /// re-measurement exists for them - raise only with evidence.
-    /// Widths at which speculation is allowed to engage at all.
-    ///
-    /// A drafter attaching used to raise this to 32 unconditionally. On sm_100
-    /// that was worth two board cells, because **every threshold in this
-    /// chain had been elected spec-vs-spec** - `dflash_live_max` went
-    /// 1 -> 8 -> 32 on arguments that only ever beat the other spec arm.
-    /// Nothing in the policy ever compared speculating against not
-    /// speculating, and on a die where speculation always won that omission
-    /// was free.
-    ///
-    /// It is not free here. qwen3.8 nvfp4 on B200, our spec against our own
-    /// no-spec, with the spec path as fast as it has ever been:
-    ///
-    ///   c1 2.84x  c4 2.17x  c8 1.57x  |  c16 0.45x  c32 0.44x  imax 0.39x
-    ///
-    /// The crossover sits between c8 and c16 and it is not close on either
-    /// side. Capping there roughly DOUBLES wide-batch throughput - by
-    /// declining to speculate, not by making speculation faster.
-    ///
-    /// Die-aware rather than a blanket flip: sm_120 is measured at 32
-    /// and its target decode is ~3x slower, so the verify tick still amortises
-    /// there. The honest version of this is an election that MEASURES spec
-    /// against no-spec per width instead of carrying a constant per die; this
-    /// default is the interim, and the fact that it had to be measured on each
-    /// die separately is the whole lesson.
-    pub(super) fn serve_spec_live_max(&self) -> usize {
-        paddock_models::dev_var!("PADDOCK_QWEN35_SPEC_LIVE_MAX")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| {
-                if self.dflash.is_none() {
-                    return 8;
-                }
-                if self.exec.compute_capability().0 == 12 {
-                    32
-                } else {
-                    8
-                }
-            })
     }
 
     /// Hybrid drafter threshold: DFlash2 rounds at live <= this, the MTP
@@ -3998,22 +3959,6 @@ impl GpuQwen35 {
         ran
     }
 
-    /// Per-round post-miss k floor for the service controller. DFlash2
-    /// drafts its whole block in one forward - depth is nearly free, and the
-    /// classic post-miss rule made it spend most rounds re-climbing (the
-    /// measured cross-leg k death-spiral, c4 457 -> 159). The MTP chain pays
-    /// per depth, so it keeps the classic floor. Answered by which drafter
-    /// actually ran (spec_round_dflash), replacing the attach-time
-    /// PADDOCK_SPEC_K_MISS_FLOOR env default that pinned floor 7 on MTP
-    /// rounds too (measured as the attached-serve residual: c4 290 vs 361).
-    pub fn spec_k_miss_floor_mtp(&self) -> Option<usize> {
-        if self.spec_round_dflash {
-            self.dflash.as_ref().map(|d| d.block - 1)
-        } else {
-            None
-        }
-    }
-
     /// Serving draft hook: MTP drafts for the live slots (must be contiguous
     /// 0..n and warm). None = the service falls back to its n-gram drafter.
     pub fn spec_draft_batch_mtp(
@@ -4109,6 +4054,7 @@ impl GpuQwen35 {
             }
         }
         self.stage_spec_tables()?;
+        self.chain_run = k_use;
         let drafts = self.mtp_draft_b(&last)?; // i-major [n_draft, n]
         if dbg {
             tracing::info!(
@@ -4283,33 +4229,10 @@ impl GpuQwen35 {
         }
         self.stage_spec_tables()?;
         let last: Vec<u32> = pendings.iter().map(|&(_, t)| t).collect();
+        self.chain_run = k_use;
         self.mtp_draft_launch(&last)?;
         self.spec_chain = Some((slots, k_use));
         Ok(Some((k_use, vec![true; n])))
-    }
-
-    /// Read the armed chain's draft plane without disarming (drivers call
-    /// this post-verify - the picks readback already synced the stream, so
-    /// this is a cheap device->host copy of n_draft×n u32).
-    fn spec_chain_peek(&self) -> Result<Vec<Vec<u32>>, GpuModelError> {
-        let (slots, k_use) = self.spec_chain.as_ref().expect("armed chain");
-        let n = slots.len();
-        let sb = self.spec_batch.as_ref().expect("spec batch");
-        let flat = self.exec.to_host_u32(&sb.d_draft)?;
-        Ok((0..n)
-            .map(|b| (0..*k_use).map(|i| flat[i * n + b]).collect())
-            .collect())
-    }
-
-    /// Async draft chain, phase 2: the armed chain's drafts in pendings
-    /// order; disarms. `Ok(None)` when nothing is armed.
-    pub fn spec_draft_fetch_mtp(&mut self) -> Result<Option<Vec<Vec<u32>>>, GpuModelError> {
-        if self.spec_chain.is_none() {
-            return Ok(None);
-        }
-        let out = self.spec_chain_peek()?;
-        self.spec_chain = None;
-        Ok(Some(out))
     }
 
     /// The plans round's eligibility - the single source of truth, shared by

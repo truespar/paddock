@@ -2031,6 +2031,19 @@ static const KernelTableV1 PD_KERNELS = {
     pd_f8_gemm_tc5x_tsw,
     pd_rmsnorm_e4m3_row_xn,
     pd_add_rmsnorm_e4m3_row_xn,
+    pd_np_patch_u8,
+    pd_np_pen_argmax,
+    pd_np_seen_or,
+    pd_np_vit_attn,
+    pd_f16_gemm_ring,
+    pd_f16_gemm_h_swiglu,
+    pd_ne_patch_u8,
+    pd_ne_rms_h,
+    pd_ne_embed_rows,
+    pd_ne_rope_qk,
+    pd_ne_attn,
+    pd_ne_pool,
+    pd_ne_add_rms_h,
 };
 
 PD_EXPORT const PackInfo* paddock_pack_info(void) {

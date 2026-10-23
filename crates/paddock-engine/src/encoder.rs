@@ -28,9 +28,12 @@ pub enum EncodeJob {
         dimensions: Option<usize>,
         reply: oneshot::Sender<Result<Vec<Vec<f32>>, String>>,
     },
-    /// Relevance scores (P(yes) at the last position), one per input sequence.
+    /// Relevance scores, one per input sequence: P(yes) at the last
+    /// position for a yes/no judge, the score head's logit for a backend
+    /// with one (`media` as [`Self::Embed`]'s - a picture document).
     Rerank {
         seqs: Vec<Vec<u32>>,
+        media: Vec<Vec<crate::service::MmChunk>>,
         yes: u32,
         no: u32,
         reply: oneshot::Sender<Result<Vec<f32>, String>>,
@@ -438,6 +441,7 @@ impl Encoder {
                         }
                         EncodeJob::Rerank {
                             seqs,
+                            media,
                             yes,
                             no,
                             reply,
@@ -445,11 +449,11 @@ impl Encoder {
                             if reply.is_closed() {
                                 continue;
                             }
-                            if let Err(e) = model.validate(&seqs) {
+                            if let Err(e) = model.validate_media(&seqs, &media) {
                                 let _ = reply.send(Err(e));
                                 continue;
                             }
-                            let mut parts = vec![(seqs, reply)];
+                            let mut parts = vec![(seqs, media, reply)];
                             let mut rows: usize = parts[0].0.iter().map(Vec::len).sum();
                             // same free-while-busy merge window as the embed arm
                             while rows < coalesce_row_budget {
@@ -482,6 +486,7 @@ impl Encoder {
                                     // only merge jobs scoring the same head pair
                                     Some(EncodeJob::Rerank {
                                         seqs,
+                                        media,
                                         yes: y2,
                                         no: n2,
                                         reply,
@@ -489,7 +494,7 @@ impl Encoder {
                                         if reply.is_closed() {
                                             continue;
                                         }
-                                        if let Err(e) = model.validate(&seqs) {
+                                        if let Err(e) = model.validate_media(&seqs, &media) {
                                             let _ = reply.send(Err(e));
                                             continue;
                                         }
@@ -497,6 +502,7 @@ impl Encoder {
                                         if extra > coalesce_row_budget.saturating_sub(rows) {
                                             pending.push_back(EncodeJob::Rerank {
                                                 seqs,
+                                                media,
                                                 yes,
                                                 no,
                                                 reply,
@@ -504,7 +510,7 @@ impl Encoder {
                                             break;
                                         }
                                         rows += seqs.iter().map(Vec::len).sum::<usize>();
-                                        parts.push((seqs, reply));
+                                        parts.push((seqs, media, reply));
                                     }
                                     Some(other) => {
                                         pending.push_back(other);
@@ -517,15 +523,15 @@ impl Encoder {
                             // burst split - see the embed arm
                             let free = lanes.saturating_sub(inflight.len()).max(1);
                             let ways = free.min(parts.len());
-                            let halves: Vec<Vec<(Vec<Vec<u32>>, _)>> = if ways >= 2 {
+                            let halves: Vec<Vec<(Vec<Vec<u32>>, _, _)>> = if ways >= 2 {
                                 let total: usize = parts
                                     .iter()
-                                    .map(|(s, _)| s.iter().map(Vec::len).sum::<usize>())
+                                    .map(|(s, _, _)| s.iter().map(Vec::len).sum::<usize>())
                                     .sum();
                                 let mut out = Vec::with_capacity(ways);
                                 let mut acc = 0usize;
                                 let mut taken = 0usize;
-                                let mut cur: Vec<(Vec<Vec<u32>>, _)> = Vec::new();
+                                let mut cur: Vec<(Vec<Vec<u32>>, _, _)> = Vec::new();
                                 let n_parts = parts.len();
                                 for (i, part) in parts.into_iter().enumerate() {
                                     acc += part.0.iter().map(Vec::len).sum::<usize>();
@@ -547,10 +553,14 @@ impl Encoder {
                                 vec![parts]
                             };
                             for parts in halves {
-                                let all: Vec<Vec<u32>> =
-                                    parts.iter().flat_map(|(s, _)| s.iter().cloned()).collect();
-                                let counts: Vec<(usize, _)> =
-                                    parts.into_iter().map(|(s, r)| (s.len(), r)).collect();
+                                let mut all: Vec<Vec<u32>> = Vec::new();
+                                let mut all_media = Vec::new();
+                                let mut counts: Vec<(usize, _)> = Vec::with_capacity(parts.len());
+                                for (s, m, r) in parts {
+                                    counts.push((s.len(), r));
+                                    all.extend(s);
+                                    all_media.extend(m);
+                                }
                                 if inflight.len() >= cap {
                                     let inf = inflight.pop_front().expect("front");
                                     collect(&mut model, inf);
@@ -565,7 +575,7 @@ impl Encoder {
                                         inflight.len()
                                     );
                                 }
-                                match model.rerank_submit(&all, yes, no, lane) {
+                                match model.rerank_submit_media(&all, &all_media, yes, no, lane) {
                                     Ok(p) => {
                                         inflight.push_back(Inflight::Rerank(p, yes, no, counts))
                                     }
@@ -796,10 +806,28 @@ impl Encoder {
 
     /// Score a batch of query-document sequences (yes/no relevance judge).
     pub async fn rerank(&self, seqs: Vec<Vec<u32>>, yes: u32, no: u32) -> Result<Vec<f32>, String> {
+        let media = seqs.iter().map(|_| Vec::new()).collect();
+        self.rerank_media(seqs, media, yes, no).await
+    }
+
+    /// [`Self::rerank`] with pictures: `media[i]` fills sequence i's picture
+    /// placeholders in order. Only a backend with a tower accepts any; a
+    /// score-head backend ignores `yes` / `no`.
+    pub async fn rerank_media(
+        &self,
+        seqs: Vec<Vec<u32>>,
+        media: Vec<Vec<crate::service::MmChunk>>,
+        yes: u32,
+        no: u32,
+    ) -> Result<Vec<f32>, String> {
+        if media.len() != seqs.len() {
+            return Err("one media list per sequence".into());
+        }
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(EncodeJob::Rerank {
                 seqs,
+                media,
                 yes,
                 no,
                 reply,

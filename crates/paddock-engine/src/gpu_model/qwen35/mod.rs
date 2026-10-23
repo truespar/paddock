@@ -43,6 +43,8 @@ mod prefix;
 mod rotation;
 mod span;
 mod spec;
+mod spec_conf;
+mod spec_width;
 pub mod vision;
 
 pub(crate) use ops::*;
@@ -1786,6 +1788,10 @@ pub struct GpuQwen35 {
     /// synced) to run accept/commit on real values; the service's
     /// spec_draft_fetch then returns the same values and disarms.
     spec_chain: Option<(Vec<u32>, usize)>,
+    /// The confidence census's planes (`spec_conf.rs`; dev, off by default).
+    draft_conf: Option<spec_conf::DraftConf>,
+    /// Depth the next draft-chain launch records (`chain_steps`).
+    chain_run: usize,
     /// Scheduler hint: whether prefill should eagerly warm the MTP draft head.
     /// The service turns this off when the live count exceeds the spec live
     /// cap - those slots would pay the warm pass (~1/41 of prefill) yet

@@ -353,6 +353,25 @@ pub struct SpecController {
     decisions: u64,
     /// Round-robin cursor for the neighbour probe.
     probe: usize,
+    /// Rounds observed (a learning mark for the calibration file).
+    observed: u64,
+}
+
+/// What the controller learned, for `tick_calibration`: the measured
+/// latency cells and the acceptance evidence. Latency is the machine's;
+/// acceptance is the workload's too, and it keeps decaying under live
+/// rounds exactly as it does within a process.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpecSnapshot {
+    /// (bucket, k, seconds, samples) of every measured cell; samples capped
+    /// at the warm count - all a seed needs to know is that the cell is warm
+    pub lat: Vec<(usize, usize, f64, u32)>,
+    /// per bucket: draft coverage (estimate, weight)
+    pub cov: Vec<(f64, f64)>,
+    pub tri: Vec<f64>,
+    pub hit: Vec<f64>,
+    pub acc_tokens: f64,
+    pub acc_stops: f64,
 }
 
 /// Drafts and accepts booked during one tick, across every slot on it.
@@ -427,7 +446,68 @@ impl SpecController {
             cov: vec![(1.0, 0.0); BUCKETS.len()],
             decisions: 0,
             probe: 0,
+            observed: 0,
         }
+    }
+
+    /// None unless this controller learns (`auto`) and has measured a cell.
+    pub fn snapshot(&self) -> Option<SpecSnapshot> {
+        if !self.policy.is_closed_loop() {
+            return None;
+        }
+        let mut lat = Vec::new();
+        for (b, row) in self.lat.iter().enumerate() {
+            for (k, c) in row.iter().enumerate() {
+                if c.n > 0 && c.t > 0.0 {
+                    lat.push((b, k, c.t, c.n.min(WARM_SAMPLES)));
+                }
+            }
+        }
+        if lat.is_empty() {
+            return None;
+        }
+        Some(SpecSnapshot {
+            lat,
+            cov: self.cov.clone(),
+            tri: self.tri.to_vec(),
+            hit: self.hit.to_vec(),
+            acc_tokens: self.acc_tokens,
+            acc_stops: self.acc_stops,
+        })
+    }
+
+    /// Start from a previous run (`tick_calibration`). A cell seeded warm is
+    /// trusted at once - no anchor rounds - and its EWMA then tracks this
+    /// run's rounds; the acceptance evidence decays under them as usual.
+    /// Shapes that do not fit this controller's tables are skipped.
+    pub fn seed(&mut self, s: &SpecSnapshot) {
+        if !self.policy.is_closed_loop() {
+            return;
+        }
+        for &(b, k, t, n) in &s.lat {
+            if let Some(c) = self.lat.get_mut(b).and_then(|row| row.get_mut(k))
+                && t > 0.0
+            {
+                *c = Cell {
+                    t,
+                    n: n.min(WARM_SAMPLES),
+                };
+            }
+        }
+        if s.cov.len() == self.cov.len() {
+            self.cov.clone_from(&s.cov);
+        }
+        if s.tri.len() == self.tri.len() && s.hit.len() == self.hit.len() {
+            self.tri.copy_from_slice(&s.tri);
+            self.hit.copy_from_slice(&s.hit);
+            self.acc_tokens = s.acc_tokens;
+            self.acc_stops = s.acc_stops;
+        }
+    }
+
+    /// Moves whenever the controller learns something.
+    pub(crate) fn marks(&self) -> u64 {
+        self.observed
     }
 
     pub fn policy(&self) -> SpecPolicy {
@@ -667,6 +747,7 @@ impl SpecController {
             return;
         }
         let b = bucket_of(live);
+        self.observed += 1;
         self.lat[b][k.min(MAX_K)].observe(secs);
         // Draft coverage for this bucket (see `cov`). Only speculative rounds
         // carry the signal - a k=0 tick drafts nothing by definition and would
@@ -755,9 +836,45 @@ pub(crate) fn spec_pos_census(drafted: usize, accepted: usize) {
     }
 }
 
+/// An `auto` controller with warm cells at one width, for other modules'
+/// tests.
+#[cfg(test)]
+pub(crate) fn warm_for_tests(c: &mut SpecController) {
+    for _ in 0..8 {
+        for k in [0usize, 2, 4, 7] {
+            c.observe(4, k, 0.025 + 0.002 * k as f64, RoundTally::one(k, k / 2));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A seeded controller trusts its warm cells at once: the anchor
+    /// rounds a cold width runs are skipped.
+    #[test]
+    fn a_seeded_controller_skips_the_anchor_rounds() {
+        let mut warm = SpecController::new(SpecPolicy::Auto);
+        warm_for_tests(&mut warm);
+        let snap = warm.snapshot().expect("warm cells");
+        let mut cold = SpecController::new(SpecPolicy::Auto);
+        // a cold bucket opens with its anchors: k=0 first
+        assert_eq!(cold.pick_k(4, 7), 0);
+        let mut seeded = SpecController::new(SpecPolicy::Auto);
+        seeded.seed(&snap);
+        assert_eq!(seeded.snapshot(), Some(snap));
+        assert_eq!(
+            seeded.pick_k(4, 7),
+            warm.pick_k(4, 7),
+            "the warm argmax at once"
+        );
+        // the ladder learns nothing and seeds nothing
+        let mut ladder = SpecController::new(SpecPolicy::Ladder);
+        assert!(ladder.snapshot().is_none());
+        ladder.seed(&warm.snapshot().expect("warm"));
+        assert!(ladder.snapshot().is_none());
+    }
 
     #[test]
     fn policy_parses_the_three_shapes() {

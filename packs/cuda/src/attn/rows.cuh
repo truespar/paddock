@@ -32,7 +32,7 @@
 // position (the causal tail can empty a short last split) writes m = -inf,
 // l = 0, o = 0, which the combine folds as nothing.
 template <uint32_t TILE, uint32_t NXQ, uint32_t NXP, bool PAGED,
-          typename KVT = __half>
+          typename KVT = __half, uint32_t HD = 128u>
 __global__ void __launch_bounds__(256) pd_attn_rows_kernel(
     const float* __restrict__ q, const KVT* __restrict__ kc,
     const KVT* __restrict__ vc, float* __restrict__ out_o,
@@ -43,7 +43,7 @@ __global__ void __launch_bounds__(256) pd_attn_rows_kernel(
     uint32_t n_rows, uint32_t n_splits, uint32_t window, float scale,
     uint32_t split_keys) {
 #if PD_FA_OK
-    constexpr uint32_t HD = 128u;
+    static_assert(HD == 64u || HD == 128u, "head dims the launcher instantiates");
     constexpr bool F8 = sizeof(KVT) == 1u;
     constexpr uint32_t NT = TILE / 8u;        // score n8 tiles per K/V tile
     constexpr uint32_t row_e = HD + 8u;       // +8-half row pad (bank law)
@@ -399,9 +399,9 @@ __global__ void __launch_bounds__(256) pd_attn_rows_kernel(
 
 // The rows partial over `n_groups` groups (`groups` = [n_groups][2] u32 of
 // (first row, rows <= 8), every group's rows one slot's and consecutive in
-// the q plane). hd128, G <= 16. `paged` = the block-table pool (f16 or
+// the q plane). hd 128 or 64 (Nemotron 3.5 Parse's decoder), G <= 16. `paged` = the block-table pool (f16 or
 // e4m3); otherwise a dense f16 cache [slots, max_ctx, kv_dim] (the drafter's).
-// Partials: out_o [n_heads, n_rows, n_splits, 128], out_ml [..., 2], for the
+// Partials: out_o [n_heads, n_rows, n_splits, head_dim], out_ml [..., 2], for the
 // batch combine at `batch = n_rows`. `window` 0 = full attention.
 static int pd_attn_rows_partial_go(const void* q, const void* kc, const void* vc,
                                    void* out_o, void* out_ml, const void* positions,
@@ -414,29 +414,38 @@ static int pd_attn_rows_partial_go(const void* q, const void* kc, const void* vc
                                    uint32_t kv_dtype, uint32_t paged, uint32_t split_keys,
                                    void* stream) {
     if (n_groups == 0 || n_rows == 0) return 0;
-    if (head_dim != 128u || n_kv_heads == 0 || n_heads % n_kv_heads != 0
+    if ((head_dim != 128u && head_dim != 64u) || n_kv_heads == 0 || n_heads % n_kv_heads != 0
         || n_heads / n_kv_heads > 16u || n_splits == 0)
         return cudaErrorInvalidValue;
     if (!paged && kv_dtype != PD_KV_FP16) return cudaErrorInvalidValue;
     constexpr uint32_t TILE = 32u;
     // the pow2 law's sizes are powers of two from 256 - always whole tiles
     if (!(split_keys & 0x80000000u) && split_keys % TILE != 0u) return cudaErrorInvalidValue;
-    const uint32_t smem = 2u * 2u * TILE * (128u + 8u) * 2u;   // 34,816 B
+    // two stages of K and V tiles at the padded row: 34,816 B at hd 128, 18,432 at 64
+    const uint32_t smem = 2u * 2u * TILE * (head_dim + 8u) * 2u;
     const dim3 grid(n_kv_heads, n_groups, n_splits);
     const cudaStream_t st = (cudaStream_t)stream;
-#define PD_ROWS_GO(PG, KT)                                                         \
-    pd_attn_rows_kernel<TILE, 2u, 3u, PG, KT><<<grid, 256, smem, st>>>(            \
+#define PD_ROWS_GO(PG, KT, H)                                                      \
+    pd_attn_rows_kernel<TILE, 2u, 3u, PG, KT, H><<<grid, 256, smem, st>>>(         \
         (const float*)q, (const KT*)kc, (const KT*)vc, (float*)out_o,             \
         (float*)out_ml, (const unsigned int*)positions,                           \
         (const unsigned int*)slots, (const uint32_t*)groups,                      \
         (const uint32_t*)block_tables, blocks_per_slot, max_ctx, n_heads,         \
         n_kv_heads, kv_dim, n_rows, n_splits, window, scale, split_keys)
-    if (!paged)
-        PD_ROWS_GO(false, __half);
-    else if (kv_dtype == PD_KV_FP8_E4M3)
-        PD_ROWS_GO(true, __nv_fp8_e4m3);
+#define PD_ROWS_KV(H)                                                              \
+    do {                                                                           \
+        if (!paged)                                                                \
+            PD_ROWS_GO(false, __half, H);                                          \
+        else if (kv_dtype == PD_KV_FP8_E4M3)                                       \
+            PD_ROWS_GO(true, __nv_fp8_e4m3, H);                                    \
+        else                                                                       \
+            PD_ROWS_GO(true, __half, H);                                           \
+    } while (0)
+    if (head_dim == 64u)
+        PD_ROWS_KV(64u);
     else
-        PD_ROWS_GO(true, __half);
+        PD_ROWS_KV(128u);
+#undef PD_ROWS_KV
 #undef PD_ROWS_GO
     return pd_launch_status();
 }
@@ -445,7 +454,7 @@ static int pd_attn_rows_partial_go(const void* q, const void* kc, const void* vc
 // (first row, rows <= 8), every group's rows one slot's and consecutive in
 // the q plane). hd128, G <= 16. `paged` = the block-table pool (f16 or
 // e4m3); otherwise a dense f16 cache [slots, max_ctx, kv_dim] (the drafter's).
-// Partials: out_o [n_heads, n_rows, n_splits, 128], out_ml [..., 2], for the
+// Partials: out_o [n_heads, n_rows, n_splits, head_dim], out_ml [..., 2], for the
 // batch combine at `batch = n_rows`. `window` 0 = full attention.
 PD_EXPORT
 int pd_attn_rows_partial(const void* q, const void* kc, const void* vc,

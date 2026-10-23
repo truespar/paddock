@@ -25,10 +25,12 @@
 // each of its two rows: CW = 64 for bf16, 128 for e4m3 (64 when K is not a
 // multiple of 128 - a property of the plane, not of the call).
 //
-// Classes: bf16 weights x bf16 activations (mma f32.bf16.bf16), and e4m3
-// weights widened exactly to f16 (cvt.f16x2.e4m3x2) x f16 activations (mma
+// Classes: bf16 weights x bf16 activations (mma f32.bf16.bf16), e4m3 weights
+// widened exactly to f16 (cvt.f16x2.e4m3x2) x f16 activations (mma
 // f32.f16.f16) - f16 carries three more mantissa bits than bf16, and the FP8
-// planes here (the mamba in/out projections) read rms-normed inputs. The f32
+// planes here (the mamba in/out projections) read rms-normed inputs - and f16
+// weights x f16 activations on the same mma (Nemotron 3.5 Parse's decoder,
+// whose F32 masters land as f16), loaded like the bf16 plane. The f32
 // activations convert in-kernel (round to nearest), so no cast launch rides
 // each projection.
 //
@@ -137,8 +139,10 @@ __device__ __forceinline__ void pd_dw16_regs(const PdDw16Run& r, uint32_t (&w)[C
 // one chunk against the CTA's live n8 columns: token n*8 + g (a dead column
 // past the last live row reads that row and is never stored). X16: the
 // activations arrive already 16-bit (the same round-to-nearest cast, done once
-// for a wide call); otherwise f32, cast here.
-template <bool E4M3, bool X16, uint32_t CW, uint32_t NT>
+// for a wide call); otherwise f32, cast here. E4M3 picks the weight bytes
+// (e4m3, widened in registers, or 16-bit as stored); F16 the mma class and the
+// activations' 16-bit type (f16, or bf16).
+template <bool E4M3, bool F16, bool X16, uint32_t CW, uint32_t NT>
 __device__ __forceinline__ void pd_dw16_chunk(float (&acc)[NT][4], const PdDw16Run& rg,
                                               const PdDw16Run& rh, uint32_t k0, uint32_t g,
                                               uint32_t nt, uint32_t nv, const void* x,
@@ -164,15 +168,15 @@ __device__ __forceinline__ void pd_dw16_chunk(float (&acc)[NT][4], const PdDw16R
 #pragma unroll
             for (uint32_t i = 0; i < NR / 2u; ++i) {
                 const float4 f = xp[i];
-                b[2u * i] = pd_dw16_pack<E4M3>(f.x, f.y);
-                b[2u * i + 1u] = pd_dw16_pack<E4M3>(f.z, f.w);
+                b[2u * i] = pd_dw16_pack<F16>(f.x, f.y);
+                b[2u * i + 1u] = pd_dw16_pack<F16>(f.z, f.w);
             }
         }
 #pragma unroll
         for (uint32_t s = 0; s < CW / 16u; ++s) {
             const uint32_t a[4] = {wg[2u * s], wh[2u * s], wg[2u * s + 1u], wh[2u * s + 1u]};
             const uint32_t bb[2] = {b[2u * s], b[2u * s + 1u]};
-            if constexpr (E4M3) pd_dw16_mma_f16(acc[n], a, bb);
+            if constexpr (F16) pd_dw16_mma_f16(acc[n], a, bb);
             else pd_dw16_mma_bf16(acc[n], a, bb);
         }
     }
@@ -185,7 +189,7 @@ __device__ __forceinline__ void pd_dw16_chunk(float (&acc)[NT][4], const PdDw16R
 // [out][in], output per PdDw16Out. Launched as a programmatic dependent: the
 // first chunks' weight loads (no predecessor's output) issue before the wait,
 // the activations after it; the release fires once the walk's loads are out.
-template <bool E4M3, bool X16, uint32_t CW, uint32_t NT>
+template <bool E4M3, bool F16, bool X16, uint32_t CW, uint32_t NT>
 __global__ void __launch_bounds__(PD_DW16_WARPS * 32u) pd_dense_w16_kernel(
     const uint8_t* __restrict__ w, const float* __restrict__ rscale,
     const void* __restrict__ x, PdDw16Out out, uint32_t in_dim, uint32_t out_dim,
@@ -217,16 +221,16 @@ __global__ void __launch_bounds__(PD_DW16_WARPS * 32u) pd_dense_w16_kernel(
         const PdDw16Run cg0 = g0, ch0 = h0;
         g0 = pd_dw16_load<E4M3, CW>(rg, c + 2u * KW, tq, lg && c + 2u * KW < nks);
         h0 = pd_dw16_load<E4M3, CW>(rh, c + 2u * KW, tq, lh && c + 2u * KW < nks);
-        pd_dw16_chunk<E4M3, X16, CW, NT>(acc, cg0, ch0, c * CW + (CW / 4u) * tq, g, nt, nv,
+        pd_dw16_chunk<E4M3, F16, X16, CW, NT>(acc, cg0, ch0, c * CW + (CW / 4u) * tq, g, nt, nv,
                                          xb, in_dim);
         const PdDw16Run cg1 = g1, ch1 = h1;
         g1 = pd_dw16_load<E4M3, CW>(rg, c + 3u * KW, tq, lg && c + 3u * KW < nks);
         h1 = pd_dw16_load<E4M3, CW>(rh, c + 3u * KW, tq, lh && c + 3u * KW < nks);
-        pd_dw16_chunk<E4M3, X16, CW, NT>(acc, cg1, ch1, (c + KW) * CW + (CW / 4u) * tq, g, nt,
+        pd_dw16_chunk<E4M3, F16, X16, CW, NT>(acc, cg1, ch1, (c + KW) * CW + (CW / 4u) * tq, g, nt,
                                          nv, xb, in_dim);
     }
     if (c < nks)
-        pd_dw16_chunk<E4M3, X16, CW, NT>(acc, g0, h0, c * CW + (CW / 4u) * tq, g, nt, nv, xb,
+        pd_dw16_chunk<E4M3, F16, X16, CW, NT>(acc, g0, h0, c * CW + (CW / 4u) * tq, g, nt, nv, xb,
                                          in_dim);
     PD_PDL_RELEASE();
     // fold the eight K parts in warp order: ((warp 0 + 1) + 2) + ... + 7
@@ -270,34 +274,50 @@ static int pd_dense_w16_go(const void* w, const void* rscale, const void* x,
                            const PdDw16Out& out, uint32_t in_dim, uint32_t out_dim,
                            uint32_t rows, uint32_t dtype, uint32_t x16, void* stream) {
     // columns per CTA by the call's rows - which columns share a CTA, never
-    // a column's arithmetic
-    const uint32_t nt = rows <= 8u ? 1u : (rows <= 16u ? 2u : 4u);
+    // a column's arithmetic. The f16 class (Parse's verify rounds: 2 rows a
+    // slot, 64 at 32 slots) also takes 64 columns, so a 64-row call streams
+    // its plane once instead of once per 32-column block; the bf16 / e4m3
+    // elections stay as they were measured.
+    const uint32_t nt = rows <= 8u ? 1u
+                      : rows <= 16u ? 2u
+                      : (rows <= 32u || dtype != 2u) ? 4u : 8u;
     dim3 grid((out_dim + 15u) / 16u, (rows + 8u * nt - 1u) / (8u * nt));
     const cudaStream_t st = (cudaStream_t)stream;
     const bool cw128 = dtype == 1u && (in_dim & 127u) == 0u;
-#define PD_DW16_GO(E, X, CW, NT)                                                           \
-    pd_pdl_go(pd_dense_w16_kernel<E, X, CW, NT>, grid, PD_DW16_WARPS * 32u, 0u, st,         \
+#define PD_DW16_GO(E, F, X, CW, NT)                                                        \
+    pd_pdl_go(pd_dense_w16_kernel<E, F, X, CW, NT>, grid, PD_DW16_WARPS * 32u, 0u, st,      \
               (const uint8_t*)w, (const float*)rscale, x, out, in_dim, out_dim, rows)
-#define PD_DW16_NT(E, X, CW)                                                               \
+#define PD_DW16_NT(E, F, X, CW)                                                            \
     do {                                                                                   \
-        if (nt == 1u) PD_DW16_GO(E, X, CW, 1u);                                            \
-        else if (nt == 2u) PD_DW16_GO(E, X, CW, 2u);                                       \
-        else PD_DW16_GO(E, X, CW, 4u);                                                     \
+        if (nt == 1u) PD_DW16_GO(E, F, X, CW, 1u);                                         \
+        else if (nt == 2u) PD_DW16_GO(E, F, X, CW, 2u);                                    \
+        else PD_DW16_GO(E, F, X, CW, 4u);                                                  \
+    } while (0)
+#define PD_DW16_NT8(E, F, X, CW)                                                           \
+    do {                                                                                   \
+        if (nt == 8u) PD_DW16_GO(E, F, X, CW, 8u);                                         \
+        else PD_DW16_NT(E, F, X, CW);                                                      \
     } while (0)
     if (dtype == 1u) {
-        if (cw128) { if (x16) PD_DW16_NT(true, true, 128u); else PD_DW16_NT(true, false, 128u); }
-        else { if (x16) PD_DW16_NT(true, true, 64u); else PD_DW16_NT(true, false, 64u); }
+        if (cw128) {
+            if (x16) PD_DW16_NT(true, true, true, 128u); else PD_DW16_NT(true, true, false, 128u);
+        } else {
+            if (x16) PD_DW16_NT(true, true, true, 64u); else PD_DW16_NT(true, true, false, 64u);
+        }
+    } else if (dtype == 2u) {
+        if (x16) PD_DW16_NT8(false, true, true, 64u); else PD_DW16_NT8(false, true, false, 64u);
     } else {
-        if (x16) PD_DW16_NT(false, true, 64u); else PD_DW16_NT(false, false, 64u);
+        if (x16) PD_DW16_NT(false, false, true, 64u); else PD_DW16_NT(false, false, false, 64u);
     }
+#undef PD_DW16_NT8
 #undef PD_DW16_NT
 #undef PD_DW16_GO
     return pd_launch_status();
 }
 
 // ABI 682. `dtype` 0 = bf16 weights x bf16 activations, 1 = e4m3 weights
-// (widened to f16) x f16 activations with a per-output-row f32 scale
-// (`rscale` nullable for bf16). `x16` 0 = x is f32 [rows][in_dim] (cast in the
+// (widened to f16) x f16 activations with a per-output-row f32 scale, 2 = f16
+// weights x f16 activations (`rscale` nullable for the 16-bit planes). `x16` 0 = x is f32 [rows][in_dim] (cast in the
 // kernel), 1 = x is already the class's 16-bit type (bf16 / f16 - the
 // convert_f32_{bf16,f16} of the same rows, which rounds identically). K % 64
 // == 0; any out_dim (rows past it neither load nor store); x rows past `rows`
@@ -307,7 +327,7 @@ int pd_dense_w16(const void* w, const void* rscale, const void* x, void* y,
                  uint32_t in_dim, uint32_t out_dim, uint32_t rows, uint32_t y_stride,
                  uint32_t dtype, uint32_t x16, void* stream) {
     if (out_dim == 0 || rows == 0) return 0;
-    if ((in_dim & 63u) != 0 || dtype > 1u || x16 > 1u || y_stride < out_dim)
+    if ((in_dim & 63u) != 0 || dtype > 2u || x16 > 1u || y_stride < out_dim)
         return cudaErrorInvalidValue;
     const PdDw16Out out = {{(float*)y, nullptr, nullptr},
                            {0u, UINT32_MAX, UINT32_MAX},
@@ -326,7 +346,7 @@ int pd_dense_w16_seg(const void* w, const void* rscale, const void* x, void* y0,
                      void* y2, uint32_t n0, uint32_t n1, uint32_t in_dim, uint32_t out_dim,
                      uint32_t rows, uint32_t dtype, uint32_t x16, void* stream) {
     if (out_dim == 0 || rows == 0) return 0;
-    if ((in_dim & 63u) != 0 || dtype > 1u || x16 > 1u || n0 == 0u || n0 > out_dim ||
+    if ((in_dim & 63u) != 0 || dtype > 2u || x16 > 1u || n0 == 0u || n0 > out_dim ||
         n1 > out_dim - n0 || y0 == nullptr || (n1 && y1 == nullptr) ||
         (n0 + n1 < out_dim && y2 == nullptr))
         return cudaErrorInvalidValue;

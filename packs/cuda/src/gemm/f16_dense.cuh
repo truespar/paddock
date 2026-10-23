@@ -265,6 +265,12 @@ __device__ __forceinline__ void pd_f16_mma(float d[4], const uint32_t a[4],
 // hybrid encoder's conv-BN-SiLU seams (PP-DocLayoutV3), x * sigmoid(x) as
 // torch spells it, x / (1 + exp(-x)) with the accurate exp.
 #define PD_F16_EPI_SILU 10u
+// SWIGLU (H16): f16(silu(gate) * up), the gated-SiLU FFN of the Mistral /
+// Pixtral line (`act_fn(gate_proj(x)) * up_proj(x)`), off GEGLU_G4's 16-row
+// block re-lay (gate rows 0-7, up rows 8-15 of each block). silu is x / (1 +
+// exp(-x)) with the accurate exp, as torch spells it; the two [N][F] f32
+// planes never land.
+#define PD_F16_EPI_SWIGLU 11u
 __device__ __forceinline__ float pd_f16_gelu_tanhf(float v) {
     return 0.5f * v * (1.0f + tanhf(0.79788456080286535587989211986876f * v
                                     * (1.0f + 0.044715f * v * v)));
@@ -273,6 +279,9 @@ __device__ __forceinline__ float pd_f16_geglu_g4(float g, float u) {
     float gelu = 0.5f * g * (1.0f + tanhf(0.79788456080286535587989211986876f * g
                                           * (1.0f + 0.044715f * g * g)));
     return gelu * u;
+}
+__device__ __forceinline__ float pd_f16_swiglu(float g, float u) {
+    return g / (1.0f + expf(-g)) * u;
 }
 __device__ __forceinline__ float pd_f16_gelu_erf(float v) {
     return 0.5f * v * (1.0f + erff(v * 0.70710678118654752440084436210484f));
@@ -709,6 +718,16 @@ __global__ void __launch_bounds__(NWARP * 32) pd_f16_gemm_mma_kernel(
                         const uint32_t f = ((r0 >> 4) << 3) + (r0 & 7u);
                         if (c0 < N) o16[(size_t)c0 * F + f] = __float2half(pd_f16_geglu_g4(v00, v10));
                         if (c1 < N) o16[(size_t)c1 * F + f] = __float2half(pd_f16_geglu_g4(v01, v11));
+                    }
+                    continue;
+                }
+                if (EPI == PD_F16_EPI_SWIGLU) {
+                    // v0x = gate feature f, v1x = its up
+                    if (r0 < M) {
+                        const uint32_t F = M >> 1;
+                        const uint32_t f = ((r0 >> 4) << 3) + (r0 & 7u);
+                        if (c0 < N) o16[(size_t)c0 * F + f] = __float2half(pd_f16_swiglu(v00, v10));
+                        if (c1 < N) o16[(size_t)c1 * F + f] = __float2half(pd_f16_swiglu(v01, v11));
                     }
                     continue;
                 }
@@ -2464,10 +2483,31 @@ static bool pd_f16_blk_gb10() {
     return on != 0;
 }
 
-// weight tiles a grid.z group walks: nwt (one group, the plain raster) or
-// PD_F16_BLK_GW, per the rule above on cc 12.1, PD_F16_BLK_GW elsewhere
-static uint32_t pd_f16_blk_gw(uint32_t nwt, uint32_t out_dim, uint32_t batch) {
-    if (pd_f16_blk_gb10() && out_dim <= batch) return nwt;
+// Past the L2 the rule above inverts. "Keep the smaller plane resident" was
+// swept on vision towers whose weight planes all fit the 24 MB L2 (<= 8 MiB);
+// once the weight plane is bigger the plain raster cannot keep it - it
+// re-streams the whole plane for every activation-tile row - while a group
+// of weight tiles stays resident and the activation plane streams once a
+// group. Swept on Nemotron 3.5 Embed's 8B body (K 4096 / 14336, planes
+// 33-235 MB) at 8192 and 32768 rows and its Pixtral tower (a 16 MB gate|up)
+// at 4640 / 13920 rows, every arm bit-equal: groups of 8 run 40-43 TMAC/s on
+// every body plane against 34-36 for groups of 4 and ~11 for the plain raster
+// (q|k|v and gate|up took plain at 8192 / 32768 rows under the old rule:
+// 3.5-4x), and the tower's gate|up 30.0 against plain's 18.3 and 4's 24.6.
+// Wider than 8 loses again (per body layer, groups of 12 / 16 / 24 / 32:
+// +2-4 / +10-12 / +18-19 / +37-44%).
+#define PD_F16_BLK_GW_WIDE 8u
+#define PD_F16_BLK_RESIDENT (8ull << 20)  // bytes: the swept towers' largest plane
+
+// weight tiles a grid.z group walks: nwt (one group, the plain raster) or a
+// group width, per the rules above on cc 12.1, PD_F16_BLK_GW elsewhere
+static uint32_t pd_f16_blk_gw(uint32_t nwt, uint32_t out_dim, uint32_t batch,
+                              uint32_t in_dim) {
+    if (pd_f16_blk_gb10()) {
+        if ((uint64_t)out_dim * in_dim * 2u > PD_F16_BLK_RESIDENT)
+            return nwt < PD_F16_BLK_GW_WIDE ? nwt : PD_F16_BLK_GW_WIDE;
+        if (out_dim <= batch) return nwt;
+    }
     return nwt < PD_F16_BLK_GW ? nwt : PD_F16_BLK_GW;
 }
 
@@ -2488,6 +2528,41 @@ static bool pd_f16_mma_blocked_elect(unsigned int out_dim, unsigned int batch) {
     return blocks2d >= (uint32_t)nsm;
 }
 
+// The deep-K tuple on cc 12.1: four warps of 64 x 64 (a third fewer ldmatrix
+// a mma than eight of 64 x 32) with the B fragments loaded two groups an
+// ldmatrix.x4 and double-buffered (FRAG 3), same three swizzled stages - two
+// blocks an SM still. Swept (bench/f16_wide_sweep, bit-equal): the 8B
+// body's down projection (K 14336) at 8192 / 32768 rows 36.2 -> 41.0 / 41.6
+// TMAC/s; at 2048 rows and at K 4096 the eight-warp tuple ties or wins
+// (q|k|v 43.5 against 41.8 at 8192 rows), so only deep K at wide batch takes it.
+static bool pd_f16_blk_deep(uint32_t in_dim, uint32_t batch) {
+    return pd_f16_blk_gb10() && in_dim >= 8192u && batch >= 4096u;
+}
+
+template <bool H16, uint32_t EPI>
+static int pd_f16_mma_blocked_deep(const __half* w, const __half* x, void* y, float beta,
+                                   unsigned in_dim, unsigned out_dim, unsigned batch,
+                                   cudaStream_t st, const float* bias) {
+    constexpr uint32_t BM = 128u, BN = 128u, NW = 4u, ST = 3u, KT = 32u, RG = 4u, CG = 8u;
+    constexpr unsigned smem = 2u * ST * (BM + BN) * KT;
+    static bool set = false;
+    if (!set) {
+        cudaFuncSetAttribute(
+                pd_f16_gemm_mma_kernel<BM, BN, NW, ST, KT, RG, CG, false, H16, EPI, true, true,
+                                       false, 3u>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        set = true;
+    }
+    const uint32_t nwt = (out_dim + BM - 1u) / BM, nxt = (batch + BN - 1u) / BN;
+    const uint32_t gw = pd_f16_blk_gw(nwt, out_dim, batch, in_dim);
+    const uint32_t nwg = (nwt + gw - 1u) / gw;
+    dim3 grid(gw, nxt, nwg);
+    pd_f16_gemm_mma_kernel<BM, BN, NW, ST, KT, RG, CG, false, H16, EPI, true, true, false, 3u>
+            <<<grid, NW * 32u, smem, st>>>(w, x, reinterpret_cast<float*>(y), beta, in_dim,
+                                           out_dim, batch, nullptr, 0u, gw, nxt, nwg, bias);
+    return (int)cudaGetLastError();
+}
+
 template <bool H16, uint32_t EPI = 0u, bool CONV3 = false>
 static int pd_f16_mma_blocked(const __half* w, const __half* x, void* y, float beta,
                               unsigned in_dim, unsigned out_dim, unsigned batch,
@@ -2495,6 +2570,11 @@ static int pd_f16_mma_blocked(const __half* w, const __half* x, void* y, float b
                               PdF16Conv3 cv = {0u, 0u, 0u, 0u, 1u},
                               PdF16Qkv qv = {nullptr, nullptr, nullptr, nullptr, nullptr, 0u, 0u,
                                              1.0f}) {
+    if constexpr (!CONV3 && EPI != PD_F16_EPI_QKV) {
+        if (pd_f16_blk_deep(in_dim, batch))
+            return pd_f16_mma_blocked_deep<H16, EPI>(w, x, y, beta, in_dim, out_dim, batch, st,
+                                                     bias);
+    }
     // three swizzled stages, one barrier a K-step (see above): 48 KB a block
     constexpr uint32_t BM = 128u, BN = 128u, NW = 8u, ST = 3u, KT = 32u, RG = 4u, CG = 4u;
     constexpr unsigned smem = 2u * ST * (BM + BN) * KT;  // bytes, no row pad
@@ -2507,7 +2587,7 @@ static int pd_f16_mma_blocked(const __half* w, const __half* x, void* y, float b
         set = true;
     }
     const uint32_t nwt = (out_dim + BM - 1u) / BM, nxt = (batch + BN - 1u) / BN;
-    const uint32_t gw = pd_f16_blk_gw(nwt, out_dim, batch);
+    const uint32_t gw = pd_f16_blk_gw(nwt, out_dim, batch, in_dim);
     const uint32_t nwg = (nwt + gw - 1u) / gw;
     dim3 grid(gw, nxt, nwg);
     pd_f16_gemm_mma_kernel<BM, BN, NW, ST, KT, RG, CG, false, H16, EPI, true, true, CONV3>
@@ -3650,6 +3730,70 @@ PD_EXPORT int pd_f16_gemm_bias_res(const void* w, const void* x, void* y, const 
     return pd_add_bias_res(y, scratch, bias, batch, out_dim, stream);
 }
 
+// 894: the f32-landing GEMM on the mma rings only - never the GEMV band and
+// never the K-split - so a row's bits do not move with the row count of the
+// call it rides in. Every unsplit ring walks one output's K in the same order:
+// the rows-invariance probe (GB10 2026-10-22) found the 64x64,
+// 128x128, ring2 and blocked rings bit-identical to each other at every row
+// count from 1 to 4096, while the elected pd_f16_gemm moved rows at <= 8 (the
+// GEMV band) and up to 64 (the K-split). A batch-invariant prefill (a prompt
+// row's projection the same whether its chunk is 3 rows or 3000, alone or
+// beside another request's rows) takes this entry; the ring election stays
+// by shape, the class does not. epi 0 = y = W x, 1 = y += W x + bias
+// (pd_add_bias_res's order). in_dim % 8 == 0; portable rings only (no
+// tcgen05 arm), so the same bits on every die it runs on.
+template <uint32_t BM, uint32_t BN, uint32_t NW, uint32_t ST, uint32_t KT, uint32_t RG,
+          uint32_t CG, bool SWZ, uint32_t EPI>
+static int pd_f16_ring_go(const __half* w, const __half* x, float* y, unsigned in_dim,
+                          unsigned out_dim, unsigned batch, cudaStream_t st, const float* bias) {
+    constexpr uint32_t KPAD = SWZ ? KT : KT + 8u;
+    constexpr unsigned smem = 2u * ST * (BM + BN) * KPAD;  // bytes
+    static bool set = false;
+    if (!set) {
+        cudaFuncSetAttribute(
+                pd_f16_gemm_mma_kernel<BM, BN, NW, ST, KT, RG, CG, false, false, EPI, SWZ>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        set = true;
+    }
+    dim3 grid((out_dim + BM - 1u) / BM, (batch + BN - 1u) / BN);
+    pd_f16_gemm_mma_kernel<BM, BN, NW, ST, KT, RG, CG, false, false, EPI, SWZ>
+            <<<grid, NW * 32u, smem, st>>>(w, x, y, 0.0f, in_dim, out_dim, batch, nullptr, 0u,
+                                           0u, 0u, 1u, bias);
+    return (int)cudaGetLastError();
+}
+
+template <uint32_t EPI>
+static int pd_f16_gemm_ring_route(const __half* w, const __half* x, float* y, const float* bias,
+                                  unsigned in_dim, unsigned out_dim, unsigned batch,
+                                  cudaStream_t st) {
+    if (!pd_f16_mma_wide_tile(out_dim, batch))
+        return pd_f16_ring_go<64u, 64u, 8u, 3u, 32u, 2u, 2u, false, EPI>(w, x, y, in_dim, out_dim,
+                                                                       batch, st, bias);
+    if (pd_f16_mma_blocked_elect(out_dim, batch))
+        return pd_f16_mma_blocked<false, EPI>(w, x, y, 0.0f, in_dim, out_dim, batch, st, bias);
+    if (pd_f16_mma_ring2_elect(out_dim, batch))
+        return pd_f16_ring_go<128u, 128u, 8u, 2u, 32u, 4u, 4u, true, EPI>(w, x, y, in_dim,
+                                                                        out_dim, batch, st, bias);
+    return pd_f16_ring_go<128u, 128u, 8u, 3u, 32u, 4u, 4u, false, EPI>(w, x, y, in_dim, out_dim,
+                                                                     batch, st, bias);
+}
+
+PD_EXPORT int pd_f16_gemm_ring(const void* w, const void* x, void* y, const void* bias,
+                               unsigned int in_dim, unsigned int out_dim, unsigned int batch,
+                               unsigned int epi, void* stream) {
+    if (out_dim == 0u || batch == 0u) return 0;
+    if ((in_dim & 7u) != 0u || epi > 1u || (epi == 1u && bias == nullptr))
+        return (int)cudaErrorInvalidValue;
+    const __half* W = (const __half*)w;
+    const __half* X = (const __half*)x;
+    float* Y = (float*)y;
+    const cudaStream_t st = (cudaStream_t)stream;
+    if (epi == 1u)
+        return pd_f16_gemm_ring_route<PD_F16_EPI_BIAS_RES>(W, X, Y, (const float*)bias, in_dim,
+                                                           out_dim, batch, st);
+    return pd_f16_gemm_ring_route<PD_F16_EPI_NONE>(W, X, Y, nullptr, in_dim, out_dim, batch, st);
+}
+
 // 775: a 3x3 / stride 1 / pad 1 convolution as one GEMM with the im2row
 // gathered in the stage (CONV3 above): src is [chips][src_chip_rows][C]
 // halves (rows >= H*W), w is [out_dim][9 C] tap-major (pd_dp_im2row3's
@@ -3749,6 +3893,18 @@ PD_EXPORT int pd_f16_gemm_h_geglu_g4(const void* w, const void* x, void* y,
                                       unsigned int batch, void* stream) {
     if ((out_dim & 15u) != 0u) return (int)cudaErrorInvalidValue;
     return pd_f16_gemm_h_route<PD_F16_EPI_GEGLU_G4>(w, x, y, nullptr, in_dim, out_dim, batch, stream);
+}
+
+// 895: the gated-SiLU landing - y is [batch][out_dim / 2] halves, silu(gate) *
+// up per feature off a weight re-laid in 16-row blocks, gate rows first (826's
+// layout). out_dim a multiple of 16. The route is 618's - the mma rings only,
+// never the GEMV band or the K-split - so a row's bits do not depend on the
+// call's row count.
+PD_EXPORT int pd_f16_gemm_h_swiglu(const void* w, const void* x, void* y,
+                                    unsigned int in_dim, unsigned int out_dim,
+                                    unsigned int batch, void* stream) {
+    if ((out_dim & 15u) != 0u) return (int)cudaErrorInvalidValue;
+    return pd_f16_gemm_h_route<PD_F16_EPI_SWIGLU>(w, x, y, nullptr, in_dim, out_dim, batch, stream);
 }
 
 // 1 when the f16 landing is this device's elected wide-batch route, 0 when the

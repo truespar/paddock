@@ -117,4 +117,6 @@
 #include "src/embedding_gemma2_audio.cuh"  // EmbeddingGemma 2 audio tower: log-mel frontend, conv subsampling, the clipped Conformer's seams, chunked rel-pos attention, light conv (needs f32_qkv's pd_launch_status)
 #include "src/gemma4v.cuh"  // Gemma 4 vision tower fused glue: device patchify, pos + norm, head norms + 2-D rope (angle table once a picture), post + next norm, GEGLU, pooled tail (bit-identical to the unfused chain; needs abi pd_df + elementwise PD_ACC_*)
 #include "src/gemma4u.cuh"  // Gemma 4 12B's encoder-free media embedders: picture patches + LayerNorm, the post-projection norms, audio frames + RMS (needs abi pd_df, f32_qkv's pd_launch_status)
+#include "src/nemotron_parse.cuh"  // Nemotron 3.5 Parse: rectangular u8 patch stem, the checkpoint's repetition penalty + greedy pick on device, seen-id bitmaps (needs f32_qkv's pd_launch_status)
+#include "src/nemotron_embed.cuh"  // Nemotron 3.5 Embed / Rerank 8B: Pixtral patch stem, RMSNorm into f16, token|picture row gather, in-place rope + q scale, packed GQA attention, mean pool + unit vector / score head (needs decode_spec's pd_fa_mma16, f32_qkv's pd_launch_status)
 #include "src/exports.cuh"

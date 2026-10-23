@@ -28,6 +28,8 @@ pub mod mlx;
 pub mod modelopt;
 pub mod nemotron;
 pub mod nemotron_asr;
+pub mod nemotron_embed;
+pub mod nemotron_parse;
 pub mod probe;
 pub mod qwen4exp;
 pub mod safetensors;
