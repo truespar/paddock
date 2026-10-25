@@ -1,40 +1,45 @@
-# Paddock 0.1.18
+# Paddock 0.1.19
 
-Mostly a Gemma 4 release. Gemma 4 can now call tools, so Claude Code and other agents can drive it, and it reads long prompts a lot faster. Also in this one: video embeddings on NVIDIA GPUs, Kumo Tabular past ten classes, faster k-quant kernels, and a RAM context cache that starts in seconds.
+New models, batch inference and a lot of B200 work. NVIDIA's Nemotron 3.5 family arrives for reading pages, search and live transcription, Gemma 4 12B takes pictures and speech, and the manager can now run OpenAI and Anthropic batch jobs.
 
 Builds for Windows x64, Linux x64 and the DGX Spark, on NVIDIA GPUs with driver 580 or newer. The macOS pre-release is built from the same commit.
 
 ## New
 
-- **Gemma 4 tool calls** on chat completions, Messages and Responses. Calls stream as they're written, `tool_choice` works, and tool results (pictures too) go back to the model the way its template expects. Until now the calls came back as plain text.
-- **EmbeddingGemma 2 video on NVIDIA GPUs** through `input_video`. Frames now use the 140 tokens the checkpoint asks for, on the Mac as well, where they were getting 70. A video that doesn't fit the 4,096-token context gets an error with its token count instead of being cut short.
-- **Kumo Tabular up to 256 classes**, using NVIDIA's error-correcting output codes. With ten classes or fewer you get the same results as before.
+- **Nemotron 3.5 Parse** reads a scanned page, a photo of a document or a PDF page into its blocks in reading order, each with its box, its kind (title, text, table, caption and so on) and its text. Tables come back as LaTeX. It takes one page per request.
+- **Nemotron 3.5 Embed 8B** puts text and pictures of pages in one vector space, and **Nemotron 3.5 Rerank 8B** scores how well each document answers a query, from its text, a picture of the page, or both.
+- **Nemotron 3.5 ASR Streaming** transcribes live audio in 40 languages and locales. Words come out as they're heard and are never revised. It serves `/v1/audio/transcriptions` and the realtime WebSocket.
+- **Gemma 4 12B** takes pictures and speech straight into the model, with no separate encoder. It has a 256K context, tools and reasoning, under Apache 2.0.
+- **Batch inference** on the manager: OpenAI's `/v1/files` and `/v1/batches` and Anthropic's `/v1/messages/batches`, at the vendors' own paths, so the official SDKs only need a base URL. A batch can hold a million requests, uploads resume, a full disk pauses the batch instead of failing it, and every result is written exactly once, even across a manager crash.
 
 ## Improved
 
-- Gemma 4 now speculates on requests that carry tools, which it didn't before, and the MoE model drafts 3 tokens instead of 7. Tool requests on the 26B-A4B with its MTP assistant went from 48.8 to 79.7 tokens/s on the DGX Spark.
-- Gemma 4 reads long prompts faster: adding 4K tokens to a 150K conversation went from 805 to 1,374 tokens/s, and a cold 200K prompt from 1,130 to 1,833 (DGX Spark). Output is bit-identical.
-- Gemma 4 keeps one copy of its embedding matrix instead of two: 0.78 GB less for the 26B-A4B and 1.5 GB less for the 31B at Q8_0.
-- k-quant models (Q4_K, Q5_K, Q6_K, IQ4_XS, Q4_0): the prompt kernel is 10-17% faster, and checking speculative drafts uses a new tensor-core path. On an RTX 5090-class card, Qwen 3.8 27B at 4 bits under 12 Claude Code sessions went from 31.3 to 37.5 tokens/s per session. Output is bit-identical.
-- The RAM context cache could take minutes to set up on some Linux hosts (a quarter of an hour for 32 GiB), and it dropped stores that arrived before it was ready. A 12 GiB cache now sets up in 6.5 s instead of 5 minutes, and early stores wait instead of getting dropped. With Qwen 3.8 27B under Claude Code, time to first token after the first turn went from 1.9-2.9 s to 0.75-0.9 s.
-- Messages compaction got the same fix Responses got in 0.1.17: a span too big for the summarizer is done in parts instead of returning a 400, and streaming requests compact inside the stream with a ping every 15 s.
-- A reasoning loop (the same span over and over, or a thought stuck on two or three words) now gets pushed on to the answer instead of running to the token limit. We hit this with Gemma 4 under Claude Code.
-- A restore waiting for cache room now waits as long as recomputing the prompt would take before giving up.
+- Live requests now go ahead of batch work. With a batch running flat out on the DGX Spark, an agent session's time to first token went from about 33 s to 0.4-0.6 s, and its prompt cache hits again. Batch throughput didn't change.
+- Qwen 3.8 27B on the B200 now runs its matrix work on Blackwell's newest tensor-core instructions, for NVFP4 and 8-bit weights. Reading pages with 128 in flight went from about 223 to about 370 pages a minute over this release.
+- Speculative decoding on the DGX Spark keeps working past 8 requests at once, where it used to switch itself off. At 16 concurrent replies, Qwen 3.6 35B-A3B went from 22.2 to 25.0 tokens/s per reply, Qwen 3.5 9B from 23.4 to 27.4, and Qwen 3.8 27B from 7.5 to 12.2.
+- At low concurrency every request now drafts to the full depth. A single Qwen 3.6 35B-A3B reply on the DGX Spark went from 80.3 to 87.1 tokens/s.
+- Picture prompts reuse the prompt cache. With Qwen 3.8 27B NVFP4, a second page that shares the same instructions went from 3.52 s to 1.67 s, and four new pages at once from 13.9 s to 8.0 s.
+- Gemma 4 at Q8_0 reads prompts faster: 9.2K tokens went from 3.31 s to 2.84 s, and 256 parallel streams run 11-13% faster. Output is bit-identical.
+- Q8_0 models decode faster at low concurrency. The matrix kernel for 1 to 16 rows is 1.15-1.43x faster, with bit-identical output.
+- Chat prompts are tokenized in cached pieces on several threads. A 119K-token agent turn took 145 ms every turn; now it's 21 ms the first time and about 1 ms after.
+- The speculation controller keeps its timing across a restart, so the first replies after a restart no longer start slow.
 
 ## Fixed
 
-- Gemma 4 thoughts no longer gain a newline every turn. An echoed thought came back one newline longer, the model copied that, and under Claude Code each tool step ended with one more newline and missed the prefix cache.
-- A speculating Gemma 4 no longer logs that it can't speculate.
-- A failed step on Qwen 3.5 to 3.8 could stop the engine, and later prompts on the same slots could get refused. Both fixed.
-- README.txt in each archive now describes GPU support correctly and mentions the DGX Spark. It still talked about an RTX 40-series override that's long gone.
+- Concurrent picture requests on Qwen 3.5 to 3.8 could turn into "!!!!" partway through an answer, in 3-25% of answers at 8 to 32 parallel requests. It was a race between the engine's two lanes.
+- Text inside a request (a pasted file, a tool result, a tool argument) could be read as a chat turn marker and open a new turn, a system turn for example. Agents hit it just by reading code that contains those markers. Request content is now always plain text to the model.
+- NVIDIA's ModelOpt NVFP4 export of Qwen 3.8 27B served its attention and output layers from the Q8_0 base without saying so. They now load as shipped.
+- Streamed Responses tool calls now keep the same IDs in the final response, so the OpenAI Agents SDK matches tool results to the right calls.
 
 ## macOS (pre-release)
 
-- LightOnOCR-3 4B on MLX matches the reference on all six test pages, boxes included.
-- EmbeddingGemma 2 video frames use 140 tokens.
+- The native app keeps your chat sessions, saves composer drafts, and has searchable model pickers.
+- The workspace keeps its layout through resizing and fullscreen.
+- Bonsai and Gemma run faster on MLX, and Bonsai reuses its own earlier replies from the prompt cache.
 
 ## Known issues
 
+- Nemotron 3.5 Parse, Embed, Rerank and ASR Streaming, and Gemma 4 12B, run on NVIDIA GPUs only for now.
 - PaddleOCR-VL's layout pipeline is NVIDIA-only; on the Mac it reads whole pages.
 - On the Mac, LightOnOCR-3 0.8B on MLX reads the same text as the reference, but a few boxes are off by up to about half a percent of the page.
 - On the Mac, Nemotron on MLX matches the reference's first token on every test prompt, but not yet the full reply on all of them.
