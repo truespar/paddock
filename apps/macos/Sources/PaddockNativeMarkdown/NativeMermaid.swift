@@ -40,6 +40,12 @@ struct NativeMermaid: View {
   let streaming: Bool
   @Environment(\.colorScheme) private var colorScheme
   @Environment(\.nativeMarkdownWork) private var markdownWork
+  @Environment(\.conversationFind) private var find
+  @Environment(\.conversationTextID) private var textID
+  private var findSource: Bool {
+    guard let find, find.current?.itemID == textID, !find.query.isEmpty else { return false }
+    return source.range(of: find.query, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+  }
   @State private var graph: PositionedGraph?
   @State private var error: String?
   @State private var sourceVisible = false
@@ -60,10 +66,15 @@ struct NativeMermaid: View {
         Text("Mermaid").font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
         if pending && error == nil { Text("Updating…").font(.caption).foregroundStyle(.secondary) }
         Spacer()
-        Button(sourceVisible ? "Diagram" : "Source") {
+        Button(sourceVisible || findSource ? "Diagram" : "Source") {
           // Explicit interaction pins this message's local controls. Do not
           // destroy a source disclosure just because the user scrolls away.
-          sourceVisible.toggle()
+          if findSource {
+            find?.close()
+            sourceVisible = false
+          } else {
+            sourceVisible.toggle()
+          }
           if sourceVisible {
             markdownWork?.pins.insert(pinID)
           } else {
@@ -75,7 +86,7 @@ struct NativeMermaid: View {
           NSPasteboard.general.setString(source, forType: .string)
         }
       }.buttonStyle(.plain).font(.caption)
-      if !sourceVisible, let graph {
+      if !sourceVisible, !findSource, let graph {
         DiagramCanvas(graph: graph, dark: dark, source: renderedSource)
           .frame(height: min(520, max(100, width * graph.height / graph.width)))
           .opacity(pending ? 0.5 : 1)
@@ -84,10 +95,10 @@ struct NativeMermaid: View {
         Text(streaming ? "Waiting for a complete diagram…" : "Diagram could not render: \(error)")
           .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
       }
-      if sourceVisible || error != nil {
+      if sourceVisible || findSource || error != nil {
         PaddockScrollView(.horizontal) {
-          Text(verbatim: source).font(.system(size: 12, design: .monospaced)).textSelection(
-            .enabled)
+          NativeSelectableText(source, size: 12, monospaced: true, wraps: false)
+            .fixedSize(horizontal: true, vertical: true)
         }.frame(maxHeight: 320)
       }
     }

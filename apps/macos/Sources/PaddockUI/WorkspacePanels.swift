@@ -2,8 +2,8 @@ import AppKit
 import SwiftUI
 
 extension EnvironmentValues {
-  /// Only a column that owns window controls reserves their row. The split
-  /// itself always occupies the full window height, including the title bar.
+  /// The shell measures the native toolbar once. Pane controls reserve this
+  /// row while their backgrounds and dividers fill the entire window.
   @Entry var workspaceLeadingPaneInset: CGFloat = 0
   /// Catalog controls clear native chrome inside each column; their shared
   /// resize divider remains full-height instead of inheriting this padding.

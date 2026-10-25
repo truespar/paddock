@@ -7,32 +7,6 @@ extension EnvironmentValues {
   @Entry var transcriptDisclosure: TranscriptScrollIntent? = nil
 }
 
-/// Stable identity across streamed deltas; no per-token environment closure.
-@Observable @MainActor final class TranscriptScrollIntent {
-  var pinned = true
-  var readingDisclosure = false
-  var awayFromBottom = false
-  var layoutRevision = 0
-  @ObservationIgnored private var measuredRows: [String: CGSize] = [:]
-
-  func didLayout(_ id: String, size: CGSize) {
-    guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height >= 0,
-      measuredRows[id] != size
-    else { return }
-    measuredRows[id] = size
-    // A remounted row of the same size is not new content. Keep this cache
-    // outside lazy row state, which SwiftUI may discard when scrolling away.
-    if pinned { layoutRevision &+= 1 }
-  }
-  func reveal() {
-    readingDisclosure = true
-    pinned = false
-  }
-  func retainRows(_ ids: Set<String>) {
-    measuredRows = measuredRows.filter { ids.contains($0.key) || $0.key == "native-bottom" }
-  }
-}
-
 /// Native presentation of the shared tree, not a second store or stream consumer.
 struct NativeStudioTranscript: View {
   let transcript: StudioState.NativeTranscript
@@ -42,6 +16,25 @@ struct NativeStudioTranscript: View {
   var workspace: StudioWorkspace?
   var onOpenDocument: ((String, String) -> Void)?
   @State private var scrollIntent = TranscriptScrollIntent()
+  @State var find = ConversationFind()
+  @State private var lastFindBlock: String?
+  init(
+    transcript: StudioState.NativeTranscript, columnWidth: CGFloat, composerHeight: CGFloat,
+    composer: AnyView? = nil, workspace: StudioWorkspace? = nil,
+    onOpenDocument: ((String, String) -> Void)? = nil, find: ConversationFind = ConversationFind(),
+    position: StudioConversationPosition? = nil
+  ) {
+    self.transcript = transcript
+    self.columnWidth = columnWidth
+    self.composerHeight = composerHeight
+    self.composer = composer
+    self.workspace = workspace
+    self.onOpenDocument = onOpenDocument
+    _find = State(initialValue: find)
+    let record =
+      position ?? transcript.conversationId.flatMap { workspace?.conversationPositions.record($0) }
+    _scrollIntent = State(initialValue: TranscriptScrollIntent(memory: record))
+  }
   var body: some View {
     ConversationSelectionSurface(items: selectionItems) {
       ScrollViewReader { proxy in
@@ -71,10 +64,11 @@ struct NativeStudioTranscript: View {
                     ).equatable()
                   }
                 }
-                .onGeometryChange(for: CGSize.self) {
-                  $0.size
-                } action: { size in
-                  scrollIntent.didLayout(block.id, size: size)
+                .id("find-block-" + block.id)
+                .onGeometryChange(for: CGRect.self) {
+                  $0.frame(in: .named("native-transcript-document"))
+                } action: { frame in
+                  scrollIntent.didLayout(block.id, frame: frame)
                 }
               }
               VStack(alignment: .leading, spacing: 28) {
@@ -95,6 +89,7 @@ struct NativeStudioTranscript: View {
             .frame(width: columnWidth, alignment: .leading)
             .padding(.top, StudioConversationSpacing.edgeInset)
             .frame(maxWidth: .infinity)
+            .coordinateSpace(name: "native-transcript-document")
           }
           // The viewport starts below the header; the bottom still reaches
           // the window edge behind the floating composer.
@@ -102,22 +97,40 @@ struct NativeStudioTranscript: View {
             .vertical, StudioConversationSpacing.scrollIndicatorInset, for: .scrollIndicators
           )
           .modifier(NativeTranscriptScrolling(intent: scrollIntent, proxy: proxy))
+          .onChange(of: find.navigationRevision) { _, _ in
+            guard let match = find.current,
+              let block = transcript.blocks.first(where: { block in
+                block.messages.contains { message in
+                  Self.selectionItems([message]).contains { $0.id == match.itemID }
+                }
+              })
+            else {
+              lastFindBlock = nil
+              return
+            }
+            scrollIntent.reveal()
+            if lastFindBlock != block.id {
+              lastFindBlock = block.id
+              proxy.scrollTo("find-block-" + block.id, anchor: .top)
+            }
+          }
           .onChange(of: transcript.leafId) { _, _ in
             // A branch swap is deliberate navigation, not a request to jump to
             // the bottom. Keep the branch point being operated on in view.
             if let id = workspace?.messageNavigationAnchor {
-              scrollIntent.pinned = false
+              scrollIntent.reveal()
               proxy.scrollTo(id, anchor: .top)
             }
           }
           .onChange(of: workspace?.messageEdit?.target.messageId) { _, id in
             if let id {
-              scrollIntent.pinned = false
+              scrollIntent.reveal()
               proxy.scrollTo(id, anchor: .top)
             }
           }
           .modifier(
             StudioConversationBars {
+              if find.presented { NativeConversationFindBar(find: find) }
               if workspace?.state?.nativeGraph?.available == true {
                 graphControl
               }
@@ -135,10 +148,14 @@ struct NativeStudioTranscript: View {
         .environment(\.transcriptDisclosure, scrollIntent)
         .environment(\.nativeMarkdownViewportReclamation, true)
         .onChange(of: transcript.blocks.map(\.id), initial: true) { _, ids in
-          scrollIntent.retainRows(Set(ids))
+          scrollIntent.retainRows(ids)
         }
       }.background(PaddockStyle.canvas).accessibilityIdentifier("native-studio-transcript")
     }
+    .environment(\.conversationFind, find)
+    .focusedSceneValue(\.conversationFind, find)
+    .onChange(of: selectionItems, initial: true) { _, items in find.update(items) }
+    .onDisappear { find.close() }
   }
   private var graphControl: some View {
     HStack {
@@ -154,7 +171,13 @@ struct NativeStudioTranscript: View {
     }.padding(.horizontal, 28).padding(.vertical, 8)
   }
   private var selectionItems: [ConversationSelectionItem] {
-    transcript.messages.flatMap { message in
+    Self.selectionItems(
+      transcript.messages.filter { $0.id != workspace?.messageEdit?.target.messageId })
+  }
+  static func selectionItems(_ messages: [StudioState.NativeTranscript.Message])
+    -> [ConversationSelectionItem]
+  {
+    messages.flatMap { message in
       var items: [ConversationSelectionItem] = []
       if !message.reasoning.isEmpty {
         items.append(
@@ -164,8 +187,15 @@ struct NativeStudioTranscript: View {
       }
       for tool in message.toolCalls ?? [] {
         items.append(
-          .init(id: tool.id + "/arguments", text: tool.arguments, includeWhenUnmounted: false))
-        items.append(.init(id: tool.id + "/output", text: tool.output, includeWhenUnmounted: false))
+          .init(
+            id: tool.id + "/arguments", text: tool.arguments, includeWhenUnmounted: false,
+            presentation: .toolArguments))
+        if tool.status != "pending" {
+          items.append(
+            .init(
+              id: tool.id + "/output", text: tool.error.isEmpty ? tool.output : tool.error,
+              includeWhenUnmounted: false, presentation: .toolOutput))
+        }
       }
       if let result = message.documentResult {
         for page in result.pages {

@@ -8,9 +8,11 @@ struct NativeSearchField: NSViewRepresentable {
   var prompt: String
   var editorOnly = false
   var focusOnAppear = false
+  var cancelClearsText = true
   var onMove: ((Int) -> Void)?
   var onSubmit: (() -> Void)?
   var onCancel: (() -> Void)?
+  var onCommit: (() -> Void)?
 
   func makeCoordinator() -> Coordinator { Coordinator(self) }
   func makeNSView(context: Context) -> Field {
@@ -190,11 +192,17 @@ struct NativeSearchField: NSViewRepresentable {
       case #selector(NSResponder.moveUp(_:)):
         guard let move = parent.onMove else { return false }
         move(-1)
-      case #selector(NSResponder.insertNewline(_:)):
+      case #selector(NSResponder.insertNewline(_:)), #selector(NSResponder.insertLineBreak(_:)):
+        if NSApp.currentEvent?.modifierFlags.contains(.command) == true,
+          let commit = parent.onCommit
+        {
+          commit()
+          return true
+        }
         guard let submit = parent.onSubmit else { return false }
         submit()
       case #selector(NSResponder.cancelOperation(_:)):
-        if !parent.text.isEmpty {
+        if parent.cancelClearsText, !parent.text.isEmpty {
           parent.text = ""
         } else {
           guard let cancel = parent.onCancel else { return false }

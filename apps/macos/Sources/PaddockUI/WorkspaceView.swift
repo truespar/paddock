@@ -18,6 +18,18 @@ public struct WorkspaceView: View {
   @State private var settingsQuery = ""
   @State private var settingsHighlight: String?
   @State private var settingsRequest: SettingsSearchRequest?
+  private var settingsResults: [SettingsSearchEntry] {
+    SettingsSearchIndex.search(settingsQuery, instances: model.instanceSettingsEntries)
+  }
+  private var visibleSettingsRequest: SettingsSearchRequest? {
+    guard let request = settingsRequest else { return nil }
+    if let port = request.entry.port,
+      port != (model.systemToolsPort ?? model.detailEndpointPort)
+    {
+      return nil
+    }
+    return request
+  }
   private struct StartSelection: Identifiable {
     let id = UUID()
     var model: String?
@@ -49,79 +61,29 @@ public struct WorkspaceView: View {
   private var hasNotices: Bool {
     if case .failed = model.state { return true }
     return model.commandError != nil || model.managementNotice != nil
+      || model.preferences.error != nil
   }
 
   public var body: some View {
-    GeometryReader { geometry in
-      // Edge-to-edge columns. Native traffic lights/navigation belong to the
-      // leading column; other pane headers can use their own top row.
-      ZStack {
-        HStack(spacing: 0) {
-          if navigation.showsSidebar {
-            let width = WorkspacePanelMetrics.width(
-              preferred: navigation.panelWidth, mode: navigation.mode,
-              available: geometry.size.width)
-            let maximum = WorkspacePanelMetrics.width(
-              preferred: .greatestFiniteMagnitude, mode: navigation.mode,
-              available: geometry.size.width)
-            VStack(alignment: .leading, spacing: 0) {
-              sidebar
-            }
-            .padding(.top, geometry.safeAreaInsets.top)
-            .frame(width: width)
-            .background(PaddockStyle.sidebar)
-            WorkspacePanelGrip(
-              width: Binding(get: { width }, set: { navigation.panelWidth = $0 }),
-              range: WorkspacePanelMetrics.limits(navigation.mode).lowerBound...maximum,
-              label: navigation.mode == .studio
-                ? (navigation.showsReadsHistory
-                  ? "Resize reads panel"
-                  : navigation.studio == .tables ? "Resize tables panel" : "Resize chats panel")
-                : "Resize Settings panel"
-            ).id(navigation.mode)
-          }
-          VStack(spacing: 0) {
-            if !showsConversation { notices }
-            if navigation.mode == .studio {
-              studioContent
-            } else if navigation.manager == .general {
-              StudioPreferencesView(
-                model: model.studioPreferences, busy: model.chat.busy, chat: model.chat)
-            } else if navigation.manager == .application {
-              applicationSettings
-            } else if navigation.manager == .cloudProviders {
-              CloudModelsView(model: model.cloud, connections: model.connections)
-            } else if navigation.manager == .customEndpoints {
-              CloudModelsView(model: model.cloud, connections: model.connections, service: .custom)
-            } else if navigation.manager == .connectors {
-              IntegrationsView(model: model.integrations, endpoints: model.snapshot?.servers ?? [])
-            } else if let snapshot = model.snapshot {
-              managerContent(snapshot)
-            } else {
-              loading
-            }
-          }.frame(
-            minWidth: WorkspacePanelMetrics.contentMinimum, maxWidth: .infinity,
-            maxHeight: .infinity
-          )
-          .padding(.top, showsConversation || showsCatalogColumns ? 0 : geometry.safeAreaInsets.top)
-          .environment(
-            \.workspaceCatalogContentInset, showsCatalogColumns ? geometry.safeAreaInsets.top : 0
-          )
-          .environment(
-            \.workspaceLeadingPaneInset, navigation.showsSidebar ? 0 : geometry.safeAreaInsets.top
-          )
-          .background(PaddockStyle.canvas)
-        }
+    WorkspaceShell(
+      navigation: $model.navigation, title: workspaceTitle,
+      enabled: !model.desktopTransition && !model.quitting,
+      onNewChat: newWorkspaceItem,
+      metrics: AnyView(WorkspaceMetricsButton(model: model))
+    ) {
+      sidebar
+    } content: {
+      WorkspaceDetailSurface(edgeToEdge: showsConversation || showsCatalogColumns) {
+        workspaceContent
       }
-      .ignoresSafeArea(.container, edges: .top)
     }
+    .ignoresSafeArea(.container, edges: .top)
     .tint(PaddockStyle.accent)
     .frame(minWidth: Self.minimumWidth(for: navigation), minHeight: 650)
     .background(PaddockStyle.canvas)
     .containerBackground(PaddockStyle.canvas, for: .window)
     .preferredColorScheme(appearance.colorScheme)
-    .environment(\.settingsSearchRequest, settingsRequest)
+    .environment(\.settingsSearchRequest, visibleSettingsRequest)
     .onChange(of: navigation.manager) { _, destination in
       if settingsRequest?.entry.destination != destination { settingsRequest = nil }
     }
@@ -131,17 +93,6 @@ public struct WorkspaceView: View {
         settingsRequest = nil
       }
     }
-    // The actual native title bar, not a second in-content header. AppKit owns
-    // traffic lights, window dragging and full-screen placement.
-    .toolbar {
-      WorkspaceToolbar(
-        navigation: $model.navigation, model: model,
-        onNewChat: newChat, onStart: { navigation.showModelLibrary(purpose: .all) })
-    }
-    // Like oMLX's native settings shell, leave the actual window toolbar's
-    // backdrop to macOS. Hiding it defeats legibility when text scrolls under
-    // traffic lights and navigation controls; do not replace it with a mask.
-    .toolbarBackgroundVisibility(.automatic, for: .windowToolbar)
     .task(id: model.desktopRequest?.id) {
       guard let request = model.desktopRequest else { return }
       await model.handleDesktopRequest(request)
@@ -180,6 +131,35 @@ public struct WorkspaceView: View {
         DownloadReviewView(downloads: model.downloads, model: modelID, artifact: artifact) {
           navigation.showManager(.downloads)
         }
+      }
+    }
+  }
+
+  private var workspaceTitle: String {
+    if showsConversation { return model.chat.conversation?.title ?? "" }
+    return navigation.mode == .manager ? navigation.manager.rawValue : navigation.studio.rawValue
+  }
+
+  @ViewBuilder private var workspaceContent: some View {
+    VStack(spacing: 0) {
+      if !showsConversation { notices }
+      if navigation.mode == .studio {
+        studioContent
+      } else if navigation.manager == .general {
+        StudioPreferencesView(
+          model: model.studioPreferences, busy: model.chat.busy, chat: model.chat)
+      } else if navigation.manager == .application {
+        applicationSettings
+      } else if navigation.manager == .cloudProviders {
+        CloudModelsView(model: model.cloud, connections: model.connections)
+      } else if navigation.manager == .customEndpoints {
+        CloudModelsView(model: model.cloud, connections: model.connections, service: .custom)
+      } else if navigation.manager == .connectors {
+        IntegrationsView(model: model.integrations, endpoints: model.snapshot?.servers ?? [])
+      } else if let snapshot = model.snapshot {
+        managerContent(snapshot)
+      } else {
+        loading
       }
     }
   }
@@ -322,10 +302,10 @@ public struct WorkspaceView: View {
             text: $settingsQuery, prompt: "Search settings", editorOnly: true,
             onMove: {
               settingsHighlight = SearchNavigation.moved(
-                settingsHighlight, in: SettingsSearchIndex.search(settingsQuery).map(\.id), by: $0)
+                settingsHighlight, in: settingsResults.map(\.id), by: $0)
             },
             onSubmit: {
-              let entries = SettingsSearchIndex.search(settingsQuery)
+              let entries = settingsResults
               if let entry = entries.first(where: { $0.id == settingsHighlight }) ?? entries.first {
                 openSetting(entry)
               }
@@ -336,7 +316,7 @@ public struct WorkspaceView: View {
       }.padding(.horizontal, 10).padding(.top, 18).padding(.bottom, 12)
       if !settingsQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
         SettingsSearchResults(
-          entries: SettingsSearchIndex.search(settingsQuery), highlighted: settingsHighlight,
+          entries: settingsResults, highlighted: settingsHighlight,
           select: openSetting)
       } else {
         PaddockScrollView {
@@ -389,13 +369,19 @@ public struct WorkspaceView: View {
     }.frame(maxHeight: .infinity).background(PaddockStyle.sidebar)
       .accessibilityIdentifier("settings-sidebar")
       .onChange(of: settingsQuery) { _, query in
-        settingsHighlight = SettingsSearchIndex.search(query).first?.id
+        settingsHighlight =
+          SettingsSearchIndex.search(query, instances: model.instanceSettingsEntries).first?.id
+      }
+      .onChange(of: settingsResults) { _, entries in
+        if !entries.contains(where: { $0.id == settingsHighlight }) {
+          settingsHighlight = entries.first?.id
+        }
       }
   }
 
   private func openSetting(_ entry: SettingsSearchEntry) {
-    navigation.manager = entry.destination
-    settingsRequest = entry.anchor == nil ? nil : SettingsSearchRequest(entry: entry)
+    guard model.openSetting(entry) else { return }
+    settingsRequest = entry.targetID == nil ? nil : SettingsSearchRequest(entry: entry)
     settingsQuery = ""
     settingsHighlight = nil
   }
@@ -422,8 +408,16 @@ public struct WorkspaceView: View {
       .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10).padding(.bottom, 6)
   }
 
+  private func newWorkspaceItem() {
+    if navigation.mode == .studio && navigation.studio == .tables {
+      Task { await model.tables.newSession() }
+    } else {
+      newChat()
+    }
+  }
+
   private func newChat() {
-    guard !model.chat.busy, !model.chat.uploading else { return }
+    guard model.chat.canNavigateConversation else { return }
     if model.chat.hasMessageEdit {
       navigation.studio = .newChat
       model.desktopError = "Send or cancel the message edit first. Nothing was discarded."
@@ -448,6 +442,10 @@ public struct WorkspaceView: View {
   @ViewBuilder private var notices: some View {
     if hasNotices {
       VStack(spacing: 8) {
+        if let error = model.preferences.error {
+          WorkspaceNotice(
+            message: error, kind: .warning, retry: { Task { await model.preferences.retry() } })
+        }
         if case .failed(let reason) = model.state {
           WorkspaceNotice(message: reason, kind: .warning)
         }

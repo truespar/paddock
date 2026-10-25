@@ -8,6 +8,7 @@ extension NativeStudioRuntime {
     cancelCompaction()
     titleTask?.cancel()
     titleTask = nil
+    titleEpoch += 1
     guard let before = document else {
       throw ConversationFailure.invalid("Open a conversation first")
     }
@@ -477,21 +478,29 @@ extension NativeStudioRuntime {
       completedTurn = .object([
         "id": .string(requestID), "conversationId": .string(document.id),
         "state": .string(
-          replies.contains { $0["error"] != nil }
+          saveFailed || replies.contains { $0["error"] != nil }
             ? "failed" : stopRequested ? "stopped" : "completed"),
       ])
       try? await refreshArtifacts()
-      if canChat(modelID), preferenceBool("auto_title", fallback: true),
+      if !preparingQuit, canChat(modelID), preferenceBool("auto_title", fallback: true),
         document.fields["titleSource"] == nil,
         document.activeMessages.filter({ $0["role"]?.string == "user" }).count == 1,
         !replies.contains(where: { $0["error"] != nil || $0["stopped"]?.bool == true })
       {
+        titleEpoch += 1
+        let epoch = titleEpoch
         titleTask = Task { [weak self] in
           try? await self?.generateTitle(document.id, automatic: true)
+          await self?.titleFinished(epoch)
         }
       }
     }
     if tasks.isEmpty { scheduleCompaction() }
+    schedulePublish()
+  }
+  private func titleFinished(_ epoch: Int) {
+    guard titleEpoch == epoch else { return }
+    titleTask = nil
     schedulePublish()
   }
   func receive(_ event: O, messageID: String) async throws {

@@ -1195,8 +1195,12 @@ static int pd_nv4tc5_swq_go(const CUtensorMap& wm, const CUtensorMap& xm, const 
 // pd_nvf4_tc5_tile_scales gives the weights. Rows past `rows` in the last group are zero.
 __global__ void pd_sf_swz128_kernel(const uint32_t* __restrict__ src, uint32_t* __restrict__ dst,
                                     uint32_t rows, uint32_t n_w, uint32_t n_out) {
+    // This kernel sits outside the tc5 guard, so every arch builds it: griddepcontrol is
+    // sm_90+ PTX and fails ptxas below that, where no PDL launch exists anyway (abi.cuh).
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.launch_dependents;");
     asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n_out) return;
     const uint32_t a = i >> 7, w = i & 127u;

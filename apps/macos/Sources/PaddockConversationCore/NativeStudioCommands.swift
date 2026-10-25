@@ -5,13 +5,21 @@ extension NativeStudioRuntime {
     -> O
   {
     guard !closed else { throw ConversationFailure.closed }
+    guard !preparingQuit else {
+      throw ConversationFailure.invalid("Paddock is saving before quitting")
+    }
     if let receipt = receipts[id] { return receipt }
+    commandCount += 1
+    defer {
+      commandCount -= 1
+      schedulePublish()
+    }
     // Read/display commands and Stop remain responsive during generation.
     let concurrent = [
       "draft", "stop", "refresh", "artifactsPane", "tools", "toolQuery", "historyFilter", "preview",
       "openDocument", "closePreview", "graphPanel", "graphArtifact", "toolApproval",
       "preferencesGet", "promptList", "promptGet", "instructionsGet", "transcriptExport",
-      "composerSize", "renderer", "quote", "saveDraft",
+      "composerSize", "renderer", "quote", "saveDraft", "retrySave",
     ]
     if !concurrent.contains(kind) {
       try idle()
@@ -32,6 +40,7 @@ extension NativeStudioRuntime {
         try await refreshArtifacts()
       case "draft": draftText = try Self.text(p["text"], limit: 128 * 1024)
       case "saveDraft": result = try await saveComposerDraft(p)
+      case "retrySave": try await persist()
       case "composerSize", "renderer": break  // Layout/rendering is wholly native.
       case "quote": result["text"] = .string("")  // The selected TextKit view owns selection.
       case "newChat":

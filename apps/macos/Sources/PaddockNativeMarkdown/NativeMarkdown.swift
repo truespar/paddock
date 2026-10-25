@@ -25,6 +25,9 @@ public struct NativeMarkdown: View, Equatable {
   @State private var work = NativeMarkdownWork()
   @State private var reclaimable = false
   @Environment(\.nativeMarkdownViewportReclamation) private var viewportReclamation
+  @Environment(\.conversationFind) private var find
+  @Environment(\.conversationTextID) private var textID
+  private var findTarget: Bool { find?.current?.itemID == textID }
 
   public init(
     _ text: String, streaming: Bool = false, textSize: CGFloat = 15, unsureWords: [String] = []
@@ -58,12 +61,17 @@ public struct NativeMarkdown: View, Equatable {
       }
       measuredWidth = width
     }
-    .task(id: MountInput(visible: visible, streaming: streaming, measured: renderedHeight != nil)) {
-      guard viewportReclamation, !admitted, visible || streaming || renderedHeight == nil else {
+    .task(
+      id: MountInput(
+        visible: visible || findTarget, streaming: streaming, measured: renderedHeight != nil)
+    ) {
+      guard viewportReclamation, !admitted,
+        visible || findTarget || streaming || renderedHeight == nil
+      else {
         return
       }
       do {
-        try await NativeMarkdownMounts.shared.admit(visible: visible || streaming)
+        try await NativeMarkdownMounts.shared.admit(visible: visible || findTarget || streaming)
         try Task.checkCancellation()
         work.beginMount()
         admitted = true
@@ -74,6 +82,7 @@ public struct NativeMarkdown: View, Equatable {
       if !visible && !streaming { renderedHeight = nil }
     }
     .onChange(of: visible) { _, _ in releaseMeasuredHost() }
+    .onChange(of: findTarget) { _, _ in releaseMeasuredHost() }
     .onChange(of: work.pinned) { _, _ in releaseMeasuredHost() }
     .onChange(of: textSize) { _, _ in
       renderedHeight = nil
@@ -99,7 +108,7 @@ public struct NativeMarkdown: View, Equatable {
     }
   }
   private func releaseMeasuredHost() {
-    guard viewportReclamation, admitted, !visible, !streaming, reclaimable,
+    guard viewportReclamation, admitted, !visible, !findTarget, !streaming, reclaimable,
       !work.pinned, work.remaining == 0, renderedHeight != nil
     else { return }
     guard let height = work.surface?.completedTextHeight() else { return }
@@ -159,7 +168,9 @@ public struct NativeMarkdown: View, Equatable {
       // SwiftUI blocks. Embedded code, math and diagrams keep their renderers.
       SelectableMarkdownSurface(unsureWords: streaming ? [] : unsureWords) {
         MarkdownText(result)
-          .markdownCodeBlockStyle(NativeCodeBlockStyle(streaming: streaming, work: work))
+          .markdownCodeBlockStyle(
+            NativeCodeBlockStyle(streaming: streaming, work: work, find: find, textID: textID)
+          )
           .textSelection(.enabled)
           .fixedSize(horizontal: false, vertical: true)
           .onGeometryChange(for: CGFloat.self) {
@@ -265,6 +276,8 @@ private struct ChatMarkdownFonts: MarkdownFontGroup {
 private struct NativeCodeBlockStyle: MarkdownCodeBlockStyle {
   let streaming: Bool
   let work: NativeMarkdownWork
+  let find: ConversationFind?
+  let textID: String
   @ViewBuilder func makeBody(configuration: Configuration) -> some View {
     if configuration.language?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
       == "mermaid"
@@ -274,6 +287,8 @@ private struct NativeCodeBlockStyle: MarkdownCodeBlockStyle {
         // work tracker explicitly; arbitrary environment keys do not cross
         // the library's attachment boundary with its rendering configuration.
         .environment(\.nativeMarkdownWork, work)
+        .environment(\.conversationFind, find)
+        .environment(\.conversationTextID, textID)
     } else {
       NativeCodeBlock(
         code: configuration.code, language: configuration.language, streaming: streaming)

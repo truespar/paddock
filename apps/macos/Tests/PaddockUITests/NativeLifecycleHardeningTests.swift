@@ -32,7 +32,7 @@ struct NativeLifecycleHardeningTests {
     while workspace.restoring { await Task.yield() }
     try await manager.resolve()
     await start.value
-    await stop.value
+    #expect(await stop.value)
     #expect(!workspace.ready && !workspace.restoring && workspace.state == nil)
     #expect(workspace.runtime == nil && workspace.nativeTransport == nil)
     #expect(workspace.error == nil && !workspace.hasWebViewer)

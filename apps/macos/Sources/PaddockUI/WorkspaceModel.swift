@@ -27,6 +27,7 @@ public final class WorkspaceModel {
   public let downloads: DownloadsModel
   public let connections: ConnectionsModel
   public let integrations: IntegrationsModel
+  public let preferences: NativeWorkspacePreferences
   let insights: InsightsModel
   let benchmarks: BenchmarksModel
   let dataStorage: DataStorageModel
@@ -36,7 +37,16 @@ public final class WorkspaceModel {
     get { StudioDraft(message: chat.composerText) }
     set { chat.composerText = newValue.message }
   }
-  var navigation = WorkspaceNavigation()
+  @ObservationIgnored private var restoringPreferences = false
+  var navigation = WorkspaceNavigation() {
+    didSet {
+      guard !restoringPreferences else { return }
+      let before = oldValue.preferences
+      for (key, value) in navigation.preferences where before[key] != value {
+        preferences.set(key, value)
+      }
+    }
+  }
   var showsRendererSamples = false
   var showsGPUMetrics = false
   var gpuHistory = GPUHistory()
@@ -51,6 +61,7 @@ public final class WorkspaceModel {
   var detailEndpointPort: UInt16?
   var editingEndpoint = false
   var endpointEditor: EndpointEditor?
+  var instanceSettingsEntries: [SettingsSearchEntry] = []
   let endpointLogs: EndpointLogsModel
   let studioLibrary = StudioLibraryModel()
   let reads: NativeReadsModel
@@ -68,7 +79,7 @@ public final class WorkspaceModel {
       || integrations.hasDraft
       || endpointEditor?.dirty == true
       || studioLibrary.hasWork || studioLibrary.instructions.hasWork || studioPreferences.hasWork
-      || draft.hasContent || chatStorage?.busy == true
+      || draft.hasContent || chatStorage?.busy == true || chatStorage?.hasBackgroundWork == true
       || chatStorage?.uploading == true
       || chatStorage?.hasAttachments == true
       || chatStorage?.hasMessageEdit == true
@@ -78,7 +89,7 @@ public final class WorkspaceModel {
   @ObservationIgnored private var chatStorage: StudioWorkspace?
   public var chat: StudioWorkspace {
     if let chatStorage { return chatStorage }
-    let value = StudioWorkspace(client: client)
+    let value = StudioWorkspace(client: client, preferences: preferences)
     value.onPresentation = { [weak self] in self?.onStudioState?($0) }
     chatStorage = value
     return value
@@ -89,6 +100,7 @@ public final class WorkspaceModel {
     cloudClient: any OpenRouterLoading = NativeOpenRouter()
   ) {
     self.client = client
+    preferences = NativeWorkspacePreferences(client: client)
     reads = NativeReadsModel(client: client)
     tables = NativeTablesModel(client: client)
     embeddings = NativeEmbeddingsModel(client: client)
@@ -150,6 +162,12 @@ public final class WorkspaceModel {
     }
     studioLibrary.command = studioCommand
     studioPreferences.command = studioCommand
+    preferences.onRestore = { [weak self] in
+      guard let self else { return }
+      self.restoringPreferences = true
+      self.navigation.restore(self.preferences.values)
+      self.restoringPreferences = false
+    }
     studioLibrary.onManage = { [weak self] in
       self?.navigation.mode = .studio
       self?.navigation.studio = .prompts
@@ -270,8 +288,10 @@ public final class WorkspaceModel {
 
   public func start() async {
     guard state == .idle else { return }
+    async let restore: Void = preferences.start()
     await refresh()
     await downloads.refresh()
+    await restore
   }
 
   /// Latest refresh wins even when an older request ignores cancellation.
@@ -294,6 +314,12 @@ public final class WorkspaceModel {
       guard generation == attempt else { return }
       try Task.checkCancellation()
       snapshot = value
+      instanceSettingsEntries = (value.servers ?? []).filter { $0.settings != nil }.flatMap {
+        EndpointEditor(
+          client: client, endpoint: $0, pid: nil, catalog: value.catalog.models,
+          memoryHardware: .init(physicalBytes: 0, recommendedBytes: nil)
+        ).searchableSettings
+      }
       gpuHistory.ingest(value.gpu)
       endpointEditor?.observeRuntime(value)
       if let job = latestJob, job.action == "remove", job.state == "succeeded",
@@ -324,7 +350,20 @@ public final class WorkspaceModel {
     if generation == attempt { pending = nil }
   }
 
-  public func shutdown() async {
+  public func prepareStudioForQuit() async throws {
+    try await preferences.flush()
+    try await chatStorage?.prepareForQuit()
+  }
+
+  @discardableResult public func shutdown() async -> Bool {
+    do { try await preferences.flush() } catch {
+      desktopError = preferences.error
+      return false
+    }
+    if let chatStorage, !(await chatStorage.shutdown()) {
+      desktopError = chatStorage.error
+      return false
+    }
     memoryPressure?.stop()
     memoryPressure = nil
     await reads.shutdown()
@@ -336,7 +375,6 @@ public final class WorkspaceModel {
     await endpointEditor?.settle()
     await integrations.stop()
     await connections.stop()
-    await chatStorage?.shutdown()
     cloud.stop()
     downloads.stop()
     monitor?.cancel()
@@ -349,7 +387,9 @@ public final class WorkspaceModel {
     refreshedAt = nil
     lastReceipt = nil
     commandError = nil
+    await preferences.close()
     await client.close()
+    return true
   }
 
   public func saveTablesBeforeQuit() async -> Bool {

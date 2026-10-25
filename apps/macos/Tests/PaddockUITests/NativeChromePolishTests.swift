@@ -67,36 +67,4 @@ struct NativeChromePolishTests {
     }
   }
 
-  @Test func headerTitleUsesTheChatColumnsLeadingEdgeInsteadOfWindowCenter() throws {
-    for width: CGFloat in [440, 680, 900, 1200, 1800] {
-      for comparison in [false, true] {
-        let column = StudioColumnLayout.resolve(
-          available: width, viewport: nil, comparison: comparison)
-        for controls: CGFloat in [20, 240] {
-          let frame = try #require(
-            StudioConversationTitleLayout.frame(
-              available: width, height: 44, column: column, controlsClearance: controls))
-          #expect(frame.minX == max(column.minX, controls))
-          #expect(frame.maxX <= column.maxX && frame.maxX <= width - 52)
-          #expect(frame.height == 44)
-        }
-      }
-    }
-    // A document pane on the left owns the controls, even with Chats folded.
-    let column = StudioColumnLayout.resolve(available: 600, viewport: nil)
-    let besideDocument = try #require(
-      StudioConversationTitleLayout.frame(
-        available: 600, height: 44, column: column, controlsClearance: 20))
-    #expect(besideDocument.minX == column.minX)
-  }
-
-  @Test func titleNeverOccupiesTheControlsWhenSpaceIsInsufficient() {
-    let column = StudioColumnLayout.resolve(available: 320, viewport: nil)
-    #expect(
-      StudioConversationTitleLayout.frame(
-        available: 320, height: 44, column: column, controlsClearance: 240) == nil)
-    #expect(
-      StudioConversationTitleLayout.frame(
-        available: .infinity, height: 44, column: column, controlsClearance: 20) == nil)
-  }
 }

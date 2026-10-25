@@ -12,7 +12,7 @@ struct StudioHeaderTests {
     let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
       .deletingLastPathComponent().deletingLastPathComponent()
     let toolbar = try String(
-      contentsOf: root.appending(path: "Sources/PaddockUI/WorkspaceToolbar.swift"), encoding: .utf8)
+      contentsOf: root.appending(path: "Sources/PaddockUI/WorkspaceShell.swift"), encoding: .utf8)
     #expect(!toolbar.contains("WorkspaceModeMenu") && !toolbar.contains("workspace-switcher"))
     #expect(toolbar.contains("navigation.showSettings()") && toolbar.contains("Back to chat"))
     let app = try String(

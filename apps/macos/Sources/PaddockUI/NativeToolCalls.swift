@@ -8,7 +8,11 @@ struct NativeToolCallView: View {
   let workspace: StudioWorkspace?
   let target: StudioMessageTarget?
   @Environment(\.transcriptDisclosure) private var readerDisclosure
+  @Environment(\.conversationFind) private var find
   @State private var expanded = false
+  private var findTarget: Bool {
+    find?.current?.itemID == call.id + "/arguments" || find?.current?.itemID == call.id + "/output"
+  }
   @State private var deciding = false
   @State private var decisionSent = false
   @State private var error: String?
@@ -27,7 +31,12 @@ struct NativeToolCallView: View {
       HStack(spacing: 7) {
         Button {
           readerDisclosure?.reveal()
-          expanded.toggle()
+          if findTarget {
+            find?.close()
+            expanded = false
+          } else {
+            expanded.toggle()
+          }
         } label: {
           HStack(spacing: 7) {
             if running {
@@ -64,11 +73,11 @@ struct NativeToolCallView: View {
                   Color(nsColor: PaddockStyle.nsColor("errorSubtle")),
                   in: RoundedRectangle(cornerRadius: PaddockStyle.Radius.small))
             }
-            Image(systemName: expanded ? "chevron.up" : "chevron.down")
+            Image(systemName: expanded || findTarget ? "chevron.up" : "chevron.down")
               .frame(width: 14, height: 14).foregroundStyle(.secondary)
           }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
         }.buttonStyle(.plain)
-          .accessibilityValue(expanded ? "Expanded" : "Collapsed")
+          .accessibilityValue(expanded || findTarget ? "Expanded" : "Collapsed")
           .accessibilityIdentifier("native-tool-toggle-\(call.id)")
         if let id = call.artifactId, let workspace {
           Button("Show") { Task { await workspace.showArtifact(id) } }
@@ -76,7 +85,7 @@ struct NativeToolCallView: View {
             .accessibilityIdentifier("native-tool-show-\(call.id)")
         }
       }.font(.system(size: 12)).padding(.vertical, 7).padding(.horizontal, 10)
-      if pending || expanded {
+      if pending || expanded || findTarget {
         VStack(alignment: .leading, spacing: 10) {
           section("Tool") {
             NativeSelectableText(call.name, size: 12, monospaced: true)
@@ -150,41 +159,13 @@ struct NativeToolCallView: View {
 
 enum ToolCallPresentation {
   static func pretty(_ value: Any) -> String {
-    guard
-      let data = try? JSONSerialization.data(
-        withJSONObject: value,
-        options: [.prettyPrinted, .sortedKeys, .fragmentsAllowed, .withoutEscapingSlashes])
-    else { return String(describing: value) }
-    return String(decoding: data, as: UTF8.self)
+    NativeToolText.pretty(value)
   }
   static func arguments(_ raw: String) -> String {
-    guard
-      let value = try? JSONSerialization.jsonObject(
-        with: Data(raw.utf8), options: .fragmentsAllowed)
-    else { return raw }
-    guard let fields = value as? [String: Any] else { return pretty(value) }
-    return fields.keys.sorted().map { key in
-      if let text = fields[key] as? String {
-        return text.contains("\n")
-          ? "\(key):\n  " + text.replacingOccurrences(of: "\n", with: "\n  ") : "\(key): \(text)"
-      }
-      return "\(key): \(pretty(fields[key]!))"
-    }.joined(separator: "\n")
+    NativeToolText.arguments(raw)
   }
   static func output(_ raw: String) -> String {
-    guard
-      let value = try? JSONSerialization.jsonObject(
-        with: Data(raw.utf8), options: .fragmentsAllowed)
-    else { return raw }
-    if let parts = value as? [[String: Any]], !parts.isEmpty,
-      parts.allSatisfy({ $0["text"] is String })
-    {
-      return parts.compactMap { $0["text"] as? String }.map { text in
-        (try? JSONSerialization.jsonObject(with: Data(text.utf8), options: .fragmentsAllowed)).map(
-          pretty) ?? text
-      }.joined(separator: "\n")
-    }
-    return pretty(value)
+    NativeToolText.output(raw)
   }
   /// Same identifier humanization as Web Studio's ToolCall.vue.
   static func title(_ raw: String, server: String) -> String {

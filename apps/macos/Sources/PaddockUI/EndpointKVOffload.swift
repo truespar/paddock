@@ -76,7 +76,7 @@ struct EndpointKVOffloadSettings: View {
               text: "SSD cache retains conversation data after restart, unencrypted on disk.")
           }
         }
-      }.accessibilityIdentifier("endpoint-kv-offload-settings")
+      }.accessibilityIdentifier("endpoint-kv-offload-settings").settingsSearchAnchor(.kvOffload)
     }
   }
 }

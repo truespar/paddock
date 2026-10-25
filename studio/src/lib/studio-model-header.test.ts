@@ -133,7 +133,8 @@ describe('shared web/native model header', () => {
     expect(controller).toContain('computed(studioModelHeader)')
     expect(toolbar).not.toContain('StudioHeaderModelView(chat: model.chat)')
     expect(toolbar).not.toContain('WorkspaceModeMenu(')
-    expect(toolbar).toContain('navigation.showSettings()')
+    // Settings opens from the sidebar footer only (asserted below), not the toolbar.
+    expect(toolbar).not.toContain('navigation.showSettings()')
     expect(toolbar).not.toContain('areaPicker')
     expect(composer).toContain('StudioComposerModelPicker(chat: chat')
     expect(modelPicker).toContain('accessibilityIdentifier("composer-model")')
@@ -148,7 +149,8 @@ describe('shared web/native model header', () => {
     expect(footer).toContain('destination(.settings, title: "Settings")')
     expect(workspace).not.toContain('HSplitView {')
     expect(workspace).not.toContain('.workspacePanel(')
-    expect(workspace).toContain('.padding(.top, geometry.safeAreaInsets.top)')
+    // The native split shell owns the top inset; the SwiftUI layer runs under the titlebar.
+    expect(workspace).toContain('.ignoresSafeArea(.container, edges: .top)')
     expect(workspace).toContain('.background(PaddockStyle.sidebar)')
     expect(sidebar).not.toContain('.background(PaddockStyle.sidebar)')
   })

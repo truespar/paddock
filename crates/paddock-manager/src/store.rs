@@ -18,6 +18,7 @@ mod batches;
 pub use batches::*;
 mod connections;
 mod conversation_drafts;
+mod conversation_view_state;
 mod downloads;
 mod integrations;
 mod mask_history;
@@ -315,14 +316,6 @@ pub fn conversation_kind(doc: &Value) -> &'static str {
 }
 
 const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS conversation_drafts (
-    id TEXT PRIMARY KEY,
-    revision TEXT NOT NULL,
-    title TEXT NOT NULL,
-    model TEXT NOT NULL,
-    updated_at INTEGER NOT NULL,
-    doc TEXT NOT NULL
-);
 CREATE TABLE IF NOT EXISTS conversations (
     id         TEXT PRIMARY KEY,
     title      TEXT NOT NULL,
@@ -854,6 +847,8 @@ impl Store {
         conn.execute_batch(SCHEMA)?;
         downloads::migrate(&conn)?;
         batches::migrate(&conn)?;
+        conversation_drafts::migrate(&conn)?;
+        conversation_view_state::migrate(&conn)?;
         connections::migrate(&conn)?;
         table_history::migrate(&conn)?;
         mask_history::migrate(&conn)?;
@@ -1122,6 +1117,10 @@ impl Store {
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute("DELETE FROM conversations WHERE id = ?1", params![id])?;
         tx.execute("DELETE FROM conversation_drafts WHERE id = ?1", params![id])?;
+        tx.execute(
+            "DELETE FROM conversation_view_state WHERE conversation_id = ?1",
+            params![id],
+        )?;
         // Cascade: drop the conversation's attachments so blobs don't orphan.
         tx.execute(
             "DELETE FROM attachments WHERE conversation_id = ?1",

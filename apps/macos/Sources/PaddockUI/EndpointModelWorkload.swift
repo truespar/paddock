@@ -111,10 +111,7 @@ struct EndpointModelWorkload: View {
           .buttonStyle(QuietButtonStyle()).accessibilityIdentifier("endpoint-download-audio")
       }
     }
-    if !editor.isImageGeneration && !editor.capabilities.contains("decision")
-      && !editor.capabilities.contains("tabular")
-      && !editor.capabilities.contains("diarization")
-    {
+    if editor.showsContextWorkload {
       EndpointFormField("Workload") {
         LazyVGrid(
           columns: Array(repeating: GridItem(.flexible(minimum: 0), spacing: 6), count: 4),
@@ -144,6 +141,7 @@ struct EndpointModelWorkload: View {
           }
         }
       }
+      .settingsSearchAnchor(.workload)
       EndpointFormField(
         editor.capabilities.contains("asr")
           ? "Decoder context"
@@ -176,6 +174,7 @@ struct EndpointModelWorkload: View {
           .frame(width: 160).accessibilityLabel("Context tokens")
         }
       }
+      .settingsSearchAnchor(.context)
       EndpointFormField("Conversation memory") {
         Text(editor.kvLabel).font(.system(size: 12))
         if !editor.kvChoices.contains(editor.kvDtype) {
@@ -201,6 +200,7 @@ struct EndpointModelWorkload: View {
         }.accessibilityIdentifier("endpoint-speculative")
           .help(editor.speculationSummary)
       }
+      .settingsSearchAnchor(.speculation)
       if editor.speculation != "off", editor.drafters.count > 1 {
         EndpointFormField("Drafter") {
           Dropdown(

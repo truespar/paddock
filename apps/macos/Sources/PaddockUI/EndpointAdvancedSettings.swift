@@ -36,7 +36,7 @@ struct EndpointAdvancedSettings: View {
               }
               .accessibilityIdentifier("endpoint-option-\(field.id)")
               .help(field.help)
-            }
+            }.settingsSearchTarget("runtime:\(field.id)")
           }
         }
       }

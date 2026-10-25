@@ -18,6 +18,8 @@ use crate::routes::AppState;
 mod mask_history;
 #[path = "api_table_history.rs"]
 mod table_history;
+#[path = "api_view_state.rs"]
+mod view_state;
 
 fn err500(e: impl std::fmt::Display) -> Response {
     (
@@ -35,6 +37,7 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .merge(table_history::routes())
         .merge(mask_history::routes())
+        .merge(view_state::routes())
         .route("/api/conversation-drafts", get(list_conversation_drafts))
         .route(
             "/api/conversation-drafts/{id}",

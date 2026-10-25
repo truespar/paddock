@@ -154,6 +154,16 @@ fn api_allowed(method: &Method, path: &str) -> bool {
         ["api", "read-history"] => *method == Method::GET,
         ["api", "table-history"] => *method == Method::GET,
         ["api", "conversation-drafts"] => *method == Method::GET,
+        ["api", "conversations", id, "view-state", "macos" | "web"]
+            if !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') =>
+        {
+            matches!(*method, Method::GET | Method::PUT)
+        }
+        ["api", "conversations", _, "view-state", ..] => false,
         ["api", "conversation-drafts", id]
             if !id.is_empty()
                 && id.len() <= 128
@@ -1158,6 +1168,22 @@ mod tests {
         assert!(!api_allowed(&Method::POST, "/api/runners"));
         assert!(api_allowed(&Method::POST, "/api/runners/1234/v1/responses"));
         assert!(api_allowed(&Method::PUT, "/api/conversations/test"));
+        assert!(api_allowed(
+            &Method::PUT,
+            "/api/conversations/test/view-state/macos"
+        ));
+        assert!(api_allowed(
+            &Method::GET,
+            "/api/conversations/test/view-state/web"
+        ));
+        assert!(!api_allowed(
+            &Method::DELETE,
+            "/api/conversations/test/view-state/macos"
+        ));
+        assert!(!api_allowed(
+            &Method::GET,
+            "/api/conversations/test/view-state/unknown"
+        ));
         assert!(api_allowed(&Method::GET, "/api/conversation-drafts"));
         assert!(api_allowed(&Method::PUT, "/api/conversation-drafts/test"));
         assert!(!api_allowed(&Method::PUT, "/api/conversation-drafts"));

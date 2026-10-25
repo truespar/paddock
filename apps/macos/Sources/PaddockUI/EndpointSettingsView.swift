@@ -53,7 +53,7 @@ struct EndpointSettingsView: View {
           EndpointMemorySettings(editor: editor).disabled(disabled)
           EndpointResidencySettings(editor: editor).disabled(disabled)
           EndpointKVOffloadSettings(editor: editor).disabled(disabled)
-          access(advanced: true).disabled(disabled)
+          access(advanced: true).disabled(disabled).settingsSearchAnchor(.endpointAccess)
         } else {
           simple
         }
@@ -166,7 +166,7 @@ struct EndpointSettingsView: View {
           .buttonStyle(FlatButtonStyle()).disabled(editor.saving)
         }
       }
-      access(advanced: false).disabled(disabled)
+      access(advanced: false).disabled(disabled).settingsSearchAnchor(.endpointAccess)
     }
   }
   private func access(advanced: Bool) -> some View {

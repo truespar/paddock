@@ -21,6 +21,7 @@ public actor NativeStudioRuntime {
   var models: [O] = []
   var caps: [String: O] = [:]
   var history: [O] = []
+  var activeConversationIDs = Set<String>()
   var projectionCache = NativePresentationCache()
   var preferences: O = [:]
   var staged: [String: O] = [:]
@@ -44,6 +45,7 @@ public actor NativeStudioRuntime {
   var latestComposerDraftID: String?
   var revision = 0
   var closed = false, mutating = false
+  var commandCount = 0
   var tasks: [String: Task<Void, Never>] = [:]
   var stopRequested = false
   var reducers: [String: ResponseAccumulator] = [:]
@@ -55,6 +57,7 @@ public actor NativeStudioRuntime {
   var publication: Task<Void, Never>?
   var polling: Task<Void, Never>?
   var titleTask: Task<Void, Never>?
+  var titleEpoch = 0
   var compactionTask: Task<Void, Never>?
   var compactionEpoch = 0
   var compactionTimeout: Duration = .seconds(600)
@@ -63,6 +66,10 @@ public actor NativeStudioRuntime {
   var receipts: [String: O] = [:]
   var receiptOrder: [String] = []
   var lastCheckpoint = ContinuousClock.now
+  var preparingQuit = false
+  var foreground = true
+  var saveFailed = false
+  var saveError = ""
 
   public init(
     transport: NativeConversationTransport,
@@ -98,6 +105,10 @@ public actor NativeStudioRuntime {
     }
     await emit()
     try checkOpen()
+    beginPolling()
+  }
+  func beginPolling() {
+    guard foreground, polling == nil, !closed else { return }
     polling = Task { [weak self] in
       while !Task.isCancelled {
         try? await Task.sleep(for: .seconds(5))
@@ -203,7 +214,15 @@ public actor NativeStudioRuntime {
       try await transport.saveConversation(doc, consumingDraft: consumingDraft)
     }
     writeTail = task
-    try await task.value
+    do { try await task.value } catch {
+      saveFailed = true
+      saveError = error.localizedDescription
+      throw error
+    }
+    if document == nil || doc.fields == document?.fields {
+      saveFailed = false
+      saveError = ""
+    }
     let retainedDraft =
       consumingDraft == nil
       && history.first(where: { $0["id"]?.string == doc.id })?["composerDraft"]?.bool == true
@@ -216,7 +235,7 @@ public actor NativeStudioRuntime {
   func schedulePublish() {
     guard publication == nil, !closed else { return }
     publication = Task { [weak self] in
-      try? await Task.sleep(for: .milliseconds(32))
+      try? await Task.sleep(for: .milliseconds(self?.foreground == false ? 250 : 32))
       guard !Task.isCancelled, let self else { return }
       await self.emitScheduled()
     }
@@ -234,7 +253,7 @@ public actor NativeStudioRuntime {
     guard !closed else { return }
     flushResponses()
     revision += 1
-    await publish(presentation())
+    await publish(presentation(includeTranscript: foreground || !busy))
   }
   public func publishNow() async { await emit() }
   public func close() async {

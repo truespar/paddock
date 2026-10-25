@@ -23,7 +23,7 @@ struct EndpointMCPSection: View {
       if !model.rows.isEmpty {
         EndpointHint(text: "Enabled servers may run tools without per-call approval.")
       }
-    }.accessibilityIdentifier("endpoint-mcp-section")
+    }.accessibilityIdentifier("endpoint-mcp-section").settingsSearchAnchor(.mcpServers)
   }
   private func connector(_ row: NativeConnector) -> some View {
     HStack(alignment: .center, spacing: 16) {

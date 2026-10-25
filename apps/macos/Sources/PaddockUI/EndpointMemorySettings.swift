@@ -63,6 +63,6 @@ struct EndpointMemorySettings: View {
         }.font(.system(size: 12)).foregroundStyle(.secondary)
           .help("Apple's recommended working set, not currently free memory.")
       }
-    }.accessibilityIdentifier("endpoint-memory-settings")
+    }.accessibilityIdentifier("endpoint-memory-settings").settingsSearchAnchor(.memoryBudget)
   }
 }

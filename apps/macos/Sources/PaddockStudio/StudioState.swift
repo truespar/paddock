@@ -4,6 +4,8 @@ import Foundation
 /// document. Raw Responses objects and credentials stay out. The isolated
 /// native renderer trial opts into a bounded projection of active-path text.
 public struct StudioState: Decodable, Sendable {
+  public let canNavigateConversation: Bool?
+  public let saveFailed: Bool?
   public struct ComposerDraft: Decodable, Sendable {
     public let id: String
     public let text: String

@@ -25,7 +25,7 @@ struct PaddockMacApp: App {
     }
     .defaultSize(width: 1200, height: 820)
     .windowStyle(.hiddenTitleBar)
-    .windowToolbarStyle(.unifiedCompact(showsTitle: false))
+    .windowToolbarStyle(.unified(showsTitle: false))
     .windowResizability(.contentMinSize)
     .commands {
       CommandGroup(replacing: .newItem) {
@@ -152,7 +152,7 @@ final class AppLifecycle: NSObject, NSApplicationDelegate {
       let alert = DesktopAlert.make()
       alert.messageText = "Quit with Studio work in progress?"
       alert.informativeText =
-        "Quitting stops active replies and discards unsent text, message edits, attachments, unsaved connection and tool settings, and artifact edits. Sent messages are saved. Closing the window instead keeps your work available."
+        "Chat drafts and completed attachments are saved. Active replies and uploads stop; unfinished uploads, Quick Question text and unsaved editors are discarded. Closing the window keeps work running."
       alert.addButton(withTitle: "Keep Paddock Open")
       alert.addButton(withTitle: "Quit Paddock")
       guard alert.runModal() == .alertSecondButtonReturn else { return .terminateCancel }
@@ -193,6 +193,17 @@ final class AppLifecycle: NSObject, NSApplicationDelegate {
         sender.reply(toApplicationShouldTerminate: false)
         return
       }
+      do { try await workspace.prepareStudioForQuit() } catch {
+        terminating = false
+        workspace.quitting = false
+        let alert = DesktopAlert.make()
+        alert.messageText = "Your work could not be saved"
+        alert.informativeText = "Paddock will stay open. \(error.localizedDescription)"
+        alert.addButton(withTitle: "Keep Paddock Open")
+        alert.runModal()
+        sender.reply(toApplicationShouldTerminate: false)
+        return
+      }
       if stopModels, !(await workspace.stopForQuit(runners)) {
         terminating = false
         workspace.quitting = false
@@ -200,8 +211,13 @@ final class AppLifecycle: NSObject, NSApplicationDelegate {
         open(.manager)
         return
       }
-      await workspace.shutdown()
-      sender.reply(toApplicationShouldTerminate: true)
+      let saved = await workspace.shutdown()
+      if !saved {
+        terminating = false
+        workspace.quitting = false
+        open(.studio)
+      }
+      sender.reply(toApplicationShouldTerminate: saved)
     }
     return .terminateLater
   }

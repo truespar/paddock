@@ -1,4 +1,6 @@
 import Foundation
+import PaddockConversationCore
+import PaddockStudio
 
 public enum WorkspaceMode: String, CaseIterable, Identifiable, Sendable {
   case studio = "Studio"
@@ -66,8 +68,8 @@ enum ManagerDestination: String, CaseIterable, Identifiable {
   }
 }
 
-/// Window-local UI state, not a second product database. Each mode remembers
-/// its destination and sidebar independently. First launch is always composer-first.
+/// The first launch is composer-first. Only layout and the last Settings page
+/// are restored; opening the app cannot replay a command or start a model.
 struct WorkspaceNavigation {
   var mode: WorkspaceMode = .studio
   var studio: StudioDestination = .newChat
@@ -77,6 +79,28 @@ struct WorkspaceNavigation {
   private var managerSidebar = true
   private var studioWidth: CGFloat = 260
   private var managerWidth: CGFloat = 220
+
+  var preferences: [NativeWorkspacePreferences.Key: ConversationValue] {
+    [
+      .studioSidebar: .bool(studioSidebar), .settingsSidebar: .bool(managerSidebar),
+      .studioWidth: .number(Decimal(Double(studioWidth))),
+      .settingsWidth: .number(Decimal(Double(managerWidth))),
+      .settingsPage: .string(manager.rawValue),
+    ]
+  }
+  mutating func restore(_ values: [NativeWorkspacePreferences.Key: ConversationValue]) {
+    if let value = values[.studioSidebar]?.bool { studioSidebar = value }
+    if let value = values[.settingsSidebar]?.bool { managerSidebar = value }
+    if let value = values[.settingsPage]?.string.flatMap(ManagerDestination.init(rawValue:)) {
+      manager = value
+    }
+    if case .number(let raw) = values[.studioWidth], !raw.isNaN {
+      studioWidth = min(360, max(220, NSDecimalNumber(decimal: raw).doubleValue))
+    }
+    if case .number(let raw) = values[.settingsWidth], !raw.isNaN {
+      managerWidth = min(260, max(200, NSDecimalNumber(decimal: raw).doubleValue))
+    }
+  }
 
   var panelWidth: CGFloat {
     get { mode == .studio ? studioWidth : managerWidth }

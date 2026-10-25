@@ -2,7 +2,7 @@ import Foundation
 import PaddockClient
 
 extension NativeStudioRuntime {
-  func presentation() -> O {
+  func presentation(includeTranscript: Bool = true) -> O {
     let fields = (document?.fields ?? [:]).filter { $0.value != .null }
     let id = selected.first ?? ""
     let cap = capability(id)
@@ -33,7 +33,10 @@ extension NativeStudioRuntime {
         "pinned": row["pinned"] ?? .bool(false),
         "kind": row["kind"] ?? .string("chat"),
         "composerDraft": row["composerDraft"] ?? .bool(false),
-        "busy": .bool(row["id"] == fields["id"] && !self.tasks.isEmpty), "titleState": .string(""),
+        "busy": .bool(
+          row["id"] == fields["id"] && !self.tasks.isEmpty
+            || row["id"]?.string.map(self.activeConversationIDs.contains) == true),
+        "titleState": .string(""),
       ])
     }
     let levels =
@@ -100,11 +103,16 @@ extension NativeStudioRuntime {
       ])
     }
     let active = document?.activeMessages ?? []
-    let controls = document?.messageControls ?? [:]
-    let groups = Dictionary(
-      grouping: active.filter { $0["group"]?.string != nil }, by: { $0["group"]!.string! })
-    let fastest = Set(groups.values.compactMap(NativeComparePresentation.fastest))
-    let transcript = projectedMessages(active, controls: controls, fastest: fastest)
+    let transcript: [V]
+    if includeTranscript {
+      let controls = document?.messageControls ?? [:]
+      let groups = Dictionary(
+        grouping: active.filter { $0["group"]?.string != nil }, by: { $0["group"]!.string! })
+      let fastest = Set(groups.values.compactMap(NativeComparePresentation.fastest))
+      transcript = projectedMessages(active, controls: controls, fastest: fastest)
+    } else {
+      transcript = []
+    }
     let compare = selected.map { id -> V in
       let model = models.first { $0["id"]?.string == id }
       return .object([
@@ -143,6 +151,7 @@ extension NativeStudioRuntime {
           "messageCount": .number(Decimal(document?.messages.count ?? 0)),
         ]),
       "history": .array(ordered.prefix(20).map(historyRow)),
+      "sessionSummary": history.first { $0["id"] == fields["id"] }.map(historyRow) ?? .null,
       "historyTotal": .number(Decimal(history.count)),
       "library": .object([
         "rows": .array(matches.dropFirst((page - 1) * 100).prefix(100).map(historyRow)),
@@ -159,7 +168,9 @@ extension NativeStudioRuntime {
         "isVision": cap["vision"] ?? .bool(false),
       ]),
       "busy": .bool(busy || (audio["phase"]?.string ?? "idle") != "idle"), "loading": .bool(false),
-      "error": .string(error),
+      "canNavigateConversation": .bool(canLeaveConversation()),
+      "error": .string(saveFailed ? "This conversation could not be saved: \(saveError)" : error),
+      "saveFailed": .bool(saveFailed),
       "viewport": .object(["left": .number(0), "width": .number(0)]),
       "previewing": .bool(previewPart != nil), "unsavedEdits": .bool(false),
       "settings": .object(settings), "capabilities": .object(capabilities),

@@ -115,10 +115,10 @@ struct StudioComposerView: View {
             dictationSession: chat.state?.audio?.session ?? "", dictation: chat.pendingDictation,
             provisionalDictation: provisionalDictation,
             onDictated: chat.acknowledgeDictation,
-            onWindow: { chat.presentationWindow = $0 }
-          ) {
-            editorHeight = $0
-          }
+            onWindow: { chat.presentationWindow = $0 },
+            onHeight: { editorHeight = $0 },
+            position: chat.state?.composerDraft.map { chat.conversationPositions.record($0.id) }
+          )
           // TextKit undo and marked-text state belong to this conversation,
           // never to whichever chat happened to occupy the editor previously.
           .id(chat.state?.composerDraft?.id)

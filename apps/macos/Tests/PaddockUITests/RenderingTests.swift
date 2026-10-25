@@ -176,7 +176,8 @@ struct RenderingTests {
       let frame = split.convert(split.bounds, to: controller.view)
       #expect(abs(frame.minY) < 1)
       #expect(abs(frame.height - controller.view.bounds.height) < 1)
-      #expect(frame.minX >= 220 + WorkspacePanelMetrics.gap)
+      #expect(abs(frame.minX) < 1)
+      #expect(split.arrangedSubviews.last!.frame.minX >= 220 + split.dividerThickness)
     }
     #expect(controller.view.bounds.width == 1000)
     #expect(controller.sizeThatFits(in: CGSize(width: 1000, height: 800)).width <= 1000)
@@ -219,7 +220,8 @@ struct RenderingTests {
           if let split = findSplit(in: controller.view) {
             let frame = split.convert(split.bounds, to: controller.view)
             #expect(
-              content.insetBy(dx: -1, dy: -1).contains(frame), "Split must not escape its card")
+              controller.view.bounds.insetBy(dx: -1, dy: -1).contains(frame),
+              "Native workspace divider fills the window; controls clear the toolbar")
           }
           let scrolls = scrollViews(in: controller.view)
           #expect(

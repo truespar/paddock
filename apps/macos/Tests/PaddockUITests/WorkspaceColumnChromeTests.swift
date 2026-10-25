@@ -353,10 +353,12 @@ struct WorkspaceColumnChromeTests {
   }
 
   private func clickClose(in pane: NSView, window: NSWindow) throws {
+    let topInset = max(0, pane.convert(pane.bounds, to: nil).maxY - window.contentLayoutRect.maxY)
     let point = pane.convert(
       NSPoint(
         x: pane.bounds.maxX - 23,
-        y: pane.isFlipped ? pane.bounds.minY + 21 : pane.bounds.maxY - 21), to: nil)
+        y: pane.isFlipped ? pane.bounds.minY + topInset + 21 : pane.bounds.maxY - topInset - 21),
+      to: nil)
     for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
       window.sendEvent(
         try #require(
@@ -397,12 +399,15 @@ struct WorkspaceColumnChromeTests {
           window.setContentSize(NSSize(width: width, height: 700))
           try await Task.sleep(for: .milliseconds(100))
           host.view.layoutSubtreeIfNeeded()
-          let split = try #require(find(NSSplitView.self, in: host.view))
+          let split = try #require(
+            allViews(host.view).compactMap { $0 as? NSSplitView }
+              .first { ($0.delegate as? StudioSplitController)?.right == true })
           let splitRect = split.convert(split.bounds, to: host.view)
           #expect(abs(splitRect.minY) < 1)
           #expect(abs(splitRect.height - host.view.bounds.height) < 1)
           let header = state.probe.convert(state.probe.bounds, to: host.view)
-          #expect(abs(header.minY) < 1, "No empty title-bar row above the preview: \(header)")
+          #expect(
+            abs(header.minY - (host.view.bounds.height - window.contentLayoutRect.height)) < 1)
           #expect(header.height >= 38 && header.height < 60)
           #expect(window.contentLayoutRect.height < host.view.bounds.height)
           // Last header button is the native Close action. Exercise window event
@@ -431,13 +436,15 @@ struct WorkspaceColumnChromeTests {
       state.comparison = true
       try await Task.sleep(for: .milliseconds(100))
       host.view.layoutSubtreeIfNeeded()
-      let split = try #require(find(NSSplitView.self, in: host.view))
+      let split = try #require(
+        allViews(host.view).compactMap { $0 as? NSSplitView }
+          .first { ($0.delegate as? StudioSplitController)?.right == true })
       split.setPosition(600, ofDividerAt: 0)
       try await Task.sleep(for: .milliseconds(100))
       host.view.layoutSubtreeIfNeeded()
       for probe in [state.probe, state.secondProbe] {
         let header = probe.convert(probe.bounds, to: host.view)
-        #expect(abs(header.minY) < 1, "Compare header must reach the top too: \(header)")
+        #expect(abs(header.minY - (host.view.bounds.height - window.contentLayoutRect.height)) < 1)
         #expect(header.width >= 340)
         let before = state.hideCount
         let point = probe.convert(NSPoint(x: probe.bounds.maxX - 23, y: probe.bounds.midY), to: nil)
@@ -474,7 +481,7 @@ struct WorkspaceColumnChromeTests {
       "busy": false, "loading": false, "error": "", "previewing": true, "unsavedEdits": false,
       "viewport": ["left": 0, "width": 760], "settings": [:], "tools": [],
       "conversation": [
-        "id": "chrome", "title": "Chrome fixture", "model": "local", "messageCount": 0,
+        "id": "chrome", "title": "Chrome fixture", "model": "local", "messageCount": 1,
       ],
       "capabilities": [
         "reasoning": "", "levels": [], "reasoningDefault": "", "reasoningOff": false,
@@ -515,32 +522,38 @@ private struct ChromeFixture: View {
   @Bindable var state: ChromeFixtureState
   @Bindable var model: WorkspaceModel
   var body: some View {
-    GeometryReader { geometry in
-      HStack(spacing: 0) {
-        if model.navigation.showsSidebar {
-          VStack(alignment: .leading) {
-            Text("Chats")
-            Spacer()
-          }.padding(.top, geometry.safeAreaInsets.top).frame(width: 260)
-        }
-        StudioDocumentSplit(open: true, right: true) {
-          Color.clear.padding(.top, geometry.safeAreaInsets.top)
-        } document: {
-          if state.comparison {
-            HSplitView {
-              pane(state.probe)
-              pane(state.secondProbe)
-            }
-          } else {
+    WorkspaceShell(
+      navigation: $model.navigation, title: "Preview fixture", onNewChat: {},
+      metrics: AnyView(Color.clear.frame(width: 32, height: 32))
+    ) {
+      VStack {
+        Text("Chats")
+        Spacer()
+      }
+    } content: {
+      ChromeFixtureContent(state: state)
+    }.ignoresSafeArea(.container, edges: .top)
+  }
+}
+
+private struct ChromeFixtureContent: View {
+  @Bindable var state: ChromeFixtureState
+  @Environment(\.workspaceLeadingPaneInset) private var topInset
+  var body: some View {
+    StudioDocumentSplit(open: true, right: true) {
+      Color.clear
+    } document: {
+      Group {
+        if state.comparison {
+          HSplitView {
             pane(state.probe)
+            pane(state.secondProbe)
           }
+        } else {
+          pane(state.probe)
         }
-      }.ignoresSafeArea(.container, edges: .top)
+      }.padding(.top, topInset)
     }
-    .toolbar {
-      WorkspaceToolbar(navigation: $model.navigation, model: model, onNewChat: {}, onStart: {})
-    }
-    .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
   }
   private func pane(_ probe: NSView) -> some View {
     VStack(spacing: 0) {

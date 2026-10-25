@@ -9,6 +9,7 @@ struct IntegrationsView: View {
   @State private var catalog = ConnectorCatalog()
   @State private var expanded = Set<String>()
   @State private var removing: NativeConnector?
+  @Environment(\.settingsSearchRequest) private var settingsRequest
   private var hits: [ConnectorHit] { catalog.rows(model.hits) }
 
   var body: some View {
@@ -16,7 +17,9 @@ struct IntegrationsView: View {
       Text("Connectors").font(.system(size: 24, weight: .semibold))
       HStack(spacing: 18) {
         tab("Find connectors", active: discovering) { discovering = true }
+          .settingsSearchAnchor(.connectorDirectory)
         tab("Your connectors (\(model.rows.count))", active: !discovering) { discovering = false }
+          .settingsSearchAnchor(.connectorLibrary)
         Spacer()
         Button("Add by URL", systemImage: "plus") { model.review() }
           .buttonStyle(FlatButtonStyle()).disabled(model.saving)
@@ -78,6 +81,13 @@ struct IntegrationsView: View {
       .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
       .background(PaddockStyle.canvas)
       .task { await model.refresh() }
+      .task(id: settingsRequest?.id) {
+        switch settingsRequest?.entry.anchor {
+        case .connectorDirectory: discovering = true
+        case .connectorLibrary: discovering = false
+        default: break
+        }
+      }
       .task(id: discovering ? model.query : "\u{0}") { if discovering { await model.search() } }
       .confirmationDialog(
         "Remove this connector?",

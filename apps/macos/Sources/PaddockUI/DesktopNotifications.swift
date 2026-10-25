@@ -18,7 +18,7 @@ public final class DesktopNotifications: NSObject, UNUserNotificationCenterDeleg
   @ObservationIgnored public var isVisible: ((DesktopAction) -> Bool)?
   @ObservationIgnored private var pending: [String: (UUID, Task<Void, Never>)] = [:]
   @ObservationIgnored private var authorizationTask: Task<Void, Never>?
-  @ObservationIgnored private var studioBusy = false
+  @ObservationIgnored private var busyConversations = Set<String>()
   public var enabled: Bool {
     didSet {
       defaults.set(enabled, forKey: "desktopNotifications")
@@ -106,8 +106,13 @@ public final class DesktopNotifications: NSObject, UNUserNotificationCenterDeleg
     deliver(tracker.management(value))
   }
   public func studio(_ value: PaddockStudio.StudioState) {
-    if value.busy && !studioBusy { prepareForBackgroundWork() }
-    studioBusy = value.busy
+    if let id = value.conversation?.id ?? value.composerDraft?.id {
+      if value.busy {
+        if busyConversations.insert(id).inserted { prepareForBackgroundWork() }
+      } else {
+        busyConversations.remove(id)
+      }
+    }
     deliver(tracker.studio(value))
   }
 

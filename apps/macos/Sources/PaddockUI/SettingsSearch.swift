@@ -5,12 +5,20 @@ import SwiftUI
 enum SettingsAnchor: String, CaseIterable {
   case replyLength, toolLimit, summarize, microphone, mapTiles
   case menuBar, login, shortcut, notifications, updates, backup, modelsFolder
+  case context, workload, memoryBudget, speculation, modelLoading, idleUnload, loadWait
+  case kvOffload, endpointAccess, webSearch, mcpServers, connectorDirectory, connectorLibrary
+
+  var isEndpoint: Bool { destination == .runners }
 
   var destination: ManagerDestination {
     switch self {
     case .replyLength, .toolLimit, .summarize, .microphone, .mapTiles: .general
     case .menuBar, .login, .shortcut, .notifications, .updates: .application
     case .backup, .modelsFolder: .storage
+    case .context, .workload, .memoryBudget, .speculation, .modelLoading, .idleUnload,
+      .loadWait, .kvOffload, .endpointAccess, .webSearch, .mcpServers:
+      .runners
+    case .connectorDirectory, .connectorLibrary: .connectors
     }
   }
   var title: String {
@@ -27,6 +35,19 @@ enum SettingsAnchor: String, CaseIterable {
     case .updates: "App updates"
     case .backup: "Conversation backup"
     case .modelsFolder: "Models folder"
+    case .context: "Context per conversation"
+    case .workload: "Concurrent requests"
+    case .memoryBudget: "Memory budget"
+    case .speculation: "Speculative decoding"
+    case .modelLoading: "Load model on demand"
+    case .idleUnload: "Unload after inactivity"
+    case .loadWait: "Load wait limit"
+    case .kvOffload: "KV cache offloading"
+    case .endpointAccess: "Endpoint access & API key"
+    case .webSearch: "Web search provider"
+    case .mcpServers: "Enabled MCP servers"
+    case .connectorDirectory: "Find connectors"
+    case .connectorLibrary: "Your connectors"
     }
   }
   var aliases: String {
@@ -43,6 +64,19 @@ enum SettingsAnchor: String, CaseIterable {
     case .updates: "version upgrade automatic check release"
     case .backup: "export conversations attachments database sqlite"
     case .modelsFolder: "disk space storage weights files directory"
+    case .context: "context window length tokens prompt"
+    case .workload: "concurrency max batch workload requests"
+    case .memoryBudget: "VRAM unified memory GPU budget limit"
+    case .speculation: "MTP DFlash DFlash2 drafter speculative decoding"
+    case .modelLoading: "automatic residency dynamic loading startup on demand"
+    case .idleUnload: "residency idle timeout unload release memory"
+    case .loadWait: "residency loading timeout seconds wait"
+    case .kvOffload: "prefix cache reuse offload SSD disk RAM"
+    case .endpointAccess: "port network listen host API key access"
+    case .webSearch: "Exa Tavily Brave Firecrawl Perplexity search provider API key"
+    case .mcpServers: "MCP enabled tools connectors endpoint"
+    case .connectorDirectory: "MCP directory discover tools servers"
+    case .connectorLibrary: "MCP installed saved connectors OAuth credentials"
     }
   }
   static func conversationSection(_ id: String) -> Self? {
@@ -60,22 +94,39 @@ enum SettingsAnchor: String, CaseIterable {
 struct SettingsSearchEntry: Identifiable, Equatable {
   let destination: ManagerDestination
   var anchor: SettingsAnchor?
-  var id: String { anchor?.rawValue ?? "page:\(destination.rawValue)" }
-  var title: String { anchor?.title ?? destination.rawValue }
+  var port: UInt16?
+  var instanceTitle: String?
+  var runtimeOption: String?
+  var label: String?
+  var keywords = ""
+  var targetID: String? { runtimeOption.map { "runtime:\($0)" } ?? anchor?.rawValue }
+  var id: String {
+    (port.map { "endpoint:\($0):" } ?? "") + (targetID ?? "page:\(destination.rawValue)")
+  }
+  var title: String { label ?? anchor?.title ?? destination.rawValue }
+  var subtitle: String {
+    if let port { return "\(instanceTitle ?? "Instance") · \(port)" }
+    return destination.rawValue
+  }
 }
 
 enum SettingsSearchIndex {
   static let entries =
     ManagerDestination.allCases.map { SettingsSearchEntry(destination: $0) }
-    + SettingsAnchor.allCases.map { SettingsSearchEntry(destination: $0.destination, anchor: $0) }
+    + SettingsAnchor.allCases.filter { !$0.isEndpoint }.map {
+      SettingsSearchEntry(destination: $0.destination, anchor: $0)
+    }
 
-  static func search(_ query: String) -> [SettingsSearchEntry] {
+  static func search(_ query: String, instances: [SettingsSearchEntry] = [])
+    -> [SettingsSearchEntry]
+  {
     let terms = query.split(whereSeparator: \.isWhitespace).map(String.init)
     guard !terms.isEmpty else { return [] }
-    return entries.filter { entry in
+    return (entries + instances).filter { entry in
       let text = [
         entry.title, entry.destination.rawValue, entry.anchor?.aliases ?? "",
-        pageAliases(entry.destination),
+        entry.targetID == nil ? pageAliases(entry.destination) : "",
+        entry.instanceTitle ?? "", entry.port.map(String.init) ?? "", entry.keywords,
       ].joined(separator: " ")
       return terms.allSatisfy { text.localizedStandardContains($0) }
     }.sorted { left, right in
@@ -84,7 +135,8 @@ enum SettingsSearchIndex {
       let b = right.title.localizedStandardContains(
         query.trimmingCharacters(in: .whitespacesAndNewlines))
       if a != b { return a }
-      return left.title.localizedStandardCompare(right.title) == .orderedAscending
+      let order = left.title.localizedStandardCompare(right.title)
+      return order == .orderedSame ? left.id < right.id : order == .orderedAscending
     }
   }
   private static func pageAliases(_ page: ManagerDestination) -> String {
@@ -118,16 +170,16 @@ private struct SettingsAnchorsKey: PreferenceKey {
   }
 }
 private struct SettingsSearchAnchorModifier: ViewModifier {
-  let anchor: SettingsAnchor?
+  let target: String?
   @Environment(\.settingsSearchRequest) private var request
   @AccessibilityFocusState private var accessibilityFocused: Bool
   @ViewBuilder
   func body(content: Content) -> some View {
-    if let anchor {
-      content.id(anchor.rawValue)
-        .preference(key: SettingsAnchorsKey.self, value: [anchor.rawValue])
+    if let target {
+      content.id(target)
+        .preference(key: SettingsAnchorsKey.self, value: [target])
         .overlay {
-          if request?.entry.anchor == anchor {
+          if request?.entry.targetID == target {
             RoundedRectangle(cornerRadius: 8).strokeBorder(
               PaddockStyle.secondary.opacity(0.6), lineWidth: 1
             )
@@ -136,7 +188,7 @@ private struct SettingsSearchAnchorModifier: ViewModifier {
         }
         .accessibilityFocused($accessibilityFocused)
         .task(id: request?.id) {
-          accessibilityFocused = request?.entry.anchor == anchor
+          accessibilityFocused = request?.entry.targetID == target
         }
     } else {
       content
@@ -145,7 +197,10 @@ private struct SettingsSearchAnchorModifier: ViewModifier {
 }
 extension View {
   func settingsSearchAnchor(_ anchor: SettingsAnchor?) -> some View {
-    modifier(SettingsSearchAnchorModifier(anchor: anchor))
+    settingsSearchTarget(anchor?.rawValue)
+  }
+  func settingsSearchTarget(_ id: String?) -> some View {
+    modifier(SettingsSearchAnchorModifier(target: id))
   }
 }
 
@@ -163,10 +218,10 @@ struct SettingsSearchScroll: ViewModifier {
       .onAppear { reveal() }
   }
   private func reveal() {
-    guard let request, handled != request.id, let anchor = request.entry.anchor,
-      anchors.contains(anchor.rawValue)
+    guard let request, handled != request.id, let target = request.entry.targetID,
+      anchors.contains(target)
     else { return }
-    proxy.scrollTo(anchor.rawValue, anchor: .center)
+    proxy.scrollTo(target, anchor: .center)
     handled = request.id
   }
 }
@@ -191,8 +246,8 @@ struct SettingsSearchResults: View {
                 Image(systemName: entry.destination.symbol).frame(width: 18)
                 VStack(alignment: .leading, spacing: 3) {
                   Text(entry.title).font(.system(size: 12, weight: .medium))
-                  if entry.anchor != nil {
-                    Text(entry.destination.rawValue).font(.system(size: 10)).foregroundStyle(
+                  if entry.targetID != nil {
+                    Text(entry.subtitle).font(.system(size: 10)).foregroundStyle(
                       .secondary)
                   }
                 }

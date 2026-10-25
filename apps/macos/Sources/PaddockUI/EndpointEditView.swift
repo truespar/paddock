@@ -8,26 +8,29 @@ struct EndpointEditView: View {
   let port: UInt16
   var onDownload: ((String, String) -> Void)? = nil
   var body: some View {
-    PaddockScrollView {
-      VStack(alignment: .leading, spacing: 24) {
-        Button("Model details", systemImage: "chevron.left") { workspace.editingEndpoint = false }
-          .buttonStyle(QuietButtonStyle()).accessibilityIdentifier("endpoint-edit-back")
-        if let editor = workspace.endpointEditor, editor.endpoint.port == port, !editor.removed {
-          PageHeading(title: "Edit \(editor.title)") {
-            EmptyView()
+    ScrollViewReader { proxy in
+      PaddockScrollView {
+        VStack(alignment: .leading, spacing: 24) {
+          Button("Model details", systemImage: "chevron.left") { workspace.editingEndpoint = false }
+            .buttonStyle(QuietButtonStyle()).accessibilityIdentifier("endpoint-edit-back")
+          if let editor = workspace.endpointEditor, editor.endpoint.port == port, !editor.removed {
+            PageHeading(title: "Edit \(editor.title)") {
+              EmptyView()
+            }
+            EndpointSettingsView(
+              editor: editor, canMutate: workspace.canSubmit,
+              onTools: { workspace.systemToolsPort = port },
+              onDownload: onDownload.map { download in { download(editor.modelID, $0) } })
+          } else {
+            ContentUnavailableView(
+              "Configuration unavailable", systemImage: "slider.horizontal.3",
+              description: Text("No editable endpoint is owned by this app on this port."))
           }
-          EndpointSettingsView(
-            editor: editor, canMutate: workspace.canSubmit,
-            onTools: { workspace.systemToolsPort = port },
-            onDownload: onDownload.map { download in { download(editor.modelID, $0) } })
-        } else {
-          ContentUnavailableView(
-            "Configuration unavailable", systemImage: "slider.horizontal.3",
-            description: Text("No editable endpoint is owned by this app on this port."))
-        }
-      }.font(.system(size: 12)).padding(28).frame(maxWidth: 1080, alignment: .leading)
-        .frame(maxWidth: .infinity, alignment: .top)
-    }.background(PaddockStyle.canvas).accessibilityIdentifier("endpoint-edit-page")
+        }.font(.system(size: 12)).padding(28).frame(maxWidth: 1080, alignment: .leading)
+          .frame(maxWidth: .infinity, alignment: .top)
+      }.background(PaddockStyle.canvas).accessibilityIdentifier("endpoint-edit-page")
+        .modifier(SettingsSearchScroll(proxy: proxy))
+    }
   }
 }
 

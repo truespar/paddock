@@ -2,6 +2,20 @@
 //! This is part of the same SQLite snapshot/backup as conversations and uploads.
 use super::*;
 
+pub(super) fn migrate(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS conversation_drafts (
+            id TEXT PRIMARY KEY,
+            revision TEXT NOT NULL,
+            title TEXT NOT NULL,
+            model TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            doc TEXT NOT NULL
+        );",
+    )?;
+    Ok(())
+}
+
 pub(super) fn check_revision(
     conn: &Connection,
     id: &str,
@@ -113,6 +127,7 @@ impl Store {
         }
         if text.is_empty() && attachments.is_empty() {
             tx.execute("DELETE FROM conversation_drafts WHERE id=?1", [id])?;
+            tx.execute("DELETE FROM conversation_view_state WHERE conversation_id=?1 AND NOT EXISTS(SELECT 1 FROM conversations WHERE id=?1)", [id])?;
             tx.commit()?;
             return Ok(json!({"revision":""}));
         }

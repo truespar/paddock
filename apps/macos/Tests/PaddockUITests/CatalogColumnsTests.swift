@@ -73,11 +73,13 @@ struct CatalogColumnsTests {
             let bounds = host.view.bounds
             let chromeHeight = bounds.height - window.contentLayoutRect.height
             #expect(chromeHeight > 10, "Exercise a real title-bar inset, not a borderless fixture")
-            let sidebarWidth =
-              sidebar
-              ? WorkspacePanelMetrics.width(
-                preferred: model.navigation.panelWidth, mode: .manager, available: bounds.width)
-                + WorkspacePanelMetrics.gap : 0
+            let shells = Self.views(host.view).compactMap {
+              ($0 as? NSSplitView)?.delegate as? WorkspaceSplitController
+            }
+            let shell = try #require(shells.first)
+            let sidebarWidth = shell.contentHost.view.convert(
+              shell.contentHost.view.bounds, to: host.view
+            ).minX
             let dividerX =
               sidebarWidth
               + Columns.listWidth(

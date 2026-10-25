@@ -11,71 +11,75 @@ struct EndpointToolsView: View {
   @State private var confirmLeave = false
   private var dirty: Bool { model.searchEditor?.dirty == true || !model.endpointChanges.isEmpty }
   var body: some View {
-    PaddockScrollView {
-      VStack(alignment: .leading, spacing: 22) {
-        Button(backLabel, systemImage: "chevron.left") {
-          if dirty { confirmLeave = true } else { onBack() }
-        }.buttonStyle(QuietButtonStyle())
-        VStack(alignment: .leading, spacing: 6) {
-          Text("System tools").font(.system(size: 24, weight: .semibold))
-          Text(title).foregroundStyle(.secondary)
-        }
-        if let editor = model.searchEditor, editor.settings.port == port {
-          EndpointFormCard("Web search") { WebSearchForm(editor: editor) }
-          EndpointMCPSection(model: model, port: port)
-          HStack {
-            Button(model.endpointSaving ? "Saving…" : "Save changes") {
-              Task { await model.saveEndpoint(port) }
-            }
-            .buttonStyle(FlatButtonStyle(primary: true))
-            .disabled(!dirty || model.saving || editor.validation != nil)
-            .accessibilityIdentifier("endpoint-tools-save")
-            Button("Discard changes") { model.discardEndpoint() }.buttonStyle(QuietButtonStyle())
-              .disabled(!dirty || model.saving)
-            Spacer()
-            if dirty {
-              Text("Unsaved changes").font(.system(size: 11)).foregroundStyle(.secondary)
-            }
-          }
-        } else if let editor = model.searchEditor, dirty {
-          Text(
-            "Finish the unsaved changes for port \(editor.settings.port) before editing another endpoint."
-          )
-          Button("Return to port \(editor.settings.port)") {
-            model.onConfigureSearch?(editor.settings.port)
-          }
-          .buttonStyle(FlatButtonStyle())
-        } else if model.error == nil {
-          ProgressView("Loading system tools…").controlSize(.small)
-        }
-        if let error = model.error {
-          Text(error).foregroundStyle(PaddockStyle.caution).textSelection(.enabled)
-          Button("Retry") {
-            Task {
-              await model.refresh()
-              await model.loadSearch(port)
-            }
+    ScrollViewReader { proxy in
+      PaddockScrollView {
+        VStack(alignment: .leading, spacing: 22) {
+          Button(backLabel, systemImage: "chevron.left") {
+            if dirty { confirmLeave = true } else { onBack() }
           }.buttonStyle(QuietButtonStyle())
+          VStack(alignment: .leading, spacing: 6) {
+            Text("System tools").font(.system(size: 24, weight: .semibold))
+            Text(title).foregroundStyle(.secondary)
+          }
+          if let editor = model.searchEditor, editor.settings.port == port {
+            EndpointFormCard("Web search") { WebSearchForm(editor: editor) }.settingsSearchAnchor(
+              .webSearch)
+            EndpointMCPSection(model: model, port: port)
+            HStack {
+              Button(model.endpointSaving ? "Saving…" : "Save changes") {
+                Task { await model.saveEndpoint(port) }
+              }
+              .buttonStyle(FlatButtonStyle(primary: true))
+              .disabled(!dirty || model.saving || editor.validation != nil)
+              .accessibilityIdentifier("endpoint-tools-save")
+              Button("Discard changes") { model.discardEndpoint() }.buttonStyle(QuietButtonStyle())
+                .disabled(!dirty || model.saving)
+              Spacer()
+              if dirty {
+                Text("Unsaved changes").font(.system(size: 11)).foregroundStyle(.secondary)
+              }
+            }
+          } else if let editor = model.searchEditor, dirty {
+            Text(
+              "Finish the unsaved changes for port \(editor.settings.port) before editing another endpoint."
+            )
+            Button("Return to port \(editor.settings.port)") {
+              model.onConfigureSearch?(editor.settings.port)
+            }
+            .buttonStyle(FlatButtonStyle())
+          } else if model.error == nil {
+            ProgressView("Loading system tools…").controlSize(.small)
+          }
+          if let error = model.error {
+            Text(error).foregroundStyle(PaddockStyle.caution).textSelection(.enabled)
+            Button("Retry") {
+              Task {
+                await model.refresh()
+                await model.loadSearch(port)
+              }
+            }.buttonStyle(QuietButtonStyle())
+          }
+          if let message = model.message { Text(message).foregroundStyle(.secondary) }
+        }.font(.system(size: 13)).padding(28).frame(maxWidth: 850, alignment: .leading)
+          .frame(maxWidth: .infinity, alignment: .top)
+      }.background(PaddockStyle.canvas).accessibilityIdentifier("endpoint-tools-page")
+        .modifier(SettingsSearchScroll(proxy: proxy))
+        .task(id: port) {
+          await model.refresh()
+          await model.loadSearch(port)
         }
-        if let message = model.message { Text(message).foregroundStyle(.secondary) }
-      }.font(.system(size: 13)).padding(28).frame(maxWidth: 850, alignment: .leading)
-        .frame(maxWidth: .infinity, alignment: .top)
-    }.background(PaddockStyle.canvas).accessibilityIdentifier("endpoint-tools-page")
-      .task(id: port) {
-        await model.refresh()
-        await model.loadSearch(port)
-      }
-      .confirmationDialog(
-        "Keep these changes?", isPresented: $confirmLeave, titleVisibility: .visible
-      ) {
-        Button("Keep editing", role: .cancel) {}
-        Button("Discard changes", role: .destructive) {
-          model.discardEndpoint()
-          onBack()
+        .confirmationDialog(
+          "Keep these changes?", isPresented: $confirmLeave, titleVisibility: .visible
+        ) {
+          Button("Keep editing", role: .cancel) {}
+          Button("Discard changes", role: .destructive) {
+            model.discardEndpoint()
+            onBack()
+          }
+        } message: {
+          Text("The system-tool changes for this endpoint have not been saved.")
         }
-      } message: {
-        Text("The system-tool changes for this endpoint have not been saved.")
-      }
+    }
   }
 }
 

@@ -195,7 +195,7 @@ struct StudioConversationSidebar: View {
             .padding(.horizontal, 8).frame(height: 32)
             .frame(maxWidth: .infinity, alignment: .leading)
         }.buttonStyle(QuietButtonStyle())
-          .disabled(chat.busy || chat.uploading)
+          .disabled(!chat.canNavigateConversation)
           .accessibilityIdentifier("sidebar-new-chat")
       }
       SidebarSearchField(text: $search) {

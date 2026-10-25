@@ -25,6 +25,7 @@ struct StudioDraftEditor: NSViewRepresentable {
   var editorLabel = "Message draft"
   var onWindow: (NSWindow?) -> Void = { _ in }
   var onHeight: (CGFloat) -> Void = { _ in }
+  var position: StudioConversationPosition?
   func makeCoordinator() -> Coordinator { Coordinator(self) }
   func makeNSView(context: Context) -> NSScrollView {
     // Match the initial document width before installing its width autoresizing
@@ -60,9 +61,14 @@ struct StudioDraftEditor: NSViewRepresentable {
       width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
     editor.autoresizingMask = [.width]
     editor.textContainer?.widthTracksTextView = true
-    editor.delegate = context.coordinator
     context.coordinator.editor = editor
     editor.string = text
+    if let selection = position?.value.composer?.selection(in: text) {
+      editor.setSelectedRange(selection)
+    } else {
+      editor.setSelectedRange(NSRange(location: (text as NSString).length, length: 0))
+    }
+    editor.delegate = context.coordinator
     editor.onSend = isEnabled ? onSend : nil
     editor.onFiles = isEnabled ? onFiles : nil
     editor.onImage = isEnabled ? onImage : nil
@@ -76,6 +82,10 @@ struct StudioDraftEditor: NSViewRepresentable {
     editor.provisionalDictation = provisionalDictation
     context.coordinator.scheduleDictation()
     return scroll
+  }
+  static func dismantleNSView(_ scroll: NSScrollView, coordinator: Coordinator) {
+    coordinator.captureSelection()
+    coordinator.editor?.delegate = nil
   }
   func updateNSView(_ scroll: NSScrollView, context: Context) {
     context.coordinator.parent = self
@@ -120,17 +130,24 @@ struct StudioDraftEditor: NSViewRepresentable {
     deinit { NotificationCenter.default.removeObserver(self) }
     // Inline edits and the composer share a window, not an undo history.
     func undoManager(for view: NSTextView) -> UndoManager? { edits }
+    func captureSelection() {
+      guard let editor, !editor.hasMarkedText() else { return }
+      parent.position?.composer(editor.selectedRange(), text: editor.string)
+    }
+    func textViewDidChangeSelection(_ notification: Notification) { captureSelection() }
     @objc private func historyChanged(_ notification: Notification) {
       // TextKit 2 restores the text storage on undo without consistently
       // calling textDidChange. Keep the Swift draft in sync, or Send would
       // submit the pre-undo text even though the editor shows the correction.
       guard let editor else { return }
       parent.text = editor.string
+      captureSelection()
       editor.measureHeight()
     }
     func textDidChange(_ notification: Notification) {
       if let editor = notification.object as? DraftTextView {
         parent.text = editor.string
+        captureSelection()
         editor.measureHeight()
       }
       scheduleDictation()

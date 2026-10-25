@@ -27,6 +27,29 @@ extension NativeCoreCheck {
         "attachments": .array([.object(display)]),
       ])
     let saved = try await transport.api("api/conversation-drafts/native-fixture")
+    let viewState: V = .object([
+      "version": .number(1),
+      "reading": .object([
+        "following": .bool(false), "blockID": .string("answer"),
+        "index": .number(1), "offset": .number(244), "height": .number(1200), "width": .number(760),
+      ]),
+      "composer": .object([
+        "location": .number(3), "length": .number(5),
+        "digest": .string(String(repeating: "a", count: 64)),
+      ]),
+    ])
+    let positionPath = "api/conversations/native-fixture/view-state/macos"
+    try require(
+      try await transport.api(positionPath, method: "PUT", body: viewState)["saved"] == .bool(true),
+      "reading position stored independently in SQLite")
+    let fresh = try NativeConversationTransport(host: host)
+    try require(
+      try await fresh.api(positionPath) == viewState,
+      "fresh native transport restores exact reading and selection state")
+    try require(
+      try await fresh.api("api/conversations/native-fixture/view-state/web") == .null,
+      "web and native view state are independent")
+    await fresh.close()
     try require(saved["text"] == .string("Keep this follow-up 🦊"), "draft text stored in SQLite")
     try require(
       saved["attachments"]?.array?.first?["display"]?["lastPage"] == .string("7"),
@@ -59,6 +82,9 @@ extension NativeCoreCheck {
     try require(
       try await transport.loadConversation("native-fixture").messages.count == 3,
       "clearing preserves all message branches")
+    try require(
+      try await transport.api(positionPath) == viewState,
+      "clearing a follow-up draft retains the conversation reading position")
     await restarted.close()
     print(
       "PASS: native composer drafts, PDF selections, restart restoration and empty-draft cleanup through real Rust/SQLite"

@@ -12,6 +12,9 @@ import WebKit
 public final class StudioWorkspace: NSObject {
   @ObservationIgnored var runtime: NativeStudioRuntime?
   @ObservationIgnored var nativeTransport: NativeConversationTransport?
+  var sessions: [UUID: StudioConversationSession] = [:]
+  var activeSession: UUID?
+  @ObservationIgnored var transportFactory: (() throws -> NativeConversationTransport)?
   @ObservationIgnored private var viewers: [NativeViewerRole: StudioViewerHost] = [:]
   @ObservationIgnored private var preparingGraph = false
   @ObservationIgnored var microphone: NativeMicrophoneSession?
@@ -46,7 +49,7 @@ public final class StudioWorkspace: NSObject {
   private func closeViewer(_ role: NativeViewerRole) {
     viewers.removeValue(forKey: role)?.close()
   }
-  private func closeViewers() {
+  func closeViewers() {
     for role in NativeViewerRole.allCases { closeViewer(role) }
   }
   /// Native panels belong to the composer window even while the WebKit split
@@ -67,6 +70,10 @@ public final class StudioWorkspace: NSObject {
   public private(set) var switchingConversation = false
   var applyingComposer = false
   var composerIdentity: String?
+  public let conversationPositions = StudioConversationPositions()
+  public let workspacePreferences: NativeWorkspacePreferences
+  @ObservationIgnored private let ownsWorkspacePreferences: Bool
+  public private(set) var positionSaveError: String?
   var composerEditRevision: UInt64 = 0
   var composerSavedRevision: UInt64 = 0
   var composerDebounce: Task<Void, Never>?
@@ -106,7 +113,7 @@ public final class StudioWorkspace: NSObject {
   public var conversation: StudioState.Conversation? { state?.conversation }
   public var history: [StudioState.History] { state?.history ?? [] }
   public var busy: Bool {
-    switchingConversation || sending || messageMutation || microphoneStarting
+    preparingQuit || switchingConversation || sending || messageMutation || microphoneStarting
       || (ready && state?.busy == true)
   }
   public var uploading: Bool { !uploads.isEmpty || !incomingDrops.isEmpty }
@@ -116,19 +123,21 @@ public final class StudioWorkspace: NSObject {
   @ObservationIgnored private let client: any ManagerLoading
   @ObservationIgnored private var host: StudioHost?
   @ObservationIgnored private var startTask: Task<Void, Never>?
-  @ObservationIgnored private let presentationDecoder = StudioPresentationDecoder()
   @ObservationIgnored private var uploads: [String: Task<Void, Never>] = [:]
   @ObservationIgnored private var network = URLSession(
     configuration: .ephemeral, delegate: NoRedirects(), delegateQueue: nil)
-  private var sending = false
-  private var closed = false
+  var sending = false
+  var closed = false
+  var preparingQuit = false
   private var dark = false
   private var composerInset: Double = 0
-  private var receivedRevision: UInt64 = 0
+  var receivedRevision: UInt64 = 0
   private var recovery: StudioState?
 
-  public init(client: any ManagerLoading) {
+  public init(client: any ManagerLoading, preferences: NativeWorkspacePreferences? = nil) {
     self.client = client
+    workspacePreferences = preferences ?? NativeWorkspacePreferences(client: client)
+    ownsWorkspacePreferences = preferences == nil
     super.init()
   }
   public func start(assets: URL? = nil) async {
@@ -154,25 +163,28 @@ public final class StudioWorkspace: NSObject {
         guard !closed else { return }
         guard Self.validHost(value) else { throw ManagerError.core("Invalid private native host") }
         host = value
-        let transport = try NativeConversationTransport(host: value)
-        nativeTransport = transport
-        let core = NativeStudioRuntime(
-          transport: transport,
-          prepareGraph: { [weak self] fields in
-            guard let self else { throw CancellationError() }
-            return try await self.prepareGraph(fields)
-          },
-          rasterPDF: { bytes, part in try await NativePDFInput.shared.parts(bytes, metadata: part)
-          },
-          openPDF: { bytes in try await NativePDFInput.shared.source(bytes) },
-          publish: { [weak self] fields in
-            await self?.receiveNative(fields)
-          })
-        runtime = core
+        if ownsWorkspacePreferences { await workspacePreferences.start() }
+        transportFactory = { try NativeConversationTransport(host: value) }
+        conversationPositions.connect(try NativeConversationTransport(host: value))
+        conversationPositions.onError = { [weak self] error in
+          let message = "Could not save the reading position: \(error.localizedDescription)"
+          self?.positionSaveError = message
+          self?.error = message
+        }
+        conversationPositions.onSaved = { [weak self] in
+          guard let self, let failure = self.positionSaveError else { return }
+          if self.error == failure { self.error = nil }
+          self.positionSaveError = nil
+        }
+        let session = try makeSession()
+        selectSession(session)
+        let core = session.runtime
         do { try await core.start(resumeDraft: initialText.isEmpty) } catch {
           await core.close()
           runtime = nil
           nativeTransport = nil
+          sessions[session.id] = nil
+          activeSession = nil
           throw error
         }
       } else {
@@ -193,17 +205,6 @@ public final class StudioWorkspace: NSObject {
       if !closed, !Task.isCancelled { self.error = error.localizedDescription }
     }
   }
-  private func receiveNative(_ fields: [String: ConversationValue]) async {
-    guard !closed else { return }
-    do {
-      let value = try await presentationDecoder.decode(fields)
-      apply(value)
-    } catch {
-      guard !closed, !(error is CancellationError) else { return }
-      self.error = "Invalid native presentation: \(error)"
-      NSLog("Paddock native presentation failed: %@", String(describing: error))
-    }
-  }
   private func updateViewer(_ role: NativeViewerRole) async {
     guard !(role == .graph && preparingGraph), let viewer = viewers[role], let runtime else {
       return
@@ -220,7 +221,7 @@ public final class StudioWorkspace: NSObject {
     async let graph: Void = updateViewer(.graph)
     _ = await (document, graph)
   }
-  private func prepareGraph(_ fields: [String: ConversationValue]) async throws -> String {
+  func prepareGraph(_ fields: [String: ConversationValue]) async throws -> String {
     guard !closed, !Task.isCancelled else { throw CancellationError() }
     preparingGraph = true
     defer { preparingGraph = false }
@@ -241,6 +242,9 @@ public final class StudioWorkspace: NSObject {
     guard !closed, value.version == 1, value.revision > receivedRevision else { return }
     receivedRevision = value.revision
     let becameIdle = state?.busy == true && !value.busy
+    let savedAfterFailure =
+      state?.saveFailed == true && value.saveFailed == false
+      && error == state?.error
     let sessionChanged =
       value.composerDraft?.id != state?.composerDraft?.id
       || (value.composerDraft == nil && value.conversation?.id != state?.conversation?.id)
@@ -292,13 +296,13 @@ public final class StudioWorkspace: NSObject {
       }
     }
     onPresentation?(value)
-    if !value.error.isEmpty { error = value.error }
+    if !value.error.isEmpty { error = value.error } else if savedAfterFailure { error = nil }
   }
   @discardableResult
   public func command(
     _ kind: String, _ payload: [String: StudioValue] = [:], id: String = UUID().uuidString
   ) async throws -> [String: StudioValue] {
-    guard ready, !closed else {
+    guard ready, !closed, !preparingQuit else {
       throw ManagerError.core("Wait for the content workspace to finish opening")
     }
     if hasMessageEdit && ["newChat", "open", "openEndpoint", "renderer", "send"].contains(kind) {
@@ -327,14 +331,41 @@ public final class StudioWorkspace: NSObject {
       }
       switchingConversation = true
     }
-    defer { if navigating || deletingCurrent { switchingConversation = false } }
-    if navigating || deletingCurrent { try await flushComposerDraft() }
+    defer {
+      if navigating || deletingCurrent {
+        switchingConversation = false
+        Task { [weak self] in
+          guard let self else { return }
+          for id in Array(self.sessions.keys) { await self.releaseIdleSession(id) }
+        }
+      }
+    }
+    if navigating || deletingCurrent {
+      try await flushComposerDraft()
+      try await conversationPositions.flush()
+    }
     let native = try JSONDecoder().decode(
       [String: ConversationValue].self, from: JSONEncoder().encode(payload))
+    try protectSessionMutation(kind, native)
+    if kind == "send" || kind == "messageAction" {
+      let active = sessions.values.filter { $0.state?.busy == true }.count
+      if active >= 4 {
+        throw ManagerError.core(
+          "Four conversations are already running. Finish or stop one before starting another.")
+      }
+    }
+    if navigating, activeSession != nil {
+      try await navigateSession(kind, native)
+      return [:]
+    }
     if kind.hasPrefix("microphone") || kind == "dictationAck" {
       return try await audioCommand(kind, native)
     }
     let reply = try await runtime.command(kind, native, id: id)
+    if kind == "models" {
+      workspacePreferences.usedModels(payload["ids"]?.array?.compactMap(\.text) ?? [])
+    }
+    if kind == "retrySave" { try await conversationPositions.flush() }
     if ["preview", "openDocument", "graphArtifact", "graphPanel", "closePreview", "messageAction"]
       .contains(kind)
     {
@@ -381,14 +412,14 @@ public final class StudioWorkspace: NSObject {
     }
   }
   public func newChat() async {
-    guard !busy, !uploading else { return }
+    guard canNavigateConversation else { return }
     do {
       try await command("newChat")
       error = nil
     } catch { self.error = describe(error) }
   }
   public func open(_ id: String) async {
-    guard !busy, !uploading else { return }
+    guard canNavigateConversation else { return }
     do {
       try await command("open", ["id": .string(id)])
       error = nil
@@ -414,6 +445,7 @@ public final class StudioWorkspace: NSObject {
       guard result["accepted"]?.boolean == true else {
         throw ManagerError.core("The message was not accepted; your draft has been kept")
       }
+      workspacePreferences.usedModels(state?.selectedModels ?? [])
       applyingComposer = true
       attachments.removeAll { ids.contains($0.id) }
       if composerText == text { composerText = "" }
@@ -748,17 +780,49 @@ public final class StudioWorkspace: NSObject {
     else { throw ManagerError.core("The content request failed") }
     return (try await Task.detached { try Data(contentsOf: file) }.value, http)
   }
-  public func shutdown() async {
+  public func prepareForQuit() async throws {
+    guard !closed else { return }
+    preparingQuit = true
+    defer { preparingQuit = false }
+    do {
+      if !composerText.isEmpty || !attachments.isEmpty {
+        guard composerIdentity != nil, runtime != nil else {
+          throw ManagerError.core(
+            "Studio is still opening. Your draft has been kept; wait for it to open before quitting."
+          )
+        }
+      }
+      try await flushComposerDraft(allowClosed: true)
+      if ownsWorkspacePreferences { try await workspacePreferences.flush() }
+      try await conversationPositions.flush()
+      await microphone?.cancel()
+      if sessions.isEmpty {
+        try await runtime?.prepareForQuit()
+      } else {
+        for session in Array(sessions.values) { try await session.runtime.prepareForQuit() }
+      }
+    } catch {
+      // A failed background save must immediately restore foreground command
+      // availability, not leave the last "preparing quit" projection onscreen.
+      await runtime?.publishNow()
+      throw error
+    }
+    await runtime?.publishNow()
+  }
+
+  @discardableResult public func shutdown() async -> Bool {
+    do { try await prepareForQuit() } catch {
+      self.error = "Could not save before quitting. Your work is still open: \(describe(error))"
+      return false
+    }
     // Close admission before the first suspension. A host request may ignore
     // cancellation; boot and presentation delivery also check this terminal flag.
-    guard !closed else { return }
+    guard !closed else { return true }
     closed = true
     ready = false
     restoring = false
     startTask?.cancel()
-    do { try await flushComposerDraft(allowClosed: true) } catch { self.error = describe(error) }
     composerDebounce?.cancel()
-    await presentationDecoder.close()
     audioPlayback.reset()
     audioMedia.reset()
     documentMedia.reset()
@@ -771,18 +835,30 @@ public final class StudioWorkspace: NSObject {
     await microphone?.cancel()
     microphone = nil
     await runtime?.close()
+    await conversationPositions.close()
+    if ownsWorkspacePreferences { await workspacePreferences.close() }
+    for session in Array(sessions.values) {
+      await session.runtime.close()
+      await session.decoder.close()
+    }
+    sessions.removeAll()
+    activeSession = nil
     await startTask?.value
     startTask = nil
     runtime = nil
     nativeTransport = nil
     network.invalidateAndCancel()
     closeViewers()
+    return true
   }
   public func reclaimCaches() async {
     audioMedia.reclaim()
     documentMedia.reclaim()
-    await presentationDecoder.reclaim()
     await runtime?.reclaimPresentationCaches()
+    for session in sessions.values where session.id != activeSession {
+      await session.runtime.reclaimPresentationCaches()
+      await session.decoder.reclaim()
+    }
   }
   private func describe(_ error: any Error) -> String { error.localizedDescription }
 }

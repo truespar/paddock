@@ -48,6 +48,7 @@ struct StudioDocumentSplit<Chat: View, Document: View>: NSViewControllerRepresen
   private var lastReadingOffset: CGFloat?
   private var restoringAnchor = false
   private var restoreQueued = false
+  private var paneLayoutTask: Task<Void, Never>?
 
   @objc private func willResize(_ notification: Notification) {
     captureReadingPosition()
@@ -143,19 +144,28 @@ struct StudioDocumentSplit<Chat: View, Document: View>: NSViewControllerRepresen
     documentHost.rootView = document
     guard opened != open else { return }
     opened = open
-    documentItem.isCollapsed = !open
-    view.layoutSubtreeIfNeeded()
-    if open {
-      let available = splitView.bounds.width - splitView.dividerThickness
-      if available >= 640 {
-        let width = min(documentWidth, available - 320)
-        splitView.setPosition(right ? available - width : width, ofDividerAt: 0)
-      }
-    } else if closingFromDocument {
-      if let target = returnFocus as? NSView, target.window === window {
-        window?.makeFirstResponder(target)
-      } else if let editor = editor(in: chatHost.view) {
-        window?.makeFirstResponder(editor)
+    paneLayoutTask?.cancel()
+    // Representable updates run inside SwiftUI's layout transaction. Forcing
+    // the nested split to lay out here reenters the parent graph while it is
+    // resolving the sidebar/header size. Apply only the latest pane change
+    // after that transaction, preserving the same hosts and reading anchor.
+    paneLayoutTask = Task { @MainActor [weak self] in
+      await Task.yield()
+      guard let self, !Task.isCancelled, opened == open else { return }
+      documentItem.isCollapsed = !open
+      view.layoutSubtreeIfNeeded()
+      if open {
+        let available = splitView.bounds.width - splitView.dividerThickness
+        if available >= 640 {
+          let width = min(documentWidth, available - 320)
+          splitView.setPosition(right ? available - width : width, ofDividerAt: 0)
+        }
+      } else if closingFromDocument {
+        if let target = returnFocus as? NSView, target.window === window {
+          window?.makeFirstResponder(target)
+        } else if let editor = editor(in: chatHost.view) {
+          window?.makeFirstResponder(editor)
+        }
       }
     }
   }

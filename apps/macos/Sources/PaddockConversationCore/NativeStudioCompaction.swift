@@ -50,7 +50,7 @@ extension NativeStudioRuntime {
   /// cancel it. The result merges only summary fields into the CURRENT document,
   /// never saves a snapshot over later titles, branches, preferences or turns.
   func scheduleCompaction() {
-    guard compactionTask == nil, !closed, !busy, !draft, selected.count == 1,
+    guard compactionTask == nil, !closed, !preparingQuit, !busy, !draft, selected.count == 1,
       preferenceBool("summarize", fallback: true), let doc = document,
       let modelID = selected.first, canChat(modelID),
       capability(modelID)["document_parser"]?.bool != true,

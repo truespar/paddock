@@ -7,17 +7,24 @@ import SwiftUI
 struct NativeThinkingBlock: View {
   let message: StudioState.NativeTranscript.Message
   @Environment(\.transcriptDisclosure) private var readerDisclosure
+  @Environment(\.conversationFind) private var find
   @State private var manualOpen: Bool?
   @State private var pinned = true
   @State private var started = Date()
   @State private var reasoningHeight: CGFloat = 1
   private var active: Bool { message.streaming && message.text.isEmpty }
-  private var expanded: Bool { manualOpen ?? active }
+  private var findTarget: Bool { find?.current?.itemID == message.id + "/reasoning" }
+  private var expanded: Bool { findTarget || (manualOpen ?? active) }
   var body: some View {
     VStack(alignment: .leading, spacing: 0) {
       Button {
         readerDisclosure?.reveal()
-        manualOpen = !expanded
+        if findTarget {
+          find?.close()
+          manualOpen = false
+        } else {
+          manualOpen = !expanded
+        }
       } label: {
         HStack(spacing: 7) {
           Image(systemName: "brain").frame(width: 14, height: 14)
@@ -44,7 +51,7 @@ struct NativeThinkingBlock: View {
         .accessibilityIdentifier("thinking-toggle-\(message.id)")
       if expanded {
         Group {
-          if active {
+          if active && !findTarget {
             ScrollViewReader { proxy in
               PaddockScrollView {
                 VStack(alignment: .leading, spacing: 0) {

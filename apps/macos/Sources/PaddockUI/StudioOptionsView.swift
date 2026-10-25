@@ -18,15 +18,19 @@ struct StudioModelSelectionView: View {
   @State private var highlighted: String?
   @State private var applying = false
   private var models: [StudioState.Model] { chat.state?.models ?? [] }
+  private var preferences: NativeWorkspacePreferences { chat.workspacePreferences }
   private var blocked: Bool { chat.busy || chat.hasMessageEdit || applying || !chat.ready }
   private var visibleIDs: [String] {
     let policy = StudioModelSelectionPolicy(models: models)
-    return StudioCompareList.groups(models, search: search, includeUnavailable: !comparing)
-      .flatMap(\.models).filter { model in
-        model.status == "ok"
-          && (!comparing || selected.contains(model.id)
-            || policy.canApply(selected.union([model.id])))
-      }.map(\.id)
+    return StudioCompareList.groups(
+      models, search: search, includeUnavailable: !comparing,
+      favorites: preferences.favorites, recent: preferences.recentModels
+    )
+    .flatMap(\.models).filter { model in
+      model.status == "ok"
+        && (!comparing || selected.contains(model.id)
+          || policy.canApply(selected.union([model.id])))
+    }.map(\.id)
   }
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
@@ -39,22 +43,36 @@ struct StudioModelSelectionView: View {
         onMove: { highlighted = SearchNavigation.moved(highlighted, in: visibleIDs, by: $0) },
         onSubmit: {
           if let id = highlighted ?? visibleIDs.first { activate(id) }
-        }, onCancel: { dismiss() })
+        }, onCancel: { dismiss() },
+        onCommit: {
+          if comparing {
+            applyComparison()
+          } else if let id = highlighted ?? visibleIDs.first {
+            activate(id)
+          }
+        })
       if comparing { StudioCompareSelectionBar(selected: $selected, busy: blocked) }
       StudioCompareList(
         models: models, selected: $selected, search: search, single: !comparing,
-        highlighted: highlighted, onSelect: { activate($0) }
+        highlighted: highlighted, onSelect: { activate($0) },
+        favorites: preferences.favorites, recent: preferences.recentModels,
+        onFavorite: preferences.loaded ? { preferences.toggleFavorite($0) } : nil
       ).disabled(blocked)
+      if let error = preferences.error {
+        HStack {
+          Text(error).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+          Button("Retry") { Task { await preferences.retry() } }.buttonStyle(QuietButtonStyle())
+        }
+      }
       if let error = chat.error { Text(error).foregroundStyle(.secondary) }
       if comparing {
         HStack {
           Spacer()
           Button("Cancel") { dismiss() }.buttonStyle(FlatButtonStyle())
           Button("Use selection") {
-            apply(
-              StudioCompareList.orderedSelection(
-                selected, existing: chat.state?.selectedModels ?? []))
+            applyComparison()
           }.buttonStyle(FlatButtonStyle(primary: true))
+            .keyboardShortcut(.return, modifiers: .command)
             .disabled(!StudioCompareList.canApply(selected, models: models) || blocked)
         }
       }
@@ -63,7 +81,9 @@ struct StudioModelSelectionView: View {
         comparing = initiallyComparing
         selected = Set(chat.state?.selectedModels ?? [])
         highlighted = chat.state?.modelHeader?.currentModel
+        if !visibleIDs.contains(highlighted ?? "") { highlighted = visibleIDs.first }
       }
+      .task { await preferences.start() }
       .onChange(of: visibleIDs) { _, ids in
         if !ids.contains(highlighted ?? "") { highlighted = ids.first }
       }
@@ -86,6 +106,10 @@ struct StudioModelSelectionView: View {
       applying = false
       if chat.error == nil { dismiss() }
     }
+  }
+  private func applyComparison() {
+    guard StudioCompareList.canApply(selected, models: models) else { return }
+    apply(StudioCompareList.orderedSelection(selected, existing: chat.state?.selectedModels ?? []))
   }
 }
 
@@ -141,6 +165,9 @@ struct StudioCompareList: View {
   var single = false
   var highlighted: String?
   var onSelect: ((String) -> Void)?
+  var favorites: Set<String> = []
+  var recent: [String] = []
+  var onFavorite: ((String) -> Void)?
 
   struct Group: Identifiable {
     let id: String
@@ -149,7 +176,8 @@ struct StudioCompareList: View {
   }
 
   static func groups(
-    _ models: [StudioState.Model], search: String, includeUnavailable: Bool = false
+    _ models: [StudioState.Model], search: String, includeUnavailable: Bool = false,
+    favorites: Set<String> = [], recent: [String] = []
   ) -> [Group] {
     let terms = search.split(whereSeparator: \.isWhitespace).map(String.init)
     let available = models.filter { model in
@@ -161,11 +189,23 @@ struct StudioCompareList: View {
         }
     }
     var groups: [Group] = []
-    let local = available.filter { $0.port != nil }
+    let starred = available.filter { favorites.contains($0.id) }
+    if !starred.isEmpty {
+      groups.append(Group(id: "favorites", title: "Favorites", models: starred))
+    }
+    let byID = Dictionary(available.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+    var promoted = Set(starred.map(\.id))
+    let latest = recent.compactMap { id -> StudioState.Model? in
+      guard let model = byID[id], promoted.insert(id).inserted else { return nil }
+      return model
+    }
+    if !latest.isEmpty { groups.append(Group(id: "recent", title: "Recent", models: latest)) }
+    let remaining = available.filter { !promoted.contains($0.id) }
+    let local = remaining.filter { $0.port != nil }
     if !local.isEmpty { groups.append(Group(id: "local", title: "Local", models: local)) }
     var providers: [String] = []
     var byProvider: [String: [StudioState.Model]] = [:]
-    for model in available where model.port == nil {
+    for model in remaining where model.port == nil {
       if byProvider[model.provider] == nil { providers.append(model.provider) }
       byProvider[model.provider, default: []].append(model)
     }
@@ -188,7 +228,8 @@ struct StudioCompareList: View {
   }
 
   var body: some View {
-    let groups = Self.groups(models, search: search, includeUnavailable: single)
+    let groups = Self.groups(
+      models, search: search, includeUnavailable: single, favorites: favorites, recent: recent)
     let height = min(300, max(72, CGFloat(groups.reduce(0) { $0 + 26 + $1.models.count * 52 + 8 })))
     let policy = StudioModelSelectionPolicy(models: models)
     ScrollViewReader { proxy in
@@ -207,7 +248,7 @@ struct StudioCompareList: View {
             Text(group.title).font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
               .frame(height: 26).accessibilityAddTraits(.isHeader)
             ForEach(group.models) { model in
-              SwiftUI.Group {
+              HStack(spacing: 6) {
                 if single {
                   StudioSingleModelRow(model: model, selected: selected.contains(model.id)) {
                     onSelect?(model.id)
@@ -223,6 +264,21 @@ struct StudioCompareList: View {
                   ).disabled(
                     !selected.contains(model.id)
                       && !policy.canApply(selected.union([model.id])))
+                }
+                if let onFavorite {
+                  Button {
+                    onFavorite(model.id)
+                  } label: {
+                    Image(systemName: favorites.contains(model.id) ? "star.fill" : "star")
+                      .font(.system(size: 12)).foregroundStyle(.secondary)
+                      .frame(width: 26, height: 32).contentShape(Rectangle())
+                  }.buttonStyle(.plain)
+                    .accessibilityLabel(
+                      "\(favorites.contains(model.id) ? "Remove" : "Add") \(model.title) \(favorites.contains(model.id) ? "from" : "to") favorites"
+                    )
+                    .accessibilityIdentifier("favorite-model-\(model.id)")
+                    .help(
+                      favorites.contains(model.id) ? "Remove from favorites" : "Add to favorites")
                 }
               }.background(
                 highlighted == model.id ? PaddockStyle.elevated : .clear,

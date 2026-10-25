@@ -7,6 +7,20 @@ import Testing
 
 @Suite("Native compare model picker", .serialized) @MainActor
 struct StudioCompareTests {
+  @Test func favoriteAndRecentGroupsKeepProviderPinsAndNeverDuplicateChoices() throws {
+    let models = try fixture()
+    let pinned = "cloud:account:meta/muse@meta"
+    let groups = StudioCompareList.groups(
+      models, search: "", includeUnavailable: true,
+      favorites: [pinned, "missing"], recent: [pinned, "qwen", "qwen", "missing"])
+    #expect(groups.map(\.title) == ["Favorites", "Recent", "OpenRouter"])
+    #expect(groups.flatMap(\.models).map(\.id) == [pinned, "qwen", "stopped"])
+    let filtered = StudioCompareList.groups(
+      models, search: "OpenRouter @meta", favorites: [pinned], recent: ["qwen"])
+    #expect(filtered.flatMap(\.models).map(\.id) == [pinned])
+    #expect(!StudioCompareList.canApply([pinned, "stopped"], models: models))
+  }
+
   @Test func imageDimensionsSnapToEndpointGridWithoutSilentStaleValues() {
     #expect(StudioImageControls.snappedSide("999", grid: 32, maxSide: 2752, fallback: 1024) == 992)
     #expect(
@@ -88,7 +102,10 @@ struct StudioCompareTests {
           count == 2 ? try fixture() : try (0..<count).map { try model(id: "cloud-\($0)") }
         let host = NSHostingController(
           rootView:
-            StudioCompareList(models: models, selected: .constant(["qwen"]))
+            StudioCompareList(
+              models: models, selected: .constant(["qwen"]),
+              favorites: [models[0].id], recent: [models[1].id], onFavorite: { _ in }
+            )
             .environment(\.colorScheme, dark ? .dark : .light))
         let fit = host.sizeThatFits(in: CGSize(width: 348, height: 600))
         #expect(fit.width <= 348)

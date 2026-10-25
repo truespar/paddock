@@ -30,64 +30,31 @@ struct StudioConversationBars<Header: View, Footer: View>: ViewModifier {
 }
 
 struct StudioConversationChrome<Content: View>: View {
-  var title: String? = nil
-  var titleColumn: CGRect? = nil
   @ViewBuilder var content: () -> Content
-  @Environment(\.workspaceLeadingPaneInset) private var leadingPaneInset
-  @State private var titlebarInset: CGFloat = 0
+  @Environment(\.workspaceWindowChrome) private var windowChrome
+  @State private var standaloneInset: CGFloat = 0
+  private var titlebarInset: CGFloat { windowChrome?.topInset ?? standaloneInset }
 
   var body: some View {
     VStack(spacing: 0) {
       if titlebarInset > 0 {
         PaddockStyle.canvas.frame(height: titlebarInset)
           .contentShape(Rectangle()).gesture(WindowDragGesture())
-          .overlay {
-            GeometryReader { geometry in
-              let clearance = leadingPaneInset > 0 ? CGFloat(240) : 20
-              let column =
-                titleColumn
-                ?? StudioColumnLayout.resolve(
-                  available: geometry.size.width, viewport: nil)
-              if let title, !title.isEmpty,
-                let frame = StudioConversationTitleLayout.frame(
-                  available: geometry.size.width, height: titlebarInset,
-                  column: column, controlsClearance: clearance)
-              {
-                Text(title)
-                  .font(.system(size: 13, weight: .medium))
-                  .lineLimit(1).truncationMode(.tail)
-                  .help(title).accessibilityLabel("Conversation: \(title)")
-                  .accessibilityIdentifier("conversation-header-title")
-                  .frame(width: frame.width, height: frame.height, alignment: .leading)
-                  .offset(x: frame.minX)
-              }
-            }
+          .overlay(alignment: .bottom) {
+            if windowChrome == nil { Divider() }
           }
-          .overlay(alignment: .bottom) { Divider() }
       }
       content().frame(maxWidth: .infinity, maxHeight: .infinity).clipped()
     }
     .background(PaddockStyle.canvas)
     .background(alignment: .top) {
-      StudioWindowChromeProbe { titlebarInset = $0 }
-        .frame(height: 0).allowsHitTesting(false).accessibilityHidden(true)
+      // Standalone rendering fixtures have no workspace shell. The app uses
+      // the shell's single measurement for sidebar, catalog and every pane.
+      if windowChrome == nil {
+        StudioWindowChromeProbe { standaloneInset = $0 }
+          .frame(height: 0).allowsHitTesting(false).accessibilityHidden(true)
+      }
     }
-  }
-}
-
-enum StudioConversationTitleLayout {
-  /// Anchor to the chat column, never to the center of the whole window or
-  /// the center of an asymmetrically padded toolbar. Keep native controls clear.
-  static func frame(available: CGFloat, height: CGFloat, column: CGRect, controlsClearance: CGFloat)
-    -> CGRect?
-  {
-    guard available.isFinite, height.isFinite, column.minX.isFinite, column.maxX.isFinite,
-      controlsClearance.isFinite, height > 0
-    else { return nil }
-    let left = max(0, max(column.minX, controlsClearance))
-    let right = min(column.maxX, available - 52)
-    guard right - left >= 100 else { return nil }
-    return CGRect(x: left, y: 0, width: right - left, height: height)
   }
 }
 

@@ -24,31 +24,27 @@ struct StudioConversationView: View {
   private var artifact: StudioState.Artifact? {
     chat.state?.nativeArtifacts?.first { $0.id == chat.selectedArtifactId }
   }
-  private var conversationTopInset: CGFloat {
-    chat.state?.nativeDocument == nil ? leadingPaneInset : 0
-  }
   var body: some View {
     StudioDocumentSplit(open: chat.state?.nativeDocument != nil) {
       StudioDocumentSplit(open: graphOpen || artifact != nil, right: true) {
-        VStack(spacing: 0) {
-          if let notices { notices.padding(.top, conversationTopInset) }
-          conversationContent
-        }
+        conversationContent
       } document: {
-        if graphOpen {
-          VStack(spacing: 0) {
-            HStack {
-              Text("Traverse").font(.system(size: 12))
-              Spacer()
-              Button("Close graph", systemImage: "xmark") {
-                Task { await chat.perform("graphPanel", ["open": .bool(false)]) }
-              }.labelStyle(.iconOnly).buttonStyle(.plain)
-            }.padding(12)
-            WorkspaceContentView(session: chat, role: .graph)
-          }.background(PaddockStyle.canvas)
-        } else if artifact != nil {
-          NativeArtifactPanel(workspace: chat)
-        }
+        Group {
+          if graphOpen {
+            VStack(spacing: 0) {
+              HStack {
+                Text("Traverse").font(.system(size: 12))
+                Spacer()
+                Button("Close graph", systemImage: "xmark") {
+                  Task { await chat.perform("graphPanel", ["open": .bool(false)]) }
+                }.labelStyle(.iconOnly).buttonStyle(.plain)
+              }.padding(12)
+              WorkspaceContentView(session: chat, role: .graph)
+            }.background(PaddockStyle.canvas)
+          } else if artifact != nil {
+            NativeArtifactPanel(workspace: chat)
+          }
+        }.padding(.top, leadingPaneInset)
       }.ignoresSafeArea(.container, edges: .top)
     } document: {
       Group {
@@ -100,36 +96,36 @@ struct StudioConversationView: View {
       let column = StudioColumnLayout.resolve(
         available: geometry.size.width, viewport: nil,
         comparison: chat.state?.nativeTranscript?.hasComparisons == true)
-      StudioConversationChrome(title: chat.conversation?.title, titleColumn: column) {
-        Group {
-          // NativeStudioRuntime owns streaming; no hidden WebView is required.
-          // Attach web content only in the allowlisted viewer panels above.
-          if !welcome, let transcript = chat.state?.nativeTranscript {
-            NativeStudioTranscript(
-              transcript: transcript, columnWidth: column.width,
-              composerHeight: measuredComposerHeight,
-              composer: AnyView(composer(columnWidth: column.width)),
-              workspace: chat,
-              onOpenDocument: { messageId, attachmentId in
-                Task {
-                  await chat.perform(
-                    "openDocument",
-                    ["messageId": .string(messageId), "attachmentId": .string(attachmentId)])
+      StudioConversationChrome {
+        VStack(spacing: 0) {
+          if let notices { notices }
+          Group {
+            // NativeStudioRuntime owns streaming; no hidden WebView is required.
+            // Attach web content only in the allowlisted viewer panels above.
+            if !welcome, let transcript = chat.state?.nativeTranscript {
+              NativeStudioTranscript(
+                transcript: transcript, columnWidth: column.width,
+                composerHeight: measuredComposerHeight,
+                composer: AnyView(composer(columnWidth: column.width)),
+                workspace: chat,
+                onOpenDocument: { messageId, attachmentId in
+                  Task {
+                    await chat.perform(
+                      "openDocument",
+                      ["messageId": .string(messageId), "attachmentId": .string(attachmentId)])
+                  }
                 }
-              }
-            )
-            .id(chat.conversation?.id)
-          } else {
-            composer(columnWidth: column.width)
+              )
+              .id(chat.conversation?.id)
+            } else {
+              composer(columnWidth: column.width)
+            }
           }
+          .frame(width: geometry.size.width)
+          .frame(maxHeight: .infinity)
+          .background(PaddockStyle.canvas)
         }
-        .frame(width: geometry.size.width)
-        .frame(maxHeight: .infinity)
-        .background(PaddockStyle.canvas)
       }
-      // When a left document pane is open, it owns the window buttons; the
-      // conversation header must not reserve their width a second time.
-      .environment(\.workspaceLeadingPaneInset, conversationTopInset)
     }
   }
 
@@ -146,6 +142,9 @@ struct StudioConversationView: View {
             .secondary)
           if !chat.ready {
             Button("Reload content") { chat.reload() }.buttonStyle(FlatButtonStyle())
+          } else if chat.state?.saveFailed == true || chat.positionSaveError != nil {
+            Button("Retry save") { Task { await chat.perform("retrySave") } }
+              .buttonStyle(FlatButtonStyle()).disabled(chat.switchingConversation)
           }
         }.padding(.bottom, 10).accessibilityIdentifier("chat-error")
       }

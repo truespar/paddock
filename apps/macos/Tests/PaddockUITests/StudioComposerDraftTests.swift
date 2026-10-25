@@ -80,6 +80,32 @@ struct StudioComposerDraftTests {
       DraftProtocol.state.withLock { $0.drafts[id]?["text"] == .string("Never discard this") })
     #expect(DraftProtocol.state.withLock { $0.drafts[id]?["attachments"] == .array([]) })
   }
+
+  @Test func failedQuitSaveLeavesEditorAndRuntimeAliveForRetry() async throws {
+    let chat = try await workspace()
+    let id = try #require(chat.composerIdentity)
+    chat.composerText = "Keep this if SQLite fails"
+    DraftProtocol.state.withLock { $0.fail = true }
+    #expect(await chat.shutdown() == false)
+    #expect(chat.ready && !chat.preparingQuit)
+    #expect(chat.runtime != nil && chat.composerIdentity == id)
+    #expect(chat.composerText == "Keep this if SQLite fails")
+    #expect(chat.error?.contains("still open") == true)
+    chat.composerText += " — retry"
+    DraftProtocol.state.withLock { $0.fail = false }
+    #expect(await chat.shutdown())
+    #expect(
+      DraftProtocol.state.withLock {
+        $0.drafts[id]?["text"] == .string("Keep this if SQLite fails — retry")
+      })
+  }
+
+  @Test func textEnteredBeforeStartupCannotBeSilentlyDiscardedByQuit() async {
+    let chat = StudioWorkspace(client: DraftNoCore())
+    chat.composerText = "Typed while opening"
+    #expect(await chat.shutdown() == false)
+    #expect(!chat.closed && chat.composerText == "Typed while opening")
+  }
   private func draft(_ id: String, text: String, attachments: [StudioAttachment] = []) throws
     -> StudioState.ComposerDraft
   {

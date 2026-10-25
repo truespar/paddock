@@ -120,6 +120,24 @@ struct DesktopTests {
     #expect(result.first?.route == .conversation("chat"))
     #expect(tracker.studio(conversationID: "chat", busy: true, activity: projection).isEmpty)
   }
+
+  @Test func interleavedConversationsRetainIndependentCompletionAndApprovalEdges() throws {
+    var tracker = DesktopEventTracker()
+    let pending = try activity("streaming", approvals: ["approval-a"])
+    #expect(tracker.studio(conversationID: "first", busy: true, activity: pending).count == 1)
+    _ = tracker.studio(conversationID: "second", busy: true, activity: try activity("streaming"))
+    #expect(tracker.studio(conversationID: "first", busy: true, activity: pending).isEmpty)
+    let first = tracker.studio(
+      conversationID: "first", busy: false, activity: try activity("completed"))
+    #expect(first.map(\.route) == [.conversation("first")])
+    let second = tracker.studio(
+      conversationID: "second", busy: false, activity: try activity("failed"))
+    #expect(second.map(\.route) == [.conversation("second")])
+    #expect(second.map(\.kind) == [.replyIssue])
+    #expect(
+      tracker.studio(conversationID: "first", busy: false, activity: try activity("completed"))
+        .isEmpty)
+  }
   @Test func notificationRoutesAreAllowlistedDataOnly() {
     #expect(DesktopNotifications.route(["destination": "manager"]) == .manager)
     #expect(

@@ -4,8 +4,9 @@ import PaddockConversationCore
 
 extension StudioWorkspace {
   public var canNavigateConversation: Bool {
-    !busy && !uploading && !hasMessageEdit && attachments.allSatisfy(\.ready)
-      && !hasArtifactEdits
+    !preparingQuit && !switchingConversation && !sending && !messageMutation && !microphoneBusy
+      && (state?.canNavigateConversation ?? !busy)
+      && !uploading && !hasMessageEdit && attachments.allSatisfy(\.ready) && !hasArtifactEdits
   }
 
   func composerChanged() {
@@ -58,6 +59,7 @@ extension StudioWorkspace {
         _ = try await runtime.command("saveDraft", native)
         guard self.composerIdentity == identity else { return }
         self.composerSavedRevision = revision
+        self.conversationPositions.resave(identity)
       }
       composerSave = task
       try await task.value

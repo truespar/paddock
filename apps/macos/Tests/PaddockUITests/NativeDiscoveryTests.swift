@@ -19,7 +19,7 @@ struct NativeDiscoveryTests {
     #expect(SettingsSearchIndex.search("dictation").map(\.anchor) == [.microphone])
     #expect(SettingsSearchIndex.search("hotkey").map(\.anchor) == [.shortcut])
     #expect(SettingsSearchIndex.search("OpenRouter").map(\.destination) == [.cloudProviders])
-    #expect(SettingsSearchIndex.search("MCP").map(\.destination) == [.connectors])
+    #expect(Set(SettingsSearchIndex.search("MCP").map(\.destination)) == [.connectors])
     for section in ["maxTokens", "maxToolCalls", "summarize", "microphone", "mapTiles"] {
       #expect(SettingsAnchor.conversationSection(section)?.destination == .general)
     }

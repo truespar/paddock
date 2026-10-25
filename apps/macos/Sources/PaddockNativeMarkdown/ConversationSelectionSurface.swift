@@ -3,16 +3,22 @@ import SwiftUI
 
 /// Stable logical order also covers messages outside a LazyVStack's mounted
 /// viewport. Hidden reasoning is not copied unless its disclosure is mounted.
-public struct ConversationSelectionItem: Sendable {
+public struct ConversationSelectionItem: Equatable, Sendable {
+  public enum Presentation: Sendable { case text, toolArguments, toolOutput }
   public let id: String
   public let text: String
   public let includeWhenUnmounted: Bool
   public let markdown: Bool
-  public init(id: String, text: String, includeWhenUnmounted: Bool = true, markdown: Bool = false) {
+  public let presentation: Presentation
+  public init(
+    id: String, text: String, includeWhenUnmounted: Bool = true, markdown: Bool = false,
+    presentation: Presentation = .text
+  ) {
     self.id = id
     self.text = text
     self.includeWhenUnmounted = includeWhenUnmounted
     self.markdown = markdown
+    self.presentation = presentation
   }
 }
 
@@ -43,6 +49,7 @@ public struct ConversationSelectionSurface<Content: View>: NSViewRepresentable {
     #endif
     view.items = items
     view.rootView = AnyView(content.environment(\.self, context.environment))
+    view.findReveal.update(context.environment.conversationFind)
   }
   public func sizeThatFits(
     _ proposal: ProposedViewSize, nsView: ConversationSelectionHost, context: Context
@@ -57,6 +64,7 @@ public struct ConversationSelectionSurface<Content: View>: NSViewRepresentable {
     var contentUpdates = 0
   #endif
   var items: [ConversationSelectionItem] = []
+  lazy var findReveal = ConversationFindReveal(host: self)
   private var anchor: Point?
   private var extent: Point?
   private var selectedText = ""
@@ -75,6 +83,7 @@ public struct ConversationSelectionSurface<Content: View>: NSViewRepresentable {
     struct Segment {
       let original: NSRange
       let plain: NSRange
+      let attachment: Bool
     }
     let view: NSTextView
     let id: String
@@ -101,7 +110,8 @@ public struct ConversationSelectionSurface<Content: View>: NSViewRepresentable {
         segments.append(
           Segment(
             original: range,
-            plain: NSRange(location: output.length, length: (value as NSString).length)))
+            plain: NSRange(location: output.length, length: (value as NSString).length),
+            attachment: attachment != nil))
         output.append(value)
       }
       text = output.copy() as! NSString
@@ -144,6 +154,7 @@ public struct ConversationSelectionSurface<Content: View>: NSViewRepresentable {
     dragTimer?.invalidate()
     dragTimer = nil
     guard window != nil else {
+      findReveal.cancel()
       copyPreparation?.cancel()
       copyPreparation = nil
       selectionEpoch += 1
@@ -361,7 +372,7 @@ public struct ConversationSelectionSurface<Content: View>: NSViewRepresentable {
     return false
   }
 
-  private func maps() -> [Map] {
+  func maps(matching id: String? = nil) -> [Map] {
     func roots(_ view: NSView) -> [NSTextView] {
       guard !view.isHidden else { return [] }
       if let text = view as? NSTextView, text.isSelectable, !text.isEditable {
@@ -371,7 +382,15 @@ public struct ConversationSelectionSurface<Content: View>: NSViewRepresentable {
     }
     let order = Dictionary(
       items.enumerated().map { ($0.element.id, $0.offset) }, uniquingKeysWith: { a, _ in a })
-    return roots(self).map { Map($0) }.sorted {
+    return roots(self).filter { text in
+      guard let id else { return true }
+      var ancestor: NSView? = text
+      while let view = ancestor, view !== self {
+        if view.identifier?.rawValue == id { return true }
+        ancestor = view.superview
+      }
+      return false
+    }.map { Map($0) }.sorted {
       (order[$0.id] ?? Int.max) < (order[$1.id] ?? Int.max)
     }
   }
@@ -463,7 +482,7 @@ public struct ConversationSelectionSurface<Content: View>: NSViewRepresentable {
           location: part.length > 0 ? part.location - location.location : 0, length: part.length))
     }
   }
-  private func textDescendants(_ root: NSView) -> [NSTextView] {
+  func textDescendants(_ root: NSView) -> [NSTextView] {
     ((root as? NSTextView).map { [$0] } ?? []) + root.subviews.flatMap(textDescendants)
   }
   private static func wordRange(_ text: NSString, at position: Int) -> NSRange {

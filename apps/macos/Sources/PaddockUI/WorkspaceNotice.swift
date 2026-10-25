@@ -7,6 +7,7 @@ struct WorkspaceNotice: View {
   let message: String
   let kind: Kind
   var dismiss: (() -> Void)? = nil
+  var retry: (() -> Void)? = nil
 
   var body: some View {
     HStack(alignment: .top, spacing: 10) {
@@ -21,6 +22,9 @@ struct WorkspaceNotice: View {
       Text(message).foregroundStyle(.secondary).textSelection(.enabled)
         .fixedSize(horizontal: false, vertical: true)
         .frame(maxWidth: .infinity, alignment: .leading)
+      if let retry {
+        Button("Retry", action: retry).buttonStyle(QuietButtonStyle())
+      }
       if let dismiss {
         Button("Dismiss", systemImage: "xmark", action: dismiss)
           .labelStyle(.iconOnly).buttonStyle(QuietButtonStyle())

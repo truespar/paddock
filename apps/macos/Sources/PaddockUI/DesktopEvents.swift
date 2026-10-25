@@ -35,10 +35,11 @@ struct DesktopEventTracker {
   private var previous: ManagerSnapshot?
   private var unhealthy = Set<String>()
   private var missed = Set<String>()
-  private var observedReplies = Set<String>()
-  private var approvals = Set<String>()
-  private var conversation: String?
-  private var completedTurn: String?
+  private var replySessions: [String: Set<String>] = [:]
+  private var approvalSessions: [String: Set<String>] = [:]
+  private var sessionOrder: [String] = []
+  private var completedTurns = Set<String>()
+  private var completionOrder: [String] = []
   private var studioInitialized = false
 
   mutating func management(_ value: ManagerSnapshot) -> [DesktopEvent] {
@@ -137,15 +138,27 @@ struct DesktopEventTracker {
     -> [DesktopEvent]
   {
     let completion = activity.completedTurn
-    let freshCompletion = studioInitialized && completion != nil && completion?.id != completedTurn
-    completedTurn = completion?.id
-    studioInitialized = true
-    if conversation != conversationID {
-      observedReplies.removeAll()
-      approvals.removeAll()
-      conversation = conversationID
+    let freshCompletion =
+      studioInitialized && completion.map { !completedTurns.contains($0.id) } == true
+    if let completion, completedTurns.insert(completion.id).inserted {
+      completionOrder.append(completion.id)
+      if completionOrder.count > 256 { completedTurns.remove(completionOrder.removeFirst()) }
     }
+    studioInitialized = true
     guard let conversationID else { return [] }
+    var observedReplies = replySessions[conversationID] ?? []
+    var approvals = approvalSessions[conversationID] ?? []
+    defer {
+      replySessions[conversationID] = observedReplies
+      approvalSessions[conversationID] = approvals
+      sessionOrder.removeAll { $0 == conversationID }
+      sessionOrder.append(conversationID)
+      if sessionOrder.count > 128 {
+        let oldest = sessionOrder.removeFirst()
+        replySessions[oldest] = nil
+        approvalSessions[oldest] = nil
+      }
+    }
     var events: [DesktopEvent] = []
     let currentApprovals = Set(activity.approvals)
     for id in currentApprovals.subtracting(approvals) {

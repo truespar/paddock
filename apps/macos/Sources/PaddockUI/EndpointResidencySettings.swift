@@ -14,6 +14,7 @@ struct EndpointResidencySettings: View {
             Button("On first request") { editor.loadOnDemand = true }
           }
         }
+        .settingsSearchAnchor(.modelLoading)
         SettingsRow(title: "Unload after inactivity") {
           HStack(spacing: 8) {
             TextField("Never", text: $editor.unloadIdleSeconds)
@@ -24,14 +25,17 @@ struct EndpointResidencySettings: View {
             "Leave empty to keep the model loaded. Zero unloads after all requests and realtime sessions finish. The API stays available."
           )
         }
+        .settingsSearchAnchor(.idleUnload)
         if editor.advanced {
           SettingsRow(title: "Load wait limit") {
             HStack(spacing: 8) {
               TextField("120", text: $editor.loadWaitSeconds).textFieldStyle(
-                StudioPopoverFieldStyle())
+                StudioPopoverFieldStyle()
+              )
+              .accessibilityIdentifier("residency-load-wait")
               Text("seconds").foregroundStyle(.secondary)
             }
-          }
+          }.settingsSearchAnchor(.loadWait)
         }
       }.accessibilityIdentifier("endpoint-residency-settings")
     }
