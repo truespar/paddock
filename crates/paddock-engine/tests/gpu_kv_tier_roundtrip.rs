@@ -421,6 +421,78 @@ fn cancelled_store_completes_failed_and_releases_everything() {
     );
 }
 
+/// A store a restore waits on goes ahead of the load-first rule: queued
+/// behind a load in flight, `expedite` launches it anyway - and both land.
+#[test]
+fn an_expedited_store_launches_beside_a_load_in_flight() {
+    let Some(exec) = common::gpu() else { return };
+    if !exec.has_kv_tier_xfer() {
+        common::missing("pack has no kv tier gather/scatter (slots 479/480) - rebuild it");
+        return;
+    }
+    let mut transport = RamTransport::new(&exec, 64 << 20).expect("transport");
+    let mut catalog = TierCatalog::new(TierCatalogConfig {
+        ram_capacity: 64 << 20,
+        nvme_capacity: 0,
+    });
+    let pool = build_pool(&exec);
+    let descs = plane_descs(&exec, &pool);
+    let sealed = (N_PLANES * PLANE_BLOCK_BYTES) as u64 * 2;
+    let store = |transport: &mut RamTransport, catalog: &mut TierCatalog, key, ids: Vec<u32>| {
+        transport
+            .expect_store(
+                key,
+                XferSpec {
+                    planes: descs.clone(),
+                    block_ids: ids,
+                    after: None,
+                },
+            )
+            .expect("expect_store");
+        catalog.reserve(key, Tier::Ram, sealed).unwrap();
+        let (op, job) = catalog.begin_store_adopt(key, Tier::Ram, sealed).unwrap();
+        transport.submit(job).expect("submit store");
+        op
+    };
+    let a: LogicalKey = test_namespace().root().child(&[21]);
+    let b: LogicalKey = test_namespace().root().child(&[22]);
+    store(&mut transport, &mut catalog, a, vec![1, 2]);
+    for c in poll_until(&mut transport, 1) {
+        catalog.on_completion(c);
+    }
+    assert!(catalog.ready_bytes(&a, Tier::Ram).is_some());
+
+    // a load of A in flight (not polled, so it stays on the lane's books)
+    transport
+        .expect_load(
+            a,
+            XferSpec {
+                planes: descs.clone(),
+                block_ids: vec![5, 6],
+                after: None,
+            },
+        )
+        .expect("expect_load");
+    let LoadStart::Started { op: _, job } = catalog
+        .begin_load(a, Tier::Ram, LoadDst::Gpu, WaiterId(1))
+        .unwrap()
+    else {
+        panic!("fresh load must start")
+    };
+    transport.submit(job).expect("submit load");
+    let op_b = store(&mut transport, &mut catalog, b, vec![3, 4]);
+    assert_eq!(transport.stores_queued(), 1, "held behind the load");
+    transport.expedite_inner(&[op_b]);
+    assert_eq!(transport.stores_queued(), 0, "launched beside it");
+    let mut wakes = Vec::new();
+    for c in poll_until(&mut transport, 2) {
+        wakes.extend(catalog.on_completion(c));
+    }
+    assert!(wakes.iter().all(|w| w.result == LoadResult::Ok));
+    assert_eq!(catalog.ready_bytes(&b, Tier::Ram), Some(sealed), "B landed");
+    catalog.check_invariants();
+}
+
 /// The full 1a.3 path on real hardware: a radix-cached chain demotes to T1
 /// under eviction pressure (pins deferring the release), the GPU copy is
 /// destroyed, and a later prompt probes + restores + PUBLISHES the prefix
@@ -579,7 +651,7 @@ fn t2_restart_persistence_survives_a_full_rebuild() {
         .collect();
     let chain_blocks: Vec<u32>;
 
-    // ---- process one: demote (write-through lands on disk) ---------------
+    // ---- process one: demote; the exit flush writes the chain ------------
     {
         let transport =
             RamTransport::with_t2(&exec, 64 << 20, &t2dir, 1 << 30).expect("transport with T2");
@@ -605,22 +677,18 @@ fn t2_restart_persistence_survives_a_full_rebuild() {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        assert!(
-            tier.stats().0 >= 1,
-            "run resident in T1 (and written through)"
-        );
-        // 3.2 deferral: the durable write does not ride the demote - it is
-        // queued for disk read slack (R2 fact 2: a writer beside a reader
-        // costs 97% of the read bandwidth on this class of device). By here
-        // the pump loop has had its slack, so the queue must have DRAINED,
-        // not merely been skipped; process two recovering the entry is the
-        // other half of that proof.
+        assert!(tier.stats().0 >= 1, "run resident in T1");
+        // nothing rides the demote to disk: the durability plan writes a
+        // chain's tip once it idles, or at exit - and nothing is queued for
+        // disk without a plan
         assert_eq!(
             tier.pending_durable_writes(),
             0,
-            "deferred write-through never drained in read slack"
+            "no disk write outside a plan"
         );
-        // dev_pool, tier, transport all drop here - the "runner exit"
+        // dev_pool, tier, transport all drop here - the "runner exit", whose
+        // flush writes the chain root-first (process two recovering it is
+        // the proof)
     }
 
     // ---- process two: rebuild everything from the directory --------------

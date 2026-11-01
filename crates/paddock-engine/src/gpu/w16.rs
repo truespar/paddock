@@ -406,6 +406,145 @@ impl GpuExecutor {
         })
     }
 
+    /// [`Self::nvf4_moe_up_relu2_w16`] without a shared expert: the routed
+    /// picks alone, `act` bf16 [rows][k * up.ff]. A LatentMoE's shared expert
+    /// reads another width than its routed experts, so it runs as its own
+    /// one-expert pass (an identity sort, weight 1 - the same bits as the
+    /// fused shared task: one scale on one accumulator).
+    #[allow(clippy::too_many_arguments)]
+    pub fn nvf4_moe_up_relu2_w16_solo(
+        &self,
+        up: &Nvf4MoePlane,
+        sorted_row: &CudaSlice<u32>,
+        sorted_slot: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        x: &CudaSlice<half::bf16>,
+        act: &mut CudaSlice<half::bf16>,
+        k: usize,
+        n_blocks: usize,
+        rows: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .nvf4_moe_up_relu2_w16
+            .ok_or(GpuError::MissingOp("nvf4_moe_up_relu2_w16"))?;
+        Self::moe_layout_ok(up, Nvf4MoeLayout::Tiled64, "nvf4_moe_up_relu2_w16_solo")?;
+        if sorted_row.len() < n_blocks * 32
+            || sorted_slot.len() < n_blocks * 32
+            || block_expert.len() < n_blocks
+            || x.len() < rows * up.in_dim
+            || act.len() < rows * k * up.ff
+        {
+            return Err(GpuError::Unsupported(
+                "nvf4_moe_up_relu2_w16_solo: buffers under the pass".into(),
+            ));
+        }
+        let (rdp, _g1) = up.data.device_ptr(&self.stream);
+        let (rsp, _g2) = up.scale.device_ptr(&self.stream);
+        let (rs2, _g3) = up.scale2.device_ptr(&self.stream);
+        let (srp, _g7) = sorted_row.device_ptr(&self.stream);
+        let (ssl, _g8) = sorted_slot.device_ptr(&self.stream);
+        let (bep, _g9) = block_expert.device_ptr(&self.stream);
+        let (xp, _g10) = x.device_ptr(&self.stream);
+        let (ap, _g11) = act.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract; sizes checked above. ff_s = 0: no shared
+        // tasks launch, so the shared plane slots (the routed plane here) are
+        // never read
+        check(unsafe {
+            f(
+                rdp as *const _,
+                rsp as *const _,
+                rs2 as *const _,
+                rdp as *const _,
+                rsp as *const _,
+                rs2 as *const _,
+                srp as *const _,
+                ssl as *const _,
+                bep as *const _,
+                xp as *const _,
+                ap as *mut _,
+                up.in_dim as u32,
+                up.ff as u32,
+                0,
+                k as u32,
+                n_blocks as u32,
+                rows as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// [`Self::nvf4_moe_down_part_w16`] without a shared expert: `part`
+    /// [rows][k + 1][down.ff] with slot k written as zeros (the zero-width
+    /// shared task), so the fixed-order fold over k + 1 slots is the routed
+    /// sum exactly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn nvf4_moe_down_part_w16_solo(
+        &self,
+        down: &Nvf4MoePlane,
+        sorted_row: &CudaSlice<u32>,
+        sorted_slot: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        topk_w: &CudaSlice<f32>,
+        act: &CudaSlice<half::bf16>,
+        part: &mut CudaSlice<f32>,
+        k: usize,
+        n_blocks: usize,
+        rows: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .nvf4_moe_down_part_w16
+            .ok_or(GpuError::MissingOp("nvf4_moe_down_part_w16"))?;
+        Self::moe_layout_ok(down, Nvf4MoeLayout::Tiled64, "nvf4_moe_down_part_w16_solo")?;
+        if sorted_row.len() < n_blocks * 32
+            || sorted_slot.len() < n_blocks * 32
+            || block_expert.len() < n_blocks
+            || topk_w.len() < rows * k
+            || act.len() < rows * k * down.in_dim
+            || part.len() < rows * (k + 1) * down.ff
+        {
+            return Err(GpuError::Unsupported(
+                "nvf4_moe_down_part_w16_solo: buffers under the pass".into(),
+            ));
+        }
+        let (rdp, _g1) = down.data.device_ptr(&self.stream);
+        let (rsp, _g2) = down.scale.device_ptr(&self.stream);
+        let (rs2, _g3) = down.scale2.device_ptr(&self.stream);
+        let (srp, _g7) = sorted_row.device_ptr(&self.stream);
+        let (ssl, _g8) = sorted_slot.device_ptr(&self.stream);
+        let (bep, _g9) = block_expert.device_ptr(&self.stream);
+        let (wp, _g10) = topk_w.device_ptr(&self.stream);
+        let (ap, _g11) = act.device_ptr(&self.stream);
+        let (pp, _g12) = part.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract; sizes checked above. ff_s = 0: the shared
+        // tasks walk no K and store zero into slot k (scaled by the routed
+        // plane's first scale2, a finite value)
+        check(unsafe {
+            f(
+                rdp as *const _,
+                rsp as *const _,
+                rs2 as *const _,
+                rdp as *const _,
+                rsp as *const _,
+                rs2 as *const _,
+                srp as *const _,
+                ssl as *const _,
+                bep as *const _,
+                wp as *const _,
+                ap as *const _,
+                pp as *mut _,
+                down.in_dim as u32,
+                0,
+                down.ff as u32,
+                k as u32,
+                n_blocks as u32,
+                rows as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// True when the pack carries the W16 routing front (slot 685).
     pub fn has_moe_route_w16(&self) -> bool {
         self.kernels.moe_route_w16.is_some()

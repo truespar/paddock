@@ -19,7 +19,11 @@ pub use clef::Clef;
 #[cfg(target_os = "macos")]
 mod diarization;
 #[cfg(target_os = "macos")]
+mod phonon;
+#[cfg(target_os = "macos")]
 pub use diarization::Diarization;
+#[cfg(target_os = "macos")]
+pub use phonon::Phonon;
 #[cfg(target_os = "macos")]
 mod kumo;
 #[cfg(target_os = "macos")]

@@ -31,6 +31,9 @@ use std::path::{Path, PathBuf};
 
 use super::io::{AlignedBuf, Backend, align_up as io_align_up};
 
+mod admit;
+use admit::{VolumeRoom, WriteGate};
+
 use super::Loc;
 use super::digest::{CacheNamespace, PrivacyScope};
 
@@ -53,18 +56,20 @@ const IO_ALIGN: u32 = 4096;
 /// fault leaves on disk (matrix rows 1-8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kill {
-    AfterDataWrite,  // row 1: data written (maybe cached), no flush
-    AfterDataFlush,  // row 2: data durable, no commit record
-    MidWalAppend,    // row 3: torn commit record
-    AfterWalAppend,  // row 4: record written, not flushed
-    MidCheckpoint,   // row 5: temp checkpoint half-written
-    MidSuperblock,   // row 6: one slot mid-write
-    MidCompaction,   // row 7: died between re-commits and the delete
-    BeforeSegDelete, // row 8: compaction committed, delete not yet run
-    ShortDataWrite,  // row 9: device wrote only part of the payload
-    DiskFullData,    // row 12: no space left while writing payload bytes
-    DiskFullWal,     // row 13: no space left while appending the commit
-    PermissionLost,  // row 14: the tree stopped being writable mid-run
+    AfterDataWrite,        // row 1: data written (maybe cached), no flush
+    AfterDataFlush,        // row 2: data durable, no commit record
+    MidWalAppend,          // row 3: torn commit record
+    AfterWalAppend,        // row 4: record written, not flushed
+    MidCheckpoint,         // row 5: temp checkpoint half-written
+    MidSuperblock,         // row 6: one slot mid-write
+    MidCompaction,         // row 7: died between re-commits and the delete
+    BeforeSegDelete,       // row 8: compaction committed, delete not yet run
+    ShortDataWrite,        // row 9: device wrote only part of the payload
+    DiskFullData,          // row 12: no space left while writing payload bytes
+    DiskFullWal,           // row 13: no space left while appending the commit
+    PermissionLost,        // row 14: the tree stopped being writable mid-run
+    ShortWalAppend,        // row 23: the disk filled part-way through a commit append
+    EvictBeforeTombstones, // row 24: evicted segment deleted, tombstones not yet out
 }
 
 impl Kill {
@@ -73,10 +78,9 @@ impl Kill {
     /// has to behave identically whether the refusal is injected or real.
     fn as_io(self) -> Option<std::io::Error> {
         match self {
-            Kill::DiskFullData | Kill::DiskFullWal => Some(std::io::Error::new(
-                std::io::ErrorKind::StorageFull,
-                "no space left on device",
-            )),
+            Kill::DiskFullData | Kill::DiskFullWal | Kill::ShortWalAppend => Some(
+                std::io::Error::new(std::io::ErrorKind::StorageFull, "no space left on device"),
+            ),
             Kill::PermissionLost => Some(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "permission denied",
@@ -98,12 +102,36 @@ pub enum StoreError {
     VersionSkew { found: u16 },
     #[error("scope quota exhausted: {used} of {quota} bytes")]
     QuotaExhausted { used: u64, quota: u64 },
+    /// The volume is down to its free-space reserve: `cap` is all the store
+    /// may hold right now (`make_room` evicts toward it).
+    #[error("volume free-space reserve reached: {used} held, room for {cap} bytes")]
+    VolumeFull { used: u64, cap: u64 },
+    /// Writes are paused after repeated device failures (see `admit`).
+    #[error("disk writes paused after repeated failures (probing)")]
+    Paused,
+    /// A failed append could not be rolled back, so the manifest tail is
+    /// unknown - any later record could land behind a torn one, and boot
+    /// replay stops at the tear. Writes stop until a restart recovers it.
+    #[error("manifest tail unknown after a failed append - writes stop until restart")]
+    ManifestBroken,
     #[error("payload failed its commit checksum at read (at-rest corruption) - entry tombstoned")]
     Integrity,
     #[error("unknown key")]
     NotFound,
     #[error("killed at test hook {0:?}")]
     Killed(Kill),
+}
+
+impl StoreError {
+    /// Refused before touching the device - quota, volume reserve or paused
+    /// writes. Capacity, not a fault: callers keep the RAM copy and count
+    /// nothing as an IO failure.
+    pub fn is_capacity(&self) -> bool {
+        matches!(
+            self,
+            Self::QuotaExhausted { .. } | Self::VolumeFull { .. } | Self::Paused
+        )
+    }
 }
 
 /// One committed extent's record - the WAL Commit payload and the
@@ -214,10 +242,38 @@ pub struct RecoveryReport {
     pub discarded_tail_records: u64,
     pub orphaned_bytes: u64,
     pub fresh_store: bool,
+    /// Committed entries whose segment file is gone - an eviction that died
+    /// after deleting the segment but before its tombstones were durable
+    /// (row 24). Dropped, never served.
+    pub lost_to_missing_segments: u64,
     /// Both superblock slots were invalid on a NON-empty directory - the
     /// cache was reset (loud alarm; a cache, not an archive).
     pub reset_after_corruption: bool,
     pub recovery_ms: u64,
+}
+
+/// One payload for [`NvmeStore::store_many`].
+pub struct StoreItem<'a> {
+    pub key: [u8; 32],
+    pub generation: u64,
+    pub schema_version: u16,
+    pub payload: &'a [u8],
+    /// The payload's `Checksum::of_payload` when the caller already has it
+    /// (the tier hashed it off the engine thread when it entered T1), so the
+    /// write does not hash it again. A wrong one cannot mislead: every read
+    /// verifies the bytes against it, and a mismatch tombstones the entry.
+    pub checksum: Option<[u8; 32]>,
+}
+
+/// Where a key's extent lives and what it must hash to (`read_plan`).
+pub struct ReadPlan {
+    pub path: PathBuf,
+    pub off: u64,
+    pub len: u64,
+    /// `len` rounded up to the device's IO alignment - what a read moves.
+    pub padded: u64,
+    pub align: u64,
+    pub checksum: [u8; 32],
 }
 
 pub struct StoreStats {
@@ -258,13 +314,26 @@ pub struct NvmeStore {
     /// checkpoint stay on ordinary buffered handles - they are small,
     /// ordering-critical, and flush-dominated, so direct IO
     /// would cost alignment padding on every record for no bandwidth.
-    io: Backend,
+    io: std::sync::Arc<Backend>,
     open_seg: u32,
     /// Append cursor in the open segment (aligned).
     cursor: u64,
     live: HashMap<[u8; 32], CommitRec>,
     dead: HashMap<u32, u64>,
+    /// Payload bytes of `live` and of `dead`, kept as running sums: the
+    /// quota is checked on every write, and summing 50K records per check
+    /// was the old way.
+    live_total: u64,
+    dead_total: u64,
     quota: u64,
+    /// Back-pressure from failed device writes.
+    gate: WriteGate,
+    /// The volume's free-space reserve - the store's second ceiling.
+    room: VolumeRoom,
+    /// Daily write budget, sized from the volume at open (`day_budget`).
+    day_budget: u64,
+    /// A failed append could not be rolled back (see `ManifestBroken`).
+    wal_broken: bool,
     /// Unflushed WAL bytes (group commit); tombstones ride the next flush.
     wal_dirty: bool,
     pub integrity_failures: u64,
@@ -441,7 +510,7 @@ impl NvmeStore {
                 return Err(StoreError::Locked);
             }
         }
-        let io = Backend::open(&dir.join("segments"))?;
+        let io = std::sync::Arc::new(Backend::open(&dir.join("segments"))?);
         let _ = std::fs::remove_file(dir.join("index.ckpt.tmp"));
 
         let mut report = RecoveryReport::default();
@@ -613,16 +682,6 @@ impl NvmeStore {
         // (in-flight-at-crash writes were uncommitted => their space is free
         // again; double allocation impossible because commit follows flush)
         let mut segments: HashSet<u32> = HashSet::new();
-        let mut seg_high: HashMap<u32, u64> = HashMap::new();
-        let mut live_bytes_per_seg: HashMap<u32, u64> = HashMap::new();
-        for rec in live.values() {
-            let end = rec.offset + rec.len;
-            let e = seg_high.entry(rec.segment).or_insert(0);
-            if end > *e {
-                *e = end;
-            }
-            *live_bytes_per_seg.entry(rec.segment).or_insert(0) += rec.len;
-        }
         let mut seg_files: Vec<(u32, std::path::PathBuf, u64)> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(dir.join("segments")) {
             for e in rd.flatten() {
@@ -636,6 +695,30 @@ impl NvmeStore {
                     seg_files.push((n, e.path(), disk_len));
                 }
             }
+        }
+        // row 24: eviction deletes a segment BEFORE its tombstones go out (a
+        // full disk has no room for them until the delete frees some), so a
+        // crash in between leaves commits naming a file that is gone. Those
+        // entries were evicted; serving them would only fail every read.
+        let present: HashSet<u32> = seg_files.iter().map(|&(n, _, _)| n).collect();
+        let orphan_commits: Vec<([u8; 32], u64)> = live
+            .values()
+            .filter(|r| !present.contains(&r.segment))
+            .map(|r| (r.key, r.generation))
+            .collect();
+        for (key, _) in &orphan_commits {
+            live.remove(key);
+        }
+        report.lost_to_missing_segments = orphan_commits.len() as u64;
+        let mut seg_high: HashMap<u32, u64> = HashMap::new();
+        let mut live_bytes_per_seg: HashMap<u32, u64> = HashMap::new();
+        for rec in live.values() {
+            let end = rec.offset + rec.len;
+            let e = seg_high.entry(rec.segment).or_insert(0);
+            if end > *e {
+                *e = end;
+            }
+            *live_bytes_per_seg.entry(rec.segment).or_insert(0) += rec.len;
         }
         // the append head is the HIGHEST segment present - decide it before
         // the dead-segment sweep, or a fully-dead low-numbered segment hides
@@ -685,6 +768,16 @@ impl NvmeStore {
 
         report.recovered_entries = live.len() as u64;
         report.recovery_ms = t0.elapsed().as_millis() as u64;
+        let live_total: u64 = live.values().map(|r| r.len).sum();
+        let dead_total: u64 = dead.values().sum();
+        // unit tests run on whatever volume holds the temp directory, so the
+        // reserve is something they opt into with a fake (`set_space`)
+        let mut space: admit::SpaceFn = if cfg!(test) {
+            Box::new(|_| None)
+        } else {
+            Box::new(admit::volume_space)
+        };
+        let day_budget = admit::day_budget(space(dir).map(|(_, total)| total));
         let mut store = Self {
             dir: dir.to_path_buf(),
             io,
@@ -698,7 +791,13 @@ impl NvmeStore {
             cursor,
             live,
             dead,
+            live_total,
+            dead_total,
             quota,
+            gate: WriteGate::new(),
+            room: VolumeRoom::new(space),
+            day_budget,
+            wal_broken: false,
             wal_dirty: false,
             integrity_failures: 0,
             kill: None,
@@ -708,6 +807,14 @@ impl NvmeStore {
         if report.fresh_store {
             store.write_superblock(0, 0)?;
         }
+        // and write the tombstones that eviction never got out, so a later
+        // segment that reuses the number can never be named by them
+        for (key, generation) in &orphan_commits {
+            if store.append_tombstone(key, *generation).is_err() {
+                break; // the next boot drops them again
+            }
+        }
+        let _ = store.flush_group();
         Ok((store, report))
     }
 
@@ -735,15 +842,56 @@ impl NvmeStore {
         self.io.class()
     }
 
-    /// Live payload bytes (quota accounting).
-    fn live_bytes(&self) -> u64 {
-        self.live.values().map(|r| r.len).sum()
+    /// Payload bytes the store holds on disk: live extents plus dead ones
+    /// still sitting in their segments. The quota and the volume reserve are
+    /// both checked against this - live bytes alone used to be the quota's
+    /// measure, so a re-stored key's old extent was disk space nothing
+    /// counted.
+    fn footprint(&self) -> u64 {
+        self.live_total + self.dead_total
+    }
+
+    /// The most the store may hold right now: its quota, or less when the
+    /// volume is down to its reserve.
+    fn limit(&mut self, now: std::time::Instant) -> u64 {
+        let fp = self.footprint();
+        self.quota.min(self.room.cap(&self.dir, now, fp))
+    }
+
+    /// The most the transports may write here in a UTC day - a quarter of
+    /// the volume, at most 1 TiB (see `admit::day_budget`). Enforcing it is
+    /// the writer's job: the store does not know when its day started.
+    pub fn day_budget(&self) -> u64 {
+        self.day_budget
+    }
+
+    /// Whether a write would be refused before the device right now -
+    /// paused and not yet probe time, or the manifest broken. (At probe
+    /// time this is false: the next write is the probe.)
+    pub fn writes_blocked(&self) -> bool {
+        self.wal_broken || self.gate.blocked(std::time::Instant::now())
+    }
+
+    /// Whether device writes are paused (repeated failures, probing).
+    pub fn writes_paused(&self) -> bool {
+        self.gate.paused() || self.wal_broken
+    }
+
+    #[cfg(test)]
+    fn set_space(&mut self, probe: admit::SpaceFn) {
+        self.room = VolumeRoom::new(probe);
     }
 
     /// Store one payload under `key` - the full ordering: reserve ->
     /// write -> data flush -> commit append -> WAL flush -> return. Completion
     /// implies durability (`durable-after-return`); the group-commit mode
     /// for background write-through arrives with the mirror-pass producer.
+    ///
+    /// Refusals that never touch the device come first: paused writes
+    /// (`Paused` - before the others, so nobody evicts for a write that
+    /// cannot run), then quota (`QuotaExhausted`) and the volume reserve
+    /// (`VolumeFull`), both answered by `make_room`. A device error counts
+    /// toward the pause.
     pub fn store(
         &mut self,
         key: [u8; 32],
@@ -751,90 +899,234 @@ impl NvmeStore {
         schema_version: u16,
         payload: &[u8],
     ) -> Result<Loc, StoreError> {
-        let used = self.live_bytes();
-        if used + payload.len() as u64 > self.quota {
+        let item = StoreItem {
+            key,
+            generation,
+            schema_version,
+            payload,
+            checksum: None,
+        };
+        self.store_many(&[item]).map(|locs| locs[0])
+    }
+
+    /// Store several payloads as one group commit: every payload written,
+    /// each segment they touched flushed once, then every commit record
+    /// appended and the manifest flushed once - the same ordering as one
+    /// [`Self::store`] (no commit before its data is durable), with two
+    /// flushes per batch instead of two per extent. A chain written in one
+    /// go (the tier's write-back at eviction) ran at ~0.4 GB/s on per-extent
+    /// flushes. All or nothing: a failure publishes none of the batch.
+    pub fn store_many(&mut self, items: &[StoreItem<'_>]) -> Result<Vec<Loc>, StoreError> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.wal_broken {
+            return Err(StoreError::ManifestBroken);
+        }
+        let now = std::time::Instant::now();
+        if self.gate.blocked(now) {
+            return Err(StoreError::Paused);
+        }
+        let len: u64 = items.iter().map(|i| i.payload.len() as u64).sum();
+        let used = self.footprint();
+        if used + len > self.quota {
             return Err(StoreError::QuotaExhausted {
                 used,
                 quota: self.quota,
             });
         }
-        // allocate (in-memory only - nothing on disk references it yet)
-        if self.cursor + payload.len() as u64 > SEG_MAX {
-            self.open_seg += 1;
-            self.cursor = 0;
+        let cap = self.limit(now);
+        if used + len > cap {
+            return Err(StoreError::VolumeFull { used, cap });
         }
-        let (seg, off) = (self.open_seg, self.cursor);
-        // 2. payload bytes. Unbuffered IO constrains length as well as
-        // offset, so the tail is padded to the device alignment - the commit
-        // record carries the true length, and `cursor` already advanced in
-        // aligned strides, so the padding is never read back as content.
-        // rows 12/14: the device refuses the payload write. Nothing is
-        // committed, so the extent is simply never referenced - the same
-        // shape as row 9's short write, reached by a different error.
-        if let Some(k) = self.kill
-            && matches!(k, Kill::DiskFullData | Kill::PermissionLost)
-            && let Some(e) = k.as_io()
-        {
-            return Err(StoreError::Io(e));
+        if !self.gate.admit(now) {
+            return Err(StoreError::Paused);
         }
-        let short = self.kill == Some(Kill::ShortDataWrite);
-        let path = seg_path(&self.dir, seg);
-        self.segments.insert(seg);
+        match self.store_io(items) {
+            Ok(locs) => {
+                self.gate.succeeded(now);
+                self.room.set_short(false, used, cap);
+                Ok(locs)
+            }
+            Err(StoreError::Io(e)) => {
+                // the device says full while the sample said room: another
+                // writer, or a quota statvfs cannot see - re-read before the
+                // next write instead of trusting the sample's window
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+                ) {
+                    self.room.invalidate();
+                }
+                self.gate.failed(now, &e);
+                Err(StoreError::Io(e))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn store_io(&mut self, items: &[StoreItem<'_>]) -> Result<Vec<Loc>, StoreError> {
+        // 1. allocate (in-memory only - nothing on disk references it yet)
+        // and 2. write every payload. Unbuffered IO constrains length as well
+        // as offset, so each tail is padded to the device alignment - the
+        // commit record carries the true length, and offsets advance in
+        // aligned strides, so padding is never read back as content.
         let a = self.io.align();
-        let padded = io_align_up(payload.len() as u64, a) as usize;
-        let mut buf = AlignedBuf::new(padded, a);
-        buf.slice_mut()[..payload.len()].copy_from_slice(payload);
-        if short {
-            // row 9: the device accepted only part of the payload - the
-            // commit is never issued, so the extent stays unreferenced
-            let half = io_align_up(padded as u64 / 2, a).min(padded as u64) as usize;
-            self.io.write_at(&path, &buf.slice()[..half], off)?;
-            return Err(StoreError::Killed(Kill::ShortDataWrite));
+        let mut cursor = self.cursor;
+        let mut placed: Vec<(u32, u64)> = Vec::with_capacity(items.len());
+        let mut touched: Vec<u32> = Vec::new();
+        for item in items {
+            let n = item.payload.len() as u64;
+            if cursor + n > SEG_MAX {
+                self.open_seg += 1;
+                cursor = 0;
+            }
+            let (seg, off) = (self.open_seg, cursor);
+            // rows 12/14: the device refuses the payload write. Nothing is
+            // committed, so the extent is simply never referenced - the
+            // same shape as row 9's short write, reached by another error.
+            if let Some(k) = self.kill
+                && matches!(k, Kill::DiskFullData | Kill::PermissionLost)
+                && let Some(e) = k.as_io()
+            {
+                return Err(StoreError::Io(e));
+            }
+            let path = seg_path(&self.dir, seg);
+            self.segments.insert(seg);
+            let padded = io_align_up(n, a) as usize;
+            let mut buf = AlignedBuf::new(padded, a);
+            buf.slice_mut()[..item.payload.len()].copy_from_slice(item.payload);
+            if self.kill == Some(Kill::ShortDataWrite) {
+                // row 9: the device accepted only part of the payload - the
+                // commit is never issued, so the extent stays unreferenced
+                let half = io_align_up(padded as u64 / 2, a).min(padded as u64) as usize;
+                self.io.write_at(&path, &buf.slice()[..half], off)?;
+                return Err(StoreError::Killed(Kill::ShortDataWrite));
+            }
+            self.io.write_at(&path, buf.slice(), off)?;
+            placed.push((seg, off));
+            if !touched.contains(&seg) {
+                touched.push(seg);
+            }
+            cursor = align_up(off + n, IO_ALIGN as u64);
         }
-        self.io.write_at(&path, buf.slice(), off)?;
         self.check_kill(Kill::AfterDataWrite)?;
-        // 3. data flush before any commit record can exist
-        self.io.sync(&path)?;
-        self.check_kill(Kill::AfterDataFlush)?;
-        // 4. commit record, then WAL flush
-        let rec = CommitRec {
-            key,
-            generation,
-            schema_version,
-            segment: seg,
-            offset: off,
-            len: payload.len() as u64,
-            payload_checksum: super::digest::Checksum::of_payload(payload).0,
-        };
-        let mut body = Vec::with_capacity(COMMIT_BODY);
-        rec.encode_body(&mut body);
-        let bytes = record(KIND_COMMIT, &body);
-        if self.kill == Some(Kill::MidWalAppend) {
-            // torn append: half the record lands (row 3)
-            let half = bytes.len() / 2;
-            self.wal.write_all(&bytes[..half])?;
-            self.wal.sync_data()?;
-            return Err(StoreError::Killed(Kill::MidWalAppend));
+        // 3. data flush before any commit record can exist - once per segment
+        for &seg in &touched {
+            self.io.sync(&seg_path(&self.dir, seg))?;
         }
-        // row 13: the payload is durable by now (flushed above) but the
-        // commit cannot be written. The extent stays unreferenced and its
-        // space is reclaimed at the next boot as an orphan tail - existing
-        // entries are untouched, which is the row's stated requirement.
-        if self.kill == Some(Kill::DiskFullWal)
-            && let Some(e) = Kill::DiskFullWal.as_io()
-        {
+        self.check_kill(Kill::AfterDataFlush)?;
+        // 4. commit records, then one WAL flush
+        let base = self.wal_len;
+        let mut recs = Vec::with_capacity(items.len());
+        for (item, &(segment, offset)) in items.iter().zip(&placed) {
+            let rec = CommitRec {
+                key: item.key,
+                generation: item.generation,
+                schema_version: item.schema_version,
+                segment,
+                offset,
+                len: item.payload.len() as u64,
+                payload_checksum: item
+                    .checksum
+                    .unwrap_or_else(|| super::digest::Checksum::of_payload(item.payload).0),
+            };
+            let mut body = Vec::with_capacity(COMMIT_BODY);
+            rec.encode_body(&mut body);
+            let bytes = record(KIND_COMMIT, &body);
+            if self.kill == Some(Kill::MidWalAppend) {
+                // torn append: half the record lands (row 3)
+                let half = bytes.len() / 2;
+                self.wal.write_all(&bytes[..half])?;
+                self.wal.sync_data()?;
+                return Err(StoreError::Killed(Kill::MidWalAppend));
+            }
+            // row 13: the payloads are durable by now (flushed above) but a
+            // commit cannot be written. The extents stay unreferenced and
+            // their space is reclaimed at the next boot as orphan tails -
+            // existing entries are untouched, the row's stated requirement.
+            if self.kill == Some(Kill::DiskFullWal)
+                && let Some(e) = Kill::DiskFullWal.as_io()
+            {
+                self.wal_truncate_to(base);
+                return Err(StoreError::Io(e));
+            }
+            if let Err(e) = self.wal_append(&bytes) {
+                // none of the batch is published, so none of it may stay
+                // in the manifest
+                self.wal_truncate_to(base);
+                return Err(e);
+            }
+            recs.push(rec);
+        }
+        self.check_kill(Kill::AfterWalAppend)?;
+        if let Err(e) = self.wal.sync_data() {
+            // not known durable, so not published - and the records must
+            // not stay in the file either: these extents' space is reused
+            // by the next write, which a surviving commit would then misname
+            self.wal_truncate_to(base);
             return Err(StoreError::Io(e));
         }
-        self.wal.write_all(&bytes)?;
-        self.check_kill(Kill::AfterWalAppend)?;
-        self.wal.sync_data()?;
         // 5. publish
-        if let Some(old) = self.live.insert(key, rec) {
-            *self.dead.entry(old.segment).or_insert(0) += old.len;
+        for rec in &recs {
+            if let Some(old) = self.live.insert(rec.key, *rec) {
+                *self.dead.entry(old.segment).or_insert(0) += old.len;
+                self.live_total -= old.len;
+                self.dead_total += old.len;
+            }
+            self.live_total += rec.len;
         }
-        self.cursor = align_up(off + payload.len() as u64, IO_ALIGN as u64);
-        self.wal_len += bytes.len() as u64;
-        Ok(loc_of(seg, off))
+        self.cursor = cursor;
+        Ok(placed
+            .into_iter()
+            .map(|(seg, off)| loc_of(seg, off))
+            .collect())
+    }
+
+    /// Append one whole record to the manifest, or none of it. A short
+    /// append on a full disk used to leave a torn record behind while the
+    /// process carried on: every later record landed after the tear, and
+    /// boot replay stops AT the tear - so one ENOSPC silently discarded every
+    /// commit and tombstone that followed it, at the next restart.
+    fn wal_append(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
+        let res = if self.kill == Some(Kill::ShortWalAppend) {
+            // row 23: part of the record fits, then the disk is full
+            self.wal
+                .write_all(&bytes[..bytes.len() / 2])
+                .and_then(|()| Err(Kill::ShortWalAppend.as_io().expect("an io fault")))
+        } else {
+            self.wal.write_all(bytes)
+        };
+        match res {
+            Ok(()) => {
+                self.wal_len += bytes.len() as u64;
+                Ok(())
+            }
+            Err(e) => Err(self.wal_rollback(e, 0)),
+        }
+    }
+
+    /// Cut the manifest back to its last whole record after a failed append
+    /// (`appended` = bytes of the failed record already counted in
+    /// `wal_len`). If even that fails the tail is unknown and writes stop
+    /// until a restart recovers it - better than appending behind a tear.
+    fn wal_rollback(&mut self, e: std::io::Error, appended: u64) -> StoreError {
+        self.wal_truncate_to(self.wal_len - appended);
+        StoreError::Io(e)
+    }
+
+    /// Cut the manifest back to `len` bytes (the end of a whole record). If
+    /// even that fails, the tail is unknown and writes stop until restart.
+    fn wal_truncate_to(&mut self, len: u64) {
+        self.wal_len = len;
+        let healed = self
+            .wal
+            .set_len(len)
+            .and_then(|()| self.wal.seek(SeekFrom::Start(len)));
+        if let Err(h) = healed {
+            self.wal_broken = true;
+            tracing::error!(rollback = %h, "KV disk cache: manifest could not be rolled back after a failed append - disk writes stop until restart");
+        }
     }
 
     /// Read + VERIFY a payload. A checksum mismatch tombstones the entry
@@ -916,6 +1208,36 @@ impl NvmeStore {
         Ok((rec.generation, rec.len))
     }
 
+    /// Everything an off-thread reader needs to fetch and verify `key`
+    /// (`t2_reads`): None when the key has no live extent.
+    pub fn read_plan(&self, key: &[u8; 32]) -> Option<ReadPlan> {
+        let r = self.live.get(key)?;
+        let align = self.io.align();
+        Some(ReadPlan {
+            path: seg_path(&self.dir, r.segment),
+            off: r.offset,
+            len: r.len,
+            padded: io_align_up(r.len, align),
+            align,
+            checksum: r.payload_checksum,
+        })
+    }
+
+    /// The IO backend, for readers on other threads (`t2_reads`).
+    pub fn reader_io(&self) -> std::sync::Arc<Backend> {
+        std::sync::Arc::clone(&self.io)
+    }
+
+    /// An off-thread read found `key`'s bytes not matching their commit
+    /// record: never serve it again (what `read_owned` does inline).
+    pub fn mark_corrupt(&mut self, key: &[u8; 32]) {
+        self.integrity_failures += 1;
+        let _ = self.tombstone(key);
+        tracing::error!(
+            "KV store: extent failed its commit checksum (at-rest corruption) - tombstoned"
+        );
+    }
+
     /// Bytes a [`Self::read_into`] buffer must hold for `key` (the payload
     /// rounded up to this device's IO alignment).
     pub fn padded_len(&self, key: &[u8; 32]) -> Option<usize> {
@@ -957,12 +1279,19 @@ impl NvmeStore {
             return Ok(());
         };
         *self.dead.entry(old.segment).or_insert(0) += old.len;
+        self.live_total -= old.len;
+        self.dead_total += old.len;
+        self.append_tombstone(key, old.generation)
+    }
+
+    /// The tombstone RECORD alone - bookkeeping for an entry already gone
+    /// from the live set.
+    fn append_tombstone(&mut self, key: &[u8; 32], generation: u64) -> Result<(), StoreError> {
         let mut body = Vec::with_capacity(40);
         body.extend_from_slice(key);
-        body.extend_from_slice(&old.generation.to_le_bytes());
+        body.extend_from_slice(&generation.to_le_bytes());
         let bytes = record(KIND_TOMBSTONE, &body);
-        self.wal.write_all(&bytes)?;
-        self.wal_len += bytes.len() as u64;
+        self.wal_append(&bytes)?;
         self.wal_dirty = true;
         Ok(())
     }
@@ -1051,67 +1380,121 @@ impl NvmeStore {
         Ok(())
     }
 
-    /// Compact a segment whose dead ratio crossed 1/2: copy live extents to
-    /// the open segment (each re-commits through the WAL - the same ordering
-    /// as any write), then delete the old file. Defers to the caller's
-    /// read-slack scheduling; bytes count against the endurance budget.
-    /// Cache eviction (the store is a CACHE, not an archive): tombstone the
-    /// OLDEST segments' live entries - log order, content neither re-stored
-    /// nor compacted forward since it landed - until `bytes` fits under the
-    /// quota, then delete the emptied segments (boot retries a delete we
-    /// die before, per fault row 8). The open segment never evicts. Returns
-    /// the evicted keys so the caller can invalidate any references it
-    /// holds - a dangling catalog entry costs a failed op AND a breaker
-    /// count on every probe that elects it.
+    /// Cache eviction (the store is a CACHE, not an archive): retire the
+    /// OLDEST segments - log order, content neither re-stored nor compacted
+    /// forward since it landed - until `bytes` fits under the store's limit:
+    /// its quota, or less when the volume is down to its free-space reserve.
+    /// Whole segments go, live and dead bytes alike (a segment of nothing
+    /// but dead extents used to be invisible here). The open segment never
+    /// evicts. A write bigger than everything the store may hold never fits,
+    /// so the cache is not emptied for it - but the store still gives back
+    /// whatever it holds over the limit. Returns the evicted keys so the
+    /// caller can invalidate any references it holds - a dangling catalog
+    /// entry costs a failed op AND a breaker count on every probe that
+    /// elects it.
     pub fn make_room(&mut self, bytes: u64) -> Result<Vec<[u8; 32]>, StoreError> {
+        let now = std::time::Instant::now();
+        let limit = self.limit(now);
+        let target = if bytes <= limit {
+            limit - bytes
+        } else {
+            // logged on the edge here, not per refusal in `store`: a refusal
+            // that eviction answers is the cache working, not running short
+            self.room.set_short(true, self.footprint(), limit);
+            limit
+        };
         let mut evicted = Vec::new();
-        // A sub-segment quota must still make progress. Previously a cache
-        // smaller than 1 GiB could fill its first segment and never evict it.
-        if bytes <= self.quota
-            && self.live_bytes().saturating_add(bytes) > self.quota
-            && self.live.values().any(|r| r.segment == self.open_seg)
-        {
+        if self.footprint() <= target {
+            return Ok(evicted);
+        }
+        // the open segment never evicts, so when it alone holds more than
+        // the target it has to roll first (a sub-segment quota used to fill
+        // its first segment and never evict it). Only then: rolling on
+        // every call would give each extent a segment file of its own.
+        if self.segment_bytes(self.open_seg) > target {
             self.open_seg += 1;
             self.cursor = 0;
         }
-        loop {
-            if self.live_bytes() + bytes <= self.quota {
-                break;
-            }
+        let reason = if limit < self.quota {
+            "volume reserve"
+        } else {
+            "quota"
+        };
+        while self.footprint() > target {
             let Some(victim) = self
-                .live
-                .values()
-                .filter(|r| r.segment != self.open_seg)
-                .map(|r| r.segment)
+                .segments
+                .iter()
+                .copied()
+                .filter(|&s| s != self.open_seg)
                 .min()
             else {
-                break; // everything live sits in the open segment
+                break; // everything sits in the open segment
             };
-            let keys: Vec<[u8; 32]> = self
-                .live
-                .iter()
-                .filter(|(_, r)| r.segment == victim)
-                .map(|(k, _)| *k)
-                .collect();
-            for k in &keys {
-                self.tombstone(k)?;
-            }
-            self.flush_group()?;
+            let keys = self.retire_segment(victim)?;
             tracing::info!(
                 segment = victim,
                 entries = keys.len(),
-                "T2 cache eviction: oldest segment retired for quota"
+                reason,
+                "T2 cache eviction: oldest segment retired"
             );
             evicted.extend(keys);
-            self.segments.remove(&victim);
-            self.dead.remove(&victim);
-            let p = seg_path(&self.dir, victim);
-            self.io.forget(&p);
-            let _ = std::fs::remove_file(p);
+        }
+        if limit < self.quota {
+            self.room.yielded(now);
         }
         Ok(evicted)
     }
 
+    /// Live plus dead payload bytes in one segment.
+    fn segment_bytes(&self, seg: u32) -> u64 {
+        let live: u64 = self
+            .live
+            .values()
+            .filter(|r| r.segment == seg)
+            .map(|r| r.len)
+            .sum();
+        live + self.dead.get(&seg).copied().unwrap_or(0)
+    }
+
+    /// Evict one whole segment: drop its entries, delete the file, THEN
+    /// write their tombstones. On a full disk the tombstones may not fit
+    /// until the delete has freed space - the old order (tombstones first)
+    /// could refuse to evict exactly when the space was gone. A crash between the delete and the
+    /// tombstones is row 24: boot drops commits whose segment is gone.
+    fn retire_segment(&mut self, victim: u32) -> Result<Vec<[u8; 32]>, StoreError> {
+        let gone: Vec<([u8; 32], u64, u64)> = self
+            .live
+            .values()
+            .filter(|r| r.segment == victim)
+            .map(|r| (r.key, r.generation, r.len))
+            .collect();
+        for &(key, _, len) in &gone {
+            self.live.remove(&key);
+            self.live_total -= len;
+        }
+        self.dead_total -= self.dead.remove(&victim).unwrap_or(0);
+        self.segments.remove(&victim);
+        let p = seg_path(&self.dir, victim);
+        self.io.forget(&p);
+        let _ = std::fs::remove_file(p);
+        self.check_kill(Kill::EvictBeforeTombstones)?;
+        for &(key, generation, _) in &gone {
+            if let Err(e) = self.append_tombstone(&key, generation) {
+                // harmless: the boot rule drops what these would have
+                tracing::debug!(err = %e, "T2 eviction: tombstones deferred to boot");
+                break;
+            }
+        }
+        if let Err(e) = self.flush_group() {
+            tracing::debug!(err = %e, "T2 eviction: tombstone flush failed");
+        }
+        Ok(gone.into_iter().map(|(k, _, _)| k).collect())
+    }
+
+    /// Compact a segment whose dead ratio crossed 1/2: copy live extents to
+    /// the open segment (each re-commits through the WAL - the same ordering
+    /// as any write), then delete the old file. Defers to the caller's
+    /// read-slack scheduling; bytes count against the endurance budget.
     pub fn maybe_compact(&mut self) -> Result<bool, StoreError> {
         let victim = self
             .dead
@@ -1149,7 +1532,7 @@ impl NvmeStore {
         }
         self.check_kill(Kill::BeforeSegDelete)?; // row 8: delete retried at boot
         self.segments.remove(&victim);
-        self.dead.remove(&victim);
+        self.dead_total -= self.dead.remove(&victim).unwrap_or(0);
         let p = seg_path(&self.dir, victim);
         self.io.forget(&p);
         let _ = std::fs::remove_file(p);
@@ -1159,8 +1542,8 @@ impl NvmeStore {
     pub fn stats(&self) -> StoreStats {
         StoreStats {
             live_entries: self.live.len() as u64,
-            live_bytes: self.live_bytes(),
-            dead_bytes: self.dead.values().sum(),
+            live_bytes: self.live_total,
+            dead_bytes: self.dead_total,
             segments: self.segments.len() as u32,
             wal_bytes: self.wal_len,
             quota: self.quota,
@@ -1633,9 +2016,12 @@ mod tests {
     // stops at the tear regardless of whether the shortfall came from a
     // torn append or a device short write; row_3 covers it. Row 11 (lost
     // completion) is the catalog race suite's drop_op class. Rows 12-14
-    // (disk full / permission loss) surface as store() Io errors -> the
-    // tier's circuit breaker (tested in pool_tier); a quota analog is
-    // covered by quota_is_enforced_loudly.
+    // (disk full / permission loss) surface as store() Io errors, which the
+    // write gate counts - three in a row pause writes until a probe lands
+    // (repeated_device_failures_pause_writes_until_a_probe_lands); a quota
+    // analog is covered by quota_is_enforced_loudly. Row 23 is a short
+    // commit append the process survives, row 24 an eviction that dies
+    // before its tombstones.
 
     #[test]
     fn make_room_evicts_oldest_segments_durably() {
@@ -1812,9 +2198,273 @@ mod tests {
             s.store(k(2), 2, 1, &payload(2, 20_000)),
             Err(StoreError::QuotaExhausted { .. })
         ));
-        // tombstoning frees quota
+        // a tombstone frees no DISK space - the extent still sits in its
+        // segment - so it frees no quota either; retiring the segment does
         s.tombstone(&k(1)).unwrap();
+        assert!(matches!(
+            s.store(k(2), 2, 1, &payload(2, 20_000)),
+            Err(StoreError::QuotaExhausted { .. })
+        ));
+        assert!(
+            s.make_room(20_000).unwrap().is_empty(),
+            "nothing live to report"
+        );
+        assert_eq!(s.stats().dead_bytes, 0, "the dead extent's segment is gone");
         s.store(k(2), 2, 1, &payload(2, 20_000)).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_re_stored_key_leaves_a_dead_extent_the_quota_counts() {
+        let d = tdir("dead");
+        let (mut s, _) = NvmeStore::open(&d, 120_000).unwrap();
+        s.store(k(1), 1, 1, &payload(1, 50_000)).unwrap();
+        s.store(k(1), 1, 1, &payload(1, 50_000)).unwrap();
+        let st = s.stats();
+        assert_eq!((st.live_bytes, st.dead_bytes), (50_000, 50_000));
+        // live bytes alone (the old measure) would have let this in
+        assert!(matches!(
+            s.store(k(2), 2, 1, &payload(2, 30_000)),
+            Err(StoreError::QuotaExhausted { used: 100_000, .. })
+        ));
+        assert_eq!(s.make_room(30_000).unwrap(), vec![k(1)]);
+        s.store(k(2), 2, 1, &payload(2, 30_000)).unwrap();
+        assert_eq!(s.stats().dead_bytes, 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn items<'a>(ps: &'a [Vec<u8>], first: u8) -> Vec<StoreItem<'a>> {
+        ps.iter()
+            .enumerate()
+            .map(|(i, p)| StoreItem {
+                key: k(first + i as u8),
+                generation: 1,
+                schema_version: 1,
+                payload: p,
+                checksum: Some(super::super::digest::Checksum::of_payload(p).0),
+            })
+            .collect()
+    }
+
+    /// A chain written as one group commit: two flushes for the batch, every
+    /// extent published together, and all of it there after a restart.
+    #[test]
+    fn a_group_commit_lands_whole_and_survives_restart() {
+        let d = tdir("gcommit");
+        let ps: Vec<Vec<u8>> = (0..3u8).map(|n| payload(n, 50_000 + n as usize)).collect();
+        {
+            let (mut s, _) = NvmeStore::open(&d, 1 << 30).unwrap();
+            let locs = s.store_many(&items(&ps, 10)).unwrap();
+            assert_eq!(locs.len(), 3);
+            assert_eq!(s.stats().live_entries, 3);
+        }
+        let (mut s, r) = NvmeStore::open(&d, 1 << 30).unwrap();
+        assert_eq!(r.recovered_entries, 3);
+        for (i, p) in ps.iter().enumerate() {
+            assert_eq!(&s.read(&k(10 + i as u8)).unwrap().1, p);
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// All or nothing: a batch whose commit cannot be written publishes none
+    /// of its extents, now or after a restart; what was there stays.
+    #[test]
+    fn a_group_commit_that_fails_publishes_nothing() {
+        let d = tdir("gcfail");
+        let ps: Vec<Vec<u8>> = (0..3u8).map(|n| payload(n, 20_000)).collect();
+        {
+            let (mut s, _) = NvmeStore::open(&d, 1 << 30).unwrap();
+            s.store(k(1), 1, 1, &payload(1, 8192)).unwrap();
+            s.set_kill(Some(Kill::DiskFullWal));
+            assert!(matches!(
+                s.store_many(&items(&ps, 20)),
+                Err(StoreError::Io(_))
+            ));
+            s.set_kill(None);
+            assert!((20..23).all(|n| !s.contains(&k(n))));
+            // and the next batch lands where the failed one would have
+            s.store_many(&items(&ps, 30)).unwrap();
+        }
+        let (mut s, r) = NvmeStore::open(&d, 1 << 30).unwrap();
+        assert_eq!(r.recovered_entries, 4, "the survivor and the second batch");
+        assert!((20..23).all(|n| !s.contains(&k(n))));
+        assert_eq!(s.read(&k(31)).unwrap().1, ps[1]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The caller's checksum is trusted at write time, never at read time: a
+    /// wrong one makes the entry unreadable (tombstoned), not misread.
+    #[test]
+    fn a_wrong_caller_checksum_can_only_fail_a_read() {
+        let d = tdir("gcsum");
+        let (mut s, _) = NvmeStore::open(&d, 1 << 30).unwrap();
+        let p = payload(7, 30_000);
+        let item = StoreItem {
+            key: k(7),
+            generation: 1,
+            schema_version: 1,
+            payload: &p,
+            checksum: Some([0xab; 32]),
+        };
+        s.store_many(&[item]).unwrap();
+        assert!(matches!(s.read(&k(7)), Err(StoreError::Integrity)));
+        assert!(!s.contains(&k(7)));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Row 23: the disk fills part-way through a commit append and the
+    /// process carries on. The torn half must not stay in the manifest -
+    /// boot replay stops at a tear, and every later commit would be lost.
+    #[test]
+    fn row_23_a_short_commit_append_rolls_back_and_later_commits_survive() {
+        let d = tdir("r23");
+        {
+            let (mut s, _) = NvmeStore::open(&d, 1 << 30).unwrap();
+            s.store(k(1), 1, 1, &payload(1, 10_000)).unwrap();
+            s.set_kill(Some(Kill::ShortWalAppend));
+            assert!(matches!(
+                s.store(k(2), 2, 1, &payload(2, 10_000)),
+                Err(StoreError::Io(_))
+            ));
+            s.set_kill(None);
+            assert!(!s.contains(&k(2)));
+            s.store(k(3), 3, 1, &payload(3, 10_000)).unwrap();
+            s.tombstone(&k(1)).unwrap();
+            s.flush_group().unwrap();
+        }
+        let (mut s, r) = NvmeStore::open(&d, 1 << 30).unwrap();
+        assert_eq!(r.discarded_tail_records, 0, "no tear left behind");
+        assert!(!s.contains(&k(1)), "the tombstone after the failure landed");
+        assert!(!s.contains(&k(2)));
+        assert_eq!(s.read(&k(3)).unwrap().1, payload(3, 10_000));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Row 24: eviction deletes the segment first (so a full disk has room
+    /// for the tombstones) and dies before writing them. Boot must drop the
+    /// commits that name the missing file - and tombstone them, so the next
+    /// boot does not have to.
+    #[test]
+    fn row_24_an_eviction_that_dies_before_its_tombstones_is_dropped_at_boot() {
+        let d = tdir("r24");
+        {
+            let (mut s, _) = NvmeStore::open(&d, 500_000).unwrap();
+            s.store(k(1), 1, 1, &payload(1, 200_000)).unwrap();
+            s.open_seg += 1;
+            s.cursor = 0;
+            s.store(k(2), 2, 1, &payload(2, 200_000)).unwrap();
+            s.set_kill(Some(Kill::EvictBeforeTombstones));
+            assert!(matches!(
+                s.make_room(200_000),
+                Err(StoreError::Killed(Kill::EvictBeforeTombstones))
+            ));
+            assert!(!seg_path(&d, 1).exists(), "the segment went first");
+        }
+        let (mut s, r) = NvmeStore::open(&d, 500_000).unwrap();
+        assert_eq!(r.lost_to_missing_segments, 1);
+        assert!(!s.contains(&k(1)), "never served from a file that is gone");
+        assert_eq!(s.read(&k(2)).unwrap().1, payload(2, 200_000));
+        drop(s);
+        let (_s, r) = NvmeStore::open(&d, 500_000).unwrap();
+        assert_eq!(r.lost_to_missing_segments, 0, "tombstoned at the last boot");
+        assert_eq!(r.recovered_entries, 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The vLLM PR 61780 class: a disk that fails every write instantly must
+    /// stop receiving them, and come back by itself once writes land again.
+    #[test]
+    fn repeated_device_failures_pause_writes_until_a_probe_lands() {
+        let d = tdir("gate");
+        let (mut s, _) = NvmeStore::open(&d, 1 << 30).unwrap();
+        s.set_kill(Some(Kill::DiskFullData));
+        for i in 0..3u8 {
+            assert!(matches!(
+                s.store(k(i), 1, 1, &payload(i, 8192)),
+                Err(StoreError::Io(_))
+            ));
+        }
+        assert!(s.writes_paused());
+        // paused: refused before the device, and before quota/eviction work
+        s.set_kill(None);
+        assert!(matches!(
+            s.store(k(9), 1, 1, &payload(9, 8192)),
+            Err(StoreError::Paused)
+        ));
+        assert!(!s.contains(&k(9)));
+        // the volume was "cleaned up": the first probe lands and resumes
+        std::thread::sleep(std::time::Duration::from_millis(1050));
+        s.store(k(9), 1, 1, &payload(9, 8192)).unwrap();
+        assert!(!s.writes_paused());
+        s.store(k(10), 1, 1, &payload(10, 8192)).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The store never takes its volume's last free space: it holds what the
+    /// volume can spare beyond its reserve, evicts toward that when other
+    /// writers take space, and grows again when space comes back.
+    #[test]
+    fn the_volume_reserve_caps_the_store_and_eviction_gives_space_back() {
+        use std::sync::{Arc, atomic::AtomicU64, atomic::Ordering::Relaxed};
+        let d = tdir("room");
+        let (mut s, _) = NvmeStore::open(&d, 1 << 30).unwrap();
+        // 1 MB volume: 100 KB reserve; 160 KB free -> room for 60 KB
+        let avail = Arc::new(AtomicU64::new(160_000));
+        let a = Arc::clone(&avail);
+        s.set_space(Box::new(move |_| Some((a.load(Relaxed), 1_000_000))));
+        s.store(k(1), 1, 1, &payload(1, 50_000)).unwrap();
+        assert!(matches!(
+            s.store(k(2), 2, 1, &payload(2, 20_000)),
+            Err(StoreError::VolumeFull { cap: 60_000, .. })
+        ));
+        // FIFO under the volume's limit, exactly as under the quota
+        assert_eq!(s.make_room(20_000).unwrap(), vec![k(1)]);
+        s.store(k(2), 2, 1, &payload(2, 20_000)).unwrap();
+        // another writer takes the rest of the volume: nothing fits, and the
+        // store gives back what it holds over the new limit
+        avail.store(0, Relaxed);
+        s.room.invalidate();
+        assert!(matches!(
+            s.store(k(3), 3, 1, &payload(3, 10_000)),
+            Err(StoreError::VolumeFull { .. })
+        ));
+        assert_eq!(s.make_room(10_000).unwrap(), vec![k(2)]);
+        assert_eq!(s.stats().live_bytes, 0);
+        // space comes back (the writer deleted its files): writes resume
+        avail.store(500_000, Relaxed);
+        s.room.invalidate();
+        s.store(k(3), 3, 1, &payload(3, 10_000)).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// An evicted segment's space must come back when it is deleted. The IO
+    /// workers used to keep a descriptor on every segment they had read from
+    /// for the life of the process, and an open descriptor keeps a deleted
+    /// file's blocks allocated - the cache's quota held while the volume
+    /// filled anyway.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_evicted_segment_that_served_restores_frees_its_space() {
+        let d = tdir("fdleak");
+        let (mut s, _) = NvmeStore::open(&d, 8 << 20).unwrap();
+        // 3 MiB reads split into 1 MiB chunks, two of them on pool workers
+        s.store(k(1), 1, 1, &payload(1, 3 << 20)).unwrap();
+        s.open_seg += 1;
+        s.cursor = 0;
+        s.store(k(2), 2, 1, &payload(2, 3 << 20)).unwrap();
+        assert_eq!(s.read(&k(1)).unwrap().1, payload(1, 3 << 20));
+        assert_eq!(s.make_room(4 << 20).unwrap(), vec![k(1)]);
+        assert!(!seg_path(&d, 1).exists());
+        let victim = seg_path(&d, 1).to_string_lossy().to_string();
+        let held: Vec<String> = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| std::fs::read_link(e.path()).ok())
+            .map(|t| t.to_string_lossy().to_string())
+            .filter(|t| t.starts_with(&victim))
+            .collect();
+        assert!(held.is_empty(), "deleted segment still open: {held:?}");
+        assert_eq!(s.read(&k(2)).unwrap().1, payload(2, 3 << 20));
         let _ = std::fs::remove_dir_all(&d);
     }
 

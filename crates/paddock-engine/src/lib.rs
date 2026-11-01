@@ -42,6 +42,7 @@ pub mod metrics;
 pub mod nemotron_asr;
 pub mod pacing;
 pub mod paged_radix;
+pub mod phonon;
 pub mod pillow;
 #[cfg(feature = "cuda")]
 pub mod reference;

@@ -34,7 +34,7 @@ use std::time::Instant;
 
 use cudarc::driver::CudaEvent;
 
-use super::pool_tier::{AuxHit, PoolTier, TicketId, TierHit, XferSink};
+use super::pool_tier::{AuxHit, PoolTier, RestoreWake, TicketId, TierHit, XferSink};
 use crate::kv_pool::{BLOCK_TOKENS, KvPool};
 use crate::paged_radix::PagedRadix;
 
@@ -87,8 +87,30 @@ enum FlowState {
         cidx: u32,
         deadline: Instant,
     },
+    /// Both rounds in flight at once: the blob loads into reserved slot
+    /// `cidx` beside the runs and attaches once both have landed. Each round
+    /// is a few scheduler pumps (submit, land, retire) whatever the disk
+    /// does, so back to back they cost a restore twice the pump cadence -
+    /// ~600 + ~350 ms on a Qwen3.8-27B session beside prefill.
+    Both {
+        blocks: TicketId,
+        aux: TicketId,
+        cidx: u32,
+        deadline: Instant,
+        blocks_wake: Option<RestoreWake>,
+        aux_wake: Option<RestoreWake>,
+    },
     /// Past deadline (or orphaned): unparked, still consuming the wake.
     Abandoned { ticket: TicketId, cidx: Option<u32> },
+    /// A `Both` that will not attach: unparked, consuming whichever wakes
+    /// are still out (None = consumed) before it returns slot `cidx` and the
+    /// published path's pin - the blocks ticket pins its tip when it
+    /// resolves, so letting go before it has would leak that pin.
+    Draining {
+        blocks: Option<TicketId>,
+        aux: Option<TicketId>,
+        cidx: u32,
+    },
     /// Resolved. `ok` = the restored prefix is adoptable (published, and for
     /// hybrids the checkpoint attached); `at` GCs unclaimed entries.
     Done { ok: bool, at: Instant },
@@ -181,7 +203,44 @@ impl RestoreFlow {
 
     /// True while a consult should keep its request parked.
     fn loading(&self) -> bool {
-        matches!(self.state, FlowState::Blocks { .. } | FlowState::Aux { .. })
+        matches!(
+            self.state,
+            FlowState::Blocks { .. } | FlowState::Aux { .. } | FlowState::Both { .. }
+        )
+    }
+
+    /// Reserve the checkpoint slot and start the blob round. None when no
+    /// slot can be had or the round cannot start (the slot is returned).
+    fn start_aux<T: XferSink>(
+        &self,
+        tier: &mut PoolTier<T>,
+        pr: &mut PagedRadix,
+        pool: Option<&mut KvPool>,
+        after: &mut dyn FnMut() -> Option<CudaEvent>,
+    ) -> Option<(TicketId, u32)> {
+        let plan = self.aux.as_ref()?;
+        // paged checkpoints draw their pages here; a flat pool (or a paged
+        // one pumped without its pool) takes a slot
+        let cidx = match pool {
+            Some(pool) if pr.state_is_paged() => pr.reserve_state_slot_with_pool(pool),
+            _ => pr.reserve_state_slot(),
+        }?;
+        // a blob coming off disk is seated back in T1 whole
+        tier.expect_aux_fill(&plan.hit, &self.tokens);
+        let started = if pr.state_is_paged() {
+            let pages = pr.state_pages(cidx).to_vec();
+            tier.begin_restore_aux_paged(&plan.hit, &pages, after())
+        } else {
+            let dst = plan.state_base + cidx as u64 * plan.state_stride;
+            tier.begin_restore_aux(&plan.hit, dst, after())
+        };
+        match started {
+            Some(tk) => Some((tk, cidx)),
+            None => {
+                pr.recycle_state(cidx);
+                None
+            }
+        }
     }
 
     fn done(&self) -> Option<(bool, Instant)> {
@@ -224,11 +283,28 @@ impl RestoreFlow {
         &mut self,
         tier: &mut PoolTier<T>,
         pr: &mut PagedRadix,
-        pool: Option<&mut KvPool>,
+        mut pool: Option<&mut KvPool>,
         after: &mut dyn FnMut() -> Option<CudaEvent>,
     ) {
         match self.state {
             FlowState::Blocks { ticket, deadline } => {
+                // start the blob round now, beside the runs (`Both`); if no
+                // slot can be had yet, the sequential path below retries
+                // once the runs land
+                if self.aux.is_some()
+                    && Instant::now() < deadline
+                    && let Some((aux, cidx)) = self.start_aux(tier, pr, pool.as_deref_mut(), after)
+                {
+                    self.state = FlowState::Both {
+                        blocks: ticket,
+                        aux,
+                        cidx,
+                        deadline,
+                        blocks_wake: None,
+                        aux_wake: None,
+                    };
+                    return;
+                }
                 // (the blob round below inherits this deadline: `est_us`
                 // already prices the blob, so the bound stays per flow)
                 if let Some(w) = tier.take_wake(ticket) {
@@ -251,16 +327,6 @@ impl RestoreFlow {
                     let Some(plan) = self.aux.as_ref() else {
                         unreachable!("aux checked above");
                     };
-                    // paged checkpoints draw their pages here; a flat pool
-                    // (or a paged one pumped without its pool) takes a slot
-                    let reserved = match pool {
-                        Some(pool) if pr.state_is_paged() => pr.reserve_state_slot_with_pool(pool),
-                        _ => pr.reserve_state_slot(),
-                    };
-                    let Some(cidx) = reserved else {
-                        self.finish(tier, false);
-                        return;
-                    };
                     // the flow's own deadline, or the blob's time at the
                     // measured rate if the blocks round ate the budget. A
                     // fixed 16 GB/s guess here abandoned every Qwen3.8
@@ -268,27 +334,15 @@ impl RestoreFlow {
                     let rate = tier.cost.rates_bpus().0.max(1.0);
                     let aux_deadline =
                         deadline.max(Instant::now() + park_deadline(plan.hit.bytes as f64 / rate));
-                    // a blob coming off disk is seated back in T1 whole
-                    tier.expect_aux_fill(&plan.hit, &self.tokens);
-                    let started = if pr.state_is_paged() {
-                        let pages = pr.state_pages(cidx).to_vec();
-                        tier.begin_restore_aux_paged(&plan.hit, &pages, after())
-                    } else {
-                        let dst = plan.state_base + cidx as u64 * plan.state_stride;
-                        tier.begin_restore_aux(&plan.hit, dst, after())
-                    };
-                    match started {
-                        Some(tk) => {
+                    match self.start_aux(tier, pr, pool, after) {
+                        Some((tk, cidx)) => {
                             self.state = FlowState::Aux {
                                 ticket: tk,
                                 cidx,
                                 deadline: aux_deadline,
                             };
                         }
-                        None => {
-                            pr.recycle_state(cidx);
-                            self.finish(tier, false);
-                        }
+                        None => self.finish(tier, false),
                     }
                 } else if Instant::now() >= deadline {
                     tracing::debug!(ticket, "tier flow abandoned (blocks round deadline)");
@@ -325,6 +379,109 @@ impl RestoreFlow {
                         ticket,
                         cidx: Some(cidx),
                     };
+                }
+            }
+            FlowState::Both {
+                blocks,
+                aux,
+                cidx,
+                deadline,
+                mut blocks_wake,
+                mut aux_wake,
+            } => {
+                if blocks_wake.is_none() {
+                    blocks_wake = tier.take_wake(blocks);
+                }
+                if aux_wake.is_none() {
+                    aux_wake = tier.take_wake(aux);
+                }
+                let boundary = self.boundary_blocks;
+                let reached = |w: &RestoreWake| w.ok && w.end_block >= boundary;
+                match (blocks_wake, aux_wake) {
+                    (Some(b), Some(a)) => {
+                        let attached = reached(&b)
+                            && a.ok
+                            && pr.attach_state_at(
+                                &self.tokens,
+                                self.boundary_blocks * BLOCK_TOKENS,
+                                cidx,
+                            );
+                        if !attached {
+                            tracing::debug!(
+                                blocks_reached = reached(&b),
+                                blob_landed = a.ok,
+                                boundary = self.boundary_blocks,
+                                "tier flow: checkpoint not attached"
+                            );
+                            pr.recycle_state(cidx);
+                        }
+                        self.finish(tier, attached);
+                    }
+                    // the runs fell short of the boundary: the blob has
+                    // nothing to attach to - unpark now, and let its wake
+                    // return the slot when it lands
+                    (Some(b), None) if !reached(&b) => {
+                        tier.note_flow_end(false, self.bytes, self.from_nvme);
+                        self.state = FlowState::Draining {
+                            blocks: None,
+                            aux: Some(aux),
+                            cidx,
+                        };
+                    }
+                    (b, a) if Instant::now() >= deadline => {
+                        tracing::debug!(blocks, aux, "tier flow abandoned (both rounds' deadline)");
+                        tier.note_flow_end(false, self.bytes, self.from_nvme);
+                        self.state = FlowState::Draining {
+                            blocks: b.is_none().then_some(blocks),
+                            aux: a.is_none().then_some(aux),
+                            cidx,
+                        };
+                    }
+                    _ => {
+                        self.state = FlowState::Both {
+                            blocks,
+                            aux,
+                            cidx,
+                            deadline,
+                            blocks_wake,
+                            aux_wake,
+                        };
+                    }
+                }
+            }
+            FlowState::Draining {
+                mut blocks,
+                mut aux,
+                cidx,
+            } => {
+                if blocks.is_some_and(|t| tier.take_wake(t).is_some()) {
+                    blocks = None;
+                }
+                if aux.is_some_and(|t| tier.take_wake(t).is_some()) {
+                    aux = None;
+                }
+                if blocks.is_none() && aux.is_none() {
+                    let el = self.started.elapsed().as_micros() as f64;
+                    tier.cost
+                        .observe_restore_from(self.bytes, el, self.est_us, self.from_nvme);
+                    pr.recycle_state(cidx);
+                    tier.release_hold(self.blocks_ticket);
+                    self.state = FlowState::Done {
+                        ok: false,
+                        at: Instant::now(),
+                    };
+                } else if self.started.elapsed() > ZOMBIE_TTL {
+                    tracing::warn!(
+                        cidx,
+                        "tier zombie flow dropped - checkpoint slot leaked (bounded)"
+                    );
+                    tier.release_hold(self.blocks_ticket);
+                    self.state = FlowState::Done {
+                        ok: false,
+                        at: Instant::now(),
+                    };
+                } else {
+                    self.state = FlowState::Draining { blocks, aux, cidx };
                 }
             }
             FlowState::Abandoned { ticket, cidx } => {
@@ -371,6 +528,56 @@ impl RestoreFlow {
 pub(super) struct FlowPark {
     active: std::collections::HashMap<usize, RestoreFlow>,
     zombies: Vec<RestoreFlow>,
+    /// Consults keeping their request parked without a flow, per slot.
+    waits: std::collections::HashMap<usize, ConsultWait>,
+}
+
+/// How often a waiting consult tries again. The scheduler re-enters a
+/// parked slot every pass - 100 us apart when nothing decodes - and each
+/// try probes (and, waiting for room, presses retention) again.
+const CONSULT_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
+/// The longest a consult waits, whatever the recompute costs.
+const CONSULT_WAIT_CAP_US: f64 = 10_000_000.0;
+/// The least a wait must be worth. Its tries come once a scheduler pass -
+/// 0.1-0.2 s beside decode on a 27B, longer beside a prefill chunk - so a
+/// wait that cannot outlast a few passes only adds one (live: a 128-token
+/// gap's first retry came 144 ms in, past the 130 ms the gap was worth).
+const CONSULT_WAIT_MIN_US: f64 = 500_000.0;
+/// A wait no try has touched this long past its end is stale (its request
+/// went another way - a probe that missed, a reused slot).
+const CONSULT_WAIT_STALE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What a waiting consult waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitFor {
+    /// Block-pool room for an elected restore ([`PoolTier::wait_for_pool`]).
+    PoolRoom,
+    /// Deeper state still on its way into T1 ([`PoolTier::wait_for_blob`]).
+    BlobLanding,
+}
+
+struct ConsultWait {
+    why: WaitFor,
+    t_len: usize,
+    since: Instant,
+    until: Instant,
+    next: Instant,
+    /// The ledger before this try. A retry asks the same question again, so
+    /// its lookup is the first try's, not another one.
+    mark: super::accounting::TierDecisions,
+}
+
+/// What a consult does about a slot whose request is waiting (see
+/// [`PoolTier::consult_try`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsultTry {
+    /// No wait: an ordinary consult.
+    Fresh,
+    /// Too soon to try again - keep the request parked.
+    Hold,
+    /// Try again now, without blocking on the pool: the passes between
+    /// tries are the wait.
+    Retry,
 }
 
 impl<T: XferSink> PoolTier<T> {
@@ -384,7 +591,12 @@ impl<T: XferSink> PoolTier<T> {
         };
         if !f.matches(tokens) {
             let f = self.flows.active.remove(&slot).expect("present");
-            if f.loading() || matches!(f.state, FlowState::Abandoned { .. }) {
+            if f.loading()
+                || matches!(
+                    f.state,
+                    FlowState::Abandoned { .. } | FlowState::Draining { .. }
+                )
+            {
                 self.flows.zombies.push(f);
             }
             return FlowStatus::None;
@@ -412,6 +624,16 @@ impl<T: XferSink> PoolTier<T> {
     /// Park a freshly begun flow for `slot`. An abandoned predecessor moves
     /// to the zombie list rather than being clobbered.
     pub fn park_flow(&mut self, slot: usize, flow: RestoreFlow) {
+        if let Some(w) = self.flows.waits.remove(&slot) {
+            // seated after waiting: one lookup, however many tries
+            self.dec.rewind_lookup(&w.mark);
+            tracing::debug!(
+                slot,
+                waited_ms = w.since.elapsed().as_millis() as u64,
+                why = ?w.why,
+                "tier: restore parked after its consult waited"
+            );
+        }
         if let Some(old) = self.flows.active.insert(slot, flow)
             && !matches!(old.state, FlowState::Done { .. })
         {
@@ -476,6 +698,113 @@ impl<T: XferSink> PoolTier<T> {
             None => true,
         });
         self.flows = park;
+    }
+
+    /// The consult's next question after [`Self::flow_status`]: is `slot`'s
+    /// request waiting ([`Self::wait_for_pool`], [`Self::wait_for_blob`])?
+    pub fn consult_try(&mut self, slot: usize, t_len: usize) -> ConsultTry {
+        let now = Instant::now();
+        let dec = self.dec;
+        match self.flows.waits.get_mut(&slot) {
+            Some(w) if w.t_len == t_len && now < w.until + CONSULT_WAIT_STALE => {
+                if now < w.next {
+                    return ConsultTry::Hold;
+                }
+                w.mark = dec;
+                ConsultTry::Retry
+            }
+            Some(_) => {
+                self.flows.waits.remove(&slot);
+                ConsultTry::Fresh
+            }
+            None => ConsultTry::Fresh,
+        }
+    }
+
+    /// An elected restore the block pool cannot seat right now. Waiting beats
+    /// recomputing while the wait plus the restore still costs less than the
+    /// prefill it saves (`restore_tokens` of it): the pool is full of live
+    /// sequences, the next ones to finish free it, and a recompute needs the
+    /// same blocks - it only starts sooner, a chunk at a time. Refusing
+    /// outright made a 19.5K-token turn whose state sat on the tier recompute
+    /// in full, 14.6 s, because a restore beside it had just taken the free
+    /// blocks. True: keep the request parked and consult again; false: give
+    /// up (a park refusal) and recompute.
+    pub fn wait_for_pool(
+        &mut self,
+        slot: usize,
+        t_len: usize,
+        est_us: f64,
+        restore_tokens: usize,
+    ) -> bool {
+        let slack_us = self.cost.recompute_us(restore_tokens as u32) - est_us;
+        if self.wait_while(slot, t_len, WaitFor::PoolRoom, slack_us) {
+            return true;
+        }
+        self.refuse_park();
+        false
+    }
+
+    /// Deeper state for this prompt is still being stored into T1
+    /// (`blob_landing` found it, `gap_tokens` past what is restorable now,
+    /// and started its stores). Waiting for it beats restoring the shallower
+    /// boundary while the wait costs less than re-prefilling the gap. True:
+    /// keep the request parked and consult again; false: stop waiting and
+    /// restore what is there.
+    pub fn wait_for_blob(&mut self, slot: usize, t_len: usize, gap_tokens: usize) -> bool {
+        let slack_us = self.cost.recompute_us(gap_tokens as u32);
+        self.wait_while(slot, t_len, WaitFor::BlobLanding, slack_us)
+    }
+
+    /// Keep `slot`'s request parked for `why` while `slack_us` (counted from
+    /// the first try of this wait) has not run out. False once it has, or
+    /// when the wait would never pay - and the wait is forgotten. A retry's
+    /// lookup counts are handed back: the first try's stand.
+    fn wait_while(&mut self, slot: usize, t_len: usize, why: WaitFor, slack_us: f64) -> bool {
+        let now = Instant::now();
+        let mut since = now;
+        if let Some(w) = self.flows.waits.get_mut(&slot)
+            && w.t_len == t_len
+        {
+            self.dec.rewind_lookup(&w.mark);
+            since = w.since;
+            if w.why == why {
+                if now < w.until {
+                    w.next = now + CONSULT_RETRY;
+                    return true;
+                }
+                let waited_ms = w.since.elapsed().as_millis() as u64;
+                self.flows.waits.remove(&slot);
+                tracing::debug!(slot, waited_ms, why = ?why, "tier: consult stopped waiting");
+                return false;
+            }
+            // the same request, now waiting on something else (the time
+            // it waited already still counts as its wait)
+            self.flows.waits.remove(&slot);
+        }
+        let slack_us = slack_us.min(CONSULT_WAIT_CAP_US);
+        if slack_us < CONSULT_WAIT_MIN_US {
+            return false;
+        }
+        tracing::debug!(
+            slot,
+            t_len,
+            why = ?why,
+            wait_up_to_ms = (slack_us / 1000.0) as u64,
+            "tier: consult waits"
+        );
+        self.flows.waits.insert(
+            slot,
+            ConsultWait {
+                why,
+                t_len,
+                since,
+                until: now + std::time::Duration::from_micros(slack_us as u64),
+                next: now + CONSULT_RETRY,
+                mark: self.dec,
+            },
+        );
+        true
     }
 
     /// Open flows (parked + zombies) - test/stat witness.

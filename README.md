@@ -109,6 +109,8 @@ Every model below runs on the engine today. Sizes are the checkpoint's own, and
 - **MiniCPM5** - 2B
 - **Muse Glimmer** - 30B
 - **Nemotron 3.5 Lightning** - 30B-A3B
+- **Nemotron 3.5 Super VL** - 120B-A12B; reads pictures and documents, NVIDIA GPUs
+  for now
 - **Kolibri 1** (Aleph Alpha) - 78B with 3.5B active, German and English, text only
 
 **Images**
@@ -157,6 +159,8 @@ Every model below runs on the engine today. Sizes are the checkpoint's own, and
   timeline
 - **Nemotron 3.5 ASR Streaming** (NVIDIA) - 0.6B; live transcripts that are
   never revised, in 40 languages and locales. NVIDIA GPUs for now
+- **Phonon** 31M (Gradium) - English text to speech, streamed as it's made, on
+  NVIDIA GPUs and the Mac
 - **Whisper Large** fine-tunes - KB-Whisper (Swedish), NB-Whisper (Norwegian),
   Røst v3 (Danish)
 

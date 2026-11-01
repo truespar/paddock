@@ -166,6 +166,8 @@ pub(crate) struct PrefillScratch {
     pub d_fq_s: CudaSlice<u8>,
     pub d_fs_s: CudaSlice<u8>,
     pub d_part: CudaSlice<f32>,
+    /// LatentMoE scratch (None without a latent)
+    pub lat: Option<super::LatentScratch>,
     /// last-row staging for the final norm + lm_head tail
     pub d_last: CudaSlice<f32>,
     pub d_lastn: CudaSlice<f32>,
@@ -223,6 +225,8 @@ pub(crate) struct Scratch {
     pub d_act: CudaSlice<f32>,
     pub d_part7: CudaSlice<f32>,
     pub d_logits: CudaSlice<f32>,
+    /// LatentMoE scratch (None without a latent)
+    pub lat: Option<super::LatentScratch>,
     /// GGUF-lane extras (None on the NVFP4 lane)
     pub q8: Option<ScratchQ8>,
 }
@@ -242,7 +246,7 @@ pub(crate) struct ScratchQ8 {
 }
 
 impl GpuNemotron {
-    fn ensure_decode(&mut self) -> Result<(), GpuModelError> {
+    pub(super) fn ensure_decode(&mut self) -> Result<(), GpuModelError> {
         if self.decode.is_some() && self.scratch.is_some() {
             return Ok(());
         }
@@ -323,6 +327,7 @@ impl GpuNemotron {
             d_act: e.alloc(hp.n_active * hp.moe_ff + hp.shared_ff)?,
             d_part7: e.alloc((hp.n_active + 1) * hp.hidden)?,
             d_logits: e.alloc(hp.vocab)?,
+            lat: super::LatentScratch::new(e, hp, 1, 1)?,
             q8: if self.is_gguf() {
                 Some(ScratchQ8 {
                     xq: e.alloc_i8(hp.hidden)?,
@@ -340,7 +345,7 @@ impl GpuNemotron {
         Ok(())
     }
 
-    fn ensure_prefill(&mut self) -> Result<(), GpuModelError> {
+    pub(super) fn ensure_prefill(&mut self) -> Result<(), GpuModelError> {
         if self.prefill.is_some() {
             return Ok(());
         }
@@ -356,6 +361,15 @@ impl GpuNemotron {
         // ceil(cap/32) (+1 covers a non-multiple tail chunk).
         let nb_r = c * hp.n_active / 32 + hp.n_expert;
         let nb_s = c / 32 + 1;
+        // a latent mixer reads none of the hidden-wide f32 MoE planes: the
+        // exact class keeps its activations in LatentScratch, and the W4A4
+        // pair's partials are the routed [c][k][latent] plane, then the
+        // shared expert's [c][hidden]
+        let latent_mma = hp.latent.is_some() && super::latent_mma_on(e);
+        let (up_rows, part_elems) = match hp.latent {
+            Some(l) => (1, c * (hp.n_active * l).max(hp.hidden)),
+            None => (c, c * (hp.n_active + 1) * hp.hidden),
+        };
         self.prefill = Some(PrefillScratch {
             cap: c,
             d_tok: e.alloc_u32(c)?,
@@ -378,10 +392,10 @@ impl GpuNemotron {
             d_logits_r: e.alloc(c * hp.n_expert)?,
             d_idx: e.alloc_u32(c * hp.n_active)?,
             d_w: e.alloc(c * hp.n_active)?,
-            d_up: e.alloc(c * hp.n_active * hp.moe_ff)?,
+            d_up: e.alloc(up_rows * hp.n_active * hp.moe_ff)?,
             d_sh_idx: e.alloc_u32(c)?, // zeroed -> plane index 0
             d_sh_w,
-            d_sh_up: e.alloc(c * hp.shared_ff)?,
+            d_sh_up: e.alloc(up_rows * hp.shared_ff)?,
             nb_r,
             nb_s,
             d_xq4: e.alloc_i8(c * hp.hidden / 2)?,
@@ -396,7 +410,8 @@ impl GpuNemotron {
             d_fs: e.alloc_u8(nb_r * 32 * hp.moe_ff / 16)?,
             d_fq_s: e.alloc_u8(nb_s * 32 * hp.shared_ff / 2)?,
             d_fs_s: e.alloc_u8(nb_s * 32 * hp.shared_ff / 16)?,
-            d_part: e.alloc(c * (hp.n_active + 1) * hp.hidden)?,
+            d_part: e.alloc(part_elems)?,
+            lat: super::LatentScratch::new(e, hp, c, if latent_mma { 1 } else { c })?,
             d_last: e.alloc(hp.hidden)?,
             d_lastn: e.alloc(hp.hidden)?,
             d_logits: e.alloc(hp.vocab)?,
@@ -446,7 +461,7 @@ impl GpuNemotron {
     }
 
     /// One chunk (T <= prefill_chunk tokens) through the whole stack.
-    fn prefill_chunk(
+    pub(super) fn prefill_chunk(
         &mut self,
         tokens: &[u32],
         want_logits: bool,
@@ -494,6 +509,8 @@ impl GpuNemotron {
             }
             TokEmbd::Q8(tab) => exec.embed_gather_batch_q8(tab, &px.d_tok, &mut px.d_x, embd, t)?,
         }
+        // a picture prompt's rows over its placeholders (mm.rs)
+        Self::apply_overlay(&exec, self.mm.as_ref(), &mut px.d_x, embd)?;
 
         // Glue rung: the checkpoint's pattern is strictly
         // (mamba|attention) -> moe, so every MoE layer's prologue is the same
@@ -632,6 +649,13 @@ impl GpuNemotron {
                             exec.gemm_f32(&wk.buf, embd, kv_dim, &px.d_xn, &mut px.d_k, t)?;
                             exec.gemm_f32(&wv.buf, embd, kv_dim, &px.d_xn, &mut px.d_v, t)?;
                         }
+                        // W8A8 like mamba in_proj: one e4m3 image of xn, three GEMMs
+                        AttnWeights::F8 { wq, wk, wv, .. } => {
+                            exec.quantize_e4m3_row(&px.d_xn, &mut px.d_xq, &mut px.d_xrs, embd, t)?;
+                            exec.f8row_gemm(wq, &px.d_xq, &px.d_xrs, &mut px.d_q, embd, q_dim, t)?;
+                            exec.f8row_gemm(wk, &px.d_xq, &px.d_xrs, &mut px.d_k, embd, kv_dim, t)?;
+                            exec.f8row_gemm(wv, &px.d_xq, &px.d_xrs, &mut px.d_v, embd, kv_dim, t)?;
+                        }
                         AttnWeights::Qw { wq, wk, wv, .. } => {
                             let s8 = px.q8.as_mut().expect("q8 prefill scratch");
                             prefill_quant(
@@ -719,6 +743,24 @@ impl GpuNemotron {
                         AttnWeights::F32 { wo, .. } => {
                             exec.gemm_f32(&wo.buf, q_dim, embd, &px.d_attn, &mut px.d_proj, t)?;
                         }
+                        AttnWeights::F8 { wo, .. } => {
+                            exec.quantize_e4m3_row(
+                                &px.d_attn,
+                                &mut px.d_xq,
+                                &mut px.d_xrs,
+                                q_dim,
+                                t,
+                            )?;
+                            exec.f8row_gemm(
+                                wo,
+                                &px.d_xq,
+                                &px.d_xrs,
+                                &mut px.d_proj,
+                                q_dim,
+                                embd,
+                                t,
+                            )?;
+                        }
                         AttnWeights::Qw { wo, .. } => {
                             let s8 = px.q8.as_mut().expect("q8 prefill scratch");
                             prefill_quant(
@@ -738,6 +780,54 @@ impl GpuNemotron {
                             )?;
                         }
                     }
+                }
+                // LatentMoE (Super): routing over the hidden, experts on the
+                // latent - the mixer output lands in d_proj for the add below
+                Mixer::Moe(w) if w.latent.is_some() => {
+                    exec.matvec_f32_batch(&w.router, &px.d_xn, &mut px.d_logits_r, t)?;
+                    exec.moe_topk_sigmoid_batch(
+                        &px.d_logits_r,
+                        &w.bias.buf,
+                        hp.routed_scale,
+                        hp.n_expert,
+                        hp.n_active,
+                        &mut px.d_idx,
+                        &mut px.d_w,
+                        t,
+                    )?;
+                    // every row here is a prompt row: the sorted W4A4 pair
+                    let mma = super::latent_mma_on(&exec).then_some(super::LatentMma {
+                        xq4: &mut px.d_xq4,
+                        xs4: &mut px.d_xs4,
+                        srow: &mut px.d_srow,
+                        sslot: &mut px.d_sslot,
+                        bexp: &mut px.d_bexp,
+                        nb_r: px.nb_r,
+                        srow_s: &mut px.d_srow_s,
+                        sslot_s: &mut px.d_sslot_s,
+                        bexp_s: &mut px.d_bexp_s,
+                        nb_s: px.nb_s,
+                        fq: &mut px.d_fq,
+                        fs: &mut px.d_fs,
+                        fq_s: &mut px.d_fq_s,
+                        fs_s: &mut px.d_fs_s,
+                        part: &mut px.d_part,
+                    });
+                    super::latent_moe(
+                        &exec,
+                        &hp,
+                        w,
+                        w.latent.as_ref().expect("guarded"),
+                        &px.d_xn,
+                        px.lat.as_mut().expect("latent scratch"),
+                        &px.d_idx,
+                        &px.d_w,
+                        &px.d_sh_idx,
+                        &px.d_sh_w,
+                        &mut px.d_proj,
+                        t,
+                        mma.map_or(super::LatentClass::Exact, super::LatentClass::Mma),
+                    )?;
                 }
                 Mixer::Moe(w) => {
                     exec.matvec_f32_batch(&w.router, &px.d_xn, &mut px.d_logits_r, t)?;
@@ -1048,7 +1138,8 @@ impl GpuNemotron {
                 && paddock_models::dev_var_os!("PADDOCK_NO_GLUE_FUSE").is_none()
                 && matches!(
                     self.layers.get(li + 1).map(|l| &l.mixer),
-                    Some(Mixer::Moe(w)) if matches!(w.planes, MoePlanes::Nvf4 { .. })
+                    Some(Mixer::Moe(w))
+                        if w.latent.is_none() && matches!(w.planes, MoePlanes::Nvf4 { .. })
                 );
             if next_bs_moe && exec.has_add_rmsnorm_quant_nvf4() {
                 let next = &self.layers[li + 1];
@@ -1091,6 +1182,7 @@ impl GpuNemotron {
         match &self.lm_head {
             HeadW::Nvf4(h) => exec.nvf4_gemv(h, &px.d_lastn, &mut px.d_logits, None)?,
             HeadW::Qw(q) => gemv_any(&exec, q, &px.d_lastn, &mut px.d_logits)?,
+            HeadW::F8(h) => exec.f8r_gemv(h, &px.d_lastn, &mut px.d_logits, embd, hp.vocab)?,
         }
         Ok(Some(exec.to_host(&px.d_logits)?))
     }
@@ -1309,6 +1401,12 @@ impl GpuNemotron {
                             gemv_any(&exec, wk, &sc.d_xn, &mut sc.d_k)?;
                             gemv_any(&exec, wv, &sc.d_xn, &mut sc.d_v)?;
                         }
+                        AttnWeights::F8 { wq, wk, wv, .. } => {
+                            let q_dim = hp.n_heads * hp.head_dim;
+                            exec.f8r_gemv(wq, &sc.d_xn, &mut sc.d_q, embd, q_dim)?;
+                            exec.f8r_gemv(wk, &sc.d_xn, &mut sc.d_k, embd, kv_dim)?;
+                            exec.f8r_gemv(wv, &sc.d_xn, &mut sc.d_v, embd, kv_dim)?;
+                        }
                     }
                     exec.kv_append_batch(
                         &sc.d_k,
@@ -1359,7 +1457,39 @@ impl GpuNemotron {
                         AttnWeights::Qw { wo, .. } => {
                             gemv_any(&exec, wo, &sc.d_attn, &mut sc.d_proj)?;
                         }
+                        AttnWeights::F8 { wo, .. } => {
+                            let q_dim = hp.n_heads * hp.head_dim;
+                            exec.f8r_gemv(wo, &sc.d_attn, &mut sc.d_proj, q_dim, embd)?;
+                        }
                     }
+                }
+                Mixer::Moe(w) if w.latent.is_some() => {
+                    exec.matvec_f32_batch(&w.router, &sc.d_xn, &mut sc.d_logits_r, 1)?;
+                    exec.moe_topk_sigmoid_batch(
+                        &sc.d_logits_r,
+                        &w.bias.buf,
+                        hp.routed_scale,
+                        hp.n_expert,
+                        hp.n_active,
+                        &mut sc.d_idx,
+                        &mut sc.d_w,
+                        1,
+                    )?;
+                    super::latent_moe(
+                        &exec,
+                        &hp,
+                        w,
+                        w.latent.as_ref().expect("guarded"),
+                        &sc.d_xn,
+                        sc.lat.as_mut().expect("latent scratch"),
+                        &sc.d_idx,
+                        &sc.d_w,
+                        &sc.d_sh_idx,
+                        &sc.d_sh_w,
+                        &mut sc.d_proj,
+                        1,
+                        super::LatentClass::Exact,
+                    )?;
                 }
                 Mixer::Moe(w) => {
                     // fp32 sigmoid router, selection-biased / combine-unbiased,
@@ -1588,6 +1718,7 @@ impl GpuNemotron {
         match &self.lm_head {
             HeadW::Nvf4(h) => exec.nvf4_gemv(h, &sc.d_xn, &mut sc.d_logits, None)?,
             HeadW::Qw(q) => gemv_any(&exec, q, &sc.d_xn, &mut sc.d_logits)?,
+            HeadW::F8(h) => exec.f8r_gemv(h, &sc.d_xn, &mut sc.d_logits, embd, hp.vocab)?,
         }
         Ok(())
     }
@@ -1683,6 +1814,9 @@ impl Generator for GpuNemotron {
 
     fn tier_pump(&mut self) {
         self.tier_pump_impl();
+    }
+    fn tier_flush_at_exit(&mut self) {
+        self.tier_flush_impl();
     }
     fn reply_pin(&mut self, slot: usize) {
         GpuNemotron::reply_pin(self, slot);
@@ -1817,6 +1951,33 @@ impl Generator for GpuNemotron {
         self.forward_prefill_impl(slot, tokens).map_err(gen_err)
     }
 
+    // Super VL pictures (mm.rs): the serial lane, and batch slots
+    fn forward_multimodal(
+        &mut self,
+        chunks: &[crate::service::MmChunk],
+    ) -> Result<Option<(Vec<f32>, usize)>, GenError> {
+        if self.vision.is_none() {
+            return Ok(None);
+        }
+        self.mm_prefill_serial(chunks).map(Some).map_err(gen_err)
+    }
+
+    fn supports_mm_slots(&self) -> bool {
+        self.vision.is_some() && self.batch.is_some()
+    }
+
+    fn forward_prefill_multimodal(
+        &mut self,
+        slot: usize,
+        chunks: &[crate::service::MmChunk],
+    ) -> Result<(Vec<f32>, usize), GenError> {
+        self.mm_prefill_slot(slot, chunks).map_err(gen_err)
+    }
+
+    fn vision_budget(&self) -> Option<crate::generator::VisionBudget> {
+        self.vision_budget_impl()
+    }
+
     fn forward_prefill_batch(
         &mut self,
         items: &[(usize, Vec<u32>)],
@@ -1920,7 +2081,13 @@ impl Generator for GpuNemotron {
     fn spec_fixed_draft_depth(&self) -> Option<usize> {
         // the elected verify depth over the trained block (dflash.rs): the
         // chain ramp's per-slot k resized the block every round instead
-        self.dflash.as_ref().map(|d| d.verify_depth())
+        if let Some(d) = self.dflash.as_ref() {
+            return Some(d.verify_depth());
+        }
+        // Super's in-file MTP (the FP8-head lane, batched drafts): a fixed
+        // depth - see super_mtp_depth
+        (self.mtp_active() && matches!(self.lm_head, HeadW::F8(_)))
+            .then(crate::gpu_model::nemotron::mtp::super_mtp_depth)
     }
 
     fn spec_live_cap(&self) -> usize {
@@ -1931,6 +2098,11 @@ impl Generator for GpuNemotron {
                 .take_while(|&live| d.depth_for_live(live) > 0)
                 .last()
                 .unwrap_or(0),
+            // Super's fixed MTP depth: every live slot's depth + 1 rows
+            None if self.mtp_active() && matches!(self.lm_head, HeadW::F8(_)) => {
+                crate::gpu_model::nemotron::spec::SPEC_ROWS_NEMO
+                    / (crate::gpu_model::nemotron::mtp::super_mtp_depth() + 1)
+            }
             None => usize::MAX,
         }
     }
@@ -2028,6 +2200,30 @@ impl Generator for GpuNemotron {
         }
         if self.mtp.as_ref().and_then(|m| m.state.as_ref()).is_some() {
             let k = k.min(crate::gpu_model::nemotron::mtp::MTP_MAX_DRAFT);
+            // the FP8-head lane drafts every warm slot together, a step at a time
+            if pendings.len() > 1 && matches!(self.lm_head, HeadW::F8(_)) {
+                let mut reqs = Vec::with_capacity(pendings.len());
+                let mut at = Vec::with_capacity(pendings.len());
+                for (i, &(slot, tok)) in pendings.iter().enumerate() {
+                    let end = self
+                        .mtp
+                        .as_ref()
+                        .and_then(|m| m.state.as_ref())
+                        .map_or(0, |st| st.feat[slot].1 as usize);
+                    if end > 0 && self.mtp_warm(slot, end) {
+                        reqs.push((slot, end, tok));
+                        at.push(i);
+                    }
+                }
+                let mut out = vec![Vec::new(); pendings.len()];
+                if !reqs.is_empty() {
+                    let d = self.mtp_draft_batch(&reqs, k).map_err(gen_err)?;
+                    for (i, d) in at.into_iter().zip(d) {
+                        out[i] = d;
+                    }
+                }
+                return Ok(Some(out));
+            }
             let mut out = Vec::with_capacity(pendings.len());
             for &(slot, tok) in pendings {
                 let end = {

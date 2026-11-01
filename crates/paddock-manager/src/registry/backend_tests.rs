@@ -1672,3 +1672,47 @@ async fn installed_alternative_cannot_displace_the_declared_default() {
     assert_eq!(q8["runtime"]["qualification"], "qualified");
     assert_eq!(q8["runtime"]["kv_cache_dtype"], "f16");
 }
+
+#[test]
+fn phonon_is_native_speech_on_metal_and_cuda_with_measured_memory() {
+    let reg = Registry::new(std::env::temp_dir()).with_backend("metal");
+    let model = reg.catalog_of("phonon-31m-en").expect("Phonon in catalog");
+    assert_eq!(model.capability, ["audio_generation"]);
+    let artifact = model
+        .artifact("native-bf16-f32")
+        .expect("native checkpoint");
+    assert!(artifact.runtime.supports_backend("metal"));
+    assert!(artifact.runtime.supports_backend("cuda"));
+    assert_eq!(
+        artifact.shape.as_ref().expect("measured shape").kind,
+        paddock_estimator::ModelKind::Speech
+    );
+    // each backend prices what its own loader holds: CUDA's planes and
+    // workspace at the artifact, Metal's as its override
+    for (backend, weights, workspace) in [
+        ("cuda", 106975492, 103513292),
+        ("metal", 98787720, 77140132),
+    ] {
+        let reg = Registry::new(std::env::temp_dir()).with_backend(backend);
+        let model = reg.catalog_of("phonon-31m-en").expect("Phonon in catalog");
+        let projected = model
+            .artifact("native-bf16-f32")
+            .expect("native checkpoint");
+        let memory = projected
+            .runtime
+            .memory
+            .as_ref()
+            .expect("measured native memory");
+        assert_eq!(memory.weight_bytes, weights, "{backend}");
+        assert_eq!(memory.workspace_bytes, Some(workspace), "{backend}");
+        assert_eq!(memory.max_batch, 1, "{backend}");
+    }
+    assert_eq!(artifact.runtime.default_spec.as_deref(), Some("off"));
+    assert_eq!(artifact.runtime.default_max_batch, Some(1));
+    assert!(
+        artifact
+            .files
+            .iter()
+            .any(|f| f.dest.ends_with("default-voice.safetensors"))
+    );
+}

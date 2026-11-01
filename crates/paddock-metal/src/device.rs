@@ -113,6 +113,7 @@ pub(crate) const SHADER_SOURCE: &str = concat!(
     include_str!("../../../packs/metal/laya.metal"),
     include_str!("../../../packs/metal/kumo.metal"),
     include_str!("../../../packs/metal/diarization.metal"),
+    include_str!("../../../packs/metal/phonon.metal"),
     include_str!("../../../packs/metal/clef.metal"),
     include_str!("../../../packs/metal/clef_quant.metal"),
     include_str!("../../../packs/metal/clef_attention.metal"),
@@ -321,7 +322,7 @@ impl MetalDevice {
     }
 
     pub fn new(budget: Option<u64>) -> Result<Self> {
-        objc2::rc::autoreleasepool(|_| Self::new_inner(budget, None))
+        objc2::rc::autoreleasepool(|_| Self::new_inner(budget, None, None))
     }
 
     /// Fixed-resident models can use an exact audited reservation instead of
@@ -329,7 +330,20 @@ impl MetalDevice {
     /// an OS limit, and leaves 2 GiB below Apple's recommendation for driver,
     /// compiler and transient allocations outside the native buffer ledger.
     pub(crate) fn new_planned(budget: Option<u64>, required: u64) -> Result<Self> {
-        objc2::rc::autoreleasepool(|_| Self::new_inner(budget, Some(required)))
+        objc2::rc::autoreleasepool(|_| Self::new_inner(budget, Some(required), None))
+    }
+
+    /// Small standalone graphs compile and specialize only their own pack.
+    /// Memory accounting, residency, synchronization and telemetry stay shared.
+    pub(crate) fn new_pack(
+        budget: Option<u64>,
+        required: u64,
+        source: &'static str,
+        names: &'static [&'static str],
+    ) -> Result<Self> {
+        objc2::rc::autoreleasepool(|_| {
+            Self::new_inner(budget, Some(required), Some((source, names)))
+        })
     }
 
     fn planned_budget(recommended: u64, budget: Option<u64>, required: u64) -> Result<u64> {
@@ -345,7 +359,11 @@ impl MetalDevice {
         Ok(grant)
     }
 
-    fn new_inner(budget: Option<u64>, required: Option<u64>) -> Result<Self> {
+    fn new_inner(
+        budget: Option<u64>,
+        required: Option<u64>,
+        pack: Option<(&'static str, &'static [&'static str])>,
+    ) -> Result<Self> {
         let raw = MTLCreateSystemDefaultDevice()
             .ok_or_else(|| MetalError::Device("no Apple GPU".into()))?;
         // MPP TensorOps also executes on the shader cores of every Metal 4
@@ -400,7 +418,7 @@ impl MetalDevice {
                     } else {
                         ""
                     },
-                    SHADER_SOURCE
+                    pack.map_or(SHADER_SOURCE, |(source, _)| source)
                 )),
                 Some(&opts),
             )
@@ -409,6 +427,23 @@ impl MetalDevice {
         #[cfg(test)]
         let mut limited_kernels = HashMap::new();
         for name in [
+            "phonon_mv",
+            "phonon_norm_mv",
+            "phonon_mm",
+            "phonon_mm32",
+            "phonon_mm_tensor",
+            "phonon_copy",
+            "phonon_denormalize",
+            "phonon_point",
+            "phonon_norm",
+            "phonon_rope",
+            "phonon_attention",
+            "phonon_attention_split",
+            "phonon_attention_join",
+            "phonon_conv_input",
+            "phonon_history",
+            "phonon_transpose_input",
+            "phonon_upsample",
             "sam3_patch",
             "sam3_text_embed",
             "sam3_text_qkv",
@@ -1772,6 +1807,9 @@ impl MetalDevice {
             "residual",
             "swiglu",
         ] {
+            if pack.is_some_and(|(_, names)| !names.contains(&name)) {
+                continue;
+            }
             if matches!(
                 name,
                 "mlx_affine_prefill_store256"
@@ -1830,7 +1868,7 @@ impl MetalDevice {
             kernels.insert(name, pipeline);
         }
         let profile = paddock_models::dev_var_os!("PADDOCK_METAL_PROFILE").is_some();
-        if raw.supportsFamily(MTLGPUFamily::Apple10) {
+        if pack.is_none() && raw.supportsFamily(MTLGPUFamily::Apple10) {
             for name in [
                 "mlx_attention_prefill_nax",
                 "nemo_mlx_prefill_nax",

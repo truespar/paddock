@@ -17,6 +17,7 @@ export type ModelKind =
   | 'reader'
   | 'tabular'
   | 'diarizer'
+  | 'synthesizer'
   | 'segmenter'
   | 'masker'
 
@@ -497,6 +498,7 @@ interface RunnerRow {
    *  labelled rows in, the missing column out; it never chats */
   tabular?: string | null
   diarization?: string | null
+  speech?: string | null
   /** dense-prediction runner (DINOv3): /v1/segmentations and nothing else */
   segmenter?: string | null
   /** promptable-segmentation runner (SAM 3): /v1/masks and nothing else - a
@@ -517,6 +519,7 @@ function rowId(r: RunnerRow): string | null {
     r.reader ??
     r.tabular ??
     r.diarization ??
+    r.speech ??
     r.segmenter ??
     r.masker ??
     r.image ??
@@ -538,7 +541,9 @@ function rowModel(r: RunnerRow, prev: ModelInfo | undefined): ModelInfo {
     // reply headers already use, so the picker and the lane agree on the mark
     vendor: r.vendor ?? cloudVendor(rowId(r) ?? ''),
     port: r.port,
-    kind: r.model
+    kind: r.speech
+      ? 'synthesizer'
+      : r.model
       ? 'chat'
       : r.embedder
         ? 'encoder'
@@ -751,6 +756,7 @@ export const useModelsStore = defineStore('models', () => {
         /** a tabular predictor (Kumo): tables in, predictions out */
         tabular?: { model: string } | null
         diarization?: { model: string } | null
+        speech?: { model: string } | null
         /** dense prediction (DINOv3) and promptable segmentation (SAM 3) */
         segmenter?: string | null
         masker?: string | null
@@ -775,6 +781,7 @@ export const useModelsStore = defineStore('models', () => {
           body.reader ||
           body.tabular ||
           body.diarization ||
+          body.speech ||
           body.segmenter ||
           body.masker
         )
@@ -978,6 +985,7 @@ export const useModelsStore = defineStore('models', () => {
       kind !== 'image' &&
       kind !== 'tabular' &&
       kind !== 'diarizer' &&
+      kind !== 'synthesizer' &&
       kind !== 'segmenter' &&
       kind !== 'masker'
     )

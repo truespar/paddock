@@ -2597,6 +2597,80 @@ fn moe_topk_sigmoid_sh_matches_plain_plus_constants() {
     println!("topk_sh: routed columns bitwise == plain, shared columns constant");
 }
 
+// ---- wide sigmoid router (slot 903) ---------------------------------------
+// At a shape both routers take it must be the narrow router bit for bit; at
+// Nemotron 3.5 Super's 512 experts / top-22 it must pick what a host replay
+// of the same rule picks (sigmoid + bias selection, lower index on a tie)
+// and weigh the picks to f32 rounding.
+#[test]
+fn moe_topk_sigmoid_wide_matches_narrow_and_host_rule() {
+    let Some(exec) = common::gpu() else { return };
+    if !exec.has_moe_topk_sigmoid_wide() {
+        common::missing("pack has no moe_topk_sigmoid_batch_wide (slot 903)");
+        return;
+    }
+    // Super's shape: only the wide slot takes it
+    let (ne, k, batch) = (512usize, 22usize, 7usize);
+    let logits = det(batch * ne, 190);
+    let bias: Vec<f32> = det(ne, 191).iter().map(|v| v * 0.05).collect();
+    let d_l = exec.to_device(&logits).expect("logits");
+    let d_b = exec.to_device(&bias).expect("bias");
+    let mut d_i = exec.alloc_u32(batch * k).expect("idx");
+    let mut d_w = exec.alloc(batch * k).expect("w");
+    exec.moe_topk_sigmoid_batch(&d_l, &d_b, 5.0, ne, k, &mut d_i, &mut d_w, batch)
+        .expect("wide topk");
+    let gi = exec.to_host_u32(&d_i).expect("idx host");
+    let gw = exec.to_host(&d_w).expect("w host");
+    for b in 0..batch {
+        let row = &logits[b * ne..(b + 1) * ne];
+        let raw: Vec<f32> = row.iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect();
+        let mut sel: Vec<(f32, usize)> = raw
+            .iter()
+            .zip(&bias)
+            .enumerate()
+            .map(|(i, (r, bb))| (r + bb, i))
+            .collect();
+        sel.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        let picks: Vec<usize> = sel[..k].iter().map(|p| p.1).collect();
+        let sum: f32 = picks.iter().map(|&i| raw[i]).sum();
+        for (s, &i) in picks.iter().enumerate() {
+            assert_eq!(gi[b * k + s] as usize, i, "row {b} pick {s}");
+            let want = raw[i] * (5.0 / sum);
+            let got = gw[b * k + s];
+            assert!(
+                (got - want).abs() <= 1e-5 * want.abs().max(1.0),
+                "row {b} pick {s}: weight {got} vs {want}"
+            );
+        }
+    }
+    // the overlap with the narrow router: 128 experts, top-6 - the wrapper
+    // keeps the narrow slot there, so reach the wide one through a k past 16
+    // and compare its first picks' ORDER with the narrow run's
+    let (ne2, k2) = (128usize, 6usize);
+    let l2 = det(batch * ne2, 192);
+    let b2 = det(ne2, 193);
+    let d_l2 = exec.to_device(&l2).expect("l2");
+    let d_b2 = exec.to_device(&b2).expect("b2");
+    let mut ni = exec.alloc_u32(batch * k2).expect("ni");
+    let mut nw = exec.alloc(batch * k2).expect("nw");
+    exec.moe_topk_sigmoid_batch(&d_l2, &d_b2, 2.5, ne2, k2, &mut ni, &mut nw, batch)
+        .expect("narrow");
+    let mut wi = exec.alloc_u32(batch * 17).expect("wi");
+    let mut ww = exec.alloc(batch * 17).expect("ww");
+    exec.moe_topk_sigmoid_batch(&d_l2, &d_b2, 2.5, ne2, 17, &mut wi, &mut ww, batch)
+        .expect("wide at k 17");
+    let ni = exec.to_host_u32(&ni).expect("ni host");
+    let wi = exec.to_host_u32(&wi).expect("wi host");
+    for b in 0..batch {
+        assert_eq!(
+            &wi[b * 17..b * 17 + k2],
+            &ni[b * k2..(b + 1) * k2],
+            "row {b} picks"
+        );
+    }
+    println!("topk wide: 512/22 == host rule, picks agree with the narrow router");
+}
+
 // ---- tensor-core NVFP4 head (bf16 mma class) -------------
 // nvf4_gemm_tc is a numeric CLASS change vs the scalar lane - the f32->bf16
 // activation cast plus mma k16-tree reassociation - so bit-equality on

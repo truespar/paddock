@@ -128,6 +128,7 @@ pub(crate) fn is_inference_path(path: &str) -> bool {
             | "/v1/rerank"
             | "/v1/audio/transcriptions"
             | "/v1/audio/alignments"
+            | "/v1/audio/speech"
             | "/v1/audio/diarizations"
             | "/v1/audio/diarizations/stream"
             | "/v1/segmentations"

@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 mod api_keys;
+pub use api_keys::KeyScope;
 mod batches;
 pub use batches::*;
 mod connections;
@@ -405,16 +406,6 @@ CREATE INDEX IF NOT EXISTS read_runs_recent ON read_runs(created_at DESC);
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS api_keys (
-    id           TEXT PRIMARY KEY,
-    name         TEXT NOT NULL,
-    key_hash     TEXT NOT NULL,
-    prefix       TEXT NOT NULL,
-    created_at   INTEGER NOT NULL,
-    last_used_at INTEGER,
-    revoked      INTEGER NOT NULL DEFAULT 0
 );
 
 -- BYO-key cloud endpoints (manager-runner doc: the manager's external-provider
@@ -845,6 +836,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        api_keys::migrate(&conn)?;
         downloads::migrate(&conn)?;
         batches::migrate(&conn)?;
         conversation_drafts::migrate(&conn)?;

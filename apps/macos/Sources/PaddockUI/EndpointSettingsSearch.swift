@@ -4,6 +4,7 @@ extension EndpointEditor {
   var showsContextWorkload: Bool {
     !isImageGeneration && !capabilities.contains("decision")
       && !capabilities.contains("tabular") && !capabilities.contains("diarization")
+      && !capabilities.contains("audio_generation")
   }
   var searchableSettings: [SettingsSearchEntry] {
     var anchors: [SettingsAnchor] = [.memoryBudget, .endpointAccess]

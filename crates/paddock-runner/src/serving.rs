@@ -2680,6 +2680,20 @@ fn load_hf_dir(
                 .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
             "nemotron".to_owned()
         }
+        // Nemotron 3.5 Super VL: the same family on CUDA (the language model
+        // under its vision-language wrapper); Metal's MLX lane reads the
+        // Lightning graph only
+        "nemotron_h_omni" => {
+            if device != "cuda" {
+                return Err(ServeError::Open(
+                    dir.to_path_buf(),
+                    format!("Nemotron 3.5 Super VL serves on CUDA only (got {device:?})"),
+                ));
+            }
+            paddock_models::nemotron::NemotronConfig::read(dir)
+                .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
+            "nemotron".to_owned()
+        }
         // granite 4.2's NVFP4 export ships no GGUF, so this is the only way to
         // serve it. Same arch string as the GGUF lane deliberately - it is the
         // same decoder, and everything keyed on family (dialect, sampling,
@@ -2754,7 +2768,10 @@ fn load_hf_dir(
         });
     let bonsai = model_type == "prism_hadamard_qwen35";
     let nemotron_parse = arch == crate::nemotron_parse::ARCH;
+    // Super VL's tower ships inside the checkpoint (CUDA only, gated above)
+    let super_vl = model_type == "nemotron_h_omni";
     let supports_vision = nemotron_parse
+        || super_vl
         || device == "metal"
             && (splash
                 || bonsai
@@ -2762,6 +2779,9 @@ fn load_hf_dir(
                 || matches!(arch.as_str(), "gemma4" | "muse-glimmer" | "diffusion-gemma"));
     let image_pad_id = if nemotron_parse {
         tokenizer.token_to_id(crate::nemotron_parse::IMAGE_MARKER)
+    } else if super_vl {
+        // the template's bare `<image>`; the engine wraps it in <img>..</img>
+        tokenizer.token_to_id("<image>")
     } else if supports_vision {
         tokenizer.token_to_id(if splash || bonsai || small_mlx_vision {
             "<|image_pad|>"
@@ -2775,7 +2795,7 @@ fn load_hf_dir(
     };
     if supports_vision && image_pad_id.is_none() {
         return Err(ServeError::Tokenizer(
-            "MLX vision checkpoint lacks its image placeholder".into(),
+            "vision checkpoint lacks its image placeholder".into(),
         ));
     }
     let tokenizer = Arc::new(tokenizer);

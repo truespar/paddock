@@ -163,6 +163,8 @@ pub struct RunnerView {
     pub tabular: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diarization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speech: Option<String>,
     /// Served dense-prediction model id (DINOv3, `/v1/segmentations`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub segmenter: Option<String>,
@@ -2054,6 +2056,7 @@ impl Supervisor {
                         .or(id.reader.as_deref())
                         .or(id.tabular.as_deref())
                         .or(id.diarization.as_deref())
+                        .or(id.speech.as_deref())
                         .or(id.segmenter.as_deref())
                         .or(id.masker.as_deref())
                         .and_then(|n| self.registry.display_of(n))
@@ -2085,6 +2088,7 @@ impl Supervisor {
                         reader: id.reader,
                         tabular: id.tabular,
                         diarization: id.diarization,
+                        speech: id.speech,
                         segmenter: id.segmenter,
                         masker: id.masker,
                         display: labels.as_ref().map(|(d, _)| d.clone()),
@@ -2124,6 +2128,7 @@ impl Supervisor {
                             reader: None,
                             tabular: None,
                             diarization: None,
+                            speech: None,
                             segmenter: None,
                             masker: None,
                             display: labels.as_ref().map(|(d, _)| d.clone()),
@@ -2161,6 +2166,7 @@ impl Supervisor {
                             reader: None,
                             tabular: None,
                             diarization: None,
+                            speech: None,
                             segmenter: None,
                             masker: None,
                             display: None,

@@ -293,6 +293,7 @@ pub struct AppState {
     pub clef: Option<crate::systemone::clef::ClefModel>,
     pub tabular: Option<crate::tabular::TabularModel>,
     pub diarization: Option<crate::diarizations::DiarizationModel>,
+    pub speech: Option<crate::phonon::SpeechModel>,
     /// Nemotron 3.5 ASR (the native streaming RNN-T lane): serves
     /// `/v1/audio/transcriptions` and the realtime transcription session.
     pub rnnt_asr: Option<crate::rnnt_asr::RnntAsrModel>,
@@ -434,6 +435,7 @@ impl AppState {
             clef: None,
             tabular: None,
             diarization: None,
+            speech: None,
             rnnt_asr: None,
             image: None,
             max_ctx: 8192,
@@ -540,6 +542,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/v1/audio/transcriptions",
             post(crate::transcriptions::handle),
+        )
+        .route(
+            "/v1/audio/speech",
+            post(crate::phonon::handle).layer(axum::extract::DefaultBodyLimit::max(32 * 1024)),
         )
         .route("/v1/audio/alignments", post(crate::alignments::handle))
         .route(
@@ -1052,6 +1058,7 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
         "reader": state.laya.as_ref().map(|l| l.id.clone())
             .or_else(|| state.clef.as_ref().map(|c| c.id.clone())),
         "tabular": state.tabular.as_ref().map(|m| serde_json::json!({"model":m.id,"capabilities":m.capabilities()})),
+        "speech": state.speech.as_ref().map(|m|serde_json::json!({"model":m.id,"capabilities":m.capabilities()})),
         "diarization": state.diarization.as_ref().map(|m|serde_json::json!({"model":m.id,"capabilities":m.capabilities()})),
         // The longest clip TRANSCRIPTION can take, same reason and same shape
         // as the alignment cap above. Null means no ceiling worth
@@ -1658,6 +1665,11 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
             ),
         );
     }
+    if let Some(m) = &state.speech {
+        data.push(ModelObject::new(m.id.clone(),0,"paddock").with_listing_meta(
+            serde_json::json!({"input_modalities":["text"],"output_modalities":["audio"],"modality":"text->audio"}),
+            m.capabilities(),vec!["model".into(),"input".into(),"voice".into(),"response_format".into(),"stream".into(),"seed".into(),"temperature".into()],512));
+    }
     if let Some(m) = &state.diarization {
         data.push(ModelObject::new(m.id.clone(),0,"paddock").with_listing_meta(
             serde_json::json!({"input_modalities":["audio"],"output_modalities":["speaker_segments"],"modality":"audio->speaker_segments"}),
@@ -1760,6 +1772,7 @@ pub(crate) fn is_generation_path(path: &str) -> bool {
             | "/v1/images/edits"
             | "/v1/systemone"
             | "/v1/tabular/predictions"
+            | "/v1/audio/speech"
             | "/v1/audio/diarizations"
             | "/v1/audio/diarizations/stream"
             | "/v1/tabular/contexts"

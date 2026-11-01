@@ -69,6 +69,7 @@ async fn identify(State(s): State<Arc<AdminState>>) -> Response {
             .or_else(|| s.app.clef.as_ref().map(|m| m.id.clone())),
         tabular: s.app.tabular.as_ref().map(|m| m.id.clone()),
         diarization: s.app.diarization.as_ref().map(|m| m.id.clone()),
+        speech: s.app.speech.as_ref().map(|m| m.id.clone()),
         segmenter: s.app.segmenter.as_ref().map(|m| m.id.clone()),
         masker: s.app.masker.as_ref().map(|m| m.id.clone()),
         started_at_unix: s.started_at_unix,

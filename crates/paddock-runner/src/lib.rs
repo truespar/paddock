@@ -52,6 +52,7 @@ mod paddle_layout;
 pub mod paddle_ocr;
 pub mod parsers;
 pub mod pdf;
+pub mod phonon;
 pub mod ratelimit;
 pub mod realtime;
 pub mod reasoning;
@@ -264,7 +265,8 @@ pub async fn run(
     };
     if let Some((path, gb)) = &nvme_armed {
         // A quota bigger than the volume is a promise the disk cannot keep.
-        // Reported, not refused: the store evicts on quota, so an optimistic
+        // Reported, not refused: the store also stops short of the volume's
+        // free-space reserve and evicts against that, so an optimistic
         // budget degrades to a smaller cache rather than failing to serve.
         match fs4::available_space(path).ok() {
             Some(free) => {
@@ -275,7 +277,8 @@ pub async fn run(
                         free_gib = free as f64 / (1u64 << 30) as f64,
                         path = %path.display(),
                         "[kv_offload] nvme_gb exceeds the free space on that volume - \
-                         the cache will evict against a quota it can never reach"
+                         the cache will hold what the volume can spare and keep a \
+                         tenth of it (at most 32 GiB) free"
                     );
                 }
             }
@@ -391,6 +394,7 @@ pub async fn run(
     let mut clef = None;
     let mut tabular = None;
     let mut diarization = None;
+    let mut speech = None;
     let mut rnnt_asr = None;
     let mut image = None;
     // the resolved off policy, surfaced on admin identify (SpecInfo.off)
@@ -500,7 +504,26 @@ pub async fn run(
                 );
             }
         }
-        if rnnt_asr::is_model(&arch) {
+        if paddock_models::phonon::is_model(path) {
+            if cfg.mmproj.is_some()
+                || cfg.kv_offload.enabled
+                || cfg.residency.enabled()
+                || cfg.spec.as_deref().is_some_and(|s| s != "off")
+            {
+                return Err("Phonon does not accept vision, KV-offload, residency or speculative decoding overrides".into());
+            }
+            speech = Some(
+                phonon::load(
+                    cfg.served_model_name.clone().unwrap_or(id),
+                    path,
+                    &cfg.device,
+                    gpu_ordinal,
+                    cfg.kernel_pack.as_deref(),
+                    cfg.vram_budget.map(|mib| mib << 20),
+                )
+                .map_err(serving::ServeError::Engine)?,
+            );
+        } else if rnnt_asr::is_model(&arch) {
             if cfg.mmproj.is_some()
                 || cfg.kv_offload.enabled
                 || cfg.spec.as_deref().is_some_and(|s| s != "off")
@@ -1270,6 +1293,7 @@ pub async fn run(
         clef,
         tabular,
         diarization,
+        speech,
         rnnt_asr,
         image,
         max_ctx: cfg.max_ctx,

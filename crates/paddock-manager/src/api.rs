@@ -559,9 +559,24 @@ async fn list_keys(State(s): State<Arc<AppState>>) -> Response {
 }
 
 /// Create a key; the plaintext is returned once in `key` and never stored.
+/// `scope` is `inference` unless the body asks for `admin` by name - a key
+/// that can reconfigure the box is never the default.
 async fn create_key(State(s): State<Arc<AppState>>, Json(body): Json<Value>) -> Response {
     let name = body.get("name").and_then(Value::as_str).unwrap_or("key");
-    match s.db.create_api_key(name) {
+    let scope = match body.get("scope") {
+        None | Some(Value::Null) => crate::store::KeyScope::Inference,
+        Some(v) => match v.as_str().and_then(crate::store::KeyScope::parse) {
+            Some(scope) => scope,
+            None => {
+                return errx(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "scope must be \"inference\" or \"admin\"",
+                );
+            }
+        },
+    };
+    match s.db.create_api_key(name, scope) {
         Ok((mut record, key)) => {
             record["key"] = Value::String(key);
             (StatusCode::CREATED, Json(record)).into_response()

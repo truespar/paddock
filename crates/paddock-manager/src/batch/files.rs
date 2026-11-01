@@ -16,6 +16,13 @@ use tokio::io::AsyncWriteExt;
 /// that is more. A batch that fills the disk takes the models dir and the
 /// store down with it.
 pub(crate) fn reserve(total: u64) -> u64 {
+    // Unit tests run on whatever volume TMP points at, and a big, busy drive can
+    // sit under 5% free for reasons that have nothing to do with the test. The
+    // floor is production policy; tests exercise a full disk through
+    // FAIL_WRITES_UNDER instead, and still refuse a write the disk cannot hold.
+    if cfg!(test) {
+        return 0;
+    }
     (4u64 << 30).max(total / 20)
 }
 

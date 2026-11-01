@@ -119,4 +119,6 @@
 #include "src/gemma4u.cuh"  // Gemma 4 12B's encoder-free media embedders: picture patches + LayerNorm, the post-projection norms, audio frames + RMS (needs abi pd_df, f32_qkv's pd_launch_status)
 #include "src/nemotron_parse.cuh"  // Nemotron 3.5 Parse: rectangular u8 patch stem, the checkpoint's repetition penalty + greedy pick on device, seen-id bitmaps (needs f32_qkv's pd_launch_status)
 #include "src/nemotron_embed.cuh"  // Nemotron 3.5 Embed / Rerank 8B: Pixtral patch stem, RMSNorm into f16, token|picture row gather, in-place rope + q scale, packed GQA attention, mean pool + unit vector / score head (needs decode_spec's pd_fa_mma16, f32_qkv's pd_launch_status)
+#include "src/nemotron_vl.cuh"  // Nemotron 3.5 Super VL's picture lane: torch's float antialiased bicubic pass, the normalized (c, ky, kx) patch stem, RADIO's cropped bilinear position field, the projector's relu^2 (needs f32_qkv's pd_launch_status)
+#include "src/phonon.cuh"  // Gradium Phonon 31M: FlowLM's fused linears / RoPE / split attention and Mimi's streamed convs, F32 math over the BF16 / F32 checkpoint (needs f32_qkv's pd_launch_status)
 #include "src/exports.cuh"

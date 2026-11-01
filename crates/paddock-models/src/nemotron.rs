@@ -55,6 +55,17 @@ pub struct NemotronConfig {
     pub moe_ff: usize,     // 1856 (squared-relu, no gate matrix)
     pub shared_ff: usize,  // 3712 (one shared expert, unscaled, parallel)
     pub routed_scale: f32, // 2.5
+    /// LatentMoE (Super): the routed experts run on a `latent`-wide copy of
+    /// the hidden - `fc1_latent_proj` down before them, `fc2_latent_proj` up
+    /// after the weighted sum - while the router and the shared expert read
+    /// the full hidden. None: experts on the hidden (Lightning).
+    pub latent: Option<usize>,
+    /// The checkpoint wraps the language model in the vision-language
+    /// `nemotron_h_omni` (tensors under `language_model.`, a RADIO tower
+    /// and projector beside it).
+    pub omni: bool,
+    /// MTP blocks the checkpoint carries (`num_nextn_predict_layers`).
+    pub mtp_layers: usize,
 
     /// generation_config eos set - [2, 11]; decode stops on any of these.
     pub eos_ids: Vec<u32>,
@@ -77,8 +88,19 @@ impl NemotronConfig {
     }
 
     pub fn read(dir: &Path) -> Result<Self, StError> {
-        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)
-            .map_err(|e| StError::Header(e.to_string()))?;
+        let top: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)
+                .map_err(|e| StError::Header(e.to_string()))?;
+        // the vision-language wrapper carries the language model's config
+        // whole, under `llm_config`
+        let omni = top.get("model_type").and_then(|x| x.as_str()) == Some("nemotron_h_omni");
+        let v = if omni {
+            top.get("llm_config").cloned().ok_or_else(|| {
+                StError::Header("nemotron_h_omni config.json: missing llm_config".into())
+            })?
+        } else {
+            top
+        };
         let miss = |k: &str| StError::Header(format!("nemotron config.json: missing {k}"));
         let u = |k: &str| {
             v.get(k)
@@ -115,7 +137,12 @@ impl NemotronConfig {
             })
             .collect::<Result<_, _>>()?;
 
-        let n_layer = u("num_hidden_layers")?;
+        // the omni wrapper's llm_config leaves the count to the block list
+        let n_layer = if v.get("num_hidden_layers").is_some() {
+            u("num_hidden_layers")?
+        } else {
+            blocks.len()
+        };
         if blocks.len() != n_layer {
             return Err(StError::Header(format!(
                 "layers_block_type has {} entries for {} layers",
@@ -175,9 +202,24 @@ impl NemotronConfig {
             moe_ff: u("moe_intermediate_size")?,
             shared_ff: u("moe_shared_expert_intermediate_size")?,
             routed_scale: f("routed_scaling_factor")?,
+            latent: v
+                .get("moe_latent_size")
+                .and_then(|x| x.as_u64())
+                .map(|x| x as usize),
+            omni,
+            mtp_layers: v
+                .get("num_nextn_predict_layers")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0) as usize,
             eos_ids,
             bos_id: v.get("bos_token_id").and_then(|x| x.as_u64()).unwrap_or(1) as u32,
         })
+    }
+
+    /// The width the routed experts compute in: the latent for LatentMoE,
+    /// else the hidden.
+    pub fn expert_in(&self) -> usize {
+        self.latent.unwrap_or(self.hidden)
     }
 }
 
@@ -344,6 +386,9 @@ impl NemotronConfig {
             moe_ff: u("expert_feed_forward_length")?,
             shared_ff: u("expert_shared_feed_forward_length")?,
             routed_scale: f("expert_weights_scale")?,
+            latent: None,
+            omni: false,
+            mtp_layers: nextn,
             eos_ids,
             bos_id: g
                 .metadata
@@ -411,6 +456,62 @@ mod tests {
         );
         assert!((c.routed_scale - 2.5).abs() < 1e-6);
         assert_eq!((c.n_groups, c.d_state, c.chunk), (8, 128, 128));
+    }
+
+    /// The vision-language wrapper (Super VL): the language model's config
+    /// arrives whole under `llm_config`, with no `num_hidden_layers` (the
+    /// block list is the count) and a LatentMoE width.
+    #[test]
+    fn omni_wrapper_unwraps_the_language_model_config() {
+        // Super VL's interleave as shipped (M mamba, E moe, * attention):
+        // 40 / 40 / 8, attention at 7, 16, 25, 36, 47, 58, 69, 78
+        let blocks: Vec<&str> = "MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEM*EMEMEMEME"
+            .chars()
+            .map(|c| match c {
+                'M' => "mamba",
+                'E' => "moe",
+                _ => "attention",
+            })
+            .collect();
+        let llm = serde_json::json!({
+            "model_type": "nemotron_h", "hidden_size": 4096,
+            "layers_block_type": blocks, "vocab_size": 131072,
+            "max_position_embeddings": 1048576, "layer_norm_epsilon": 1e-5,
+            "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+            "mamba_num_heads": 128, "mamba_head_dim": 64, "ssm_state_size": 128,
+            "conv_kernel": 4, "n_groups": 8, "chunk_size": 128,
+            "n_routed_experts": 512, "num_experts_per_tok": 22,
+            "moe_intermediate_size": 2688, "moe_shared_expert_intermediate_size": 5376,
+            "moe_latent_size": 1024, "routed_scaling_factor": 5.0,
+            "num_nextn_predict_layers": 1, "eos_token_id": 11, "bos_token_id": 1
+        });
+        let top = serde_json::json!({"model_type": "nemotron_h_omni", "llm_config": llm});
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.json"), top.to_string()).expect("write");
+        let c = NemotronConfig::read(dir.path()).expect("omni config parses");
+        assert!(c.omni);
+        assert_eq!((c.n_layer, c.hidden), (88, 4096));
+        let attn: Vec<usize> = (0..c.n_layer)
+            .filter(|&i| c.blocks[i] == NemotronBlock::Attention)
+            .collect();
+        assert_eq!(attn, vec![7, 16, 25, 36, 47, 58, 69, 78]);
+        assert_eq!((c.n_expert, c.n_active, c.latent), (512, 22, Some(1024)));
+        assert_eq!(c.expert_in(), 1024);
+        assert_eq!(
+            (c.mamba_heads, c.d_inner(), c.in_proj_rows()),
+            (128, 8192, 18560)
+        );
+        assert_eq!(c.mtp_layers, 1);
+        assert_eq!(c.eos_ids, vec![11]);
+        // a plain nemotron_h config has no latent and no wrapper
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut flat = llm.clone();
+        flat["moe_latent_size"] = serde_json::Value::Null;
+        flat["num_hidden_layers"] = serde_json::json!(88);
+        std::fs::write(dir.path().join("config.json"), flat.to_string()).expect("write");
+        let c = NemotronConfig::read(dir.path()).expect("flat config parses");
+        assert!(!c.omni && c.latent.is_none());
+        assert_eq!(c.expert_in(), 4096);
     }
 
     /// The two official drafters' configs as NVIDIA ships them (quantization

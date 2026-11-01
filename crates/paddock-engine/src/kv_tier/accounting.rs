@@ -135,6 +135,21 @@ impl TierDecisions {
         }
     }
 
+    /// Hand back the lookup and election counts taken since `to`: a consult
+    /// that asks the same question again (a restore waiting for pool room)
+    /// is still one lookup.
+    pub fn rewind_lookup(&mut self, to: &TierDecisions) {
+        self.lookups = to.lookups;
+        self.hits = to.hits;
+        self.miss_cold = to.miss_cold;
+        self.miss_no_new_tokens = to.miss_no_new_tokens;
+        self.miss_tripped = to.miss_tripped;
+        self.miss_ghost = to.miss_ghost;
+        self.miss_no_state = to.miss_no_state;
+        self.elected_restore = to.elected_restore;
+        self.elected_recompute = to.elected_recompute;
+    }
+
     /// Share of lookups that found something restorable, 0..1. None until
     /// anything was asked - an empty tier reports "no question asked yet",
     /// never a 0% hit rate it did not earn.
@@ -194,6 +209,8 @@ pub struct TierReport {
     pub device_write_gbs: f64,
     pub device_unbuffered: bool,
     pub t2_written_day_bytes: u64,
+    /// The day's write budget - a quarter of the volume, at most 1 TiB.
+    pub t2_day_budget_bytes: u64,
     /// Ghost-set occupancy - context for the alarm.
     pub ghost_keys: u64,
 }

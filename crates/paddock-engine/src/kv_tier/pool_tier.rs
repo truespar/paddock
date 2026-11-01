@@ -162,12 +162,32 @@ const TARGET_EXTENT_BYTES: u64 = 16 << 20;
 /// Ceiling on blocks per run: 8 blocks = 128 tokens of hit granularity.
 const MAX_RUN_BLOCKS: usize = 8;
 
+/// How one disk write the durability plan asked for went (`XferSink::persist`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Persist {
+    Written,
+    /// Already on disk (content keys: the same bytes).
+    Durable,
+    /// Refused before the device - quota, volume reserve, paused writes or
+    /// the day's budget. Retry later.
+    Declined,
+    /// The device failed the write (the store's gate counts it).
+    Failed,
+    /// The T1 extent is gone.
+    Gone,
+    NoDisk,
+}
+
 /// What a transport must offer beyond the catalog's command interface for
 /// the pool tier to drive it: the device-geometry side channel and physical
 /// extent reclamation. `RamTransport` implements it for real; tests
 /// implement it over `FakeTransport` so every control-flow path here runs
 /// deterministically without a GPU.
 pub trait XferSink: TierTransport {
+    /// Start these queued stores now, ahead of the load-first rule: a
+    /// restore waits on what they carry. Default: stores never wait.
+    fn expedite(&mut self, _ops: &[OpId]) {}
+
     /// Keys the transport's T2 cache evicted for quota since the last call -
     /// the pump drops their catalog Nvme references so no probe elects a
     /// load the disk can no longer serve. Default: none (no T2).
@@ -188,6 +208,11 @@ pub trait XferSink: TierTransport {
         0
     }
 
+    /// The day's T2 write budget (0: no disk tier).
+    fn t2_day_budget(&self) -> u64 {
+        0
+    }
+
     /// The T2 device's probed read bandwidth in GB/s, when a store is
     /// attached - the cost model's seed for disk-sourced restores.
     /// Default: no T2, nothing to seed.
@@ -195,9 +220,48 @@ pub trait XferSink: TierTransport {
         None
     }
 
-    /// Durable writes deferred to read slack. Default: none.
-    fn t2_pending_writes(&self) -> usize {
-        0
+    /// Write the T1 extent at `loc` (`bytes`, `checksum` from the catalog)
+    /// to disk now. Which extents, and in what order, is the pool tier's
+    /// call (`durable.rs`). Default: no disk.
+    fn persist(
+        &mut self,
+        _key: &LogicalKey,
+        _loc: Loc,
+        _bytes: u64,
+        _checksum: super::digest::Checksum,
+    ) -> Persist {
+        Persist::NoDisk
+    }
+
+    /// [`Self::persist`] for a chain at once, in order: stops at the first
+    /// extent that does not land (the rest stay [`Persist::NoDisk`] - writing
+    /// past it would break chain order). The disk transport makes it one
+    /// group commit.
+    fn persist_batch(
+        &mut self,
+        items: &[(LogicalKey, Loc, u64, super::digest::Checksum)],
+    ) -> Vec<Persist> {
+        let mut out = vec![Persist::NoDisk; items.len()];
+        for (i, &(k, loc, bytes, sum)) in items.iter().enumerate() {
+            out[i] = self.persist(&k, loc, bytes, sum);
+            if !matches!(out[i], Persist::Written | Persist::Durable) {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Whether a `persist` could run now: a disk attached, its writes not
+    /// paused, budget left, and no disk read queued or in flight (a writer
+    /// beside a reader costs most of the read bandwidth on consumer drives).
+    fn disk_ready(&self) -> bool {
+        false
+    }
+
+    /// [`Self::disk_ready`] without the read rule - for a write that saves
+    /// the last copy of something, which cannot wait for reads to drain.
+    fn disk_writable(&self) -> bool {
+        self.disk_ready()
     }
 
     /// The T2 device's measured geometry: (read GB/s, write GB/s,
@@ -242,8 +306,31 @@ impl XferSink for RamTransport {
     fn t2_device_gbs(&self) -> Option<f64> {
         self.t2().map(|s| s.device().read_gbs)
     }
-    fn t2_pending_writes(&self) -> usize {
-        RamTransport::t2_pending_writes(self)
+    fn persist(
+        &mut self,
+        key: &LogicalKey,
+        loc: Loc,
+        _bytes: u64,
+        checksum: super::digest::Checksum,
+    ) -> Persist {
+        self.persist_batch_inner(&[(*key, loc, checksum.0)])[0]
+    }
+    fn persist_batch(
+        &mut self,
+        items: &[(LogicalKey, Loc, u64, super::digest::Checksum)],
+    ) -> Vec<Persist> {
+        let items: Vec<(LogicalKey, Loc, [u8; 32])> =
+            items.iter().map(|&(k, l, _, s)| (k, l, s.0)).collect();
+        self.persist_batch_inner(&items)
+    }
+    fn disk_ready(&self) -> bool {
+        self.disk_ready_inner()
+    }
+    fn disk_writable(&self) -> bool {
+        self.disk_writable_inner()
+    }
+    fn expedite(&mut self, ops: &[OpId]) {
+        self.expedite_inner(ops)
     }
     fn t2_device(&self) -> Option<(f64, f64, bool)> {
         self.t2().map(|s| {
@@ -263,6 +350,9 @@ impl XferSink for RamTransport {
     }
     fn t2_written_today(&self) -> u64 {
         self.t2_written_today_inner()
+    }
+    fn t2_day_budget(&self) -> u64 {
+        self.t2_day_budget_inner()
     }
     fn arena_layout(&self) -> Vec<super::host::SlabLayout> {
         self.t1_layout()
@@ -341,6 +431,8 @@ pub struct AuxTaken {
     /// The run keys the checkpoint resumes over, root-first - bound to the
     /// blob once it stores (see `PoolTier::blob_runs`).
     pub runs: Vec<LogicalKey>,
+    /// The checkpoint is a user-turn anchor (see `AuxMeta::anchor`).
+    pub anchor: bool,
 }
 
 /// Where an aux blob's bytes sit on device (issue #33).
@@ -392,6 +484,8 @@ struct DeferredStore {
     /// Aux-shard store: the state index to recycle once the last shard of
     /// its blob completes (the countdown lives in `aux_pending`).
     aux_recycle: Option<u32>,
+    /// A run's predecessor on its chain (unused for shards).
+    parent: durable::Parent,
     /// True when this store's pins hold EVICTED blocks - their release
     /// frees. A 2.3 mirror store pins TREE-HELD blocks instead (release
     /// frees nothing), and counting those toward pressure targets made
@@ -405,11 +499,16 @@ struct AuxMeta {
     bytes: u64,
     shards: usize,
     last_used: u64,
+    /// A user-turn anchor's state (`PagedRadix::mark_anchor`) - kept for
+    /// disk past the reply path that runs deeper (`blob_worth_keeping`).
+    anchor: bool,
 }
 
 struct RunMeta {
     loc: Option<Loc>,
     last_used: u64,
+    /// The run before it on its chain - what the durability plan walks.
+    parent: durable::Parent,
 }
 
 struct TicketRun {
@@ -504,6 +603,14 @@ pub struct PoolTier<T: XferSink> {
     ghosts: super::accounting::GhostSet,
     /// When the cost model's calibration was last persisted, and what.
     cal_saved: Option<(std::time::Instant, super::cost::Calibration)>,
+    /// What goes to disk, in what order (`durable.rs`).
+    durable: durable::Durable,
+}
+
+impl<T: XferSink> Drop for PoolTier<T> {
+    fn drop(&mut self) {
+        self.persist_at_exit();
+    }
 }
 
 impl<T: XferSink> PoolTier<T> {
@@ -597,15 +704,15 @@ impl<T: XferSink> PoolTier<T> {
             dec: Default::default(),
             ghosts: Default::default(),
             cal_saved: None,
+            durable: Default::default(),
         };
         tier.load_calibration();
         Ok(tier)
     }
 
-    /// Durable write-throughs waiting for disk read slack - an accounting
-    /// gauge, and what proves the deferral is real rather than nominal.
+    /// Extents the durability plan has queued for disk (`durable.rs`).
     pub fn pending_durable_writes(&self) -> usize {
-        self.transport.t2_pending_writes()
+        self.durable.queued()
     }
 
     /// flow bookkeeping for the ledger - called by `restore_flow` at
@@ -652,7 +759,7 @@ impl<T: XferSink> PoolTier<T> {
             resident_runs: self.runs.len() as u64,
             in_flight_demotes: self.deferred.len() as u64,
             open_tickets: self.tickets.len() as u64,
-            pending_durable_writes: self.transport.t2_pending_writes() as u64,
+            pending_durable_writes: self.durable.queued() as u64,
             tripped: self.tripped,
             io_failures: self.catalog.counters.io_failures,
             integrity_failures: self.catalog.counters.integrity_failures,
@@ -666,6 +773,7 @@ impl<T: XferSink> PoolTier<T> {
             device_write_gbs: dev.map(|d| d.1).unwrap_or(0.0),
             device_unbuffered: dev.map(|d| d.2).unwrap_or(false),
             t2_written_day_bytes: self.transport.t2_written_today(),
+            t2_day_budget_bytes: self.transport.t2_day_budget(),
             ghost_keys: self.ghosts.len() as u64,
         }
     }
@@ -863,6 +971,7 @@ impl<T: XferSink> PoolTier<T> {
                         end_block: e.depth,
                         state_idx: idx,
                         runs,
+                        anchor: radix.is_anchor(e.node),
                     });
                 }
             }
@@ -1048,6 +1157,7 @@ impl<T: XferSink> PoolTier<T> {
                             end_block: e.depth,
                             state_idx: idx,
                             runs,
+                            anchor: radix.is_anchor(e.node),
                         };
                         self.demote_aux_paged(radix, pool, t, after());
                     }
@@ -1079,20 +1189,40 @@ impl<T: XferSink> PoolTier<T> {
     /// than the shallow store pipeline. Aux blobs still ship at eviction
     /// (v1). Bounded: at most `max_runs` submissions per call, LRU chains
     /// first (they evict first, so they are worth pre-storing first).
-    /// Returns runs submitted.
+    /// Returns runs submitted. The disk half - which of T1 reaches T2 -
+    /// rides the same slack (`durable.rs`).
     pub fn mirror_slack(
+        &mut self,
+        radix: &PagedRadix,
+        pool: &mut KvPool,
+        after: Option<CudaEvent>,
+        max_runs: usize,
+        state: Option<(u64, u64)>,
+    ) -> usize {
+        let (n, _) = self.mirror_slack_t1(radix, pool, after, max_runs, state, false);
+        let now = std::time::Instant::now();
+        self.persist_pass(now, false, now);
+        n
+    }
+
+    /// `all`: every live checkpoint and every cached chain, not one blob
+    /// and `max_runs` runs a pass (`flush_live`, at shutdown). Returns
+    /// (runs, blobs) submitted.
+    fn mirror_slack_t1(
         &mut self,
         radix: &PagedRadix,
         pool: &mut KvPool,
         mut after: Option<CudaEvent>,
         max_runs: usize,
         state: Option<(u64, u64)>,
-    ) -> usize {
-        if self.tripped || !self.tickets.is_empty() {
-            return 0; // never beside a restore; breaker owns the tier
+        all: bool,
+    ) -> (usize, usize) {
+        if self.tripped || (!all && !self.tickets.is_empty()) {
+            return (0, 0); // never beside a restore; breaker owns the tier
         }
         let r = self.run_blocks;
         let mut submitted = 0usize;
+        let mut blobs = 0usize;
         // blob write-through first: live checkpoints mirror (slot stays
         // attached), one blob per pass. Scanned off the state attachments,
         // not the LRU leaves - the checkpoint pool recycles oldest-first,
@@ -1111,6 +1241,11 @@ impl<T: XferSink> PoolTier<T> {
         self.drop_stale_claims();
         if radix.state_is_paged() || state.is_some() {
             for (depth, key, idx, node) in radix.state_attachments() {
+                // the radix anchors a turn's checkpoint after it is written,
+                // so a blob already shipped learns it here
+                if let Some(m) = key.and_then(|k| self.aux_meta.get_mut(&k)) {
+                    m.anchor |= radix.is_anchor(node);
+                }
                 if depth % r == 0
                     && let Some(key) = key
                     && !self.aux_meta.contains_key(&key)
@@ -1129,26 +1264,39 @@ impl<T: XferSink> PoolTier<T> {
                     let ev = after.take();
                     let pool = radix.state_is_paged().then_some(&mut *pool);
                     if self.mirror_aux_span(key, depth, span, pool, ev, runs) {
-                        break;
+                        if let Some(m) = self.aux_meta.get_mut(&key) {
+                            m.anchor = radix.is_anchor(node);
+                        }
+                        blobs += 1;
+                        if !all {
+                            break;
+                        }
                     }
                 }
             }
         }
-        for path in radix.lru_leaf_paths(4) {
+        for path in radix.lru_leaf_paths(if all { usize::MAX } else { 4 }) {
             for lo in (0..(path.len() / r) * r).step_by(r) {
                 if submitted >= max_runs {
-                    return submitted;
+                    return (submitted, blobs);
                 }
                 let run = &path[lo..lo + r];
                 if let Some(key) = run[r - 1].tkey
                     && run.iter().all(|e| e.tkey.is_some())
-                    && self.demote_run(key, run, pool, &mut after, false)
+                    && self.demote_run(
+                        key,
+                        durable::run_parent(&path, lo),
+                        run,
+                        pool,
+                        &mut after,
+                        false,
+                    )
                 {
                     submitted += 1;
                 }
             }
         }
-        submitted
+        (submitted, blobs)
     }
 
     /// Store every complete run of `path` root-first - a probe resumes only
@@ -1170,7 +1318,14 @@ impl<T: XferSink> PoolTier<T> {
             let run = &path[lo..lo + r];
             if let Some(rk) = run[r - 1].tkey
                 && run.iter().all(|x| x.tkey.is_some())
-                && self.demote_run(rk, run, pool, after, evicting)
+                && self.demote_run(
+                    rk,
+                    durable::run_parent(path, lo),
+                    run,
+                    pool,
+                    after,
+                    evicting,
+                )
             {
                 n += 1;
             }
@@ -1187,6 +1342,7 @@ impl<T: XferSink> PoolTier<T> {
     fn demote_run(
         &mut self,
         key: LogicalKey,
+        parent: durable::Parent,
         run: &[crate::paged_radix::LruPathEntry],
         pool: &mut KvPool,
         after: &mut Option<CudaEvent>,
@@ -1249,6 +1405,7 @@ impl<T: XferSink> PoolTier<T> {
                 blocks: run.iter().map(|e| e.block).collect(),
                 shard: false,
                 aux_recycle: None,
+                parent,
                 evicting,
             },
         );
@@ -1396,6 +1553,7 @@ impl<T: XferSink> PoolTier<T> {
                                 blocks: pins,
                                 shard: true,
                                 aux_recycle: Some(t.state_idx),
+                                parent: durable::Parent::Unknown,
                                 evicting: true,
                             },
                         );
@@ -1422,6 +1580,7 @@ impl<T: XferSink> PoolTier<T> {
                 bytes,
                 shards,
                 last_used: now,
+                anchor: t.anchor,
             },
         );
         tracing::debug!(
@@ -1548,6 +1707,7 @@ impl<T: XferSink> PoolTier<T> {
                                 blocks: pins,
                                 shard: true,
                                 aux_recycle: None, // the slot stays attached
+                                parent: durable::Parent::Unknown,
                                 evicting: false,
                             },
                         );
@@ -1572,6 +1732,7 @@ impl<T: XferSink> PoolTier<T> {
                 bytes,
                 shards,
                 last_used: now,
+                anchor: false,
             },
         );
         tracing::debug!(end_block, bytes, shards, "tier aux mirror submitted");
@@ -1588,32 +1749,26 @@ impl<T: XferSink> PoolTier<T> {
     /// took the tier offline; evicting LRU until a hole appeared drained it.
     fn evict_t1(&mut self, need: u64, place: &[u64]) -> bool {
         if self.catalog.ledger(Tier::Ram).free < need {
-            // runs no blob owns first (all of them, for a KV-only family:
-            // plain LRU), then blobs, dominated ones first (`blob_victims`)
-            // - each turning the runs only it owned into the next victims,
-            // deepest first, so a chain shrinks from its tail and never
-            // loses the head everything else hangs on
-            let mut orphans: Vec<(u64, LogicalKey)> = self
-                .runs
-                .iter()
-                .filter(|(k, _)| !self.run_owners.contains_key(*k))
-                .map(|(k, m)| (m.last_used, *k))
-                .collect();
-            orphans.sort_unstable_by_key(|v| v.0);
-            let mut orphans: std::collections::VecDeque<LogicalKey> =
-                orphans.into_iter().map(|v| v.1).collect();
+            // runs no blob owns first (all of them, for a KV-only family),
+            // what eviction would not lose before what it would
+            // (`RunVictims`); then blobs (`blob_victims`) - each turning the
+            // runs only it owned into the next victims, so a chain shrinks
+            // from its tail and never loses the head everything else hangs on
+            let mut orphans = self.run_victims(|k| !self.run_owners.contains_key(k));
             let mut blobs = self.blob_victims().into_iter();
             while self.catalog.ledger(Tier::Ram).free < need {
-                if let Some(k) = orphans.pop_front() {
-                    self.evict_run_t1(k);
+                if self.evict_next_victim(&mut orphans).is_some() {
                     continue;
                 }
                 let Some(b) = blobs.next() else { break };
+                if self.blob_loss(&b) {
+                    self.persist_before_evict(b);
+                }
                 let owned = self.blob_runs.get(&b).cloned().unwrap_or_default();
                 self.retire_aux(b);
                 for k in owned.into_iter().rev() {
                     if !self.run_owners.contains_key(&k) && self.runs.contains_key(&k) {
-                        orphans.push_back(k);
+                        self.queue_victim(&mut orphans, k);
                     }
                 }
             }
@@ -1628,6 +1783,7 @@ impl<T: XferSink> PoolTier<T> {
     /// by a restore in flight).
     fn evict_run_t1(&mut self, key: LogicalKey) -> bool {
         let loc = self.catalog.ready_loc(&key, Tier::Ram);
+        let bytes = self.catalog.ready_bytes(&key, Tier::Ram).unwrap_or(0);
         if self.catalog.evict(&key, Tier::Ram).is_err() {
             return false;
         }
@@ -1646,7 +1802,9 @@ impl<T: XferSink> PoolTier<T> {
         // the catalog's Nvme replica is what keeps the content
         // findable, exactly as a boot-time preload does.
         self.runs.remove(&key);
-        let promoted = match self.transport.t2_entry(&key.0) {
+        let on_disk = self.transport.t2_entry(&key.0);
+        super::census::ev("e", &key.0, bytes, Some(on_disk.is_some()));
+        let promoted = match on_disk {
             Some((t2loc, bytes, sum)) => self.catalog.preload_ready(
                 key,
                 Tier::Nvme,
@@ -1668,9 +1826,10 @@ impl<T: XferSink> PoolTier<T> {
 
     /// Make the arena able to take every extent in `place`, in order: plan,
     /// on a copy of the arena, one hole per extent it cannot take as it
-    /// stands - the window of Ready entries whose NEWEST entry is oldest
-    /// (fewest bytes on a tie), so LRU order holds window by window - and
-    /// evict only once the WHOLE plan exists. Evicting toward a plan that
+    /// stands - the window whose newest content eviction would LOSE is
+    /// oldest (content the disk also holds, or a superseded blob, loses
+    /// nothing), then whose newest entry is, then fewest bytes, so LRU order
+    /// holds window by window - and evict only once the WHOLE plan exists. Evicting toward a plan that
     /// cannot complete frees bytes the store still cannot use: a full tier
     /// that chased holes that way drained itself to nothing during a long
     /// prefill, while every in-flight store blocked the windows it needed.
@@ -1685,23 +1844,29 @@ impl<T: XferSink> PoolTier<T> {
         }
         // Ready, evictable extents and who owns them; everything else in the
         // arena (stores in flight, pinned restores' sources) is immovable
-        let mut owner: HashMap<Loc, (u64, Owner)> = HashMap::new();
+        // an owner's stamp as a window costs it: what eviction would lose
+        // (no disk copy, not superseded) at its last use, plus everything at
+        // its last use as the tie-break - a window of content the disk also
+        // holds costs nothing to take
+        let mut owner: HashMap<Loc, ((u64, u64), Owner)> = HashMap::new();
         for (k, m) in &self.runs {
             if let Some(l) = m.loc {
-                owner.insert(l, (m.last_used, Owner::Run(*k)));
+                let lost = if self.durable_copy(k) { 0 } else { m.last_used };
+                owner.insert(l, ((lost, m.last_used), Owner::Run(*k)));
             }
         }
         for (k, m) in &self.aux_meta {
+            let lost = if self.blob_loss(k) { m.last_used } else { 0 };
             for i in 0..m.shards {
                 let sk = k.child_bytes("aux", &(i as u32).to_le_bytes());
                 if let Some(l) = self.catalog.ready_loc(&sk, Tier::Ram) {
-                    owner.insert(l, (m.last_used, Owner::Aux(*k)));
+                    owner.insert(l, ((lost, m.last_used), Owner::Aux(*k)));
                 }
             }
         }
-        // the simulated arena: per slab, (offset, len, owner and its last
-        // use) - None is immovable (live and not evictable, or a planned hole)
-        type Sim = Vec<(u64, Vec<(u64, u64, Option<(Owner, u64)>)>)>;
+        // the simulated arena: per slab, (offset, len, owner and its cost) -
+        // None is immovable (live and not evictable, or a planned hole)
+        type Sim = Vec<(u64, Vec<(u64, u64, Option<(Owner, (u64, u64))>)>)>;
         let mut sim: Sim = self
             .transport
             .arena_layout()
@@ -1718,7 +1883,7 @@ impl<T: XferSink> PoolTier<T> {
         let mut plan: Vec<Owner> = Vec::new();
         for &bytes in place {
             let size = self.transport.arena_rounded(bytes);
-            let mut best: Option<((u64, u64), usize, u64)> = None;
+            let mut best: Option<((u64, u64, u64), usize, u64)> = None;
             for (si, (len, ex)) in sim.iter().enumerate() {
                 let mut starts: Vec<u64> = std::iter::once(0)
                     .chain(ex.iter().flat_map(|&(o, r, _)| [o, o + r]))
@@ -1730,14 +1895,15 @@ impl<T: XferSink> PoolTier<T> {
                         break;
                     }
                     let first = ex.partition_point(|&(o, r, _)| o + r <= p);
-                    let (mut newest, mut freed) = (0u64, 0u64);
+                    let (mut lost, mut newest, mut freed) = (0u64, 0u64, 0u64);
                     let mut clear = true;
                     for &(o, r, who) in &ex[first..] {
                         if o >= p + size {
                             break;
                         }
                         match who {
-                            Some((_, used)) => {
+                            Some((_, (l, used))) => {
+                                lost = lost.max(l);
                                 newest = newest.max(used);
                                 freed += r;
                             }
@@ -1747,8 +1913,9 @@ impl<T: XferSink> PoolTier<T> {
                             }
                         }
                     }
-                    if clear && best.as_ref().is_none_or(|(c, _, _)| (newest, freed) < *c) {
-                        best = Some(((newest, freed), si, p));
+                    let cost = (lost, newest, freed);
+                    if clear && best.as_ref().is_none_or(|(c, _, _)| cost < *c) {
+                        best = Some((cost, si, p));
                     }
                 }
             }
@@ -1793,15 +1960,29 @@ impl<T: XferSink> PoolTier<T> {
                 .map(|(b, _)| *b)
                 .collect()
         };
+        // what the holes take that exists nowhere else goes to disk first
+        // (`persist_before_evict` - the arena is untouched by it, so the
+        // plan stands)
         for b in broken {
+            if self.blob_loss(&b) {
+                self.persist_before_evict(b);
+            }
             self.retire_aux(b);
         }
         for w in plan {
             match w {
                 Owner::Run(k) => {
+                    if !self.hybrid() && !self.durable_copy(&k) {
+                        self.persist_before_evict(k);
+                    }
                     self.evict_run_t1(k);
                 }
-                Owner::Aux(k) => self.retire_aux(k),
+                Owner::Aux(k) => {
+                    if self.blob_loss(&k) {
+                        self.persist_before_evict(k);
+                    }
+                    self.retire_aux(k)
+                }
             }
         }
         self.transport.can_place(place)
@@ -2052,18 +2233,40 @@ impl<T: XferSink> PoolTier<T> {
     /// hit is cut to the boundary, priced with the blob, and the arm counted
     /// like [`Self::elect`]'s. `Some((cut hit, est_us))` when restore wins.
     ///
+    /// `resident_tokens`: how deep a checkpoint the GPU already holds for
+    /// this prompt. The families used to skip the tier whenever one existed
+    /// at all - so once a shared system prompt's checkpoint was resident,
+    /// every revisit whose own state was on disk recomputed from the end of
+    /// that prompt (a third of a fleet's sessions after a restart, at
+    /// random, by whether the shared checkpoint happened to be resident).
+    /// The tier is moot only when it offers nothing deeper, and a restore
+    /// is priced against recomputing from the resident depth, not from 0.
+    ///
     /// [`MissReason::NoState`]: super::accounting::MissReason::NoState
-    pub fn elect_hybrid(&mut self, hit: &TierHit, aux: Option<&AuxHit>) -> Option<(TierHit, f64)> {
-        let Some(aux) = aux else {
+    pub fn elect_hybrid(
+        &mut self,
+        hit: &TierHit,
+        aux: Option<&AuxHit>,
+        resident_tokens: usize,
+    ) -> Option<(TierHit, f64)> {
+        let deeper = aux.filter(|a| a.end_block * BLOCK_TOKENS > resident_tokens);
+        let Some(aux) = deeper else {
             self.dec.hits = self.dec.hits.saturating_sub(1);
-            self.dec.record_miss(super::accounting::MissReason::NoState);
+            self.dec.record_miss(if resident_tokens > 0 {
+                // the GPU's own checkpoint is as deep as anything here
+                super::accounting::MissReason::NoNewTokens
+            } else {
+                super::accounting::MissReason::NoState
+            });
             return None;
         };
         let r = self.run_blocks;
-        let n_runs = aux.end_block / r;
+        // from where the probe started - the GPU-resident depth - to the
+        // boundary: the resident prefix is not read back off disk
+        let n_runs = (aux.end_block / r).saturating_sub(hit.start_block / r);
         let per_run = hit.bytes / hit.keys.len().max(1) as u64;
         let cut = TierHit {
-            start_block: 0,
+            start_block: hit.start_block,
             end_block: aux.end_block,
             bytes: per_run * n_runs as u64,
             keys: hit.keys[..n_runs.min(hit.keys.len())].to_vec(),
@@ -2073,7 +2276,7 @@ impl<T: XferSink> PoolTier<T> {
         };
         let e = self.cost.elect(HitShape {
             restore_bytes: cut.bytes + aux.bytes,
-            restore_tokens: (aux.end_block * BLOCK_TOKENS) as u32,
+            restore_tokens: (aux.end_block * BLOCK_TOKENS).saturating_sub(resident_tokens) as u32,
             queued_bytes: self.catalog.ledger(Tier::Ram).in_flight,
             nvme_bytes: cut.nvme_bytes + aux.nvme_bytes,
         });
@@ -2262,6 +2465,7 @@ impl<T: XferSink> PoolTier<T> {
                 self.runs.entry(key).or_insert(RunMeta {
                     loc: Some(loc),
                     last_used: self.lru,
+                    parent: durable::Parent::Unknown, // read off disk: durable
                 });
             } else {
                 // logically full or already resident - hand the extent back
@@ -2309,6 +2513,7 @@ impl<T: XferSink> PoolTier<T> {
                         RunMeta {
                             loc,
                             last_used: now,
+                            parent: d.parent,
                         },
                     );
                     tracing::debug!(
@@ -2489,6 +2694,7 @@ impl<T: XferSink> PoolTier<T> {
             evictions: c.evictions,
             stale_completions: c.stale_completions,
             t2_written_day_bytes: self.transport.t2_written_today(),
+            t2_day_budget_bytes: self.transport.t2_day_budget(),
         }
     }
 
@@ -2544,7 +2750,10 @@ impl PoolTier<RamTransport> {
 
 mod blobs;
 mod calibration;
+mod durable;
 
+#[cfg(test)]
+mod durable_tests;
 #[cfg(test)]
 mod hybrid_tests;
 

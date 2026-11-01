@@ -620,6 +620,7 @@ impl Qwen35 {
             device_read_gbs: t.cache.device_read_gbs,
             prediction_error_pct: t.cost.prediction_error_pct(),
             t2_written_day_bytes: s.t2_written_day_bytes,
+            t2_day_budget_bytes: s.t2_day_budget_bytes,
             ..Default::default()
         })
     }

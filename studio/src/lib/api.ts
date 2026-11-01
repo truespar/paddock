@@ -228,6 +228,8 @@ export interface CacheTier {
   disk_write_gbs: number
   disk_unbuffered: boolean
   disk_written_today: number
+  /** Daily disk write budget: a quarter of the cache's volume, at most 1 TiB. */
+  disk_write_budget_day: number
   ghost_keys: number
 }
 

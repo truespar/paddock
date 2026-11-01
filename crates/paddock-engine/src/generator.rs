@@ -847,6 +847,11 @@ pub trait Generator: Send {
     /// drains its own demotes (found live on the first granite probe).
     fn tier_pump(&mut self) {}
 
+    /// KV-tier shutdown: copy what only the GPU still holds into the tier
+    /// and write it to disk, before the device is dropped (`PoolTier::
+    /// flush_live`). Called once as the scheduler leaves; default no-op.
+    fn tier_flush_at_exit(&mut self) {}
+
     /// Park/wake (KVFlow): true when `tokens`' prefix is being restored
     /// from the KV tier for `slot` - the scheduler skips the request this
     /// tick and the batch runs other work; the per-pass `tier_pump` resolves
@@ -1523,6 +1528,9 @@ impl Generator for crate::gpu_model::qwen35::GpuQwen35 {
     }
     fn tier_pump(&mut self) {
         crate::gpu_model::qwen35::GpuQwen35::tier_pump_impl(self);
+    }
+    fn tier_flush_at_exit(&mut self) {
+        crate::gpu_model::qwen35::GpuQwen35::tier_flush_impl(self);
     }
     fn tier_stats(&self) -> Option<crate::kv_tier::TierStats> {
         crate::gpu_model::qwen35::GpuQwen35::tier_stats_impl(self)

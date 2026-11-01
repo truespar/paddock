@@ -1701,6 +1701,106 @@ int pd_moe_topk_sigmoid_batch_sh(const void* logits, const void* bias,
     return (int)cudaGetLastError();
 }
 
+// ---- wide sigmoid router (slot 903) -----------------------------------------
+// pd_moe_topk_sigmoid_warp for routers past 256 experts or top-16: VJ experts a
+// lane (one warp covers 32 * VJ), up to 32 selections (selection s parks in
+// lane s). Same selection score (sigmoid + correction bias), comparator
+// (strict >, lower index wins a tie), weights (the unbiased scores of the
+// picks, sum-normalized in s = 0..k-1 order, x routed_scale) as the 8-wide
+// router, so at the shapes both take they pick and weigh identically.
+// Nemotron 3.5 Super's 512 experts, top-22, ride VJ = 16.
+template <uint32_t VJ>
+__device__ __forceinline__ void pd_moe_topk_sigmoid_warp_v(
+    const float* __restrict__ logits, const float* __restrict__ bias,
+    float routed_scale, uint32_t n_expert, uint32_t k,
+    uint32_t* __restrict__ out_idx, float* __restrict__ out_w) {
+    const uint32_t lane = threadIdx.x & 31u;
+    float sel[VJ];
+    float raw[VJ];
+    #pragma unroll
+    for (uint32_t j = 0; j < VJ; ++j) {
+        const uint32_t i = lane + 32u * j;
+        if (i < n_expert) {
+            const float s = 1.0f / (1.0f + expf(-logits[i]));
+            raw[j] = s;
+            sel[j] = s + (bias ? bias[i] : 0.0f);
+        } else {
+            raw[j] = 0.0f;
+            sel[j] = -1e30f;
+        }
+    }
+    float myw = 0.0f;
+    uint32_t myi = 0u;
+    for (uint32_t s = 0; s < k; ++s) {
+        float best = -1e30f, braw = 0.0f;
+        uint32_t bi = 0;
+        #pragma unroll
+        for (uint32_t j = 0; j < VJ; ++j) {
+            const uint32_t i = lane + 32u * j;
+            if (sel[j] > best) { best = sel[j]; braw = raw[j]; bi = i; }
+        }
+        #pragma unroll
+        for (uint32_t off = 16u; off > 0u; off >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, best, off);
+            const float orw = __shfl_xor_sync(0xffffffffu, braw, off);
+            const uint32_t oi = __shfl_xor_sync(0xffffffffu, bi, off);
+            if (ov > best || (ov == best && oi < bi)) {
+                best = ov; braw = orw; bi = oi;
+            }
+        }
+        #pragma unroll
+        for (uint32_t j = 0; j < VJ; ++j)
+            if ((bi >> 5) == j && (bi & 31u) == lane) sel[j] = -1e30f;
+        if (lane == s) { myw = braw; myi = bi; }
+    }
+    float sum = 0.0f;
+    for (uint32_t s = 0; s < k; ++s)
+        sum += __shfl_sync(0xffffffffu, myw, s);
+    const float inv = routed_scale / sum;
+    if (lane < k) {
+        out_idx[lane] = myi;
+        out_w[lane] = myw * inv;
+    }
+}
+
+template <uint32_t VJ>
+__launch_bounds__(128, 1)
+__global__ void pd_moe_topk_sigmoid_wide_kernel(
+    const float* __restrict__ logits, const float* __restrict__ bias,
+    float routed_scale, uint32_t n_expert, uint32_t k,
+    uint32_t* __restrict__ out_idx, float* __restrict__ out_w, uint32_t batch) {
+    PD_PDL_ARM();
+    const uint32_t b = blockIdx.x * blockDim.y + threadIdx.y;
+    if (b >= batch) return;
+    pd_moe_topk_sigmoid_warp_v<VJ>(logits + (size_t)b * n_expert, bias, routed_scale,
+                                   n_expert, k, out_idx + (size_t)b * k,
+                                   out_w + (size_t)b * k);
+}
+
+// Slot 903: moe_topk_sigmoid_batch's arguments, for up to 512 experts and
+// top-32. Four rows a block, a warp a row.
+PD_EXPORT
+int pd_moe_topk_sigmoid_batch_wide(const void* logits, const void* bias,
+                                   float routed_scale, uint32_t n_expert, uint32_t k,
+                                   void* out_idx, void* out_w, uint32_t batch,
+                                   void* stream) {
+    if (batch == 0) return 0;
+    if (n_expert == 0 || n_expert > 512u || k == 0 || k > 32u || k > n_expert)
+        return cudaErrorInvalidValue;
+    const dim3 grid((batch + 3u) / 4u), block(32, 4);
+    auto st = (cudaStream_t)stream;
+    if (n_expert <= 256u) {
+        pd_pdl_go(pd_moe_topk_sigmoid_wide_kernel<8>, grid, block, 0u, st,
+            (const float*)logits, (const float*)bias, routed_scale, n_expert, k,
+            (uint32_t*)out_idx, (float*)out_w, batch);
+    } else {
+        pd_pdl_go(pd_moe_topk_sigmoid_wide_kernel<16>, grid, block, 0u, st,
+            (const float*)logits, (const float*)bias, routed_scale, n_expert, k,
+            (uint32_t*)out_idx, (float*)out_w, batch);
+    }
+    return (int)cudaGetLastError();
+}
+
 // ---- Kolibri 1 sigmoid_logit_add MoE router --------------------------------
 // Aleph Alpha's vLLM plugin (`sigmoid_logit_add_routing`) is the reference:
 // expert SELECTION runs on the raw f32 logits + the selection bias

@@ -78,9 +78,12 @@ impl ModeloptQuantMap {
             .get("quant_method")
             .and_then(|m| m.as_str())
             .unwrap_or("");
-        if method != "modelopt" {
+        // `modelopt_mixed` (Nemotron 3.5 Super): the same per-module table,
+        // FP8 and NVFP4 modules side by side
+        if method != "modelopt" && method != "modelopt_mixed" {
             return Err(StError::Header(format!(
-                "quantization_config.quant_method is {method:?}, expected \"modelopt\""
+                "quantization_config.quant_method is {method:?}, expected \"modelopt\" \
+                 or \"modelopt_mixed\""
             )));
         }
         let layers = qc
@@ -95,12 +98,15 @@ impl ModeloptQuantMap {
                 .unwrap_or("");
             let parsed = match algo {
                 "FP8" => QuantAlgo::Fp8,
-                "W4A16_NVFP4" => {
+                // the weight bytes are the same NVFP4 triple either way;
+                // `NVFP4` (W4A4) adds a static activation scale the engine,
+                // which picks its own activation class, does not need
+                "W4A16_NVFP4" | "NVFP4" => {
                     let group =
                         spec.get("group_size")
                             .and_then(|g| g.as_u64())
                             .ok_or_else(|| {
-                                StError::Header(format!("{module}: W4A16_NVFP4 without group_size"))
+                                StError::Header(format!("{module}: {algo} without group_size"))
                             })? as usize;
                     QuantAlgo::Nvfp4 { group }
                 }

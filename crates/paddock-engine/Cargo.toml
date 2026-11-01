@@ -10,7 +10,7 @@ publish.workspace = true
 default = ["cuda"]
 # The scheduler, generation contract and logical caches also serve Metal.
 # Device-specific model graphs and offload transports are CUDA-only.
-cuda = ["dep:cudarc"]
+cuda = ["dep:cudarc", "dep:paddock-tokenizer"]
 # Weld the CUDA kernels into the binary instead of dlopen'ing a pack.
 # Off by default: dev keeps --kernel-pack and the fast rebuild loop,
 # GPU-less CI keeps building. Release turns it on.
@@ -34,7 +34,12 @@ rand_core = { workspace = true }
 blake3 = { workspace = true }
 paddock-kernels = { workspace = true }
 paddock-models = { workspace = true }
+# Phonon tokenizes its own input on the CUDA lane, as the Metal one does
+paddock-tokenizer = { workspace = true, optional = true }
 libc = "0.2.189"
+# the KV disk store reads its volume's free space (statvfs / GetDiskFreeSpaceEx)
+# to keep a reserve free - same crate the runner and manager already use
+fs4 = "1.1.0"
 symphonia = { version = "0.6.1", features = ["mp3", "aac", "isomp4", "alac"] }
 symphonia-adapter-libopus = "0.3.0"
 

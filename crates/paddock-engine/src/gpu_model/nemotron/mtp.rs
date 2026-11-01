@@ -40,7 +40,7 @@
 
 use cudarc::driver::CudaSlice;
 
-use crate::gpu::{DeviceTensor, GpuError, KvDtype, QuantW};
+use crate::gpu::{DeviceTensor, GpuError, KvDtype, QuantTensor, QuantW};
 use crate::gpu_model::gpt_oss::GpuModelError;
 use crate::gpu_model::qwen35::{gemv_any, prefill_mm_pre_any, prefill_quant};
 
@@ -49,20 +49,71 @@ use super::*;
 /// Draft chain cap per round (mirrors DFlash's block cap).
 pub(crate) const MTP_MAX_DRAFT: usize = 15;
 
-/// The blk.52 nextn weights, Q8_0 residency (the GGUF lane's classes: qw
-/// planes decode on the repacked GEMV / prefill on the mmq ladder, experts
-/// on the repacked relu2 pair - byte-identical dispatch to a trunk layer).
+/// Super's MTP draft depth per round, fixed (the batched drafter drafts
+/// every slot to one depth; the chain ramp's per-slot k is the GGUF lane's).
+/// Overridable for the election's A/B only.
+pub(crate) fn super_mtp_depth() -> usize {
+    paddock_models::dev_var!("PADDOCK_SUPER_MTP_DEPTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&d| (1..=7).contains(&d))
+        .unwrap_or(3)
+}
+
+/// A dense projection of the block in its file's class: the GGUF nextn's
+/// Q8_0 (repacked GEMV at one row, the mmq ladder past it), or Super's bf16
+/// (the bf16 GEMM/GEMV - exact products against f32 rows), [in, out] dims.
+pub(crate) enum MtpProj {
+    Qw(QuantW),
+    Bf16(QuantTensor),
+}
+
+/// The block's attention planes (NoPE; q, k, v, o).
+pub(crate) struct MtpAttn {
+    pub wq: MtpProj,
+    pub wk: MtpProj,
+    pub wv: MtpProj,
+    pub wo: MtpProj,
+}
+
+/// The nextn weights. The GGUF lane's blk.52 (Q8_0 residency - the qw
+/// planes and the repacked relu2 experts, byte-identical dispatch to a trunk
+/// layer), or Super's `mtp.layers.{0,1}` (bf16 projections, the trunk's
+/// NVFP4 latent MoE).
 pub(crate) struct MtpWeights {
     pub enorm: DeviceTensor,
     pub hnorm: DeviceTensor,
     /// [2*hidden -> hidden], e-first concat (vLLM order)
-    pub eh_proj: QuantW,
+    pub eh_proj: MtpProj,
     pub attn_norm: DeviceTensor,
-    pub attn: AttnWeights,
+    pub attn: MtpAttn,
     pub post_norm: DeviceTensor,
     pub moe: MoeWeights,
-    /// shared_head_norm - RMSNorm per the vendor reference
+    /// shared_head_norm / Super's final_layernorm - RMSNorm per the vendor
+    /// reference
     pub head_norm: DeviceTensor,
+}
+
+/// `y = W x` over `rows` rows for a bf16 block plane; Q8_0 planes take the
+/// pass's own quantize-once dispatch at the call site.
+fn mtp_bf16(
+    exec: &GpuExecutor,
+    w: &MtpProj,
+    x: &CudaSlice<f32>,
+    y: &mut CudaSlice<f32>,
+    rows: usize,
+) -> Result<bool, GpuError> {
+    match w {
+        MtpProj::Bf16(t) => exec.bf16_gemm(t, None, x, y, rows).map(|()| true),
+        MtpProj::Qw(_) => Ok(false),
+    }
+}
+
+fn mtp_qw(w: &MtpProj) -> &QuantW {
+    match w {
+        MtpProj::Qw(q) => q,
+        MtpProj::Bf16(_) => unreachable!("bf16 planes dispatch through mtp_bf16"),
+    }
 }
 
 pub(crate) struct MtpDrafter {
@@ -95,7 +146,8 @@ pub(crate) struct MtpState {
     /// the MTP block's own residual stream [band, embd] - sc.d_x stays the
     /// trunk's (callers head it after the hook)
     pub d_mx: CudaSlice<f32>,
-    /// draft-loop head-normed row (the chained h) [embd]
+    /// draft-loop head-normed rows (the chained h), one per drafting slot
+    /// [n_slots, embd]
     pub d_hd: CudaSlice<f32>,
     pub d_pick: CudaSlice<u32>,
     /// stays zero - pending_h resets copy from here
@@ -149,8 +201,8 @@ impl GpuNemotron {
             d_h: e.alloc(band * hp.hidden)?,
             d_hin: e.alloc(band * hp.hidden)?,
             d_mx: e.alloc(band * hp.hidden)?,
-            d_hd: e.alloc(hp.hidden)?,
-            d_pick: e.alloc_u32(1)?,
+            d_hd: e.alloc(n_slots * hp.hidden)?,
+            d_pick: e.alloc_u32(n_slots)?,
             d_zero: e.alloc(hp.hidden)?,
         });
         tracing::info!(
@@ -363,8 +415,10 @@ impl GpuNemotron {
                 embd,
             )?;
         }
-        if dec1 {
-            gemv_any(&exec, &m.eh_proj, &sc.d_zxbcdt, &mut st.d_mx)?;
+        if mtp_bf16(&exec, &m.eh_proj, &sc.d_zxbcdt, &mut st.d_mx, r)? {
+            // Super's bf16 plane: done
+        } else if dec1 {
+            gemv_any(&exec, mtp_qw(&m.eh_proj), &sc.d_zxbcdt, &mut st.d_mx)?;
         } else {
             let s8 = sc.q8.as_mut().expect("q8 batch scratch");
             prefill_quant(
@@ -378,7 +432,7 @@ impl GpuNemotron {
             )?;
             prefill_mm_pre_any(
                 &exec,
-                &m.eh_proj,
+                mtp_qw(&m.eh_proj),
                 &s8.xq,
                 &s8.xs,
                 &s8.yq,
@@ -393,9 +447,8 @@ impl GpuNemotron {
         // x1 = x0 + attn(attn_norm(x0)) - NoPE, dense per-slot KV, per-row
         // causal window [0, pos_i] (the decode kernel is exactly that)
         exec.rmsnorm_batch(&st.d_mx, &m.attn_norm.buf, &mut sc.d_xn, embd, eps, r)?;
-        let AttnWeights::Qw { wq, wk, wv, wo } = &m.attn else {
-            unreachable!("in-file MTP is the GGUF lane (Qw planes)");
-        };
+        let MtpAttn { wq, wk, wv, wo } = &m.attn;
+        let bf16 = matches!(wq, MtpProj::Bf16(_));
         // An append pass (head_out false: prefill chunks, decode ticks,
         // verify commits) only has to leave this position's K/V behind - a
         // cell is k/v(attn_norm(x0)), and x0 pairs the token with the TRUNK's
@@ -406,13 +459,21 @@ impl GpuNemotron {
         // whole prefix, so an 11.7K-token append at 130K depth spent ~65 s
         // here (GB10, Claude Code replay; the trunk's own chunk took ~9 s).
         // The K/V bytes are unchanged, so drafts are bit-identical.
-        if dec1 {
+        if bf16 {
+            if head_out {
+                mtp_bf16(&exec, wq, &sc.d_xn, &mut sc.d_q, r)?;
+            }
+            mtp_bf16(&exec, wk, &sc.d_xn, &mut sc.d_k, r)?;
+            mtp_bf16(&exec, wv, &sc.d_xn, &mut sc.d_v, r)?;
+        } else if dec1 {
+            let (wq, wk, wv) = (mtp_qw(wq), mtp_qw(wk), mtp_qw(wv));
             if head_out {
                 gemv_any(&exec, wq, &sc.d_xn, &mut sc.d_q)?;
             }
             gemv_any(&exec, wk, &sc.d_xn, &mut sc.d_k)?;
             gemv_any(&exec, wv, &sc.d_xn, &mut sc.d_v)?;
         } else {
+            let (wq, wk, wv) = (mtp_qw(wq), mtp_qw(wk), mtp_qw(wv));
             let s8 = sc.q8.as_mut().expect("q8 batch scratch");
             prefill_quant(&exec, &mut s8.xq, &mut s8.xs, &mut s8.yq, &sc.d_xn, embd, r)?;
             if head_out {
@@ -548,8 +609,10 @@ impl GpuNemotron {
                 KvDtype::Fp16,
             )?;
         }
-        if dec1 {
-            gemv_any(&exec, wo, &sc.d_attn, &mut sc.d_proj)?;
+        if mtp_bf16(&exec, wo, &sc.d_attn, &mut sc.d_proj, r)? {
+            // Super's bf16 plane: done
+        } else if dec1 {
+            gemv_any(&exec, mtp_qw(wo), &sc.d_attn, &mut sc.d_proj)?;
         } else {
             let s8 = sc.q8.as_mut().expect("q8 batch scratch");
             prefill_quant(
@@ -557,7 +620,7 @@ impl GpuNemotron {
             )?;
             prefill_mm_pre_any(
                 &exec,
-                wo,
+                mtp_qw(wo),
                 &s8.xq,
                 &s8.xs,
                 &s8.yq,
@@ -583,6 +646,48 @@ impl GpuNemotron {
             &mut sc.d_w,
             r,
         )?;
+        // Super: the trunk's latent mixer - a one-row draft on the exact
+        // class, a batched draft step (one row per drafting slot) on W16 over
+        // the tiled planes (appends stop before the MoE)
+        if let Some(lp) = m.moe.latent.as_ref() {
+            let class = if r > 1 && super::latent_tiled(&m.moe) {
+                super::LatentClass::W16(super::LatentW16 {
+                    x16: &mut sc.d_x16b,
+                    act16: &mut sc.d_act16,
+                    srow: &mut sc.d_srow,
+                    sslot: &mut sc.d_sslot,
+                    bexp: &mut sc.d_bexp,
+                    nb_r: sc.nb_r,
+                    srow_s: &mut sc.d_srow_s,
+                    sslot_s: &mut sc.d_sslot_s,
+                    bexp_s: &mut sc.d_bexp_s,
+                    nb_s: sc.nb_s,
+                    part: &mut sc.d_part,
+                })
+            } else {
+                super::LatentClass::Exact
+            };
+            super::latent_moe(
+                &exec,
+                &hp,
+                &m.moe,
+                lp,
+                &sc.d_xn,
+                sc.lat.as_mut().expect("latent scratch"),
+                &sc.d_idx,
+                &sc.d_w,
+                &sc.d_sh_idx,
+                &sc.d_sh_w,
+                &mut sc.d_proj,
+                r,
+                class,
+            )?;
+            exec.add(&mut st.d_mx, &sc.d_proj, r * embd)?;
+            if head_out {
+                exec.rmsnorm_batch(&st.d_mx, &m.head_norm.buf, &mut st.d_hd, embd, eps, r)?;
+            }
+            return Ok(());
+        }
         let MoePlanes::Q8 {
             up,
             down,
@@ -590,7 +695,7 @@ impl GpuNemotron {
             sh_down,
         } = &m.moe.planes
         else {
-            unreachable!("in-file MTP is the GGUF lane (Q8 experts)");
+            unreachable!("a non-latent MTP block is the GGUF lane (Q8 experts)");
         };
         let s8 = sc.q8.as_mut().expect("q8 batch scratch");
         if dec1 {
@@ -712,6 +817,129 @@ impl GpuNemotron {
         Ok(())
     }
 
+    /// Draft up to `k` tokens for every slot of `reqs` (slot, covered end =
+    /// the pending token's position, pending token) together: each chain step
+    /// is ONE block pass over a row per slot and one head launch over them -
+    /// the drafter's weights and the head stream once a step instead of once
+    /// per slot. The NVFP4 lane's (its head takes rows); same pairing as
+    /// [`Self::mtp_draft`], each slot's row reading its own cells.
+    pub(crate) fn mtp_draft_batch(
+        &mut self,
+        reqs: &[(usize, usize, u32)],
+        k: usize,
+    ) -> Result<Vec<Vec<u32>>, GpuModelError> {
+        let r = reqs.len();
+        let n_slots = self.batch.as_ref().map_or(0, |b| b.n_slots);
+        assert!((1..=MTP_MAX_DRAFT).contains(&k) && r <= n_slots);
+        let k = reqs
+            .iter()
+            .map(|&(_, pos, _)| self.max_ctx.saturating_sub(pos))
+            .min()
+            .unwrap_or(0)
+            .min(k);
+        if k == 0 {
+            return Ok(vec![Vec::new(); r]);
+        }
+        let slots: Vec<u32> = reqs.iter().map(|&(s, _, _)| s as u32).collect();
+        let last: Vec<u32> = reqs.iter().map(|&(_, p, _)| (p + k - 1) as u32).collect();
+        match self.ensure_rows(&slots, &last) {
+            Ok(()) => {}
+            Err(GpuModelError::PoolExhausted) => return Ok(vec![Vec::new(); r]),
+            Err(e) => return Err(e),
+        }
+        let exec = self.exec.clone();
+        let (embd, vocab) = (self.hp.hidden, self.hp.vocab);
+        let drv = |e: cudarc::driver::DriverError| crate::gpu::from_driver(e);
+        let mut drafts = vec![Vec::with_capacity(k); r];
+        let mut toks: Vec<u32> = reqs.iter().map(|&(_, _, t)| t).collect();
+        for i in 0..k {
+            {
+                let bs = self.batch.as_mut().expect("batch enabled");
+                let sc = &mut bs.sc;
+                let stm = &exec.stream;
+                let pos: Vec<u32> = reqs.iter().map(|&(_, p, _)| (p + i) as u32).collect();
+                let mut t = sc
+                    .d_tok
+                    .try_slice_mut(0..r)
+                    .ok_or_else(|| GpuError::Driver("tok".into()))?;
+                stm.memcpy_htod(&toks, &mut t).map_err(drv)?;
+                let mut p = sc
+                    .d_pos
+                    .try_slice_mut(0..r)
+                    .ok_or_else(|| GpuError::Driver("pos".into()))?;
+                stm.memcpy_htod(&pos, &mut p).map_err(drv)?;
+                let mut s = sc
+                    .d_slots
+                    .try_slice_mut(0..r)
+                    .ok_or_else(|| GpuError::Driver("slots".into()))?;
+                stm.memcpy_htod(&slots, &mut s).map_err(drv)?;
+            }
+            {
+                let st = self
+                    .mtp
+                    .as_mut()
+                    .expect("mtp weights")
+                    .state
+                    .as_mut()
+                    .expect("mtp state");
+                if i == 0 {
+                    for (j, &(slot, _, _)) in reqs.iter().enumerate() {
+                        exec.copy_region(
+                            &st.pending_h,
+                            slot * embd,
+                            &mut st.d_hin,
+                            j * embd,
+                            embd,
+                        )?;
+                    }
+                } else {
+                    exec.copy_region(&st.d_hd, 0, &mut st.d_hin, 0, r * embd)?;
+                }
+            }
+            self.mtp_block_rows(r, true)?;
+            {
+                let HeadW::F8(h) = &self.lm_head else {
+                    return Err(GpuModelError::Unsupported(
+                        "batched MTP drafting is the FP8-head lane's".into(),
+                    ));
+                };
+                let st = self
+                    .mtp
+                    .as_mut()
+                    .expect("mtp weights")
+                    .state
+                    .as_mut()
+                    .expect("mtp state");
+                let bs = self.batch.as_mut().expect("batch enabled");
+                let sc = &mut bs.sc;
+                head_f8_batch(
+                    &exec,
+                    h,
+                    &st.d_hd,
+                    &mut sc.d_xq,
+                    &mut sc.d_xrs,
+                    &mut sc.head_logits,
+                    embd,
+                    vocab,
+                    r,
+                )?;
+                exec.argmax_rows(&sc.head_logits, &mut st.d_pick, r, vocab)?;
+                let view = st
+                    .d_pick
+                    .try_slice(0..r)
+                    .ok_or_else(|| GpuError::Driver("pick view".into()))?;
+                toks = exec
+                    .stream
+                    .clone_dtoh(&view)
+                    .map_err(|e| GpuError::Driver(e.to_string()))?;
+            }
+            for (d, &t) in drafts.iter_mut().zip(&toks) {
+                d.push(t);
+            }
+        }
+        Ok(drafts)
+    }
+
     /// Draft up to k tokens for one slot: chain (pending token, pending_h)
     /// -> block -> trunk head -> pick, feeding the head's own normed output
     /// back as the next h (qwen35's single-head chain). The chain's KV cells
@@ -781,14 +1009,6 @@ impl GpuNemotron {
             }
             self.mtp_block_rows(1, true)?;
             {
-                let head = match &self.lm_head {
-                    HeadW::Qw(q) => q,
-                    HeadW::Nvf4(_) => {
-                        return Err(GpuModelError::Unsupported(
-                            "in-file MTP is the GGUF lane".into(),
-                        ));
-                    }
-                };
                 let st = self
                     .mtp
                     .as_mut()
@@ -798,7 +1018,26 @@ impl GpuNemotron {
                     .expect("mtp state");
                 let bs = self.batch.as_mut().expect("batch enabled");
                 let sc = &mut bs.sc;
-                gemv_any(&exec, head, &st.d_hd, &mut sc.head_logits)?;
+                match &self.lm_head {
+                    HeadW::Qw(q) => gemv_any(&exec, q, &st.d_hd, &mut sc.head_logits)?,
+                    // Super's FP8 head: the one-row W8A16 GEMV, as its decode
+                    HeadW::F8(h) => head_f8_batch(
+                        &exec,
+                        h,
+                        &st.d_hd,
+                        &mut sc.d_xq,
+                        &mut sc.d_xrs,
+                        &mut sc.head_logits,
+                        embd,
+                        vocab,
+                        1,
+                    )?,
+                    HeadW::Nvf4(_) => {
+                        return Err(GpuModelError::Unsupported(
+                            "the NVFP4-head lane has no in-file MTP".into(),
+                        ));
+                    }
+                }
                 exec.argmax_rows(&sc.head_logits, &mut st.d_pick, 1, vocab)?;
                 let view = st
                     .d_pick

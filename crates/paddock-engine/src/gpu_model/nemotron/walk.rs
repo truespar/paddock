@@ -774,6 +774,50 @@ impl GpuNemotron {
                                 }
                             }
                         }
+                        // FP8 projections (Super): the serial lane's classes -
+                        // the exact GEMV for one row, W8A8 for a batch
+                        AttnWeights::F8 { wq, wk, wv, .. } => {
+                            if dec1 {
+                                exec.f8r_gemv(wq, &sc.d_xn, &mut sc.d_q, embd, q_dim)?;
+                                exec.f8r_gemv(wk, &sc.d_xn, &mut sc.d_k, embd, kv_dim)?;
+                                exec.f8r_gemv(wv, &sc.d_xn, &mut sc.d_v, embd, kv_dim)?;
+                            } else {
+                                exec.quantize_e4m3_row(
+                                    &sc.d_xn,
+                                    &mut sc.d_xq,
+                                    &mut sc.d_xrs,
+                                    embd,
+                                    r,
+                                )?;
+                                exec.f8row_gemm(
+                                    wq,
+                                    &sc.d_xq,
+                                    &sc.d_xrs,
+                                    &mut sc.d_q,
+                                    embd,
+                                    q_dim,
+                                    r,
+                                )?;
+                                exec.f8row_gemm(
+                                    wk,
+                                    &sc.d_xq,
+                                    &sc.d_xrs,
+                                    &mut sc.d_k,
+                                    embd,
+                                    kv_dim,
+                                    r,
+                                )?;
+                                exec.f8row_gemm(
+                                    wv,
+                                    &sc.d_xq,
+                                    &sc.d_xrs,
+                                    &mut sc.d_v,
+                                    embd,
+                                    kv_dim,
+                                    r,
+                                )?;
+                            }
+                        }
                         AttnWeights::Qw { wq, wk, wv, .. } => {
                             if dec1 {
                                 gemv_any(&exec, wq, &sc.d_xn, &mut sc.d_q)?;
@@ -1203,6 +1247,28 @@ impl GpuNemotron {
                                 }
                             }
                         }
+                        AttnWeights::F8 { wo, .. } => {
+                            if dec1 {
+                                exec.f8r_gemv(wo, &sc.d_attn, &mut sc.d_proj, q_dim, embd)?;
+                            } else {
+                                exec.quantize_e4m3_row(
+                                    &sc.d_attn,
+                                    &mut sc.d_xq,
+                                    &mut sc.d_xrs,
+                                    q_dim,
+                                    r,
+                                )?;
+                                exec.f8row_gemm(
+                                    wo,
+                                    &sc.d_xq,
+                                    &sc.d_xrs,
+                                    &mut sc.d_proj,
+                                    q_dim,
+                                    embd,
+                                    r,
+                                )?;
+                            }
+                        }
                         AttnWeights::Qw { wo, .. } => {
                             if dec1 {
                                 gemv_any(&exec, wo, &sc.d_attn, &mut sc.d_proj)?;
@@ -1227,6 +1293,118 @@ impl GpuNemotron {
                                 )?;
                             }
                         }
+                    }
+                }
+                // LatentMoE (Super): the output lands in d_proj for the add
+                // after the match. A prefill pass's rows ride the sorted W4A4
+                // pair; decode rows - a decode tick's, a verify round's, and a
+                // mixed tick's band [0, dec) recomputed over the chunk's -
+                // keep the exact row class, so a stream's bits do not depend
+                // on a prompt being admitted beside it. Past the exact class's
+                // rows (a tick wider than its scratch) the pair takes them all.
+                Mixer::Moe(w) if w.latent.is_some() => {
+                    exec.matvec_f32_batch(&w.router, &sc.d_xn, &mut sc.d_logits_r, r)?;
+                    exec.moe_topk_sigmoid_batch(
+                        &sc.d_logits_r,
+                        &w.bias.buf,
+                        hp.routed_scale,
+                        hp.n_expert,
+                        hp.n_active,
+                        &mut sc.d_idx,
+                        &mut sc.d_w,
+                        r,
+                    )?;
+                    let lp = w.latent.as_ref().expect("guarded");
+                    // the decode rows' class: W16 on tiled planes (its bf16
+                    // planes hold W16_ROWS rows), the exact GEMVs on row-major
+                    let tiled = super::latent_tiled(w);
+                    let exact_rows = if tiled {
+                        super::batch::W16_ROWS
+                    } else {
+                        sc.lat.as_ref().map_or(0, |l| l.exact_rows)
+                    };
+                    let dec_rows = match cuts {
+                        Some(c) if !verify => c.dec,
+                        _ => r,
+                    };
+                    // rows [0, exact) on the exact class, everything on the
+                    // pair first when any row is left for it
+                    let exact = if !super::latent_mma_on(&exec) {
+                        r
+                    } else if dec_rows <= exact_rows {
+                        dec_rows
+                    } else {
+                        0
+                    };
+                    let mma = exact < r;
+                    if mma {
+                        super::latent_moe(
+                            &exec,
+                            &hp,
+                            w,
+                            lp,
+                            &sc.d_xn,
+                            sc.lat.as_mut().expect("latent scratch"),
+                            &sc.d_idx,
+                            &sc.d_w,
+                            &sc.d_sh_idx,
+                            &sc.d_sh_w,
+                            &mut sc.d_proj,
+                            r,
+                            super::LatentClass::Mma(super::LatentMma {
+                                xq4: &mut sc.d_xq4,
+                                xs4: &mut sc.d_xs4,
+                                srow: &mut sc.d_srow,
+                                sslot: &mut sc.d_sslot,
+                                bexp: &mut sc.d_bexp,
+                                nb_r: sc.nb_r,
+                                srow_s: &mut sc.d_srow_s,
+                                sslot_s: &mut sc.d_sslot_s,
+                                bexp_s: &mut sc.d_bexp_s,
+                                nb_s: sc.nb_s,
+                                fq: &mut sc.d_fq,
+                                fs: &mut sc.d_fs,
+                                fq_s: &mut sc.d_fq_s,
+                                fs_s: &mut sc.d_fs_s,
+                                part: &mut sc.d_part,
+                            }),
+                        )?;
+                    }
+                    // the decode rows' class over the decode rows
+                    // (overwriting the pair's output for a mixed tick's band)
+                    if exact > 0 {
+                        let class = if tiled {
+                            super::LatentClass::W16(super::LatentW16 {
+                                x16: &mut sc.d_x16b,
+                                act16: &mut sc.d_act16,
+                                srow: &mut sc.d_srow,
+                                sslot: &mut sc.d_sslot,
+                                bexp: &mut sc.d_bexp,
+                                nb_r: sc.nb_r,
+                                srow_s: &mut sc.d_srow_s,
+                                sslot_s: &mut sc.d_sslot_s,
+                                bexp_s: &mut sc.d_bexp_s,
+                                nb_s: sc.nb_s,
+                                part: &mut sc.d_part,
+                            })
+                        } else {
+                            super::LatentClass::Exact
+                        };
+                        super::latent_moe(
+                            &exec,
+                            &hp,
+                            w,
+                            lp,
+                            &sc.d_xn,
+                            sc.lat.as_mut().expect("latent scratch"),
+                            &sc.d_idx,
+                            &sc.d_w,
+                            &sc.d_sh_idx,
+                            &sc.d_sh_w,
+                            &mut sc.d_proj,
+                            exact,
+                            class,
+                        )?;
                     }
                 }
                 Mixer::Moe(w) => {
@@ -1931,7 +2109,8 @@ impl GpuNemotron {
             let next_bs_moe = glue_fuse
                 && matches!(
                     self.layers.get(li + 1).map(|l| &l.mixer),
-                    Some(Mixer::Moe(w)) if matches!(w.planes, MoePlanes::Nvf4 { .. })
+                    Some(Mixer::Moe(w))
+                        if w.latent.is_none() && matches!(w.planes, MoePlanes::Nvf4 { .. })
                 );
             if next_bs_moe {
                 let next_w = &self.layers[li + 1].norm.buf;

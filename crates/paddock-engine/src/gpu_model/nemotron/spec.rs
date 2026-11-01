@@ -361,6 +361,17 @@ impl GpuNemotron {
         vp.open = None;
         exec.rmsnorm_batch(&sc.d_x, &final_norm, &mut vp.d_h, embd, eps, total)?;
         match &self.lm_head {
+            HeadW::F8(h) => super::head_f8_batch(
+                &exec,
+                h,
+                &vp.d_h,
+                &mut sc.d_xq,
+                &mut sc.d_xrs,
+                &mut vp.d_logits,
+                embd,
+                self.hp.vocab,
+                total,
+            )?,
             HeadW::Nvf4(h) => super::head_nvf4_batch(
                 &exec,
                 h,

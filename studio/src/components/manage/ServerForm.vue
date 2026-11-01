@@ -1266,7 +1266,8 @@ const singlePass = computed(() =>
       c === 'masks' ||
       c === 'decision' ||
       c === 'tabular' ||
-      c === 'diarization',
+      c === 'diarization' ||
+      c === 'audio_generation',
   ),
 )
 const canOffload = computed(() => backend.value !== 'metal' || selectedWeights.value?.kv_offload_supported === true)

@@ -39,28 +39,66 @@ impl GpuQwen35 {
             FlowStatus::Done { .. } => return false,
             FlowStatus::None => {}
         }
-        // a resident usable checkpoint makes the tier moot for this prompt
-        if pr.match_full(tokens).ckpt.is_some() {
+        let retry = match tier.consult_try(slot, tokens.len()) {
+            crate::kv_tier::ConsultTry::Hold => return true,
+            t => t == crate::kv_tier::ConsultTry::Retry,
+        };
+        // a resident checkpoint makes the tier moot only where the tier has
+        // nothing deeper (`elect_hybrid`); one covering the whole prompt
+        // skips the probe outright
+        let resident = pr.match_full(tokens).ckpt.map_or(0, |(t, _)| t);
+        if resident + tier.run_blocks() * BLOCK_TOKENS > tokens.len() {
             return false;
         }
         // the blob's geometry lets the probe find it on any tier
         tier.declare_blob_pages(pr.pages_per_ckpt());
         // probe counts the lookup (and the miss when nothing is held)
-        let Some(hit) = tier.probe(tokens, 0) else {
+        // from the resident depth: what the GPU holds is not read back
+        let probed = tier.probe(tokens, resident / BLOCK_TOKENS);
+        let r = tier.run_blocks();
+        let deepest = probed.as_ref().and_then(|hit| {
+            tier.probe_aux(tokens, hit.end_block)
+                .filter(|a| a.end_block * BLOCK_TOKENS >= 32 && a.end_block % r == 0)
+        });
+        // deeper state may still be on its way into T1 (a demote claims the
+        // checkpoint and drops its radix path at once; its stores queue
+        // behind loads): wait for it rather than restore a shallower one
+        let above = deepest
+            .as_ref()
+            .map_or(0, |a| a.end_block)
+            .max(resident / BLOCK_TOKENS)
+            .max(32usize.div_ceil(BLOCK_TOKENS) - 1);
+        let ready_to = probed
+            .as_ref()
+            .map_or(resident / BLOCK_TOKENS, |h| h.end_block);
+        if let Some(gap) = tier.blob_landing(tokens, above, ready_to)
+            && tier.wait_for_blob(slot, tokens.len(), gap)
+        {
+            return true;
+        }
+        let Some(hit) = probed else {
+            tracing::debug!(
+                t_len = tokens.len(),
+                resident,
+                "qwen35 tier consult: probe missed"
+            );
             return false;
         };
-        let r = tier.run_blocks();
-        let deepest = tier
-            .probe_aux(tokens, hit.end_block)
-            .filter(|a| a.end_block * crate::kv_pool::BLOCK_TOKENS >= 32 && a.end_block % r == 0);
-        let Some((hit, est_us)) = tier.elect_hybrid(&hit, deepest.as_ref()) else {
+        let Some((hit, est_us)) = tier.elect_hybrid(&hit, deepest.as_ref(), resident) else {
+            tracing::debug!(
+                t_len = tokens.len(),
+                resident,
+                held_to = hit.end_block * BLOCK_TOKENS,
+                state_at = deepest.map(|a| a.end_block * BLOCK_TOKENS),
+                "qwen35 tier consult: not elected"
+            );
             return false;
         };
         let aux = deepest.expect("an elected hybrid hit has its boundary");
         // the destination: the restored blocks, then the checkpoint's own
         // pages - the blob round draws those from the pool too, and a pool
         // that seats only the blocks makes it evict to find them
-        let need = aux.end_block + pr.pages_per_ckpt();
+        let need = (aux.end_block - hit.start_block) + pr.pages_per_ckpt();
         let afford =
             |pool: &crate::kv_pool::KvPool| pool.free_blocks().saturating_sub(2 * r) / r * r;
         if afford(pool) < need {
@@ -78,7 +116,10 @@ impl GpuQwen35 {
                 }
             }
             pr.reclaim(pool);
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+            // a retry does not block here: the passes between tries are
+            // its wait
+            let wait = std::time::Duration::from_millis(if retry { 0 } else { 50 });
+            let deadline = std::time::Instant::now() + wait;
             while pool.free_blocks() < want && tier.stats().2 > 0 {
                 tier.pump_completions(pr, pool);
                 if std::time::Instant::now() >= deadline {
@@ -87,16 +128,24 @@ impl GpuQwen35 {
                 std::thread::sleep(std::time::Duration::from_micros(200));
             }
         }
+        if afford(pool) < need {
+            if !retry {
+                tracing::debug!(
+                    free = pool.free_blocks(),
+                    need,
+                    boundary = aux.end_block,
+                    "qwen35 tier gate"
+                );
+            }
+            let restore_tokens = (aux.end_block * BLOCK_TOKENS).saturating_sub(resident);
+            return tier.wait_for_pool(slot, tokens.len(), est_us, restore_tokens);
+        }
         tracing::debug!(
             free = pool.free_blocks(),
             need,
             boundary = aux.end_block,
             "qwen35 tier gate"
         );
-        if afford(pool) < need {
-            tier.refuse_park();
-            return false;
-        }
         let after = exec.record_event().ok();
         // the checkpoint lands in pool pages the flow reserves; the radix
         // names them, so there is no slot base to hand over
@@ -125,6 +174,58 @@ impl GpuQwen35 {
             }
             None => false,
         }
+    }
+
+    /// The tier's shutdown flush (see `Generator::tier_flush_at_exit`).
+    pub fn tier_flush_impl(&mut self) {
+        let exec = self.exec.clone();
+        let Some(bs) = self.batch.as_mut() else {
+            return;
+        };
+        let (Some(tier), Some(pr), Some(pool)) =
+            (bs.tier.as_mut(), bs.paged_prefix.as_mut(), bs.pool.as_mut())
+        else {
+            return;
+        };
+        tier.flush_live(pr, pool, &mut || exec.record_event().ok(), None);
+    }
+
+    /// The per-tick tier pump (see `Generator::tier_pump`).
+    pub fn tier_pump_impl(&mut self) {
+        let exec = self.exec.clone();
+        let Some(bs) = self.batch.as_mut() else {
+            return;
+        };
+        let (Some(tier), Some(pr), Some(pool)) =
+            (bs.tier.as_mut(), bs.paged_prefix.as_mut(), bs.pool.as_mut())
+        else {
+            return;
+        };
+        tier.pump_completions(pr, pool);
+        // an aux round reserves its checkpoint's pages from the pool
+        tier.pump_flows_with_pool(pr, pool, &mut || exec.record_event().ok());
+        // 2.3 write-through: retained chains AND live checkpoint blobs
+        // pre-store in slack so eviction (and ckpt-slot recycling) is free.
+        // The checkpoints are pool pages; the tier reads them off the radix.
+        tier.mirror_slack(pr, pool, exec.record_event().ok(), 2, None);
+    }
+
+    pub fn tier_observe_prefill_impl(&mut self, tokens: u32, wall_us: f64) {
+        if let Some(t) = self.batch.as_mut().and_then(|b| b.tier.as_mut()) {
+            t.cost.observe_prefill(tokens, wall_us);
+        }
+    }
+
+    pub fn tier_stats_impl(&self) -> Option<crate::kv_tier::TierStats> {
+        self.batch.as_ref()?.tier.as_ref().map(|t| t.tier_stats())
+    }
+
+    pub fn tier_report_impl(&self) -> Option<crate::kv_tier::TierReport> {
+        self.batch
+            .as_ref()?
+            .tier
+            .as_ref()
+            .map(crate::kv_tier::PoolTier::report)
     }
 
     /// Prefill `tokens` into batch slot `slot`. Fresh sequences zero the

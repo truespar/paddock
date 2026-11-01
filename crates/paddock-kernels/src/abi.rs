@@ -9495,7 +9495,228 @@ pub struct KernelTableV1 {
             *mut core::ffi::c_void,
         ) -> i32,
     >,
+    /// Slot 903: `pd_moe_topk_sigmoid_batch_wide` - `moe_topk_sigmoid_batch`
+    /// (same arguments, same picks and weights where both fit) past 256
+    /// experts / top-16: up to 512 experts, top-32. Nemotron 3.5 Super's
+    /// router (512 experts, top-22).
+    pub moe_topk_sigmoid_batch_wide: Option<MoeTopkSigmoidBatchFn>,
+    /// Slot 904: `pd_nvl_resample` (src, dst, src_u8, lines, in, out, horiz,
+    /// xmin, xsize, w, taps, ch, stream): one separable pass of torch's float
+    /// antialiased bicubic over interleaved rows - `horiz` walks the taps
+    /// along a row ([lines][in][ch] -> [lines][out][ch]), else down a column
+    /// ([in][lines][ch] -> [out][lines][ch]); the per-output taps and f32
+    /// weights come with the call. Nemotron 3.5 Super VL's processor.
+    pub nvl_resample: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 905: `pd_nvl_patchify_h` (img, out, h, w, p, m0, m1, m2, s0, s1,
+    /// s2, stream): an f32 HWC picture on the 0..255 scale -> (v / 255 -
+    /// mean) / std, p x p patches flattened (c, ky, kx), one f16 row each.
+    pub nvl_patchify_h: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            f32,
+            f32,
+            f32,
+            f32,
+            f32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 906: `pd_nvl_pos_add` (x, grid, g, m, hp, wp, d, stream): RADIO's
+    /// cropped position embedding - the g x g grid bilinearly resized to
+    /// m x m (align_corners=False), its top-left hp x wp corner added to the
+    /// patch rows.
+    pub nvl_pos_add: Option<
+        unsafe extern "C" fn(
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 907: `pd_nvl_relu2` (x, n, stream): relu(x)^2 in place over f32.
+    pub nvl_relu2:
+        Option<unsafe extern "C" fn(*mut core::ffi::c_void, u64, *mut core::ffi::c_void) -> i32>,
+    /// Slot 908: `pd_ph_linear` (x, ln_w, ln_b, mod, w, w_bf16, bias, res, gate, y, rows, in, out, eps, pro, epi, kc, vc, pos_dev, pos0, cap, esplit, hint, stream): Phonon's one-row-class linear (GEMV): y = epi(W prologue(x) + b) over BF16 or F32 weights, F32 math; prologue none / LayerNorm / LayerNorm (+affine) with adaLN modulation, epilogue none / +res / GELU-erf / SiLU / res + gate * v / the qkv rope with K/V cache writes; outputs from esplit on take no epilogue; hint = the weights' L2 policy.
+    pub ph_linear: Option<PhLinearFn>,
+    /// Slot 909: `pd_ph_rope_kv` (qkv, q, kc, vc, pos_dev, pos0, rows, cap, stream): Phonon's RoPE (interleaved pairs, theta 1e4, 8 heads x 64) on q/k, k/v into ring caches [cap][512] at the device-held position.
+    pub ph_rope_kv: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 910: `pd_ph_attn` (q, kc, vc, part, out, ctr, pos_dev, pos0, rows, cap, window, nsplit, stream): Phonon's causal (optionally windowed) attention over the f32 ring caches, 64-key splits merged by each head's last block (ticket in ctr).
+    pub ph_attn: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            *const core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 911: `pd_ph_layernorm` (x, w, b, y, rows, d, eps, stream): Phonon's LayerNorm rows (the wide passes' GEMM inputs).
+    pub ph_layernorm: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 912: `pd_ph_point` (a, b, y, n, period, mode, alpha, stream): Phonon's elementwise ops: a + alpha * b (broadcast), ELU, SiLU(a + b), a * std + mean, cos/sin, y + b * a.
+    pub ph_point: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u64,
+            u32,
+            u32,
+            f32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 913: `pd_ph_im2col` (x, hist, y, rows, c, k, elu, stream): Mimi's causal conv input rows for a GEMM: k taps side by side over [hist ; x], optional ELU.
+    pub ph_im2col: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 914: `pd_ph_history` (x, hist, rows, c, keep, stream): the conv history update: the last `keep` raw rows of [hist ; x].
+    pub ph_history: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 915: `pd_ph_upsample` (x, hist, w, y, frames, stream): Mimi's depthwise x16 upsample (conv_transpose1d, width 32, groups 512), streamed.
+    pub ph_upsample: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 916: `pd_ph_conv` (x, hist, w, bias, y, rows, cin, n, k, elu, resid, stream): Mimi's narrow causal conv straight from its input rows (no im2col plane): rows staged once a tile with their history, ELU applied; weights [n][k cin]; optional residual accumulate.
+    pub ph_conv: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
+    /// Slot 917: `pd_ph_conv_gemm` (x, w, bias, y, rows, cin, n, k, resid, stream): Mimi's causal conv as the 3xTF32 GEMM (698) reading its im2col rows in place: x = [k - 1 history rows ; rows] at pitch cin, weights [n][k cin]; optional residual accumulate.
+    pub ph_conv_gemm: Option<
+        unsafe extern "C" fn(
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut core::ffi::c_void,
+        ) -> i32,
+    >,
 }
+
+/// See [`KernelTableV1::ph_linear`] (slot 908).
+pub type PhLinearFn = unsafe extern "C" fn(
+    x: *const core::ffi::c_void,
+    ln_w: *const core::ffi::c_void,
+    ln_b: *const core::ffi::c_void,
+    modulation: *const core::ffi::c_void,
+    w: *const core::ffi::c_void,
+    w_bf16: u32,
+    bias: *const core::ffi::c_void,
+    res: *const core::ffi::c_void,
+    gate: *const core::ffi::c_void,
+    y: *mut core::ffi::c_void,
+    rows: u32,
+    in_dim: u32,
+    out: u32,
+    eps: f32,
+    pro: u32,
+    epi: u32,
+    kc: *mut core::ffi::c_void,
+    vc: *mut core::ffi::c_void,
+    pos_dev: *const core::ffi::c_void,
+    pos0: u32,
+    cap: u32,
+    esplit: u32,
+    hint: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
 
 /// See [`KernelTableV1::gated_rmsnorm_e4m3_zs_sw`].
 pub type GatedRmsnormE4m3ZsSwFn = unsafe extern "C" fn(
@@ -11494,7 +11715,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 888;
+pub const KERNEL_TABLE_SLOTS: usize = 903;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,

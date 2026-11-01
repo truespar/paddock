@@ -849,6 +849,12 @@ impl Metrics {
                     "T2 payload bytes written this UTC day (endurance budget)",
                     n(&t.t2_written_day_bytes),
                 );
+                g(
+                    "paddock_kv_tier_t2_day_budget_bytes",
+                    "gauge",
+                    "T2 daily write budget: a quarter of the cache volume, at most 1 TiB",
+                    n(&t.t2_day_budget_bytes),
+                );
             }
             meta(
                 &mut out,

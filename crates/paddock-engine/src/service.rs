@@ -47,6 +47,7 @@ use spec_budget::{
     serve_spec_max_k, serve_spec_max_rows, serve_spec_mixed_k_cap, serve_spec_policy, slot_spec_k,
     spec_book_mixed,
 };
+mod idle;
 mod timing;
 pub use finish::{FinishReason, next_event};
 use timing::trace_us;
@@ -3402,7 +3403,7 @@ fn run_batched(
         }
         let active = slots.iter().filter(|s| s.is_some()).count();
         if ctl.stop_requested() {
-            tracing::info!("engine: shutdown requested - leaving the scheduler ({active} live)");
+            idle::leave(&mut *generator, active);
             return finish::fail_held_requests(&mut slots, &mut preempted, mm_pending.take(), rx);
         }
         // Straggler self-report: one full iteration (admission + tick body)
@@ -3588,14 +3589,11 @@ fn run_batched(
                     Ok(r) => break Ok(r),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         if ctl.stop_requested() {
-                            tracing::info!(
-                                "engine: shutdown requested - leaving the scheduler (idle)"
-                            );
                             calib.finish(&pacers, &spec_ctl);
+                            idle::leave(&mut *generator, 0);
                             return;
                         }
-                        // idle wakes save what the last busy stretch learned
-                        calib.tick(true, &pacers, &spec_ctl);
+                        idle::wake(&mut calib, &pacers, &spec_ctl, &mut *generator);
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                         break Err(std::sync::mpsc::RecvError);

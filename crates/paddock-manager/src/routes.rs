@@ -282,6 +282,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(relay_transcriptions),
         )
         .route(
+            "/api/runners/{port}/v1/audio/speech",
+            post(relay_speech).layer(axum::extract::DefaultBodyLimit::max(32 * 1024)),
+        )
+        .route(
             "/api/runners/{port}/v1/audio/diarizations",
             post(relay_diarizations).layer(axum::extract::DefaultBodyLimit::max(25 * 1024 * 1024)),
         )
@@ -2053,6 +2057,14 @@ async fn relay_alignments(
     relay_raw(state, port, "v1/audio/alignments", &ct, body).await
 }
 
+async fn relay_speech(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(port): axum::extract::Path<u16>,
+    body: axum::body::Bytes,
+) -> Response {
+    relay_raw(state, port, "v1/audio/speech", "application/json", body).await
+}
+
 async fn relay_diarizations(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(port): axum::extract::Path<u16>,
@@ -3542,128 +3554,9 @@ pub(crate) async fn not_found(uri: axum::http::Uri) -> Response {
         .into_response()
 }
 
-/// Is this request from the box itself? The runner's test, kept in step with
-/// `paddock_runner::routes::peer_is_local`: a loopback peer, no declared proxy
-/// (`trusted_proxy`), and no forwarding header on the request - behind a
-/// proxy on the same host every caller is 127.0.0.1, and a forged header can
-/// only cost a caller its exemption, never grant one.
-fn peer_is_local(req: &axum::extract::Request, trusted_proxy: bool) -> bool {
-    if trusted_proxy {
-        return false;
-    }
-    let loopback = req
-        .extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .is_some_and(|ci| ci.0.ip().is_loopback());
-    loopback
-        && !["x-forwarded-for", "x-real-ip", "forwarded"]
-            .iter()
-            .any(|h| req.headers().contains_key(*h))
-}
-
-/// Bearer auth for `/api`. A no-op when no key is configured (loopback
-/// default); otherwise the header key must equal the configured key or match a
-/// stored (db-backed) API key. Non-API paths (the SPA) always pass so the UI
-/// can load. Loopback PEERS are exempt (`peer_is_local`) - the runner's
-/// policy, and what makes a network bind usable at all: without it, --host
-/// 0.0.0.0 locked the box's own Studio out of every /api route and every page
-/// rendered empty. The exemption ends where a reverse proxy begins.
-async fn auth_mw(
-    State(state): State<Arc<AppState>>,
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> Response {
-    if let Some(required) = &state.auth_key {
-        let local = peer_is_local(&req, state.trusted_proxy);
-        let path = req.uri().path();
-        if !local && (path.starts_with("/api/") || path.starts_with("/v1/")) {
-            let verify = |k: &str| k == required || state.db.verify_api_key(k).unwrap_or(false);
-            // Bearer for OpenAI-style clients; `x-api-key` is how the
-            // Anthropic SDKs send theirs (the batch surface speaks both)
-            let bearer_ok = req
-                .headers()
-                .get(axum::http::header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.strip_prefix("Bearer "))
-                .or_else(|| req.headers().get("x-api-key").and_then(|v| v.to_str().ok()))
-                .is_some_and(verify);
-            // The Studio's key-gate session: a browser cannot attach Bearer
-            // headers to every fetch/SSE the SPA makes, so /auth/login turns
-            // the key into an HttpOnly cookie and this accepts it.
-            let cookie_ok = req
-                .headers()
-                .get(axum::http::header::COOKIE)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|c| {
-                    c.split(';')
-                        .map(str::trim)
-                        .find_map(|p| p.strip_prefix("paddock_key="))
-                })
-                .is_some_and(verify);
-            if !bearer_ok && !cookie_ok {
-                return (
-                    StatusCode::UNAUTHORIZED,
-                    Json(ErrorBody::new(
-                        "invalid_api_key",
-                        "missing or invalid API key",
-                    )),
-                )
-                    .into_response();
-            }
-        }
-    }
-    next.run(req).await
-}
-
-#[derive(serde::Deserialize)]
-struct LoginBody {
-    key: String,
-}
-
-/// `POST /auth/login` - the Studio's key gate for network browsers. Lives
-/// outside `/api` so it is reachable before auth. A valid key comes back as
-/// an HttpOnly cookie (30 days), which `auth_mw` accepts alongside the
-/// Bearer header - the key never sits in script-readable storage.
-async fn auth_login(State(state): State<Arc<AppState>>, Json(b): Json<LoginBody>) -> Response {
-    let ok = state.auth_key.as_deref().is_some_and(|k| b.key == k)
-        || state.db.verify_api_key(&b.key).unwrap_or(false);
-    if !ok {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorBody::new(
-                "invalid_api_key",
-                "that key does not open this paddock",
-            )),
-        )
-            .into_response();
-    }
-    // No `Secure` flag, still deliberately - for a different reason.
-    // Network browsers now reach this over https, so `Secure` would
-    // normally be right. But the identity can fail to establish (an unwritable
-    // data root), and the fallback is cleartext: a `Secure` cookie would then
-    // never be sent, so the key gate would accept a correct key and refuse
-    // every request after it. Loopback callers are exempt from auth entirely
-    // and never need this cookie, so the flag would buy nothing it does not
-    // also risk.
-    let cookie = format!(
-        "paddock_key={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000",
-        b.key
-    );
-    set_cookie_response(&cookie)
-}
-
-/// `POST /auth/logout` - drops the session cookie.
-async fn auth_logout() -> Response {
-    set_cookie_response("paddock_key=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
-}
-
-fn set_cookie_response(cookie: &str) -> Response {
-    let mut res = StatusCode::NO_CONTENT.into_response();
-    if let Ok(v) = axum::http::HeaderValue::from_str(cookie) {
-        res.headers_mut().insert(axum::http::header::SET_COOKIE, v);
-    }
-    res
-}
+#[path = "routes_auth.rs"]
+mod auth;
+use auth::{auth_login, auth_logout, auth_mw};
 
 #[cfg(test)]
 mod tests {
@@ -3826,55 +3719,6 @@ mod tests {
     async fn body_json(res: Response) -> serde_json::Value {
         let bytes = res.into_body().collect().await.expect("body").to_bytes();
         serde_json::from_slice(&bytes).expect("json body")
-    }
-
-    /// The loopback exemption is for the box's own browser and tools, and only
-    /// them: a forwarding header or a declared proxy means the peer address is
-    /// the proxy's, and the key is required again.
-    #[tokio::test]
-    async fn loopback_is_exempt_only_when_nothing_says_proxy() {
-        use axum::extract::ConnectInfo;
-        let local: std::net::SocketAddr = "127.0.0.1:4242".parse().expect("addr");
-        let keyed = |trusted_proxy: bool| {
-            let mut s = AppState::for_tests();
-            s.auth_key = Some("pk-test".into());
-            s.trusted_proxy = trusted_proxy;
-            Arc::new(s)
-        };
-        // a real route, so the answer tells auth apart from a 404
-        let get = |headers: &[(&str, &str)]| {
-            let mut req = axum::http::Request::get("/api/definitely-not-a-route");
-            for (k, v) in headers {
-                req = req.header(*k, *v);
-            }
-            let mut req = req.body(axum::body::Body::empty()).expect("request");
-            req.extensions_mut().insert(ConnectInfo(local));
-            req
-        };
-        // the box's own browser: through to the router (which 404s this path)
-        let plain = router(keyed(false))
-            .oneshot(get(&[]))
-            .await
-            .expect("response");
-        assert_eq!(plain.status(), StatusCode::NOT_FOUND);
-        // the same peer, but a proxy left its mark: key required
-        let forwarded = router(keyed(false))
-            .oneshot(get(&[("x-forwarded-for", "203.0.113.7")]))
-            .await
-            .expect("response");
-        assert_eq!(forwarded.status(), StatusCode::UNAUTHORIZED);
-        // the operator declared a proxy: loopback means nothing, key required
-        let declared = router(keyed(true))
-            .oneshot(get(&[]))
-            .await
-            .expect("response");
-        assert_eq!(declared.status(), StatusCode::UNAUTHORIZED);
-        // and the key still opens it
-        let with_key = router(keyed(true))
-            .oneshot(get(&[("authorization", "Bearer pk-test")]))
-            .await
-            .expect("response");
-        assert_eq!(with_key.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

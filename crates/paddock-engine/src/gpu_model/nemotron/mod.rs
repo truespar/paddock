@@ -25,11 +25,14 @@ mod chunked;
 pub(crate) mod dflash;
 mod forward;
 mod load;
+mod mm;
+pub use mm::PictureProbe;
 pub(crate) mod mtp;
 mod prefix;
 mod sampled;
 mod spec;
 pub(crate) mod ssm_arena;
+pub(crate) mod vision;
 mod walk;
 
 use std::sync::Arc;
@@ -92,6 +95,15 @@ pub(crate) enum AttnWeights {
         wk: QuantW,
         wv: QuantW,
         wo: QuantW,
+    },
+    /// Super's ModelOpt FP8 projections: the checkpoint's e4m3 rows with
+    /// the per-tensor weight scale broadcast to every row - the mamba
+    /// in/out_proj residency (W8A8 prefill, W8A16 decode).
+    F8 {
+        wq: F8RowPlane,
+        wk: F8RowPlane,
+        wv: F8RowPlane,
+        wo: F8RowPlane,
     },
 }
 
@@ -166,6 +178,312 @@ pub(crate) struct MoeWeights {
     pub router: DeviceTensor,
     pub bias: DeviceTensor,
     pub planes: MoePlanes,
+    /// LatentMoE (Super): the routed experts' planes are latent-wide and
+    /// these carry the hidden across ([`latent_moe`]); None on Lightning.
+    pub latent: Option<LatentProj>,
+}
+
+/// LatentMoE's two bf16 projections, as the checkpoint ships them: `fc1`
+/// hidden -> latent before the routed experts, `fc2` latent -> hidden after
+/// their weighted sum. [in, out] dims.
+pub(crate) struct LatentProj {
+    pub fc1: QuantTensor,
+    pub fc2: QuantTensor,
+}
+
+/// Scratch the LatentMoE path adds: the latent copy of the normed hidden
+/// the routed experts read and their weighted sum (`rows` rows), and the
+/// exact class's f32 up activations of the routed picks and the shared
+/// expert, sized for the `exact_rows` it may run, plus its one-row partial
+/// plane (`part1`, the tiled planes' r=1 twins fold through it). The sorted
+/// W4A4 pair and the W16 class keep their activations in the lane's own
+/// planes.
+pub(crate) struct LatentScratch {
+    pub lat_in: CudaSlice<f32>,
+    pub lat: CudaSlice<f32>,
+    pub up: CudaSlice<f32>,
+    pub sh_up: CudaSlice<f32>,
+    pub part1: CudaSlice<f32>,
+    pub exact_rows: usize,
+}
+
+impl LatentScratch {
+    pub(crate) fn new(
+        exec: &GpuExecutor,
+        hp: &NemotronConfig,
+        rows: usize,
+        exact_rows: usize,
+    ) -> Result<Option<Self>, crate::gpu::GpuError> {
+        let Some(l) = hp.latent else {
+            return Ok(None);
+        };
+        let exact_rows = exact_rows.clamp(1, rows.max(1));
+        Ok(Some(Self {
+            lat_in: exec.alloc(rows * l)?,
+            lat: exec.alloc(rows * l)?,
+            up: exec.alloc(exact_rows * hp.n_active * hp.moe_ff)?,
+            sh_up: exec.alloc(exact_rows * hp.shared_ff)?,
+            part1: exec.alloc(((hp.n_active + 1) * l).max(2 * hp.hidden))?,
+            exact_rows,
+        }))
+    }
+}
+
+/// Whether the latent mixer's prefill rows can ride the sorted W4A4 pair:
+/// the block-scale MMA chain plus the write-out fold. `PADDOCK_NO_NVF4_MOE_BS`
+/// (the Lightning lane's A/B switch) pins them to the exact class too.
+pub(crate) fn latent_mma_on(exec: &GpuExecutor) -> bool {
+    exec.has_nvf4_moe_bs()
+        && exec.has_moe_slot_combine_init()
+        && paddock_models::dev_var_os!("PADDOCK_NO_NVF4_MOE_BS").is_none()
+}
+
+/// The lane's sorted-MoE buffers a latent mixer borrows for the W4A4 pair:
+/// the e2m1 activation image (the latent for the routed pass, then the
+/// hidden for the shared expert - one after the other), the two CSR sorts
+/// and their block capacities, the e2m1 up activations, and the
+/// pre-weighted partial plane (routed `[rows][k][latent]`, then the shared
+/// expert's `[rows][hidden]`).
+pub(crate) struct LatentMma<'a> {
+    pub xq4: &'a mut CudaSlice<i8>,
+    pub xs4: &'a mut CudaSlice<u8>,
+    pub srow: &'a mut CudaSlice<u32>,
+    pub sslot: &'a mut CudaSlice<u32>,
+    pub bexp: &'a mut CudaSlice<u32>,
+    pub nb_r: usize,
+    pub srow_s: &'a mut CudaSlice<u32>,
+    pub sslot_s: &'a mut CudaSlice<u32>,
+    pub bexp_s: &'a mut CudaSlice<u32>,
+    pub nb_s: usize,
+    pub fq: &'a mut CudaSlice<u8>,
+    pub fs: &'a mut CudaSlice<u8>,
+    pub fq_s: &'a mut CudaSlice<u8>,
+    pub fs_s: &'a mut CudaSlice<u8>,
+    pub part: &'a mut CudaSlice<f32>,
+}
+
+/// The batch lane's W16-class buffers a latent mixer borrows for its decode
+/// rows: the bf16 activation rows (the latent, then the hidden), the bf16 up
+/// activations, the two CSR sorts, and the partial plane (routed
+/// `[rows][k + 1][latent]`, then the shared expert's `[rows][2][hidden]`).
+pub(crate) struct LatentW16<'a> {
+    pub x16: &'a mut CudaSlice<half::bf16>,
+    pub act16: &'a mut CudaSlice<half::bf16>,
+    pub srow: &'a mut CudaSlice<u32>,
+    pub sslot: &'a mut CudaSlice<u32>,
+    pub bexp: &'a mut CudaSlice<u32>,
+    pub nb_r: usize,
+    pub srow_s: &'a mut CudaSlice<u32>,
+    pub sslot_s: &'a mut CudaSlice<u32>,
+    pub bexp_s: &'a mut CudaSlice<u32>,
+    pub nb_s: usize,
+    pub part: &'a mut CudaSlice<f32>,
+}
+
+/// Which class a latent mixer call runs (see [`latent_moe`]).
+pub(crate) enum LatentClass<'a> {
+    /// prompt rows: the sorted W4A4 pair
+    Mma(LatentMma<'a>),
+    /// the batch lane's decode / verify rows on the tiled planes: W16
+    W16(LatentW16<'a>),
+    /// the exact row class: f32 activations, one GEMV per row and pick on
+    /// row-major planes; the r=1 tiled twins on tiled ones
+    Exact,
+}
+
+/// Whether the latent planes ride the tiled layout (and so its classes):
+/// the whole tiled consumer set plus the W16 pair, which serves the batch
+/// lane's decode rows on it.
+pub(crate) fn latent_tiled(w: &MoeWeights) -> bool {
+    matches!(&w.planes, MoePlanes::Nvf4 { up, .. } if up.layout == crate::gpu::Nvf4MoeLayout::Tiled64)
+}
+
+/// One LatentMoE mixer over `rows` normed rows `xn`, into `out` (written,
+/// the caller adds it to the residual). Routing is already in `idx` / `w`
+/// (picks + weights over the FULL hidden, routed scale folded in). The
+/// reference (vLLM's `NemotronHMoE`): routed = fc2(sum_k w_k * expert_k(
+/// fc1(xn))), shared = shared_expert(xn), out = routed + shared.
+///
+/// Three classes, one graph:
+/// - `Mma`, prompt rows: the sorted W4A4 pair - activations to e2m1 with
+///   dynamic e4m3 block scales, the checkpoint's own NVFP4 recipe and the
+///   reference's serving class - streaming each touched expert once per pass
+///   (the row-major bs pair, or its bit-exact tiled twin).
+/// - `W16`, the batch lane's decode and verify rows on tiled planes: bf16
+///   activations on tensor cores, sorted blocks (each touched expert read
+///   once per tick), batch-invariant - a verify row is the decode step it
+///   stands for.
+/// - `Exact`: f32 activations against the dequantized planes - per-row GEMVs
+///   on row-major planes, the r=1 twins on tiled ones (the serial lane, the
+///   drafter's one-row passes).
+///
+/// The shared expert cannot fold into the routed launch in any class (its
+/// input is the hidden, the routed experts' the latent): it runs as its own
+/// one-expert pass.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn latent_moe(
+    exec: &GpuExecutor,
+    hp: &NemotronConfig,
+    w: &MoeWeights,
+    lp: &LatentProj,
+    xn: &CudaSlice<f32>,
+    ls: &mut LatentScratch,
+    idx: &CudaSlice<u32>,
+    wts: &CudaSlice<f32>,
+    sh_idx: &CudaSlice<u32>,
+    sh_w: &CudaSlice<f32>,
+    out: &mut CudaSlice<f32>,
+    rows: usize,
+    class: LatentClass<'_>,
+) -> Result<(), crate::gpu::GpuError> {
+    let MoePlanes::Nvf4 {
+        up,
+        down,
+        sh_up: sh_up_pl,
+        sh_down,
+    } = &w.planes
+    else {
+        return Err(crate::gpu::GpuError::Unsupported(
+            "LatentMoE serves NVFP4 expert planes only".into(),
+        ));
+    };
+    let tiled = up.layout == crate::gpu::Nvf4MoeLayout::Tiled64;
+    let (hidden, latent, k) = (hp.hidden, hp.expert_in(), hp.n_active);
+    // the bf16 planes against f32 rows: the GEMV at one row, the multi-row
+    // band to 8, the tile past it - every product exact either way
+    let lin = |w: &QuantTensor,
+               x: &CudaSlice<f32>,
+               y: &mut CudaSlice<f32>|
+     -> Result<(), crate::gpu::GpuError> { exec.bf16_gemm(w, None, x, y, rows) };
+    lin(&lp.fc1, xn, &mut ls.lat_in)?;
+    match class {
+        LatentClass::Mma(m) => {
+            // routed: latent rows -> e2m1, sorted into 32-row expert blocks,
+            // the pair writes each pick pre-weighted into its slot, one
+            // fixed-order fold into the latent sum
+            exec.quantize_nvf4(&ls.lat_in, m.xq4, m.xs4, rows * latent)?;
+            let nbr = batch::moe_live_blocks(rows, k, hp.n_expert, m.nb_r);
+            exec.moe_align(idx, m.srow, m.sslot, m.bexp, rows, k, hp.n_expert, nbr)?;
+            if tiled {
+                exec.nvf4_moe_up_relu2_st(up, m.srow, m.bexp, m.xq4, m.xs4, m.fq, m.fs, nbr, 32)?;
+                exec.nvf4_moe_down_st(
+                    down,
+                    m.srow,
+                    m.sslot,
+                    m.bexp,
+                    Some(wts),
+                    m.fq,
+                    m.fs,
+                    m.part,
+                    k,
+                    k,
+                    0,
+                    nbr,
+                    32,
+                )?;
+            } else {
+                exec.nvf4_moe_up_relu2_bs(up, m.srow, m.bexp, m.xq4, m.xs4, m.fq, m.fs, nbr)?;
+                exec.nvf4_moe_down_bs(
+                    down,
+                    m.srow,
+                    m.sslot,
+                    m.bexp,
+                    Some(wts),
+                    m.fq,
+                    m.fs,
+                    m.part,
+                    k,
+                    k,
+                    0,
+                    nbr,
+                )?;
+            }
+            exec.moe_slot_combine_init(m.part, &mut ls.lat, latent, k, rows)?;
+            lin(&lp.fc2, &ls.lat, out)?;
+            // shared: the hidden rows, one identity block list, weight 1,
+            // folded onto the routed output
+            exec.quantize_nvf4(xn, m.xq4, m.xs4, rows * hidden)?;
+            let nbs = batch::moe_live_blocks(rows, 1, 1, m.nb_s);
+            exec.moe_align(sh_idx, m.srow_s, m.sslot_s, m.bexp_s, rows, 1, 1, nbs)?;
+            if tiled {
+                exec.nvf4_moe_up_relu2_st(
+                    sh_up_pl, m.srow_s, m.bexp_s, m.xq4, m.xs4, m.fq_s, m.fs_s, nbs, 32,
+                )?;
+                exec.nvf4_moe_down_st(
+                    sh_down, m.srow_s, m.sslot_s, m.bexp_s, None, m.fq_s, m.fs_s, m.part, 1, 1, 0,
+                    nbs, 32,
+                )?;
+            } else {
+                exec.nvf4_moe_up_relu2_bs(
+                    sh_up_pl, m.srow_s, m.bexp_s, m.xq4, m.xs4, m.fq_s, m.fs_s, nbs,
+                )?;
+                exec.nvf4_moe_down_bs(
+                    sh_down, m.srow_s, m.sslot_s, m.bexp_s, None, m.fq_s, m.fs_s, m.part, 1, 1, 0,
+                    nbs,
+                )?;
+            }
+            exec.moe_slot_combine(m.part, out, hidden, 1, rows)
+        }
+        LatentClass::W16(m) => {
+            if !tiled {
+                return Err(crate::gpu::GpuError::Unsupported(
+                    "the W16 class reads the tiled expert planes".into(),
+                ));
+            }
+            // routed: the latent rows as bf16, sorted into 32-row blocks, the
+            // pair's partials [rows][k + 1][latent] (slot k a zero), folded
+            exec.convert_f32_bf16(&ls.lat_in, m.x16, rows * latent)?;
+            let nbr = batch::moe_live_blocks(rows, k, hp.n_expert, m.nb_r);
+            exec.moe_align(idx, m.srow, m.sslot, m.bexp, rows, k, hp.n_expert, nbr)?;
+            exec.nvf4_moe_up_relu2_w16_solo(
+                up, m.srow, m.sslot, m.bexp, m.x16, m.act16, k, nbr, rows,
+            )?;
+            exec.nvf4_moe_down_part_w16_solo(
+                down, m.srow, m.sslot, m.bexp, wts, m.act16, m.part, k, nbr, rows,
+            )?;
+            exec.moe_slot_combine_init(m.part, &mut ls.lat, latent, k + 1, rows)?;
+            lin(&lp.fc2, &ls.lat, out)?;
+            // shared: one routed expert over every row (identity sort, weight
+            // 1), partials [rows][2][hidden], folded onto the routed output
+            exec.convert_f32_bf16(xn, m.x16, rows * hidden)?;
+            let nbs = batch::moe_live_blocks(rows, 1, 1, m.nb_s);
+            exec.moe_align(sh_idx, m.srow_s, m.sslot_s, m.bexp_s, rows, 1, 1, nbs)?;
+            exec.nvf4_moe_up_relu2_w16_solo(
+                sh_up_pl, m.srow_s, m.sslot_s, m.bexp_s, m.x16, m.act16, 1, nbs, rows,
+            )?;
+            exec.nvf4_moe_down_part_w16_solo(
+                sh_down, m.srow_s, m.sslot_s, m.bexp_s, sh_w, m.act16, m.part, 1, nbs, rows,
+            )?;
+            exec.moe_slot_combine(m.part, out, hidden, 2, rows)
+        }
+        LatentClass::Exact if tiled => {
+            if rows != 1 {
+                return Err(crate::gpu::GpuError::Unsupported(format!(
+                    "LatentMoE's tiled exact class is the one-row twins, asked {rows}"
+                )));
+            }
+            exec.nvf4_moe_up_relu2_mtt_solo(up, idx, &ls.lat_in, &mut ls.up, k)?;
+            exec.nvf4_moe_down_part_tt_solo(down, idx, wts, &ls.up, &mut ls.part1, k)?;
+            exec.moe_slot_combine_init(&ls.part1, &mut ls.lat, latent, k + 1, 1)?;
+            lin(&lp.fc2, &ls.lat, out)?;
+            exec.nvf4_moe_up_relu2_mtt_solo(sh_up_pl, sh_idx, xn, &mut ls.sh_up, 1)?;
+            exec.nvf4_moe_down_part_tt_solo(sh_down, sh_idx, sh_w, &ls.sh_up, &mut ls.part1, 1)?;
+            exec.moe_slot_combine(&ls.part1, out, hidden, 2, 1)
+        }
+        LatentClass::Exact => {
+            if rows > ls.exact_rows {
+                return Err(crate::gpu::GpuError::Unsupported(format!(
+                    "LatentMoE exact class sized for {} rows, asked {rows}",
+                    ls.exact_rows
+                )));
+            }
+            exec.nvf4_moe_up_relu2(up, idx, &ls.lat_in, &mut ls.up, k, rows)?;
+            exec.nvf4_moe_down_acc(down, idx, wts, &ls.up, &mut ls.lat, None, k, rows, false)?;
+            lin(&lp.fc2, &ls.lat, out)?;
+            exec.nvf4_moe_up_relu2(sh_up_pl, sh_idx, xn, &mut ls.sh_up, 1, rows)?;
+            exec.nvf4_moe_down_acc(sh_down, sh_idx, sh_w, &ls.sh_up, out, None, 1, rows, true)
+        }
+    }
 }
 
 /// Expert plane residency: NVFP4 triples (W4A16), or repacked Q8_0 (W8A8
@@ -190,10 +508,12 @@ pub(crate) enum MoePlanes {
     },
 }
 
-/// lm_head residency (untied): NVFP4 plane, or a GGUF quant plane.
+/// lm_head residency (untied): NVFP4 plane, a GGUF quant plane, or Super's
+/// ModelOpt FP8 rows.
 pub(crate) enum HeadW {
     Nvf4(Nvf4Plane),
     Qw(QuantW),
+    F8(F8RowPlane),
 }
 
 /// Batched NVFP4 lm_head election, shared by the decode
@@ -240,6 +560,28 @@ pub(crate) fn head_nvf4_batch(
     } else {
         exec.nvf4_gemv_batch(h, x, y, None, rows)
     }
+}
+
+/// The FP8 lm_head (Super) over `rows` rows of `x`: the exact W8A16 GEMV
+/// for one row, the W8A8 GEMM (per-row e4m3 activations, like every FP8
+/// projection here) past it. `xq`/`xrs` are the activation image's scratch.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn head_f8_batch(
+    exec: &GpuExecutor,
+    h: &F8RowPlane,
+    x: &CudaSlice<f32>,
+    xq: &mut CudaSlice<i8>,
+    xrs: &mut CudaSlice<f32>,
+    y: &mut CudaSlice<f32>,
+    hidden: usize,
+    vocab: usize,
+    rows: usize,
+) -> Result<(), crate::gpu::GpuError> {
+    if rows == 1 {
+        return exec.f8r_gemv(h, x, y, hidden, vocab);
+    }
+    exec.quantize_e4m3_row(x, xq, xrs, hidden, rows)?;
+    exec.f8row_gemm(h, xq, xrs, y, hidden, vocab, rows)
 }
 
 // one per layer; the Mamba/Attn/Moe weight bundles differ in size by design
@@ -305,4 +647,10 @@ pub struct GpuNemotron {
     /// loaded whenever the file carries it and spec isn't killed
     /// (PADDOCK_NO_SPEC); an explicit DFlash attach evicts it.
     pub(crate) mtp: Option<mtp::MtpDrafter>,
+    /// Super VL's picture tower + projector (`vision.rs`); None on a
+    /// text-only checkpoint.
+    pub(crate) vision: Option<vision::SuperVision>,
+    /// The picture rows the current prefill pass carries (`mm.rs`) - set
+    /// around a picture prompt's passes only.
+    pub(crate) mm: Option<mm::MmOverlay>,
 }

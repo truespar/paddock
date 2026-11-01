@@ -5,6 +5,16 @@ import Testing
 
 @Suite("Rust manager wire contracts")
 struct ContractTests {
+  @Test func speechGenerationKeepsItsIdentityWithoutOfferingChat() throws {
+    let runner = try ManagerWire.decode(
+      RunnerInfo.self,
+      from: Data(
+        #"{"port":45971,"pid":42,"status":"ok","speech":"phonon-31m-en","endpoint":"http://127.0.0.1:45971"}"#
+          .utf8))
+    #expect(runner.title == "phonon-31m-en")
+    #expect(runner.speech != nil)
+    #expect(!runner.hasStudioSurface)
+  }
   @Test func diarizationKeepsItsNameWithoutOfferingAChatSurface() throws {
     let runner = try ManagerWire.decode(
       RunnerInfo.self,

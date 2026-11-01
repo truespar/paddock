@@ -20,6 +20,7 @@ pub mod nemotron_asr;
 pub mod nemotron_embed;
 pub mod nemotron_parse;
 pub mod paddleocr_vl;
+pub mod phonon;
 pub mod picture_store;
 // host-side and backend-neutral, so it lives at the crate root (the runner
 // fits LightOnOCR pages with it on every backend); re-exported here for the

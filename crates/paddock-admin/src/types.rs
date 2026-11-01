@@ -62,6 +62,9 @@ pub struct Identify {
     /// Audio speaker activity, not a chat or transcription model.
     #[serde(default)]
     pub diarization: Option<String>,
+    /// Native text-to-speech; never offered as chat or speech recognition.
+    #[serde(default)]
+    pub speech: Option<String>,
     /// Served dense-prediction model id (DINOv3: chips in, class and height
     /// rasters out, `/v1/segmentations` only). Optional on the wire for older
     /// runners - which a manager then reported as serving nothing.

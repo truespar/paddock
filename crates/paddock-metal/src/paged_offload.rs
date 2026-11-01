@@ -315,6 +315,7 @@ impl PagedTier {
             device_read_gbs: self.cache.device_read_gbs,
             prediction_error_pct: self.cost.prediction_error_pct(),
             t2_written_day_bytes: s.t2_written_day_bytes,
+            t2_day_budget_bytes: s.t2_day_budget_bytes,
             ..Default::default()
         }
     }

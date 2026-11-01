@@ -539,27 +539,53 @@ impl GpuLaguna {
             FlowStatus::Done { .. } => return false,
             FlowStatus::None => {}
         }
-        // a resident usable checkpoint makes the tier moot for this prompt
-        if pf.radix.match_full(tokens).ckpt.is_some() {
+        let retry = match tier.consult_try(slot, tokens.len()) {
+            crate::kv_tier::ConsultTry::Hold => return true,
+            t => t == crate::kv_tier::ConsultTry::Retry,
+        };
+        // a resident checkpoint makes the tier moot only where the tier has
+        // nothing deeper (`elect_hybrid`); one covering the whole prompt
+        // skips the probe outright
+        let resident = pf.radix.match_full(tokens).ckpt.map_or(0, |(t, _)| t);
+        if resident + tier.run_blocks() * BLOCK_TOKENS > tokens.len() {
             return false;
         }
         // the blob's geometry lets the probe find it on any tier
         tier.declare_blob_flat(state_bytes);
         // probe counts the lookup (and the miss when nothing is held)
-        let Some(hit) = tier.probe(tokens, 0) else {
+        // from the resident depth: what the GPU holds is not read back
+        let probed = tier.probe(tokens, resident / BLOCK_TOKENS);
+        let r = tier.run_blocks();
+        let deepest = probed.as_ref().and_then(|hit| {
+            tier.probe_aux(tokens, hit.end_block)
+                .filter(|a| a.end_block * BLOCK_TOKENS >= MIN_CACHE_PREFIX && a.end_block % r == 0)
+        });
+        // deeper state may still be on its way into T1 (a demote claims the
+        // checkpoint and drops its radix path at once; its stores queue
+        // behind loads): wait for it rather than restore a shallower one
+        let above = deepest
+            .as_ref()
+            .map_or(0, |a| a.end_block)
+            .max(resident / BLOCK_TOKENS)
+            .max(MIN_CACHE_PREFIX.div_ceil(BLOCK_TOKENS) - 1);
+        let ready_to = probed
+            .as_ref()
+            .map_or(resident / BLOCK_TOKENS, |h| h.end_block);
+        if let Some(gap) = tier.blob_landing(tokens, above, ready_to)
+            && tier.wait_for_blob(slot, tokens.len(), gap)
+        {
+            return true;
+        }
+        let Some(hit) = probed else {
             return false;
         };
-        let r = tier.run_blocks();
-        let deepest = tier
-            .probe_aux(tokens, hit.end_block)
-            .filter(|a| a.end_block * BLOCK_TOKENS >= MIN_CACHE_PREFIX && a.end_block % r == 0);
-        let Some((hit, est_us)) = tier.elect_hybrid(&hit, deepest.as_ref()) else {
+        let Some((hit, est_us)) = tier.elect_hybrid(&hit, deepest.as_ref(), resident) else {
             return false;
         };
         let aux = deepest.expect("an elected hybrid hit has its boundary");
         // the destination: the restored blocks (the blob lands in a fixed
         // checkpoint slot, not in pool pages)
-        let need = aux.end_block;
+        let need = aux.end_block - hit.start_block;
         let afford =
             |pool: &crate::kv_pool::KvPool| pool.free_blocks().saturating_sub(2 * r) / r * r;
         if afford(&bs.pool) < need {
@@ -578,7 +604,10 @@ impl GpuLaguna {
                     pf.radix.recycle_state(t.state_idx);
                 }
             }
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+            // a retry does not block here: the passes between tries are
+            // its wait
+            let wait = std::time::Duration::from_millis(if retry { 0 } else { 50 });
+            let deadline = std::time::Instant::now() + wait;
             while bs.pool.free_blocks() < want && tier.stats().2 > 0 {
                 tier.pump_completions(&mut pf.radix, &mut bs.pool);
                 if std::time::Instant::now() >= deadline {
@@ -587,16 +616,24 @@ impl GpuLaguna {
                 std::thread::sleep(std::time::Duration::from_micros(200));
             }
         }
+        if afford(&bs.pool) < need {
+            if !retry {
+                tracing::debug!(
+                    free = bs.pool.free_blocks(),
+                    need,
+                    boundary = aux.end_block,
+                    "laguna tier gate"
+                );
+            }
+            let restore_tokens = (aux.end_block * BLOCK_TOKENS).saturating_sub(resident);
+            return tier.wait_for_pool(slot, tokens.len(), est_us, restore_tokens);
+        }
         tracing::debug!(
             free = bs.pool.free_blocks(),
             need,
             boundary = aux.end_block,
             "laguna tier gate"
         );
-        if afford(&bs.pool) < need {
-            tier.refuse_park();
-            return false;
-        }
         let after = exec.record_event().ok();
         let (cp, _g) = pf.d_ckpt.device_ptr(&exec.stream);
         let plan = crate::kv_tier::AuxPlan {
@@ -624,6 +661,23 @@ impl GpuLaguna {
             }
             None => false,
         }
+    }
+
+    /// The tier's shutdown flush (see `Generator::tier_flush_at_exit`).
+    pub(crate) fn tier_flush_impl(&mut self) {
+        let exec = self.exec.clone();
+        let Some(bs) = self.batch.as_mut() else {
+            return;
+        };
+        let Some(pf) = bs.prefix.as_mut() else { return };
+        let state = Some(pf.tier_state_geom(&exec.stream));
+        let Some(tier) = pf.tier.as_mut() else { return };
+        tier.flush_live(
+            &mut pf.radix,
+            &mut bs.pool,
+            &mut || exec.record_event().ok(),
+            state,
+        );
     }
 
     pub(crate) fn tier_pump_impl(&mut self) {

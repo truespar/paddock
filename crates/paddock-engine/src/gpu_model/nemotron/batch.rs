@@ -320,6 +320,8 @@ pub(crate) struct NemoBatchScratch {
     pub d_w16ml: CudaSlice<f32>,
     pub d_w16_groups: CudaSlice<u32>,
     pub d_part7: CudaSlice<f32>,
+    /// LatentMoE scratch (None without a latent)
+    pub lat: Option<super::LatentScratch>,
     /// [n_slots, vocab] logits - decode graphs bake this address
     pub head_logits: CudaSlice<f32>,
     /// device sampler params [n_slots, 4] (inv_t, u, mode, pad)
@@ -751,7 +753,11 @@ impl GpuNemotron {
         // shared fold-: the r>1 path serves the shared expert
         // as ns_sh pseudo-experts inside the routed launch, so the align
         // capacity and the idx/w/part planes carry n_active + ns_sh picks
-        let ns_sh = if hp.shared_ff.is_multiple_of(hp.moe_ff) && hp.moe_ff.is_multiple_of(32) {
+        // (a latent mixer never folds: its shared expert reads the hidden)
+        let ns_sh = if hp.latent.is_none()
+            && hp.shared_ff.is_multiple_of(hp.moe_ff)
+            && hp.moe_ff.is_multiple_of(32)
+        {
             hp.shared_ff / hp.moe_ff
         } else {
             0
@@ -759,6 +765,32 @@ impl GpuNemotron {
         let kw_r = hp.n_active + ns_sh;
         let nb_r = cap * kw_r / 32 + hp.n_expert + ns_sh;
         let nb_s = cap / 32 + 1;
+        // partial plane per row: the folded slots over the hidden, or a
+        // latent mixer's routed [k][latent] then its shared [hidden]
+        let part_row = match hp.latent {
+            Some(l) => (hp.n_active * l).max(embd),
+            None => kw_r.max(hp.n_active + 1) * embd,
+        };
+        // the latent mixer's exact class runs decode rows only once the W4A4
+        // pair takes prompt rows - its f32 activations are a band's worth
+        // (on tiled planes the decode rows run W16 in the lane's own planes,
+        // and the exact class is the drafter's one-row twins)
+        let latent_tiled = self.layers.iter().any(
+            |l| matches!(&l.mixer, Mixer::Moe(w) if w.latent.is_some() && super::latent_tiled(w)),
+        );
+        let latent_exact_rows = if latent_tiled {
+            1
+        } else if super::latent_mma_on(&self.exec) {
+            W16_ROWS.max(max_batch).min(cap)
+        } else {
+            cap
+        };
+        let latent_est = hp.latent.map_or(0, |l| {
+            (2 * cap * l
+                + latent_exact_rows * (hp.n_active * hp.moe_ff + hp.shared_ff)
+                + ((hp.n_active + 1) * l).max(2 * embd))
+                * 4
+        });
         // estimate the scratch before committing to a pool size, so the pool
         // can never starve it: the f32 row planes dominate, then the bs fq/fs
         // tiles, the vocab head, and the attention partials; 128 MiB covers
@@ -775,8 +807,9 @@ impl GpuNemotron {
                 + 2 * q_dim
                 + 2 * kv_dim
                 + hp.n_expert
-                + kw_r.max(hp.n_active + 1) * embd)
+                + part_row)
             * 4
+            + latent_est
             + cap * qmax
             + cap * (embd / 2 + embd / 16)
             + nb_r * 32 * (hp.moe_ff / 2 + hp.moe_ff / 16)
@@ -991,7 +1024,7 @@ impl GpuNemotron {
             d_fs: e.alloc_u8(nb_r * 32 * hp.moe_ff / 16)?,
             d_fq_s: e.alloc_u8(nb_s * 32 * hp.shared_ff / 2)?,
             d_fs_s: e.alloc_u8(nb_s * 32 * hp.shared_ff / 16)?,
-            d_part: e.alloc(cap * kw_r.max(hp.n_active + 1) * embd)?,
+            d_part: e.alloc(cap * part_row)?,
             d_act: e.alloc(hp.n_active * hp.moe_ff + hp.shared_ff)?,
             d_x16b: e.stream_alloc_bf16(W16_ROWS.min(cap) * embd.max(q_dim))?,
             d_x16h: e.alloc_f16(W16_ROWS.min(cap) * embd.max(d_inner))?,
@@ -1011,6 +1044,7 @@ impl GpuNemotron {
                     .collect::<Vec<_>>(),
             )?,
             d_part7: e.alloc((hp.n_active + 1) * embd)?,
+            lat: super::LatentScratch::new(e, &hp, cap, latent_exact_rows)?,
             head_logits: e.alloc(slots * hp.vocab)?,
             d_par: e.alloc_u32(slots * 4)?,
             d_out: e.alloc_u32(slots)?,
@@ -1507,6 +1541,8 @@ impl GpuNemotron {
                     .embed_gather_batch_q8(tab, &sc.d_tok, &mut sc.d_x, embd, r)?
             }
         }
+        // a picture prompt's rows over its placeholders (mm.rs)
+        Self::apply_overlay(&self.exec, self.mm.as_ref(), &mut sc.d_x, embd)?;
         Ok(())
     }
 
@@ -1516,10 +1552,22 @@ impl GpuNemotron {
         let exec = self.exec.clone();
         let (embd, eps) = (self.hp.hidden, self.hp.eps);
         let final_norm = self.final_norm.buf.clone();
+        let vocab = self.hp.vocab;
         let bs = self.batch.as_mut().expect("batch enabled");
         let sc = &mut bs.sc;
         exec.rmsnorm_batch(&sc.d_x, &final_norm, &mut sc.d_xn, embd, eps, rows)?;
         match &self.lm_head {
+            HeadW::F8(h) => super::head_f8_batch(
+                &exec,
+                h,
+                &sc.d_xn,
+                &mut sc.d_xq,
+                &mut sc.d_xrs,
+                &mut sc.head_logits,
+                embd,
+                vocab,
+                rows,
+            )?,
             HeadW::Nvf4(h) => super::head_nvf4_batch(
                 &exec,
                 h,

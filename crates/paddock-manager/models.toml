@@ -46,6 +46,133 @@
 
 schema = 3
 
+# Native Rust/Metal FlowLM + Mimi; original checkpoint, no external runtime.
+[[model]]
+id = "phonon-31m-en"
+vendor = "Gradium"
+display = "Phonon 31M English"
+family = "phonon"
+capability = ["audio_generation"]
+license = "apache-2.0"
+revision = "2026-10-30"
+
+  [model.specs]
+  params = "31M speech generator + Mimi decoder"
+  context = "512 text tokens; up to 60 seconds per utterance"
+  homepage = "https://huggingface.co/gradium/phonon-31m-en"
+  about = "English text-to-speech with the bundled default voice. Paddock runs FlowLM and the streaming Mimi decoder natively on Metal and CUDA, serving 24 kHz mono WAV or streaming PCM through /v1/audio/speech."
+  strengths = ["Local speech synthesis", "Streaming PCM", "Small checkpoint"]
+  tradeoffs = ["English default voice only", "No voice cloning or speed control", "Uses the checkpoint tokenizer without number or currency expansion"]
+
+  [[model.artifact]]
+  id = "native-bf16-f32"
+  kind = "weights"
+  format = "safetensors"
+  label = "Original BF16 / F32"
+  quant = "BF16/F32"
+  default = true
+  workspace = 103513292
+
+  [model.artifact.source]
+  repo = "gradium/phonon-31m-en"
+  base_model = "gradium/phonon-31m-en"
+  revision = "92741c5b07d085ff840e26fea8ce43110b87852f"
+  license = "apache-2.0"
+  license_url = "https://huggingface.co/gradium/phonon-31m-en/blob/main/README.md"
+
+  [model.artifact.runtime]
+  backends = ["metal", "cuda"]
+  checkpoint_dir = true
+  companions = []
+  kv_cache_dtype = "auto"
+  default_spec = "off"
+  default_max_ctx = 512
+  default_max_batch = 1
+
+  [model.artifact.runtime.memory]
+  weight_bytes = 106975492
+  source = "measured"
+  max_ctx = 512
+  max_batch = 1
+  full_paged_kv = false
+  kv_reserve_sequences = 0
+  workspace_bytes = 103513292
+
+  [model.artifact.runtime.backend_overrides.metal]
+
+  [model.artifact.runtime.backend_overrides.metal.memory]
+  weight_bytes = 98787720
+  source = "measured"
+  max_ctx = 512
+  max_batch = 1
+  full_paged_kv = false
+  kv_reserve_sequences = 0
+  workspace_bytes = 77140132
+
+  [model.artifact.shape]
+  weight_bytes = 106975492
+  kind = "speech"
+  vocab = 0
+  max_ctx = 512
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = []
+
+    [[model.artifact.file]]
+    url = "https://huggingface.co/gradium/phonon-31m-en/resolve/92741c5b07d085ff840e26fea8ce43110b87852f/model.safetensors"
+    dest = "Phonon-31M-EN/model.safetensors"
+    sha256 = "8a04cf833cfe69b67c2ec968b2d31244655b9accc84ade9c0ebcc176f2074607"
+    size = 102823920
+
+    [[model.artifact.file]]
+    url = "https://huggingface.co/gradium/phonon-31m-en/resolve/92741c5b07d085ff840e26fea8ce43110b87852f/config.json"
+    dest = "Phonon-31M-EN/config.json"
+    sha256 = "b5d0f88353638370d94035b7d73d7d6577c0554d78f8d7ecfd40490aae39ae85"
+    size = 4634
+
+    [[model.artifact.file]]
+    url = "https://huggingface.co/gradium/phonon-31m-en/resolve/92741c5b07d085ff840e26fea8ce43110b87852f/default-voice.safetensors"
+    dest = "Phonon-31M-EN/default-voice.safetensors"
+    sha256 = "dc537478eaadc1a5257fcda2e3501ab81e14c111a5d95a5838f350db2afd0f1a"
+    size = 256136
+
+    [[model.artifact.file]]
+    url = "https://huggingface.co/gradium/phonon-31m-en/resolve/92741c5b07d085ff840e26fea8ce43110b87852f/tokenizer.json"
+    dest = "Phonon-31M-EN/tokenizer.json"
+    sha256 = "691a00068fa7b989f2f3e5ae5daa2d1a5bb319f2d5360deafcfb19a8bb6e7936"
+    size = 277967
+
+    [[model.artifact.file]]
+    url = "https://huggingface.co/gradium/phonon-31m-en/resolve/92741c5b07d085ff840e26fea8ce43110b87852f/tokenizer_config.json"
+    dest = "Phonon-31M-EN/tokenizer_config.json"
+    sha256 = "17d12cf8dee2891506648bb1d5657e26fb165263686d0e2ef311513488d6446f"
+    size = 575
+
+    [[model.artifact.file]]
+    url = "https://huggingface.co/gradium/phonon-31m-en/resolve/92741c5b07d085ff840e26fea8ce43110b87852f/generation_config.json"
+    dest = "Phonon-31M-EN/generation_config.json"
+    sha256 = "ffb086e8f531b10a43bfd17a56069f90b649171a55aae98b5e9a28c8411cffc0"
+    size = 220
+
+    [[model.artifact.file]]
+    url = "https://huggingface.co/gradium/phonon-31m-en/resolve/92741c5b07d085ff840e26fea8ce43110b87852f/processor_config.json"
+    dest = "Phonon-31M-EN/processor_config.json"
+    sha256 = "1ba08d75f0aba95fb494e8264e65e6b3e6b0b50981e1d49f183cb70eed58cfee"
+    size = 747
+
+    [[model.artifact.file]]
+    url = "https://huggingface.co/gradium/phonon-31m-en/resolve/92741c5b07d085ff840e26fea8ce43110b87852f/chat_template.jinja"
+    dest = "Phonon-31M-EN/chat_template.jinja"
+    sha256 = "7dbe65d426b02c082cdbb61e7db1d58a7a1f6152328dc929d971e3ce3ad932cc"
+    size = 1513
+
+    [[model.artifact.file]]
+    url = "https://huggingface.co/gradium/phonon-31m-en/resolve/92741c5b07d085ff840e26fea8ce43110b87852f/README.md"
+    dest = "Phonon-31M-EN/README.md"
+    sha256 = "fc04467c0e5560e89cd5bbded052e9b7f6c23e2abcdd03a32a3a07a27a7ea3ed"
+    size = 10478
+
+
 # User-elected MLX conversion of Aleph Alpha's FP8 release. This is a native
 # Metal loader, not mlx-lm serving. Keep download availability separate from
 # full-generation parity and performance qualification (see runtime.note).
@@ -7969,6 +8096,776 @@ revision = "2026-10-08"
     dest = "EmbeddingGemma-2-MLX-8bit/validation.json"
     sha256 = "7d8681a0a27d61cbad9b25bf788bc553a1345f153860c4b31c98b10906bbcac1"
     size = 2417
+
+# NVIDIA's NVFP4 release of Nemotron 3.5 Super VL, served from its own
+# checkpoint directory on CUDA (ModelOpt mixed: NVFP4 experts, FP8 mamba /
+# attention / lm_head, bf16 latent projections and vision tower). The
+# picture tower ships inside the bundle (embedded_vision). 112 files
+# mirrored under models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/ - the
+# 88 shards and their index, configs, processor and tokenizer files, chat
+# template, the release's custom code and model card - every byte checked
+# against revision da5b2650's LFS ids / blobs (its empty __init__.py and
+# .gitattributes are left out). That revision ships no LICENSE file (its
+# card names OpenMDW-1.1), so the Lightning release's own LICENSE
+# (OpenMDW-1.1, NVIDIA) is mirrored beside it, unchanged.
+[[model]]
+id = "nemotron-3.5-super-vl-120b"
+# KV8 by default: the family default
+kv_default = "fp8_e4m3"
+mtp_in_file = true
+vendor = "NVIDIA"
+display = "Nemotron 3.5 Super VL 120B-A12B"
+family = "nemotron-h"
+capability = ["chat", "vision", "tools", "reasoning", "speculative"]
+license = "openmdw-1.1"
+revision = "2026-10-29"
+
+  [model.specs]
+  params = "120B total, 12B active"
+  context = "1M"
+  published_at = "2026-10-15"
+  published_source = "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4"
+  homepage = "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4"
+  about = "NVIDIA's large hybrid vision-language model - mamba, mixture-of-experts and a few attention layers, reasoning over text, pictures and documents, and calling tools."
+  strengths = [
+    "Reads pictures and documents as well as text, in the same conversation",
+    "Thinks before answering, and calls tools",
+    "Very long context without the usual memory cost - only 8 of 88 layers page a KV cache",
+  ]
+  tradeoffs = [
+    "Needs a large card: about 75 GB of weights (a DGX Spark or a 96 GB Blackwell card)",
+    "12B active parameters - answers at a mid-size model's speed, slower than Lightning",
+    "Reasoning output is verbose unless you ask it to be brief",
+  ]
+
+  [[model.artifact]]
+  id = "nvfp4"
+  kind = "weights"
+  format = "safetensors"
+  label = "Compact (Blackwell)"
+  quant = "NVFP4"
+  default = true
+  # sm_120a or better: the NVFP4 expert consumers (the sorted W4A4 pair, the
+  # W16 decode class, the tiled r=1 twins) compile under PD_BS_OK.
+  min_cc = [12, 0]
+  # Device bytes beyond the weights, the KV pool and the mamba arenas at the
+  # default 262144 x 4, measured serving the registry pull (GB10): the picture
+  # tower's workspace 1,044,062,208 (one picture at the 13312-patch budget,
+  # reserved at load), the 8192-row prefill scratch 3.42 GiB, the prefix
+  # state staging 1.45 GiB and the MTP verify planes 0.12 GiB - rounded up
+  # from the loader's reserves. The VRAM audit after enable_batch: 0 MiB
+  # unplanned.
+  workspace = 6402000000
+
+  [model.artifact.source]
+  repo = "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4"
+  base_model = "nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16"
+  revision = "da5b2650a835292c678994a1fa3fb653250fb508"
+  license = "openmdw-1.1"
+  license_url = "https://openmdw.ai/license/1-1/"
+
+  [model.artifact.runtime]
+  backends = ["cuda"]
+  checkpoint_dir = true
+  embedded_vision = true
+  companions = []
+  # the Lightning lane's CUDA target: 262K at 4 slots, fitted to the card at
+  # admission; eight attention layers keep the window cheap
+  default_max_ctx = 262144
+  default_max_batch = 4
+
+  [model.artifact.shape]
+  weight_bytes = 75207384068
+  kind = "generative"
+  vocab = 131072
+  max_ctx = 1048576
+  nextn_bytes = 1773881344
+  source = "measured"
+  # 8 attention layers at 256/256, plus the in-file MTP block's attention
+  # K/V: it rides the pool as f16 stripes (1 KB a token), exactly two more
+  # 256/256 layers at the fp8 element size
+  kv_layers = [
+    { k_dim = 256, v_dim = 256, count = 10 },
+  ]
+
+    [model.artifact.shape.recurrent]
+    layers = 40
+    state_elems = 1048576
+    conv_elems = 30720
+    conv_dim = 10240
+    elem_bytes = 4
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00001-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00001-of-00088.safetensors"
+    sha256 = "6f41915eae39faf9eea1b8edbbc8a4ffcab6c7b8a3288e872c65457c86fa1438"
+    size = 2868224280
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00002-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00002-of-00088.safetensors"
+    sha256 = "5579cbc0f0e71cb2616e9f5b2c4250fb48a4cbea454186aa964f310670eae027"
+    size = 1631773032
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00003-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00003-of-00088.safetensors"
+    sha256 = "18829df5916e1e388046848b4af922e7a15990957b93269a58924df4806069eb"
+    size = 109705480
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00004-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00004-of-00088.safetensors"
+    sha256 = "2175d9a2ea3850af25b172391c5d0b82a356a098635adc431cd15bf9c6b8a18e"
+    size = 1631773032
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00005-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00005-of-00088.safetensors"
+    sha256 = "7cddde605ad54afe7696b6fb3be4ce317354da1d1b3333aa4da2fdabc473ac10"
+    size = 109705480
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00006-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00006-of-00088.safetensors"
+    sha256 = "10f2874c36f60cafe49f0e6c3481d60503dc57f2d85bd75b367d39454d8d8b1f"
+    size = 1631773032
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00007-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00007-of-00088.safetensors"
+    sha256 = "cb511368ac106f9d896e5968a5445e89f4aa40304d85d03fddfc0cb7e616f55f"
+    size = 109705480
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00008-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00008-of-00088.safetensors"
+    sha256 = "5ae1f86003d237659f6fb990ce55e2f4adeb9c0e81ac484b63de066b60746418"
+    size = 35661352
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00009-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00009-of-00088.safetensors"
+    sha256 = "9b2a2bfaaa5fd0a34578fce54e587ce0b0aa5c7f5ff123a1578ad97488429f89"
+    size = 1631773032
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00010-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00010-of-00088.safetensors"
+    sha256 = "5b807b58002dc5db72d71f7bfb183ed8ec852879b7644ed73971f716cc6dc7fa"
+    size = 109705480
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00011-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00011-of-00088.safetensors"
+    sha256 = "c180c31d09574e02ffa57f74a17e51a75d92fa1a95bfbb4003e0abd18cafdf48"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00012-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00012-of-00088.safetensors"
+    sha256 = "793dafe8bbaefc1ceafd077f09ab8418efe5885cb6233928a194f6514e88a132"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00013-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00013-of-00088.safetensors"
+    sha256 = "037feb9fcbb67c7f3974bc5eaf942519b5e5d61de26acc98807c4b9eb1465cd9"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00014-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00014-of-00088.safetensors"
+    sha256 = "7e6f86059a4d672405591262e4c972faeeda7bea8df2e4d4e4948ef12333e13e"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00015-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00015-of-00088.safetensors"
+    sha256 = "48a44458600b0b9d36fb89010f6d812c3637f0a8267e2cdb4910e5f592721c54"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00016-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00016-of-00088.safetensors"
+    sha256 = "744d5f9f795a57c7ca6902a62122a14804a456bc4789fed042bdc77996e17fee"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00017-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00017-of-00088.safetensors"
+    sha256 = "bc6360d6d77e7011ff2bc7d40e13ade7dc80e27fbb221ecd5aae1b45436573e2"
+    size = 35661360
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00018-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00018-of-00088.safetensors"
+    sha256 = "15e7faad91d67e12bcfe186f0a8e75602cf5fa157e137dc2600e888f7b974594"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00019-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00019-of-00088.safetensors"
+    sha256 = "c267e9f16333437161c03793ffe919989cca60c6fec7006ea941de933ea617d7"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00020-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00020-of-00088.safetensors"
+    sha256 = "02789117d4e9b77304ef02e0699084085fb3cfcbd5c6632897997b650c42d825"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00021-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00021-of-00088.safetensors"
+    sha256 = "c2bcfbb23075c1dcb07cc1a21f8253e674c31fea4bb81163fc004ac79a8773ca"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00022-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00022-of-00088.safetensors"
+    sha256 = "b2eac4a1082e898c7ba673fa128c4470f1975b30df3fae0ec51bc49d6a84a993"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00023-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00023-of-00088.safetensors"
+    sha256 = "b0d4cf25a480c5213b6dc9dd85b53d0b70a520f06600dd344b8e3772de580dbf"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00024-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00024-of-00088.safetensors"
+    sha256 = "c5f00189536c5f008b0a3cfcaec1d1755e078dfe7666bf81a9783936cb35eccb"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00025-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00025-of-00088.safetensors"
+    sha256 = "42168f15fc92eac997af7be049d2ce2d50fe282fbbcb13d00e9a9bd4ec82540c"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00026-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00026-of-00088.safetensors"
+    sha256 = "00c41541c7f59164f64d6387f099693ec2250613bb26a7ec843d612ab0f7ed23"
+    size = 35661360
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00027-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00027-of-00088.safetensors"
+    sha256 = "702eb4481debb5b5c95f26f5eccd3ce885e9eca26300a963a30219ca996c72fa"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00028-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00028-of-00088.safetensors"
+    sha256 = "37bd9377bd368a4308ed25d9817978b8362791910ee450c7fcc409ef0fd731bf"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00029-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00029-of-00088.safetensors"
+    sha256 = "791f997bd0486a1841c227a80b3e7883ba273493dd2623a0625be4bee02a54d0"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00030-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00030-of-00088.safetensors"
+    sha256 = "1589f152eb639ff15c904d5307de2f262c3e083b1b56d0718b6c3b8e0af24b26"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00031-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00031-of-00088.safetensors"
+    sha256 = "ffd15f64d1fbc7d5cc706e7124ff1d41a121894ff09e38d9c8fcb0042fb84a41"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00032-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00032-of-00088.safetensors"
+    sha256 = "7cb09e5020596ad69e943bba89e8d1a8f6470402f3e67236b6094d910d9fb40c"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00033-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00033-of-00088.safetensors"
+    sha256 = "97c251bfcc856b7688a8f54d5e0789d83512be3a08e64d8e64f5f7858adbbb6a"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00034-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00034-of-00088.safetensors"
+    sha256 = "56dd383919ec1c97fa443dbc4055e4040f06a45caf9efd4c17502a2c94284dc5"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00035-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00035-of-00088.safetensors"
+    sha256 = "66c3d62af12b2b9c930e36adff13665d521ba82eb0e473cf651b0597a8bb12c4"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00036-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00036-of-00088.safetensors"
+    sha256 = "423477a6882922a85ababafc8146598ff255a5a57b19e2115df854c2a1e2fce5"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00037-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00037-of-00088.safetensors"
+    sha256 = "fa9e7f89224662e792694fc290aa295d941668234899d1d2734fd1702c7a3c1e"
+    size = 35661360
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00038-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00038-of-00088.safetensors"
+    sha256 = "ba2238df3ebae6a9f3817bb0a0c627abd2ceb5fc05ddee7b09969c587d3dcc4b"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00039-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00039-of-00088.safetensors"
+    sha256 = "dc07e34448f1f281228a61ad204c0cf4f01c363ae26a19f5d881b7b099d3b349"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00040-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00040-of-00088.safetensors"
+    sha256 = "e9e363b9e3e8d6a079b8cbc83202ff816baf5930464c3ebb33bc9fea110fec02"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00041-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00041-of-00088.safetensors"
+    sha256 = "b7954bd274ec7767d2911fc2a5d9535c26349ea00a68b1fc8b060c01d8432947"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00042-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00042-of-00088.safetensors"
+    sha256 = "dd848c6299b73e66329e8239f6657230d77e29dc3b61e998e5f9bcdd78d15b35"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00043-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00043-of-00088.safetensors"
+    sha256 = "2760662fbd08b56babc72bc6a95b502465deb8eb422e4be2bb2b7ba365db6ee2"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00044-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00044-of-00088.safetensors"
+    sha256 = "26d72fef9caad970619be872f8f9c5eb9011487699b43bd43120f0fd793578e4"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00045-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00045-of-00088.safetensors"
+    sha256 = "5b33832e6031f67775e186cadfa4e320362c1830b85b8084f8b717a6f13c5f57"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00046-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00046-of-00088.safetensors"
+    sha256 = "98ee0cd33c63b53d12e9a9a126a93b220efb801d5626f9c325f1dc4f7dfe4ab0"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00047-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00047-of-00088.safetensors"
+    sha256 = "1400a275bea74b0657fada69b32252ff6b51059de7ae4be6ce61cdc5e5b4085e"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00048-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00048-of-00088.safetensors"
+    sha256 = "71d80d08153f098c7b1870877dd3b3e391e423d8ce6196ee8bd5fadebfd63077"
+    size = 35661360
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00049-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00049-of-00088.safetensors"
+    sha256 = "62cf886c959e267d6b59681ddf689cb4a7c74695ce18d6a40cb69a603b3685b9"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00050-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00050-of-00088.safetensors"
+    sha256 = "7e40d1843df007c50af02ee93f0c19a9feddc742701d8ba786d25ccdab791810"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00051-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00051-of-00088.safetensors"
+    sha256 = "e8134d14dbe802581bdf1384dbfc3ca73f557207367b331f5f72900687175840"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00052-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00052-of-00088.safetensors"
+    sha256 = "b9702f2de4430e64d273f1f3ef37514e3cfb4df00392ed553ebe2237c3943c30"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00053-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00053-of-00088.safetensors"
+    sha256 = "406c1109b3ec86027c8853e11fb7a18120d51cc1539cacb6fde0af75a14f5337"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00054-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00054-of-00088.safetensors"
+    sha256 = "305c48c4057efdd12c1238fc86b234103f1eb5fdaf71309b11c905673d008592"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00055-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00055-of-00088.safetensors"
+    sha256 = "b59fd31cd4f371581281a71928af390772e6cbf658376ea4715efc32ea5f3982"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00056-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00056-of-00088.safetensors"
+    sha256 = "59927af12b8442bd0adc82bacf8ffd16a8c77f3adbc7ff95278bd855e5fe0351"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00057-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00057-of-00088.safetensors"
+    sha256 = "9bb05a91a17fede4861e1d94dff255410b9893832ff094503b7c3de8a9b5c2e5"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00058-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00058-of-00088.safetensors"
+    sha256 = "14b2a580e67eebc92c7daeffe87ff06ee4a48d65fe8c61d118ef98923d4122e4"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00059-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00059-of-00088.safetensors"
+    sha256 = "6e5cfd45c75815fc8f0472a806770993f19e3a612caa5d1cf2bcb28eedf56b71"
+    size = 35661360
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00060-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00060-of-00088.safetensors"
+    sha256 = "18e1617933e6b5f8b2b697b5a36d7fc4353e2aa46b7131fbd420cc31991f433f"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00061-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00061-of-00088.safetensors"
+    sha256 = "96ae4395ebcb9576f1779d1e26b2fc8aa80d2d495b78553eec2c925793d1e7e3"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00062-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00062-of-00088.safetensors"
+    sha256 = "4eb47a166711b16ed9cff0b5de6b35d1d4e4c4a55b90efbec7f97e7c3db060dd"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00063-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00063-of-00088.safetensors"
+    sha256 = "d6d52d2d1fb97ab2950b4a525ddfc3d08418747a5cef7b30eb3c3ee0efe752d8"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00064-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00064-of-00088.safetensors"
+    sha256 = "baf4b2d137e7b4ff01b2a09821b881624b79191c7941668210d4b55ac139e4f9"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00065-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00065-of-00088.safetensors"
+    sha256 = "f3286f5b4839da6f39f0fb81f3ff363b569a2e9a06f65110494908f6846881d4"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00066-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00066-of-00088.safetensors"
+    sha256 = "62fb403c7dbc1b859888b1f4ce968654b983d32e456639b4b0b6c2bef310dc9a"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00067-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00067-of-00088.safetensors"
+    sha256 = "71e30a1baa4d952cef92cb2112ba4fcc3a258bcf3386c83310d4e34499e63e20"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00068-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00068-of-00088.safetensors"
+    sha256 = "72b7f7d7527f0d55638c158e3804b72df2e9e58bea32e7295357bb62290c9601"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00069-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00069-of-00088.safetensors"
+    sha256 = "0120919a4d75f38be4efa3272ff31061c1733e2e8b05131b6fb1ee9574b0d271"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00070-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00070-of-00088.safetensors"
+    sha256 = "d1893626de20be153946a89d10b78f0c49bb2c9d668521311af7daf7ee76a103"
+    size = 35661360
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00071-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00071-of-00088.safetensors"
+    sha256 = "cb1ff9a5e0675f9c2853046355b2c52b372734476eada8b842445d4b9d91bf2b"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00072-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00072-of-00088.safetensors"
+    sha256 = "6b5550553d314258d05047e5459ccd11c6c64046f3cc72f4634f4c68b48226fc"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00073-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00073-of-00088.safetensors"
+    sha256 = "49bc3077777db67d047dd7be6aefa9151ef216a5b22183d463c0dbb0629b8325"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00074-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00074-of-00088.safetensors"
+    sha256 = "f4eedd847384946e2a48f6b5a089fedc990cf3603b2dc8a543528d7c4e4bc4cf"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00075-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00075-of-00088.safetensors"
+    sha256 = "b8ccaaa2566487d7b4a9b62f47a8a7d182394831871a7d39d4d8c38b4dd529f6"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00076-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00076-of-00088.safetensors"
+    sha256 = "d81a94179ba3882c619d30bccdb7ab0f1e7bbc9005989d4c2afdfa3956bdd9ee"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00077-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00077-of-00088.safetensors"
+    sha256 = "5520b6e5538b842e1bd732e4f7f18da43f2fc6ea7a52db4e9dc635f25765c2f9"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00078-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00078-of-00088.safetensors"
+    sha256 = "be0ad7debfcc928632c0ea2a1960f81fc6d5b10bd667e5aef64eed0a64f6a42b"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00079-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00079-of-00088.safetensors"
+    sha256 = "aa4b44ce3a0fb19d01cf3a42b1b3ca7440c3c753d776516b5dd7118351b7bc47"
+    size = 35661360
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00080-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00080-of-00088.safetensors"
+    sha256 = "ab0ecd6a48fc3209f5cb230f49aa5296ac39eb324e2517c726e5bc98690142c0"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00081-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00081-of-00088.safetensors"
+    sha256 = "6e4b06244ab661e7c0280e14ea5c381ba7f7db16764b4d99a58487b665bb958d"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00082-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00082-of-00088.safetensors"
+    sha256 = "c15e7926cfc22e88fd0736257a6c0f4b8c0838e9d7397f86497722d84cb3be60"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00083-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00083-of-00088.safetensors"
+    sha256 = "5a13e46428f89d489080cf7128160c7334c82bf77818d05acdbb9d154497bdd8"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00084-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00084-of-00088.safetensors"
+    sha256 = "ad356ff2414f9123a5859f112c63bb1fcc0e6b1270e796a144bf733ba77aa467"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00085-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00085-of-00088.safetensors"
+    sha256 = "dba638bd7910d5c84574c070c74b487a45a0b4d13379828532b9571db8613fff"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00086-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00086-of-00088.safetensors"
+    sha256 = "992ccd2c56c9a1ee79f5c4907bee0aa12517204bbd2e65a3d86469fa1dee7b47"
+    size = 1631777144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00087-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00087-of-00088.safetensors"
+    sha256 = "26361d65e034375d00b1ac09e4cc436132dbc2895f315c0a679218b0b18eea52"
+    size = 109705488
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00088-of-00088.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model-00088-of-00088.safetensors"
+    sha256 = "6e576283e02f46a5a547e08a892515cd4e77a0fa4e6955325cfbbfab24e37479"
+    size = 3938866920
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/accuracy_plot.png"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/accuracy_plot.png"
+    sha256 = "06abbc64e8658a9c360e65044269f5fa6429715eb9446a33941844af92c9c27a"
+    size = 1756481
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/bias.md"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/bias.md"
+    sha256 = "c5cedf15a6a2d14d73d3aedb1514462c5f55ed3539e6e0e7e08a75e0f99d694e"
+    size = 3263
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/chat_template.jinja"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/chat_template.jinja"
+    sha256 = "1369e90b19976f99ce2070eb21ade8fcb4af640f008e14e82af5c5e89a9cc816"
+    size = 12927
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/config.json"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/config.json"
+    sha256 = "35189a8038d1b1f934e58cba50eb7e97b42a4da569424e35b9fd1048058bc7ea"
+    size = 8668620
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/configuration_nemotron_h_omni.py"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/configuration_nemotron_h_omni.py"
+    sha256 = "83f0c11fd9fb4da4a3de434759e1a18958b69f9fce672bafed4346a616ec20d4"
+    size = 7140
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/configuration_radio.py"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/configuration_radio.py"
+    sha256 = "b0f1ea1d8136272635bc8d6eeba0564542a4e48474ae98b2d8ed74b0fc5d20ce"
+    size = 4219
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/explainability.md"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/explainability.md"
+    sha256 = "0633d9f3519170f88ea7e3f0447d58b9674260216b8454d8a80e8f42abef2d5e"
+    size = 2699
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/generation_config.json"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/generation_config.json"
+    sha256 = "c67c90fcadf0e7ef78b663eb159664b36a35ffb9dd2523096e226e5c3d1b0e5f"
+    size = 209
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/harness_comparisons.png"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/harness_comparisons.png"
+    sha256 = "aca282a7f7191693018f30210f5ffec1e19a63bf959eda08772304846b57f3b6"
+    size = 255501
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/hf_quant_config.json"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/hf_quant_config.json"
+    sha256 = "b797654d89e25e9bd13617cb1d216ff5fad78cb6a8b99ba0cd0fbcf20050d75a"
+    size = 5631355
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/image_processing_nemotron_h_omni.py"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/image_processing_nemotron_h_omni.py"
+    sha256 = "0344e8432097e0718672d6529c68fd6095c36bea176500f131d203d1c7d497e0"
+    size = 10159
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/LICENSE"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/LICENSE"
+    sha256 = "d7c8a9e5d1896d0a9588319cc7b1433e64645ad6d9e55632c30b78d8c038c23b"
+    size = 2693
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model.safetensors.index.json"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/model.safetensors.index.json"
+    sha256 = "c368acdbcfe882236af1ec79df4a1fb6127e6ed9f742d59c01c21fe96ddc2741"
+    size = 19521590
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/modeling_nemotron_h_omni.py"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/modeling_nemotron_h_omni.py"
+    sha256 = "dfe88cc516f27b1dc8508ec7e448d81143aaf13d01400f5f93525b7f1271d929"
+    size = 22566
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/modeling_radio.py"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/modeling_radio.py"
+    sha256 = "ceec4c1ecd2a2649a79e74b16a2ea4af60e6cd11fbecebbd681c33fb1fccb943"
+    size = 22804
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/preprocessor_config.json"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/preprocessor_config.json"
+    sha256 = "0b80e5c895052ff2d8e528eca719a6b6e39b7b1b60afb0b94553ffae948e22bc"
+    size = 693
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/privacy.md"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/privacy.md"
+    sha256 = "db5582217364a580391a86ac54466c75a7577c9e0446f13a0511f74265174d97"
+    size = 827
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/processing_nemotron_h_omni.py"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/processing_nemotron_h_omni.py"
+    sha256 = "406bc7689161d19e2a01e34f0ac8a7cc1bbc927f664d03bae3d23d00ea27f11a"
+    size = 16450
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/processor_config.json"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/processor_config.json"
+    sha256 = "ce813d598192df1b09813631b5f9c78f31c1e2e8d291c7c660c8dfa92a9597a7"
+    size = 1062
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/README.md"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/README.md"
+    sha256 = "8f43225c9036e7aa14cdba81e56107e0a1d8b6d28a59b559c92a6dc8f8463ff9"
+    size = 98048
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/safety.md"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/safety.md"
+    sha256 = "60f74211be1d81624807ca626462778610960cf20adc989140118da37d80a86b"
+    size = 2145
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/tokenizer.json"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/tokenizer.json"
+    sha256 = "d0432ad8b1c2984a2e2dca82e1933e3fd5628df6e95c51fba4c3ee9950dce299"
+    size = 17077366
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/tokenizer_config.json"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/tokenizer_config.json"
+    sha256 = "89fa70d31734c0c75ffdcee4114449f8cf8abd64bc233d420b58e25763f91aba"
+    size = 619
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/ultra_v3_reasoning_parser.py"
+    dest = "NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/ultra_v3_reasoning_parser.py"
+    sha256 = "14e03de50a523c1b6b4542c22d38ec11cadc515a95752e5a4c8246967f620857"
+    size = 2490
 
 # Nemotron 3.5 Embed 8B (NVIDIA, Oct 2026): the multimodal embedder - a
 # Pixtral picture tower and Mistral 3's projector in front of a

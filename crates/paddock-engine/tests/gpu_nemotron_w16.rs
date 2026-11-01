@@ -172,6 +172,227 @@ fn w16_experts_rows_match_one_row_bitexact() {
     }
 }
 
+/// The LatentMoE split (Super): the routed picks without a shared expert
+/// (`_solo`, a zero-width shared slot), and the shared expert as a
+/// one-expert routed pass (identity sort, weight 1), each bit-identical to
+/// the fused pair's columns and slots on the same planes - the W16 pair at
+/// 1..64 rows and the r=1 tiled twins (mtt / tt) - with the spare slot zero.
+#[test]
+fn w16_solo_and_shared_as_routed_match_the_fused_pair() {
+    let Some(exec) = common::gpu() else { return };
+    let Some(st) = checkpoint() else {
+        common::missing("no nemotron checkpoint");
+        return;
+    };
+    if !exec.has_nvf4_moe_w16() || !exec.has_nvf4_moe_st() {
+        common::missing("pack has no W16 / tiled expert set (cc != 12?)");
+        return;
+    }
+    let n_e = 8usize;
+    let (mut up_p, mut up_s, mut up_s2) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut dn_p, mut dn_s, mut dn_s2) = (Vec::new(), Vec::new(), Vec::new());
+    let mut views = Vec::new();
+    for e in 0..n_e {
+        let u = nvfp4_view(&st, &format!("backbone.layers.1.mixer.experts.{e}.up_proj"))
+            .expect("up view");
+        let d = nvfp4_view(
+            &st,
+            &format!("backbone.layers.1.mixer.experts.{e}.down_proj"),
+        )
+        .expect("down view");
+        up_p.extend_from_slice(u.packed);
+        up_s.extend_from_slice(u.scales);
+        up_s2.push(u.scale2);
+        dn_p.extend_from_slice(d.packed);
+        dn_s.extend_from_slice(d.scales);
+        dn_s2.push(d.scale2);
+        views.push((u, d));
+    }
+    let (ff, in_dim, embd) = (views[0].0.n, views[0].0.k, views[0].1.n);
+    let sh = &views[5];
+    let k = 3usize;
+    let tiled = |p: &[u8], s: &[u8], s2: &[f32], n: usize, rows: usize, k_in: usize| {
+        exec.nvf4_moe_upload_tiled(p, s, s2, n, rows, k_in)
+            .expect("upload")
+    };
+    let up = tiled(&up_p, &up_s, &up_s2, n_e, ff, in_dim);
+    let dn = tiled(&dn_p, &dn_s, &dn_s2, n_e, embd, ff);
+    let shu = tiled(sh.0.packed, sh.0.scales, &[sh.0.scale2], 1, ff, in_dim);
+    let shd = tiled(sh.1.packed, sh.1.scales, &[sh.1.scale2], 1, embd, ff);
+    let nb = 64usize;
+    let align = |idx: &[u32], rows: usize, kk: usize, ne: usize| {
+        let d_idx = exec.to_device_u32(idx).unwrap();
+        let mut srow = exec.alloc_u32(nb * 32).unwrap();
+        let mut sslot = exec.alloc_u32(nb * 32).unwrap();
+        let mut bexp = exec.alloc_u32(nb).unwrap();
+        exec.moe_align_bm(
+            &d_idx, &mut srow, &mut sslot, &mut bexp, rows, kk, ne, 32, nb,
+        )
+        .expect("align");
+        (srow, sslot, bexp)
+    };
+    let bits16 = |v: Vec<half::bf16>| v.iter().map(|x| x.to_bits()).collect::<Vec<u16>>();
+    for rows in [1usize, 5, 33, 64] {
+        let idx: Vec<u32> = (0..rows)
+            .flat_map(|r| [0u32, 1 + (r % 7) as u32, 1 + ((r + 3) % 7) as u32])
+            .collect();
+        let topk_w: Vec<f32> = det(rows * k, 7 + rows as u64)
+            .iter()
+            .map(|v| 0.2 + 0.1 * v)
+            .collect();
+        let x = det(rows * in_dim, 91 + rows as u64);
+        let x16 = bf16_up(&exec, &x);
+        let d_w = exec.to_device(&topk_w).unwrap();
+        // fused
+        let (srow, sslot, bexp) = align(&idx, rows, k, n_e);
+        let aw = k * ff + ff;
+        let mut act = exec.stream_alloc_bf16(rows * aw).unwrap();
+        let mut part = exec.alloc(rows * (k + 1) * embd).unwrap();
+        exec.nvf4_moe_up_relu2_w16(&up, &shu, &srow, &sslot, &bexp, &x16, &mut act, k, nb, rows)
+            .unwrap();
+        exec.nvf4_moe_down_part_w16(
+            &dn, &shd, &srow, &sslot, &bexp, &d_w, &act, &mut part, k, nb, rows,
+        )
+        .unwrap();
+        let act = bits16(exec.to_host_bf16(&act).unwrap());
+        let part = exec.to_host(&part).unwrap();
+        // routed solo
+        let mut act_r = exec.stream_alloc_bf16(rows * k * ff).unwrap();
+        let mut part_r = exec.alloc(rows * (k + 1) * embd).unwrap();
+        exec.nvf4_moe_up_relu2_w16_solo(&up, &srow, &sslot, &bexp, &x16, &mut act_r, k, nb, rows)
+            .unwrap();
+        exec.nvf4_moe_down_part_w16_solo(
+            &dn,
+            &srow,
+            &sslot,
+            &bexp,
+            &d_w,
+            &act_r,
+            &mut part_r,
+            k,
+            nb,
+            rows,
+        )
+        .unwrap();
+        let act_r = bits16(exec.to_host_bf16(&act_r).unwrap());
+        let part_r = exec.to_host(&part_r).unwrap();
+        // the shared expert as one routed expert over every row
+        let (srow_s, sslot_s, bexp_s) = align(&vec![0u32; rows], rows, 1, 1);
+        let ones = exec.to_device(&vec![1.0f32; rows]).unwrap();
+        let mut act_s = exec.stream_alloc_bf16(rows * ff).unwrap();
+        let mut part_s = exec.alloc(rows * 2 * embd).unwrap();
+        exec.nvf4_moe_up_relu2_w16_solo(
+            &shu, &srow_s, &sslot_s, &bexp_s, &x16, &mut act_s, 1, nb, rows,
+        )
+        .unwrap();
+        exec.nvf4_moe_down_part_w16_solo(
+            &shd,
+            &srow_s,
+            &sslot_s,
+            &bexp_s,
+            &ones,
+            &act_s,
+            &mut part_s,
+            1,
+            nb,
+            rows,
+        )
+        .unwrap();
+        let act_s = bits16(exec.to_host_bf16(&act_s).unwrap());
+        let part_s = exec.to_host(&part_s).unwrap();
+        for r in 0..rows {
+            let fa = &act[r * aw..(r + 1) * aw];
+            assert_eq!(
+                &act_r[r * k * ff..(r + 1) * k * ff],
+                &fa[..k * ff],
+                "{rows} rows: routed act row {r}"
+            );
+            assert_eq!(
+                &act_s[r * ff..(r + 1) * ff],
+                &fa[k * ff..],
+                "{rows} rows: shared act row {r}"
+            );
+            let fp = &part[r * (k + 1) * embd..(r + 1) * (k + 1) * embd];
+            let rp = &part_r[r * (k + 1) * embd..(r + 1) * (k + 1) * embd];
+            assert!(
+                bits_eq(&rp[..k * embd], &fp[..k * embd]),
+                "{rows} rows: routed partials row {r}"
+            );
+            assert!(
+                rp[k * embd..].iter().all(|v| *v == 0.0),
+                "{rows} rows: spare slot row {r}"
+            );
+            let sp = &part_s[r * 2 * embd..(r + 1) * 2 * embd];
+            assert!(
+                bits_eq(&sp[..embd], &fp[k * embd..]),
+                "{rows} rows: shared partial row {r}"
+            );
+            assert!(
+                sp[embd..].iter().all(|v| *v == 0.0),
+                "{rows} rows: shared spare slot row {r}"
+            );
+        }
+        println!("[w16] solo + shared-as-routed: {rows} rows bit-exact with the fused pair");
+    }
+    // the r=1 tiled twins
+    let idx = [0u32, 3, 6];
+    let wts = [0.31f32, 0.22, 0.17];
+    let x = det(in_dim, 5);
+    let (d_idx, d_w, d_x) = (
+        exec.to_device_u32(&idx).unwrap(),
+        exec.to_device(&wts).unwrap(),
+        exec.to_device(&x).unwrap(),
+    );
+    let mut act = exec.alloc(k * ff + ff).unwrap();
+    let mut part = exec.alloc((k + 1) * embd).unwrap();
+    exec.nvf4_moe_up_relu2_mtt(&up, &shu, &d_idx, &d_x, &mut act, k)
+        .unwrap();
+    exec.nvf4_moe_down_part_tt(&dn, &shd, &d_idx, &d_w, &act, &mut part, k)
+        .unwrap();
+    let (act, part) = (exec.to_host(&act).unwrap(), exec.to_host(&part).unwrap());
+    let mut act_r = exec.alloc(k * ff).unwrap();
+    let mut part_r = exec.alloc((k + 1) * embd).unwrap();
+    exec.nvf4_moe_up_relu2_mtt_solo(&up, &d_idx, &d_x, &mut act_r, k)
+        .unwrap();
+    exec.nvf4_moe_down_part_tt_solo(&dn, &d_idx, &d_w, &act_r, &mut part_r, k)
+        .unwrap();
+    let (act_r, part_r) = (
+        exec.to_host(&act_r).unwrap(),
+        exec.to_host(&part_r).unwrap(),
+    );
+    let zero = exec.to_device_u32(&[0u32]).unwrap();
+    let one = exec.to_device(&[1.0f32]).unwrap();
+    let mut act_s = exec.alloc(ff).unwrap();
+    let mut part_s = exec.alloc(2 * embd).unwrap();
+    exec.nvf4_moe_up_relu2_mtt_solo(&shu, &zero, &d_x, &mut act_s, 1)
+        .unwrap();
+    exec.nvf4_moe_down_part_tt_solo(&shd, &zero, &one, &act_s, &mut part_s, 1)
+        .unwrap();
+    let (act_s, part_s) = (
+        exec.to_host(&act_s).unwrap(),
+        exec.to_host(&part_s).unwrap(),
+    );
+    assert!(bits_eq(&act_r, &act[..k * ff]), "mtt routed act");
+    assert!(bits_eq(&act_s, &act[k * ff..]), "mtt shared act");
+    assert!(
+        bits_eq(&part_r[..k * embd], &part[..k * embd]),
+        "tt routed partials"
+    );
+    assert!(
+        part_r[k * embd..].iter().all(|v| *v == 0.0),
+        "tt spare slot"
+    );
+    assert!(
+        bits_eq(&part_s[..embd], &part[k * embd..]),
+        "tt shared partial"
+    );
+    assert!(
+        part_s[embd..].iter().all(|v| *v == 0.0),
+        "tt shared spare slot"
+    );
+    println!("[w16] r=1 tiled twins: solo + shared-as-routed bit-exact with the fused pair");
+}
+
 /// The FP8 mamba projections (in_proj [10304, 2688], out_proj [2688, 4096])
 /// across the in-kernel cast (<= 8 rows) and the pre-cast plane past it.
 #[test]

@@ -147,6 +147,7 @@ public struct RunnerInfo: Decodable, Identifiable, Sendable {
   public let reader: String?
   public let tabular: String?
   public let diarization: String?
+  public let speech: String?
   public let display: String?
   public let endpoint: String
   public let version: String?
@@ -159,9 +160,10 @@ public struct RunnerInfo: Decodable, Identifiable, Sendable {
   public var id: String { "\(port):\(pid)" }
   public var title: String {
     display ?? model ?? embedder ?? asr ?? aligner ?? image ?? reader ?? tabular ?? diarization
+      ?? speech
       ?? "Runner \(port)"
   }
-  public var hasStudioSurface: Bool { diarization == nil }
+  public var hasStudioSurface: Bool { diarization == nil && speech == nil }
   public var studioActionTitle: String {
     tabular != nil
       ? "Open Tables"

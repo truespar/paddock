@@ -93,7 +93,9 @@ impl GpuExecutor {
     /// Laguna sigmoid MoE router: selection = top-k over sigmoid(logits) +
     /// `bias` (the selection-only `exp_probs_b` correction); `out_w` = the
     /// UNBIASED sigmoid scores of the selected experts, sum-normalized,
-    /// × `routed_scale` - ready for the down-combine unchanged.
+    /// × `routed_scale` - ready for the down-combine unchanged. Past 256
+    /// experts or top-16 it runs the wide router (slot 903 - same picks and
+    /// weights, up to 512 / top-32), so callers never pick.
     #[allow(clippy::too_many_arguments)]
     pub fn moe_topk_sigmoid_batch(
         &self,
@@ -106,10 +108,15 @@ impl GpuExecutor {
         out_w: &mut CudaSlice<f32>,
         batch: usize,
     ) -> Result<(), GpuError> {
-        let f = self
-            .kernels
-            .moe_topk_sigmoid_batch
-            .ok_or(GpuError::MissingOp("moe_topk_sigmoid_batch"))?;
+        let f = if n_expert > 256 || k > 16 {
+            self.kernels
+                .moe_topk_sigmoid_batch_wide
+                .ok_or(GpuError::MissingOp("moe_topk_sigmoid_batch_wide"))?
+        } else {
+            self.kernels
+                .moe_topk_sigmoid_batch
+                .ok_or(GpuError::MissingOp("moe_topk_sigmoid_batch"))?
+        };
         let (lp, _g1) = logits.device_ptr(&self.stream);
         let (bp, _g2) = bias.device_ptr(&self.stream);
         let (ip, _g3) = out_idx.device_ptr_mut(&self.stream);
@@ -167,6 +174,11 @@ impl GpuExecutor {
                 self.stream_ptr(),
             )
         })
+    }
+
+    /// The wide sigmoid router (slot 903): past 256 experts or top-16.
+    pub fn has_moe_topk_sigmoid_wide(&self) -> bool {
+        self.kernels.moe_topk_sigmoid_batch_wide.is_some()
     }
 
     pub fn has_moe_topk_logit_sigmoid(&self) -> bool {

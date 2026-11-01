@@ -49,6 +49,14 @@ pub enum Transport {
     },
 }
 
+/// Env names a stdio server's config may not set: the dynamic loader reads
+/// these before the tool's own code runs, so they would turn any allowed
+/// command into a different program. A tool needs none of them to work.
+fn steers_loader(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.starts_with("LD_") || upper.starts_with("DYLD_")
+}
+
 /// A registered MCP server. `id` keys the connection pool; `label` namespaces
 /// its tools so two servers can't collide.
 #[derive(Clone, Debug)]
@@ -90,6 +98,13 @@ impl McpClient {
     pub async fn connect(cfg: &ServerConfig) -> Result<Self> {
         let service = match &cfg.transport {
             Transport::Stdio { command, args, env } => {
+                if let Some(name) = env.keys().find(|k| steers_loader(k)) {
+                    return Err(McpError::Transport(format!(
+                        "mcp stdio server {:?}: env {name} is refused - variables that \
+                         steer the dynamic loader never pass to a tool process",
+                        cfg.label
+                    )));
+                }
                 let mut cmd = Command::new(command);
                 cmd.args(args);
                 for (k, v) in env {
@@ -407,6 +422,30 @@ mod tests {
         let a = http("inline:s", "http://x/mcp", &[]);
         let b = http("inline:s", "http://y/mcp", &[]);
         assert_ne!(pool_key(&a), pool_key(&b));
+    }
+
+    #[tokio::test]
+    async fn a_stdio_server_may_not_steer_the_loader() {
+        for name in [
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "ld_audit",
+            "DYLD_INSERT_LIBRARIES",
+        ] {
+            let cfg = ServerConfig {
+                id: "registry:s".into(),
+                label: "s".into(),
+                transport: Transport::Stdio {
+                    command: "true".into(),
+                    args: Vec::new(),
+                    env: [(name.to_string(), "x".to_string())].into(),
+                },
+            };
+            let err = McpClient::connect(&cfg).await.err().expect("refused");
+            assert!(err.to_string().contains("is refused"), "{name}: {err}");
+        }
+        // an ordinary tool variable is not caught by it
+        assert!(!steers_loader("API_TOKEN") && !steers_loader("OLD_PATH"));
     }
 
     #[test]

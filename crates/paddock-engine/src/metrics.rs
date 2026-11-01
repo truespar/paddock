@@ -62,6 +62,7 @@ pub struct TierGauges {
     pub device_write_gbs: AtomicU64,
     pub device_unbuffered: AtomicU8,
     pub t2_written_day_bytes: AtomicU64,
+    pub t2_day_budget_bytes: AtomicU64,
     pub ghost_keys: AtomicU64,
 }
 
@@ -127,6 +128,8 @@ impl TierGauges {
             .store(u8::from(r.device_unbuffered), Relaxed);
         self.t2_written_day_bytes
             .store(r.t2_written_day_bytes, Relaxed);
+        self.t2_day_budget_bytes
+            .store(r.t2_day_budget_bytes, Relaxed);
         self.ghost_keys.store(r.ghost_keys, Relaxed);
     }
 }

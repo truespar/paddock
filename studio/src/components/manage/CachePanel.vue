@@ -199,8 +199,14 @@ const anyArmed = computed(() => rows.value.length > 0)
               <dd class="c-mono">{{ s.tier.promoted_to_disk.toLocaleString() }}</dd>
             </div>
             <div v-if="s.tier.disk_capacity > 0" class="ch__row">
-              <dt>Written to disk today</dt>
-              <dd class="c-mono">{{ fmtBytes(s.tier.disk_written_today) }}</dd>
+              <dt>
+                <Tooltip label="The cache writes at most a quarter of its drive's size a day (up to 1 TiB), to spare the drive's wear. At the limit it stops writing to disk until midnight UTC; the memory cache keeps working.">
+                  <span>Written to disk today</span>
+                </Tooltip>
+              </dt>
+              <dd class="c-mono">
+                {{ fmtBytes(s.tier.disk_written_today) }}<template v-if="s.tier.disk_write_budget_day > 0"> of {{ fmtBytes(s.tier.disk_write_budget_day) }}</template>
+              </dd>
             </div>
             <div v-if="s.tier.pending_durable_writes > 0" class="ch__row">
               <dt>

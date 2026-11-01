@@ -5,7 +5,7 @@
 use super::{
     TierStats,
     cost::{Calibration, CostModel},
-    nvme_store::NvmeStore,
+    nvme_store::{NvmeStore, StoreError},
 };
 mod calibration;
 use std::{
@@ -62,7 +62,9 @@ enum Job {
     Calibrate(Calibration),
 }
 enum Done {
-    Stored(Key, usize, bool, Vec<Key>),
+    /// (key, len, landed, failed on the device - capacity refusals are
+    /// neither, evicted keys)
+    Stored(Key, usize, bool, bool, Vec<Key>),
     Loaded(Key, Option<Arc<Payload>>, bool),
     Calibrated(Calibration, bool),
 }
@@ -115,6 +117,7 @@ impl ColdCache {
         let (done, rx) = mpsc::channel();
         let mut disk_index = HashMap::new();
         let mut device_read_gbs = 0.0;
+        let mut day_budget = 0;
         let disk_quota = config.disk.as_ref().map_or(0, |(_, q)| *q);
         let mut calibration = None;
         let store = config
@@ -130,9 +133,11 @@ impl ColdCache {
                 }
                 tracing::info!(
                     recovered = recovery.recovered_entries,
+                    day_budget_gib = store.day_budget() >> 30,
                     "Metal KV cache recovered"
                 );
                 device_read_gbs = store.device().read_gbs;
+                day_budget = store.day_budget();
                 for (key, _, _, len, _) in store.live_iter() {
                     if len <= max_payload as u64 {
                         disk_index.insert(*key, len as usize);
@@ -148,23 +153,29 @@ impl ColdCache {
                     let result = match job {
                         Job::Store(key, payload) => {
                             let bytes = payload.bytes();
-                            let evicted = store.make_room(bytes.len() as u64);
-                            let (ok, evicted) = match evicted {
-                                Ok(evicted) => {
-                                    let result = store.store(key, 1, 1, bytes);
-                                    if let Err(error) = &result { tracing::warn!(%error, "Metal KV SSD write failed; RAM cache remains usable"); }
-                                    (result.is_ok(), evicted)
+                            let mut evicted = Vec::new();
+                            let mut result = store.store(key, 1, 1, bytes);
+                            if matches!(result, Err(StoreError::QuotaExhausted { .. } | StoreError::VolumeFull { .. })) {
+                                match store.make_room(bytes.len() as u64) {
+                                    Ok(keys) => {
+                                        evicted = keys;
+                                        result = store.store(key, 1, 1, bytes);
+                                    }
+                                    Err(error) => tracing::warn!(%error, "Metal KV SSD eviction failed"),
                                 }
-                                Err(error) => { tracing::warn!(%error, "Metal KV SSD eviction failed"); (false, Vec::new()) },
-                            };
-                            Done::Stored(key, bytes.len(), ok, evicted)
+                            }
+                            // the store logs pause/resume and a volume at its
+                            // reserve once each; per write this is detail
+                            if let Err(error) = &result { tracing::debug!(%error, "Metal KV SSD write declined; RAM cache remains usable"); }
+                            let failed = result.as_ref().is_err_and(|e| !e.is_capacity());
+                            Done::Stored(key, bytes.len(), result.is_ok(), failed, evicted)
                         }
                         Job::Load(key, reservation) => {
                             match store.read_owned(&key) {
                                 Ok((_, bytes)) if bytes.as_ref().len() as u64 <= reservation.bytes / 3 => {
                                     Done::Loaded(key, Some(Arc::new(Payload::new(bytes, reservation))), false)
                                 }
-                                Err(super::nvme_store::StoreError::Integrity) => Done::Loaded(key, None, true),
+                                Err(StoreError::Integrity) => Done::Loaded(key, None, true),
                                 _ => Done::Loaded(key, None, false),
                             }
                         }
@@ -199,7 +210,10 @@ impl ColdCache {
             budget: config.ram_bytes,
             max_payload,
             clock: 0,
-            stats: TierStats::default(),
+            stats: TierStats {
+                t2_day_budget_bytes: day_budget,
+                ..TierStats::default()
+            },
             device_read_gbs,
             disk_quota,
             day: utc_day(),
@@ -227,7 +241,7 @@ impl ColdCache {
                 }
             };
             match done {
-                Done::Stored(key, len, ok, evicted) => {
+                Done::Stored(key, len, ok, failed, evicted) => {
                     self.writing.remove(&key);
                     for key in evicted {
                         self.disk.remove(&key);
@@ -236,7 +250,7 @@ impl ColdCache {
                     if ok {
                         self.disk.insert(key, len);
                         self.stats.t2_written_day_bytes += len as u64;
-                    } else {
+                    } else if failed {
                         self.stats.io_failures += 1;
                     }
                 }
@@ -330,11 +344,12 @@ impl ColdCache {
             return;
         }
         let payload = Arc::new(payload);
-        // Same elected 1 TiB/day safety ceiling as CUDA. Stops new durable
-        // writes, not inference or RAM caching; this counter resets on startup.
+        // Same elected daily ceiling as CUDA (a quarter of the volume, at most
+        // 1 TiB - `NvmeStore::day_budget`). Stops new durable writes, not
+        // inference or RAM caching; this counter resets on startup.
         if let Some(tx) = &self.tx
             && self.stats.t2_written_day_bytes + self.queued_bytes() + payload.bytes().len() as u64
-                <= 1 << 40
+                <= self.stats.t2_day_budget_bytes
         {
             match tx.try_send(Job::Store(key, payload.clone())) {
                 Ok(()) => {

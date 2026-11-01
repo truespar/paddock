@@ -2712,22 +2712,33 @@ impl GpuExecutor {
         let (ip, _g4) = idx.device_ptr(&self.stream);
         let (xp, _g5) = x.device_ptr(&self.stream);
         let (yp, _g6) = y.device_ptr_mut(&self.stream);
-        // SAFETY: ABI contract; sizes checked above
-        check(unsafe {
-            f(
-                dp as *const _,
-                sp as *const _,
-                s2p as *const _,
-                ip as *const _,
-                xp as *const _,
-                yp as *mut _,
-                w.in_dim as u32,
-                w.ff as u32,
-                k as u32,
-                batch as u32,
-                self.stream_ptr(),
-            )
-        })
+        // one grid row per (token, pick): split the batch so batch * k stays
+        // inside the grid's 65535 y-extent (Super's 22 picks over a whole
+        // picture prompt's rows pass it). Each row's output is its own, so
+        // the split changes no bits.
+        let per = (65535 / k.max(1)).max(1);
+        let mut b0 = 0usize;
+        while b0 < batch {
+            let n = per.min(batch - b0);
+            // SAFETY: ABI contract; sizes checked above, offsets inside them
+            check(unsafe {
+                f(
+                    dp as *const _,
+                    sp as *const _,
+                    s2p as *const _,
+                    (ip + (b0 * k * 4) as u64) as *const _,
+                    (xp + (b0 * w.in_dim * 4) as u64) as *const _,
+                    (yp + (b0 * k * w.ff * 4) as u64) as *mut _,
+                    w.in_dim as u32,
+                    w.ff as u32,
+                    k as u32,
+                    n as u32,
+                    self.stream_ptr(),
+                )
+            })?;
+            b0 += n;
+        }
+        Ok(())
     }
 
     /// Token-batched expert down GEMV + weighted combine (deterministic
@@ -3616,6 +3627,111 @@ impl GpuExecutor {
                 up.in_dim as u32,
                 up.ff as u32,
                 sh_up.ff as u32,
+                k as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// [`Self::nvf4_moe_up_relu2_mtt`] without a shared expert: the routed
+    /// picks of one row alone, `act` f32 [k * up.ff] (a LatentMoE's shared
+    /// expert reads another width; it runs as its own one-pick pass).
+    pub fn nvf4_moe_up_relu2_mtt_solo(
+        &self,
+        up: &Nvf4MoePlane,
+        idx: &CudaSlice<u32>,
+        x: &CudaSlice<f32>,
+        act: &mut CudaSlice<f32>,
+        k: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .nvf4_moe_up_relu2_mtt
+            .ok_or(GpuError::MissingOp("nvf4_moe_up_relu2_mtt"))?;
+        Self::moe_layout_ok(up, Nvf4MoeLayout::Tiled64, "nvf4_moe_up_relu2_mtt_solo")?;
+        if idx.len() < k || x.len() < up.in_dim || act.len() < k * up.ff {
+            return Err(GpuError::Unsupported(
+                "nvf4_moe_up_relu2_mtt_solo: buffers under the pass".into(),
+            ));
+        }
+        let (rdp, _g1) = up.data.device_ptr(&self.stream);
+        let (rsp, _g2) = up.scale.device_ptr(&self.stream);
+        let (rs2, _g3) = up.scale2.device_ptr(&self.stream);
+        let (ip, _g7) = idx.device_ptr(&self.stream);
+        let (xp, _g8) = x.device_ptr(&self.stream);
+        let (ap, _g9) = act.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract; sizes checked above. ff_s = 0 launches no
+        // shared tasks, so the shared plane slots are never read
+        check(unsafe {
+            f(
+                rdp as *const _,
+                rsp as *const _,
+                rs2 as *const _,
+                rdp as *const _,
+                rsp as *const _,
+                rs2 as *const _,
+                ip as *const _,
+                xp as *const _,
+                ap as *mut _,
+                up.in_dim as u32,
+                up.ff as u32,
+                0,
+                k as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// [`Self::nvf4_moe_down_part_tt`] without a shared expert: `part`
+    /// [k + 1][down.ff], slot k written as zeros (the zero-width shared
+    /// slot), so the fold over k + 1 slots is the routed sum exactly.
+    pub fn nvf4_moe_down_part_tt_solo(
+        &self,
+        down: &Nvf4MoePlane,
+        idx: &CudaSlice<u32>,
+        topk_w: &CudaSlice<f32>,
+        act: &CudaSlice<f32>,
+        part: &mut CudaSlice<f32>,
+        k: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .nvf4_moe_down_part_tt
+            .ok_or(GpuError::MissingOp("nvf4_moe_down_part_tt"))?;
+        Self::moe_layout_ok(down, Nvf4MoeLayout::Tiled64, "nvf4_moe_down_part_tt_solo")?;
+        if idx.len() < k
+            || topk_w.len() < k
+            || act.len() < k * down.in_dim
+            || part.len() < (k + 1) * down.ff
+        {
+            return Err(GpuError::Unsupported(
+                "nvf4_moe_down_part_tt_solo: buffers under the pass".into(),
+            ));
+        }
+        let (rdp, _g1) = down.data.device_ptr(&self.stream);
+        let (rsp, _g2) = down.scale.device_ptr(&self.stream);
+        let (rs2, _g3) = down.scale2.device_ptr(&self.stream);
+        let (ip, _g7) = idx.device_ptr(&self.stream);
+        let (wp, _g8) = topk_w.device_ptr(&self.stream);
+        let (ap, _g9) = act.device_ptr(&self.stream);
+        let (pp, _g10) = part.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract; sizes checked above. ff_s = 0: slot k walks
+        // no K and stores zero
+        check(unsafe {
+            f(
+                rdp as *const _,
+                rsp as *const _,
+                rs2 as *const _,
+                rdp as *const _,
+                rsp as *const _,
+                rs2 as *const _,
+                ip as *const _,
+                wp as *const _,
+                ap as *const _,
+                pp as *mut _,
+                down.in_dim as u32,
+                0,
+                down.ff as u32,
                 k as u32,
                 self.stream_ptr(),
             )

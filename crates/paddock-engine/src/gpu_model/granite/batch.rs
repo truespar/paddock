@@ -541,9 +541,9 @@ impl GpuGranite {
                     || q8(&l.wk)
                     || q8(&l.wv)
                     || q8(&l.wo)
-                    || l.gate.as_ref().is_some_and(&q8)
-                    || l.up.as_ref().is_some_and(&q8)
-                    || l.gate_up.as_ref().is_some_and(&q8)
+                    || l.gate.as_ref().is_some_and(q8)
+                    || l.up.as_ref().is_some_and(q8)
+                    || l.gate_up.as_ref().is_some_and(q8)
                     || q8(&l.down)
             });
 

@@ -1014,44 +1014,6 @@ impl GpuQwen35 {
             .unwrap_or(crate::kv_pool::BLOCK_TOKENS)
     }
 
-    /// The per-tick tier pump (see `Generator::tier_pump`).
-    pub fn tier_pump_impl(&mut self) {
-        let exec = self.exec.clone();
-        let Some(bs) = self.batch.as_mut() else {
-            return;
-        };
-        let (Some(tier), Some(pr), Some(pool)) =
-            (bs.tier.as_mut(), bs.paged_prefix.as_mut(), bs.pool.as_mut())
-        else {
-            return;
-        };
-        tier.pump_completions(pr, pool);
-        // an aux round reserves its checkpoint's pages from the pool
-        tier.pump_flows_with_pool(pr, pool, &mut || exec.record_event().ok());
-        // 2.3 write-through: retained chains AND live checkpoint blobs
-        // pre-store in slack so eviction (and ckpt-slot recycling) is free.
-        // The checkpoints are pool pages; the tier reads them off the radix.
-        tier.mirror_slack(pr, pool, exec.record_event().ok(), 2, None);
-    }
-
-    pub fn tier_observe_prefill_impl(&mut self, tokens: u32, wall_us: f64) {
-        if let Some(t) = self.batch.as_mut().and_then(|b| b.tier.as_mut()) {
-            t.cost.observe_prefill(tokens, wall_us);
-        }
-    }
-
-    pub fn tier_stats_impl(&self) -> Option<crate::kv_tier::TierStats> {
-        self.batch.as_ref()?.tier.as_ref().map(|t| t.tier_stats())
-    }
-
-    pub fn tier_report_impl(&self) -> Option<crate::kv_tier::TierReport> {
-        self.batch
-            .as_ref()?
-            .tier
-            .as_ref()
-            .map(crate::kv_tier::PoolTier::report)
-    }
-
     /// P5b free-on-completion: return the KV blocks of every slot that no longer
     /// holds a live sequence (`!occupied[slot]`) to the shared pool, so the memory
     /// is available to new admissions the moment a sequence ends - not only when

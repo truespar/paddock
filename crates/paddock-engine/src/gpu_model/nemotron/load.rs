@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use cudarc::driver::CudaSlice;
 
-use crate::gpu::{DeviceTensor, GpuError, GpuExecutor, KvDtype, Nvf4MoePlane, QuantTensor};
+use crate::gpu::{
+    DeviceTensor, F8RowPlane, GpuError, GpuExecutor, KvDtype, Nvf4MoePlane, QuantTensor,
+};
 use crate::gpu_model::gpt_oss::GpuModelError;
 use paddock_models::ggml_type::GgmlType;
 use paddock_models::modelopt::{ModeloptQuantMap, fp8_view, nvfp4_view};
@@ -89,6 +91,9 @@ impl GpuNemotron {
                 })
             };
 
+        // the vision-language wrapper keeps the language model's tensors
+        // under `language_model.` (its tower and projector sit beside them)
+        let lm = if hp.omni { "language_model." } else { "" };
         let mut weights_bytes: u64 = 0;
         let mut count = |b: usize| weights_bytes += b as u64;
         // itemized duplicate residency (nonkv-overhead plan R1.5): both are
@@ -105,7 +110,11 @@ impl GpuNemotron {
         // gather them (bit-identical rows - the widen happens in-kernel),
         // else widened to f32
         let tok_embd = if bf16_lane && exec.has_embed_gather_bf16() {
-            let raw = bf16_bytes(&st, "backbone.embeddings.weight", hp.vocab * hp.hidden)?;
+            let raw = bf16_bytes(
+                &st,
+                &format!("{lm}backbone.embeddings.weight"),
+                hp.vocab * hp.hidden,
+            )?;
             count(hp.vocab * hp.hidden * 2);
             TokEmbd::Bf16(QuantTensor {
                 bytes: exec.to_device_u8(raw).map_err(GpuModelError::from)?,
@@ -113,7 +122,11 @@ impl GpuNemotron {
                 dims: vec![hp.hidden, hp.vocab],
             })
         } else {
-            let embd_host = f32_tensor(&st, "backbone.embeddings.weight", hp.vocab * hp.hidden)?;
+            let embd_host = f32_tensor(
+                &st,
+                &format!("{lm}backbone.embeddings.weight"),
+                hp.vocab * hp.hidden,
+            )?;
             count(hp.vocab * hp.hidden * 4);
             TokEmbd::F32(up(&exec, embd_host)?)
         };
@@ -124,7 +137,7 @@ impl GpuNemotron {
         let mut cat_s: Vec<u8> = Vec::new();
 
         for li in 0..hp.n_layer {
-            let pfx = format!("backbone.layers.{li}");
+            let pfx = format!("{lm}backbone.layers.{li}");
             let norm = dt(
                 &exec,
                 f32_tensor(&st, &format!("{pfx}.norm.weight"), hp.hidden)?,
@@ -199,6 +212,36 @@ impl GpuNemotron {
                         d,
                         dt_bias,
                         norm_w,
+                    })
+                }
+                NemotronBlock::Attention
+                    if st
+                        .bytes(&format!("{pfx}.mixer.q_proj.weight_scale"))
+                        .is_some() =>
+                {
+                    // Super: ModelOpt FP8 projections - kept as e4m3 rows with
+                    // the per-tensor scale broadcast, like mamba in/out_proj
+                    let q_dim = hp.n_heads * hp.head_dim;
+                    let kv_dim = hp.n_kv_heads * hp.head_dim;
+                    let mut f8 =
+                        |name: &str, out: usize, inn: usize| -> Result<F8RowPlane, GpuModelError> {
+                            let v = fp8_view(&st, &format!("{pfx}.mixer.{name}")).map_err(|e| {
+                                GpuModelError::Unsupported(format!("{pfx} {name}: {e}"))
+                            })?;
+                            if (v.n, v.k) != (out, inn) {
+                                return Err(GpuModelError::Unsupported(format!(
+                                    "{pfx} {name} is [{}, {}], expected [{out}, {inn}]",
+                                    v.n, v.k
+                                )));
+                            }
+                            count(v.n * v.k + v.n * 4);
+                            Ok(exec.fp8_ckpt_to_f8row(v.weight, v.weight_scale, v.k, v.n)?)
+                        };
+                    Mixer::Attn(AttnWeights::F8 {
+                        wq: f8("q_proj", q_dim, hp.hidden)?,
+                        wk: f8("k_proj", kv_dim, hp.hidden)?,
+                        wv: f8("v_proj", kv_dim, hp.hidden)?,
+                        wo: f8("o_proj", hp.hidden, q_dim)?,
                     })
                 }
                 NemotronBlock::Attention => {
@@ -287,194 +330,11 @@ impl GpuNemotron {
                     })
                 }
                 NemotronBlock::Moe => {
-                    let router = dt(
-                        &exec,
-                        f32_tensor(
-                            &st,
-                            &format!("{pfx}.mixer.gate.weight"),
-                            hp.n_expert * hp.hidden,
-                        )?,
-                        vec![hp.hidden, hp.n_expert],
-                    )?;
-                    let bias = dt(
-                        &exec,
-                        f32_tensor(
-                            &st,
-                            &format!("{pfx}.mixer.gate.e_score_correction_bias"),
-                            hp.n_expert,
-                        )?,
-                        vec![hp.n_expert],
-                    )?;
-                    count(hp.n_expert * (hp.hidden + 1) * 4);
-
-                    // Shared-expert fold-: when shared_ff is a
-                    // clean multiple of moe_ff, the shared expert is also
-                    // registered as `ns` pseudo-experts appended to the
-                    // routed planes, so the batched path serves it inside
-                    // the one sorted-tile launch (the separate 1-block
-                    // shared pass measured 10-12% of the stream roof -
-                    // bench/nv4moe_bench.cu). up: a row split - rows are
-                    // independent through relu2 + the per-16-along-ff
-                    // requant (moe_ff % 16 == 0 keeps fq/fs blocks intact,
-                    // so shared fq bytes are identical to the 1-expert
-                    // pass). down: a K split - each pseudo-expert takes a
-                    // moe_ff-wide column slice and its output lands in its
-                    // own combine slot; the fixed-order slot_combine fold
-                    // is the sanctioned f32 regroup for the K sum.
-                    let ns_sh = if hp.shared_ff % hp.moe_ff == 0 && hp.moe_ff % 32 == 0 {
-                        hp.shared_ff / hp.moe_ff
-                    } else {
-                        0
-                    };
-                    // TILED-layout election: repack every
-                    // MoE plane to the piece-major 64x64 tile order and serve
-                    // the _st/_stw/_mtt consumer family (contiguous stages ->
-                    // 512 B-class loads; bench: pair 79-83% -> 92-94% of the
-                    // stream roof). Requires the full consumer set in the
-                    // pack (cc12), 64-aligned dims on every plane, and the
-                    // bs arm alive (the row-major kill switch reverts the
-                    // whole family coherently - a tiled plane with any
-                    // row-major reader left live would be silent garbage).
-                    let moe_tiled = exec.has_nvf4_moe_st()
-                        && hp.moe_ff % 64 == 0
-                        && hp.hidden % 64 == 0
-                        && hp.shared_ff % 64 == 0
-                        && paddock_models::dev_var_os!("PADDOCK_NO_NVF4_MOE_ST").is_none()
-                        && paddock_models::dev_var_os!("PADDOCK_NO_NVF4_MOE_BS").is_none();
-                    let mut moe_plane =
-                        |role: &str,
-                         rows: usize,
-                         in_dim: usize,
-                         sh_row_split: bool|
-                         -> Result<Nvf4MoePlane, GpuModelError> {
-                            cat_p.clear();
-                            cat_s.clear();
-                            let mut s2 = Vec::with_capacity(hp.n_expert + ns_sh);
-                            for e in 0..hp.n_expert {
-                                let v = nvfp4_view(&st, &format!("{pfx}.mixer.experts.{e}.{role}"))
-                                    .map_err(|err| {
-                                        GpuModelError::Unsupported(format!(
-                                            "{pfx} expert {e} {role}: {err}"
-                                        ))
-                                    })?;
-                                if (v.n, v.k) != (rows, in_dim) {
-                                    return Err(GpuModelError::Unsupported(format!(
-                                        "{pfx} expert {e} {role} is [{}, {}], expected [{rows}, {in_dim}]",
-                                        v.n, v.k
-                                    )));
-                                }
-                                cat_p.extend_from_slice(v.packed);
-                                cat_s.extend_from_slice(v.scales);
-                                s2.push(v.scale2);
-                            }
-                            let mut ne = hp.n_expert;
-                            if ns_sh > 0 {
-                                let v =
-                                    nvfp4_view(&st, &format!("{pfx}.mixer.shared_experts.{role}"))
-                                        .map_err(|e| {
-                                            GpuModelError::Unsupported(format!(
-                                                "{pfx} shared {role}: {e}"
-                                            ))
-                                        })?;
-                                let (want_n, want_k) = if sh_row_split {
-                                    (ns_sh * rows, in_dim)
-                                } else {
-                                    (rows, ns_sh * in_dim)
-                                };
-                                if (v.n, v.k) != (want_n, want_k) {
-                                    return Err(GpuModelError::Unsupported(format!(
-                                        "{pfx} shared {role} is [{}, {}], expected [{want_n}, {want_k}]",
-                                        v.n, v.k
-                                    )));
-                                }
-                                if sh_row_split {
-                                    // pseudo-experts are consecutive row spans -
-                                    // already contiguous in the checkpoint plane
-                                    cat_p.extend_from_slice(v.packed);
-                                    cat_s.extend_from_slice(v.scales);
-                                } else {
-                                    // K split: pseudo-expert h takes columns
-                                    // [h*in_dim, (h+1)*in_dim) of every row
-                                    let rb = in_dim / 2;
-                                    let sb = in_dim / 16;
-                                    let vrb = v.k / 2;
-                                    let vsb = v.k / 16;
-                                    for h in 0..ns_sh {
-                                        for r in 0..rows {
-                                            cat_p.extend_from_slice(
-                                                &v.packed[r * vrb + h * rb..r * vrb + (h + 1) * rb],
-                                            );
-                                            cat_s.extend_from_slice(
-                                                &v.scales[r * vsb + h * sb..r * vsb + (h + 1) * sb],
-                                            );
-                                        }
-                                    }
-                                }
-                                for _ in 0..ns_sh {
-                                    s2.push(v.scale2);
-                                }
-                                ne += ns_sh;
-                            }
-                            if moe_tiled {
-                                exec.nvf4_moe_upload_tiled(&cat_p, &cat_s, &s2, ne, rows, in_dim)
-                            } else {
-                                exec.nvf4_moe_upload(&cat_p, &cat_s, &s2, ne, rows, in_dim)
-                            }
-                            .map_err(GpuModelError::from)
-                        };
-                    let up_pl = moe_plane("up_proj", hp.moe_ff, hp.hidden, true)?;
-                    let down_pl = moe_plane("down_proj", hp.hidden, hp.moe_ff, false)?;
-                    count(hp.n_expert * (hp.moe_ff * hp.hidden + hp.moe_ff * hp.hidden / 8));
-                    if ns_sh > 0 {
-                        // the fold-in's appended shared copies (the shared
-                        // planes below stay resident too, for the r=1 path)
-                        count(hp.shared_ff * hp.hidden + hp.shared_ff * hp.hidden / 8);
-                        moe_foldin_bytes +=
-                            (hp.shared_ff * hp.hidden + hp.shared_ff * hp.hidden / 8) as u64;
-                    }
-
-                    let sh_plane = |role: &str,
-                                    rows: usize,
-                                    in_dim: usize|
-                     -> Result<Nvf4MoePlane, GpuModelError> {
-                        let v = nvfp4_view(&st, &format!("{pfx}.mixer.shared_experts.{role}"))
-                            .map_err(|e| {
-                                GpuModelError::Unsupported(format!("{pfx} shared {role}: {e}"))
-                            })?;
-                        if (v.n, v.k) != (rows, in_dim) {
-                            return Err(GpuModelError::Unsupported(format!(
-                                "{pfx} shared {role} is [{}, {}], expected [{rows}, {in_dim}]",
-                                v.n, v.k
-                            )));
-                        }
-                        if moe_tiled {
-                            exec.nvf4_moe_upload_tiled(
-                                v.packed,
-                                v.scales,
-                                &[v.scale2],
-                                1,
-                                rows,
-                                in_dim,
-                            )
-                        } else {
-                            exec.nvf4_moe_upload(v.packed, v.scales, &[v.scale2], 1, rows, in_dim)
-                        }
-                        .map_err(GpuModelError::from)
-                    };
-                    let sh_up = sh_plane("up_proj", hp.shared_ff, hp.hidden)?;
-                    let sh_down = sh_plane("down_proj", hp.hidden, hp.shared_ff)?;
-                    count(hp.shared_ff * hp.hidden + hp.shared_ff * hp.hidden / 8);
-
-                    Mixer::Moe(MoeWeights {
-                        router,
-                        bias,
-                        planes: MoePlanes::Nvf4 {
-                            up: up_pl,
-                            down: down_pl,
-                            sh_up,
-                            sh_down,
-                        },
-                    })
+                    let (moe, b, fb) =
+                        load_nvf4_moe(&exec, &st, &hp, &pfx, &mut cat_p, &mut cat_s)?;
+                    count(b as usize);
+                    moe_foldin_bytes += fb;
+                    Mixer::Moe(moe)
                 }
             };
             layers.push(NemotronLayer { norm, mixer });
@@ -482,42 +342,105 @@ impl GpuNemotron {
 
         let final_norm = dt(
             &exec,
-            f32_tensor(&st, "backbone.norm_f.weight", hp.hidden)?,
+            f32_tensor(&st, &format!("{lm}backbone.norm_f.weight"), hp.hidden)?,
             vec![hp.hidden],
         )?;
-        let lh = nvfp4_view(&st, "lm_head")
-            .map_err(|e| GpuModelError::Unsupported(format!("lm_head: {e}")))?;
-        if (lh.n, lh.k) != (hp.vocab, hp.hidden) {
-            return Err(GpuModelError::Unsupported(format!(
-                "lm_head is [{}, {}]",
-                lh.n, lh.k
-            )));
-        }
-        // lm_head residency election: FRAGMENT
-        // order first - the tile-major blocks additionally permuted into
-        // mma-fragment order, which puts the tensor-core head at marlin
-        // parity on the kernel (probe 159.2 us b32 / 144.2 b8) - then
-        // TILE-MAJOR, then row-major. Every twin set is bit-exact per class
-        // vs the row-major family, and the head is the only non-row plane -
-        // every other NVFP4 residency stays row-major. Kill switches:
-        // PADDOCK_NO_NVF4_TF drops to the tiled lane, PADDOCK_NO_NVF4_TM to
-        // row-major (so the whole prior election tree stays reachable).
-        let k_ok = lh.k % 128 == 0;
-        let tf = exec.has_nvf4_tf()
-            && k_ok
-            && paddock_models::dev_var_os!("PADDOCK_NO_NVF4_TF").is_none();
-        let tm = exec.has_nvf4_tm()
-            && k_ok
-            && paddock_models::dev_var_os!("PADDOCK_NO_NVF4_TM").is_none();
-        let lm_head = HeadW::Nvf4(if tf {
-            exec.nvf4_upload_frag(lh.packed, lh.scales, lh.scale2, lh.n, lh.k)?
-        } else if tm {
-            exec.nvf4_upload_tiled(lh.packed, lh.scales, lh.scale2, lh.n, lh.k)?
+        let head_name = format!("{lm}lm_head");
+        // Super ships an FP8 head (weight_scale, no weight_scale_2)
+        let fp8_head = st.bytes(&format!("{head_name}.weight_scale")).is_some()
+            && st.bytes(&format!("{head_name}.weight_scale_2")).is_none();
+        let lm_head = if fp8_head {
+            let v = fp8_view(&st, &head_name)
+                .map_err(|e| GpuModelError::Unsupported(format!("lm_head: {e}")))?;
+            if (v.n, v.k) != (hp.vocab, hp.hidden) {
+                return Err(GpuModelError::Unsupported(format!(
+                    "lm_head is [{}, {}]",
+                    v.n, v.k
+                )));
+            }
+            count(v.n * v.k + v.n * 4 + hp.hidden * 4);
+            HeadW::F8(exec.fp8_ckpt_to_f8row(v.weight, v.weight_scale, v.k, v.n)?)
         } else {
-            exec.nvf4_upload(lh.packed, lh.scales, lh.scale2, lh.n, lh.k)?
-        });
-        count(lh.n * lh.k / 2 + lh.n * lh.k / 16 + hp.hidden * 4);
+            Self::nvf4_head(&exec, &st, &head_name, &hp, &mut count)?
+        };
 
+        // Super's in-file MTP: `mtp.layers.0` = eh_proj / enorm / hnorm + the
+        // attention sublayer, `.1` = the latent MoE sublayer + its
+        // final_layernorm (vLLM's nemotron_h_mtp, pattern "*E"). The drafter
+        // on this lane; PADDOCK_NO_SPEC leaves it unloaded.
+        let mtp_pfx = format!("{lm}mtp.layers");
+        let mtp = if hp.mtp_layers == 0
+            || hp.latent.is_none()
+            || st.bytes(&format!("{mtp_pfx}.0.eh_proj.weight")).is_none()
+        {
+            None
+        } else if std::env::var_os("PADDOCK_NO_SPEC").is_some() {
+            tracing::info!("nemotron: PADDOCK_NO_SPEC - the MTP block left unloaded");
+            None
+        } else {
+            let (p0, p1) = (format!("{mtp_pfx}.0"), format!("{mtp_pfx}.1"));
+            let norm = |name: String| -> Result<DeviceTensor, GpuModelError> {
+                Ok(dt(
+                    &exec,
+                    f32_tensor(&st, &name, hp.hidden)?,
+                    vec![hp.hidden],
+                )?)
+            };
+            let bf16 = |name: String, out: usize, inn: usize| {
+                let raw = bf16_bytes(&st, &format!("{name}.weight"), out * inn)?;
+                Ok::<_, GpuModelError>(super::mtp::MtpProj::Bf16(QuantTensor {
+                    bytes: exec.to_device_u8(raw)?,
+                    ty: GgmlType::Bf16,
+                    dims: vec![inn, out],
+                }))
+            };
+            let q_dim = hp.n_heads * hp.head_dim;
+            let kv_dim = hp.n_kv_heads * hp.head_dim;
+            let eh_proj = bf16(format!("{p0}.eh_proj"), hp.hidden, 2 * hp.hidden)?;
+            let attn = super::mtp::MtpAttn {
+                wq: bf16(format!("{p0}.mixer.q_proj"), q_dim, hp.hidden)?,
+                wk: bf16(format!("{p0}.mixer.k_proj"), kv_dim, hp.hidden)?,
+                wv: bf16(format!("{p0}.mixer.v_proj"), kv_dim, hp.hidden)?,
+                wo: bf16(format!("{p0}.mixer.o_proj"), hp.hidden, q_dim)?,
+            };
+            let (moe, b, _) = load_nvf4_moe(&exec, &st, &hp, &p1, &mut cat_p, &mut cat_s)?;
+            count(
+                b as usize
+                    + (2 * hp.hidden * hp.hidden + 2 * q_dim * hp.hidden + 2 * kv_dim * hp.hidden)
+                        * 2
+                    + 5 * hp.hidden * 4,
+            );
+            tracing::info!("nemotron: in-file MTP block loaded (attention + latent MoE)");
+            Some(super::mtp::MtpDrafter {
+                w: super::mtp::MtpWeights {
+                    enorm: norm(format!("{p0}.enorm.weight"))?,
+                    hnorm: norm(format!("{p0}.hnorm.weight"))?,
+                    eh_proj,
+                    attn_norm: norm(format!("{p0}.norm.weight"))?,
+                    attn,
+                    post_norm: norm(format!("{p1}.norm.weight"))?,
+                    moe,
+                    head_norm: norm(format!("{p1}.final_layernorm.weight"))?,
+                },
+                state: None,
+            })
+        };
+
+        // Super VL: the picture tower + projector beside the language model
+        let mut vision = if hp.omni {
+            super::vision::SuperVision::load(exec.clone(), &st, dir, hp.hidden)?
+        } else {
+            None
+        };
+        if let Some(v) = vision.as_mut() {
+            v.reserve()?;
+            weights_bytes += v.weight_bytes;
+            tracing::info!(
+                tower_gib = v.weight_bytes as f64 / (1u64 << 30) as f64,
+                workspace_gib = v.workspace_bytes() as f64 / (1u64 << 30) as f64,
+                "nemotron: Super VL picture tower + projector loaded"
+            );
+        }
         let ssm_dtype = super::ssm_arena::ssm_dtype_from_env();
         // label-must-reflect-configuration: stamp the elected MoE plane layout
         let moe_layout = layers.iter().find_map(|l| match &l.mixer {
@@ -566,11 +489,56 @@ impl GpuNemotron {
             pipe_b: None,
             dflash: None,
             stop: Default::default(),
-            // the NVFP4 checkpoint's mtp.* planes are bf16 - a residency
-            // class the expert enums don't carry; the NVFP4 lane's drafter
-            // is DFlash (attach via --mtp)
-            mtp: None,
+            // Lightning's NVFP4 checkpoint ships its mtp.* experts in bf16 -
+            // a residency class the expert enums don't carry, so its drafter
+            // is DFlash (attach via --mtp); Super's are NVFP4 (above)
+            mtp,
+            vision,
+            mm: None,
         })
+    }
+
+    /// The NVFP4 lm_head (Lightning), in its elected tile layout.
+    fn nvf4_head(
+        exec: &GpuExecutor,
+        st: &ShardedSafetensors,
+        name: &str,
+        hp: &NemotronConfig,
+        count: &mut impl FnMut(usize),
+    ) -> Result<HeadW, GpuModelError> {
+        let lh = nvfp4_view(st, name)
+            .map_err(|e| GpuModelError::Unsupported(format!("lm_head: {e}")))?;
+        if (lh.n, lh.k) != (hp.vocab, hp.hidden) {
+            return Err(GpuModelError::Unsupported(format!(
+                "lm_head is [{}, {}]",
+                lh.n, lh.k
+            )));
+        }
+        // lm_head residency election: FRAGMENT
+        // order first - the tile-major blocks additionally permuted into
+        // mma-fragment order, which puts the tensor-core head at marlin
+        // parity on the kernel (probe 159.2 us b32 / 144.2 b8) - then
+        // TILE-MAJOR, then row-major. Every twin set is bit-exact per class
+        // vs the row-major family, and the head is the only non-row plane -
+        // every other NVFP4 residency stays row-major. Kill switches:
+        // PADDOCK_NO_NVF4_TF drops to the tiled lane, PADDOCK_NO_NVF4_TM to
+        // row-major (so the whole prior election tree stays reachable).
+        let k_ok = lh.k % 128 == 0;
+        let tf = exec.has_nvf4_tf()
+            && k_ok
+            && paddock_models::dev_var_os!("PADDOCK_NO_NVF4_TF").is_none();
+        let tm = exec.has_nvf4_tm()
+            && k_ok
+            && paddock_models::dev_var_os!("PADDOCK_NO_NVF4_TM").is_none();
+        let head = HeadW::Nvf4(if tf {
+            exec.nvf4_upload_frag(lh.packed, lh.scales, lh.scale2, lh.n, lh.k)?
+        } else if tm {
+            exec.nvf4_upload_tiled(lh.packed, lh.scales, lh.scale2, lh.n, lh.k)?
+        } else {
+            exec.nvf4_upload(lh.packed, lh.scales, lh.scale2, lh.n, lh.k)?
+        });
+        count(lh.n * lh.k / 2 + lh.n * lh.k / 16 + hp.hidden * 4);
+        Ok(head)
     }
 
     /// Load the unsloth Q8_0 GGUF (the second lane on the same
@@ -775,6 +743,7 @@ impl GpuNemotron {
                             sh_up,
                             sh_down,
                         },
+                        latent: None,
                     })
                 }
             };
@@ -874,9 +843,14 @@ impl GpuNemotron {
                 w: super::mtp::MtpWeights {
                     enorm,
                     hnorm,
-                    eh_proj,
+                    eh_proj: super::mtp::MtpProj::Qw(eh_proj),
                     attn_norm,
-                    attn: AttnWeights::Qw { wq, wk, wv, wo },
+                    attn: super::mtp::MtpAttn {
+                        wq: super::mtp::MtpProj::Qw(wq),
+                        wk: super::mtp::MtpProj::Qw(wk),
+                        wv: super::mtp::MtpProj::Qw(wv),
+                        wo: super::mtp::MtpProj::Qw(wo),
+                    },
                     post_norm,
                     moe: MoeWeights {
                         router,
@@ -887,6 +861,7 @@ impl GpuNemotron {
                             sh_up,
                             sh_down,
                         },
+                        latent: None,
                     },
                     head_norm,
                 },
@@ -932,6 +907,8 @@ impl GpuNemotron {
             dflash: None,
             stop: Default::default(),
             mtp,
+            vision: None,
+            mm: None,
         })
     }
 
@@ -979,4 +956,241 @@ impl GpuNemotron {
 /// to f16 (serving.rs), and an explicit kv_cache_dtype wins.
 pub(crate) fn default_kv_dtype() -> KvDtype {
     KvDtype::Fp8E4m3
+}
+
+/// One NVFP4 MoE mixer under `pfx` (a trunk layer, or Super's MTP block's
+/// MoE sublayer): router + bias, the routed planes (shared fold-in and tiled
+/// layout where elected), the shared expert, and the latent projections when
+/// the config has them. Returns the mixer, the bytes it made resident, and
+/// the fold-in's share of them. `cat_p` / `cat_s` are the caller's reusable
+/// staging buffers.
+fn load_nvf4_moe(
+    exec: &Arc<GpuExecutor>,
+    st: &ShardedSafetensors,
+    hp: &NemotronConfig,
+    pfx: &str,
+    cat_p: &mut Vec<u8>,
+    cat_s: &mut Vec<u8>,
+) -> Result<(MoeWeights, u64, u64), GpuModelError> {
+    let bytes = std::cell::Cell::new(0u64);
+    let count_b = |b: usize| bytes.set(bytes.get() + b as u64);
+    let mut foldin = 0u64;
+    let dt =
+        |exec: &GpuExecutor, v: Vec<f32>, dims: Vec<usize>| -> Result<DeviceTensor, GpuError> {
+            Ok(DeviceTensor {
+                buf: exec.to_device(&v)?,
+                dims,
+            })
+        };
+    let router = dt(
+        exec,
+        f32_tensor(
+            st,
+            &format!("{pfx}.mixer.gate.weight"),
+            hp.n_expert * hp.hidden,
+        )?,
+        vec![hp.hidden, hp.n_expert],
+    )?;
+    let bias = dt(
+        exec,
+        f32_tensor(
+            st,
+            &format!("{pfx}.mixer.gate.e_score_correction_bias"),
+            hp.n_expert,
+        )?,
+        vec![hp.n_expert],
+    )?;
+    count_b(hp.n_expert * (hp.hidden + 1) * 4);
+
+    // Shared-expert fold-: when shared_ff is a
+    // clean multiple of moe_ff, the shared expert is also
+    // registered as `ns` pseudo-experts appended to the
+    // routed planes, so the batched path serves it inside
+    // the one sorted-tile launch (the separate 1-block
+    // shared pass measured 10-12% of the stream roof -
+    // bench/nv4moe_bench.cu). up: a row split - rows are
+    // independent through relu2 + the per-16-along-ff
+    // requant (moe_ff % 16 == 0 keeps fq/fs blocks intact,
+    // so shared fq bytes are identical to the 1-expert
+    // pass). down: a K split - each pseudo-expert takes a
+    // moe_ff-wide column slice and its output lands in its
+    // own combine slot; the fixed-order slot_combine fold
+    // is the sanctioned f32 regroup for the K sum.
+    // LatentMoE: the shared expert reads the hidden and the
+    // routed experts the latent - no fold-in
+    let ns_sh = if hp.latent.is_none()
+        && hp.shared_ff.is_multiple_of(hp.moe_ff)
+        && hp.moe_ff.is_multiple_of(32)
+    {
+        hp.shared_ff / hp.moe_ff
+    } else {
+        0
+    };
+    // TILED-layout election: repack every
+    // MoE plane to the piece-major 64x64 tile order and serve
+    // the _st/_stw/_mtt consumer family (contiguous stages ->
+    // 512 B-class loads; bench: pair 79-83% -> 92-94% of the
+    // stream roof). Requires the full consumer set in the
+    // pack (cc12), 64-aligned dims on every plane, and the
+    // bs arm alive (the row-major kill switch reverts the
+    // whole family coherently - a tiled plane with any
+    // row-major reader left live would be silent garbage).
+    // LatentMoE rides it too where the pack carries the W16 pair (its decode
+    // rows' class on the tiled planes) and the W4A4 pair is on: prompt rows
+    // take the tiled W4A4 twin, decode rows W16, one-row passes the r=1 twins
+    let moe_tiled = exec.has_nvf4_moe_st()
+        && (hp.latent.is_none()
+            || (exec.has_nvf4_moe_w16()
+                && super::latent_mma_on(exec)
+                && hp.expert_in().is_multiple_of(64)
+                && paddock_models::dev_var_os!("PADDOCK_NO_LATENT_TILED").is_none()))
+        && hp.moe_ff.is_multiple_of(64)
+        && hp.hidden.is_multiple_of(64)
+        && hp.shared_ff.is_multiple_of(64)
+        && paddock_models::dev_var_os!("PADDOCK_NO_NVF4_MOE_ST").is_none()
+        && paddock_models::dev_var_os!("PADDOCK_NO_NVF4_MOE_BS").is_none();
+    let mut moe_plane = |role: &str,
+                         rows: usize,
+                         in_dim: usize,
+                         sh_row_split: bool|
+     -> Result<Nvf4MoePlane, GpuModelError> {
+        cat_p.clear();
+        cat_s.clear();
+        let mut s2 = Vec::with_capacity(hp.n_expert + ns_sh);
+        for e in 0..hp.n_expert {
+            let v = nvfp4_view(st, &format!("{pfx}.mixer.experts.{e}.{role}")).map_err(|err| {
+                GpuModelError::Unsupported(format!("{pfx} expert {e} {role}: {err}"))
+            })?;
+            if (v.n, v.k) != (rows, in_dim) {
+                return Err(GpuModelError::Unsupported(format!(
+                    "{pfx} expert {e} {role} is [{}, {}], expected [{rows}, {in_dim}]",
+                    v.n, v.k
+                )));
+            }
+            cat_p.extend_from_slice(v.packed);
+            cat_s.extend_from_slice(v.scales);
+            s2.push(v.scale2);
+        }
+        let mut ne = hp.n_expert;
+        if ns_sh > 0 {
+            let v = nvfp4_view(st, &format!("{pfx}.mixer.shared_experts.{role}"))
+                .map_err(|e| GpuModelError::Unsupported(format!("{pfx} shared {role}: {e}")))?;
+            let (want_n, want_k) = if sh_row_split {
+                (ns_sh * rows, in_dim)
+            } else {
+                (rows, ns_sh * in_dim)
+            };
+            if (v.n, v.k) != (want_n, want_k) {
+                return Err(GpuModelError::Unsupported(format!(
+                    "{pfx} shared {role} is [{}, {}], expected [{want_n}, {want_k}]",
+                    v.n, v.k
+                )));
+            }
+            if sh_row_split {
+                // pseudo-experts are consecutive row spans -
+                // already contiguous in the checkpoint plane
+                cat_p.extend_from_slice(v.packed);
+                cat_s.extend_from_slice(v.scales);
+            } else {
+                // K split: pseudo-expert h takes columns
+                // [h*in_dim, (h+1)*in_dim) of every row
+                let rb = in_dim / 2;
+                let sb = in_dim / 16;
+                let vrb = v.k / 2;
+                let vsb = v.k / 16;
+                for h in 0..ns_sh {
+                    for r in 0..rows {
+                        cat_p
+                            .extend_from_slice(&v.packed[r * vrb + h * rb..r * vrb + (h + 1) * rb]);
+                        cat_s
+                            .extend_from_slice(&v.scales[r * vsb + h * sb..r * vsb + (h + 1) * sb]);
+                    }
+                }
+            }
+            for _ in 0..ns_sh {
+                s2.push(v.scale2);
+            }
+            ne += ns_sh;
+        }
+        if moe_tiled {
+            exec.nvf4_moe_upload_tiled(cat_p, cat_s, &s2, ne, rows, in_dim)
+        } else {
+            exec.nvf4_moe_upload(cat_p, cat_s, &s2, ne, rows, in_dim)
+        }
+        .map_err(GpuModelError::from)
+    };
+    let ein = hp.expert_in();
+    let up_pl = moe_plane("up_proj", hp.moe_ff, ein, true)?;
+    let down_pl = moe_plane("down_proj", ein, hp.moe_ff, false)?;
+    count_b(hp.n_expert * (hp.moe_ff * ein + hp.moe_ff * ein / 8));
+    if ns_sh > 0 {
+        // the fold-in's appended shared copies (the shared
+        // planes below stay resident too, for the r=1 path)
+        count_b(hp.shared_ff * hp.hidden + hp.shared_ff * hp.hidden / 8);
+        foldin += (hp.shared_ff * hp.hidden + hp.shared_ff * hp.hidden / 8) as u64;
+    }
+
+    let sh_plane =
+        |role: &str, rows: usize, in_dim: usize| -> Result<Nvf4MoePlane, GpuModelError> {
+            let v = nvfp4_view(st, &format!("{pfx}.mixer.shared_experts.{role}"))
+                .map_err(|e| GpuModelError::Unsupported(format!("{pfx} shared {role}: {e}")))?;
+            if (v.n, v.k) != (rows, in_dim) {
+                return Err(GpuModelError::Unsupported(format!(
+                    "{pfx} shared {role} is [{}, {}], expected [{rows}, {in_dim}]",
+                    v.n, v.k
+                )));
+            }
+            if moe_tiled {
+                exec.nvf4_moe_upload_tiled(v.packed, v.scales, &[v.scale2], 1, rows, in_dim)
+            } else {
+                exec.nvf4_moe_upload(v.packed, v.scales, &[v.scale2], 1, rows, in_dim)
+            }
+            .map_err(GpuModelError::from)
+        };
+    let sh_up = sh_plane("up_proj", hp.shared_ff, hp.hidden)?;
+    let sh_down = sh_plane("down_proj", hp.hidden, hp.shared_ff)?;
+    count_b(hp.shared_ff * hp.hidden + hp.shared_ff * hp.hidden / 8);
+
+    // LatentMoE projections: bf16 in the checkpoint (ModelOpt
+    // leaves them out of the quantization), kept bf16 - the
+    // bf16 GEMM/GEMV widen each weight exactly against f32
+    // activations, so the planes cost half the bytes of an
+    // f32 copy for the same products
+    let latent = match hp.latent {
+        Some(l) => {
+            let proj = |name: &str, out: usize, inn: usize| {
+                let raw = crate::gpu_model::st_load::bf16_bytes(
+                    st,
+                    &format!("{pfx}.mixer.{name}.weight"),
+                    out * inn,
+                )?;
+                Ok::<_, GpuModelError>(crate::gpu::QuantTensor {
+                    bytes: exec.to_device_u8(raw)?,
+                    ty: paddock_models::ggml_type::GgmlType::Bf16,
+                    dims: vec![inn, out],
+                })
+            };
+            count_b(2 * l * hp.hidden * 2);
+            Some(LatentProj {
+                fc1: proj("fc1_latent_proj", l, hp.hidden)?,
+                fc2: proj("fc2_latent_proj", hp.hidden, l)?,
+            })
+        }
+        None => None,
+    };
+    Ok((
+        MoeWeights {
+            router,
+            bias,
+            planes: MoePlanes::Nvf4 {
+                up: up_pl,
+                down: down_pl,
+                sh_up,
+                sh_down,
+            },
+            latent,
+        },
+        bytes.get(),
+        foldin,
+    ))
 }

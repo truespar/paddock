@@ -281,7 +281,7 @@ const noTools = computed(() => !!cfg.value && !webProvider.value && !mcpLabels.v
           </span>
         </div>
         <div class="sd__actions">
-          <button v-if="!row.diarization && !row.segmenter" class="pk-btn pk-btn--sm" @click="openInStudio">
+          <button v-if="!row.diarization && !row.speech && !row.segmenter" class="pk-btn pk-btn--sm" @click="openInStudio">
             <Icon name="external-link" :size="13" /> Open in Studio
           </button>
           <RouterLink

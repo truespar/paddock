@@ -32,6 +32,7 @@
 
 pub mod accounting;
 pub mod catalog;
+pub(crate) mod census;
 pub mod cold;
 pub mod cost;
 pub mod digest;
@@ -49,6 +50,8 @@ pub mod pool_tier;
 pub mod ram_transport;
 #[cfg(feature = "cuda")]
 pub mod restore_flow;
+#[cfg(feature = "cuda")]
+mod t2_reads;
 pub mod transport;
 
 #[cfg(test)]
@@ -65,7 +68,7 @@ pub use pool_tier::{PoolTier, RestoreWake, TierHit, XferSink};
 #[cfg(feature = "cuda")]
 pub use ram_transport::{PlaneDesc, RamTransport, XferSpec};
 #[cfg(feature = "cuda")]
-pub use restore_flow::{AuxPlan, FlowStatus, RestoreFlow};
+pub use restore_flow::{AuxPlan, ConsultTry, FlowStatus, RestoreFlow};
 pub use transport::{FakeTransport, IoCompletion, IoJob, TierTransport};
 
 /// Backend-independent cache-tier telemetry consumed by the serving API.
@@ -83,6 +86,8 @@ pub struct TierStats {
     pub stale_completions: u64,
     /// T2 payload bytes written this UTC day (endurance budget).
     pub t2_written_day_bytes: u64,
+    /// The day's T2 write budget (0: no disk tier).
+    pub t2_day_budget_bytes: u64,
 }
 
 /// An off-GPU storage tier. v1 ships exactly these two; remote/cluster tiers

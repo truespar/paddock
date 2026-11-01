@@ -69,11 +69,15 @@ mod nemotron_asr;
 mod nemotron_embed;
 pub use nemotron_embed::{NE_EMB_PIC, NE_PATCH_K, NE_TILE_SHIFT, ne_attn_rows};
 mod nemotron_parse;
+mod nemotron_vl;
+mod phonon;
 pub use mamba::mamba2_keep_row;
 pub use nemotron_asr::{
     NASR_JOBS, NASR_PART_BYTES, NASR_STATE_BYTES, NasrDecoderWeights, NasrEpi, NasrJob, NasrSeg,
     nasr_bytes,
 };
+pub use nemotron_vl::ResampleAxis;
+pub use phonon::{PhEpi, PhExtra, PhHint, PhPro, PhRope, PhWeight};
 mod moe_bs;
 mod moe_mxfp4;
 mod moe_q8;

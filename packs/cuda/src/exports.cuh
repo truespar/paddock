@@ -2044,6 +2044,21 @@ static const KernelTableV1 PD_KERNELS = {
     pd_ne_attn,
     pd_ne_pool,
     pd_ne_add_rms_h,
+    pd_moe_topk_sigmoid_batch_wide,
+    pd_nvl_resample,
+    pd_nvl_patchify_h,
+    pd_nvl_pos_add,
+    pd_nvl_relu2,
+    pd_ph_linear,
+    pd_ph_rope_kv,
+    pd_ph_attn,
+    pd_ph_layernorm,
+    pd_ph_point,
+    pd_ph_im2col,
+    pd_ph_history,
+    pd_ph_upsample,
+    pd_ph_conv,
+    pd_ph_conv_gemm,
 };
 
 PD_EXPORT const PackInfo* paddock_pack_info(void) {

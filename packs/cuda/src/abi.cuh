@@ -4283,6 +4283,46 @@ struct KernelTableV1 {
     // 902: ne_add_rms_h (x, proj, w, out16, rows, d, eps, stream) - x += proj over [rows][d] f32,
     // then (w non-null) out16 = 897's RMSNorm of the updated rows; d in {1024, 2048, 4096}
     int (*ne_add_rms_h)(void*, const void*, const void*, void*, uint32_t, uint32_t, float, void*);
+    // 903: moe_topk_sigmoid_batch_wide (moe_topk_sigmoid_batch's arguments) - the sigmoid +
+    // correction-bias router past 256 experts / top-16: up to 512 experts, top-32 (Nemotron
+    // 3.5 Super: 512, top-22); same picks and weights as moe_topk_sigmoid_batch where both fit
+    int (*moe_topk_sigmoid_batch_wide)(const void*, const void*, float, uint32_t, uint32_t,
+                                       void*, void*, uint32_t, void*);
+    // 904: nvl_resample (src, dst, src_u8, lines, in, out, horiz, xmin, xsize, w, taps, ch,
+    // stream) - one separable pass of torch's float antialiased bicubic over interleaved rows,
+    // the per-output taps + f32 weights supplied (Nemotron 3.5 Super VL's processor)
+    int (*nvl_resample)(const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                        const void*, const void*, const void*, uint32_t, uint32_t, void*);
+    // 905: nvl_patchify_h (img, out, h, w, p, m0, m1, m2, s0, s1, s2, stream) - f32 HWC
+    // (0..255) -> (v / 255 - mean) / std, p x p patches flattened (c, ky, kx), f16 rows
+    int (*nvl_patchify_h)(const void*, void*, uint32_t, uint32_t, uint32_t, float, float, float,
+                          float, float, float, void*);
+    // 906: nvl_pos_add (x, grid, g, m, hp, wp, d, stream) - RADIO's cropped position field: the
+    // g x g grid bilinearly resized to m x m (align_corners=False), its top-left hp x wp added
+    int (*nvl_pos_add)(void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                       void*);
+    // 907: nvl_relu2 (x, n, stream) - relu(x)^2 in place, f32
+    int (*nvl_relu2)(void*, uint64_t, void*);
+    // 908: ph_linear (x, ln_w, ln_b, mod, w, w_bf16, bias, res, gate, y, rows, in, out, eps, pro, epi, kc, vc, pos_dev, pos0, cap, esplit, hint, stream) - Phonon's one-row-class linear (GEMV): y = epi(W prologue(x) + b) over BF16 or F32 weights, F32 math; prologue none / LayerNorm / LayerNorm (+affine) with adaLN modulation, epilogue none / +res / GELU-erf / SiLU / res + gate * v / the qkv rope with K/V cache writes; outputs from esplit on take no epilogue; hint = the weights' L2 policy
+    int (*ph_linear)(const void*, const void*, const void*, const void*, const void*, uint32_t, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, float, uint32_t, uint32_t, void*, void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 909: ph_rope_kv (qkv, q, kc, vc, pos_dev, pos0, rows, cap, stream) - Phonon's RoPE (interleaved pairs, theta 1e4, 8 heads x 64) on q/k, k/v into ring caches [cap][512] at the device-held position
+    int (*ph_rope_kv)(const void*, void*, void*, void*, const void*, uint32_t, uint32_t, uint32_t, void*);
+    // 910: ph_attn (q, kc, vc, part, out, ctr, pos_dev, pos0, rows, cap, window, nsplit, stream) - Phonon's causal (optionally windowed) attention over the f32 ring caches, 64-key splits merged by each head's last block (ticket in ctr)
+    int (*ph_attn)(const void*, const void*, const void*, void*, void*, void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 911: ph_layernorm (x, w, b, y, rows, d, eps, stream) - Phonon's LayerNorm rows (the wide passes' GEMM inputs)
+    int (*ph_layernorm)(const void*, const void*, const void*, void*, uint32_t, uint32_t, float, void*);
+    // 912: ph_point (a, b, y, n, period, mode, alpha, stream) - Phonon's elementwise ops: a + alpha * b (broadcast), ELU, SiLU(a + b), a * std + mean, cos/sin, y + b * a
+    int (*ph_point)(const void*, const void*, void*, uint64_t, uint32_t, uint32_t, float, void*);
+    // 913: ph_im2col (x, hist, y, rows, c, k, elu, stream) - Mimi's causal conv input rows for a GEMM: k taps side by side over [hist ; x], optional ELU
+    int (*ph_im2col)(const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 914: ph_history (x, hist, rows, c, keep, stream) - the conv history update: the last `keep` raw rows of [hist ; x]
+    int (*ph_history)(const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+    // 915: ph_upsample (x, hist, w, y, frames, stream) - Mimi's depthwise x16 upsample (conv_transpose1d, width 32, groups 512), streamed
+    int (*ph_upsample)(const void*, const void*, const void*, void*, uint32_t, void*);
+    // 916: ph_conv (x, hist, w, bias, y, rows, cin, n, k, elu, resid, stream) - Mimi's narrow causal conv straight from its input rows (no im2col plane): rows staged once a tile with their history, ELU applied; weights [n][k cin]; optional residual accumulate
+    int (*ph_conv)(const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 917: ph_conv_gemm (x, w, bias, y, rows, cin, n, k, resid, stream) - Mimi's causal conv as the 3xTF32 GEMM (698) reading its im2col rows in place: x = [k - 1 history rows ; rows] at pitch cin, weights [n][k cin]; optional residual accumulate
+    int (*ph_conv_gemm)(const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
 };
 
 } // extern "C"

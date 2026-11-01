@@ -136,7 +136,9 @@ fn is_single_pass(capability: &str) -> bool {
 /// picture, not a token window); the encoder capabilities share `Encoder`;
 /// everything else decodes.
 pub(crate) fn kind_for(capabilities: &[String]) -> ModelKind {
-    if capabilities.iter().any(|c| c == "image-generation") {
+    if capabilities.iter().any(|c| c == "audio_generation") {
+        ModelKind::Speech
+    } else if capabilities.iter().any(|c| c == "image-generation") {
         ModelKind::Image
     } else if capabilities.iter().any(|c| is_single_pass(c)) {
         ModelKind::Encoder
@@ -1213,7 +1215,7 @@ mod tests {
                     && shape.kv_layers.is_empty();
                 assert_eq!(
                     no_decode,
-                    single || transducer,
+                    single || transducer || m.capability.iter().any(|c| c == "audio_generation"),
                     "{}/{}: capability {:?} but shape kind {:?}",
                     m.id,
                     a.id,

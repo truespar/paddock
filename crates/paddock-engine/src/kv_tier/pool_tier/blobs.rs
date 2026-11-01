@@ -86,7 +86,7 @@ impl<T: XferSink> PoolTier<T> {
 
     /// The same keys straight from a prompt's tokens (a restore that has no
     /// radix path to read them off).
-    fn token_run_keys(&self, tokens: &[u32], end_block: usize) -> Vec<LogicalKey> {
+    pub(super) fn token_run_keys(&self, tokens: &[u32], end_block: usize) -> Vec<LogicalKey> {
         let r = self.run_blocks;
         let mut key = self.ns_root;
         let mut out = Vec::with_capacity(end_block / r);
@@ -150,19 +150,28 @@ impl<T: XferSink> PoolTier<T> {
 
     // -- eviction order ----------------------------------------------------
 
-    /// T1 blobs in eviction order: dominated ones first (a deeper blob is
-    /// bound to this one's last run - its key - so it owns that run too),
-    /// then the rest, least recently used first within each class.
+    /// T1 blobs in eviction order, least recently used first within each
+    /// class: superseded ones (a deeper blob over the same chain serves the
+    /// next turn; one where chains branch is not superseded - every new
+    /// session on that prefix resumes there), then ones the disk holds whole
+    /// (eviction costs only RAM speed), then the rest - state that exists
+    /// nowhere else yet, which the durability plan writes once it idles.
     pub(super) fn blob_victims(&self) -> Vec<LogicalKey> {
-        let mut v: Vec<(bool, u64, LogicalKey)> = self
+        let mut v: Vec<(u8, u64, LogicalKey)> = self
             .aux_meta
             .iter()
             .map(|(k, m)| {
-                let dominated = self.run_owners.get(k).is_some_and(|&n| n >= 2);
-                (!dominated, m.last_used, *k)
+                let class = if !self.blob_worth_keeping(k) {
+                    0
+                } else if self.blob_on_disk(k, m.shards) {
+                    1
+                } else {
+                    2
+                };
+                (class, m.last_used, *k)
             })
             .collect();
-        v.sort_unstable_by_key(|&(leaf, used, _)| (leaf, used));
+        v.sort_unstable_by_key(|&(class, used, _)| (class, used));
         v.into_iter().map(|(_, _, k)| k).collect()
     }
 
@@ -225,6 +234,59 @@ impl<T: XferSink> PoolTier<T> {
         None
     }
 
+    /// The deepest state for this prompt past `above` (blocks) that is still
+    /// on its way into T1: a blob whose every shard is Ready or being
+    /// stored, over runs Ready to `ready_to` and Ready or being stored from
+    /// there. A demote claims the GPU checkpoint and drops its radix path at
+    /// once, and its stores queue behind every load, so until they land the
+    /// state is on no tier a probe sees - a consult in that window restored
+    /// a shallower boundary and recomputed the rest. Starts those stores now
+    /// (`XferSink::expedite`) and returns the tokens past `above` that
+    /// waiting for them saves.
+    pub fn blob_landing(&mut self, tokens: &[u32], above: usize, ready_to: usize) -> Option<usize> {
+        if self.tripped || self.aux_meta.is_empty() {
+            return None;
+        }
+        let r = self.run_blocks;
+        let full = tokens.len().saturating_sub(1) / BLOCK_TOKENS;
+        let mut key = self.ns_root;
+        let mut keys_at = Vec::with_capacity(full);
+        for b in 0..full {
+            key = key.child(&tokens[b * BLOCK_TOKENS..(b + 1) * BLOCK_TOKENS]);
+            keys_at.push(key);
+        }
+        // Ready anywhere, or the op storing it into T1
+        let landing = |k: &LogicalKey, ops: &mut Vec<OpId>| -> bool {
+            if self.ready_on(k).is_some() {
+                return true;
+            }
+            match self.catalog.writing_op(k, Tier::Ram) {
+                Some(op) => {
+                    ops.push(op);
+                    true
+                }
+                None => false,
+            }
+        };
+        for b in (above + 1..=full).rev().filter(|b| b % r == 0) {
+            let k = keys_at[b - 1];
+            let Some(m) = self.aux_meta.get(&k) else {
+                continue;
+            };
+            let mut ops = Vec::new();
+            let shards_ok = (0..m.shards)
+                .all(|i| landing(&k.child_bytes("aux", &(i as u32).to_le_bytes()), &mut ops));
+            let runs_ok = shards_ok
+                && (ready_to / r + 1..=b / r).all(|run| landing(&keys_at[run * r - 1], &mut ops));
+            if !runs_ok || ops.is_empty() {
+                continue;
+            }
+            self.transport.expedite(&ops);
+            return Some((b - above) * BLOCK_TOKENS);
+        }
+        None
+    }
+
     // -- retire ----------------------------------------------------------------
 
     /// Drop an aux boundary from T1: evict every shard entry and free its
@@ -232,6 +294,15 @@ impl<T: XferSink> PoolTier<T> {
     /// catalog takes the disk replica, exactly as a run's eviction does - so
     /// a blob written through to disk is still a restore, not a loss.
     pub(super) fn retire_aux(&mut self, key: LogicalKey) {
+        if tracing::enabled!(tracing::Level::DEBUG) && self.aux_meta.contains_key(&key) {
+            let shards = self.aux_meta.get(&key).map_or(0, |m| m.shards);
+            tracing::debug!(
+                depth = self.blob_depth_tokens(&key),
+                worth_keeping = self.blob_worth_keeping(&key),
+                on_disk = self.blob_on_disk(&key, shards),
+                "tier: blob leaves T1"
+            );
+        }
         self.disown_runs(key);
         let Some(m) = self.aux_meta.remove(&key) else {
             return;
@@ -240,10 +311,15 @@ impl<T: XferSink> PoolTier<T> {
         for i in 0..m.shards {
             let sk = key.child_bytes("aux", &(i as u32).to_le_bytes());
             let loc = self.catalog.ready_loc(&sk, Tier::Ram);
+            let ram = self.catalog.ready_bytes(&sk, Tier::Ram);
             if self.catalog.evict(&sk, Tier::Ram).is_ok()
                 && let Some(l) = loc
             {
                 self.transport.free_extent(l);
+            }
+            if let Some(b) = ram {
+                let on_disk = self.transport.t2_entry(&sk.0).is_some();
+                super::super::census::ev("e", &sk.0, b, Some(on_disk));
             }
             if let Some((t2loc, bytes, sum)) = self.transport.t2_entry(&sk.0)
                 && (self.catalog.ready_bytes(&sk, Tier::Nvme).is_some()
@@ -355,6 +431,8 @@ impl<T: XferSink> PoolTier<T> {
                         bytes: f.bytes,
                         shards: f.shards,
                         last_used: now,
+                        // read back off disk: written already, whatever it was
+                        anchor: false,
                     },
                 );
                 self.own_runs(b, f.runs);

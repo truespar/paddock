@@ -676,6 +676,11 @@ impl PagedRadix {
         );
     }
 
+    /// Whether `node`'s checkpoint is a user-turn anchor ([`Self::mark_anchor`]).
+    pub fn is_anchor(&self, node: u32) -> bool {
+        self.nodes.get(node as usize).is_some_and(|n| n.anchor)
+    }
+
     /// Hold the deepest checkpoint on `tokens`' path at or below `upto` as a
     /// USER-TURN anchor: it goes after every plain checkpoint when room is
     /// needed. The runner flags the prompt that opens a user turn; its end is

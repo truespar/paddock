@@ -27,6 +27,7 @@ fn test_router(port: u16) -> Router {
                     reader: None,
                     tabular: None,
                     diarization: None,
+                    speech: None,
                     segmenter: None,
                     masker: None,
                     started_at_unix: 0,

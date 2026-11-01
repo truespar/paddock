@@ -590,6 +590,11 @@ impl GpuExecutor {
         self.moe_slot_combine_init_at(part, residual, 0, embd, n_active, rows)
     }
 
+    /// Whether the pack carries slot 485 (the write-out fold).
+    pub fn has_moe_slot_combine_init(&self) -> bool {
+        self.kernels.moe_slot_combine_init.is_some()
+    }
+
     /// [`Self::moe_slot_combine_init`] writing residual rows
     /// `[row_off, row_off + rows)` from partials that are local to that range -
     /// the fold of one sub-wave of a wider walk.

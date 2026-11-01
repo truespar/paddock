@@ -26,7 +26,11 @@ async function unlock(): Promise<void> {
       return
     }
     err.value =
-      res.status === 401 ? 'That key does not open this paddock.' : `Login failed (${res.status}).`
+      res.status === 401
+        ? 'That key does not open this paddock.'
+        : res.status === 403
+          ? 'That key is for the API only. The Studio needs an admin key.'
+          : `Login failed (${res.status}).`
   } catch {
     err.value = 'Could not reach the manager.'
   } finally {

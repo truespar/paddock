@@ -9,7 +9,7 @@ use super::*;
 use crate::kv_pool::BlockTable;
 
 /// Insert `tokens` (whole blocks + one tail token) as a tree-held chain.
-fn chain(radix: &mut PagedRadix, pool: &mut KvPool, tokens: &[u32]) {
+pub(super) fn chain(radix: &mut PagedRadix, pool: &mut KvPool, tokens: &[u32]) {
     let mut t = BlockTable::new();
     t.ensure(tokens.len() - 2, pool).unwrap();
     radix.insert(tokens, t.blocks(), pool);
@@ -123,6 +123,45 @@ fn the_blob_round_inherits_the_flows_budget() {
     t.transport.deliver_all();
     t.pump_completions(&mut radix, &mut pool);
     t.pump_flows_with_pool(&mut radix, &mut pool, &mut || None);
+    t.catalog.check_invariants();
+}
+
+/// Both rounds go out together: the blob round starts at the first pump,
+/// beside the runs, so one delivery lands the whole restore - back to back,
+/// each round cost its own few scheduler pumps.
+#[test]
+fn the_blob_round_runs_beside_the_blocks_round() {
+    let mut t = tier(256 << 20);
+    let mut pool = KvPool::with_blocks(64);
+    let mut radix = armed_radix(&t);
+    radix.set_state_paged(4, 6);
+    let tokens = cached_chain(&mut radix, &mut pool, 2, 8);
+    radix
+        .attach_state_with_pool(&tokens, 8 * BLOCK_TOKENS, &mut pool)
+        .expect("checkpoint");
+    t.press(&mut radix, &mut pool, 64, None, &mut || None);
+    t.transport.deliver_all();
+    t.pump_completions(&mut radix, &mut pool);
+    let hit = t.probe(&tokens, 0).expect("held");
+    let aux = t.probe_aux(&tokens, hit.end_block).expect("blob");
+    let plan = AuxPlan {
+        hit: aux,
+        state_base: 0,
+        state_stride: 0,
+    };
+    let flow =
+        RestoreFlow::begin(&mut t, &mut pool, &tokens, &hit, Some(plan), 1e6, None).expect("flow");
+    t.park_flow(0, flow);
+    t.pump_flows_with_pool(&mut radix, &mut pool, &mut || None);
+    assert_eq!(t.tickets.len(), 2, "blocks and blob in flight together");
+    t.transport.deliver_all();
+    t.pump_completions(&mut radix, &mut pool);
+    t.pump_flows_with_pool(&mut radix, &mut pool, &mut || None);
+    assert_eq!(t.flow_status(0, &tokens), FlowStatus::Done { ok: true });
+    assert!(
+        radix.match_full(&tokens).ckpt.is_some(),
+        "the checkpoint attached"
+    );
     t.catalog.check_invariants();
 }
 
@@ -257,7 +296,7 @@ fn a_hybrid_hit_without_its_state_is_a_no_state_miss() {
     t.transport.deliver_all();
     t.pump_completions(&mut radix, &mut pool);
     let hit = t.probe(&bare, 0).expect("the KV is held");
-    assert!(t.elect_hybrid(&hit, None).is_none());
+    assert!(t.elect_hybrid(&hit, None, 0).is_none());
     assert_eq!((t.dec.lookups, t.dec.hits, t.dec.miss_no_state), (1, 0, 1));
     let whole = cached_chain(&mut radix, &mut pool, 2, 8);
     radix
@@ -271,10 +310,56 @@ fn a_hybrid_hit_without_its_state_is_a_no_state_miss() {
     t.pump_completions(&mut radix, &mut pool);
     let hit = t.probe(&whole, 0).expect("held");
     let aux = t.probe_aux(&whole, hit.end_block);
-    let (cut, _est) = t.elect_hybrid(&hit, aux.as_ref()).expect("restore elected");
+    let (cut, _est) = t
+        .elect_hybrid(&hit, aux.as_ref(), 0)
+        .expect("restore elected");
     assert_eq!(cut.end_block, 8);
     assert_eq!((t.dec.hits, t.dec.elected_restore), (1, 1));
     t.catalog.check_invariants();
+}
+
+/// A checkpoint the GPU already holds makes the tier moot only when the
+/// tier has nothing deeper. The families skipped the tier on any resident
+/// checkpoint at all, so a resident shared-prompt checkpoint made every
+/// revisit recompute its own (disk-held) turns.
+#[test]
+fn a_resident_checkpoint_is_moot_only_when_the_tier_has_nothing_deeper() {
+    let mut t = tier(256 << 20);
+    t.cost.set_force_restore(true);
+    let mut pool = KvPool::with_blocks(64);
+    let mut radix = armed_radix(&t);
+    radix.set_state_capacity(2);
+    let whole = cached_chain(&mut radix, &mut pool, 3, 8);
+    radix
+        .attach_state(&whole, 8 * BLOCK_TOKENS)
+        .expect("checkpoint");
+    let (_e, taken) = t.pressure_demote(&mut radix, &mut pool, 64, None);
+    for x in taken {
+        t.demote_aux(&mut radix, x, 4096, 20 << 20, None);
+    }
+    t.transport.deliver_all();
+    t.pump_completions(&mut radix, &mut pool);
+    let probe = |t: &mut PoolTier<super::super::transport::FakeTransport>, gpu: usize| {
+        let hit = t.probe(&whole, gpu).expect("held");
+        let aux = t.probe_aux(&whole, hit.end_block);
+        (hit, aux)
+    };
+    // the GPU resumes at block 4 already: the tier's state at 8 is deeper,
+    // and only the run past the resident depth comes back (not the one the
+    // GPU holds - every restore used to re-read its shared prompt)
+    let (hit, aux) = probe(&mut t, 4);
+    let (cut, _) = t
+        .elect_hybrid(&hit, aux.as_ref(), 4 * BLOCK_TOKENS)
+        .expect("deeper state on the tier: restore");
+    assert_eq!((cut.start_block, cut.end_block, cut.keys.len()), (4, 8, 1));
+    // the GPU resumes at 8: nothing deeper here - moot, and not a state miss
+    let (hit, aux) = probe(&mut t, 0);
+    assert!(
+        t.elect_hybrid(&hit, aux.as_ref(), 8 * BLOCK_TOKENS)
+            .is_none()
+    );
+    assert_eq!(t.dec.miss_no_state, 0);
+    assert_eq!(t.dec.miss_no_new_tokens, 1);
 }
 
 // -- dominance and the disk tier ---------------------------------------------
@@ -336,16 +421,28 @@ fn t1_drops_a_dominated_blob_before_any_chains_deepest() {
     t.catalog.check_invariants();
 }
 
-/// The fake with a pretend disk: every store that lands is "written
-/// through" (its key -> the same at-rest loc, which the fake keeps), and a
-/// disk-sourced load read-fills a T1 copy through the promotion outbox.
+/// The fake with a pretend disk: what the durability plan persists is
+/// "written" (its key -> the same at-rest loc, which the fake keeps; `log`
+/// records the order), and a disk-sourced load read-fills a T1 copy
+/// through the promotion outbox.
 #[derive(Default)]
-struct DiskFake {
+pub(super) struct DiskFake {
     /// Where the cost model's calibration lives (None: nowhere).
     home: Option<std::path::PathBuf>,
-    inner: super::super::transport::FakeTransport,
-    durable: HashMap<[u8; 32], (Loc, u64, [u8; 32])>,
-    stores: HashMap<OpId, LogicalKey>,
+    pub(super) inner: super::super::transport::FakeTransport,
+    pub(super) durable: HashMap<[u8; 32], (Loc, u64, [u8; 32])>,
+    /// Keys in the order they were persisted.
+    pub(super) log: Vec<LogicalKey>,
+    /// Writes allowed before the disk declines (None: no limit).
+    pub(super) writes_left: Option<usize>,
+    /// Every submitted op completes at the next poll (a pump that waits on
+    /// its own stores, like the exit flush, needs the device to move).
+    pub(super) auto_deliver: bool,
+    /// A disk read in flight: the background plan waits (no duplex), a
+    /// last-copy write does not.
+    pub(super) reading: bool,
+    /// Store ops a consult asked to start ahead of loads.
+    pub(super) expedited: Vec<OpId>,
     disk_loads: HashMap<OpId, (LogicalKey, Loc)>,
     fills: Vec<([u8; 32], Loc, [u8; 32], u64)>,
 }
@@ -356,14 +453,10 @@ impl TierTransport for DiskFake {
     }
     fn submit(&mut self, job: super::super::transport::IoJob) -> Result<(), SubmitError> {
         use super::super::transport::IoJobKind;
-        match &job.kind {
-            IoJobKind::Store { .. } => {
-                self.stores.insert(job.op, job.key);
-            }
-            IoJobKind::Load { loc, .. } if job.tier == Tier::Nvme => {
-                self.disk_loads.insert(job.op, (job.key, *loc));
-            }
-            IoJobKind::Load { .. } => {}
+        if let IoJobKind::Load { loc, .. } = &job.kind
+            && job.tier == Tier::Nvme
+        {
+            self.disk_loads.insert(job.op, (job.key, *loc));
         }
         self.inner.submit(job)
     }
@@ -372,26 +465,17 @@ impl TierTransport for DiskFake {
     }
     fn poll(&mut self) -> Vec<super::super::transport::IoCompletion> {
         use super::super::transport::IoOutcome;
+        if self.auto_deliver {
+            self.inner.deliver_all();
+        }
         let out = self.inner.poll();
         for c in &out {
-            match &c.outcome {
-                IoOutcome::StoreDone {
-                    loc,
-                    bytes,
-                    checksum,
-                } => {
-                    if let Some(k) = self.stores.remove(&c.op) {
-                        self.durable.insert(k.0, (*loc, *bytes, checksum.0));
-                    }
-                }
-                IoOutcome::LoadDone {
-                    bytes, checksum, ..
-                } => {
-                    if let Some((k, loc)) = self.disk_loads.remove(&c.op) {
-                        self.fills.push((k.0, loc, checksum.0, *bytes));
-                    }
-                }
-                _ => {}
+            if let IoOutcome::LoadDone {
+                bytes, checksum, ..
+            } = &c.outcome
+                && let Some((k, loc)) = self.disk_loads.remove(&c.op)
+            {
+                self.fills.push((k.0, loc, checksum.0, *bytes));
             }
         }
         out
@@ -401,6 +485,34 @@ impl TierTransport for DiskFake {
 impl XferSink for DiskFake {
     fn t2_entry(&self, key: &[u8; 32]) -> Option<(Loc, u64, [u8; 32])> {
         self.durable.get(key).copied()
+    }
+    fn persist(
+        &mut self,
+        key: &LogicalKey,
+        loc: Loc,
+        bytes: u64,
+        checksum: super::super::digest::Checksum,
+    ) -> Persist {
+        if self.durable.contains_key(&key.0) {
+            return Persist::Durable;
+        }
+        match &mut self.writes_left {
+            Some(0) => return Persist::Declined,
+            Some(n) => *n -= 1,
+            None => {}
+        }
+        self.durable.insert(key.0, (loc, bytes, checksum.0));
+        self.log.push(*key);
+        Persist::Written
+    }
+    fn disk_ready(&self) -> bool {
+        !self.reading
+    }
+    fn disk_writable(&self) -> bool {
+        true
+    }
+    fn expedite(&mut self, ops: &[OpId]) {
+        self.expedited.extend_from_slice(ops);
     }
     fn take_t2_promotions(&mut self) -> Vec<([u8; 32], Loc, [u8; 32], u64)> {
         std::mem::take(&mut self.fills)
@@ -418,7 +530,7 @@ impl XferSink for DiskFake {
     }
 }
 
-fn disk_tier(ram: u64, disk: DiskFake) -> PoolTier<DiskFake> {
+pub(super) fn disk_tier(ram: u64, disk: DiskFake) -> PoolTier<DiskFake> {
     use super::tests::{ns, planes};
     PoolTier::with_capacities(&ns(), planes(), ram, 1 << 30, disk).unwrap()
 }
@@ -480,6 +592,7 @@ fn a_blob_evicted_from_ram_restores_from_disk() {
     radix.set_state_paged(4, 3);
     t.declare_blob_pages(3);
     let a = pressed_chain(&mut t, &mut radix, &mut pool, 1);
+    t.persist_all(); // A's tip goes to disk (what an idle A would get)
     let _b = pressed_chain(&mut t, &mut radix, &mut pool, 2);
     let aux = t.probe_aux(&a, 8).expect("A's blob, now from disk");
     assert_eq!(aux.nvme_bytes, aux.bytes, "every shard on T2");
@@ -502,6 +615,7 @@ fn after_a_restart_a_blob_on_disk_restores_and_seats_back_whole() {
     let mut radix = armed_radix_of(&t);
     radix.set_state_paged(4, 3);
     let a = pressed_chain(&mut t, &mut radix, &mut pool, 1);
+    t.persist_all(); // the exit flush
     // restart: the disk survives, nothing else does
     let disk = std::mem::take(&mut t.transport);
     let entries: Vec<_> = disk.durable.iter().map(|(k, v)| (*k, *v)).collect();
@@ -538,7 +652,7 @@ fn after_a_restart_a_blob_on_disk_restores_and_seats_back_whole() {
     t.catalog.check_invariants();
 }
 
-fn armed_radix_of<T: XferSink>(t: &PoolTier<T>) -> PagedRadix {
+pub(super) fn armed_radix_of<T: XferSink>(t: &PoolTier<T>) -> PagedRadix {
     let mut r = PagedRadix::new();
     r.set_tier_root(t.tier_root());
     r
@@ -578,4 +692,81 @@ fn a_restart_prices_its_first_disk_hit_by_the_last_runs_calibration() {
         "priced by the saved rate, not the generic seed: {est}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An elected restore the block pool cannot seat waits for room instead of
+/// recomputing - one lookup however many tries, re-tried no faster than
+/// the retry interval, given up once waiting stops beating the recompute.
+#[test]
+fn a_restore_the_pool_cannot_seat_waits_then_gives_up() {
+    use crate::kv_tier::ConsultTry;
+    let mut t = disk_tier(64 << 20, DiskFake::default());
+    t.cost.seed_prefill(1_000, 1_000_000.0); // 1 token a ms
+    let t_len = 10_001;
+    // 700 tokens are 0.7 s to recompute: a wait worth having
+    let est_us = 5_000.0;
+    assert_eq!(t.consult_try(3, t_len), ConsultTry::Fresh);
+    t.dec.lookups += 1; // the first try's probe
+    let counted = t.dec;
+    assert!(t.wait_for_pool(3, t_len, est_us, 700), "waits");
+    assert_eq!(t.consult_try(3, t_len), ConsultTry::Hold, "not yet");
+    std::thread::sleep(std::time::Duration::from_millis(6));
+    assert_eq!(t.consult_try(3, t_len), ConsultTry::Retry);
+    t.dec.lookups += 1; // the retry probes again
+    t.dec.elected_restore += 1;
+    assert!(t.wait_for_pool(3, t_len, est_us, 700), "still worth it");
+    assert_eq!(t.dec.lookups, counted.lookups, "one lookup");
+    assert_eq!(t.dec.elected_restore, counted.elected_restore);
+    assert_eq!(
+        t.consult_try(4, 77),
+        ConsultTry::Fresh,
+        "other slots unaffected"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(720));
+    assert_eq!(t.consult_try(3, t_len), ConsultTry::Retry);
+    let refused = t.dec.park_refused;
+    assert!(!t.wait_for_pool(3, t_len, est_us, 700), "gives up");
+    assert_eq!(t.dec.park_refused, refused + 1, "counted as a refusal");
+    assert_eq!(t.consult_try(3, t_len), ConsultTry::Fresh, "and forgets");
+
+    // a restore no cheaper than its recompute is refused outright, and so
+    // is a wait worth less than a few scheduler passes
+    assert!(!t.wait_for_pool(5, t_len, 1e9, 700));
+    assert!(!t.wait_for_pool(5, t_len, est_us, 300));
+    // a reused slot (another prompt) starts fresh
+    assert!(t.wait_for_pool(6, t_len, est_us, 700));
+    assert_eq!(t.consult_try(6, t_len + 1), ConsultTry::Fresh);
+}
+
+/// A consult waiting for deeper state to land keeps its request parked
+/// while that beats re-prefilling the gap, and a wait for pool room that
+/// follows it is the same request's - still one lookup.
+#[test]
+fn a_consult_waits_for_state_landing_then_for_room() {
+    use crate::kv_tier::ConsultTry;
+    let mut t = disk_tier(64 << 20, DiskFake::default());
+    t.cost.seed_prefill(1_000, 1_000_000.0); // 1 token a ms
+    let t_len = 10_001;
+    t.dec.lookups += 1;
+    let counted = t.dec;
+    assert!(t.wait_for_blob(2, t_len, 1_280), "waits");
+    assert_eq!(t.consult_try(2, t_len), ConsultTry::Hold);
+    std::thread::sleep(std::time::Duration::from_millis(6));
+    assert_eq!(t.consult_try(2, t_len), ConsultTry::Retry);
+    t.dec.lookups += 1;
+    assert!(t.wait_for_blob(2, t_len, 1_280), "still worth it");
+    std::thread::sleep(std::time::Duration::from_millis(6));
+    assert_eq!(t.consult_try(2, t_len), ConsultTry::Retry);
+    t.dec.lookups += 1;
+    // landed, but the pool cannot seat it: the same request waits on
+    assert!(t.wait_for_pool(2, t_len, 5_000.0, 10_000));
+    assert_eq!(t.dec.lookups, counted.lookups, "one lookup");
+    // a gap no wait pays for (one run, ~0.13 s): restore what is there
+    assert!(!t.wait_for_blob(7, t_len, 128));
+    // spent: stop waiting, and forget
+    assert!(t.wait_for_blob(8, t_len, 520));
+    std::thread::sleep(std::time::Duration::from_millis(540));
+    assert_eq!(t.consult_try(8, t_len), ConsultTry::Retry);
+    assert!(!t.wait_for_blob(8, t_len, 520), "stops waiting");
+    assert_eq!(t.consult_try(8, t_len), ConsultTry::Fresh);
 }

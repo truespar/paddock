@@ -180,6 +180,12 @@ struct PdKumoFuse {
     const float2* rope;
     const float* hs;
     uint32_t klen;
+    // A's row pitch in floats when it is not K (0: K). A causal conv's
+    // im2col rows are k consecutive input rows end to end, so with the
+    // input's own pitch the GEMM reads them in place - overlapping rows, no
+    // k-times expanded plane (Phonon's Mimi, slot 917). Every other caller
+    // leaves it 0: the same addresses, the same bits.
+    uint32_t lda;
 };
 
 static __host__ __device__ constexpr uint32_t pd_kumo_umin(uint32_t a, uint32_t b) { return a < b ? a : b; }
@@ -277,7 +283,7 @@ pd_kumo_gemm_kernel(const float* __restrict__ x, const float* __restrict__ w,
     for (uint32_t i = 0; i < XCH; ++i) {
         const uint32_t m = m0 + r0 + i * RPI;
         const uint32_t xr = m >= M ? 0u : F && f.alen ? m / f.alen * f.astride + m % f.alen : m;
-        xp[i] = x + (size_t)xr * K + kc;
+        xp[i] = x + (size_t)xr * (f.lda ? f.lda : K) + kc;
         live |= (m < M ? 1u : 0u) << i;
         // the fused norm's row statistic
         if (F) ainv[i] = f.ainv && m < M ? f.ainv[xr] : 0.f;

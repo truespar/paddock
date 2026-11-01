@@ -227,7 +227,8 @@ pub fn open_segment(path: &Path, unbuffered: bool) -> io::Result<File> {
 /// boundary because the caller BLOCKS until every chunk of its request has
 /// reported - the borrow is scoped by that wait, not by the type system.
 struct Job {
-    path: Arc<PathBuf>,
+    /// The segment's handles; worker `i` uses `workers[i]`.
+    file: Arc<Handles>,
     ptr: SendPtr,
     len: usize,
     off: u64,
@@ -240,16 +241,56 @@ struct SendPtr(*mut u8);
 // lifetime of the job, and chunks never overlap (see `run_chunks`).
 unsafe impl Send for SendPtr {}
 
-/// Worker threads that give the device its queue depth. Each worker keeps its
-/// own handle per segment file - sharing one would re-serialize in the kernel
-/// on Windows and hand us depth 1 (see the module note).
+/// Async disk readers (`t2_reads`): each owns a handle slot past the pool's.
+pub const READERS: usize = 8;
+
+/// Handle slots per segment: the calling thread's (slot 0, the only one
+/// writes use), one per pool worker, one per async reader. On Windows each
+/// is its own handle - a synchronous handle serializes IO in the kernel, so
+/// sharing one is depth 1 (see the module note). Elsewhere positioned IO on
+/// one descriptor runs in parallel (no shared file offset), so every slot
+/// is the same descriptor and a big cache costs one per segment.
+const SLOTS: usize = if cfg!(windows) {
+    READ_DEPTH + READERS
+} else {
+    1
+};
+
+/// Every handle on one segment file, opened when a slot first needs it.
+///
+/// Owned by the [`Backend`], never by the workers. Workers used to cache a
+/// handle per segment for the life of the process, and an open descriptor
+/// keeps a deleted file's blocks allocated: every evicted segment that had
+/// ever served a restore stayed on the disk until the runner exited,
+/// invisible to the cache's own size and to `du`, while the volume filled.
+struct Handles {
+    path: PathBuf,
+    unbuffered: bool,
+    slots: [std::sync::OnceLock<File>; SLOTS],
+}
+
+impl Handles {
+    fn file(&self, slot: usize) -> io::Result<&File> {
+        // one shared descriptor where slots are not their own handles
+        let cell = self.slots.get(slot).unwrap_or(&self.slots[0]);
+        if let Some(f) = cell.get() {
+            return Ok(f);
+        }
+        // two threads may race to open the slot; one handle wins, the other
+        // closes - either way the slot ends up with a live handle
+        let _ = cell.set(open_segment(&self.path, self.unbuffered)?);
+        Ok(cell.get().expect("set above"))
+    }
+}
+
+/// Worker threads that give the device its queue depth.
 struct IoPool {
     tx: Option<mpsc::Sender<Job>>,
     workers: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl IoPool {
-    fn new(n: usize, unbuffered: bool) -> Self {
+    fn new(n: usize) -> Self {
         let (tx, rx) = mpsc::channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
         let workers = (0..n)
@@ -258,7 +299,6 @@ impl IoPool {
                 std::thread::Builder::new()
                     .name(format!("kv-t2-io-{i}"))
                     .spawn(move || {
-                        let mut handles: HashMap<PathBuf, File> = HashMap::new();
                         loop {
                             let job = {
                                 let g = rx.lock().expect("io pool queue");
@@ -267,23 +307,30 @@ impl IoPool {
                                     Err(_) => break, // sender dropped: shut down
                                 }
                             };
-                            let r = (|| -> io::Result<()> {
-                                if !handles.contains_key(job.path.as_ref()) {
-                                    let f = open_segment(job.path.as_ref(), unbuffered)?;
-                                    handles.insert(job.path.as_ref().clone(), f);
-                                }
-                                let f = &handles[job.path.as_ref()];
-                                // SAFETY: caller-owned region, exclusive for
-                                // this chunk, valid until it reports done.
-                                let buf =
-                                    unsafe { std::slice::from_raw_parts_mut(job.ptr.0, job.len) };
-                                if job.write {
-                                    pwrite_all(f, buf, job.off)
+                            let Job {
+                                file,
+                                ptr,
+                                len,
+                                off,
+                                write,
+                                done,
+                            } = job;
+                            // SAFETY: caller-owned region, exclusive for this
+                            // chunk, valid until it reports done.
+                            let buf = unsafe { std::slice::from_raw_parts_mut(ptr.0, len) };
+                            let r = file.file(1 + i).and_then(|f| {
+                                if write {
+                                    pwrite_all(f, buf, off)
                                 } else {
-                                    pread_exact(f, buf, job.off)
+                                    pread_exact(f, buf, off)
                                 }
-                            })();
-                            let _ = job.done.send(r);
+                            });
+                            // let go of the handles BEFORE reporting: once the
+                            // caller has every report it may forget and delete
+                            // the segment, and its space is free at once only
+                            // if no worker still holds a descriptor
+                            drop(file);
+                            let _ = done.send(r);
                         }
                     })
                     .expect("spawn kv-t2 io worker")
@@ -351,9 +398,8 @@ pub struct DeviceClass {
 pub struct Backend {
     class: DeviceClass,
     pool: IoPool,
-    /// Primary handles, one per segment, for the calling thread's own share
-    /// of each request (the caller is queue slot 0).
-    handles: Mutex<HashMap<PathBuf, Arc<Mutex<File>>>>,
+    /// Every open handle, per segment (see [`Handles`]).
+    handles: Mutex<HashMap<PathBuf, Arc<Handles>>>,
 }
 
 impl Backend {
@@ -392,7 +438,7 @@ impl Backend {
         }
         Ok(Self {
             class,
-            pool: IoPool::new(READ_DEPTH.saturating_sub(1), class.unbuffered),
+            pool: IoPool::new(READ_DEPTH.saturating_sub(1)),
             handles: Mutex::new(HashMap::new()),
         })
     }
@@ -429,27 +475,33 @@ impl Backend {
     /// you turn a 2.5 GB/s device into a 0.4 GB/s one (fact 2's contention
     /// collapse). The write-QD ladder is queued for the next probe rev.
     pub fn write_at(&self, path: &Path, buf: &[u8], off: u64) -> io::Result<()> {
-        let f = self.handle(path)?;
-        let g = f.lock().expect("segment handle");
+        let f = self.handles(path)?;
+        let g = f.file(0)?;
         let chunk = self.class.write_chunk as usize;
         let mut done = 0usize;
         while done < buf.len() {
             let n = chunk.min(buf.len() - done);
-            pwrite_all(&g, &buf[done..done + n], off + done as u64)?;
+            pwrite_all(g, &buf[done..done + n], off + done as u64)?;
             done += n;
         }
         Ok(())
     }
 
     pub fn sync(&self, path: &Path) -> io::Result<()> {
-        let f = self.handle(path)?;
-        let g = f.lock().expect("segment handle");
-        g.sync_data()
+        self.handles(path)?.file(0)?.sync_data()
     }
 
-    /// Drop a segment's cached handles (the file is about to be deleted).
-    /// Worker caches self-heal: a deleted-then-recreated segment number opens
-    /// fresh because the worker's handle read fails and the job reports it.
+    /// Read all of `buf` at `off` on async reader `reader`'s own handle slot
+    /// (`t2_reads`): one positioned read, no pool - the readers ARE the depth.
+    /// `buf` must be alignment-sized and -addressed when unbuffered.
+    pub fn read_on(&self, path: &Path, buf: &mut [u8], off: u64, reader: usize) -> io::Result<()> {
+        let f = self.handles(path)?;
+        pread_exact(f.file(READ_DEPTH + reader)?, buf, off)
+    }
+
+    /// Close every handle on a segment (the file is about to be deleted, and
+    /// its space only comes back once the last descriptor is gone). IO calls
+    /// block until all their chunks report, so no job still holds these.
     pub fn forget(&self, path: &Path) {
         self.handles.lock().expect("segment handles").remove(path);
     }
@@ -463,12 +515,19 @@ impl Backend {
         per_slot.clamp(READ_CHUNK_MIN, READ_CHUNK_MAX)
     }
 
-    fn handle(&self, path: &Path) -> io::Result<Arc<Mutex<File>>> {
+    fn handles(&self, path: &Path) -> io::Result<Arc<Handles>> {
         let mut g = self.handles.lock().expect("segment handles");
         if let Some(f) = g.get(path) {
             return Ok(Arc::clone(f));
         }
-        let f = Arc::new(Mutex::new(open_segment(path, self.class.unbuffered)?));
+        let f = Arc::new(Handles {
+            path: path.to_path_buf(),
+            unbuffered: self.class.unbuffered,
+            slots: std::array::from_fn(|_| std::sync::OnceLock::new()),
+        });
+        // the first write creates the file: open the caller's slot now so an
+        // unwritable path fails here, at the write that needs it
+        f.file(0)?;
         g.insert(path.to_path_buf(), Arc::clone(&f));
         Ok(f)
     }
@@ -487,7 +546,7 @@ impl Backend {
         if len == 0 {
             return Ok(());
         }
-        let path = Arc::new(path.to_path_buf());
+        let file = self.handles(path)?;
         let (tx, rx) = mpsc::channel::<io::Result<()>>();
         let mut queued = 0usize;
         let mut pos = chunk.min(len as u64) as usize; // chunk 0 stays here
@@ -497,7 +556,7 @@ impl Backend {
             // blocks below until this job reports.
             let jp = SendPtr(unsafe { ptr.add(pos) });
             let job = Job {
-                path: Arc::clone(&path),
+                file: Arc::clone(&file),
                 ptr: jp,
                 len: n,
                 off: off + pos as u64,
@@ -511,30 +570,28 @@ impl Backend {
             pos += n;
         }
         // this thread's share
-        let mine = {
-            let f = self.handle(&path)?;
-            let g = f.lock().expect("segment handle");
+        let mine = file.file(0).and_then(|g| {
             let n = (chunk as usize).min(len);
             // SAFETY: chunk 0 of the caller's region, disjoint from queued.
             let b = unsafe { std::slice::from_raw_parts_mut(ptr, n) };
             if write {
-                pwrite_all(&g, b, off)
+                pwrite_all(g, b, off)
             } else {
-                pread_exact(&g, b, off)
+                pread_exact(g, b, off)
             }
-        };
+        });
         // anything the pool refused
         let mut tail = Ok(());
         if pos < len {
-            let f = self.handle(&path)?;
-            let g = f.lock().expect("segment handle");
             // SAFETY: the un-queued tail, disjoint from every other chunk.
             let b = unsafe { std::slice::from_raw_parts_mut(ptr.add(pos), len - pos) };
-            tail = if write {
-                pwrite_all(&g, b, off + pos as u64)
-            } else {
-                pread_exact(&g, b, off + pos as u64)
-            };
+            tail = file.file(0).and_then(|g| {
+                if write {
+                    pwrite_all(g, b, off + pos as u64)
+                } else {
+                    pread_exact(g, b, off + pos as u64)
+                }
+            });
         }
         drop(tx);
         let mut first_err = mine.err().or(tail.err());

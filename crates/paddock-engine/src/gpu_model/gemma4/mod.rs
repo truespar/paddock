@@ -1260,6 +1260,9 @@ impl Generator for GpuGemma4 {
     fn tier_pump(&mut self) {
         self.tier_pump_impl();
     }
+    fn tier_flush_at_exit(&mut self) {
+        self.tier_flush_impl();
+    }
     fn tier_prefix_loading(&mut self, slot: usize, tokens: &[u32]) -> bool {
         self.tier_consult_impl(slot, tokens)
     }

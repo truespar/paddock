@@ -53,7 +53,7 @@ pub const GRAPH_MARGIN: u64 = (3 << 30) - CUDA_CONTEXT;
 /// Fixed overhead for a model of this kind.
 fn fixed_overhead(kind: ModelKind) -> u64 {
     match kind {
-        ModelKind::Encoder | ModelKind::Image => CUDA_CONTEXT,
+        ModelKind::Encoder | ModelKind::Image | ModelKind::Speech => CUDA_CONTEXT,
         ModelKind::Generative => CUDA_CONTEXT + GRAPH_MARGIN,
     }
 }
@@ -205,6 +205,9 @@ pub enum ModelKind {
     /// serves, not by a token window, and the Studio must not draw it a
     /// context slider.
     Image,
+    /// Speech synthesis with bounded per-worker transformer and codec state.
+    /// Those caches are included in the measured workspace, not a paged text pool.
+    Speech,
 }
 
 /// Static cross-attention K/V an encoder-decoder holds per slot (whisper).
@@ -776,7 +779,7 @@ pub enum Fit {
 /// dependency on the context it is used to derive.
 fn block_tables(shape: &ModelShape, env: &Envelope) -> u64 {
     match shape.kind {
-        ModelKind::Encoder | ModelKind::Image => 0,
+        ModelKind::Encoder | ModelKind::Image | ModelKind::Speech => 0,
         ModelKind::Generative => env.concurrency * shape.max_ctx.div_ceil(16) * 4,
     }
 }
@@ -786,7 +789,7 @@ fn block_tables(shape: &ModelShape, env: &Envelope) -> u64 {
 /// couple of rows per call and is transient, so it rides in the margin.
 fn logits(shape: &ModelShape, env: &Envelope) -> u64 {
     match shape.kind {
-        ModelKind::Encoder | ModelKind::Image => 0,
+        ModelKind::Encoder | ModelKind::Image | ModelKind::Speech => 0,
         // A speculative round scores 1 pending + K drafted tokens per slot in
         // one pass, so the plane is that many times wider and stays resident
         // for the round.

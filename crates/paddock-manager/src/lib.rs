@@ -124,21 +124,23 @@ pub async fn initialize(
     // with no key auto-generates and requires one; loopback with no key = none.
     let auth_key = match cfg.api_key.as_deref().filter(|s| !s.is_empty()) {
         Some(k) => Some(k.to_owned()),
-        None if !cfg.host.is_loopback() => match db.create_api_key("auto (network bind)") {
-            Ok((_, key)) => {
-                tracing::warn!("network bind with no key - generated one (shown below)");
-                Some(key)
-            }
-            Err(e) => {
-                // Fail closed. Serving a network bind keyless because the key
-                // store hiccupped is the one outcome worse than not serving.
-                return Err(format!(
+        None if !cfg.host.is_loopback() => {
+            match db.create_api_key("auto (network bind)", store::KeyScope::Admin) {
+                Ok((_, key)) => {
+                    tracing::warn!("network bind with no key - generated one (shown below)");
+                    Some(key)
+                }
+                Err(e) => {
+                    // Fail closed. Serving a network bind keyless because the key
+                    // store hiccupped is the one outcome worse than not serving.
+                    return Err(format!(
                     "network bind ({}) with no api key, and generating one failed: {e}. Refusing to start without auth: set PADDOCK_MANAGER_API_KEY, or bind loopback (--host 127.0.0.1)",
                     cfg.host
                 )
                 .into());
+                }
             }
-        },
+        }
         None => None,
     };
 

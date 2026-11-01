@@ -47,6 +47,7 @@ export interface FleetRow {
   reader?: string | null
   tabular?: string | null
   diarization?: string | null
+  speech?: string | null
   /** dense prediction (DINOv3, /v1/segmentations) and promptable segmentation
    *  (SAM 3, /v1/masks) serving ids - pictures in, rasters or masks out */
   segmenter?: string | null
@@ -331,6 +332,7 @@ export function servedId(r: {
   reader?: string | null
   tabular?: string | null
   diarization?: string | null
+  speech?: string | null
   segmenter?: string | null
   masker?: string | null
 }): string | undefined {
@@ -343,6 +345,7 @@ export function servedId(r: {
     r.reader ??
     r.tabular ??
     r.diarization ??
+    r.speech ??
     r.segmenter ??
     r.masker ??
     undefined

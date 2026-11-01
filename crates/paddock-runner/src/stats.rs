@@ -114,6 +114,8 @@ pub struct TierSnapshot {
     pub disk_write_gbs: f64,
     pub disk_unbuffered: bool,
     pub disk_written_today: u64,
+    /// The day's disk write budget (0: no disk tier).
+    pub disk_write_budget_day: u64,
     pub ghost_keys: u64,
 }
 
@@ -167,6 +169,7 @@ impl TierSnapshot {
             disk_write_gbs: f(&t.device_write_gbs),
             disk_unbuffered: t.device_unbuffered.load(Relaxed) == 1,
             disk_written_today: n(&t.t2_written_day_bytes),
+            disk_write_budget_day: n(&t.t2_day_budget_bytes),
             ghost_keys: n(&t.ghost_keys),
         })
     }

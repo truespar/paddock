@@ -274,12 +274,35 @@ impl TierCatalog {
         }
     }
 
+    /// A Ready replica's integrity reference.
+    pub fn ready_checksum(&self, key: &LogicalKey, tier: Tier) -> Option<Checksum> {
+        match self.tiers[tier.idx()].replicas.get(key) {
+            Some(Replica {
+                state: ReplicaState::Ready { checksum, .. },
+                ..
+            }) => Some(*checksum),
+            _ => None,
+        }
+    }
+
     pub fn ready_bytes(&self, key: &LogicalKey, tier: Tier) -> Option<u64> {
         match self.tiers[tier.idx()].replicas.get(key) {
             Some(Replica {
                 bytes,
                 state: ReplicaState::Ready { .. },
             }) => Some(*bytes),
+            _ => None,
+        }
+    }
+
+    /// The op writing `key` into `tier`, while one is in flight - content on
+    /// its way in (a demote's store), not yet readable.
+    pub fn writing_op(&self, key: &LogicalKey, tier: Tier) -> Option<OpId> {
+        match self.tiers[tier.idx()].replicas.get(key) {
+            Some(Replica {
+                state: ReplicaState::Writing { op, .. },
+                ..
+            }) => Some(*op),
             _ => None,
         }
     }

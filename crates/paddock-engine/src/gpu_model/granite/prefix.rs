@@ -204,6 +204,18 @@ impl GpuGranite {
 }
 
 impl GpuGranite {
+    /// The tier's shutdown flush (see `Generator::tier_flush_at_exit`).
+    pub(crate) fn tier_flush_impl(&mut self) {
+        let exec = self.exec.clone();
+        let Some(bs) = self.batch.as_mut() else {
+            return;
+        };
+        let (Some(tier), Some(radix)) = (bs.tier.as_mut(), bs.prefix.as_mut()) else {
+            return;
+        };
+        tier.flush_live(radix, &mut bs.pool, &mut || exec.record_event().ok(), None);
+    }
+
     /// The per-tick tier pump (see `Generator::tier_pump`).
     pub(crate) fn tier_pump_impl(&mut self) {
         let exec = self.exec.clone();
