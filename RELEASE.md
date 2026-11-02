@@ -1,45 +1,38 @@
-# Paddock 0.1.19
+# Paddock 0.1.20
 
-New models, batch inference and a lot of B200 work. NVIDIA's Nemotron 3.5 family arrives for reading pages, search and live transcription, Gemma 4 12B takes pictures and speech, and the manager can now run OpenAI and Anthropic batch jobs.
+Two new models and a context cache that survives a restart. NVIDIA's Nemotron 3.5 Super VL reads pictures and documents, Phonon turns text into speech on NVIDIA GPUs and the Mac, and conversations now come back after a restart with their cache intact.
 
 Builds for Windows x64, Linux x64 and the DGX Spark, on NVIDIA GPUs with driver 580 or newer. The macOS pre-release is built from the same commit.
 
 ## New
 
-- **Nemotron 3.5 Parse** reads a scanned page, a photo of a document or a PDF page into its blocks in reading order, each with its box, its kind (title, text, table, caption and so on) and its text. Tables come back as LaTeX. It takes one page per request.
-- **Nemotron 3.5 Embed 8B** puts text and pictures of pages in one vector space, and **Nemotron 3.5 Rerank 8B** scores how well each document answers a query, from its text, a picture of the page, or both.
-- **Nemotron 3.5 ASR Streaming** transcribes live audio in 40 languages and locales. Words come out as they're heard and are never revised. It serves `/v1/audio/transcriptions` and the realtime WebSocket.
-- **Gemma 4 12B** takes pictures and speech straight into the model, with no separate encoder. It has a 256K context, tools and reasoning, under Apache 2.0.
-- **Batch inference** on the manager: OpenAI's `/v1/files` and `/v1/batches` and Anthropic's `/v1/messages/batches`, at the vendors' own paths, so the official SDKs only need a base URL. A batch can hold a million requests, uploads resume, a full disk pauses the batch instead of failing it, and every result is written exactly once, even across a manager crash.
+- **Nemotron 3.5 Super VL 120B-A12B** on NVIDIA GPUs, from NVIDIA's NVFP4 checkpoint. It reads pictures and documents, thinks before answering, calls tools, and drafts with its own built-in MTP head. Only 8 of its 88 layers keep a KV cache, so long contexts stay cheap. The weights are about 75 GB, so it wants a DGX Spark or a 96 GB Blackwell card.
+- **Phonon 31M** from Gradium turns English text into speech on NVIDIA GPUs and the Mac, as 24 kHz WAV or streaming PCM through `/v1/audio/speech`. On the DGX Spark it runs about 200 times faster than real time, and the first audio arrives in 1.6-3 ms.
+
+## Changed
+
+- API keys now have a scope. An inference key (the default) reaches the OpenAI and Anthropic endpoints only; an admin key also reaches the management API and the Studio login. Keys made before this release count as inference keys, so if you used one for `/api` or to sign in to the Studio, create an admin key with `{"scope": "admin"}` on `POST /api/keys`. The manager's configured key and its automatic network key are admin keys.
+- A stdio MCP server's environment can no longer set `LD_*` or `DYLD_*` variables. Connecting to one that does fails with a clear error.
 
 ## Improved
 
-- Live requests now go ahead of batch work. With a batch running flat out on the DGX Spark, an agent session's time to first token went from about 33 s to 0.4-0.6 s, and its prompt cache hits again. Batch throughput didn't change.
-- Qwen 3.8 27B on the B200 now runs its matrix work on Blackwell's newest tensor-core instructions, for NVFP4 and 8-bit weights. Reading pages with 128 in flight went from about 223 to about 370 pages a minute over this release.
-- Speculative decoding on the DGX Spark keeps working past 8 requests at once, where it used to switch itself off. At 16 concurrent replies, Qwen 3.6 35B-A3B went from 22.2 to 25.0 tokens/s per reply, Qwen 3.5 9B from 23.4 to 27.4, and Qwen 3.8 27B from 7.5 to 12.2.
-- At low concurrency every request now drafts to the full depth. A single Qwen 3.6 35B-A3B reply on the DGX Spark went from 80.3 to 87.1 tokens/s.
-- Picture prompts reuse the prompt cache. With Qwen 3.8 27B NVFP4, a second page that shares the same instructions went from 3.52 s to 1.67 s, and four new pages at once from 13.9 s to 8.0 s.
-- Gemma 4 at Q8_0 reads prompts faster: 9.2K tokens went from 3.31 s to 2.84 s, and 256 parallel streams run 11-13% faster. Output is bit-identical.
-- Q8_0 models decode faster at low concurrency. The matrix kernel for 1 to 16 rows is 1.15-1.43x faster, with bit-identical output.
-- Chat prompts are tokenized in cached pieces on several threads. A 119K-token agent turn took 145 ms every turn; now it's 21 ms the first time and about 1 ms after.
-- The speculation controller keeps its timing across a restart, so the first replies after a restart no longer start slow.
+- Conversations come back after a restart. With 24 agent sessions on the DGX Spark, 24 of 24 resumed from their cache after a restart, where 5 did before. Shutdown now saves what's still on the GPU, and the last copy of a session's state goes to disk before RAM evicts it.
+- Restoring a conversation from disk is faster and no longer slows everyone else down. The median restore went from 3.44 s to 0.95 s, with reads at the drive's full speed and off the engine thread.
+- The disk cache writes less and keeps more of what it writes. It stores each conversation's newest state once it has been idle for 30 s, instead of every change. On the same workload it wrote 18.9 GiB instead of 54.8 GiB, and 65% of it was read back, against 4% before.
+- The disk cache backs off a full or failing disk instead of failing requests, keeps a tenth of its volume free (at most 32 GiB), and frees the space of what it evicts. Writes are capped at a quarter of the drive's size a day, at most 1 TiB.
 
 ## Fixed
 
-- Concurrent picture requests on Qwen 3.5 to 3.8 could turn into "!!!!" partway through an answer, in 3-25% of answers at 8 to 32 parallel requests. It was a race between the engine's two lanes.
-- Text inside a request (a pasted file, a tool result, a tool argument) could be read as a chat turn marker and open a new turn, a system turn for example. Agents hit it just by reading code that contains those markers. Request content is now always plain text to the model.
-- NVIDIA's ModelOpt NVFP4 export of Qwen 3.8 27B served its attention and output layers from the Q8_0 base without saying so. They now load as shipped.
-- Streamed Responses tool calls now keep the same IDs in the final response, so the OpenAI Agents SDK matches tool results to the right calls.
+- A request could restore an older checkpoint of a conversation while a newer one was still on its way into RAM, and recompute more than it needed to. It now waits for the newer one when that's quicker than recomputing.
 
 ## macOS (pre-release)
 
-- The native app keeps your chat sessions, saves composer drafts, and has searchable model pickers.
-- The workspace keeps its layout through resizing and fullscreen.
-- Bonsai and Gemma run faster on MLX, and Bonsai reuses its own earlier replies from the prompt cache.
+- Phonon runs natively on Metal, with streamed audio.
 
 ## Known issues
 
-- Nemotron 3.5 Parse, Embed, Rerank and ASR Streaming, and Gemma 4 12B, run on NVIDIA GPUs only for now.
+- Nemotron 3.5 Super VL, Parse, Embed, Rerank and ASR Streaming, and Gemma 4 12B, run on NVIDIA GPUs only for now.
+- Phonon has one English voice, no voice cloning or speed control, and doesn't spell out numbers or currency.
 - PaddleOCR-VL's layout pipeline is NVIDIA-only; on the Mac it reads whole pages.
 - On the Mac, LightOnOCR-3 0.8B on MLX reads the same text as the reference, but a few boxes are off by up to about half a percent of the page.
 - On the Mac, Nemotron on MLX matches the reference's first token on every test prompt, but not yet the full reply on all of them.
