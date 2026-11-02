@@ -37,7 +37,6 @@ Builds for Windows x64, Linux x64 and the DGX Spark, on NVIDIA GPUs with driver 
 - On the Mac, LightOnOCR-3 0.8B on MLX reads the same text as the reference, but a few boxes are off by up to about half a percent of the page.
 - On the Mac, Nemotron on MLX matches the reference's first token on every test prompt, but not yet the full reply on all of them.
 - SAM 3 and TIC Forestry are NVIDIA-only, and their downloads need a Hugging Face account that has accepted the model licence. TIC Forestry is made for Swedish aerial imagery at 0.5 m.
-- Kolibri 1 can't be checked against llama.cpp yet, since no llama.cpp release reads it. We check it against Aleph Alpha's own serving code instead.
 - EmbeddingGemma 2 audio clips are limited to 30 seconds.
 - Laya is text-only, and its confidence isn't calibrated for more than ten options. The English checkpoint ships an out-of-range temperature for that case, which we clamp the same way Laya's own server does.
 - On the NVFP4 versions of Qwen 3.8 Flash-Next, a greedy speculative reply can differ from plain decoding at a near tie. That's numerics, not a wrong answer.
