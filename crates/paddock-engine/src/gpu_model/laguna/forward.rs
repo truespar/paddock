@@ -114,10 +114,7 @@ impl GpuLaguna {
         let ff_max = self
             .layers
             .iter()
-            .map(|l| match &l.ffn {
-                Ffn::Dense { gate, .. } => gate.dims()[1],
-                Ffn::Moe(_) | Ffn::MoeNv(_) => m.moe_ff,
-            })
+            .map(|l| l.ffn.dense_ff().unwrap_or(m.moe_ff))
             .max()
             .unwrap_or(m.moe_ff);
         let fused_len = m.n_active * m.moe_ff;
@@ -220,6 +217,11 @@ impl GpuLaguna {
                     kv_dim,
                     1,
                 )?,
+                Proj::Nv { wq, wk, wv, .. } => {
+                    super::nv::nv_rows(&exec, wq, &sc.d_xn, &mut sc.d_q, 1)?;
+                    super::nv::nv_rows(&exec, wk, &sc.d_xn, &mut sc.d_k, 1)?;
+                    super::nv::nv_rows(&exec, wv, &sc.d_xn, &mut sc.d_v, 1)?;
+                }
             }
             exec.rmsnorm_batch(
                 &sc.d_q,
@@ -293,11 +295,12 @@ impl GpuLaguna {
                 kv_dtype,
             )?;
             let window = if layer.is_swa { hp.swa_window } else { 0 };
+            let sinks = layer.sinks.as_ref().map_or(&sc.d_sinks, |t| &t.buf);
             exec.attn_decode_batch(
                 &sc.d_qn,
                 &ds.kv_k[li],
                 &ds.kv_v[li],
-                &sc.d_sinks,
+                sinks,
                 &mut sc.d_attn,
                 &ds.d_pos,
                 Some(&ds.d_slots),
@@ -317,6 +320,9 @@ impl GpuLaguna {
             match &layer.proj {
                 Proj::Quant(q) => gemv_any(&exec, &q.wo, &sc.d_attn, &mut sc.d_proj)?,
                 Proj::Bf16 { wo, .. } => exec.bf16_gemm(wo, None, &sc.d_attn, &mut sc.d_proj, 1)?,
+                Proj::Nv { wo, .. } => {
+                    super::nv::nv_rows(&exec, wo, &sc.d_attn, &mut sc.d_proj, 1)?
+                }
             }
             if let Some(post) = &layer.post_attn_norm {
                 // sandwich: x += rmsnorm(attn_out) * post, then the pre-FFN norm
@@ -341,6 +347,17 @@ impl GpuLaguna {
                     exec.swiglu(&mut sc.d_ffn_gate, &sc.d_ffn_up, gate.dims()[1])?;
                     gemv_any(&exec, down, &sc.d_ffn_gate, &mut sc.d_proj)?;
                 }
+                Ffn::DenseNv { gate, up, down } => super::nv::nv_swiglu(
+                    &exec,
+                    gate,
+                    up,
+                    down,
+                    &sc.d_xn,
+                    &mut sc.d_ffn_gate,
+                    &mut sc.d_ffn_up,
+                    &mut sc.d_proj,
+                    1,
+                )?,
                 Ffn::MoeNv(w) => {
                     // W4A16 routed GEMVs off f32 + the BF16 shared expert
                     exec.matvec_f32_batch(&w.router_w, &sc.d_xn, &mut sc.d_moe_logits, 1)?;
@@ -373,10 +390,25 @@ impl GpuLaguna {
                         1,
                         false,
                     )?;
-                    exec.bf16_gemm(&w.sh_gate, None, &sc.d_xn, &mut sc.d_sh_gate, 1)?;
-                    exec.bf16_gemm(&w.sh_up, None, &sc.d_xn, &mut sc.d_sh_up, 1)?;
-                    exec.swiglu(&mut sc.d_sh_gate, &sc.d_sh_up, moe_dims.shexp_ff)?;
-                    exec.bf16_gemm(&w.sh_down, None, &sc.d_sh_gate, &mut sc.d_sh_out, 1)?;
+                    match &w.shared {
+                        SharedNv::Bf16 { gate, up, down } => {
+                            exec.bf16_gemm(gate, None, &sc.d_xn, &mut sc.d_sh_gate, 1)?;
+                            exec.bf16_gemm(up, None, &sc.d_xn, &mut sc.d_sh_up, 1)?;
+                            exec.swiglu(&mut sc.d_sh_gate, &sc.d_sh_up, moe_dims.shexp_ff)?;
+                            exec.bf16_gemm(down, None, &sc.d_sh_gate, &mut sc.d_sh_out, 1)?;
+                        }
+                        SharedNv::Nv { gate, up, down } => super::nv::nv_swiglu(
+                            &exec,
+                            gate,
+                            up,
+                            down,
+                            &sc.d_xn,
+                            &mut sc.d_sh_gate,
+                            &mut sc.d_sh_up,
+                            &mut sc.d_sh_out,
+                            1,
+                        )?,
+                    }
                     exec.add(&mut sc.d_proj, &sc.d_sh_out, embd)?;
                 }
                 Ffn::Moe(w) => {
@@ -494,6 +526,7 @@ impl GpuLaguna {
         match &self.lm_head {
             Head::Quant(q) => gemv_any(&exec, q, &sc.d_xn, &mut sc.d_logits)?,
             Head::Bf16(w) => exec.bf16_gemm(w, None, &sc.d_xn, &mut sc.d_logits, 1)?,
+            Head::Nv(w) => super::nv::nv_rows(&exec, w, &sc.d_xn, &mut sc.d_logits, 1)?,
         }
         ds.pos += 1;
         let logits = exec.stream.clone_dtoh(&sc.d_logits).map_err(drv)?;
@@ -606,12 +639,18 @@ impl Generator for GpuLaguna {
     // plan_chunk's cap under the pass's row capacity (the decode rows share it)
     fn prefill_tick_cap(&self, decode_rows: usize) -> usize {
         // a pass with no decode band takes the wide chunk (Kolibri); one with
-        // decode rows keeps pf_rows - every band row waits on the whole pass
+        // decode rows keeps pf_rows - every band row waits on the whole pass.
+        // Flint's prefill tile takes the wide chunk beside decode rows too: a
+        // pass re-streams every touched expert's weights (~450 MB a layer),
+        // so a 1024-row rider pass cost ~1.5x a row of the 8192-row one, and
+        // four 8K prompts arriving together paid it three times over (GB10:
+        // median TTFT 3.84 -> 2.89 s, aggregate 84 -> 97 tok/s); the knee
+        // still trims the pass while a few streams wait
         self.batch.as_ref().map_or(0, |bs| {
             let rows = if decode_rows == 0 {
                 bs.pf_wide
             } else {
-                super::batch::pf_rows()
+                self.rider_rows()
             };
             rows.min(bs.cap.saturating_sub(decode_rows))
         })

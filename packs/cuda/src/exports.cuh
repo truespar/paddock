@@ -2059,6 +2059,19 @@ static const KernelTableV1 PD_KERNELS = {
     pd_ph_upsample,
     pd_ph_conv,
     pd_ph_conv_gemm,
+    pd_nvf4_moe_gu_swiglu_w16r,
+    pd_nvf4_moe_down_part_w16r,
+    pd_nvf4_pf_gemm,
+    pd_nvf4_pf_gu,
+    pd_nvf4_pf_moe_gu,
+    pd_nvf4_pf_moe_dn,
+    pd_add_norm16,
+    pd_attn_prefill_f16_paged_o16,
+    pd_nvf4_pf_moe_gu_ne,
+    pd_nvf4_gemm_mr3,
+    pd_gemm_f32_tiled,
+    pd_qkv_norm_rope_batch_q16,
+    pd_attn_prefill_f16_paged_q16,
 };
 
 PD_EXPORT const PackInfo* paddock_pack_info(void) {
@@ -2189,6 +2202,7 @@ PD_EXPORT const KernelTableV1* paddock_pack_kernels_v1(void) {
             t.nvf4_moe_up_relu2_mt = NULL;
             t.nvf4_moe_down_part = NULL;
             t.nvf4_gemm_mr = NULL;
+            t.nvf4_gemm_mr3 = NULL;
             t.nvf4_gemm_tc = NULL;
             t.nvf4_gemv_batch_tm = NULL;
             t.nvf4_gemm_mr_tm = NULL;
@@ -2201,6 +2215,15 @@ PD_EXPORT const KernelTableV1* paddock_pack_kernels_v1(void) {
             // need the 8.9 floor (nibble decode via e4m3, bf16 mma is 8.0)
             t.nvf4_moe_up_relu2_bs = NULL;
             t.nvf4_moe_down_bs = NULL;
+            // the row-plane W16 pair: e4m3 nibble decode + plain bf16 mma
+            t.nvf4_moe_gu_swiglu_w16r = NULL;
+            t.nvf4_moe_down_part_w16r = NULL;
+            // the W4A16 prefill tile: the same decode + bf16 mma
+            t.nvf4_pf_gemm = NULL;
+            t.nvf4_pf_gu = NULL;
+            t.nvf4_pf_moe_gu = NULL;
+            t.nvf4_pf_moe_dn = NULL;
+            t.nvf4_pf_moe_gu_ne = NULL;
         }
         // Exact cc match, same reason: the device gate is
         // `__CUDA_ARCH__ == 1000 && __CUDA_ARCH_FEAT_SM100_ALL`, so a 10.3 die

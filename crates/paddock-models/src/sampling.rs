@@ -161,6 +161,20 @@ pub fn elected(arch: &str) -> Option<Elected> {
             instruct: None,
             source: "lightonai/LightOnOCR client lightonocr/models.py (LightOnOCR-3                      0.8B/4B: temperature 0.2, top_p 1.0) and the LightOnOCR-3 model                      cards' recommended temperature 0.2",
         },
+        // Flint: one row (the card's evaluation settings, which
+        // generation_config.json and the GGUF's general.sampling.* ship too);
+        // the model decides per turn whether to reason, so there is no
+        // separate instruct row
+        "flint" => Elected {
+            thinking: Knobs {
+                temperature: 1.0,
+                top_k: 20,
+                top_p: 0.95,
+                min_p: 0.0,
+            },
+            instruct: None,
+            source: "RecursiveSI/flint generation_config.json (temperature 1.0, top_p 0.95, top_k 20) and the model card's evaluation settings",
+        },
         "kolibri1" => Elected {
             thinking: Knobs {
                 temperature: 1.0,

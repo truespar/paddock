@@ -207,11 +207,40 @@ impl GpuExecutor {
         params: (f32, f32, f32, f32, f32, f32),
         rows: usize,
     ) -> Result<(), GpuError> {
+        let (heads, plane) = ((n_head, n_kv, head_dim), (0, rows));
+        self.qk_norm_rope_batch_at(
+            q, k, v, qw, kw, qn, kn, positions, heads, eps, params, plane,
+        )
+    }
+
+    /// [`Self::qk_norm_rope_batch`] over rows `[row0, row0 + rows)` of every
+    /// plane (`plane` = (row0, rows); `heads` = (n_head, n_kv, head_dim)) -
+    /// each row's bits as the whole-plane call's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_norm_rope_batch_at(
+        &self,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &mut CudaSlice<f32>,
+        qw: &CudaSlice<f32>,
+        kw: &CudaSlice<f32>,
+        qn: &mut CudaSlice<f32>,
+        kn: &mut CudaSlice<f32>,
+        positions: &CudaSlice<u32>,
+        (n_head, n_kv, head_dim): (usize, usize, usize),
+        eps: f32,
+        params: (f32, f32, f32, f32, f32, f32),
+        (row0, rows): (usize, usize),
+    ) -> Result<(), GpuError> {
         let f = self
             .kernels
             .qkv_norm_rope_batch5
             .ok_or(GpuError::MissingOp("qkv_norm_rope_batch5"))?;
         let (theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale) = params;
+        let (qo, ko) = (
+            (row0 * n_head * head_dim * 4) as u64,
+            (row0 * n_kv * head_dim * 4) as u64,
+        );
         let (qp, _g1) = q.device_ptr(&self.stream);
         let (kp, _g2) = k.device_ptr(&self.stream);
         let (vp, _g3) = v.device_ptr_mut(&self.stream);
@@ -220,6 +249,8 @@ impl GpuExecutor {
         let (qnp, _g6) = qn.device_ptr_mut(&self.stream);
         let (knp, _g7) = kn.device_ptr_mut(&self.stream);
         let (pp, _g8) = positions.device_ptr(&self.stream);
+        let (qp, kp, vp, qnp, knp) = (qp + qo, kp + ko, vp + ko, qnp + qo, knp + ko);
+        let pp = pp + (row0 * 4) as u64;
         // SAFETY: ABI contract; v == vn is the documented in-place pass-through
         check(unsafe {
             f(
@@ -251,6 +282,89 @@ impl GpuExecutor {
                 self.stream_ptr(),
             )
         })
+    }
+
+    /// Whether the pack exports the f16-q norm + rope (slot 929).
+    pub fn has_qkv_norm_rope_batch_q16(&self) -> bool {
+        self.kernels.qkv_norm_rope_batch_q16.is_some()
+    }
+
+    /// [`Self::qk_norm_rope_batch_at`] (NEOX, unnormed V in place) with q
+    /// landing in `q16` as `f16(q * qscale)` (slot 929) - the halves the f16
+    /// wide prefill rung forms from the f32 plane at its Q scale `qscale`.
+    /// `Ok(false)`, nothing launched, without the slot or when the f32 entry
+    /// would elect another arm; the caller then keeps the f32 call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_norm_rope_batch_q16(
+        &self,
+        q: &CudaSlice<f32>,
+        k: &CudaSlice<f32>,
+        v: &mut CudaSlice<f32>,
+        qw: &CudaSlice<f32>,
+        kw: &CudaSlice<f32>,
+        q16: &mut CudaSlice<f16>,
+        kn: &mut CudaSlice<f32>,
+        positions: &CudaSlice<u32>,
+        (n_head, n_kv, head_dim): (usize, usize, usize),
+        eps: f32,
+        params: (f32, f32, f32, f32, f32, f32),
+        (row0, rows): (usize, usize),
+        qscale: f32,
+    ) -> Result<bool, GpuError> {
+        let Some(f) = self.kernels.qkv_norm_rope_batch_q16 else {
+            return Ok(false);
+        };
+        if (row0 + rows) * n_head * head_dim > q16.len() {
+            return Ok(false);
+        }
+        let (theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale) = params;
+        let (qo, ko) = (
+            (row0 * n_head * head_dim) as u64,
+            (row0 * n_kv * head_dim * 4) as u64,
+        );
+        let (qp, _g1) = q.device_ptr(&self.stream);
+        let (kp, _g2) = k.device_ptr(&self.stream);
+        let (vp, _g3) = v.device_ptr_mut(&self.stream);
+        let (qwp, _g4) = qw.device_ptr(&self.stream);
+        let (kwp, _g5) = kw.device_ptr(&self.stream);
+        let (qhp, _g6) = q16.device_ptr_mut(&self.stream);
+        let (knp, _g7) = kn.device_ptr_mut(&self.stream);
+        let (pp, _g8) = positions.device_ptr(&self.stream);
+        let (qp, kp, vp, knp) = (qp + qo * 4, kp + ko, vp + ko, knp + ko);
+        let (qhp, pp) = (qhp + qo * 2, pp + (row0 * 4) as u64);
+        // SAFETY: ABI contract (slot 929); v == vn is the in-place pass-through
+        let rc = unsafe {
+            f(
+                qp as *const _,
+                kp as *const _,
+                vp as *const _,
+                qwp as *const _,
+                kwp as *const _,
+                qhp as *mut _,
+                knp as *mut _,
+                vp as *mut _,
+                pp as *const _,
+                n_head as u32,
+                n_kv as u32,
+                head_dim as u32,
+                eps,
+                theta_scale,
+                freq_scale,
+                corr_low,
+                corr_high,
+                ext_factor,
+                mscale,
+                rows as u32,
+                qscale,
+                self.stream_ptr(),
+            )
+        };
+        // cudaErrorNotSupported: the f32 entry's election is another arm
+        if rc == 801 {
+            return Ok(false);
+        }
+        check(rc)?;
+        Ok(true)
     }
 
     /// `moe_topk_sigmoid_batch` with the shared-expert fold-:
@@ -348,6 +462,46 @@ impl GpuExecutor {
             )
         })
     }
+    /// The router's exact-f32 tiled GEMM at any row count (slot 928): one
+    /// owner thread and ascending K walk a logit whatever the rows, no TF32
+    /// arm. `Ok(false)` (nothing launched) without the slot or off its grid
+    /// (out % 32, in % 32): the caller keeps [`Self::matvec_f32_batch`].
+    pub fn gemm_f32_tiled(
+        &self,
+        w: &DeviceTensor,
+        x: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        batch: usize,
+    ) -> Result<bool, GpuError> {
+        let Some(f) = self.kernels.gemm_f32_tiled else {
+            return Ok(false);
+        };
+        let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
+        if !out_dim.is_multiple_of(32)
+            || !in_dim.is_multiple_of(32)
+            || x.len() < batch * in_dim
+            || y.len() < batch * out_dim
+        {
+            return Ok(false);
+        }
+        let (wp, _g1) = w.buf.device_ptr(&self.stream);
+        let (xp, _g2) = x.device_ptr(&self.stream);
+        let (yp, _g3) = y.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slot 928); x / y sized above
+        check(unsafe {
+            f(
+                wp as *const _,
+                xp as *const _,
+                yp as *mut _,
+                in_dim as u32,
+                out_dim as u32,
+                batch as u32,
+                self.stream_ptr(),
+            )
+        })?;
+        Ok(true)
+    }
+
     /// K-split router matvec (slot 486): deterministic ascending-split fold,
     /// caller-owned scratch (>= 8 * batch * out_dim f32; the decode graph
     /// bakes the launch, so no allocation ever happens here). New summation
@@ -1712,6 +1866,84 @@ impl GpuExecutor {
                 self.stream_ptr(),
             )
         })
+    }
+
+    /// Whether the pack exports the prefill residual tails (slot 924).
+    pub fn has_add_norm16(&self) -> bool {
+        self.kernels.add_norm16.is_some()
+    }
+
+    /// A prefill layer's residual tail and the next norm in one pass (slot
+    /// 924), with the bf16 rows the next tensor-core GEMM reads. `fold`
+    /// false: `x += proj; xn = rmsnorm(x) * w` - [`Self::add_rmsnorm_batch`]'s
+    /// bits. `fold` true: `proj`'s rows plus the `part` bf16 per-slot
+    /// partials `[rows][k][n]` (in an f32-typed buffer, slots ascending; None
+    /// is a plain add) onto `x`, then `rmsnorm_batch`'s norm - the bits of
+    /// `moe_slot_combine_bf16` + `add` + `rmsnorm_batch`. `x16` takes
+    /// `convert_f32_bf16(xn)`'s bits; `xn` and `x16` are each optional.
+    /// `Ok(false)` (nothing launched) without the slot or when it declines:
+    /// the caller runs the chain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_norm16(
+        &self,
+        x: &mut CudaSlice<f32>,
+        proj: &CudaSlice<f32>,
+        part: Option<(&CudaSlice<f32>, usize)>,
+        w: &CudaSlice<f32>,
+        xn: Option<&mut CudaSlice<f32>>,
+        x16: Option<&mut CudaSlice<half::bf16>>,
+        n: usize,
+        eps: f32,
+        rows: usize,
+        fold: bool,
+    ) -> Result<bool, GpuError> {
+        let Some(f) = self.kernels.add_norm16 else {
+            return Ok(false);
+        };
+        let k = part.map_or(0, |(_, k)| k);
+        let span = rows * n;
+        if !n.is_multiple_of(4)
+            || (!fold && k != 0)
+            || x.len() < span
+            || proj.len() < span
+            || w.len() < n
+            || part.is_some_and(|(p, k)| 2 * p.len() < span * k)
+            || xn.as_ref().is_some_and(|v| v.len() < span)
+            || x16.as_ref().is_some_and(|v| v.len() < span)
+        {
+            return Ok(false);
+        }
+        let (xp, _g1) = x.device_ptr_mut(&self.stream);
+        let (pp, _g2) = proj.device_ptr(&self.stream);
+        let (wp, _g3) = w.device_ptr(&self.stream);
+        let part = part.map(|(p, _)| p.device_ptr(&self.stream));
+        let xn = xn.map(|v| v.device_ptr_mut(&self.stream));
+        let x16 = x16.map(|v| v.device_ptr_mut(&self.stream));
+        // SAFETY: ABI contract (slot 924); planes sized above
+        let rc = unsafe {
+            f(
+                xp as *mut _,
+                pp as *const _,
+                part.as_ref()
+                    .map_or(std::ptr::null(), |(p, _)| *p as *const _),
+                k as u32,
+                wp as *const _,
+                xn.as_ref()
+                    .map_or(std::ptr::null_mut(), |(p, _)| *p as *mut _),
+                x16.as_ref()
+                    .map_or(std::ptr::null_mut(), |(p, _)| *p as *mut _),
+                n as u32,
+                eps,
+                rows as u32,
+                u32::from(fold),
+                self.stream_ptr(),
+            )
+        };
+        if rc == -2 {
+            return Ok(false);
+        }
+        check(rc)?;
+        Ok(true)
     }
 
     /// Shared-expert scalar sigmoid gate fold: `dst[b] += sigmoid(x[b].w) * src[b]`.

@@ -143,6 +143,10 @@ impl GpuLaguna {
                 exec.bf16_gemm(w, None, &sc.xn, &mut sc.head_logits, rows)?;
                 return Ok(());
             }
+            Head::Nv(w) => {
+                super::nv::nv_rows(&exec, w, &sc.xn, &mut sc.head_logits, rows)?;
+                return Ok(());
+            }
             Head::Quant(q) => q,
         };
         if rows == 1 {

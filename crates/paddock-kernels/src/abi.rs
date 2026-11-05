@@ -9688,7 +9688,292 @@ pub struct KernelTableV1 {
             *mut core::ffi::c_void,
         ) -> i32,
     >,
+    /// Slot 918: `pd_nvf4_moe_gu_swiglu_w16r` - the W16 expert pair's up
+    /// (moe/nvf4_w16r.cuh) over ROW-MAJOR planes with a SwiGLU gate|up:
+    /// routed gate/up planes + per-expert f32 factors, the shared expert's
+    /// gate/up + its two factors, the 32-row sorting, bf16 rows ->
+    /// `silu(g) * u` bf16 act `[rows][k * ff_r + ff_s]`. Batch-invariant.
+    pub nvf4_moe_gu_swiglu_w16r: Option<Nvf4MoeGuW16rFn>,
+    /// Slot 919: `pd_nvf4_moe_down_part_w16r` - its down over row-major
+    /// planes: per-(token, slot) f32 partials `[rows][k + 1][embd]` with the
+    /// top-k weight and expert factor folded in (slot k = the shared expert).
+    pub nvf4_moe_down_part_w16r: Option<Nvf4MoeDownW16rFn>,
+    /// Slot 920: `pd_nvf4_pf_gemm` - the W4A16 prefill tile (gemm/nvf4_pf.cuh):
+    /// `y[c * ldy + yoff + r] = (W x_c)_r * s2` over bf16 rows `x` (row stride
+    /// ldx, column offset xoff), the NVFP4 row plane decoded once a 128 x 128
+    /// tile onto m16n8k16. Row-invariant (no split-K).
+    pub nvf4_pf_gemm: Option<Nvf4PfGemmFn>,
+    /// Slot 921: `pd_nvf4_pf_gu` - its SwiGLU twin over a gate and an up
+    /// plane: `act[c * lda + aoff + ch] = bf16(silu(g * gs2) * (u * us2))`.
+    pub nvf4_pf_gu: Option<Nvf4PfGuFn>,
+    /// Slot 922: `pd_nvf4_pf_moe_gu` - the routed gate|up over
+    /// `moe_align_bm(64)`'s blocks: `act[t * aw + slot * ff + ch]`.
+    pub nvf4_pf_moe_gu: Option<Nvf4PfMoeGuFn>,
+    /// Slot 923: `pd_nvf4_pf_moe_dn` - the routed down over the same blocks:
+    /// per-(token, slot) bf16 partials `[rows][k][embd]`, the top-k weight and
+    /// the expert factor folded in (`moe_slot_combine_bf16`'s layout).
+    pub nvf4_pf_moe_dn: Option<Nvf4PfMoeDnFn>,
+    /// Slot 924: `pd_add_norm16` - a prefill layer's residual tail and the
+    /// next norm in one pass, with the bf16 rows the next tensor-core GEMM
+    /// reads: mode 0 is `add_rmsnorm_batch` (+ the cast), mode 1 the bf16
+    /// slot fold + residual add + `rmsnorm_batch` (+ the cast), each
+    /// bit-identical to its launches. -2 declines (the caller keeps them).
+    pub add_norm16: Option<AddNorm16Fn>,
+    /// Slot 925: `pd_attn_prefill_f16_paged_o16` - slot 653 with a bf16
+    /// output plane, on the f16 wide rung only (hd128 f16 pools); not
+    /// supported elsewhere.
+    pub attn_prefill_f16_paged_o16: Option<AttnPrefillPagedWpFn>,
+    /// Slot 926: `pd_nvf4_pf_moe_gu_ne` - slot 922 with the plane's expert
+    /// count, which elects its weight copy width (two k-tiles a copy below
+    /// ~2.5 blocks an expert, where the expert weights stream from DRAM).
+    pub nvf4_pf_moe_gu_ne: Option<Nvf4PfMoeGuNeFn>,
+    /// Slot 927: `pd_nvf4_gemm_mr3` - up to three Row-plane W4A16 GEMVs
+    /// (q|k|v, a gate|up pair) over the same <= 8 activation rows in one
+    /// launch, each row the single-plane multi-row GEMV's bits. A plane with
+    /// out_dim 0 is skipped.
+    pub nvf4_gemm_mr3: Option<Nvf4GemmMr3Fn>,
+    /// Slot 928: `pd_gemm_f32_tiled` - the router's exact-f32 tiled GEMM at
+    /// any row count (one owner thread and K walk a logit, whatever the
+    /// rows; no TF32 arm). Same signature as `gemm_f32`.
+    pub gemm_f32_tiled: Option<GemmF32TiledFn>,
+    /// Slot 929: `pd_qkv_norm_rope_batch_q16` - `qkv_norm_rope_batch5`'s f32
+    /// NEOX arm with q landing in an f16 plane as `f16(q * qscale)`, the
+    /// halves the f16 wide prefill rung forms from the f32 plane (qscale =
+    /// its log2-domain Q scale); k into kn, an unnormed V left in place.
+    /// cudaErrorNotSupported when the f32 entry would elect another arm.
+    pub qkv_norm_rope_batch_q16: Option<QkvNormRopeQ16Fn>,
+    /// Slot 930: `pd_attn_prefill_f16_paged_q16` - slot 925 reading that f16
+    /// q (the same bits as 925 on the f32 plane). batch 0 is the readiness
+    /// probe: 0 when the rung takes the shape, cudaErrorNotSupported else.
+    pub attn_prefill_f16_paged_q16: Option<AttnPrefillPagedWpFn>,
 }
+
+/// See [`KernelTableV1::qkv_norm_rope_batch_q16`] (slot 929): (q, k, v, qw,
+/// kw, q16, kn, vn, positions, n_head, n_kv, head_dim, eps, theta_scale,
+/// freq_scale, corr_low, corr_high, ext_factor, mscale, rows, qscale, stream).
+pub type QkvNormRopeQ16Fn = unsafe extern "C" fn(
+    q: *const core::ffi::c_void,
+    k: *const core::ffi::c_void,
+    v: *const core::ffi::c_void,
+    qw: *const core::ffi::c_void,
+    kw: *const core::ffi::c_void,
+    q16: *mut core::ffi::c_void,
+    kn: *mut core::ffi::c_void,
+    vn: *mut core::ffi::c_void,
+    positions: *const core::ffi::c_void,
+    n_head: u32,
+    n_kv: u32,
+    head_dim: u32,
+    eps: f32,
+    theta_scale: f32,
+    freq_scale: f32,
+    corr_low: f32,
+    corr_high: f32,
+    ext_factor: f32,
+    mscale: f32,
+    rows: u32,
+    qscale: f32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::gemm_f32_tiled`] (slot 928): (w [out, in], x [batch,
+/// in], out [batch, out], in_dim, out_dim, batch, stream).
+pub type GemmF32TiledFn = unsafe extern "C" fn(
+    w: *const core::ffi::c_void,
+    x: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    in_dim: u32,
+    out_dim: u32,
+    batch: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::nvf4_gemm_mr3`] (slot 927): per plane (data, scale,
+/// scale2, y, out_dim), then x, in_dim, batch, stream.
+pub type Nvf4GemmMr3Fn = unsafe extern "C" fn(
+    d0: *const core::ffi::c_void,
+    s0: *const core::ffi::c_void,
+    f0: f32,
+    y0: *mut core::ffi::c_void,
+    n0: u32,
+    d1: *const core::ffi::c_void,
+    s1: *const core::ffi::c_void,
+    f1: f32,
+    y1: *mut core::ffi::c_void,
+    n1: u32,
+    d2: *const core::ffi::c_void,
+    s2: *const core::ffi::c_void,
+    f2: f32,
+    y2: *mut core::ffi::c_void,
+    n2: u32,
+    x: *const core::ffi::c_void,
+    in_dim: u32,
+    batch: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::nvf4_pf_moe_gu_ne`] (slot 926).
+pub type Nvf4PfMoeGuNeFn = unsafe extern "C" fn(
+    gdata: *const core::ffi::c_void,
+    gscale: *const core::ffi::c_void,
+    gs2: *const core::ffi::c_void,
+    udata: *const core::ffi::c_void,
+    uscale: *const core::ffi::c_void,
+    us2: *const core::ffi::c_void,
+    sorted_row: *const core::ffi::c_void,
+    sorted_slot: *const core::ffi::c_void,
+    block_expert: *const core::ffi::c_void,
+    x: *const core::ffi::c_void,
+    act: *mut core::ffi::c_void,
+    in_dim: u32,
+    ff: u32,
+    aw: u32,
+    n_blocks: u32,
+    n_expert: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::add_norm16`] (slot 924).
+pub type AddNorm16Fn = unsafe extern "C" fn(
+    x: *mut core::ffi::c_void,
+    proj: *const core::ffi::c_void,
+    part: *const core::ffi::c_void,
+    k: u32,
+    w: *const core::ffi::c_void,
+    xn: *mut core::ffi::c_void,
+    x16: *mut core::ffi::c_void,
+    n: u32,
+    eps: f32,
+    rows: u32,
+    mode: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::nvf4_pf_gemm`] (slot 920).
+pub type Nvf4PfGemmFn = unsafe extern "C" fn(
+    data: *const core::ffi::c_void,
+    scale: *const core::ffi::c_void,
+    s2: f32,
+    x: *const core::ffi::c_void,
+    ldx: u32,
+    xoff: u32,
+    y: *mut core::ffi::c_void,
+    ldy: u32,
+    yoff: u32,
+    in_dim: u32,
+    out_dim: u32,
+    ntok: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::nvf4_pf_gu`] (slot 921).
+pub type Nvf4PfGuFn = unsafe extern "C" fn(
+    gdata: *const core::ffi::c_void,
+    gscale: *const core::ffi::c_void,
+    gs2: f32,
+    udata: *const core::ffi::c_void,
+    uscale: *const core::ffi::c_void,
+    us2: f32,
+    x: *const core::ffi::c_void,
+    ldx: u32,
+    act: *mut core::ffi::c_void,
+    lda: u32,
+    aoff: u32,
+    in_dim: u32,
+    ff: u32,
+    ntok: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::nvf4_pf_moe_gu`] (slot 922).
+pub type Nvf4PfMoeGuFn = unsafe extern "C" fn(
+    gdata: *const core::ffi::c_void,
+    gscale: *const core::ffi::c_void,
+    gs2: *const core::ffi::c_void,
+    udata: *const core::ffi::c_void,
+    uscale: *const core::ffi::c_void,
+    us2: *const core::ffi::c_void,
+    sorted_row: *const core::ffi::c_void,
+    sorted_slot: *const core::ffi::c_void,
+    block_expert: *const core::ffi::c_void,
+    x: *const core::ffi::c_void,
+    act: *mut core::ffi::c_void,
+    in_dim: u32,
+    ff: u32,
+    aw: u32,
+    n_blocks: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::nvf4_pf_moe_dn`] (slot 923).
+pub type Nvf4PfMoeDnFn = unsafe extern "C" fn(
+    data: *const core::ffi::c_void,
+    scale: *const core::ffi::c_void,
+    s2: *const core::ffi::c_void,
+    sorted_row: *const core::ffi::c_void,
+    sorted_slot: *const core::ffi::c_void,
+    block_expert: *const core::ffi::c_void,
+    topk_w: *const core::ffi::c_void,
+    act: *const core::ffi::c_void,
+    aw: u32,
+    part: *mut core::ffi::c_void,
+    ff: u32,
+    embd: u32,
+    k: u32,
+    n_blocks: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::nvf4_moe_gu_swiglu_w16r`] (slot 918).
+pub type Nvf4MoeGuW16rFn = unsafe extern "C" fn(
+    gdata: *const core::ffi::c_void,
+    gscale: *const core::ffi::c_void,
+    gscale2: *const core::ffi::c_void,
+    udata: *const core::ffi::c_void,
+    uscale: *const core::ffi::c_void,
+    uscale2: *const core::ffi::c_void,
+    sgdata: *const core::ffi::c_void,
+    sgscale: *const core::ffi::c_void,
+    sudata: *const core::ffi::c_void,
+    suscale: *const core::ffi::c_void,
+    sg2: f32,
+    su2: f32,
+    sorted_row: *const core::ffi::c_void,
+    sorted_slot: *const core::ffi::c_void,
+    block_expert: *const core::ffi::c_void,
+    x: *const core::ffi::c_void,
+    act: *mut core::ffi::c_void,
+    in_dim: u32,
+    ff_r: u32,
+    ff_s: u32,
+    k: u32,
+    n_blocks: u32,
+    rows: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::nvf4_moe_down_part_w16r`] (slot 919).
+pub type Nvf4MoeDownW16rFn = unsafe extern "C" fn(
+    rdata: *const core::ffi::c_void,
+    rscale: *const core::ffi::c_void,
+    rscale2: *const core::ffi::c_void,
+    sdata: *const core::ffi::c_void,
+    sscale: *const core::ffi::c_void,
+    ss2: f32,
+    sorted_row: *const core::ffi::c_void,
+    sorted_slot: *const core::ffi::c_void,
+    block_expert: *const core::ffi::c_void,
+    topk_w: *const core::ffi::c_void,
+    act: *const core::ffi::c_void,
+    part: *mut core::ffi::c_void,
+    ff_r: u32,
+    ff_s: u32,
+    embd: u32,
+    k: u32,
+    n_blocks: u32,
+    rows: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
 
 /// See [`KernelTableV1::ph_linear`] (slot 908).
 pub type PhLinearFn = unsafe extern "C" fn(
@@ -11715,7 +12000,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 903;
+pub const KERNEL_TABLE_SLOTS: usize = 916;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,

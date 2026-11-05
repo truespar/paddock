@@ -831,6 +831,97 @@ revision = "2026-10-07"
 # with the file's f16 block scales, the rest F32); workspace is the window
 # planes plus 32 concurrent sessions' K/V and convolution rings.
 [[model]]
+id = "flint"
+# F16 KV: Recursive's recommended class (its own llama.cpp recipe pins
+# -ctk/-ctv f16), and with 14 full layers over 4 KV heads the cache is small
+# enough that fp8 buys little - 256K costs ~7 GiB a sequence at f16
+kv_default = "f16"
+vendor = "Recursive"
+display = "Flint"
+family = "flint"
+capability = ["chat", "reasoning", "tools"]
+license = "apache-2.0"
+revision = "2026-11-04"
+
+  [model.specs]
+  published_at = "2026-10-21"
+  published_source = "https://huggingface.co/RecursiveSI/flint"
+  params = "39.8B total / 2.5B active"
+  context = "262K native; 262K default on CUDA"
+  homepage = "https://huggingface.co/RecursiveSI/flint"
+  about = "Recursive's mixture-of-experts model for coding agents - reading codebases, fixing bugs and making changes over many tool calls. It decides on each turn whether to reason. CUDA serves Recursive's own NVFP4 GGUF with F16 KV, at 16-bit activations as the file specifies."
+  strengths = ["Coding agents and multi-turn tool use", "2.5B active parameters: fast decode", "Small KV cache: long contexts and many sessions"]
+  tradeoffs = ["23 GB download; plan for at least 32 GB of GPU or unified memory", "Text only; no speculative decoder", "CUDA only, Ada or newer (NVFP4 weights)"]
+
+  # Recursive's NVFP4 GGUF (llama.cpp reads `flint` since PR #30928): every
+  # projection, the shared expert and the head NVFP4 with per-tensor F32
+  # factors, router and embeddings BF16. The file marks every tensor
+  # 16-bit-activation, so the lane serves W4A16 at every width: f32 rows on
+  # the decode GEMVs, bf16 rows on the prefill tensor cores (the row-plane
+  # W16 expert pair). cc 8.9 is the NVFP4 consumers' floor; measured on GB10.
+  [[model.artifact]]
+  id = "nvfp4"
+  kind = "weights"
+  format = "gguf"
+  label = "NVFP4"
+  quant = "NVFP4"
+  default = true
+  min_cc = [8, 9]
+  # The engine's own ledger at 262K x 4 on GB10 (2026-11-04): 78.20 GiB after
+  # enable_batch, less the 56 GiB pool, 0.28 GiB of sliding rings and the
+  # 22.96 GB of weights below = 0.57 GB of serving scratch (the 1028-row
+  # prefill chunk and the W16 pair's bf16 staging), plus the 0.14 GiB of
+  # prefix checkpoints.
+  workspace = 720000000
+
+  [model.artifact.source]
+  repo = "RecursiveSI/flint-nvfp4-gguf"
+  revision = "6ec43e19b565fc8d560e2d04985d7724f20673bf"
+  base_model = "RecursiveSI/flint"
+  license = "apache-2.0"
+  license_url = "https://huggingface.co/RecursiveSI/flint-nvfp4-gguf/blob/6ec43e19b565fc8d560e2d04985d7724f20673bf/LICENSE"
+
+  [model.artifact.runtime]
+  backends = ["cuda"]
+  companions = []
+  default_max_ctx = 262144
+  default_max_batch = 4
+  default_spec = "off"
+
+  # weight_bytes is the device-resident count (the BF16 router also rides
+  # widened to f32 for the prefill widths). KV is 14 full layers in the
+  # paged pool; the 35 sliding layers keep 513-key rings.
+  [model.artifact.shape]
+  weight_bytes = 22960000000
+  kind = "generative"
+  vocab = 150144
+  max_ctx = 262144
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = [
+    { k_dim = 512, v_dim = 512, window = 513, count = 35 },
+    { k_dim = 512, v_dim = 512, count = 14 },
+  ]
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/RecursiveSI/6ec43e19b565fc8d560e2d04985d7724f20673bf/Flint-NVFP4-GGUF/flint-nvfp4.gguf"
+    dest = "Flint-NVFP4-GGUF/flint-nvfp4.gguf"
+    sha256 = "97cc8009ff9b132d5cf3c488e6767962bb5a5dc158a90ed661bbbddf876b8bde"
+    size = 22863084160
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/RecursiveSI/6ec43e19b565fc8d560e2d04985d7724f20673bf/Flint-NVFP4-GGUF/README.md"
+    dest = "Flint-NVFP4-GGUF/README.md"
+    sha256 = "8a1a130252d03f22883e1aa52aa5f6f90374f85fd80477ebd7b7eaf2602dfbcc"
+    size = 3322
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/RecursiveSI/6ec43e19b565fc8d560e2d04985d7724f20673bf/Flint-NVFP4-GGUF/LICENSE"
+    dest = "Flint-NVFP4-GGUF/LICENSE"
+    sha256 = "43070e2d4e532684de521b885f385d0841030efa2b1a20bafb76133a5e1379c1"
+    size = 11356
+
+[[model]]
 id = "nemotron-3.5-asr-streaming-0.6b"
 vendor = "NVIDIA"
 display = "Nemotron 3.5 ASR Streaming"

@@ -71,6 +71,11 @@ impl GpuExecutor {
             && k.kumo_gemm.is_some()
     }
 
+    /// Whether the pack carries the BF16-weight GEMM (slot 722) on its own.
+    pub fn has_diar_gemm(&self) -> bool {
+        self.kernels.diar_gemm.is_some()
+    }
+
     /// Log-mel frames `start .. start + count` of a PCM window into `out`
     /// `[frames][128]` (slot 718). `pcm` holds samples `offset .. total` of
     /// the recording; frames at or past `count` (up to `frames`) and past the

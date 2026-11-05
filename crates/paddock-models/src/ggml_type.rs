@@ -179,11 +179,14 @@ impl GgmlType {
             Iq1M => (256, 56),
             // 32 elems: 1-byte shared E8M0 scale + 16 bytes of packed FP4
             Mxfp4 => (32, 17),
+            // 64 elems: 4 UE4M3 scales (one per 16) + 32 bytes of packed FP4
+            // (gguf_nvfp4 repacks it to the row layout)
+            Nvfp4 => (64, 36),
             // 128 elems: f16 d + 32 bytes of 2-bit slots (code - 1 = the trit)
             Pq2_0 => (128, 34),
             // 128 elems: qs[24] (5 trits a byte) + qh[2] (4 trits a byte) + f16 d
             Ptq1_0 => (128, 28),
-            // iq1/iq2/iq3/tq/nvfp4/q1_0 layouts not yet verified against ggml -
+            // iq1/iq2/iq3/tq/q1_0 layouts not yet verified against ggml -
             // fill in when a model in our matrix actually needs them
             _ => return None,
         })

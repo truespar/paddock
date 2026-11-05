@@ -21,12 +21,17 @@
 //! f32-widened BF16 router. The shared expert's three BF16 planes ride the
 //! bf16 GEMV / mma ladder (the prefill pair at prefill widths) and add on top
 //! of the routed sum.
+//!
+//! Flint's GGUF rides the same seat with an NVFP4 shared expert (the
+//! `nv::nv_rows` election) and no sorted pair at all: its file marks every
+//! expert 16-bit-activation, so the routed experts stay on the W4A16 GEMVs
+//! at every width (the caller passes `sorted: false`).
 
 use crate::gpu::GpuExecutor;
 use crate::gpu_model::gpt_oss::GpuModelError;
 
 use super::batch::BatchScratch;
-use super::{MoeDims, MoeNv};
+use super::{MoeDims, MoeNv, SharedNv};
 
 /// Whether the ring pair (slots 830 / 831) takes this layer's experts: the
 /// pack carries it, the planes meet its shape laws (gate|up in_dim % 128,
@@ -63,6 +68,22 @@ pub(super) fn moe_nv_rows(
     x16_ready: bool,
 ) -> Result<(), GpuModelError> {
     let k = m.n_active;
+    // decode band with an NVFP4 shared expert (Flint): the shared expert
+    // forks onto the side stream before the router - it reads only xn and
+    // lands proj, which nothing on the routed branch touches until the fold
+    // (the z-split down writes its partials), so the router -> route chain's
+    // latency hides under the shared expert's GEMVs. Scheduling only: every
+    // kernel and value is unchanged. Kill: PADDOCK_NO_FLINT_MOE_FORK.
+    let fork = !sorted
+        && r <= 64
+        && matches!(w.shared, SharedNv::Nv { .. })
+        && !no_moe_fork()
+        && exec.side_fork().is_ok();
+    if fork {
+        let shared = shared_expert(exec, m, w, sc, embd, r, true, x16_ready);
+        exec.side_end()?;
+        shared?;
+    }
     // router: at decode widths its BF16 plane through the f32-activation
     // GEMVs (exact products, f32 sums - the widened plane's class, half the
     // bytes); the tile's bf16-activation class never routes
@@ -89,7 +110,11 @@ pub(super) fn moe_nv_rows(
     // the routed + shared order bit for bit (two operands commute), and the
     // separate add is gone.
     let shared_first = b16 || (!sorted && r <= 64);
-    if shared_first {
+    debug_assert!(
+        !sorted || matches!(w.shared, SharedNv::Bf16 { .. }),
+        "the W4A4 pair is Kolibri's; an NVFP4 shared expert marks a W4A16 build"
+    );
+    if shared_first && !fork {
         shared_expert(exec, m, w, sc, embd, r, true, x16_ready)?;
     }
     if sorted {
@@ -185,6 +210,8 @@ pub(super) fn moe_nv_rows(
                 r,
                 false,
             )?;
+            // the forked shared expert's proj meets the routed partials here
+            exec.side_join()?;
             exec.moe_slot_combine(&sc.moe_part, &mut sc.proj, embd, k.div_ceil(2), r)?;
         } else {
             exec.nvf4_moe_down_acc(
@@ -207,6 +234,13 @@ pub(super) fn moe_nv_rows(
     Ok(())
 }
 
+/// PADDOCK_NO_FLINT_MOE_FORK: the decode band's shared expert stays on the
+/// compute stream.
+fn no_moe_fork() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_FLINT_MOE_FORK").is_some())
+}
+
 /// The always-on, ungated shared expert (BF16) over `r` rows of `sc.xn`,
 /// into `sc.proj` (`into_proj`) or `sc.sh_out`. Gate and up read one
 /// narrowing of xn when the prefill pair is elected (`x16_ready`: already
@@ -222,16 +256,38 @@ fn shared_expert(
     into_proj: bool,
     x16_ready: bool,
 ) -> Result<(), GpuModelError> {
+    let (sh_gate, sh_up, sh_down) = match &w.shared {
+        SharedNv::Bf16 { gate, up, down } => (gate, up, down),
+        SharedNv::Nv { gate, up, down } => {
+            let y = if into_proj {
+                &mut sc.proj
+            } else {
+                &mut sc.sh_out
+            };
+            super::nv::nv_swiglu(
+                exec,
+                gate,
+                up,
+                down,
+                &sc.xn,
+                &mut sc.sh_gate,
+                &mut sc.sh_up,
+                y,
+                r,
+            )?;
+            return Ok(());
+        }
+    };
     if exec.bf16_pf_elect(m.shexp_ff, r) {
         if !x16_ready {
             exec.convert_f32_bf16(&sc.xn, &mut sc.x16, r * embd)?;
         }
-        exec.bf16_gemm_pf(&w.sh_gate, None, &sc.x16, &mut sc.sh_gate, r)?;
-        exec.bf16_gemm_pf(&w.sh_up, None, &sc.x16, &mut sc.sh_up, r)?;
+        exec.bf16_gemm_pf(sh_gate, None, &sc.x16, &mut sc.sh_gate, r)?;
+        exec.bf16_gemm_pf(sh_up, None, &sc.x16, &mut sc.sh_up, r)?;
     } else {
         let x16 = &mut sc.x16;
-        super::head::bf16_rows_narrow(exec, &w.sh_gate, &sc.xn, x16, &mut sc.sh_gate, r)?;
-        super::head::bf16_rows_narrow(exec, &w.sh_up, &sc.xn, x16, &mut sc.sh_up, r)?;
+        super::head::bf16_rows_narrow(exec, sh_gate, &sc.xn, x16, &mut sc.sh_gate, r)?;
+        super::head::bf16_rows_narrow(exec, sh_up, &sc.xn, x16, &mut sc.sh_up, r)?;
     }
     exec.swiglu(&mut sc.sh_gate, &sc.sh_up, r * m.shexp_ff)?;
     let y = if into_proj {
@@ -239,6 +295,6 @@ fn shared_expert(
     } else {
         &mut sc.sh_out
     };
-    super::head::bf16_rows_narrow(exec, &w.sh_down, &sc.sh_gate, &mut sc.x16, y, r)?;
+    super::head::bf16_rows_narrow(exec, sh_down, &sc.sh_gate, &mut sc.x16, y, r)?;
     Ok(())
 }

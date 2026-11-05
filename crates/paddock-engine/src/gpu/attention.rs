@@ -5,6 +5,14 @@ use super::*;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
 use half::f16;
 
+/// The q plane a bf16-output prefill attention reads: the f32 plane, or the
+/// f16 one slot 929 wrote pre-scaled.
+#[derive(Clone, Copy)]
+pub enum PfQ<'a> {
+    F32(&'a CudaSlice<f32>),
+    F16(&'a CudaSlice<f16>),
+}
+
 impl GpuExecutor {
     /// The sinks buffer a family passes when it has no attention sinks.
     ///
@@ -2023,6 +2031,152 @@ impl GpuExecutor {
                 self.stream_ptr(),
             )
         })
+    }
+
+    /// Whether the pack exports the bf16-output prefill attention (slot 925).
+    pub fn has_attn_prefill_f16_paged_o16(&self) -> bool {
+        self.kernels.attn_prefill_f16_paged_o16.is_some()
+    }
+
+    /// [`Self::attn_prefill_f16_paged_at`] into a bf16 output plane (slot
+    /// 925) - the rows the o-projection's prefill tile reads, the bits of
+    /// the f32 call put through `convert_f32_bf16`. Only the f16 wide rung
+    /// lands bf16 (hd128 f16 pools): `Ok(false)`, nothing launched, for any
+    /// other shape or without the slot, and the caller keeps the f32 call.
+    /// [`PfQ::F16`] reads q as slot 929 wrote it (slot 930, same bits); ask
+    /// [`Self::attn_prefill_q16_ready`] before writing that q.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_prefill_f16_paged_o16_at(
+        &self,
+        q: PfQ<'_>,
+        pool_k: &CudaSlice<u8>,
+        pool_v: &CudaSlice<u8>,
+        sinks: &CudaSlice<f32>,
+        out: &mut CudaSlice<half::bf16>,
+        positions: &CudaSlice<u32>,
+        slots: &CudaSlice<u32>,
+        row_off: usize,
+        block_tables: &CudaSlice<u32>,
+        blocks_per_slot: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        kv_dim: usize,
+        swa_window: usize,
+        batch: usize,
+        scale: f32,
+        kv_dtype: KvDtype,
+    ) -> Result<bool, GpuError> {
+        let f = match q {
+            PfQ::F32(_) => self.kernels.attn_prefill_f16_paged_o16,
+            PfQ::F16(_) => self.kernels.attn_prefill_f16_paged_q16,
+        };
+        let Some(f) = f else {
+            return Ok(false);
+        };
+        let q_row = n_heads * head_dim;
+        let (q_len, q_elt) = match q {
+            PfQ::F32(p) => (p.len(), 4u64),
+            PfQ::F16(p) => (p.len(), 2u64),
+        };
+        if (row_off + batch) * q_row > q_len.min(out.len())
+            || row_off + batch > positions.len().min(slots.len())
+        {
+            return Ok(false);
+        }
+        let (qp, _g1) = match q {
+            PfQ::F32(p) => p.device_ptr(&self.stream),
+            PfQ::F16(p) => p.device_ptr(&self.stream),
+        };
+        let (kp, _g2) = pool_k.device_ptr(&self.stream);
+        let (vp, _g3) = pool_v.device_ptr(&self.stream);
+        let (sp, _g4) = sinks.device_ptr(&self.stream);
+        let (op, _g5) = out.device_ptr_mut(&self.stream);
+        let (pp, _g6) = positions.device_ptr(&self.stream);
+        let (slp, _g7) = slots.device_ptr(&self.stream);
+        let (btp, _g8) = block_tables.device_ptr(&self.stream);
+        let u32sz = std::mem::size_of::<u32>() as u64;
+        let qp = qp + (row_off * q_row) as u64 * q_elt;
+        let op = op + (row_off * q_row) as u64 * std::mem::size_of::<half::bf16>() as u64;
+        let pp = pp + row_off as u64 * u32sz;
+        let slp = slp + row_off as u64 * u32sz;
+        // SAFETY: ABI contract (slots 925 / 930); spans checked above
+        let rc = unsafe {
+            f(
+                qp as *const _,
+                kp as *const _,
+                vp as *const _,
+                sp as *const _,
+                op as *mut _,
+                pp as *const _,
+                std::ptr::null(),
+                slp as *const _,
+                btp as *const _,
+                blocks_per_slot as u32,
+                n_heads as u32,
+                n_kv_heads as u32,
+                head_dim as u32,
+                kv_dim as u32,
+                swa_window as u32,
+                batch as u32,
+                scale,
+                kv_dtype as u32,
+                self.stream_ptr(),
+            )
+        };
+        // cudaErrorNotSupported: not the f16 wide rung's shape
+        if rc == 801 {
+            return Ok(false);
+        }
+        check(rc)?;
+        Ok(true)
+    }
+
+    /// Whether the pack exports the f16-q prefill attention (slot 930).
+    pub fn has_attn_prefill_f16_paged_q16(&self) -> bool {
+        self.kernels.attn_prefill_f16_paged_q16.is_some()
+    }
+
+    /// Whether slot 930 takes this layer shape (its batch-0 probe): the f16
+    /// wide rung's gates, asked before q is written in f16.
+    pub fn attn_prefill_q16_ready(
+        &self,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        kv_dtype: KvDtype,
+    ) -> bool {
+        let Some(f) = self.kernels.attn_prefill_f16_paged_q16 else {
+            return false;
+        };
+        let (null, out) = (std::ptr::null(), std::ptr::null_mut());
+        let (nh, nkv, hd) = (n_heads as u32, n_kv_heads as u32, head_dim as u32);
+        let st = self.stream_ptr();
+        // SAFETY: ABI contract (slot 930): batch 0 reads no pointer
+        let rc = unsafe {
+            f(
+                null,
+                null,
+                null,
+                null,
+                out,
+                null,
+                null,
+                null,
+                null,
+                0,
+                nh,
+                nkv,
+                hd,
+                0,
+                0,
+                0,
+                1.0,
+                kv_dtype as u32,
+                st,
+            )
+        };
+        rc == 0
     }
 
     /// Whether the pack exports the pf7 varlen packed prefill (ABI 322).

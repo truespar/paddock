@@ -89,6 +89,14 @@ const DEEPSEEK3_NUM: &str = r"\p{N}{1,3}";
 const DEEPSEEK3_CJK: &str = "[\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}]+";
 const DEEPSEEK3_MAIN: &str = r##"[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"##;
 
+/// Recursive's Flint (`tokenizer.ggml.pre = "flint"`, vocab 150144). Three
+/// splits then ByteLevel, reproduced 1:1 from RecursiveSI/flint's
+/// tokenizer.json: digit runs capped at 3 and CJK/kana runs first (the same
+/// two stages DeepSeek-V3 opens with), then an o200k-shaped main pattern
+/// whose punctuation branch keys on \p{P}\p{S}. llama.cpp's FLINT case
+/// carries the same three (contractions as [sS] classes; we keep `(?i:)`).
+const FLINT_MAIN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 /// MiniCPM5 (`tokenizer.ggml.pre = "minicpm5"`; openbmb/MiniCPM5-2B, vocab
 /// 130560, served under arch `llama`). Two-stage, reproduced 1:1 from the
 /// model's own tokenizer.json: digit runs are capped at 3 FIRST, then a
@@ -117,9 +125,14 @@ pub fn build(pre: &str) -> Result<PreTokenizerWrapper, TokenizerError> {
         stages.push(PreTokenizerWrapper::ByteLevel(byte_level));
         return Ok(Sequence::new(stages).into());
     }
-    if pre == "deepseek-v3" {
+    if pre == "deepseek-v3" || pre == "flint" {
+        let main = if pre == "flint" {
+            FLINT_MAIN
+        } else {
+            DEEPSEEK3_MAIN
+        };
         let mut stages = Vec::with_capacity(4);
-        for pat in [DEEPSEEK3_NUM, DEEPSEEK3_CJK, DEEPSEEK3_MAIN] {
+        for pat in [DEEPSEEK3_NUM, DEEPSEEK3_CJK, main] {
             let s = Split::new(
                 SplitPattern::Regex(pat.to_owned()),
                 SplitDelimiterBehavior::Isolated,

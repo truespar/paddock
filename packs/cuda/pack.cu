@@ -17,6 +17,7 @@
 #include "src/attn/lagd.cuh"        // hd128 v5-class decode partial (needs decode's ldm/mma/cpa helpers; f32_qkv launches it)
 #include "src/gemm/f32_mv_staged.cuh"  // the f32 tile matvec with K staged in smem (cc 10, bit-identical); f32_qkv's batch launcher tries it first
 #include "src/gemm/f32_qkv.cuh"
+#include "src/gemm/f32_gemm.cuh"     // the f32 GEMM entries over f32_qkv.cuh's tiled kernel (pd_gemm_f32, slot 928)
 #include "src/sandwich_norm.cuh"  // sandwich post-norm + next norm (slot 777; elementwise + abi helpers)
 #include "src/attn/rows.cuh"        // split-K decode attention over runs of one slot's rows (spec verify + block drafter); needs decode's cpa/ldm/mma helpers + f32_qkv's pd_launch_status
 #include "src/qwen4exp.cuh"   // qwen4_exp (Qwen3.8-Flash-Next) new math: grouped (1+w) norm, hyper-connection mix/combine, PLE gate, dilated conv, GDN sigmoid gated-norm + repeat-interleave split; plain CUDA, needs f32_qkv's pd_launch_status
@@ -70,8 +71,11 @@
 #include "src/moe/nvf4_sorted.cuh"   // NVFP4 MoE over the sorted layout + sm_100 sorted-tile arm + decode expert GEMVs; follows nvf4_expert
 #include"src/moe/nvf4_st.cuh"      // tiled-layout MoE consumers (skinny-tile pair; needs nvf4's mma/dot4w helpers)
 #include "src/moe/nvf4_w16.cuh"    // W4A16 expert pair on tensor cores over the tiled plane, batch-invariant (needs nvf4_st's layout, decode.cuh's PD_MOE_PAD)
+#include "src/moe/nvf4_w16r.cuh"   // the same pair over row-major planes, SwiGLU gate|up (needs nvf4_w16's tile + mma helpers)
+#include "src/gemm/nvf4_pf.cuh"    // W4A16 prefill tile: NVFP4 row planes x bf16 rows, dense + MoE (needs decode.cuh's PD_MOE_PAD; helpers its own)
 #include "src/moe/q8.cuh"
 #include "src/norm/add_rmsnorm.cuh"     // fused residual add + RMSNorm rows (pd_add_rmsnorm_batch; moved from moe/q8.cuh)
+#include "src/norm/add_norm16.cuh"      // prefill residual tails + next norm with bf16 rows (slot 924; elementwise + abi helpers)
 #include "src/moe/q8_relu2.cuh"
 #include "src/moe/f8.cuh"           // tcgen05 e4m3 grouped MoE (needs attn/decode + moe/block_scale_quant; its tc5 descriptors now come from tma_desc)
 #include "src/moe/f8row.cuh"        // flat per-row-scale e4m3 expert GEMM, sm_89+ mma.sync (needs moe/mmq stage_y + int8_mma's PD_MMA_OK)

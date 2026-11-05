@@ -41,8 +41,11 @@ impl GpuLaguna {
     ) -> Result<Self, GpuModelError> {
         let flavor = match map.gguf().architecture() {
             Some("kolibri1") => Flavor::Kolibri,
+            Some("flint") => return Self::load_flint(exec, map, max_ctx),
             _ => Flavor::Laguna,
         };
+        // From here the flavor is Laguna or Kolibri: Flint loaded above, and
+        // it rides the Kolibri arms below only to keep the matches total.
         let fam = flavor.name();
         exec.vram_load_gate(map.total_len(), fam)
             .map_err(GpuModelError::WontFit)?;
@@ -79,7 +82,7 @@ impl GpuLaguna {
                 .into_iter()
                 .map(|v| v as usize)
                 .collect(),
-            Flavor::Kolibri => vec![u("attention.head_count")? as usize; n_layer],
+            Flavor::Kolibri | Flavor::Flint => vec![u("attention.head_count")? as usize; n_layer],
         };
         if n_heads.len() != n_layer {
             return Err(GpuModelError::Unsupported(format!(
@@ -113,22 +116,24 @@ impl GpuLaguna {
         }
         let swa_pattern: Vec<bool> = match flavor {
             Flavor::Laguna => (0..n_layer).map(|i| !i.is_multiple_of(4)).collect(),
-            Flavor::Kolibri => match map.gguf().arch_field("attention.sliding_window_pattern") {
-                Some(Value::Array(items)) if items.len() == n_layer => items
-                    .iter()
-                    .map(|v| match v {
-                        Value::Bool(b) => Ok(*b),
-                        _ => Err(GpuModelError::MissingMeta(
+            Flavor::Kolibri | Flavor::Flint => {
+                match map.gguf().arch_field("attention.sliding_window_pattern") {
+                    Some(Value::Array(items)) if items.len() == n_layer => items
+                        .iter()
+                        .map(|v| match v {
+                            Value::Bool(b) => Ok(*b),
+                            _ => Err(GpuModelError::MissingMeta(
+                                "attention.sliding_window_pattern".into(),
+                            )),
+                        })
+                        .collect::<Result<_, _>>()?,
+                    _ => {
+                        return Err(GpuModelError::MissingMeta(
                             "attention.sliding_window_pattern".into(),
-                        )),
-                    })
-                    .collect::<Result<_, _>>()?,
-                _ => {
-                    return Err(GpuModelError::MissingMeta(
-                        "attention.sliding_window_pattern".into(),
-                    ));
+                        ));
+                    }
                 }
-            },
+            }
         };
         let is_swa = |i: usize| swa_pattern[i];
         for (i, &h) in n_heads.iter().enumerate() {
@@ -151,12 +156,12 @@ impl GpuLaguna {
             routed_scale: f("expert_weights_scale").unwrap_or(1.0),
             router: match flavor {
                 Flavor::Laguna => Router::SigmoidNorm,
-                Flavor::Kolibri => Router::LogitSigmoid,
+                Flavor::Kolibri | Flavor::Flint => Router::LogitSigmoid,
             },
         };
         let (want_gating, want_name) = match flavor {
             Flavor::Laguna => (GATING_FUNC_SIGMOID, "sigmoid"),
-            Flavor::Kolibri => (GATING_FUNC_SIGMOID_LOGIT_ADD, "sigmoid_logit_add"),
+            Flavor::Kolibri | Flavor::Flint => (GATING_FUNC_SIGMOID_LOGIT_ADD, "sigmoid_logit_add"),
         };
         let gating = u("expert_gating_func").unwrap_or(GATING_FUNC_SIGMOID);
         if gating != want_gating {
@@ -184,7 +189,7 @@ impl GpuLaguna {
         // Kolibri routes every layer (no dense lead, no key)
         let n_dense_lead = match flavor {
             Flavor::Laguna => u("leading_dense_block_count")? as usize,
-            Flavor::Kolibri => 0,
+            Flavor::Kolibri | Flavor::Flint => 0,
         };
 
         // Rope, per layer type. Full layers: YaRN over n_rot=64 of 128 dims
@@ -198,7 +203,9 @@ impl GpuLaguna {
         // never read there.
         let n_rot = match flavor {
             Flavor::Laguna => u("rope.dimension_count")? as usize,
-            Flavor::Kolibri => u("rope.dimension_count").map_or(head_dim, |v| v as usize),
+            Flavor::Kolibri | Flavor::Flint => {
+                u("rope.dimension_count").map_or(head_dim, |v| v as usize)
+            }
         };
         let n_rot_swa = u("rope.dimension_count_swa")
             .map(|v| v as usize)
@@ -207,7 +214,7 @@ impl GpuLaguna {
             .ok_or_else(|| GpuModelError::MissingMeta("rope.freq_base".into()))?;
         let rope_base_swa = f("rope.freq_base_swa").unwrap_or(match flavor {
             Flavor::Laguna => 10_000.0,
-            Flavor::Kolibri => rope_base,
+            Flavor::Kolibri | Flavor::Flint => rope_base,
         });
         if flavor == Flavor::Kolibri && (n_rot_swa != head_dim || n_rot != head_dim) {
             return Err(GpuModelError::Unsupported(format!(
@@ -401,7 +408,7 @@ impl GpuLaguna {
             let sandwich = |name: &str| -> Result<Option<DeviceTensor>, GpuError> {
                 match flavor {
                     Flavor::Laguna => Ok(None),
-                    Flavor::Kolibri => dt(name).map(Some),
+                    Flavor::Kolibri | Flavor::Flint => dt(name).map(Some),
                 }
             };
             let layer = LagunaLayer {
@@ -423,6 +430,7 @@ impl GpuLaguna {
                 ffn_norm: dt("ffn_norm.weight")?,
                 post_attn_norm: sandwich("post_attention_norm.weight")?,
                 post_ffn_norm: sandwich("post_ffw_norm.weight")?,
+                sinks: None,
                 ffn,
                 is_swa: swa,
                 nope: !swa && flavor == Flavor::Kolibri,
@@ -550,6 +558,7 @@ impl GpuLaguna {
             pipe: None,
             dflash: None,
             chunked: Vec::new(),
+            w16r: None,
         })
     }
 }

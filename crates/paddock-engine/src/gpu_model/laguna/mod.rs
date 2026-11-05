@@ -35,20 +35,37 @@
 //! sandwich norms (`post_attention_norm` after the attention block,
 //! `post_ffw_norm` after routed + shared experts), MoE on every layer, and
 //! the `sigmoid_logit_add` router ([`Router::LogitSigmoid`]).
+//!
+//! And Recursive's **Flint** (`flint` GGUFs, [`Flavor::Flint`];
+//! llama.cpp `src/models/flint.cpp` and the SGLang plugin's `model.py` are
+//! the study references). Kolibri's attention plan - the file's sliding
+//! pattern, 513-key SWA with RoPE (θ 10k), NoPE full layers - plus a learned
+//! per-head sink logit on every layer, two dense lead layers, uniform 32 Q
+//! heads over 4 KV heads, and Laguna's sigmoid router with renormalized
+//! weights (scale 1.0, no selection bias). Its one shipped build is NVFP4
+//! throughout (`flint-nvfp4.gguf`): every projection, the shared expert and
+//! the head are NVFP4 planes, and the file marks every one of them as
+//! 16-bit-activation (`prec_a4` false), so this flavor serves W4A16 at every
+//! width - f32 rows on the GEMVs, bf16 rows on the exact-dequant tensor-core
+//! GEMMs - never the W4A4 pair Kolibri's NVFP4 build prefills on.
 
 use std::sync::Arc;
 
 use crate::gpu::{
-    DeviceTensor, GpuExecutor, KvDtype, Nvf4MoePlane, QuantTensor, QuantW, RepackedKQ, RepackedQ8,
+    DeviceTensor, GpuExecutor, KvDtype, Nvf4MoePlane, Nvf4Plane, QuantTensor, QuantW, RepackedKQ,
+    RepackedQ8,
 };
 
+mod attend;
 mod batch;
 mod dflash;
 mod forward;
 mod head;
 mod load;
+mod load_flint;
 mod load_hf;
 mod moe_nv;
+mod nv;
 mod prefix;
 mod profile;
 
@@ -73,6 +90,7 @@ pub(crate) enum ExpW {
 pub(crate) enum Flavor {
     Laguna,
     Kolibri,
+    Flint,
 }
 
 impl Flavor {
@@ -81,6 +99,7 @@ impl Flavor {
         match self {
             Flavor::Laguna => "laguna",
             Flavor::Kolibri => "kolibri1",
+            Flavor::Flint => "flint",
         }
     }
 }
@@ -142,10 +161,27 @@ pub(crate) struct MoeNv {
     pub gate: Nvf4MoePlane,
     pub up: Nvf4MoePlane,
     pub down: Nvf4MoePlane,
-    /// shared expert, BF16 `[k, n]` planes
-    pub sh_gate: QuantTensor,
-    pub sh_up: QuantTensor,
-    pub sh_down: QuantTensor,
+    /// the always-on shared expert
+    pub shared: SharedNv,
+}
+
+/// The NVFP4 builds' shared expert: BF16 as Kolibri's export ships it, NVFP4
+/// on Flint's GGUF.
+// one value per MoE layer, read by reference - boxing the NVFP4 arm would
+// buy nothing
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum SharedNv {
+    /// BF16 `[k, n]` planes
+    Bf16 {
+        gate: QuantTensor,
+        up: QuantTensor,
+        down: QuantTensor,
+    },
+    Nv {
+        gate: Nvf4Plane,
+        up: Nvf4Plane,
+        down: Nvf4Plane,
+    },
 }
 
 /// Per-layer FFN: layer 0 is dense (ffn 8192), everything else is MoE.
@@ -160,6 +196,23 @@ pub(crate) enum Ffn {
     },
     Moe(MoeWeights),
     MoeNv(MoeNv),
+    /// Flint's dense lead layers: NVFP4 SwiGLU planes.
+    DenseNv {
+        gate: Nvf4Plane,
+        up: Nvf4Plane,
+        down: Nvf4Plane,
+    },
+}
+
+impl Ffn {
+    /// The dense FFN's width, or None on an MoE layer.
+    pub(crate) fn dense_ff(&self) -> Option<usize> {
+        match self {
+            Ffn::Dense { gate, .. } => Some(gate.dims()[1]),
+            Ffn::DenseNv { gate, .. } => Some(gate.out_dim),
+            Ffn::Moe(_) | Ffn::MoeNv(_) => None,
+        }
+    }
 }
 
 /// The GGUF builds' attention projections (Q8_0 / k-quant, the W4A8 ladders).
@@ -193,14 +246,23 @@ pub(crate) enum Proj {
         wqkv: QuantTensor,
         wo: QuantTensor,
     },
+    /// Flint's NVFP4 GGUF: q, k, v and o as their own planes - each tensor
+    /// carries its own per-tensor scale, so they do not fuse into one plane.
+    Nv {
+        wq: Nvf4Plane,
+        wk: Nvf4Plane,
+        wv: Nvf4Plane,
+        wo: Nvf4Plane,
+    },
 }
 
 impl Proj {
-    /// The GGUF planes - the dev probes and the GGUF-only paths read these.
+    /// The GGUF k-quant planes - the dev probes and the k-quant-only paths
+    /// read these.
     pub(crate) fn quant(&self) -> Option<&QProj> {
         match self {
             Proj::Quant(q) => Some(q),
-            Proj::Bf16 { .. } => None,
+            Proj::Bf16 { .. } | Proj::Nv { .. } => None,
         }
     }
 }
@@ -209,6 +271,7 @@ impl Proj {
 pub(crate) enum Head {
     Quant(QuantW),
     Bf16(QuantTensor),
+    Nv(Nvf4Plane),
 }
 
 /// One transformer block.
@@ -224,6 +287,10 @@ pub(crate) struct LagunaLayer {
     /// shared experts' sum before theirs. None on Laguna.
     pub post_attn_norm: Option<DeviceTensor>,
     pub post_ffn_norm: Option<DeviceTensor>,
+    /// Learned attention sinks [n_heads] f32 (Flint): one logit per head in
+    /// the softmax denominator, no value row. None = no sinks (the -inf
+    /// scratch rides instead).
+    pub sinks: Option<DeviceTensor>,
     pub ffn: Ffn,
     /// SWA layer (Laguna il % 4 != 0, Kolibri the file's sliding pattern).
     /// Laguna's full layers run partial-rotary YaRN.
@@ -350,4 +417,7 @@ pub struct GpuLaguna {
     /// tick resumes it - decode rows never wait for a whole prompt, let
     /// alone a whole admission wave.
     pub(crate) chunked: Vec<batch::ChunkedPrefill>,
+    /// Flint's prefill experts on the W16 pair (nv.rs): its scratch, built
+    /// beside the batch state; None on every other build.
+    pub(crate) w16r: Option<nv::W16r>,
 }

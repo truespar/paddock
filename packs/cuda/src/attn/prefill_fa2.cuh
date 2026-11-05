@@ -1113,8 +1113,20 @@ template <bool B> struct PdPfIn { static constexpr bool value = B; };
 // one ldmatrix 8x8 reads sit in 8 distinct bank groups) where SUB=1 keeps
 // the +8-half pad. SUB=1 is this kernel as it was, op for op; SUB=2 at TK=32
 // moves the online-softmax tile boundary, a numerics-class change.
+//
+// K16 (f16 pools): nothing to repack, so K and V stage straight into two
+// panes (no raw buffers) - at SUB=2 / TK=32 that is 50,176 B, exactly two
+// CTAs in GB10's 100 KB with the 1 KB reserve each. K[i+1] streams under
+// PV[i], V[i] under QK[i] + its softmax; three barriers a tile. The mma
+// loop and the softmax are the fp8 rung's, op for op (same halves in, same
+// order), so f16 rides the same numerics class at its own bytes.
+// O16: the output lands bf16 (the o-projection's prefill tile reads bf16
+// rows) - the same f32 value rounded to nearest at the store, so it equals
+// the f32 output put through convert_f32_bf16.
+// Q16: q arrives as f16 already scaled (slot 929 wrote f16(value * qscale)),
+// so the Q stage only copies - the halves this kernel would have formed.
 template <uint32_t G, bool VL = false, uint32_t HD = 256u, uint32_t TK = 64u,
-          uint32_t SUB = 1u>
+          uint32_t SUB = 1u, bool K16 = false, bool O16 = false, bool Q16 = false>
 __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
     const float* __restrict__ q, const unsigned char* __restrict__ pool_k,
     const unsigned char* __restrict__ pool_v, const float* __restrict__ sinks,
@@ -1131,6 +1143,8 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
     constexpr uint32_t QROWQ = QSW ? HD : QROW;
     static_assert(SUB == 1u || SUB == 2u, "one or two m-tiles a warp");
     static_assert(!(VL && SUB > 1u), "the varlen items tile 64 rows");
+    static_assert(!K16 || SUB > 1u, "the f16 panes are the wide rung's");
+    static_assert(!Q16 || (K16 && O16), "q16 rides the bf16-output wide rung");
     // SUB=2 runs the softmax in the log2 domain (FlashInfer's form): log2(e)
     // rides the Q scale, so every score's exp is one ex2 - __expf is ex2 of
     // x * log2(e), a multiply an element. Running max/sum stay consistent
@@ -1173,7 +1187,9 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
     extern __shared__ __align__(16) unsigned char pf7_sm[];
     __half* sh_q = (__half*)pf7_sm;
     __half* pane = sh_q + (size_t)MR * QROWQ;
-    unsigned char* kraw = (unsigned char*)(pane + (size_t)TK * QROW);
+    // K16: pane holds K, vpane V; otherwise one pane takes K then V
+    __half* vpane = K16 ? pane + (size_t)TK * QROW : pane;
+    unsigned char* kraw = (unsigned char*)(pane + (size_t)(K16 ? 2u : 1u) * TK * QROW);
     unsigned char* vraw = kraw + (size_t)TK * RROW;
     // per-row positions and true positions (floors) live in the head of the
     // repack pane: every read of them is in the prologue, before the main
@@ -1262,6 +1278,31 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
         }
         pd_attn_cpa_commit();
     };
+    // K16: one f16 tile straight into its pane, 16 B lines, rows past hi
+    // zero-filled (stale halves can be inf / NaN, same reason as above)
+    auto stage16 = [&](__half* dstp, const unsigned char* pool, uint32_t t0) {
+        const uint32_t n_t = hi - t0 < TK ? hi - t0 : TK;
+        constexpr uint32_t CH = HD / 8u;   // 16 B lines a key row
+        static_assert(TK * CH % 128u == 0u, "whole lines a thread");
+        uint32_t bt4[TK / 16u];
+        #pragma unroll
+        for (uint32_t j = 0; j < TK / 16u; ++j)
+            bt4[j] = t0 + j * 16u < hi ? bt[(t0 >> 4) + j] : 0u;
+        #pragma unroll
+        for (uint32_t i = 0; i < TK * CH / 128u; ++i) {
+            const uint32_t u = d + i * 128u;
+            const uint32_t p = u / CH, l = u % CH;
+            __half* dst = dstp + (size_t)p * QROW + l * 8u;
+            if (p < n_t) {
+                const uint32_t gpos = t0 + p;
+                pd_attn_cpa16(dst, pool + ((size_t)bt4[p >> 4] * 16u * kv_dim
+                    + (size_t)(gpos & 15u) * kv_dim + (size_t)kvh * HD) * 2u + l * 16u);
+            } else {
+                *reinterpret_cast<uint4*>(dst) = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
+        pd_attn_cpa_commit();
+    };
 
     // bulk fp8 -> f16 repack: one 16B raw chunk (16 e4m3) -> 32B pane
     // (16 halves), same per-element cvt as pf7's in-loop cvt2. 8 chunks
@@ -1333,8 +1374,15 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
     };
 
     // K0/V0 fly while Q stages
-    stage_one(kraw, pool_k, lo_t);
-    stage_one(vraw, pool_v, lo_t);
+    if constexpr (K16) {
+        // the positions above live in the K pane K0 lands on
+        __syncthreads();
+        stage16(pane, pool_k, lo_t);
+        stage16(vpane, pool_v, lo_t);
+    } else {
+        stage_one(kraw, pool_k, lo_t);
+        stage_one(vraw, pool_v, lo_t);
+    }
 
     // Q stage (scaled f32 -> f16), float4-wide: the scalar version's
     // LDG->FMUL chains had no memory-level parallelism and were 32% of
@@ -1343,6 +1391,31 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
     // serialize all 32 iterations through one temp cluster (every FMUL
     // consumer stalling on its own LDG - 25% of kernel stall samples).
     // An explicit 8-wide load array forces 8 LDG.128 in flight per group.
+    if constexpr (Q16) {
+        // the halves arrive formed: 8 B loads, same rows, same zero tail
+        const __half* qh = reinterpret_cast<const __half*>(q);
+        #pragma unroll
+        for (uint32_t gq = 0; gq < MR * (HD / 4u) / 128u / 8u; ++gq) {
+            uint2 x[8];
+            #pragma unroll
+            for (uint32_t j = 0; j < 8u; ++j) {
+                const uint32_t u = d + (gq * 8u + j) * 128u;
+                uint32_t R = row0 + u / (HD / 4u);
+                R = R < Rtot ? R : Rtot - 1u;
+                x[j] = *reinterpret_cast<const uint2*>(
+                    qh + ((size_t)(qr0 + R / G) * n_heads + kvh * G + R % G)
+                        * HD + (u % (HD / 4u)) * 4u);
+            }
+            #pragma unroll
+            for (uint32_t j = 0; j < 8u; ++j) {
+                const uint32_t u = d + (gq * 8u + j) * 128u;
+                const uint32_t r = u / (HD / 4u), c4 = (u % (HD / 4u)) * 4u;
+                // c4..c4+3 sit in one swizzled 8-half chunk: one 8 B store
+                *reinterpret_cast<uint2*>(sh_q + qix(r, c4)) =
+                    row0 + r < Rtot ? x[j] : make_uint2(0u, 0u);
+            }
+        }
+    } else {
     #pragma unroll
     for (uint32_t gq = 0; gq < MR * (HD / 4u) / 128u / 8u; ++gq) {
         float4 x[8];
@@ -1371,6 +1444,7 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
             *reinterpret_cast<__half2*>(sh_q + qix(r, c4 + 2u)) = h1;
         }
     }
+    }
     if constexpr (!QSW) {
         if (d < MR)  // zero the +8 pad halves so ldmatrix never sees junk
             *reinterpret_cast<uint4*>(sh_q + (size_t)d * QROW + HD) =
@@ -1379,13 +1453,21 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
 
     for (uint32_t t0 = lo_t; t0 < hi; t0 += TK) {
         const bool more = t0 + TK < hi;
-        // pending {K[i], V[i]} -> wait1 retires K[i] (commit order), V may fly
-        pd_attn_cpa_wait1();
-        __syncthreads();           // prev PV done reading pane + kraw ready
+        if constexpr (K16) {
+            // first tile: pending {K0, V0}; later ones {K[i]} (V[i] stages
+            // here, once every warp is past PV[i-1])
+            if (t0 == lo_t) pd_attn_cpa_wait1(); else pd_attn_cpa_wait0();
+            __syncthreads();       // K[i] visible, vpane free (first: Q too)
+            if (t0 != lo_t) stage16(vpane, pool_v, t0);
+        } else {
+            // pending {K[i], V[i]} -> wait1 retires K[i] (commit order), V may fly
+            pd_attn_cpa_wait1();
+            __syncthreads();       // prev PV done reading pane + kraw ready
                                    // (first iter: Q stage visible too)
-        repack(kraw);
-        __syncthreads();           // pane K visible; kraw free
-        if (more) stage_one(kraw, pool_k, t0 + TK);
+            repack(kraw);
+            __syncthreads();       // pane K visible; kraw free
+            if (more) stage_one(kraw, pool_k, t0 + TK);
+        }
 
         // scores: warp-owned m16 x TK; QK-B = x4 non-trans on the pane.
         // Software-pipelined (mma-pipeline door): 1
@@ -1545,12 +1627,19 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
         else softmax_tile(PdPfIn<false>{});
 
         __syncthreads();           // pane K consumed by all warps
-        pd_attn_cpa_wait1();       // V[i] arrived (K[i+1] may fly);
+        if constexpr (K16) {
+            if (more) stage16(pane, pool_k, t0 + TK);
+            // pending {V[i], K[i+1]} -> wait1; last tile {V[i]} -> wait0
+            if (more) pd_attn_cpa_wait1(); else pd_attn_cpa_wait0();
+            __syncthreads();       // V[i] visible
+        } else {
+            pd_attn_cpa_wait1();   // V[i] arrived (K[i+1] may fly);
                                    // last tile: pending {V[i]} only -> wait0
-        if (!more) pd_attn_cpa_wait0();
-        repack(vraw);
-        __syncthreads();           // pane V visible; vraw free
-        if (more) stage_one(vraw, pool_v, t0 + TK);
+            if (!more) pd_attn_cpa_wait0();
+            repack(vraw);
+            __syncthreads();       // pane V visible; vraw free
+            if (more) stage_one(vraw, pool_v, t0 + TK);
+        }
 
         // O rescale + PV; PV-B = x4.trans on the pane. Loop nest SWAPPED to
         // kc-outer/dc-inner + distance-1 B prefetch (same mma-pipeline
@@ -1572,7 +1661,7 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
             }
         // lanes 0-7: keys 0-7 cols 0-7 | 8-15: keys 8-15 cols 0-7 |
         // 16-23: keys 0-7 cols 8-15 | 24-31: keys 8-15 cols 8-15
-        const __half* pv_b0 = pane
+        const __half* pv_b0 = vpane
             + (size_t)((((lane >> 3) & 1u) ? 8u : 0u) + (lane & 7u)) * QROW
             + ((lane >> 4) ? 8u : 0u);
         uint32_t bt2[2][4];
@@ -1610,14 +1699,25 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
         const float cm = ex(mm - mtot), cs2 = ex(sv - mtot);
         const float l = ll * cm + cs2;
         const float nrm = l > 0.f ? cm / l : 0.f;
-        float* op = out + ((size_t)(qr0 + R / G) * n_heads + h) * HD;
+        const size_t ob = ((size_t)(qr0 + R / G) * n_heads + h) * HD;
+        float* op = out + ob;
+        __nv_bfloat16* op16 = reinterpret_cast<__nv_bfloat16*>(out) + ob;
+        (void)op; (void)op16;
         #pragma unroll
         for (uint32_t dc = 0; dc < HD / 16u; ++dc) {
             const uint32_t i0 = half ? 2u : 0u;
-            *reinterpret_cast<float2*>(op + dc * 16u + c2) =
-                make_float2(o_acc[sb][dc][i0] * nrm, o_acc[sb][dc][i0 + 1u] * nrm);
-            *reinterpret_cast<float2*>(op + dc * 16u + 8u + c2) =
-                make_float2(o_acc[sb][dc][i0 + 4u] * nrm, o_acc[sb][dc][i0 + 5u] * nrm);
+            if constexpr (O16) {
+                *reinterpret_cast<__nv_bfloat162*>(op16 + dc * 16u + c2) = __floats2bfloat162_rn(
+                    o_acc[sb][dc][i0] * nrm, o_acc[sb][dc][i0 + 1u] * nrm);
+                *reinterpret_cast<__nv_bfloat162*>(op16 + dc * 16u + 8u + c2) =
+                    __floats2bfloat162_rn(o_acc[sb][dc][i0 + 4u] * nrm,
+                                          o_acc[sb][dc][i0 + 5u] * nrm);
+            } else {
+                *reinterpret_cast<float2*>(op + dc * 16u + c2) =
+                    make_float2(o_acc[sb][dc][i0] * nrm, o_acc[sb][dc][i0 + 1u] * nrm);
+                *reinterpret_cast<float2*>(op + dc * 16u + 8u + c2) =
+                    make_float2(o_acc[sb][dc][i0 + 4u] * nrm, o_acc[sb][dc][i0 + 5u] * nrm);
+            }
         }
     }
 #else
@@ -1626,6 +1726,38 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
     (void)n_heads; (void)kv_dim; (void)swa_window; (void)n_rows; (void)scale;
     (void)vl_items; (void)run_offs;
 #endif
+}
+
+// The f16 wide rung's gates (pd_pf7rp128_go's K16 branch): kill switches,
+// the instantiated ratios, the opt-in smem fit. Also the readiness probe of
+// slot 930, whose caller writes q in f16 before attention runs and so must
+// know up front the rung will take it.
+static inline bool pd_pf7rp16_ok(uint32_t g_) {
+    constexpr uint32_t WTK = 32u, WHD = 128u, WMR = 128u;
+    // Q MR*HD h (swizzled, unpadded) | K, V panes TK*(HD+8) h each:
+    // 50,176 -> 2 CTA/SM with the 1 KB reserve each (102,400 B an SM)
+    constexpr uint32_t WSM = WMR * WHD * 2u + 2u * WTK * (WHD + 8u) * 2u;
+    static const bool no_rp128 = pd_env("PADDOCK_NO_PF7RP") != nullptr;
+    static const bool rp128w = pd_env("PADDOCK_NO_PF7RP_SUB2") == nullptr;
+    // f16 pools on the wide rung (K16: K and V straight into their own
+    // panes). Before it they took v4 - TK 16, 64 rows a CTA - at ~38 TF/s on
+    // an 8192-row hd128 G=8 prompt (Flint's full layers). Kill:
+    // PADDOCK_NO_PF7RP16 -> v4.
+    static const bool rp16 = pd_env("PADDOCK_NO_PF7RP16") == nullptr;
+    const bool g_ok = g_ == 4u || g_ == 6u || g_ == 8u || g_ == 9u || g_ == 12u || g_ == 16u;
+    if (!rp16 || no_rp128 || !rp128w || !g_ok) return false;
+#define PD_PF7RP16_FITS(GV, OV, QV)                                            \
+pd_smem_fits((const void*)pd_attn_prefill_pf7rp_kernel<GV, false, WHD,     \
+                                                       WTK, 2u, true, OV, QV>, WSM)
+#define PD_PF7RP16_FITS3(GV)                                                   \
+(PD_PF7RP16_FITS(GV, false, false) && PD_PF7RP16_FITS(GV, true, false)      \
+ && PD_PF7RP16_FITS(GV, true, true))
+    static const bool w16_fits = PD_PF7RP16_FITS3(4u) && PD_PF7RP16_FITS3(6u)
+        && PD_PF7RP16_FITS3(8u) && PD_PF7RP16_FITS3(9u) && PD_PF7RP16_FITS3(12u)
+        && PD_PF7RP16_FITS3(16u);
+#undef PD_PF7RP16_FITS3
+#undef PD_PF7RP16_FITS
+    return w16_fits;
 }
 
 // hd128 fp8 launches of pf7rp for pd_attn_prefill_f16_paged (attn/prefill_pf5.cuh):
@@ -1637,7 +1769,11 @@ static inline bool pd_pf7rp128_go(int* rc, bool f8v4n, uint32_t g_, const void* 
                                   uint32_t blocks_per_slot, const void* slots,
                                   uint32_t n_heads, uint32_t n_kv_heads, uint32_t kv_dim,
                                   uint32_t swa_window, uint32_t batch, float scale,
-                                  const unsigned int* wp, void* stream) {
+                                  const unsigned int* wp, void* stream, bool o16 = false,
+                                  bool q16 = false) {
+    // o16 (slot 925) is the f16 wide rung's alone: nothing else lands bf16;
+    // q16 (slot 930: q as f16 pre-scaled, see slot 929) only with it
+    if ((o16 && f8v4n) || (q16 && !o16)) return false;
     // hd128 REPACK-PANE arm (pf7rp) - sits above the pf7
     // convert-in-register arm below because it wins the long spans that
     // arm loses. Measured against FlashInfer's own prefill kernel, pf7
@@ -1683,8 +1819,42 @@ static inline bool pd_pf7rp128_go(int* rc, bool f8v4n, uint32_t g_, const void* 
     // output is unchanged (relRMS 1.9e-3..2.4e-3, both arms).
     // Kill: PADDOCK_NO_PF7RP_SUB2 -> the 64-row arm below.
     static const bool rp128w = pd_env("PADDOCK_NO_PF7RP_SUB2") == nullptr;
-    if (f8v4n && !no_rp128 && rp128w && (g_ == 4u || g_ == 6u || g_ == 8u
-                                         || g_ == 9u || g_ == 12u || g_ == 16u)) {
+    const bool g_ok = g_ == 4u || g_ == 6u || g_ == 8u || g_ == 9u || g_ == 12u || g_ == 16u;
+    if (!f8v4n && pd_pf7rp16_ok(g_)) {
+        constexpr uint32_t WMR = 128u, WTK = 32u, WHD = 128u;
+        constexpr uint32_t WSM = WMR * WHD * 2u + 2u * WTK * (WHD + 8u) * 2u;
+        const bool multi = pd_pf_runs_offs != nullptr;
+        const dim3 gr = multi
+            ? dim3(n_kv_heads, (pd_pf_runs_maxn * g_ + WMR - 1u) / WMR,
+                   pd_pf_runs_n)
+            : dim3(n_kv_heads, (batch * g_ + WMR - 1u) / WMR);
+        const uint32_t* ro = multi ? (const uint32_t*)pd_pf_runs_offs : nullptr;
+#define PD_PF7RP16_LAUNCH(GV, OV, QV)                                          \
+pd_attn_prefill_pf7rp_kernel<GV, false, WHD, WTK, 2u, true, OV, QV>        \
+    <<<gr, 128, WSM, (cudaStream_t)stream>>>(                              \
+    (const float*)q, (const unsigned char*)pool_k,                         \
+    (const unsigned char*)pool_v,                                          \
+    (const float*)sinks, (float*)out, (const unsigned int*)positions,      \
+    (const uint32_t*)block_tables, blocks_per_slot,                        \
+    (const unsigned int*)slots, n_heads, kv_dim, swa_window, batch, scale, \
+    nullptr, ro, wp)
+#define PD_PF7RP16_G(OV, QV)                                                   \
+        if (g_ == 4u) PD_PF7RP16_LAUNCH(4u, OV, QV);                           \
+        else if (g_ == 6u) PD_PF7RP16_LAUNCH(6u, OV, QV);                      \
+        else if (g_ == 8u) PD_PF7RP16_LAUNCH(8u, OV, QV);                      \
+        else if (g_ == 9u) PD_PF7RP16_LAUNCH(9u, OV, QV);                      \
+        else if (g_ == 12u) PD_PF7RP16_LAUNCH(12u, OV, QV);                    \
+        else PD_PF7RP16_LAUNCH(16u, OV, QV);
+        if (q16) { PD_PF7RP16_G(true, true) }
+        else if (o16) { PD_PF7RP16_G(true, false) }
+        else { PD_PF7RP16_G(false, false) }
+#undef PD_PF7RP16_G
+#undef PD_PF7RP16_LAUNCH
+        *rc = pd_launch_status();
+        return true;
+    }
+    if (o16) return false;
+    if (f8v4n && !no_rp128 && rp128w && g_ok) {
         constexpr uint32_t WMR = 128u, WTK = 32u, WHD = 128u;
         // Q MR*HD h (swizzled, unpadded) | pane TK*(HD+8) h | raw K,V
         // TK*HD B each: 49,664 -> 2 CTA/SM with the 1 KB reserve each

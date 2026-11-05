@@ -4323,6 +4323,72 @@ struct KernelTableV1 {
     int (*ph_conv)(const void*, const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
     // 917: ph_conv_gemm (x, w, bias, y, rows, cin, n, k, resid, stream) - Mimi's causal conv as the 3xTF32 GEMM (698) reading its im2col rows in place: x = [k - 1 history rows ; rows] at pitch cin, weights [n][k cin]; optional residual accumulate
     int (*ph_conv_gemm)(const void*, const void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 918: nvf4_moe_gu_swiglu_w16r - the W16 expert pair's up over ROW-MAJOR
+    // planes with a SwiGLU gate|up (moe/nvf4_w16r.cuh): routed gate/up +
+    // their per-expert f32 factors, shared gate/up + theirs, the 32-row
+    // sorting, bf16 x -> bf16 act [rows][k ff_r + ff_s]. Pure append.
+    int (*nvf4_moe_gu_swiglu_w16r)(const void*, const void*, const void*, const void*,
+                                   const void*, const void*, const void*, const void*,
+                                   const void*, const void*, float, float, const void*,
+                                   const void*, const void*, const void*, void*, uint32_t,
+                                   uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 919: nvf4_moe_down_part_w16r - its down over row-major planes, per-slot
+    // f32 partials [rows][k + 1][embd] (slot k = shared). Pure append.
+    int (*nvf4_moe_down_part_w16r)(const void*, const void*, const void*, const void*,
+                                   const void*, float, const void*, const void*,
+                                   const void*, const void*, const void*, void*, uint32_t,
+                                   uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 920-923: the W4A16 prefill tile (gemm/nvf4_pf.cuh) - NVFP4 row planes
+    // x bf16 rows on m16n8k16 at prefill widths, the codes decoded once a
+    // tile. 920 dense (f32 out, strided), 921 dense SwiGLU gate|up (bf16
+    // out), 922 / 923 the routed gate|up / down (bf16 partials) over
+    // moe_align_bm(64) blocks.
+    // Pure append.
+    int (*nvf4_pf_gemm)(const void*, const void*, float, const void*, uint32_t, uint32_t,
+                        void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    int (*nvf4_pf_gu)(const void*, const void*, float, const void*, const void*, float,
+                      const void*, uint32_t, void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                      uint32_t, void*);
+    int (*nvf4_pf_moe_gu)(const void*, const void*, const void*, const void*, const void*,
+                          const void*, const void*, const void*, const void*, const void*,
+                          void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    int (*nvf4_pf_moe_dn)(const void*, const void*, const void*, const void*, const void*,
+                          const void*, const void*, const void*, uint32_t, void*, uint32_t,
+                          uint32_t, uint32_t, uint32_t, void*);
+    // 924: a prefill layer's residual tail + the next norm with its bf16
+    // rows (norm/add_norm16.cuh): mode 0 add_rmsnorm, mode 1 the bf16
+    // slot fold + add + rmsnorm_batch. 925: slot 653 with a bf16 output
+    // plane (the f16 wide rung only). Pure append.
+    int (*add_norm16)(void*, const void*, const void*, uint32_t, const void*, void*, void*,
+                      uint32_t, float, uint32_t, uint32_t, void*);
+    int (*attn_prefill_f16_paged_o16)(const void*, const void*, const void*, const void*,
+                                      void*, const void*, const void*, const void*,
+                                      const void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                                      uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
+    // 926: 922 with the plane's expert count (its weight copy width election).
+    // Pure append.
+    int (*nvf4_pf_moe_gu_ne)(const void*, const void*, const void*, const void*, const void*,
+                             const void*, const void*, const void*, const void*, const void*,
+                             void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 927: up to three Row-plane W4A16 GEMVs over the same <= 8 rows in one
+    // launch (moe/nvf4_expert.cuh). Pure append.
+    int (*nvf4_gemm_mr3)(const void*, const void*, float, void*, uint32_t, const void*,
+                         const void*, float, void*, uint32_t, const void*, const void*, float,
+                         void*, uint32_t, const void*, uint32_t, uint32_t, void*);
+    // 928: the router's exact-f32 tiles at any row count (gemm/f32_qkv.cuh).
+    // Pure append.
+    int (*gemm_f32_tiled)(const void*, const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+    // 929: the f32 norm + rope v3 arm with q landing f16 pre-scaled for the
+    // f16 wide rung (elementwise.cuh). 930: slot 925 reading that q (batch 0
+    // = readiness probe). Pure append.
+    int (*qkv_norm_rope_batch_q16)(const void*, const void*, const void*, const void*,
+                                   const void*, void*, void*, void*, const void*, uint32_t,
+                                   uint32_t, uint32_t, float, float, float, float, float, float,
+                                   float, uint32_t, float, void*);
+    int (*attn_prefill_f16_paged_q16)(const void*, const void*, const void*, const void*,
+                                      void*, const void*, const void*, const void*,
+                                      const void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                                      uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
 };
 
 } // extern "C"

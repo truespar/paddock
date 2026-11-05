@@ -2469,6 +2469,77 @@ impl GpuExecutor {
     /// Row-batched twin of [`Self::nvf4_gemv`]: x `[batch, in_dim]`,
     /// y `[batch, out_dim]`. Bit-exact per row vs the 1-row GEMV (the
     /// continuous-batching lm_head consumer).
+    /// Up to three Row planes over the same `batch` (2..=8) rows of `x` in
+    /// one launch (slot 927), each row bit-identical to
+    /// [`Self::nvf4_gemv_batch`] on its plane. `Ok(false)` (nothing launched)
+    /// without the slot or off its shape - the caller runs the planes alone.
+    pub fn nvf4_gemv_batch3(
+        &self,
+        planes: &mut [(&Nvf4Plane, &mut CudaSlice<f32>)],
+        x: &CudaSlice<f32>,
+        batch: usize,
+    ) -> Result<bool, GpuError> {
+        let Some(f) = self.kernels.nvf4_gemm_mr3 else {
+            return Ok(false);
+        };
+        let in_dim = planes.first().map_or(0, |(w, _)| w.in_dim);
+        if !(2..=8).contains(&batch)
+            || planes.len() > 3
+            || !in_dim.is_multiple_of(32)
+            || x.len() < batch * in_dim
+            || planes.iter().any(|(w, y)| {
+                w.layout != Nvf4Layout::Row
+                    || w.gu_pairs
+                    || w.in_dim != in_dim
+                    || y.len() < batch * w.out_dim
+            })
+        {
+            return Ok(false);
+        }
+        let null = core::ptr::null::<core::ffi::c_void>();
+        let mut d = [null; 3];
+        let mut s = [null; 3];
+        let mut ys = [core::ptr::null_mut::<core::ffi::c_void>(); 3];
+        let mut fs = [0.0f32; 3];
+        let mut ns = [0u32; 3];
+        let mut guards = Vec::with_capacity(planes.len() * 3);
+        for (i, (w, y)) in planes.iter_mut().enumerate() {
+            let (dp, g1) = w.data.device_ptr(&self.stream);
+            let (sp, g2) = w.scale.device_ptr(&self.stream);
+            let (yp, g3) = y.device_ptr_mut(&self.stream);
+            (d[i], s[i], ys[i]) = (dp as *const _, sp as *const _, yp as *mut _);
+            (fs[i], ns[i]) = (w.scale2, w.out_dim as u32);
+            guards.push((g1, g2, g3));
+        }
+        let (xp, _gx) = x.device_ptr(&self.stream);
+        // SAFETY: ABI contract (slot 927); every plane and x sized above
+        check(unsafe {
+            f(
+                d[0],
+                s[0],
+                fs[0],
+                ys[0],
+                ns[0],
+                d[1],
+                s[1],
+                fs[1],
+                ys[1],
+                ns[1],
+                d[2],
+                s[2],
+                fs[2],
+                ys[2],
+                ns[2],
+                xp as *const _,
+                in_dim as u32,
+                batch as u32,
+                self.stream_ptr(),
+            )
+        })?;
+        drop(guards);
+        Ok(true)
+    }
+
     pub fn nvf4_gemv_batch(
         &self,
         w: &Nvf4Plane,

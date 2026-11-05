@@ -2315,6 +2315,14 @@ pub(crate) fn load_with_residency(
     {
         stop_tokens.push(eot);
     }
+    // The tokenizer's own family enders: Flint ends a turn on the next role
+    // marker (`<|user|>`, `<|observation|>`, `<|developer|>`, its eog list),
+    // and without them a served turn wrote the user's next message itself.
+    for id in tokenizer.stop_ids() {
+        if !stop_tokens.contains(&id) {
+            stop_tokens.push(id);
+        }
+    }
     // `<|im_end|>` by name: MiniCPM5's GGUF stamps eos `</s>` (1) and no eot
     // key, while its ChatML template ends every turn with `<|im_end|>`
     // (130073) - config.json lists both as eos, the conversion kept one.
@@ -3753,6 +3761,24 @@ projection floors restored (W8_MIN=64, F8_DEC_MIN=8) - planes resident"
                 Ok(Box::new(model))
             }
             other => Err(format!("kolibri1 GGUF needs cuda (got {other:?})")),
+        },
+        // Recursive's Flint GGUF (`flint`, the NVFP4 build): the laguna
+        // body's Flint flavor - learned sinks, NoPE full layers, two dense
+        // lead layers, W4A16 throughout (gpu_model/laguna). Text only; no
+        // drafter ships for it.
+        "flint" => match device {
+            "cuda" => {
+                if mtp.is_some() {
+                    return Err("flint has no drafter class to attach".into());
+                }
+                let exec = make_exec(pack)?;
+                let mut model =
+                    paddock_engine::gpu_model::laguna::GpuLaguna::load(exec, &map, max_ctx)
+                        .map_err(|e| e.to_string())?;
+                apply_kv_dtype(|d| model.set_kv_dtype(d));
+                Ok(Box::new(model))
+            }
+            other => Err(format!("flint needs cuda (got {other:?})")),
         },
         // IBM Granite 4.1 (3b/8b/30b share the code - shapes come from the
         // file). Greedy-parity validated against llama.cpp on the identical

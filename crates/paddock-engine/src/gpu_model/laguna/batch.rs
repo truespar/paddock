@@ -234,7 +234,7 @@ const MAX_ATTN_SPLITS: usize = 16;
 /// both key off it. Same law gpt_oss learned: fused shapes route through
 /// partial+combine even at n_splits == 1, because the plain per-q-head
 /// kernel re-reads each K/V tile group(=6-8)x.
-fn attn_gqa_fused(n_heads: usize, n_kv_heads: usize, batch: usize) -> bool {
+pub(super) fn attn_gqa_fused(n_heads: usize, n_kv_heads: usize, batch: usize) -> bool {
     let group = n_heads.checked_div(n_kv_heads).unwrap_or(1);
     batch > 1
         && (2..=8).contains(&group)
@@ -243,7 +243,7 @@ fn attn_gqa_fused(n_heads: usize, n_kv_heads: usize, batch: usize) -> bool {
         && std::env::var_os("PD_NO_GQA_FUSE").is_none()
 }
 
-fn attn_splits(
+pub(super) fn attn_splits(
     n_heads: usize,
     n_kv_heads: usize,
     batch: usize,
@@ -663,10 +663,7 @@ impl GpuLaguna {
         let dense_ff = self
             .layers
             .iter()
-            .filter_map(|l| match &l.ffn {
-                Ffn::Dense { gate, .. } => Some(gate.dims()[1]),
-                Ffn::Moe(_) | Ffn::MoeNv(_) => None,
-            })
+            .filter_map(|l| l.ffn.dense_ff())
             .max()
             .unwrap_or(0);
         // widest quantize consumer: attn out, the dense gated rows, or the
@@ -687,7 +684,7 @@ impl GpuLaguna {
                 }) || match &l.ffn {
                     Ffn::Dense { gate, up, down } => q8(gate) || q8(up) || q8(down),
                     Ffn::Moe(w) => q8(&w.shexp_gate) || q8(&w.shexp_up) || q8(&w.shexp_down),
-                    Ffn::MoeNv(_) => false,
+                    Ffn::MoeNv(_) | Ffn::DenseNv { .. } => false,
                 }
             });
         let fused_len = m.n_active * m.moe_ff;
@@ -704,7 +701,7 @@ impl GpuLaguna {
         // measured -3.2% on 2048×128 c32). Costs slots/pf_rows of the scratch
         // (~3% at the 32-slot / 1024-row default).
         let pf_wide = match hp.flavor {
-            Flavor::Kolibri => pf_rows_wide(nv),
+            Flavor::Kolibri | Flavor::Flint => pf_rows_wide(nv),
             Flavor::Laguna => pf_rows(),
         };
         let cap = pf_wide + max_batch;
@@ -867,6 +864,7 @@ impl GpuLaguna {
             });
         }
 
+        self.w16r = super::nv::W16r::new(e, hp, &self.layers, cap)?;
         self.batch = Some(BatchState {
             n_slots: slots,
             pf_wide,
@@ -1441,9 +1439,13 @@ impl GpuLaguna {
         // compensate cost 3.2% on 2048×128 c32.
         let bs = self.batch.as_ref().expect("batch enabled");
         let room = bs.cap.saturating_sub(dec_n);
-        // a live band keeps the narrow chunk whatever budget arrives - its
+        // a live band keeps the rider chunk whatever budget arrives - its
         // rows wait on the whole pass (the wide one is for empty bands)
-        let lim = if dec_n > 0 { pf_rows() } else { bs.pf_wide };
+        let lim = if dec_n > 0 {
+            self.rider_rows()
+        } else {
+            bs.pf_wide
+        };
         let (chunk_rows, take) = if room == 0 {
             (Vec::new(), Vec::new())
         } else {
@@ -1475,6 +1477,16 @@ impl GpuLaguna {
     /// Pick this tick's chunk rows: FIFO over the queue, up to `budget` rows,
     /// splitting the last prompt if it does not fit. Returns the row stream
     /// and (queue index, rows taken, finishes?) per touched entry.
+    /// The chunk a pass with decode rows takes: pf_rows, or the wide chunk
+    /// on Flint's prefill tile (see `prefill_tick_cap`).
+    pub(super) fn rider_rows(&self) -> usize {
+        let wide = self.w16r.as_ref().is_some_and(super::nv::W16r::pf_tile);
+        match self.batch.as_ref() {
+            Some(bs) if wide => bs.pf_wide,
+            _ => pf_rows(),
+        }
+    }
+
     fn plan_chunk(&self, budget: usize) -> (Vec<(u32, u32, u32)>, Vec<(usize, usize, bool)>) {
         let mut rows: Vec<(u32, u32, u32)> = Vec::new();
         let mut take: Vec<(usize, usize, bool)> = Vec::new();
@@ -2100,6 +2112,9 @@ impl GpuLaguna {
         // attention input, `qkv16` that it landed as the bf16 rows the
         // q|k|v prefill pair reads (and only those - no f32 xn).
         let (mut pre_normed, mut qkv16) = (false, false);
+        if let Some(ws) = self.w16r.as_mut() {
+            ws.reset();
+        }
         for (li, layer) in self.layers.iter().enumerate() {
             let nh = layer.n_heads;
             let wmma_pf = wmma_pf_base && pf_attn_dtype_ok(kv_dtype, nh, n_kv);
@@ -2114,7 +2129,9 @@ impl GpuLaguna {
             // r==1); the k-norm and softplus consumers read at offsets.
             let qp = layer.proj.quant();
             let qk_fused = r1 && qp.is_some_and(|q| q.qkg.is_some());
-            if let Proj::Bf16 { wqkv, .. } = &layer.proj {
+            if let Proj::Nv { wq, wk, wv, .. } = &layer.proj {
+                super::nv::qkv_rows(&exec, [wq, wk, wv], sc, self.w16r.as_mut(), pf, r)?;
+            } else if let Proj::Bf16 { wqkv, .. } = &layer.proj {
                 // the NVFP4 build's BF16 attention: q|k|v off one plane
                 super::head::bf16_qkv(
                     &exec,
@@ -2349,7 +2366,7 @@ impl GpuLaguna {
             // (NoPE layers at freq_scale 0 - cos 1, sin 0, mscale 1: the
             // rotation is an exact identity); laguna keeps its chain bytes
             let kolibri_pf = pf
-                && hp.flavor == Flavor::Kolibri
+                && matches!(hp.flavor, Flavor::Kolibri | Flavor::Flint)
                 && exec.has_qkv_norm_rope_batch()
                 && paddock_models::dev_var_os!("PADDOCK_NO_KOLIBRI_NR").is_none();
             if !dec_nra && kolibri_pf {
@@ -2359,22 +2376,60 @@ impl GpuLaguna {
                 } else {
                     hp.rope_swa
                 };
-                exec.qk_norm_rope_batch(
-                    &sc.q,
-                    &sc.k,
-                    &mut sc.v,
-                    &layer.q_norm.buf,
-                    &layer.k_norm.buf,
-                    &mut sc.qn,
-                    &mut sc.kn,
-                    &sc.d_pos,
-                    nh,
-                    n_kv,
-                    hd,
-                    eps,
-                    rp,
-                    r,
-                )?;
+                // q straight into the f16 wide attention rung's halves where
+                // that rung lands this layer's bf16 rows: the same f32
+                // expression rounded once where the rung would round it, at
+                // half the bytes each way. A decode band's rows keep the f32
+                // plane its decode launches read.
+                let dec = cuts.map_or(0, |c| c.dec);
+                let q16 = wmma_pf
+                    && kv_dtype == KvDtype::Fp16
+                    && exec.attn_prefill_q16_ready(nh, n_kv, hd, kv_dtype);
+                let q16 = q16
+                    .then(|| self.w16r.as_mut().and_then(|w| w.q16_plane()))
+                    .flatten();
+                let (qw, kw) = (&layer.q_norm.buf, &layer.k_norm.buf);
+                let heads = (nh, n_kv, hd);
+                let landed = match q16 {
+                    Some(qh) if dec < r => {
+                        if dec > 0 {
+                            let (q, k, v, qn, kn) =
+                                (&sc.q, &sc.k, &mut sc.v, &mut sc.qn, &mut sc.kn);
+                            let p = &sc.d_pos;
+                            exec.qk_norm_rope_batch_at(
+                                q,
+                                k,
+                                v,
+                                qw,
+                                kw,
+                                qn,
+                                kn,
+                                p,
+                                heads,
+                                eps,
+                                rp,
+                                (0, dec),
+                            )?;
+                        }
+                        let qscale = scale * std::f32::consts::LOG2_E;
+                        let (q, k, v, kn, p) = (&sc.q, &sc.k, &mut sc.v, &mut sc.kn, &sc.d_pos);
+                        let plane = (dec, r - dec);
+                        exec.qk_norm_rope_batch_q16(
+                            q, k, v, qw, kw, qh, kn, p, heads, eps, rp, plane, qscale,
+                        )?
+                    }
+                    _ => false,
+                };
+                if landed {
+                    if let Some(w) = self.w16r.as_mut() {
+                        w.set_q16();
+                    }
+                } else {
+                    exec.qk_norm_rope_batch(
+                        &sc.q, &sc.k, &mut sc.v, qw, kw, &mut sc.qn, &mut sc.kn, &sc.d_pos, nh,
+                        n_kv, hd, eps, rp, r,
+                    )?;
+                }
             } else if !dec_nra {
                 exec.rmsnorm_batch(&sc.q, &layer.q_norm.buf, &mut sc.qn, hd, eps, r * nh)?;
                 if qk_fused {
@@ -2417,7 +2472,9 @@ impl GpuLaguna {
                     )?;
                 }
             }
-            // append + attend, per cache kind
+            // append + attend, per cache kind (Flint's learned sinks or the
+            // -inf no-op row)
+            let sinks = layer.sinks.as_ref().map_or(&sc.sinks, |t| &t.buf);
             let (bt, window) = if layer.is_swa {
                 (&bs.swa_bt, hp.swa_window)
             } else {
@@ -2425,304 +2482,23 @@ impl GpuLaguna {
             };
             let kvs = &mut bs.kv[li];
             match cuts {
-                Some(c) if layer.is_swa => {
-                    // span ladder: within one sub-span nothing a row reads has
-                    // been recycled (ring holds SWA_SPAN + window)
-                    debug_assert!(ring * 16 >= SWA_SPAN + hp.swa_window);
-                    for &(off, len) in &c.swa {
-                        exec.kv_append_batch_paged_rows(
-                            &sc.kn,
-                            &mut kvs.k,
-                            &sc.d_pos,
-                            Some(&sc.d_slots),
-                            bt,
-                            bps,
-                            kv_dim,
-                            off,
-                            len,
-                            kv_dtype,
-                        )?;
-                        exec.kv_append_batch_paged_rows(
-                            &sc.v,
-                            &mut kvs.v,
-                            &sc.d_pos,
-                            Some(&sc.d_slots),
-                            bt,
-                            bps,
-                            kv_dim,
-                            off,
-                            len,
-                            kv_dtype,
-                        )?;
-                        // the fused tick's decode band: one decode-class
-                        // launch for all its rows (see PfCuts::dec)
-                        if off < c.dec {
-                            exec.attn_decode_batch_rows_paged(
-                                &sc.qn,
-                                &kvs.k,
-                                &kvs.v,
-                                &sc.sinks,
-                                &mut sc.attn,
-                                &sc.d_pos,
-                                Some(&sc.d_slots),
-                                bt,
-                                bps,
-                                nh,
-                                n_kv,
-                                hd,
-                                kv_dim,
-                                window,
-                                off,
-                                len,
-                                scale,
-                                kv_dtype,
-                            )?;
-                        } else if wmma_pf {
-                            exec.attn_prefill_f16_paged_at(
-                                &sc.qn,
-                                &kvs.k,
-                                &kvs.v,
-                                &sc.sinks,
-                                &mut sc.attn,
-                                &sc.d_pos,
-                                &sc.d_slots,
-                                off,
-                                bt,
-                                bps,
-                                nh,
-                                n_kv,
-                                hd,
-                                kv_dim,
-                                window,
-                                len,
-                                scale,
-                                kv_dtype,
-                            )?;
-                        } else if len > 24 && exec.has_attn_prefill_paged() {
-                            exec.attn_prefill_rows_paged(
-                                &sc.qn,
-                                &kvs.k,
-                                &kvs.v,
-                                &sc.sinks,
-                                &mut sc.attn,
-                                &sc.d_pos,
-                                &sc.d_slots,
-                                bt,
-                                bps,
-                                nh,
-                                n_kv,
-                                hd,
-                                kv_dim,
-                                window,
-                                off,
-                                len,
-                                scale,
-                                kv_dtype,
-                            )?;
-                        } else {
-                            exec.attn_decode_batch_rows_paged(
-                                &sc.qn,
-                                &kvs.k,
-                                &kvs.v,
-                                &sc.sinks,
-                                &mut sc.attn,
-                                &sc.d_pos,
-                                Some(&sc.d_slots),
-                                bt,
-                                bps,
-                                nh,
-                                n_kv,
-                                hd,
-                                kv_dim,
-                                window,
-                                off,
-                                len,
-                                scale,
-                                kv_dtype,
-                            )?;
-                        }
-                    }
-                }
                 Some(c) => {
-                    // full layer, prefill: append the whole chunk in one pass
-                    // (per-row slot/pos - rows land in their own slots' pool
-                    // blocks, no aliasing), attend per same-slot run (causal
-                    // bound = positions[row]). Single-run chunks keep the
-                    // whole-chunk calls - bit-for-bit the serial path.
-                    exec.kv_append_batch_paged(
-                        &sc.kn,
-                        &mut kvs.k,
-                        &sc.d_pos,
-                        Some(&sc.d_slots),
+                    let a = super::attend::PfAttend {
+                        sinks: layer.sinks.as_ref().map(|t| &t.buf),
                         bt,
                         bps,
+                        nh,
+                        n_kv,
+                        hd,
                         kv_dim,
-                        r,
+                        window,
+                        scale,
                         kv_dtype,
-                    )?;
-                    exec.kv_append_batch_paged(
-                        &sc.v,
-                        &mut kvs.v,
-                        &sc.d_pos,
-                        Some(&sc.d_slots),
-                        bt,
-                        bps,
-                        kv_dim,
-                        r,
-                        kv_dtype,
-                    )?;
-                    if c.runs.len() == 1 {
-                        if wmma_pf {
-                            exec.attn_prefill_f16_paged(
-                                &sc.qn,
-                                &kvs.k,
-                                &kvs.v,
-                                &sc.sinks,
-                                &mut sc.attn,
-                                &sc.d_pos,
-                                &sc.d_slots,
-                                bt,
-                                bps,
-                                nh,
-                                n_kv,
-                                hd,
-                                kv_dim,
-                                window,
-                                r,
-                                scale,
-                                kv_dtype,
-                            )?;
-                        } else if r > 24 && exec.has_attn_prefill_paged() {
-                            exec.attn_prefill_paged(
-                                &sc.qn,
-                                &kvs.k,
-                                &kvs.v,
-                                &sc.sinks,
-                                &mut sc.attn,
-                                &sc.d_pos,
-                                &sc.d_slots,
-                                bt,
-                                bps,
-                                nh,
-                                n_kv,
-                                hd,
-                                kv_dim,
-                                window,
-                                r,
-                                scale,
-                                kv_dtype,
-                            )?;
-                        } else {
-                            exec.attn_decode_batch_paged(
-                                &sc.qn,
-                                &kvs.k,
-                                &kvs.v,
-                                &sc.sinks,
-                                &mut sc.attn,
-                                &sc.d_pos,
-                                Some(&sc.d_slots),
-                                bt,
-                                bps,
-                                nh,
-                                n_kv,
-                                hd,
-                                kv_dim,
-                                window,
-                                r,
-                                scale,
-                                kv_dtype,
-                            )?;
-                        }
-                    } else {
-                        for &(off, len) in &c.runs {
-                            if off < c.dec {
-                                // fused decode band - one launch, decode class
-                                exec.attn_decode_batch_rows_paged(
-                                    &sc.qn,
-                                    &kvs.k,
-                                    &kvs.v,
-                                    &sc.sinks,
-                                    &mut sc.attn,
-                                    &sc.d_pos,
-                                    Some(&sc.d_slots),
-                                    bt,
-                                    bps,
-                                    nh,
-                                    n_kv,
-                                    hd,
-                                    kv_dim,
-                                    window,
-                                    off,
-                                    len,
-                                    scale,
-                                    kv_dtype,
-                                )?;
-                            } else if wmma_pf {
-                                exec.attn_prefill_f16_paged_at(
-                                    &sc.qn,
-                                    &kvs.k,
-                                    &kvs.v,
-                                    &sc.sinks,
-                                    &mut sc.attn,
-                                    &sc.d_pos,
-                                    &sc.d_slots,
-                                    off,
-                                    bt,
-                                    bps,
-                                    nh,
-                                    n_kv,
-                                    hd,
-                                    kv_dim,
-                                    window,
-                                    len,
-                                    scale,
-                                    kv_dtype,
-                                )?;
-                            } else if len > 24 && exec.has_attn_prefill_paged() {
-                                exec.attn_prefill_rows_paged(
-                                    &sc.qn,
-                                    &kvs.k,
-                                    &kvs.v,
-                                    &sc.sinks,
-                                    &mut sc.attn,
-                                    &sc.d_pos,
-                                    &sc.d_slots,
-                                    bt,
-                                    bps,
-                                    nh,
-                                    n_kv,
-                                    hd,
-                                    kv_dim,
-                                    window,
-                                    off,
-                                    len,
-                                    scale,
-                                    kv_dtype,
-                                )?;
-                            } else {
-                                exec.attn_decode_batch_rows_paged(
-                                    &sc.qn,
-                                    &kvs.k,
-                                    &kvs.v,
-                                    &sc.sinks,
-                                    &mut sc.attn,
-                                    &sc.d_pos,
-                                    Some(&sc.d_slots),
-                                    bt,
-                                    bps,
-                                    nh,
-                                    n_kv,
-                                    hd,
-                                    kv_dim,
-                                    window,
-                                    off,
-                                    len,
-                                    scale,
-                                    kv_dtype,
-                                )?;
-                            }
-                        }
-                    }
+                        wmma_pf,
+                    };
+                    let swa = layer.is_swa.then_some((&c.swa[..], ring));
+                    let ws = self.w16r.as_mut();
+                    super::attend::attend_pf(&exec, sc, kvs, &a, swa, &c.runs, c.dec, r, ws)?;
                 }
                 None => {
                     // decode: one new token per row
@@ -2823,7 +2599,7 @@ impl GpuLaguna {
                         exec.attn_combine_batch(
                             &sc.attn_o,
                             &sc.attn_ml,
-                            &sc.sinks,
+                            sinks,
                             &mut sc.attn,
                             nh,
                             hd,
@@ -2835,7 +2611,7 @@ impl GpuLaguna {
                             &sc.qn,
                             &kvs.k,
                             &kvs.v,
-                            &sc.sinks,
+                            sinks,
                             &mut sc.attn,
                             &sc.d_pos,
                             Some(&sc.d_slots),
@@ -2861,7 +2637,9 @@ impl GpuLaguna {
             } else {
                 exec.mul_softplus_head(&mut sc.attn, &sc.gate_h, nh, hd, r)?;
             }
-            if let Proj::Bf16 { wo, .. } = &layer.proj {
+            if let Proj::Nv { wo, .. } = &layer.proj {
+                super::nv::o_rows(&exec, wo, sc, self.w16r.as_mut(), pf, r)?;
+            } else if let Proj::Bf16 { wo, .. } = &layer.proj {
                 super::head::bf16_rows(&exec, wo, &sc.attn, &mut sc.x16, &mut sc.proj, r)?;
             } else if let Some(q) = qp {
                 if g8 {
@@ -2950,15 +2728,8 @@ impl GpuLaguna {
                     exec.rmsnorm_batch(&sc.x, &layer.ffn_norm.buf, &mut sc.xn, embd, eps, r)?;
                 }
             } else {
-                exec.add_rmsnorm_batch(
-                    &mut sc.x,
-                    &sc.proj,
-                    &layer.ffn_norm.buf,
-                    &mut sc.xn,
-                    embd,
-                    eps,
-                    r,
-                )?;
+                let w = &layer.ffn_norm.buf;
+                super::nv::attn_tail(&exec, sc, self.w16r.as_mut(), pf, w, embd, eps, r)?;
             }
 
             match &layer.ffn {
@@ -3091,11 +2862,15 @@ impl GpuLaguna {
                         )?;
                     }
                 }
+                Ffn::DenseNv { gate, up, down } => {
+                    super::nv::dense_rows(&exec, [gate, up, down], sc, self.w16r.as_mut(), pf, r)?
+                }
                 Ffn::MoeNv(w) => {
-                    // the NVFP4 build: W4A4 sorted pair in prefill mode and
-                    // wide verify rounds, W4A16 GEMVs at decode (moe_nv.rs)
-                    let sorted = pf || (spec && r > 8);
-                    super::moe_nv::moe_nv_rows(&exec, &m, w, sc, embd, r, sorted, ffn16)?;
+                    // the wide class in prefill mode and wide verify rounds,
+                    // the W4A16 GEMVs at decode (nv.rs `moe_nv_any`)
+                    let wide = pf || (spec && r > 8);
+                    let ws = self.w16r.as_mut();
+                    super::nv::moe_nv_any(&exec, hp, w, sc, ws, pf, wide, r, ffn16)?;
                 }
                 Ffn::Moe(w) => {
                     // routed experts: token-batched k-quant/Q8 class, batch=r
@@ -3521,7 +3296,11 @@ impl GpuLaguna {
                         exec.rmsnorm_add_scale(&mut sc.x, &sc.proj, &post.buf, embd, eps, 1.0, r)?
                     }
                 }
-                None => exec.add(&mut sc.x, &sc.proj, r * embd)?,
+                None => {
+                    let nx = self.layers.get(li + 1).map(|l| &l.attn_norm.buf);
+                    let ws = self.w16r.as_mut();
+                    pre_normed = super::nv::ffn_tail(&exec, sc, ws, pf, nx, embd, eps, r)?;
+                }
             }
             if let Some((aux, ids)) = dtap.as_mut()
                 && let Some(band) = ids.iter().position(|&t| t == li)

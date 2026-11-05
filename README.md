@@ -112,6 +112,8 @@ Every model below runs on the engine today. Sizes are the checkpoint's own, and
 - **Nemotron 3.5 Super VL** - 120B-A12B; reads pictures and documents, NVIDIA GPUs
   for now
 - **Kolibri 1** (Aleph Alpha) - 78B with 3.5B active, German and English, text only
+- **Flint** (Recursive) - 40B with 2.5B active, for coding agents; text only, on
+  NVIDIA GPUs (Ada or newer)
 
 **Images**
 

@@ -14,6 +14,7 @@ pub mod diarization;
 pub mod dinov3;
 pub mod ggml_type;
 pub mod gguf;
+pub mod gguf_nvfp4;
 pub mod gpu_support;
 pub mod granite;
 pub mod hadamard;

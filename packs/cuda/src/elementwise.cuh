@@ -1268,8 +1268,12 @@ __global__ void pd_qkv_norm_rope_batch_v2_kernel(
 // runs on f32 registers and rounds once at the store, so the f16 plane is
 // exactly __float2half(the f32 plane) elementwise (v2 would read back its
 // own rounded norm store and rope over that - a different class).
-template <bool TBL, typename TI = float, typename TO = float, bool NEOX = true>
-__global__ void pd_qkv_norm_rope_batch_v3_kernel(
+// QH (slot 929, NEOX): q lands in q16 as f16(value * qscale) - the cast the
+// f16 attention's Q stage applies to the f32 plane, done here so q crosses
+// memory once at half width (both values are the same f32 expression rounded
+// once); k and v keep TO.
+template <bool TBL, typename TI, typename TO, bool NEOX, bool QH>
+__device__ __forceinline__ void pd_qkv_norm_rope_v3_body(
     const TI* __restrict__ q, const TI* __restrict__ k,
     const TI* __restrict__ v, const float* __restrict__ qw,
     const float* __restrict__ kw, TO* __restrict__ qn,
@@ -1278,7 +1282,8 @@ __global__ void pd_qkv_norm_rope_batch_v3_kernel(
     const float* __restrict__ factors, uint32_t n_head, uint32_t n_kv,
     uint32_t head_dim, float eps, float theta_scale, float freq_scale,
     float corr_low, float corr_high, float ext_factor, float mscale,
-    uint32_t rows, bool vnorm) {
+    uint32_t rows, bool vnorm, __half* __restrict__ q16, float qscale) {
+    static_assert(!QH || NEOX, "the f16 q arm is the NEOX rope's");
     const uint32_t nslots = n_head + 2u * n_kv;
     const uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
     const uint32_t idx = blockIdx.x * (blockDim.x >> 5) + warp;
@@ -1286,6 +1291,8 @@ __global__ void pd_qkv_norm_rope_batch_v3_kernel(
     const uint32_t b = idx / nslots, slot = idx % nslots;
     const bool is_q = slot < n_head;
     const bool is_v = slot >= n_head + n_kv;
+    // vn null: an unnormed V passed in place - nothing to load or store
+    if (is_v && !vnorm && vn == nullptr) return;
     const uint32_t h = is_q ? slot : (is_v ? slot - n_head - n_kv : slot - n_head);
     const TI* src = is_q ? q + ((size_t)b * n_head + h) * head_dim
                   : (is_v ? v : k) + ((size_t)b * n_kv + h) * head_dim;
@@ -1348,6 +1355,15 @@ __global__ void pd_qkv_norm_rope_batch_v3_kernel(
             float c = cosf(angle) * mscale;
             float a = rv[t2];
             float bb = rv[t2 + hb];
+            if constexpr (QH) {
+                if (is_q) {
+                    __half* qh = q16 + ((size_t)b * n_head + h) * head_dim;
+                    const float o0 = a * c - bb * s, o1 = a * s + bb * c;
+                    qh[kk] = __float2half_rn(o0 * qscale);
+                    qh[kk + half] = __float2half_rn(o1 * qscale);
+                    continue;
+                }
+            }
             dst[kk] = (TO)(a * c - bb * s);
             dst[kk + half] = (TO)(a * s + bb * c);
             if (!TBL)
@@ -1413,6 +1429,38 @@ __global__ void pd_qkv_norm_rope_batch_v3_kernel(
             }
         }
     }
+}
+
+template <bool TBL, typename TI = float, typename TO = float, bool NEOX = true>
+__global__ void pd_qkv_norm_rope_batch_v3_kernel(
+    const TI* __restrict__ q, const TI* __restrict__ k,
+    const TI* __restrict__ v, const float* __restrict__ qw,
+    const float* __restrict__ kw, TO* __restrict__ qn,
+    TO* __restrict__ kn, TO* __restrict__ vn,
+    const unsigned int* __restrict__ positions,
+    const float* __restrict__ factors, uint32_t n_head, uint32_t n_kv,
+    uint32_t head_dim, float eps, float theta_scale, float freq_scale,
+    float corr_low, float corr_high, float ext_factor, float mscale,
+    uint32_t rows, bool vnorm) {
+    pd_qkv_norm_rope_v3_body<TBL, TI, TO, NEOX, false>(
+        q, k, v, qw, kw, qn, kn, vn, positions, factors, n_head, n_kv, head_dim, eps,
+        theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, rows, vnorm,
+        nullptr, 1.0f);
+}
+
+// slot 929's kernel: the f32 closed-form NEOX instance with q into q16
+__global__ void pd_qkv_norm_rope_batch_v3q16_kernel(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ qw,
+    const float* __restrict__ kw, float* __restrict__ kn, float* __restrict__ vn,
+    const unsigned int* __restrict__ positions, uint32_t n_head, uint32_t n_kv,
+    uint32_t head_dim, float eps, float theta_scale, float freq_scale,
+    float corr_low, float corr_high, float ext_factor, float mscale,
+    uint32_t rows, __half* __restrict__ q16, float qscale) {
+    pd_qkv_norm_rope_v3_body<true, float, float, true, true>(
+        q, k, v, qw, kw, nullptr, kn, vn, positions, nullptr, n_head, n_kv, head_dim, eps,
+        theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, rows, false,
+        q16, qscale);
 }
 
 static int pd_qkv_norm_rope_batch_impl(
@@ -1498,6 +1546,9 @@ static int pd_qkv_norm_rope_batch_impl(
         return (int)cudaGetLastError();
     }
     if (!no_v2) {
+        // an unnormed V passed in place is a copy onto itself: the v3 warps
+        // for it return at once (bit-identical - nothing moves)
+        if (v3ok && !vnorm && v == vn) vn = nullptr;
         auto kfn = v3ok
             ? (neox
                ? (no_tbl ? pd_qkv_norm_rope_batch_v3_kernel<false, float, float, true>
@@ -1610,6 +1661,35 @@ int pd_qkv_norm_rope_batch4(const void* q, const void* k, const void* v,
 // the RAW Vcur to build_attn and must not. Like `neox` this is carried by
 // the architecture, not by any metadata key, and like `neox` it rides the
 // superset export so batch..batch4 keep their exact signatures.
+// 929: the f32 v3 arm (NEOX, closed-form theta) with q landing f16 x
+// qscale in q16 (the f16 attention rung's Q cast); k into kn, an unnormed V
+// left in place. head_dim <= 256, % 64.
+PD_EXPORT
+int pd_qkv_norm_rope_batch_q16(const void* q, const void* k, const void* v, const void* qw,
+                               const void* kw, void* q16, void* kn, void* vn,
+                               const void* positions, uint32_t n_head, uint32_t n_kv,
+                               uint32_t head_dim, float eps, float theta_scale,
+                               float freq_scale, float corr_low, float corr_high,
+                               float ext_factor, float mscale, uint32_t rows, float qscale,
+                               void* stream) {
+    // the f32 launcher's election must be the v3 closed-form arm, or these
+    // are not its bits: refuse (the caller keeps the f32 entry) otherwise
+    static const bool off = pd_env("PADDOCK_NO_NRV2") || pd_env("PADDOCK_NO_NRV3")
+                            || pd_env("PADDOCK_NO_RTBL");
+    if (off || head_dim == 0 || head_dim > 256u || (head_dim & 63u))
+        return cudaErrorNotSupported;
+    if (rows == 0) return 0;
+    const uint32_t total = rows * (n_head + 2u * n_kv);
+    // an unnormed V passed in place stores nothing (see the f32 launcher)
+    void* vout = v == vn ? nullptr : vn;
+    pd_qkv_norm_rope_batch_v3q16_kernel<<<(total + 7u) / 8u, 256, 0, (cudaStream_t)stream>>>(
+        (const float*)q, (const float*)k, (const float*)v, (const float*)qw, (const float*)kw,
+        (float*)kn, (float*)vout, (const unsigned int*)positions, n_head, n_kv, head_dim, eps,
+        theta_scale, freq_scale, corr_low, corr_high, ext_factor, mscale, rows, (__half*)q16,
+        qscale);
+    return (int)cudaGetLastError();
+}
+
 PD_EXPORT
 int pd_qkv_norm_rope_batch5(const void* q, const void* k, const void* v,
                             const void* qw, const void* kw, void* qn, void* kn,

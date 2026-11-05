@@ -3548,6 +3548,59 @@ int pd_attn_prefill_f16_paged_wp(const void* q, const void* pool_k, const void* 
                                           scale, kv_dtype, stream);
 }
 
+// slot 925: pd_attn_prefill_f16_paged_wp with a bf16 output plane, for a
+// consumer that reads bf16 rows (the o-projection's prefill tile). Only the
+// f16 wide rung lands bf16 (hd128 f16 pools, G in {4,6,8,9,12,16});
+// cudaErrorNotSupported for anything else, and the caller keeps the f32
+// entry + convert_f32_bf16 - the same bits.
+PD_EXPORT
+int pd_attn_prefill_f16_paged_o16(const void* q, const void* pool_k, const void* pool_v,
+                                  const void* sinks, void* out, const void* positions,
+                                  const void* win_pos, const void* slots,
+                                  const void* block_tables, uint32_t blocks_per_slot,
+                                  uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                                  uint32_t kv_dim, uint32_t swa_window, uint32_t batch,
+                                  float scale, uint32_t kv_dtype, void* stream) {
+    if (n_heads == 0 || batch == 0) return 0;
+    if (head_dim != 128u || kv_dtype != PD_KV_FP16 || n_kv_heads == 0
+        || n_heads % n_kv_heads != 0)
+        return cudaErrorNotSupported;
+    int rc = 0;
+    if (pd_pf7rp128_go(&rc, false, n_heads / n_kv_heads, q, pool_k, pool_v, sinks, out,
+                       positions, block_tables, blocks_per_slot, slots, n_heads, n_kv_heads,
+                       kv_dim, swa_window, batch, scale, (const unsigned int*)win_pos, stream,
+                       true))
+        return rc;
+    return cudaErrorNotSupported;
+}
+
+// slot 930: slot 925 with q as f16 already scaled - the rows slot 929 wrote
+// (f16(q * scale * log2 e), the halves the wide rung's Q stage would form
+// from the f32 plane), so the same bits as 925 on the same q. batch 0 is the
+// readiness probe: 0 when the rung would take this shape, else
+// cudaErrorNotSupported - the caller asks before it writes q in f16, since
+// a refusal after that has no f32 plane to fall back on.
+PD_EXPORT
+int pd_attn_prefill_f16_paged_q16(const void* q, const void* pool_k, const void* pool_v,
+                                  const void* sinks, void* out, const void* positions,
+                                  const void* win_pos, const void* slots,
+                                  const void* block_tables, uint32_t blocks_per_slot,
+                                  uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+                                  uint32_t kv_dim, uint32_t swa_window, uint32_t batch,
+                                  float scale, uint32_t kv_dtype, void* stream) {
+    if (head_dim != 128u || kv_dtype != PD_KV_FP16 || n_kv_heads == 0 || n_heads == 0
+        || n_heads % n_kv_heads != 0 || !pd_pf7rp16_ok(n_heads / n_kv_heads))
+        return cudaErrorNotSupported;
+    if (batch == 0) return 0;
+    int rc = 0;
+    if (pd_pf7rp128_go(&rc, false, n_heads / n_kv_heads, q, pool_k, pool_v, sinks, out,
+                       positions, block_tables, blocks_per_slot, slots, n_heads, n_kv_heads,
+                       kv_dim, swa_window, batch, scale, (const unsigned int*)win_pos, stream,
+                       true, true))
+        return rc;
+    return cudaErrorNotSupported;
+}
+
 // a16 twin (attention streams): q and out are f16 planes. Own
 // dispatch, not a flag on the big election above - only the v3c/v3s/v3w
 // arms have TQ/TO forms, and any geometry that would fall to another

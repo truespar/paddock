@@ -307,6 +307,9 @@ pub const KOLIBRI_Q4KM: &[&str] = &[
 ];
 /// The compressed-tensors NVFP4 checkpoint directory.
 pub const KOLIBRI_NVFP4: &[&str] = &["Kolibri-1-NVFP4"];
+/// Recursive's Flint, the official NVFP4 GGUF (the laguna body's Flint
+/// flavor); llama.cpp reads `flint` since PR #30928.
+pub const FLINT_NVFP4: &[&str] = &["Flint-NVFP4-GGUF/flint-nvfp4.gguf", "flint-nvfp4.gguf"];
 /// EmbeddingGemma 2's text Q8_0 (unsloth, the CUDA lane's checkpoint).
 pub const EMBEDDINGGEMMA2_Q8: &[&str] = &[
     "EmbeddingGemma-2-GGUF/embeddinggemma-2-Q8_0.gguf",

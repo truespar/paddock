@@ -106,7 +106,9 @@ impl Dialect {
             "qwen35" | "qwen35moe" | "qwen4exp" | "nemotron" | "nemotron_h_moe" => Dialect::QwenXml,
             // diffusion-gemma ships Gemma 4's chat template verbatim
             "gemma4" | "diffusion-gemma" => Dialect::GemmaChannel,
-            "laguna" => Dialect::Laguna,
+            // Flint writes the same GLM-shaped calls (`<tool_call>NAME<arg_key>`)
+            // and an optional `<think>` block it opens itself
+            "laguna" | "flint" => Dialect::Laguna,
             "muse-glimmer" => Dialect::MuseChannel,
             "granite" => Dialect::JsonToolCall,
             "kolibri1" => Dialect::JsonThinking,
@@ -1887,6 +1889,38 @@ mod tests {
         assert_eq!(p.finish_reason(), "tool_calls");
         assert!(p.content.is_none());
         assert_eq!(p.complete_calls, 1);
+    }
+
+    /// Flint writes Laguna's GLM-shaped calls, and its `<think>` block is
+    /// one it opens itself (its prompt ends on `<|assistant|>`, never inside
+    /// reasoning): a call written inside the reasoning stays reasoning, one
+    /// after `</think>` is a call, and a turn without the block is content.
+    #[test]
+    fn flint_rides_the_laguna_dialect_with_self_opened_reasoning() {
+        let d = Dialect::for_arch("flint");
+        assert_eq!(d, Dialect::Laguna);
+        assert!(!d.thinking_open("<|user|>weather in Paris?<|assistant|>"));
+        let t = "<think>maybe <tool_call>x</tool_call> later</think>\
+                 <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>";
+        let p = parse(d, t, false, hints_weather().as_ref());
+        assert_eq!(p.tool_calls.len(), 1);
+        assert_eq!(p.tool_calls[0].name, "get_weather");
+        assert!(
+            p.reasoning
+                .as_deref()
+                .is_some_and(|r| r.contains("<tool_call>x"))
+        );
+        let p = parse(
+            d,
+            "The capital of France is Paris.",
+            false,
+            hints_weather().as_ref(),
+        );
+        assert_eq!(
+            p.content.as_deref(),
+            Some("The capital of France is Paris.")
+        );
+        assert!(p.reasoning.is_none() && p.tool_calls.is_empty());
     }
 
     #[test]

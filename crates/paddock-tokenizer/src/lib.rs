@@ -171,6 +171,18 @@ impl GgufTokenizer {
                 .position(|t| *t == "<|endoftext|>")
                 .map(|i| vec![i as u32])
                 .unwrap_or_default(),
+            // Flint ends a turn on <|end_of_text|> and on the next role
+            // marker (<|user|>, <|observation|>, <|developer|>) - the four
+            // generation_config eos ids, which its converter writes as the
+            // eog list
+            Some("flint") => match f.metadata.get("tokenizer.ggml.eog_token_ids") {
+                Some(Value::Array(ids)) => ids
+                    .iter()
+                    .filter_map(Value::as_u64)
+                    .filter_map(|v| u32::try_from(v).ok())
+                    .collect(),
+                _ => Vec::new(),
+            },
             _ => Vec::new(),
         };
 

@@ -175,9 +175,11 @@ impl GpuLaguna {
                 gate,
                 up,
                 down,
-                sh_gate: sh("gate_proj", ff, n_embd)?,
-                sh_up: sh("up_proj", ff, n_embd)?,
-                sh_down: sh("down_proj", n_embd, ff)?,
+                shared: SharedNv::Bf16 {
+                    gate: sh("gate_proj", ff, n_embd)?,
+                    up: sh("up_proj", ff, n_embd)?,
+                    down: sh("down_proj", n_embd, ff)?,
+                },
             });
             shared_bytes += vs.saturating_sub(vfree());
             let swa = KolibriConfig::sliding(i);
@@ -190,6 +192,7 @@ impl GpuLaguna {
                 ffn_norm: norm("post_attention_layernorm", n_embd)?,
                 post_attn_norm: Some(norm("post_attn_norm", n_embd)?),
                 post_ffn_norm: Some(norm("post_ffn_norm", n_embd)?),
+                sinks: None,
                 ffn,
                 is_swa: swa,
                 nope: !swa,
@@ -257,6 +260,7 @@ impl GpuLaguna {
             pipe: None,
             dflash: None,
             chunked: Vec::new(),
+            w16r: None,
         })
     }
 }
