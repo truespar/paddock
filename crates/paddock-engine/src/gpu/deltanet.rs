@@ -1978,6 +1978,10 @@ impl GpuExecutor {
     /// The pick is bit-identical to `argmax_rows` - same tie rule, same walk -
     /// so a lane that turns confidence on cannot get a different transcript
     /// than one that leaves it off.
+    ///
+    /// `suppress` names up to 8 token ids the pick never returns and the
+    /// normaliser leaves out - the reference decoder's `SuppressTokens`. The
+    /// probe's probability is still read over the full distribution.
     pub fn argmax_top2_rows(
         &self,
         logits: &CudaSlice<f32>,
@@ -1985,6 +1989,7 @@ impl GpuExecutor {
         alt: &mut CudaSlice<u32>,
         stats: &mut CudaSlice<f32>,
         probe: u32,
+        suppress: Option<&CudaSlice<u32>>,
         rows: usize,
         n: usize,
     ) -> Result<(), GpuError> {
@@ -1992,10 +1997,23 @@ impl GpuExecutor {
             .kernels
             .argmax_top2_rows
             .ok_or(GpuError::MissingOp("argmax_top2_rows"))?;
+        let n_mask = suppress.map_or(0, |m| m.len());
+        if n_mask > 8 {
+            return Err(GpuError::Driver(format!(
+                "argmax_top2_rows: {n_mask} suppressed ids, the kernel takes at most 8"
+            )));
+        }
         let (lp, _g1) = logits.device_ptr(&self.stream);
         let (op, _g2) = out.device_ptr_mut(&self.stream);
         let (ap, _g3) = alt.device_ptr_mut(&self.stream);
         let (sp, _g4) = stats.device_ptr_mut(&self.stream);
+        let (mp, _g5) = match suppress.filter(|m| !m.is_empty()) {
+            Some(m) => {
+                let (p, g) = m.device_ptr(&self.stream);
+                (p, Some(g))
+            }
+            None => (0, None),
+        };
         check(unsafe {
             f(
                 lp as *const _,
@@ -2003,6 +2021,8 @@ impl GpuExecutor {
                 ap as *mut _,
                 sp as *mut _,
                 probe,
+                mp as *const _,
+                n_mask as u32,
                 rows as u32,
                 n as u32,
                 self.stream_ptr(),

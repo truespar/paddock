@@ -290,7 +290,7 @@ pub fn resolve(
     let resolved = OcrResolved {
         mode: resolved_mode.map(LoMode::as_str),
         crop: "base",
-        force_base: false,
+        crop_force: None,
         grounding: resolved_mode == Some(LoMode::Grounding),
         pages,
         views: pages,
@@ -300,6 +300,7 @@ pub fn resolve(
         dropped_text,
         ngram: (0, 0),
         repeat_stop: false,
+        page_guard: None,
     };
     tracing::info!(
         mode = resolved.mode.unwrap_or("pass-through"),
@@ -405,6 +406,8 @@ pub fn parse_blocks(raw: &str) -> Vec<Region> {
                 text: (!text.is_empty()).then(|| text.to_owned()),
                 quads: Vec::new(),
                 continues,
+                level: None,
+                page: None,
             }
         })
         .collect()

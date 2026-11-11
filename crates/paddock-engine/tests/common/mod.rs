@@ -172,8 +172,19 @@ pub fn qwen4exp_exact_kv() {
 }
 
 pub fn gpu() -> Option<GpuExecutor> {
+    // A `--features static-pack` test build gates the kernels linked INTO it,
+    // the same table the release runner ships - not whatever .so is lying in
+    // packs/cuda/build, which may be months older than the archive and would
+    // make every parity failure here a question about the harness.
+    #[cfg(feature = "static-pack")]
+    let pack = std::path::PathBuf::from("<built-in kernels>");
+    #[cfg(not(feature = "static-pack"))]
     let pack = pack()?;
-    match GpuExecutor::new(0, &pack) {
+    #[cfg(feature = "static-pack")]
+    let opened = GpuExecutor::with_pack(0, None);
+    #[cfg(not(feature = "static-pack"))]
+    let opened = GpuExecutor::new(0, &pack);
+    match opened {
         Ok(e) => Some(e),
         Err(e @ GpuError::Pack(_)) => panic!("kernel pack {} is bad: {e}", pack.display()),
         Err(GpuError::Driver(e)) => unavailable(&format!("no usable CUDA device ({e})")),

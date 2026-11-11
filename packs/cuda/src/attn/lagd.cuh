@@ -167,11 +167,23 @@ __global__ void pd_attn_decode_lagd_kernel(
 
     extern __shared__ __align__(16) unsigned char lagd_smraw[];
     constexpr uint32_t row_e = HD + 8u;            // +8-half row pad (bank law)
+    // f16 K / V panes: unpadded 256-byte rows, 16-byte chunk c of row r at
+    // c ^ (r & 7) - the ldmatrix reads stay conflict-free and every row
+    // starts 128-byte aligned. GB10: cp.async rows landing at the padded
+    // 272-byte stride cost 1.5x the L2 sector requests of the aligned ones
+    // (24 against 16 a warp instruction) - Flint's 4-row 8K full layers ran
+    // their KV at ~185 GB/s where the same copies, aligned, stream ~235.
+    // The fp8 arms keep the padded panes (their raw bytes land elsewhere).
+    constexpr bool SWZ = !F8;
+    constexpr uint32_t row_k = SWZ ? HD : row_e;
+    auto kvc = [](uint32_t r, uint32_t c) -> uint32_t {
+        return SWZ ? ((((c >> 3) ^ (r & 7u)) << 3) | (c & 7u)) : c;
+    };
     constexpr uint32_t w_s = TILE + 8u;
     constexpr uint32_t NSW = TILE / 8u;            // score warps
     __half* s_qh = (__half*)lagd_smraw;                 // [NXQ][16][row_e]
     __half* s_wh = s_qh + (size_t)NXQ * 16u * row_e;    // [NXP][16][w_s]
-    __half* s_kv = s_wh + (size_t)NXP * 16u * w_s;      // [2][K,V][TILE][row_e]
+    __half* s_kv = s_wh + (size_t)NXP * 16u * w_s;      // [2][K,V][TILE][row_k]
                                                         // (RR: [K,V][TILE][row_e])
     // RR: the raw ring after the single pane, [2][K,V][TILE][HD] bytes
     unsigned char* s_raw = (unsigned char*)(s_kv + (size_t)2u * TILE * row_e);
@@ -219,8 +231,8 @@ __global__ void pd_attn_decode_lagd_kernel(
                 const uint32_t kvsel = i / ((TILE - n_t) * lines);
                 const uint32_t j = i - kvsel * (TILE - n_t) * lines;
                 const uint32_t p = n_t + j / lines, l = j % lines;
-                *(uint4*)((char*)(s_kv
-                    + ((size_t)(bf * 2u + kvsel) * TILE + p) * row_e) + l * 16u)
+                *(uint4*)(s_kv + ((size_t)(bf * 2u + kvsel) * TILE + p) * row_k
+                          + kvc(p, l * 8u))
                     = make_uint4(0u, 0u, 0u, 0u);
             }
         }
@@ -239,8 +251,10 @@ __global__ void pd_attn_decode_lagd_kernel(
                 src = (kvsel ? vcb : kcb)
                     + (size_t)gpos * kv_dim + (size_t)kvh * HD;
             }
-            __half* dst = s_kv + ((size_t)(bf * 2u + kvsel) * TILE + p) * row_e;
-            pd_attn_cpa16((char*)dst + l * 16u, (const char*)src + l * 16u);
+            __half* dst = s_kv + ((size_t)(bf * 2u + kvsel) * TILE + p) * row_k;
+            // (F8: the raw bytes at the front of the padded f16 row slot)
+            pd_attn_cpa16((char*)(dst + (SWZ ? kvc(p, l * 8u) : 0u)) + (SWZ ? 0u : l * 16u),
+                          (const char*)src + l * 16u);
         }
         pd_attn_cpa_commit();
     };
@@ -352,8 +366,8 @@ __global__ void pd_attn_decode_lagd_kernel(
             }
             __syncthreads();
         }
-        const __half* kbuf = s_kv + (size_t)(RR ? 0u : bf * 2u) * TILE * row_e;
-        const __half* vbuf = s_kv + ((size_t)(RR ? 0u : bf * 2u) + 1u) * TILE * row_e;
+        const __half* kbuf = s_kv + (size_t)(RR ? 0u : bf * 2u) * TILE * row_k;
+        const __half* vbuf = s_kv + ((size_t)(RR ? 0u : bf * 2u) + 1u) * TILE * row_k;
         // scores in registers: warp w owns cols [w*8, +8); m16n8k16 over the
         // head dim, q frags from the f16 plane(s), K rows as B (no trans)
         float dfr[4] = {0.f, 0.f, 0.f, 0.f};
@@ -366,8 +380,9 @@ __global__ void pd_attn_decode_lagd_kernel(
                                  + kk + ((lane >> 4) ? 8u : 0u);
                 pd_ldm_x4(af, (const unsigned char*)ap);
                 uint32_t bfr[2];
-                const __half* bp = kbuf + (size_t)(p0 + (lane & 7u)) * row_e
-                                 + kk + (((lane >> 3) & 1u) ? 8u : 0u);
+                const uint32_t kr = p0 + (lane & 7u);
+                const __half* bp = kbuf + (size_t)kr * row_k
+                                 + kvc(kr, kk + (((lane >> 3) & 1u) ? 8u : 0u));
                 asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
                              : "=r"(bfr[0]), "=r"(bfr[1])
                              : "r"((unsigned)__cvta_generic_to_shared(bp)));
@@ -501,8 +516,9 @@ __global__ void pd_attn_decode_lagd_kernel(
                 #pragma unroll
                 for (uint32_t sub = 0; sub < 2u; ++sub) {
                     uint32_t bfr[2];
-                    const __half* bp = vbuf + (size_t)(kk + (lane & 15u)) * row_e
-                                     + n_base_w + sub * 8u;
+                    const uint32_t vr = kk + (lane & 15u);
+                    const __half* bp = vbuf + (size_t)vr * row_k
+                                     + kvc(vr, n_base_w + sub * 8u);
                     asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];"
                                  : "=r"(bfr[0]), "=r"(bfr[1])
                                  : "r"((unsigned)__cvta_generic_to_shared(bp)));

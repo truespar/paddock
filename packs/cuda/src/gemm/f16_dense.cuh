@@ -265,6 +265,10 @@ __device__ __forceinline__ void pd_f16_mma(float d[4], const uint32_t a[4],
 // hybrid encoder's conv-BN-SiLU seams (PP-DocLayoutV3), x * sigmoid(x) as
 // torch spells it, x / (1 + exp(-x)) with the accurate exp.
 #define PD_F16_EPI_SILU 10u
+// QUICK_GELU (H16): y = f16(v * sigmoid(1.702 v)), v = acc + bias[m] - CLIP's
+// quick-GELU in the composed chain's own ops (pd_scale's product, then
+// pd_mul_sigmoid's 1 / (1 + exp(-g))), so the landing is those passes' bits.
+#define PD_F16_EPI_QUICK_GELU 12u
 // SWIGLU (H16): f16(silu(gate) * up), the gated-SiLU FFN of the Mistral /
 // Pixtral line (`act_fn(gate_proj(x)) * up_proj(x)`), off GEGLU_G4's 16-row
 // block re-lay (gate rows 0-7, up rows 8-15 of each block). silu is x / (1 +
@@ -285,6 +289,10 @@ __device__ __forceinline__ float pd_f16_swiglu(float g, float u) {
 }
 __device__ __forceinline__ float pd_f16_gelu_erf(float v) {
     return 0.5f * v * (1.0f + erff(v * 0.70710678118654752440084436210484f));
+}
+__device__ __forceinline__ float pd_f16_quick_gelu(float v) {
+    const float g = __fmul_rn(v, 1.702f);   // pd_scale's rounded product
+    return __fmul_rn(v, 1.0f / (1.0f + expf(-g)));
 }
 // torch's gelu(approximate="tanh"): sqrt(2/pi) * (v + 0.044715 v^3), in f32
 __device__ __forceinline__ float pd_f16_gelu_tanh(float v) {
@@ -738,6 +746,14 @@ __global__ void __launch_bounds__(NWARP * 32) pd_f16_gemm_mma_kernel(
                     v01 = pd_f16_gelu_erf(v01 + b0);
                     v10 = pd_f16_gelu_erf(v10 + b8);
                     v11 = pd_f16_gelu_erf(v11 + b8);
+                }
+                if (EPI == PD_F16_EPI_QUICK_GELU) {
+                    const float b0 = r0 < M ? bias[r0] : 0.0f;
+                    const float b8 = r8 < M ? bias[r8] : 0.0f;
+                    v00 = pd_f16_quick_gelu(v00 + b0);
+                    v01 = pd_f16_quick_gelu(v01 + b0);
+                    v10 = pd_f16_quick_gelu(v10 + b8);
+                    v11 = pd_f16_quick_gelu(v11 + b8);
                 }
                 if (EPI == PD_F16_EPI_GELU_TANH) {
                     const float b0 = r0 < M ? bias[r0] : 0.0f;

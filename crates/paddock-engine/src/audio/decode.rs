@@ -161,17 +161,24 @@ fn probe() -> &'static Probe {
 /// Errors are user-facing: they surface as 400s on the transcription
 /// endpoints, so each one names the format that arrived and what would work.
 pub fn decode_audio(bytes: &[u8]) -> Result<WavAudio, String> {
-    decode_with_limit(bytes, None)
+    decode_with_limit(bytes, None, false)
 }
 
 /// Bound decoded duration as packets arrive, before resampling or queueing.
 /// Also reject damaged/changing streams: dropping packets would silently
 /// shift the speaker timeline. The older transcription policy is unchanged.
 pub fn decode_audio_limited(bytes: &[u8], seconds: u32) -> Result<WavAudio, String> {
-    decode_with_limit(bytes, Some(seconds))
+    decode_with_limit(bytes, Some(seconds), true)
 }
 
-fn decode_with_limit(bytes: &[u8], seconds: Option<u32>) -> Result<WavAudio, String> {
+/// The transcription policy with a duration bound: torn packets and chained
+/// streams are tolerated as in `decode_audio`, but a compressed upload cannot
+/// decode past `seconds` - the body limit alone bounds bytes, not minutes.
+pub fn decode_audio_bounded(bytes: &[u8], seconds: u32) -> Result<WavAudio, String> {
+    decode_with_limit(bytes, Some(seconds), false)
+}
+
+fn decode_with_limit(bytes: &[u8], seconds: Option<u32>, strict: bool) -> Result<WavAudio, String> {
     let kind = sniff(bytes);
     match kind {
         Container::Wav => {
@@ -247,7 +254,7 @@ fn decode_with_limit(bytes: &[u8], seconds: Option<u32>) -> Result<WavAudio, Str
             // A track-list change mid-stream (chained OGG). Everything decoded
             // up to here is real audio, so keep it rather than failing the
             // request - and stop, because the decoder past this point is stale.
-            Err(SymphErr::ResetRequired) if seconds.is_some() => {
+            Err(SymphErr::ResetRequired) if strict => {
                 return Err("audio track changes mid-stream; convert to a single WAV first".into());
             }
             Err(SymphErr::ResetRequired) => break,
@@ -260,12 +267,12 @@ fn decode_with_limit(bytes: &[u8], seconds: Option<u32>) -> Result<WavAudio, Str
             Ok(b) => b,
             // Both are per-packet faults: a torn packet in the middle of a
             // recording should cost that packet, not the transcript.
-            Err(SymphErr::IoError(_)) | Err(SymphErr::DecodeError(_)) if seconds.is_none() => {
+            Err(SymphErr::IoError(_)) | Err(SymphErr::DecodeError(_)) if !strict => {
                 continue;
             }
             Err(e) => return Err(format!("{} decode: {e}", kind.name())),
         };
-        if seconds.is_some() && rate != 0 && buf.spec().rate() != rate {
+        if strict && rate != 0 && buf.spec().rate() != rate {
             return Err("audio sample rate changes mid-stream".into());
         }
         push_mono(&buf, &mut inter, &mut samples, &mut rate);

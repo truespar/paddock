@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-pub const MAX_WORDS: usize = 20_000;
+/// Four hours at a fast 200 words/min is 48k; attribution is O(log segments)
+/// per word, so the cap only bounds the request, not the algorithm.
+pub const MAX_WORDS: usize = 100_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Word {

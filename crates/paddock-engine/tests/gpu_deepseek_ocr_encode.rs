@@ -106,8 +106,14 @@ fn run_geometry(enc: &mut DeepEncoder, dir: &std::path::Path, run: &str, views: 
     let got = enc_to_host(enc, &out.embd);
     assert_eq!(got.len(), want.len(), "{run}: feature count");
     let d = diff(&got, &want);
+    // FNV-1a over the feature bits: the anchor a numerically-neutral tower
+    // change (a fused epilogue, a dropped pass) is checked against - it must
+    // not move
+    let bits = got.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, x| {
+        (h ^ u64::from(x.to_bits())).wrapping_mul(0x0100_0000_01b3)
+    });
     eprintln!(
-        "{run}: max|Δ| {:.4}  mean|Δ| {:.5}  relL2 {:.5}  cos {:.6}",
+        "{run}: max|Δ| {:.4}  mean|Δ| {:.5}  relL2 {:.5}  cos {:.6}  bits {bits:016x}",
         d.max_abs, d.mean_abs, d.rel_l2, d.cosine
     );
     // f16-weight/f32-accumulate class against an f32 oracle, 36 GEMM-deep.
@@ -175,6 +181,61 @@ fn u8_stem_matches_the_f32_stem() {
             .expect("u8 stem");
         let got = enc_to_host(&enc, &u8_arm.embd);
         assert_eq!(got.len(), want.len(), "{views}x{px}: feature count");
+        let diverged = got
+            .iter()
+            .zip(&want)
+            .filter(|(g, w)| g.to_bits() != w.to_bits())
+            .count();
+        assert_eq!(
+            diverged,
+            0,
+            "{views}x{px}: {diverged} of {} values differ",
+            got.len()
+        );
+    }
+}
+
+/// The tower's seams landed in its GEMMs (bias + residual in the projections,
+/// the FFN up landed f16 with its activation, f16 layernorms, the q|k|v split
+/// in one pass) must land the composed tower's exact bits, at every view
+/// count a request can chunk to - 1 and 8 views stress the GEMMs' smallest
+/// and widest CLIP grids, where a shape may leave the fused tile for the
+/// scratch fallback.
+#[test]
+fn fused_seams_match_the_composed_tower() {
+    let Some(path) = mmproj_path() else {
+        common::missing("no Unlimited-OCR mmproj (set UNLIMITED_OCR_MMPROJ)");
+        return;
+    };
+    let Some(exec) = common::gpu_arc() else {
+        return;
+    };
+    let map = MappedGguf::open(&path).expect("open mmproj");
+    let mut enc = DeepEncoder::load(Arc::clone(&exec), &map).expect("load deepencoder");
+    if !exec.has_deepencoder_fused() {
+        common::missing("pack without the DeepEncoder tower landings (slots 940-941)");
+        return;
+    }
+    for (views, px) in [(1usize, 1024usize), (1, 640), (3, 640), (8, 640)] {
+        let n = views * px * px * 3;
+        let mut s = 0x5eed_0f0cu64 ^ (views * px) as u64;
+        let pixels: Vec<u8> = (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (s >> 33) as u8
+            })
+            .collect();
+        enc.set_composed_seams(false);
+        let fused = enc.encode(PatchSrc::U8(&pixels), views, px).expect("fused");
+        let got = enc_to_host(&enc, &fused.embd);
+        enc.set_composed_seams(true);
+        let composed = enc
+            .encode(PatchSrc::U8(&pixels), views, px)
+            .expect("composed");
+        let want = enc_to_host(&enc, &composed.embd);
+        enc.set_composed_seams(false);
         let diverged = got
             .iter()
             .zip(&want)

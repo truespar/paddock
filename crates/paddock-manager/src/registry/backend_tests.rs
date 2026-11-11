@@ -999,7 +999,7 @@ fn unlimited_ocr_metal_has_an_explicit_required_pair_and_preserves_cuda() {
             .weight_bytes,
         3126134688
     );
-    assert_eq!(m.artifact("mmproj").unwrap().workspace, Some(996147200));
+    assert_eq!(m.artifact("mmproj").unwrap().workspace, Some(1063256064));
 }
 
 #[test]

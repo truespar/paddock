@@ -7,7 +7,7 @@ export function mergeDiarization(
 ): TranscriptMeta {
   const original = meta.words ?? []
   if (result.attribution !== 'time_overlap_v1' || !Number.isFinite(result.duration) ||
-    result.duration <= 0 || result.duration > 600 || !Array.isArray(result.segments) ||
+    result.duration <= 0 || result.duration > 4 * 3600 || !Array.isArray(result.segments) ||
     result.segments.some(s => !Number.isInteger(s.speaker) || s.speaker < 0 || s.speaker >= 8 ||
       !Number.isFinite(s.start) || !Number.isFinite(s.end) || s.start < 0 || s.end <= s.start ||
       s.end > result.duration + 0.001) || !Array.isArray(result.words) ||
@@ -24,7 +24,7 @@ export async function identifySpeakers(
   port: number, model: string, audio: Blob, meta: TranscriptMeta, signal: AbortSignal,
 ): Promise<TranscriptMeta> {
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid speaker endpoint')
-  if (audio.size > 25 * 1024 * 1024) throw new Error('Speaker analysis accepts audio files up to 25 MiB')
+  if (audio.size > 192 * 1024 * 1024) throw new Error('Speaker analysis accepts audio files up to 192 MiB')
   const form = new FormData()
   form.append('file', audio, 'recording')
   form.append('model', model)

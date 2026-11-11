@@ -23,7 +23,8 @@
 //! on the response (and logged), so a bench artifact can stamp the serve
 //! configuration from server state rather than intent.
 
-use paddock_engine::service::FinishReason;
+use paddock_engine::gpu_model::deepseek_ocr::dash::MAX_PAGE_TOKENS;
+use paddock_engine::service::{FinishReason, OcrCropMode};
 use serde_json::{Value, json};
 
 /// The family's five task modes. The canonical strings are BYTE-EXACT to the
@@ -102,8 +103,19 @@ impl OcrMode {
 /// serves. The mode names are the model's interface (same reasoning as
 /// `task_tags`): `supported_parameters` can say an `ocr` object exists, but
 /// only a listed vocabulary lets a client offer the modes as controls
-/// instead of leaving them discoverable by 400.
-pub fn caps_json() -> Value {
+/// instead of leaving them discoverable by 400. Unlimited-OCR-2 lists the
+/// one instruction it trains and its page-count guard.
+pub fn caps_json(unlimited_ocr2: bool) -> Value {
+    if unlimited_ocr2 {
+        return json!({
+            "modes": [OcrMode::Multipage.as_str()],
+            "crops": ["auto", "gundam", "base"],
+            // every block carries its box; `ocr.regions` adds `page` and a
+            // heading's `level`
+            "grounding": true,
+            "page_guard": { "max_page_tokens": MAX_PAGE_TOKENS },
+        });
+    }
     json!({
         "modes": OcrMode::ALL.map(OcrMode::as_str),
         // OcrOpts::parse's crop vocabulary ("auto" derives from the request
@@ -221,7 +233,7 @@ fn usize_field(v: &Value, name: &str) -> Result<usize, String> {
 }
 
 /// What the server actually resolved for one request - the echo/log payload,
-/// plus the two values the serving path consumes (`ngram`, `force_base`).
+/// plus the two values the serving path consumes (`ngram`, `crop_force`).
 #[derive(Debug, Clone)]
 pub struct OcrResolved {
     /// The resolved mode's WIRE NAME (a string so both document-parser
@@ -230,9 +242,10 @@ pub struct OcrResolved {
     pub mode: Option<&'static str>,
     /// The crop class that will actually run.
     pub crop: &'static str,
-    /// Prepend an `OcrCrop(Base)` directive chunk (single image forced base;
-    /// multi-image is base engine-side already).
-    pub force_base: bool,
+    /// Prepend an `OcrCrop` directive chunk: `Base` for a single image read
+    /// base (several are base engine-side already), `Gundam` for several
+    /// pages tiled (Unlimited-OCR-2 only; one image tiles by default).
+    pub crop_force: Option<OcrCropMode>,
     /// The grounding-region parse is armed for this request's output.
     pub grounding: bool,
     pub pages: usize,
@@ -250,6 +263,10 @@ pub struct OcrResolved {
     /// The n-gram guard STOPS the read where it would have banned (the
     /// sampler's stop mode) instead of masking - PaddleOCR-VL's default.
     pub repeat_stop: bool,
+    /// Unlimited-OCR-2's page-count guard, run in the engine on every read:
+    /// EOS banned until one `<PAGE>` a prompt page has been written, nothing
+    /// but EOS past it, and a page closed at this many tokens.
+    pub page_guard: Option<u32>,
 }
 
 impl OcrResolved {
@@ -275,6 +292,9 @@ impl OcrResolved {
             "dropped_text": self.dropped_text,
             "no_repeat_ngram": { "size": ban.0, "window": ban.1 },
         });
+        if let Some(n) = self.page_guard {
+            echo["page_guard"] = json!({ "max_page_tokens": n });
+        }
         if self.repeat_stop {
             echo["repetition_stop"] = json!({
                 "size": self.ngram.0,
@@ -297,6 +317,13 @@ const NGRAM_WINDOW_MULTI: usize = 1024;
 /// grounding token is injected); `sizes` is one (w, h) per decoded image in
 /// request order; `max_tiles` is the served tower's tile budget.
 ///
+/// `unlimited_ocr2` switches to that checkpoint's surface: it trains ONE
+/// instruction ("Multi page parsing.", single pages included), so the mode
+/// vocabulary is just `multipage` and a single page still tiles (gundam) by
+/// default - the reference's auto policy; every block it writes carries a
+/// box, so grounding is always on and has no prompt token; the page-count
+/// guard runs in the engine and is echoed.
+///
 /// Returns `Ok(None)` for a text-only request with no `ocr` object - plain
 /// chat on this model, nothing to resolve. A text-only request with an `ocr`
 /// object is a 400: every knob in it conditions an image parse.
@@ -305,6 +332,7 @@ pub fn resolve(
     opts: Option<OcrOpts>,
     sizes: &[(usize, usize)],
     max_tiles: usize,
+    unlimited_ocr2: bool,
 ) -> Result<Option<OcrResolved>, String> {
     let pages = sizes.len();
     if pages == 0 {
@@ -318,6 +346,23 @@ pub fn resolve(
         return Ok(None);
     }
     let opts = opts.unwrap_or_default();
+    if unlimited_ocr2 {
+        if let Some(m) = opts.mode
+            && m != OcrMode::Multipage
+        {
+            return Err(format!(
+                "Unlimited-OCR-2 trains one instruction - ocr.mode \"multipage\" (\"Multi page \
+                 parsing.\"), single pages included; \"{}\" is an Unlimited-OCR v1 prompt",
+                m.as_str()
+            ));
+        }
+        if opts.grounding == Some(false) {
+            return Err(
+                "Unlimited-OCR-2 writes a box for every block - ocr.grounding cannot be turned off"
+                    .into(),
+            );
+        }
+    }
 
     let text = body_text(messages);
     let has_text = !text.trim().is_empty();
@@ -329,44 +374,60 @@ pub fn resolve(
     // conditioning, so pass-through is never rewritten).
     let mode = match opts.mode {
         Some(m) => Some(m),
-        None if !has_text => Some(if pages > 1 {
+        None if !has_text => Some(if pages > 1 || unlimited_ocr2 {
             OcrMode::Multipage
         } else {
             OcrMode::Document
         }),
         None => None,
     };
-    let multipage = pages > 1 || mode == Some(OcrMode::Multipage);
+    // v1's multipage mode is its base-mode configuration; v2 runs that
+    // instruction on everything, so only the page count says multi-page
+    let multipage = pages > 1 || (!unlimited_ocr2 && mode == Some(OcrMode::Multipage));
 
-    // crop: gundam is single-image only (the reference mandates non-crop for
-    // multi-image, and multipage mode is the non-crop configuration).
-    if opts.crop == OcrCrop::Gundam && pages > 1 {
+    // crop: v1 tiles a single image only (its reference mandates non-crop
+    // for multi-image, and its multipage mode is the non-crop configuration).
+    // Unlimited-OCR-2's reads several pages tiled when asked - every page its
+    // own grid - though several pages default to base (its auto policy).
+    if !unlimited_ocr2 && opts.crop == OcrCrop::Gundam && pages > 1 {
         return Err(format!(
-            "ocr.crop \"gundam\" needs a single image - this family parses {pages} images in \
-             base mode only (the reference mandates non-crop for multi-image)"
+            "ocr.crop \"gundam\" needs a single image - this family parses {pages} images \
+             in base mode only (the reference mandates non-crop for multi-image)"
         ));
     }
-    if opts.crop == OcrCrop::Gundam && mode == Some(OcrMode::Multipage) {
+    if !unlimited_ocr2 && opts.crop == OcrCrop::Gundam && mode == Some(OcrMode::Multipage) {
         return Err(
             "ocr.crop \"gundam\" contradicts ocr.mode \"multipage\" - multi-page parsing runs \
              in base mode"
                 .into(),
         );
     }
-    let force_base = pages == 1 && (opts.crop == OcrCrop::Base || mode == Some(OcrMode::Multipage));
+    let crop_force = if pages == 1
+        && (opts.crop == OcrCrop::Base || (!unlimited_ocr2 && mode == Some(OcrMode::Multipage)))
+    {
+        Some(OcrCropMode::Base)
+    } else if pages > 1 && opts.crop == OcrCrop::Gundam {
+        Some(OcrCropMode::Gundam)
+    } else {
+        None
+    };
 
     // grounding: layout mode's canonical string carries the token already;
     // an explicit `grounding: true` on any other prompt prepends it (the
     // family's grounded shape is `<image>\n<|grounding|>TASK`). Either arms
     // the region parse, as does pass-through text that brought its own token.
-    let grounding =
-        opts.grounding == Some(true) || mode == Some(OcrMode::Layout) || text.contains(GROUNDING);
+    // Unlimited-OCR-2 is always grounded and has no such token.
+    let grounding = unlimited_ocr2
+        || opts.grounding == Some(true)
+        || mode == Some(OcrMode::Layout)
+        || text.contains(GROUNDING);
+    let prepend = opts.grounding == Some(true) && !unlimited_ocr2;
 
     // the prompt mutation
     let mut dropped_text = false;
     if let Some(m) = mode {
         let mut task = m.canonical().to_owned();
-        if opts.grounding == Some(true) && !task.contains(GROUNDING) {
+        if prepend && !task.contains(GROUNDING) {
             task = format!("\n{GROUNDING}{}", task.trim_start_matches('\n'));
         }
         if opts.mode.is_some() && has_text {
@@ -379,12 +440,13 @@ pub fn resolve(
             );
         }
         set_body_text(messages, &task, opts.mode.is_some());
-    } else if opts.grounding == Some(true) && !text.contains(GROUNDING) {
+    } else if prepend && !text.contains(GROUNDING) {
         prepend_grounding(messages);
     }
 
     // the sampling default, unless overridden; both halves > 0 or it is off
-    // (the reference's own gate)
+    // (the reference's own gate). Unlimited-OCR-2's card serves the same
+    // 35-gram with the same two windows.
     let size = opts.ngram_size.unwrap_or(NGRAM_SIZE);
     let window = opts.ngram_window.unwrap_or(if multipage {
         NGRAM_WINDOW_MULTI
@@ -399,24 +461,21 @@ pub fn resolve(
 
     // geometry echo - the exact planner the engine runs
     let layout =
-        paddock_engine::gpu_model::deepseek_ocr::tiling::Layout::plan(sizes, max_tiles, force_base);
+        paddock_engine::gpu_model::deepseek_ocr::tiling::Layout::plan(sizes, max_tiles, crop_force);
     let resolved = OcrResolved {
         mode: mode.map(OcrMode::as_str),
-        crop: if layout.grid.is_some() {
-            "gundam"
-        } else {
-            "base"
-        },
-        force_base,
+        crop: if layout.tiled() { "gundam" } else { "base" },
+        crop_force,
         grounding,
         pages,
         views: layout.views,
-        tiles: layout.grid.map_or(0, |g| g.tiles()),
+        tiles: layout.tiles(),
         image_tokens: layout.image_tokens,
         pass_through,
         dropped_text,
         ngram,
         repeat_stop: false,
+        page_guard: unlimited_ocr2.then_some(MAX_PAGE_TOKENS),
     };
     tracing::info!(
         mode = resolved.mode.unwrap_or("pass-through"),
@@ -547,9 +606,15 @@ pub struct Region {
     /// empty and the wire omits it.
     pub quads: Vec<[i64; 8]>,
     /// The block continues the previous one (LightOnOCR-3's `label+`: a
-    /// paragraph flowing into the next column). Only that parse sets it, and
-    /// the wire carries it only when true.
+    /// paragraph flowing into the next column; Unlimited-OCR-2's `append_<t>`
+    /// across a page break and `<MERGE>` columns). The wire carries it only
+    /// when true.
     pub continues: bool,
+    /// A heading's level (Unlimited-OCR-2's `title<LEVELn>`), when stated.
+    pub level: Option<u32>,
+    /// The request image the block sits on, 0-based - set by the parses whose
+    /// output spans pages (Unlimited-OCR-2's `<PAGE>` runs).
+    pub page: Option<usize>,
 }
 
 impl Region {
@@ -563,6 +628,12 @@ impl Region {
         }
         if self.continues {
             v["continues"] = json!(true);
+        }
+        if let Some(l) = self.level {
+            v["level"] = json!(l);
+        }
+        if let Some(p) = self.page {
+            v["page"] = json!(p);
         }
         v
     }
@@ -604,6 +675,8 @@ pub fn parse_regions(raw: &str) -> Vec<Region> {
                 text: None,
                 quads: vec![],
                 continues: false,
+                level: None,
+                page: None,
             });
         }
         cur = &body[de + "<|/det|>".len()..];
@@ -649,6 +722,8 @@ pub fn parse_regions(raw: &str) -> Vec<Region> {
                 text: (!span.is_empty()).then(|| span.to_owned()),
                 quads: vec![],
                 continues: false,
+                level: None,
+                page: None,
             });
         }
     }
@@ -681,12 +756,16 @@ fn parse_boxes(s: &str) -> Option<Vec<[i64; 4]>> {
 }
 
 /// Regions as the response extension array, or None when nothing parsed.
-/// Tries this family's det/ref markup first, then paddleocr's spotting
+/// Tries this family's det/ref markup first, then Unlimited-OCR-2's
+/// `<BLOCK>` records, then paddleocr's spotting
 /// `<|LOC_n|>` lines, then LightOnOCR-3's `![label](x1,y1,x2,y2)` blocks -
 /// the marker vocabularies are disjoint, so one entry point serves every
 /// attach site and the parse itself stays the truth test.
 pub fn regions_json(raw: &str) -> Option<Value> {
     let mut rs = parse_regions(raw);
+    if rs.is_empty() {
+        rs = crate::unlimited_ocr2::parse_blocks(raw);
+    }
     if rs.is_empty() {
         rs = crate::paddle_ocr::parse_spotting(raw);
     }
@@ -717,11 +796,11 @@ mod tests {
     fn derived_default_single_image_is_document_gundam() {
         // the battery-page shape: one image, no text, no ocr object
         let mut msgs = vec![user(json!([{"type": "image"}]))];
-        let r = resolve(&mut msgs, None, &[(1240, 1754)], MAX_TILES)
+        let r = resolve(&mut msgs, None, &[(1240, 1754)], MAX_TILES, false)
             .expect("resolve")
             .expect("images present");
         assert_eq!(r.mode, Some("document"));
-        assert_eq!((r.crop, r.force_base), ("gundam", false));
+        assert_eq!((r.crop, r.crop_force), ("gundam", None));
         assert_eq!((r.pages, r.views, r.tiles), (1, 7, 6));
         assert_eq!(r.image_tokens, 903, "the arbiter-measured battery geometry");
         assert_eq!(r.ngram, (35, 128));
@@ -732,13 +811,19 @@ mod tests {
     #[test]
     fn derived_default_multi_image_is_multipage_base() {
         let mut msgs = vec![user(json!([{"type": "image"}, {"type": "image"}]))];
-        let r = resolve(&mut msgs, None, &[(1240, 1754), (800, 600)], MAX_TILES)
-            .expect("resolve")
-            .expect("images");
+        let r = resolve(
+            &mut msgs,
+            None,
+            &[(1240, 1754), (800, 600)],
+            MAX_TILES,
+            false,
+        )
+        .expect("resolve")
+        .expect("images");
         assert_eq!(r.mode, Some("multipage"));
         assert_eq!(
-            (r.crop, r.force_base),
-            ("base", false),
+            (r.crop, r.crop_force),
+            ("base", None),
             "N pages: engine derives base"
         );
         assert_eq!((r.pages, r.views, r.tiles), (2, 2, 0));
@@ -752,7 +837,7 @@ mod tests {
             json!([{"type": "image"}, {"type": "text", "text": "document parsing."}]),
         )];
         let before = msgs.clone();
-        let r = resolve(&mut msgs, None, &[(1240, 1754)], MAX_TILES)
+        let r = resolve(&mut msgs, None, &[(1240, 1754)], MAX_TILES, false)
             .expect("resolve")
             .expect("images");
         assert!(r.pass_through);
@@ -770,7 +855,7 @@ mod tests {
             mode: Some(OcrMode::Free),
             ..Default::default()
         };
-        let r = resolve(&mut msgs, Some(opts), &[(1000, 1000)], MAX_TILES)
+        let r = resolve(&mut msgs, Some(opts), &[(1000, 1000)], MAX_TILES, false)
             .expect("resolve")
             .expect("images");
         assert_eq!(r.mode, Some("free"));
@@ -789,12 +874,12 @@ mod tests {
             mode: Some(OcrMode::Layout),
             ..Default::default()
         };
-        let r = resolve(&mut msgs, Some(opts), &[(1240, 1754)], MAX_TILES)
+        let r = resolve(&mut msgs, Some(opts), &[(1240, 1754)], MAX_TILES, false)
             .expect("resolve")
             .expect("images");
         assert!(r.grounding, "layout IS the grounded mode");
         assert!(text_of(&msgs).contains(GROUNDING));
-        assert!(!r.force_base);
+        assert_eq!(r.crop_force, None);
 
         // multipage mode on one image runs base - the README pairs them
         let mut msgs = vec![user(json!([{"type": "image"}]))];
@@ -802,10 +887,10 @@ mod tests {
             mode: Some(OcrMode::Multipage),
             ..Default::default()
         };
-        let r = resolve(&mut msgs, Some(opts), &[(1240, 1754)], MAX_TILES)
+        let r = resolve(&mut msgs, Some(opts), &[(1240, 1754)], MAX_TILES, false)
             .expect("resolve")
             .expect("images");
-        assert!(r.force_base);
+        assert_eq!(r.crop_force, Some(OcrCropMode::Base));
         assert_eq!((r.crop, r.views, r.image_tokens), ("base", 1, 273));
         assert_eq!(r.ngram, (35, 1024), "multipage mode takes the long window");
     }
@@ -818,9 +903,15 @@ mod tests {
             grounding: Some(true),
             ..Default::default()
         };
-        let r = resolve(&mut msgs, Some(opts.clone()), &[(1240, 1754)], MAX_TILES)
-            .expect("resolve")
-            .expect("images");
+        let r = resolve(
+            &mut msgs,
+            Some(opts.clone()),
+            &[(1240, 1754)],
+            MAX_TILES,
+            false,
+        )
+        .expect("resolve")
+        .expect("images");
         assert!(r.grounding);
         assert_eq!(text_of(&msgs), "\n<|grounding|>document parsing.");
 
@@ -828,7 +919,7 @@ mod tests {
         let mut msgs = vec![user(
             json!([{"type": "image"}, {"type": "text", "text": "find the tables"}]),
         )];
-        let r = resolve(&mut msgs, Some(opts), &[(1240, 1754)], MAX_TILES)
+        let r = resolve(&mut msgs, Some(opts), &[(1240, 1754)], MAX_TILES, false)
             .expect("resolve")
             .expect("images");
         assert!(r.grounding && r.pass_through);
@@ -843,10 +934,10 @@ mod tests {
             crop: OcrCrop::Base,
             ..Default::default()
         };
-        let r = resolve(&mut msgs, Some(opts), &[(1240, 1754)], MAX_TILES)
+        let r = resolve(&mut msgs, Some(opts), &[(1240, 1754)], MAX_TILES, false)
             .expect("resolve")
             .expect("images");
-        assert!(r.force_base);
+        assert_eq!(r.crop_force, Some(OcrCropMode::Base));
         assert_eq!(
             (r.crop, r.views, r.tiles, r.image_tokens),
             ("base", 1, 0, 273)
@@ -858,8 +949,14 @@ mod tests {
             crop: OcrCrop::Gundam,
             ..Default::default()
         };
-        let err = resolve(&mut msgs, Some(opts), &[(100, 100), (100, 100)], MAX_TILES)
-            .expect_err("must refuse");
+        let err = resolve(
+            &mut msgs,
+            Some(opts),
+            &[(100, 100), (100, 100)],
+            MAX_TILES,
+            false,
+        )
+        .expect_err("must refuse");
         assert!(err.contains("base mode only"), "{err}");
     }
 
@@ -871,7 +968,7 @@ mod tests {
             ngram_window: Some(256),
             ..Default::default()
         };
-        let r = resolve(&mut msgs, Some(opts), &[(640, 480)], MAX_TILES)
+        let r = resolve(&mut msgs, Some(opts), &[(640, 480)], MAX_TILES, false)
             .expect("resolve")
             .expect("images");
         assert_eq!(r.ngram, (20, 256));
@@ -881,7 +978,7 @@ mod tests {
             ngram_size: Some(0),
             ..Default::default()
         };
-        let r = resolve(&mut msgs, Some(opts), &[(640, 480)], MAX_TILES)
+        let r = resolve(&mut msgs, Some(opts), &[(640, 480)], MAX_TILES, false)
             .expect("resolve")
             .expect("images");
         assert_eq!(
@@ -895,7 +992,7 @@ mod tests {
     fn text_only_requests_stay_plain_chat() {
         let mut msgs = vec![user(json!("what is the capital of France?"))];
         assert!(
-            resolve(&mut msgs, None, &[], MAX_TILES)
+            resolve(&mut msgs, None, &[], MAX_TILES, false)
                 .expect("ok")
                 .is_none()
         );
@@ -904,7 +1001,7 @@ mod tests {
             mode: Some(OcrMode::Document),
             ..Default::default()
         };
-        assert!(resolve(&mut msgs, Some(opts), &[], MAX_TILES).is_err());
+        assert!(resolve(&mut msgs, Some(opts), &[], MAX_TILES, false).is_err());
     }
 
     #[test]
@@ -945,6 +1042,8 @@ mod tests {
                 text: Some("Quarterly Report".into()),
                 quads: vec![],
                 continues: false,
+                level: None,
+                page: None,
             }
         );
         assert_eq!(rs[1].label, "text");
@@ -967,12 +1066,85 @@ mod tests {
     }
 
     #[test]
+    fn unlimited_ocr2_trains_one_instruction() {
+        // one page, no text: the trained instruction, still tiled, short window
+        let mut msgs = vec![user(json!([{"type": "image"}]))];
+        let r = resolve(&mut msgs, None, &[(1240, 1754)], 16, true)
+            .expect("resolve")
+            .expect("images");
+        assert_eq!(r.mode, Some("multipage"));
+        assert_eq!((r.crop, r.crop_force, r.tiles), ("gundam", None, 6));
+        assert_eq!(r.ngram, (35, 128), "the card's single-page window");
+        assert!(r.grounding);
+        assert_eq!(r.page_guard, Some(MAX_PAGE_TOKENS));
+        assert_eq!(text_of(&msgs), "Multi page parsing.");
+        assert_eq!(
+            r.echo_at(None)["page_guard"]["max_page_tokens"],
+            json!(MAX_PAGE_TOKENS)
+        );
+
+        // several pages: base, the long window
+        let mut msgs = vec![user(json!([{"type": "image"}, {"type": "image"}]))];
+        let r = resolve(&mut msgs, None, &[(1240, 1754), (800, 600)], 16, true)
+            .expect("resolve")
+            .expect("images");
+        assert_eq!((r.crop, r.views, r.ngram), ("base", 2, (35, 1024)));
+
+        // explicit base on one page; grounding true adds no prompt token
+        let mut msgs = vec![user(json!([{"type": "image"}]))];
+        let opts = OcrOpts {
+            crop: OcrCrop::Base,
+            grounding: Some(true),
+            ..Default::default()
+        };
+        let r = resolve(&mut msgs, Some(opts), &[(1240, 1754)], 16, true)
+            .expect("resolve")
+            .expect("images");
+        assert_eq!(
+            (r.crop_force, r.image_tokens),
+            (Some(OcrCropMode::Base), 273)
+        );
+        assert_eq!(text_of(&msgs), "Multi page parsing.");
+
+        // v1 prompts and grounding off are refused
+        for opts in [
+            OcrOpts {
+                mode: Some(OcrMode::Document),
+                ..Default::default()
+            },
+            OcrOpts {
+                grounding: Some(false),
+                ..Default::default()
+            },
+        ] {
+            let mut msgs = vec![user(json!([{"type": "image"}]))];
+            assert!(resolve(&mut msgs, Some(opts), &[(100, 100)], 16, true).is_err());
+        }
+        // several pages tiled on request: every page its own grid, the
+        // directive rides, and the long window still applies
+        let mut msgs = vec![user(json!([{"type": "image"}, {"type": "image"}]))];
+        let opts = OcrOpts {
+            crop: OcrCrop::Gundam,
+            ..Default::default()
+        };
+        let r = resolve(&mut msgs, Some(opts), &[(1448, 2048), (600, 580)], 16, true)
+            .expect("resolve")
+            .expect("images");
+        assert_eq!(
+            (r.crop, r.crop_force),
+            ("gundam", Some(OcrCropMode::Gundam))
+        );
+        assert_eq!((r.views, r.tiles, r.image_tokens), (8, 6, 903 + 273));
+        assert_eq!(r.ngram, (35, 1024));
+    }
+
+    #[test]
     fn advertised_caps_round_trip_through_the_parsers() {
         // Every advertised mode and crop must be accepted verbatim by the
         // request parser - the capability object is a promise about what
         // OcrOpts::parse takes, and a listed string the parser rejects is the
         // silent-drift failure this test exists to catch.
-        let caps = caps_json();
+        let caps = caps_json(false);
         let modes = caps["modes"].as_array().expect("modes array");
         assert_eq!(modes.len(), OcrMode::ALL.len());
         for m in modes {
@@ -986,5 +1158,11 @@ mod tests {
             OcrOpts::parse(&json!({"crop": c})).expect("advertised crop parses");
         }
         assert_eq!(caps["grounding"], json!(true));
+        // Unlimited-OCR-2 advertises its one mode, which parses too
+        let caps = caps_json(true);
+        assert_eq!(caps["modes"], json!(["multipage"]));
+        for m in caps["modes"].as_array().expect("modes array") {
+            OcrOpts::parse(&json!({"mode": m})).expect("advertised mode parses");
+        }
     }
 }

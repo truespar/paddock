@@ -5826,8 +5826,8 @@ revision = "2026-08-13"
   # Not optional: without the tower this is a 3B text model with the purpose
   # gone (the granite-vision precedent). `workspace` is the persistent encode
   # slab set DeepEncoder pins from attach to shutdown - logged as
-  # workspace_mib=950 at attach, and BIGGER than the weight
-  # file, so the fit estimate must count it.
+  # workspace_mib=1013 at attach (a floor; 1014 MiB here), and BIGGER than the
+  # weight file, so the fit estimate must count it.
   [[model.artifact]]
   id = "mmproj"
   kind = "vision"
@@ -5835,7 +5835,7 @@ revision = "2026-08-13"
   label = "Image reader"
   default = true
   required = true
-  workspace = 996147200
+  workspace = 1063256064
 
   [model.artifact.runtime]
   backends = ["cuda", "metal"]
@@ -5854,6 +5854,94 @@ revision = "2026-08-13"
     [[model.artifact.file]]
     url = "https://models.truespar.io/models/Unlimited-OCR-GGUF/mmproj-Unlimited-OCR-F16.gguf"
     dest = "Unlimited-OCR-GGUF/mmproj-Unlimited-OCR-F16.gguf"
+    sha256 = "f9984c20c64610002b213d9518305c19d47f00ed0f4574cb7590e1ff98f97bf6"
+    size = 825245664
+
+# Unlimited-OCR-2 (Baidu, Oct 2026) - Unlimited-OCR's successor on the same
+# body: the identical DeepEncoder tower and 3B MoE decoder shape, retrained,
+# with SR-SWA (Sparse Reference Sliding Window Attention) in every layer - a
+# 128-key window plus up to 12 router-picked 32-key blocks of the page being
+# read - and a page-2D rope. KV is the prompt plus a 128-row ring however long
+# the output runs, which is what lets one request read a whole document.
+#
+# Sourcing: baidu ships BF16 only - the decoder GGUF is our in-house
+# conversion of baidu/Unlimited-OCR-2's official checkpoint (revision
+# 0480966938291445591f69f08a13b041c073a96a), router planes kept f32; MIT, so
+# redistribution is permitted and the attribution travels with the row. The
+# vision tower is byte-for-byte v1's (all 476 tensors identical), so the
+# companion IS the published v1 mmproj.
+[[model]]
+id = "unlimited-ocr-2"
+# the SR-SWA lane reads an f16 pool (no fp8 arm yet) - the loader refuses KV8
+kv_default = "f16"
+vendor = "Baidu"
+display = "Unlimited-OCR 2"
+family = "deepseek-ocr"
+capability = ["chat", "documents"]
+license = "mit"
+revision = "2026-11-10"
+
+  [model.specs]
+  params = "3B"
+  context = "32K"
+  published_at = "2026-10-26"
+  published_source = "https://huggingface.co/baidu/Unlimited-OCR-2"
+  homepage = "https://huggingface.co/baidu/Unlimited-OCR-2"
+  about = "Baidu's long-document reader - reads a whole multi-page document in one pass and returns every page as layout blocks (titles with their level, text, tables as HTML), each with where it sits on the page."
+  strengths = [
+    "Whole documents in one request - memory stays flat however long the output runs (about 30 dense pages fit the 32K context)",
+    "Structured output: block type, heading level, position and text for every block, page by page",
+    "Same small footprint as Unlimited-OCR - under 4 GB for weights and image reader together",
+  ]
+  tradeoffs = [
+    "One trained instruction (multi-page parsing) - no free-text, figure or layout-only modes",
+    "Several pages read one whole-page view each unless asked to tile every page, which costs about 3x the prompt",
+  ]
+
+  [[model.artifact]]
+  id = "q8"
+  kind = "weights"
+  format = "gguf"
+  label = "Full quality"
+  quant = "Q8_0"
+  default = true
+
+  [model.artifact.runtime]
+  backends = ["cuda"]
+
+  [model.artifact.shape]
+  weight_bytes = 3141886176
+  kind = "generative"
+  vocab = 129280
+  max_ctx = 32768
+  nextn_bytes = 0
+  source = "probed"
+  kv_layers = [
+    { k_dim = 1280, v_dim = 1280, count = 12 },
+  ]
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Unlimited-OCR-2-GGUF/Unlimited-OCR-2-Q8_0.gguf"
+    dest = "Unlimited-OCR-2-GGUF/Unlimited-OCR-2-Q8_0.gguf"
+    sha256 = "1c2ae092b6cf57ec9984fd00014b0e43ccd9fc741787236c1066bededac6b92f"
+    size = 3141886176
+
+  # Required, as for v1 (same tower, same ~1 GiB of encode slabs)
+  [[model.artifact]]
+  id = "mmproj"
+  kind = "vision"
+  format = "gguf"
+  label = "Image reader"
+  default = true
+  required = true
+  workspace = 1063256064
+
+  [model.artifact.runtime]
+  backends = ["cuda"]
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Unlimited-OCR-GGUF/mmproj-Unlimited-OCR-F16.gguf"
+    dest = "Unlimited-OCR-2-GGUF/mmproj-Unlimited-OCR-F16.gguf"
     sha256 = "f9984c20c64610002b213d9518305c19d47f00ed0f4574cb7590e1ff98f97bf6"
     size = 825245664
 

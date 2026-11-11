@@ -19,6 +19,10 @@ use serde_json::{Value, json};
 use std::{sync::Arc, time::Duration};
 
 const MAX_MESSAGE: usize = SAMPLE_RATE * 2;
+/// A live session is bounded by real time, not by a duration: audio may trail
+/// the wall clock by at most this much, so an idle or trickling client frees
+/// its admission slot while a day-long meeting runs to the engine ceiling.
+const PACE_SLACK: Duration = Duration::from_secs(60);
 fn low() -> Preset {
     Preset::Low
 }
@@ -84,12 +88,7 @@ pub async fn handle(
         .max_write_buffer_size(2 * 1024 * 1024)
         .on_upgrade(move |socket| async move {
             let (_permit, _guard) = (permit, guard);
-            // Absolute session expiry also covers endless pings or slow input.
-            let _ = tokio::time::timeout(
-                Duration::from_secs(900),
-                run(socket, session, tracker, model, opts.preset),
-            )
-            .await;
+            run(socket, session, tracker, model, opts.preset).await;
         })
 }
 
@@ -125,7 +124,7 @@ async fn run(
         &mut socket,
         json!({"type":"diarization.session", "sequence_number":0, "model":model,
         "preset":preset,"audio_format":"pcm_s16le","sample_rate":16000,"channels":1,
-        "max_chunk_samples":16000,"max_duration_seconds":600,"max_speakers":8,
+        "max_chunk_samples":16000,"max_duration_seconds":paddock_engine::diarization::MAX_SECONDS,"max_speakers":8,
         "frame_seconds":0.01,"input_buffer_seconds":(g.chunk+g.right) as f64 * 0.08,
         "stft_lookahead_seconds":0.006,"transcription":false}),
     )
@@ -135,12 +134,22 @@ async fn run(
         return;
     }
     let mut seq = 1;
-    let mut audio_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    // Each accepted second of audio moves the deadline one second: a real-time
+    // sender stays PACE_SLACK ahead, a silent or trickling one runs out.
+    let opened = tokio::time::Instant::now();
+    let mut received = 0usize;
     loop {
-        let msg = match tokio::time::timeout_at(audio_deadline, socket.recv()).await {
+        let deadline =
+            opened + PACE_SLACK + Duration::from_secs_f64(received as f64 / SAMPLE_RATE as f64);
+        let msg = match tokio::time::timeout_at(deadline, socket.recv()).await {
             Ok(Some(Ok(msg))) => msg,
             Err(_) => {
-                fail(&mut socket, "No audio received for 60 seconds", seq).await;
+                fail(
+                    &mut socket,
+                    "Audio fell more than 60 seconds behind real time",
+                    seq,
+                )
+                .await;
                 return;
             }
             _ => return,
@@ -178,7 +187,7 @@ async fn run(
                 return;
             }
         };
-        audio_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        received = batch.received_samples;
         let update = match tracker.push(&batch.probabilities, finish) {
             Ok(u) => u,
             Err(e) => {

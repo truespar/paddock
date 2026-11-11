@@ -249,7 +249,7 @@ pub fn resolve(
     Ok(Some(OcrResolved {
         mode: resolved.map(NpMode::as_str),
         crop: "page",
-        force_base: false,
+        crop_force: None,
         grounding: true,
         pages,
         views: pages,
@@ -259,6 +259,7 @@ pub fn resolve(
         dropped_text: dropped,
         ngram: (0, 0),
         repeat_stop: false,
+        page_guard: None,
     }))
 }
 
@@ -378,6 +379,8 @@ pub fn parse_blocks(raw: &str) -> Vec<Region> {
             text: (!text.is_empty()).then(|| text.to_owned()),
             quads: Vec::new(),
             continues: false,
+            level: None,
+            page: None,
         });
         rest = after;
     }

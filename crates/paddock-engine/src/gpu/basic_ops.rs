@@ -1611,6 +1611,117 @@ impl GpuExecutor {
         })
     }
 
+    /// Whether the pack lands DeepEncoder's tower seams in its GEMMs: the FFN
+    /// up with bias + activation (slot 940), the q|k|v bias split (941), and
+    /// the residual projection (835).
+    pub fn has_deepencoder_fused(&self) -> bool {
+        self.kernels.f16_gemm_h_act.is_some()
+            && self.kernels.qkv_bias_split.is_some()
+            && self.kernels.f16_gemm_bias_res.is_some()
+            && self.kernels.layernorm_f16.is_some()
+    }
+
+    /// A tower FFN up landing `y16 = f16(act(W x + bias))` - `quick = false`
+    /// the exact GELU (SAM ViT-B), `true` CLIP's quick GELU `x * sigmoid(1.702
+    /// x)` - the f32 up plane never landing: bit-for-bit
+    /// [`Self::matvec_batch_f16`], [`Self::bias_add`], the activation pass(es)
+    /// and [`Self::convert_f32_f16`]. `scratch` (f32 `[batch, out]`) is where the
+    /// pack runs that chain at a shape its fused landing cannot reproduce.
+    /// `x16` and `y16` must not overlap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_batch_f16_act(
+        &self,
+        w: &HalfTensor,
+        x16: &CudaSlice<f16>,
+        y16: &mut CudaSlice<f16>,
+        bias: &CudaSlice<f32>,
+        scratch: &mut CudaSlice<f32>,
+        batch: usize,
+        quick: bool,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .f16_gemm_h_act
+            .ok_or(GpuError::MissingOp("f16_gemm_h_act"))?;
+        let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
+        if w.buf.len() < in_dim * out_dim
+            || x16.len() < batch * in_dim
+            || y16.len() < batch * out_dim
+            || scratch.len() < batch * out_dim
+            || bias.len() < out_dim
+        {
+            return Err(oob("f16_gemm_h_act: buffers under the GEMM geometry"));
+        }
+        super::basic_ops::gemm_census("B-gemm-f16-h-act", in_dim, out_dim, batch);
+        let (wp, _g1) = w.buf.device_ptr(&self.stream);
+        let (xp, _g2) = x16.device_ptr(&self.stream);
+        let (bp, _g3) = bias.device_ptr(&self.stream);
+        let (yp, _g4) = y16.device_ptr_mut(&self.stream);
+        let (sp, _g5) = scratch.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slot 940); bounds checked above
+        check(unsafe {
+            f(
+                wp as *const _,
+                xp as *const _,
+                yp as *mut _,
+                bp as *const _,
+                sp as *mut _,
+                in_dim as u32,
+                out_dim as u32,
+                batch as u32,
+                u32::from(quick),
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// Split a merged `[rows, 3d]` q|k|v landing into three `[rows, d]`
+    /// planes with its `[3d]` bias added: [`Self::bias_add`] + three
+    /// [`Self::row_slice`]s, one pass, the same values. `d % 4 == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qkv_bias_split(
+        &self,
+        qkv: &CudaSlice<f32>,
+        bias: &CudaSlice<f32>,
+        q: &mut CudaSlice<f32>,
+        k: &mut CudaSlice<f32>,
+        v: &mut CudaSlice<f32>,
+        rows: usize,
+        d: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .qkv_bias_split
+            .ok_or(GpuError::MissingOp("qkv_bias_split"))?;
+        if !d.is_multiple_of(4)
+            || qkv.len() < rows * 3 * d
+            || bias.len() < 3 * d
+            || q.len() < rows * d
+            || k.len() < rows * d
+            || v.len() < rows * d
+        {
+            return Err(oob("qkv_bias_split: buffers under the split geometry"));
+        }
+        let (xp, _g1) = qkv.device_ptr(&self.stream);
+        let (bp, _g2) = bias.device_ptr(&self.stream);
+        let (qp, _g3) = q.device_ptr_mut(&self.stream);
+        let (kp, _g4) = k.device_ptr_mut(&self.stream);
+        let (vp, _g5) = v.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slot 941); bounds checked above
+        check(unsafe {
+            f(
+                xp as *const _,
+                bp as *const _,
+                qp as *mut _,
+                kp as *mut _,
+                vp as *mut _,
+                rows as u32,
+                d as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// Q8_0 embedding gather with fused scale: `out[t] = q8_row(tokens[t])·scale`.
     /// Token ids are device memory - the graph-capturable decode input.
     /// Q8_0 row-gather with unit scale - drop-in for the f32 `embed_gather_batch`

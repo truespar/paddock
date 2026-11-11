@@ -38,6 +38,54 @@ enum Node {
     Integer,
     Boolean,
     Null,
+    /// `anyOf` / `type: [..]`: alternatives that each open with a different
+    /// byte class, so the first byte of the value picks one and the machine
+    /// stays deterministic. Flat (no union inside a union).
+    Union {
+        alts: Vec<usize>,
+    },
+}
+
+/// The bytes a value of a node can open with. Two union alternatives in the
+/// same class cannot be told apart by their first byte.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Opens {
+    Quote,
+    Number,
+    Bool,
+    Null,
+    Brace,
+    Bracket,
+    Anything,
+}
+
+impl Node {
+    fn opens(&self) -> Opens {
+        match self {
+            Node::Any => Opens::Anything,
+            Node::Object { .. } | Node::ObjLax { .. } => Opens::Brace,
+            Node::Array { .. } => Opens::Bracket,
+            Node::Str | Node::EnumStr { .. } => Opens::Quote,
+            Node::Number | Node::Integer => Opens::Number,
+            Node::Boolean => Opens::Bool,
+            Node::Null => Opens::Null,
+            Node::Union { .. } => unreachable!("unions are flat"),
+        }
+    }
+}
+
+impl Opens {
+    fn admits(self, b: u8) -> bool {
+        match self {
+            Opens::Quote => b == b'"',
+            Opens::Number => b == b'-' || b.is_ascii_digit(),
+            Opens::Bool => b == b't' || b == b'f',
+            Opens::Null => b == b'n',
+            Opens::Brace => b == b'{',
+            Opens::Bracket => b == b'[',
+            Opens::Anything => true,
+        }
+    }
 }
 
 /// One property of a `Node::ObjLax`. Position in the vec is the bit index in
@@ -75,7 +123,6 @@ impl CompiledSchema {
 }
 
 const UNSUPPORTED: &[&str] = &[
-    "anyOf",
     "oneOf",
     "allOf",
     "not",
@@ -111,10 +158,93 @@ fn compile_node(v: &Value, arena: &mut Vec<Node>) -> Result<usize, String> {
             ));
         }
     }
+    if let Some(branches) = obj.get("anyOf") {
+        // anyOf beside other structure would mean the intersection of both;
+        // the subset keeps it to a plain choice between the branches
+        if ["type", "properties", "items", "enum"]
+            .iter()
+            .any(|k| obj.contains_key(*k))
+        {
+            return Err(
+                "`anyOf` must stand alone (no `type`, `properties`, `items` or `enum` beside it)"
+                    .into(),
+            );
+        }
+        let branches = branches.as_array().ok_or("`anyOf` must be an array")?;
+        if branches.is_empty() {
+            return Err("`anyOf` must not be empty".into());
+        }
+        let mut alts = Vec::with_capacity(branches.len());
+        for b in branches {
+            alts.push(compile_node(b, arena)?);
+        }
+        return union(alts, arena);
+    }
+    // `type: ["string", "null"]`: OpenAI's way to say nullable; each type is
+    // the same node with that one type, an `enum` split by its variants' types
+    if let Some(types) = obj.get("type").and_then(Value::as_array) {
+        let mut alts = Vec::with_capacity(types.len());
+        for t in types {
+            let t = t.as_str().ok_or("`type` entries must be strings")?;
+            let mut one = obj.clone();
+            one.insert("type".into(), Value::from(t));
+            if let Some(e) = obj.get("enum").and_then(Value::as_array) {
+                if !e.iter().all(|v| v.is_string() || v.is_null()) {
+                    return Err("an `enum` takes strings and null only".into());
+                }
+                match t {
+                    // the null alternative is the enum's null, which takes no enum of its own
+                    "null" => {
+                        if !e.iter().any(Value::is_null) {
+                            return Err("`type` allows null but `enum` does not list it".into());
+                        }
+                        one.remove("enum");
+                    }
+                    "string" => {
+                        let keep: Vec<Value> =
+                            e.iter().filter(|v| v.is_string()).cloned().collect();
+                        if keep.is_empty() {
+                            return Err("`type` allows a string but `enum` lists none".into());
+                        }
+                        one.insert("enum".into(), Value::Array(keep));
+                    }
+                    other => {
+                        return Err(format!(
+                            "`enum` beside type {other:?}: only strings and null take an enum"
+                        ));
+                    }
+                }
+            }
+            alts.push(compile_node(&Value::Object(one), arena)?);
+        }
+        if alts.is_empty() {
+            return Err("`type` must not be an empty list".into());
+        }
+        return union(alts, arena);
+    }
+    // an `enum` alone says its type through its variants
+    if !obj.contains_key("type")
+        && let Some(e) = obj.get("enum").and_then(Value::as_array)
+    {
+        let mut types: Vec<&str> = Vec::new();
+        for v in e {
+            let t = match v {
+                Value::String(_) => "string",
+                Value::Null => "null",
+                _ => return Err("an `enum` without `type` takes strings and null only".into()),
+            };
+            if !types.contains(&t) {
+                types.push(t);
+            }
+        }
+        let mut typed = obj.clone();
+        typed.insert("type".into(), Value::from(types));
+        return compile_node(&Value::Object(typed), arena);
+    }
     let ty = obj
         .get("type")
         .and_then(Value::as_str)
-        .ok_or("schema node needs a string `type`")?;
+        .ok_or("schema node needs a `type` (a string, or a list of them)")?;
     let node = match ty {
         "object" => {
             let props = obj
@@ -183,6 +313,81 @@ fn compile_node(v: &Value, arena: &mut Vec<Node>) -> Result<usize, String> {
         other => return Err(format!("unsupported schema type {other:?}")),
     };
     arena.push(node);
+    Ok(arena.len() - 1)
+}
+
+/// What two union alternatives that open alike come to.
+enum Merge {
+    /// the one already picked covers the new one (integer within number)
+    Keep,
+    /// the new one covers the picked one
+    Take,
+    /// two string enums: one with both variant lists
+    Enum(Vec<String>),
+    /// both open with the same byte and neither covers the other
+    Clash,
+}
+
+/// One node for "any of these": unions flattened, an alternative another one
+/// covers folded into it, and refused when two alternatives still open with
+/// the same byte - the first byte has to decide, or the machine would need to
+/// follow several branches at once.
+fn union(alts: Vec<usize>, arena: &mut Vec<Node>) -> Result<usize, String> {
+    let mut flat = Vec::with_capacity(alts.len());
+    for a in alts {
+        match &arena[a] {
+            Node::Union { alts } => flat.extend(alts.iter().copied()),
+            _ => flat.push(a),
+        }
+    }
+    let mut picked: Vec<usize> = Vec::with_capacity(flat.len());
+    for a in flat {
+        let opens = arena[a].opens();
+        if opens == Opens::Anything {
+            return Ok(a);
+        }
+        let Some(pos) = picked.iter().position(|&p| arena[p].opens() == opens) else {
+            picked.push(a);
+            continue;
+        };
+        let merge = match (&arena[picked[pos]], &arena[a]) {
+            (Node::Null, Node::Null)
+            | (Node::Boolean, Node::Boolean)
+            | (Node::Number, Node::Number | Node::Integer)
+            | (Node::Integer, Node::Integer)
+            | (Node::Str, Node::Str | Node::EnumStr { .. }) => Merge::Keep,
+            (Node::Integer, Node::Number) | (Node::EnumStr { .. }, Node::Str) => Merge::Take,
+            (Node::EnumStr { variants: x }, Node::EnumStr { variants: y }) => {
+                let mut v = x.clone();
+                v.extend(y.iter().filter(|s| !x.contains(s)).cloned());
+                Merge::Enum(v)
+            }
+            _ => Merge::Clash,
+        };
+        match merge {
+            Merge::Keep => {}
+            Merge::Take => picked[pos] = a,
+            Merge::Enum(variants) => {
+                arena.push(Node::EnumStr { variants });
+                picked[pos] = arena.len() - 1;
+            }
+            Merge::Clash => {
+                let what = match opens {
+                    Opens::Brace => "two objects",
+                    Opens::Bracket => "two arrays",
+                    _ => "two alternatives of one kind",
+                };
+                return Err(format!(
+                    "`anyOf` / `type` alternatives must each open with a different JSON type; \
+                     {what} cannot be told apart by their first byte (unsupported)"
+                ));
+            }
+        }
+    }
+    if picked.len() == 1 {
+        return Ok(picked[0]);
+    }
+    arena.push(Node::Union { alts: picked });
     Ok(arena.len() - 1)
 }
 
@@ -517,8 +722,19 @@ impl JsonMachine {
             };
             match top {
                 Frame::Value { node } => {
-                    let node = *node;
+                    let mut node = *node;
+                    // a union is decided by this first byte: its alternatives open differently
+                    if let Node::Union { alts } = &self.schema.arena[node] {
+                        match alts
+                            .iter()
+                            .find(|&&a| self.schema.arena[a].opens().admits(b))
+                        {
+                            Some(&a) => node = a,
+                            None => return false,
+                        }
+                    }
                     let frame = match &self.schema.arena[node] {
+                        Node::Union { .. } => unreachable!("unions are flat"),
                         Node::Any => match b {
                             b'{' => Frame::AnyObj {
                                 any: node,
@@ -1286,6 +1502,102 @@ mod tests {
             json!({"type": "string", "pattern": "x"}),
             json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": []}),
             json!({"type": "array"}),
+        ] {
+            assert!(CompiledSchema::compile(&schema).is_err(), "{schema}");
+        }
+    }
+
+    fn compile(v: Value) -> Arc<CompiledSchema> {
+        CompiledSchema::compile(&v).expect("compile")
+    }
+
+    fn accepts(schema: &Arc<CompiledSchema>, s: &str) -> bool {
+        let mut m = JsonMachine::new(schema.clone());
+        feed_all(&mut m, s) && m.may_stop()
+    }
+
+    /// OpenAI's nullable field: `type: [T, "null"]`, inside a strict object
+    #[test]
+    fn nullable_by_type_list() {
+        let s = compile(json!({
+            "type": "object", "additionalProperties": false,
+            "properties": {"phone": {"type": ["string", "null"]}, "employees": {"type": ["integer", "null"]}},
+            "required": ["phone", "employees"]
+        }));
+        assert!(accepts(&s, r#"{"phone": "+46 8 123", "employees": 12}"#));
+        assert!(accepts(&s, r#"{"phone": null, "employees": null}"#));
+        assert!(!accepts(&s, r#"{"phone": 5, "employees": null}"#));
+        assert!(!accepts(&s, r#"{"phone": null, "employees": 1.5}"#));
+        let mut m = JsonMachine::new(s);
+        assert!(feed_all(&mut m, r#"{"phone": n"#));
+        assert!(!m.feed(b'x'), "after n only null may follow");
+    }
+
+    #[test]
+    fn nullable_by_any_of() {
+        let s = compile(json!({"anyOf": [
+            {"type": "object", "additionalProperties": false, "properties": {"a": {"type": "boolean"}}, "required": ["a"]},
+            {"type": "null"}
+        ]}));
+        assert!(accepts(&s, r#"{"a": true}"#));
+        assert!(accepts(&s, "null"));
+        assert!(!accepts(&s, "true"));
+    }
+
+    /// pydantic's Optional[Literal[...]] and OpenAI's own nullable enum
+    #[test]
+    fn nullable_enums() {
+        for s in [
+            compile(json!({"type": ["string", "null"], "enum": ["F", "C", null]})),
+            compile(json!({"anyOf": [{"type": "string", "enum": ["F", "C"]}, {"type": "null"}]})),
+            compile(json!({"enum": ["F", "C", null]})),
+        ] {
+            assert!(accepts(&s, r#""F""#));
+            assert!(accepts(&s, "null"));
+            assert!(!accepts(&s, r#""K""#));
+        }
+        assert!(
+            CompiledSchema::compile(&json!({"type": ["string", "null"], "enum": ["F"]})).is_err(),
+            "null allowed but not listed"
+        );
+    }
+
+    #[test]
+    fn enum_without_type_is_a_string_enum() {
+        let s = compile(json!({"enum": ["sales", "support"]}));
+        assert!(accepts(&s, r#""sales""#));
+        assert!(!accepts(&s, r#""spam""#));
+        assert!(!accepts(&s, "null"));
+        assert!(CompiledSchema::compile(&json!({"enum": [1, 2]})).is_err());
+    }
+
+    #[test]
+    fn covered_alternatives_fold_together() {
+        let s = compile(json!({"anyOf": [{"type": "integer"}, {"type": "number"}]}));
+        assert!(accepts(&s, "2.5"), "number covers integer");
+        let s = compile(
+            json!({"anyOf": [{"type": "string", "enum": ["a"]}, {"type": "string", "enum": ["b"]}]}),
+        );
+        assert!(accepts(&s, r#""a""#) && accepts(&s, r#""b""#));
+        let s = compile(json!({"anyOf": [{"type": "string", "enum": ["a"]}, {"type": "string"}]}));
+        assert!(accepts(&s, r#""anything""#), "string covers its enum");
+        let s = compile(json!({"type": ["integer", "null"]}));
+        assert!(
+            accepts(&s, "42"),
+            "a root number in a union may end the output"
+        );
+    }
+
+    #[test]
+    fn alternatives_that_open_alike_are_refused() {
+        let obj = |k: &str| json!({"type": "object", "additionalProperties": false, "properties": {k: {"type": "string"}}, "required": [k]});
+        for schema in [
+            json!({"anyOf": [obj("a"), obj("b")]}),
+            json!({"anyOf": [{"type": "array", "items": {"type": "string"}}, {"type": "array", "items": {"type": "integer"}}]}),
+            json!({"anyOf": []}),
+            json!({"type": []}),
+            json!({"type": "string", "anyOf": [{"type": "null"}]}),
+            json!({"type": ["number", "null"], "enum": [1, null]}),
         ] {
             assert!(CompiledSchema::compile(&schema).is_err(), "{schema}");
         }

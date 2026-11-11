@@ -94,6 +94,40 @@ int pd_bias_add(void* x, const void* bias, uint32_t rows, uint32_t n, void* stre
     return pd_launch_status();
 }
 
+// 941: a merged q|k|v landing split with its bias - q / k / v [rows][d] f32 =
+// qkv[rows][3d] + bias[3d], third by third: pd_bias_add's add and the three
+// row slices' copies in one pass (DeepEncoder's SAM and CLIP towers). Four
+// floats a thread; d % 4 == 0, so a quad never straddles two thirds.
+__global__ void pd_qkv_bias_split_kernel(const float4* __restrict__ qkv,
+                                         const float4* __restrict__ bias, float4* __restrict__ q,
+                                         float4* __restrict__ k, float4* __restrict__ v,
+                                         uint32_t rows, uint32_t d4) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t w4 = 3u * d4;
+    if (i >= (uint64_t)rows * w4) return;
+    const uint32_t c = (uint32_t)(i % w4);
+    const uint64_t r = i / w4;
+    float4 t = qkv[i];
+    const float4 bb = bias[c];
+    t.x += bb.x;
+    t.y += bb.y;
+    t.z += bb.z;
+    t.w += bb.w;
+    float4* dst = c < d4 ? q : (c < 2u * d4 ? k : v);
+    dst[r * d4 + c % d4] = t;
+}
+
+PD_EXPORT
+int pd_qkv_bias_split(const void* qkv, const void* bias, void* q, void* k, void* v,
+                      uint32_t rows, uint32_t d, void* stream) {
+    if (rows == 0 || d == 0) return 0;
+    if ((d & 3u) != 0u) return (int)cudaErrorInvalidValue;
+    const uint64_t n4 = (uint64_t)rows * 3u * (d / 4u);
+    pd_qkv_bias_split_kernel<<<(uint32_t)((n4 + 255u) / 256u), 256, 0, (cudaStream_t)stream>>>(
+        (const float4*)qkv, (const float4*)bias, (float4*)q, (float4*)k, (float4*)v, rows, d / 4u);
+    return pd_launch_status();
+}
+
 // Vision 2D rope (llama.cpp's clip_graph::build_rope_2d): the head splits into
 // two INDEPENDENT rope blocks - dims [0, hd/2) roped by pos_x, dims [hd/2, hd)
 // by pos_y; each block is its own ggml_rope_ext with n_dims = hd/2, so both

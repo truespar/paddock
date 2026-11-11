@@ -194,7 +194,7 @@ pub struct CatalogArtifact {
     /// Device bytes the loaded artifact holds BEYOND its file bytes - the
     /// persistent workspace the engine pins for it from load to shutdown.
     /// Most artifacts hold nothing worth naming; the two kinds that do:
-    /// towers (deepseek-ocr's DeepEncoder pins ~950 MiB of encode slabs,
+    /// towers (deepseek-ocr's DeepEncoder pins ~1 GiB of encode slabs,
     /// more than its weight file) and MoE weights (gemma-4-26B-A4B's expert
     /// serving scratch self-reports 5.79 GiB at the default 32-slot width -
     /// double the estimator's whole graph margin). A fit estimate that skips

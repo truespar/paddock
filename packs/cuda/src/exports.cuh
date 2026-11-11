@@ -2072,6 +2072,17 @@ static const KernelTableV1 PD_KERNELS = {
     pd_gemm_f32_tiled,
     pd_qkv_norm_rope_batch_q16,
     pd_attn_prefill_f16_paged_q16,
+    pd_nvf4_pf_gemm3,
+    pd_nvf4_pf_moe_gu_sh,
+    pd_nvf4_pf_moe_dn_sh,
+    pd_nvf4_pf_qkv_nr,
+    pd_dash_rope2d,
+    pd_dash_summary,
+    pd_dash_route,
+    pd_dash_attn_f16,
+    pd_dash_guard,
+    pd_f16_gemm_h_act,
+    pd_qkv_bias_split,
 };
 
 PD_EXPORT const PackInfo* paddock_pack_info(void) {
@@ -2224,6 +2235,10 @@ PD_EXPORT const KernelTableV1* paddock_pack_kernels_v1(void) {
             t.nvf4_pf_moe_gu = NULL;
             t.nvf4_pf_moe_dn = NULL;
             t.nvf4_pf_moe_gu_ne = NULL;
+            t.nvf4_pf_gemm3 = NULL;
+            t.nvf4_pf_moe_gu_sh = NULL;
+            t.nvf4_pf_moe_dn_sh = NULL;
+            t.nvf4_pf_qkv_nr = NULL;
         }
         // Exact cc match, same reason: the device gate is
         // `__CUDA_ARCH__ == 1000 && __CUDA_ARCH_FEAT_SM100_ALL`, so a 10.3 die

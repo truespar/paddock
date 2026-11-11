@@ -77,6 +77,7 @@ mod tool_stream;
 mod user_turn;
 pub use paddock_mcp::{loop_budget, tool_search};
 pub mod transcriptions;
+pub mod unlimited_ocr2;
 pub mod websearch;
 
 use std::sync::Arc;

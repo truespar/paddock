@@ -13,7 +13,13 @@ use std::sync::{
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
-pub const MAX_SAMPLES: usize = SAMPLE_RATE * 600;
+/// Ceiling on one recording's running sample count, not a memory bound:
+/// the stream keeps the speaker cache (<=CACHE rows), the FIFO and only the
+/// <=31 s of PCM its next window reads, whatever the duration. 24 h guards
+/// the frame/sample index arithmetic and the counters serialised to clients;
+/// file routes impose their own decoded-upload bound below it.
+pub const MAX_SECONDS: usize = 24 * 3600;
+pub const MAX_SAMPLES: usize = SAMPLE_RATE * MAX_SECONDS;
 pub struct AudioWindow<'a> {
     pub audio: &'a [f32],
     pub offset: usize,
@@ -178,7 +184,7 @@ impl Stream {
             .checked_add(pcm.len())
             .is_none_or(|n| n > MAX_SAMPLES)
         {
-            return Err("diarization duration exceeds 600 seconds".into());
+            return Err("diarization duration exceeds 24 hours".into());
         }
         self.received += pcm.len();
         self.audio.extend_from_slice(pcm);
@@ -371,7 +377,7 @@ impl Session {
                 .checked_add(pcm.len())
                 .is_none_or(|n| n > MAX_SAMPLES || (final_chunk && n < HOP))
         {
-            return Err(Error::Invalid("expected <=1 second of finite mono 16-kHz PCM per step, 0.01–600 seconds total, and one final flush".into()));
+            return Err(Error::Invalid("expected <=1 second of finite mono 16-kHz PCM per step, 0.01 seconds to 24 hours total, and one final flush".into()));
         }
         if self.worker_alive.strong_count() == 0 {
             return Err(Error::Unavailable);
@@ -507,7 +513,7 @@ impl Diarizer {
             || !(0.0..1.0).contains(&threshold)
         {
             return Err(Error::Invalid(
-                "expected 0.01–600 seconds of finite mono 16-kHz PCM and threshold in [0,1)".into(),
+                "expected 0.01 seconds to 24 hours of finite mono 16-kHz PCM and threshold in [0,1)".into(),
             ));
         }
         let mut session = self.session(preset)?;
@@ -596,6 +602,38 @@ mod tests {
                 previous = Some(all);
             }
         }
+    }
+    #[test]
+    fn hour_long_recording_keeps_bounded_state() {
+        // 61 minutes, past the former 600-second cap: retention stays at the
+        // speaker-cache/FIFO/lookahead bound and every frame is emitted once.
+        let fe = Fake.frontend().unwrap();
+        let second = vec![0.; SAMPLE_RATE];
+        for preset in [Preset::Offline, Preset::Low] {
+            let mut stream = Stream::new(preset);
+            let mut frames = 0;
+            for _ in 0..3660 {
+                frames += stream.feed(&mut Fake, &fe, &second, false).unwrap().len();
+                assert!(stream.retained_rows() <= 528);
+                assert!(stream.retained_samples() <= SAMPLE_RATE * 31);
+            }
+            frames += stream.feed(&mut Fake, &fe, &[], true).unwrap().len();
+            assert_eq!(frames, 366_000);
+            assert_eq!(stream.frames, 366_000);
+            assert!(stream.compressed);
+        }
+    }
+    #[test]
+    fn duration_ceiling_is_24_hours() {
+        let mut s = Stream::new(Preset::Low);
+        let fe = Fake.frontend().unwrap();
+        s.received = MAX_SAMPLES - SAMPLE_RATE;
+        assert!(
+            s.feed(&mut Fake, &fe, &vec![0.; SAMPLE_RATE + 1], false)
+                .is_err()
+        );
+        assert_eq!(s.received, MAX_SAMPLES - SAMPLE_RATE);
+        assert_eq!(MAX_SAMPLES, 16_000 * 86_400);
     }
     #[test]
     fn invalid_input_does_not_mutate_state() {

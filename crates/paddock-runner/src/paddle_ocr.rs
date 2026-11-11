@@ -234,7 +234,7 @@ pub fn resolve(
         mode: resolved_mode.map(PoMode::as_str),
         // no crop concept: every page is read whole
         crop: "base",
-        force_base: false,
+        crop_force: None,
         grounding: false,
         pages,
         views: pages,
@@ -245,6 +245,7 @@ pub fn resolve(
         // off is off - never the ban the same sizes would arm
         ngram: if stop { REPEAT_STOP } else { (0, 0) },
         repeat_stop: stop,
+        page_guard: None,
     };
     tracing::info!(
         mode = resolved.mode.unwrap_or("pass-through"),
@@ -345,6 +346,8 @@ pub fn parse_spotting(raw: &str) -> Vec<Region> {
                 text: Some(text.to_owned()),
                 quads,
                 continues: false,
+                level: None,
+                page: None,
             });
         }
     }

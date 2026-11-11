@@ -207,7 +207,7 @@ const SLAB_NAMES: [&str; N_SLABS] = [
     "cnrm",
     "cqkv",
     "cff",
-    "gate",
+    "h16",
     "cattn",
     "clip_flat",
     "tmp",
@@ -235,7 +235,9 @@ fn need(d: &TowerDims, gm: &Geom) -> [usize; N_SLABS] {
         gm.part_rows * d.e,
         gm.part_rows * d.e,
         gm.rows * d.e,
-        gm.rows * d.sam_ff,
+        // SAM's up plane; also the composed quick-GELU's gate in the CLIP
+        // stage (idle there)
+        (gm.rows * d.sam_ff).max(gm.rc * d.cff),
         // +1 on nk/nk2/n2: the 3x3 conv gathers' zero tap row
         (gm.rows + 1) * d.neck_ch,
         gm.rows * 9 * d.neck_ch,
@@ -247,7 +249,8 @@ fn need(d: &TowerDims, gm: &Geom) -> [usize; N_SLABS] {
         gm.rc * d.ce,
         gm.rc * 3 * d.ce,
         gm.rc * d.cff,
-        gm.rc * d.cff,
+        // f16: the FFN up's fused landing, SAM's or CLIP's
+        (gm.rows * d.sam_ff).max(gm.rc * d.cff),
         gm.rc * d.ce,
         gm.rows_t * d.ce,
         gm.rows_t * d.out_dim,
@@ -457,7 +460,7 @@ pub(super) struct TowerWs {
     cnrm: CudaSlice<f32>,
     cqkv: CudaSlice<f32>,
     cff: CudaSlice<f32>,
-    gate: CudaSlice<f32>,
+    h16: CudaSlice<f16>,
     cattn: CudaSlice<f32>,
     clip_flat: CudaSlice<f32>,
     tmp: CudaSlice<f32>,
@@ -465,6 +468,10 @@ pub(super) struct TowerWs {
     pos: HashMap<usize, CudaSlice<f32>>,
     cpos: HashMap<usize, CudaSlice<f32>>,
     rel: HashMap<(usize, usize), (CudaSlice<f32>, CudaSlice<f32>)>,
+    /// Run the seams as their own passes even where the pack lands them in
+    /// the GEMMs - the reference arm the fused tower is gated bit-for-bit
+    /// against ([`super::vision::DeepEncoder::set_composed_seams`]).
+    pub(super) composed: bool,
 }
 
 impl TowerWs {
@@ -511,7 +518,7 @@ impl TowerWs {
             cnrm: exec.alloc(mx[18])?,
             cqkv: exec.alloc(mx[19])?,
             cff: exec.alloc(mx[20])?,
-            gate: exec.alloc(mx[21])?,
+            h16: exec.alloc_f16(mx[21])?,
             cattn: exec.alloc(mx[22])?,
             clip_flat: exec.alloc(mx[23])?,
             tmp: exec.alloc(mx[24])?,
@@ -520,6 +527,7 @@ impl TowerWs {
             pos: HashMap::new(),
             cpos: HashMap::new(),
             rel: HashMap::new(),
+            composed: false,
         };
         for gm in [&a, &b] {
             geo_cached(&mut ws.geo, exec, gm, hp.window)?;
@@ -556,12 +564,11 @@ impl TowerWs {
             + self.cnrm.len()
             + self.cqkv.len()
             + self.cff.len()
-            + self.gate.len()
             + self.cattn.len()
             + self.clip_flat.len()
             + self.tmp.len())
             * 4
-            + self.s16.len() * 2
+            + (self.s16.len() + self.h16.len()) * 2
             + self.patches8.len()
     }
 
@@ -592,7 +599,7 @@ impl TowerWs {
             self.cnrm.len(),
             self.cqkv.len(),
             self.cff.len(),
-            self.gate.len(),
+            self.h16.len(),
             self.cattn.len(),
             self.clip_flat.len(),
             self.tmp.len(),
@@ -721,7 +728,7 @@ impl DeepEncoder {
             cnrm,
             cqkv,
             cff,
-            gate,
+            h16,
             cattn,
             clip_flat,
             tmp,
@@ -729,8 +736,11 @@ impl DeepEncoder {
             pos,
             cpos,
             rel,
+            composed,
         } = &mut self.ws;
         let gt = geo_cached(geo, &exec, &gm, win)?;
+        // the tower seams fold into their GEMMs where the pack has the slots
+        let fused = exec.has_deepencoder_fused() && !*composed;
         let pos = pos_cached(pos, &exec, hp, &self.sam_pos, &gm)?;
 
         // Re-arm the always-zero rows the reused slabs carry: nrm's window-
@@ -772,21 +782,32 @@ impl DeepEncoder {
                 let p = rel_cached(rel, &exec, il, blk, side, hd)?;
                 (&p.0, &p.1)
             };
-            exec.layernorm(x, &blk.pre_ln_w, &blk.pre_ln_b, nrm, rows, e, hp.sam_eps)?;
-
             let (arows, batch) = if global {
                 (rows, views)
             } else {
-                exec.pixel_shuffle_rows(nrm, &gt.part, part, part_rows, 1, e)?;
                 (part_rows, views * gm.n_win)
             };
-            let src: &CudaSlice<f32> = if global { nrm } else { part };
-            exec.convert_f32_f16(src, s16, arows * e)?;
+            if fused && global {
+                exec.layernorm_f16(x, &blk.pre_ln_w, &blk.pre_ln_b, s16, rows, e, hp.sam_eps)?;
+            } else {
+                // a windowed layer partitions the normed rows (f32 gather)
+                // before they stage
+                exec.layernorm(x, &blk.pre_ln_w, &blk.pre_ln_b, nrm, rows, e, hp.sam_eps)?;
+                if !global {
+                    exec.pixel_shuffle_rows(nrm, &gt.part, part, part_rows, 1, e)?;
+                }
+                let src: &CudaSlice<f32> = if global { nrm } else { part };
+                exec.convert_f32_f16(src, s16, arows * e)?;
+            }
             exec.matvec_batch_f16(&blk.qkv_w, s16, qkv, arows)?;
-            exec.bias_add(qkv, &blk.qkv_b, arows, 3 * e)?;
-            exec.row_slice(qkv, q, 3 * e, 0, e, arows)?;
-            exec.row_slice(qkv, k, 3 * e, e, e, arows)?;
-            exec.row_slice(qkv, v, 3 * e, 2 * e, e, arows)?;
+            if fused {
+                exec.qkv_bias_split(qkv, &blk.qkv_b, q, k, v, arows, e)?;
+            } else {
+                exec.bias_add(qkv, &blk.qkv_b, arows, 3 * e)?;
+                exec.row_slice(qkv, q, 3 * e, 0, e, arows)?;
+                exec.row_slice(qkv, k, 3 * e, e, e, arows)?;
+                exec.row_slice(qkv, v, 3 * e, 2 * e, e, arows)?;
+            }
             exec.sam_attn(q, k, v, rh, rw, attn, batch, side, heads, hd, scale)?;
 
             // out proj reads real rows only: unpartition first when windowed.
@@ -798,19 +819,29 @@ impl DeepEncoder {
                 part
             };
             exec.convert_f32_f16(attn_rows, s16, rows * e)?;
-            exec.matvec_batch_f16(&blk.out_w, s16, proj, rows)?;
-            exec.bias_add(proj, &blk.out_b, rows, e)?;
-            exec.add(x, proj, rows * e)?;
+            if fused {
+                // the seams in the GEMMs: bias + residual in the projection
+                // landings, the up plane landed f16 with its bias and GELU -
+                // bit-for-bit the composed chain below
+                exec.matvec_batch_f16_bias_res(&blk.out_w, s16, x, &blk.out_b, proj, rows)?;
+                exec.layernorm_f16(x, &blk.post_ln_w, &blk.post_ln_b, s16, rows, e, hp.sam_eps)?;
+                exec.matvec_batch_f16_act(&blk.lin1_w, s16, h16, &blk.lin1_b, ff, rows, false)?;
+                exec.matvec_batch_f16_bias_res(&blk.lin2_w, h16, x, &blk.lin2_b, proj, rows)?;
+            } else {
+                exec.matvec_batch_f16(&blk.out_w, s16, proj, rows)?;
+                exec.bias_add(proj, &blk.out_b, rows, e)?;
+                exec.add(x, proj, rows * e)?;
 
-            exec.layernorm(x, &blk.post_ln_w, &blk.post_ln_b, nrm, rows, e, hp.sam_eps)?;
-            exec.convert_f32_f16(nrm, s16, rows * e)?;
-            exec.matvec_batch_f16(&blk.lin1_w, s16, ff, rows)?;
-            exec.bias_add(ff, &blk.lin1_b, rows, hp.sam_ff)?;
-            exec.gelu_erf(ff, rows * hp.sam_ff)?;
-            exec.convert_f32_f16(ff, s16, rows * hp.sam_ff)?;
-            exec.matvec_batch_f16(&blk.lin2_w, s16, proj, rows)?;
-            exec.bias_add(proj, &blk.lin2_b, rows, e)?;
-            exec.add(x, proj, rows * e)?;
+                exec.layernorm(x, &blk.post_ln_w, &blk.post_ln_b, nrm, rows, e, hp.sam_eps)?;
+                exec.convert_f32_f16(nrm, s16, rows * e)?;
+                exec.matvec_batch_f16(&blk.lin1_w, s16, ff, rows)?;
+                exec.bias_add(ff, &blk.lin1_b, rows, hp.sam_ff)?;
+                exec.gelu_erf(ff, rows * hp.sam_ff)?;
+                exec.convert_f32_f16(ff, s16, rows * hp.sam_ff)?;
+                exec.matvec_batch_f16(&blk.lin2_w, s16, proj, rows)?;
+                exec.bias_add(proj, &blk.lin2_b, rows, e)?;
+                exec.add(x, proj, rows * e)?;
+            }
             if dump_on() {
                 stage(&exec, &format!("sam_block-{il}"), x, rows * e);
             }
@@ -875,48 +906,81 @@ impl DeepEncoder {
         let chd = hp.clip_head_dim;
         let cscale = 1.0 / (chd as f32).sqrt();
         for (il, blk) in self.clip_blocks.iter().enumerate() {
-            exec.layernorm(
-                cx,
-                &blk.ln1_w,
-                &blk.ln1_b,
-                cnrm,
-                rc,
-                ce,
-                super::vision::CLIP_EPS,
-            )?;
-            exec.convert_f32_f16(cnrm, s16, rc * ce)?;
+            if fused {
+                exec.layernorm_f16(
+                    cx,
+                    &blk.ln1_w,
+                    &blk.ln1_b,
+                    s16,
+                    rc,
+                    ce,
+                    super::vision::CLIP_EPS,
+                )?;
+            } else {
+                exec.layernorm(
+                    cx,
+                    &blk.ln1_w,
+                    &blk.ln1_b,
+                    cnrm,
+                    rc,
+                    ce,
+                    super::vision::CLIP_EPS,
+                )?;
+                exec.convert_f32_f16(cnrm, s16, rc * ce)?;
+            }
             exec.matvec_batch_f16(&blk.qkv_w, s16, cqkv, rc)?;
-            exec.bias_add(cqkv, &blk.qkv_b, rc, 3 * ce)?;
-            exec.row_slice(cqkv, q, 3 * ce, 0, ce, rc)?;
-            exec.row_slice(cqkv, k, 3 * ce, ce, ce, rc)?;
-            exec.row_slice(cqkv, v, 3 * ce, 2 * ce, ce, rc)?;
+            if fused {
+                exec.qkv_bias_split(cqkv, &blk.qkv_b, q, k, v, rc, ce)?;
+            } else {
+                exec.bias_add(cqkv, &blk.qkv_b, rc, 3 * ce)?;
+                exec.row_slice(cqkv, q, 3 * ce, 0, ce, rc)?;
+                exec.row_slice(cqkv, k, 3 * ce, ce, ce, rc)?;
+                exec.row_slice(cqkv, v, 3 * ce, 2 * ce, ce, rc)?;
+            }
             exec.vision_attn_x(q, k, v, cattn, nc, nc, cheads, chd, views, cscale)?;
             exec.convert_f32_f16(cattn, s16, rc * ce)?;
-            exec.matvec_batch_f16(&blk.out_w, s16, cnrm, rc)?;
-            exec.bias_add(cnrm, &blk.out_b, rc, ce)?;
-            exec.add(cx, cnrm, rc * ce)?;
+            if fused {
+                exec.matvec_batch_f16_bias_res(&blk.out_w, s16, cx, &blk.out_b, cnrm, rc)?;
+                exec.layernorm_f16(
+                    cx,
+                    &blk.ln2_w,
+                    &blk.ln2_b,
+                    s16,
+                    rc,
+                    ce,
+                    super::vision::CLIP_EPS,
+                )?;
+                // QUICK-gelu - x·σ(1.702x) - in the up landing
+                exec.matvec_batch_f16_act(&blk.up_w, s16, h16, &blk.up_b, cff, rc, true)?;
+                exec.matvec_batch_f16_bias_res(&blk.down_w, h16, cx, &blk.down_b, cnrm, rc)?;
+            } else {
+                exec.matvec_batch_f16(&blk.out_w, s16, cnrm, rc)?;
+                exec.bias_add(cnrm, &blk.out_b, rc, ce)?;
+                exec.add(cx, cnrm, rc * ce)?;
 
-            exec.layernorm(
-                cx,
-                &blk.ln2_w,
-                &blk.ln2_b,
-                cnrm,
-                rc,
-                ce,
-                super::vision::CLIP_EPS,
-            )?;
-            exec.convert_f32_f16(cnrm, s16, rc * ce)?;
-            exec.matvec_batch_f16(&blk.up_w, s16, cff, rc)?;
-            exec.bias_add(cff, &blk.up_b, rc, cffw)?;
-            // QUICK-gelu - x·σ(1.702x), the half-specific activation. Composed
-            // from existing ops; a fused kernel is a perf rung, not a need.
-            exec.copy_region(cff, 0, gate, 0, rc * cffw)?;
-            exec.scale(gate, 1.702, rc * cffw)?;
-            exec.mul_sigmoid(cff, gate, rc * cffw)?;
-            exec.convert_f32_f16(cff, s16, rc * cffw)?;
-            exec.matvec_batch_f16(&blk.down_w, s16, cnrm, rc)?;
-            exec.bias_add(cnrm, &blk.down_b, rc, ce)?;
-            exec.add(cx, cnrm, rc * ce)?;
+                exec.layernorm(
+                    cx,
+                    &blk.ln2_w,
+                    &blk.ln2_b,
+                    cnrm,
+                    rc,
+                    ce,
+                    super::vision::CLIP_EPS,
+                )?;
+                exec.convert_f32_f16(cnrm, s16, rc * ce)?;
+                exec.matvec_batch_f16(&blk.up_w, s16, cff, rc)?;
+                exec.bias_add(cff, &blk.up_b, rc, cffw)?;
+                // QUICK-gelu - x·σ(1.702x), composed: a copy of the up plane
+                // scaled into the gate (the fused landing's reference chain;
+                // SAM's `ff` plane is idle here and wider than rc·cff)
+                exec.copy_region(cff, 0, ff, 0, rc * cffw)?;
+                exec.scale(ff, 1.702, rc * cffw)?;
+                exec.mul_sigmoid(cff, ff, rc * cffw)?;
+                exec.convert_f32_f16(cff, s16, rc * cffw)?;
+                exec.matvec_batch_f16(&blk.down_w, s16, cnrm, rc)?;
+                exec.bias_add(cnrm, &blk.down_b, rc, ce)?;
+                exec.add(cx, cnrm, rc * ce)?;
+            }
             if dump_on() {
                 stage(&exec, &format!("clip_block-{il}"), cx, rc * ce);
             }

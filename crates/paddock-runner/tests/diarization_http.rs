@@ -187,19 +187,63 @@ async fn backpressure_precedes_decoding() {
     );
 }
 
-#[tokio::test]
-async fn oversized_upload_is_413_not_a_decoder_error() {
-    let (app, _) = app();
+fn upload(mib: usize) -> Vec<u8> {
     let mut data =
         b"--audio\r\nContent-Disposition: form-data; name=\"file\"; filename=\"large.wav\"\r\n\r\n"
             .to_vec();
-    data.resize(data.len() + 26 * 1024 * 1024, 0);
+    data.resize(data.len() + mib * 1024 * 1024, 0);
     data.extend_from_slice(b"\r\n--audio--\r\n");
+    data
+}
+#[tokio::test]
+async fn oversized_upload_is_413_not_a_decoder_error() {
+    let (app, _) = app();
+    // The former 25 MiB ceiling now reaches the decoder (zeros are not audio);
+    // the transcription-sized 192 MiB body limit still refuses at the edge.
     assert_eq!(
-        call(&app, "/v1/audio/diarizations", Some(data), true)
+        call(&app, "/v1/audio/diarizations", Some(upload(26)), true)
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(&app, "/v1/audio/diarizations", Some(upload(193)), true)
             .await
             .0,
         StatusCode::PAYLOAD_TOO_LARGE
+    );
+}
+#[tokio::test]
+async fn recordings_past_ten_minutes_are_diarized() {
+    let (app, _) = app();
+    let seconds = 11 * 60;
+    let pcm = vec![0u8; 16000 * 2 * seconds];
+    let mut data =
+        b"--audio\r\nContent-Disposition: form-data; name=\"preset\"\r\n\r\nlow\r\n".to_vec();
+    data.extend_from_slice(b"--audio\r\nContent-Disposition: form-data; name=\"file\"; filename=\"long.wav\"\r\nContent-Type: audio/wav\r\n\r\n");
+    data.extend_from_slice(b"RIFF");
+    data.extend_from_slice(&(36u32 + pcm.len() as u32).to_le_bytes());
+    data.extend_from_slice(b"WAVEfmt ");
+    data.extend_from_slice(&16u32.to_le_bytes());
+    data.extend_from_slice(&1u16.to_le_bytes());
+    data.extend_from_slice(&1u16.to_le_bytes());
+    data.extend_from_slice(&16000u32.to_le_bytes());
+    data.extend_from_slice(&32000u32.to_le_bytes());
+    data.extend_from_slice(&2u16.to_le_bytes());
+    data.extend_from_slice(&16u16.to_le_bytes());
+    data.extend_from_slice(b"data");
+    data.extend_from_slice(&(pcm.len() as u32).to_le_bytes());
+    data.extend(pcm);
+    data.extend_from_slice(b"\r\n--audio--\r\n");
+    let (status, out) = call(&app, "/v1/audio/diarizations", Some(data), true).await;
+    assert_eq!(status, StatusCode::OK, "{out}");
+    assert_eq!(out["duration"], seconds as f64);
+    assert_eq!(out["frames"], seconds * 100);
+    assert_eq!(out["num_speakers"], 2);
+    let (_, caps) = call(&app, "/v1/models", None, true).await;
+    assert!(
+        caps.to_string().contains("\"max_duration_seconds\":14400"),
+        "{caps}"
     );
 }
 

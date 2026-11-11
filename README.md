@@ -149,6 +149,8 @@ Every model below runs on the engine today. Sizes are the checkpoint's own, and
   labelled blocks with their boxes
 - **PaddleOCR-VL** 1.6
 - **Unlimited-OCR** 3B
+- **Unlimited-OCR 2** (Baidu) - 3B; reads a whole multi-page document in one
+  request, page by page as labelled blocks with their boxes. NVIDIA GPUs for now
 - **Nemotron 3.5 Parse** (NVIDIA) - 0.6B; turns a page into its blocks in
   reading order, each with its box, kind and text. NVIDIA GPUs for now
 

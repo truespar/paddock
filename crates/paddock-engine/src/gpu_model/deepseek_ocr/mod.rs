@@ -16,9 +16,17 @@
 //!    a plain Llama MHA rather than the DeepSeek-V2 attention its filename
 //!    suggests. Everything here is ordinary q/k/v/o with RoPE.
 //! 2. **R-SWA**, the reason "Unlimited" is in the name - see [`Hparams::rswa_window`].
+//!
+//! `baidu/Unlimited-OCR-2` keeps v1's tower (byte-identical) and decoder body and
+//! replaces R-SWA with **SR-SWA** (its code calls the router DASH): every layer's
+//! queries read a 128-token local window plus at most 12 router-selected 32-token
+//! blocks with an additive log-prior bias, in prefill and decode alike, under a
+//! page-2D rope (a token axis counted within each page, a page-parity axis). See
+//! [`Dash`] for the parameters and their trained values.
 
 pub mod batch;
 pub mod chunked;
+pub mod dash;
 pub mod encode;
 pub mod forward;
 pub mod load;
@@ -88,6 +96,50 @@ pub struct Hparams {
     /// Consequence worth stating where it will be read: the prefix region is a
     /// perfectly ordinary shareable prefix, so prefix caching stays on here.
     pub rswa_window: Option<usize>,
+    /// SR-SWA (Unlimited-OCR-2): present iff the file carries the router keys.
+    pub dash: Option<Dash>,
+}
+
+/// Unlimited-OCR-2's SR-SWA router ("DASH" in its code) and page-2D rope, as the
+/// checkpoint's inference path resolves them. The file stores them verbatim from
+/// the checkpoint's config (never the router module's rewritten live state).
+///
+/// Per query: the router scores every candidate key block `c` (32 keys) by
+/// `q_r . kbar_c` - `q_r` / `kbar_c` being the router's own 128-wide projections,
+/// `kbar_c` a learned-softmax summary of the block's router keys - takes the top
+/// `entmax_window` (16), runs 1.5-entmax over them, and reads the first
+/// `topk_blocks` (12) with bias `log(max(p, floor)) - mean` (over the read ones,
+/// / `sigma`). The query attends to those blocks plus its `local_window` (128)
+/// latest keys; the window wins where the two overlap. Remote blocks are those at
+/// or before the query's block minus `local_blocks`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Dash {
+    pub block_size: usize,
+    pub local_blocks: usize,
+    pub local_window: usize,
+    pub index_dim: usize,
+    pub topk_blocks: usize,
+    pub entmax_window: usize,
+    pub sigma: f32,
+    /// The router's entmax input scale `scale / sqrt(index_dim)`; one value for
+    /// every layer (the loader refuses a file whose per-layer values differ).
+    pub score_scale: f32,
+    /// Prior floor before the log.
+    pub floor: f32,
+    /// Remote candidates are limited to image blocks (decode: the response
+    /// page's; prefill: the query's own page, falling back to every block).
+    pub image_only: bool,
+    pub image_token_id: u32,
+    pub page_token_id: u32,
+    /// The page-count guard's stop token (the tokenizer's EOS).
+    pub eos_token_id: u32,
+    pub per_page_image_tokens: usize,
+    /// Page-2D rope: token pairs `inv[j] = tok_theta^(-j / n_tok)` (`n_tok =
+    /// head_dim/2 - page_pairs`) on the in-page token count, one page pair
+    /// turning by `(page mod page_mod) * page_theta^0` radians.
+    pub tok_theta: f32,
+    pub page_theta: f32,
+    pub page_mod: u32,
 }
 
 /// Every key this family reads, so a stale or foreign file fails by NAME.
@@ -107,6 +159,27 @@ mod key {
     pub const RMS_EPS: &str = "deepseek2-ocr.attention.layer_norm_rms_epsilon";
     pub const ROPE_BASE: &str = "deepseek2-ocr.rope.freq_base";
     pub const SLIDING: &str = "deepseek2-ocr.attention.sliding_window";
+    pub const DASH_BLOCK: &str = "deepseek2-ocr.dash.block_size";
+    pub const DASH_LOCAL_BLOCKS: &str = "deepseek2-ocr.dash.local_blocks";
+    pub const DASH_LOCAL_WINDOW: &str = "deepseek2-ocr.dash.local_window";
+    pub const DASH_INDEX_DIM: &str = "deepseek2-ocr.dash.index_dim";
+    pub const DASH_TOPK: &str = "deepseek2-ocr.dash.topk_blocks";
+    pub const DASH_WINDOW: &str = "deepseek2-ocr.dash.entmax_window";
+    pub const DASH_STAGE0: &str = "deepseek2-ocr.dash.stage0";
+    pub const DASH_SIGMA: &str = "deepseek2-ocr.dash.sigma";
+    pub const DASH_SCALE: &str = "deepseek2-ocr.dash.scale_per_layer";
+    pub const DASH_FLOOR: &str = "deepseek2-ocr.dash.floor_per_layer";
+    pub const DASH_LAYERS: &str = "deepseek2-ocr.dash.layers";
+    pub const DASH_IMAGE_ONLY: &str = "deepseek2-ocr.dash.image_only";
+    pub const IMAGE_TOKEN: &str = "deepseek2-ocr.image_token_id";
+    pub const PAGE_TOKEN: &str = "deepseek2-ocr.page_token_id";
+    pub const PAGE_TOKENS: &str = "deepseek2-ocr.per_page_image_tokens";
+    pub const ROPE_TOK_THETA: &str = "deepseek2-ocr.page_rope.tok_theta";
+    pub const ROPE_PAGE_THETA: &str = "deepseek2-ocr.page_rope.page_theta";
+    pub const ROPE_PAGE_PAIRS: &str = "deepseek2-ocr.page_rope.page_pairs";
+    pub const ROPE_PAGE_MOD: &str = "deepseek2-ocr.page_rope.page_mod";
+    pub const ROPE_TOK_MODE: &str = "deepseek2-ocr.page_rope.tok_freq_mode";
+    pub const EOS: &str = "tokenizer.ggml.eos_token_id";
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -138,6 +211,93 @@ fn f32_key(map: &MappedGguf, k: &str, default: Option<f32>) -> Result<f32, Hpara
         Some(Value::F64(f)) => Ok(*f as f32),
         Some(_) => Err(HparamsError::BadKey(k.to_owned())),
         None => default.ok_or_else(|| HparamsError::MissingKey(k.to_owned())),
+    }
+}
+
+/// One f32 per layer, all equal (the [`Dash`] contract).
+fn uniform_f32_array(map: &MappedGguf, k: &str, n: usize) -> Result<f32, HparamsError> {
+    let Some(Value::Array(a)) = map.gguf().metadata.get(k) else {
+        return Err(HparamsError::MissingKey(k.to_owned()));
+    };
+    let v: Option<Vec<f32>> = a.iter().map(Value::as_f32).collect();
+    let v = v.ok_or_else(|| HparamsError::BadKey(k.to_owned()))?;
+    if v.len() != n || v.iter().any(|&x| x != v[0]) {
+        return Err(HparamsError::Geometry(format!(
+            "{k}: {v:?} - one equal value per layer is what this lane serves"
+        )));
+    }
+    Ok(v[0])
+}
+
+/// The file is Unlimited-OCR-2 (it carries the SR-SWA router keys). The
+/// runner's prompt layout (`<PAGE><image>` a page) and request vocabulary key
+/// off this before any weight loads; [`Hparams::from_gguf`] then validates the
+/// keys in full.
+pub fn is_unlimited_ocr2(gguf: &paddock_models::gguf::GgufFile) -> bool {
+    gguf.metadata.contains_key(key::DASH_BLOCK)
+}
+
+impl Dash {
+    /// Present iff the file has the router keys; every one of them is then
+    /// required, and the shapes this lane implements are checked by name.
+    fn from_gguf(
+        map: &MappedGguf,
+        n_layer: usize,
+        head_dim: usize,
+    ) -> Result<Option<Self>, HparamsError> {
+        let md = &map.gguf().metadata;
+        if !md.contains_key(key::DASH_BLOCK) {
+            return Ok(None);
+        }
+        let geo = |m: String| Err(HparamsError::Geometry(m));
+        if md.get(key::DASH_STAGE0).and_then(Value::as_str) != Some("head_cls") {
+            return geo("dash.stage0 must be head_cls (the block-summary router)".into());
+        }
+        if md.get(key::ROPE_TOK_MODE).and_then(Value::as_str) != Some("resample") {
+            return geo("page_rope.tok_freq_mode must be resample".into());
+        }
+        if usize_key(map, key::ROPE_PAGE_PAIRS)? != 1 {
+            return geo("page_rope.page_pairs must be 1".into());
+        }
+        match md.get(key::DASH_LAYERS) {
+            Some(Value::Array(a))
+                if a.len() == n_layer && a.iter().all(|v| v.as_u64() == Some(1)) => {}
+            _ => return geo("dash.layers: every layer must be a router layer".into()),
+        }
+        let index_dim = usize_key(map, key::DASH_INDEX_DIM)?;
+        if index_dim != head_dim {
+            return geo(format!(
+                "dash.index_dim {index_dim} != head_dim {head_dim} (shared rope)"
+            ));
+        }
+        let block_size = usize_key(map, key::DASH_BLOCK)?;
+        let local_blocks = usize_key(map, key::DASH_LOCAL_BLOCKS)?;
+        let local_window = usize_key(map, key::DASH_LOCAL_WINDOW)?;
+        if local_window != local_blocks * block_size {
+            return geo(format!(
+                "dash.local_window {local_window} != {local_blocks} blocks x {block_size}"
+            ));
+        }
+        let scale = uniform_f32_array(map, key::DASH_SCALE, n_layer)?;
+        Ok(Some(Dash {
+            block_size,
+            local_blocks,
+            local_window,
+            index_dim,
+            topk_blocks: usize_key(map, key::DASH_TOPK)?,
+            entmax_window: usize_key(map, key::DASH_WINDOW)?,
+            sigma: f32_key(map, key::DASH_SIGMA, None)?,
+            score_scale: scale / (index_dim as f32).sqrt(),
+            floor: uniform_f32_array(map, key::DASH_FLOOR, n_layer)?,
+            image_only: matches!(md.get(key::DASH_IMAGE_ONLY), Some(Value::Bool(true))),
+            image_token_id: u64_key(map, key::IMAGE_TOKEN)? as u32,
+            page_token_id: u64_key(map, key::PAGE_TOKEN)? as u32,
+            eos_token_id: u64_key(map, key::EOS)? as u32,
+            per_page_image_tokens: usize_key(map, key::PAGE_TOKENS)?,
+            tok_theta: f32_key(map, key::ROPE_TOK_THETA, None)?,
+            page_theta: f32_key(map, key::ROPE_PAGE_THETA, None)?,
+            page_mod: u64_key(map, key::ROPE_PAGE_MOD)? as u32,
+        }))
     }
 }
 
@@ -193,7 +353,17 @@ impl Hparams {
                 },
                 None => None,
             },
+            dash: None,
         };
+        let hp = Hparams {
+            dash: Dash::from_gguf(map, hp.n_layer, hp.head_dim)?,
+            ..hp
+        };
+        if hp.dash.is_some() && hp.rswa_window.is_some() {
+            return Err(HparamsError::Geometry(
+                "a router file must not also declare the v1 R-SWA ring".into(),
+            ));
+        }
         if hp.first_k_dense > hp.n_layer {
             return Err(HparamsError::Geometry(format!(
                 "leading_dense_block_count {} exceeds block_count {}",
@@ -220,6 +390,12 @@ impl Hparams {
     /// point of the family: the answer does not grow with the number of tokens
     /// generated, only with how much was prefilled. Used by the fit estimate.
     pub fn kv_rows(&self, prefill_len: usize, max_new: usize) -> usize {
+        if let Some(d) = &self.dash {
+            // SR-SWA keeps the prompt's blocks (up to the end of the block that
+            // straddles the prompt end) plus a ring the size of the local window
+            let keep = prefill_len.next_multiple_of(d.block_size);
+            return keep + d.local_window.min(max_new);
+        }
         match self.rswa_window {
             Some(w) => prefill_len + w.min(max_new),
             None => prefill_len + max_new,
@@ -249,6 +425,7 @@ mod tests {
             rms_eps: 1e-6,
             rope_freq_base: 10_000.0,
             rswa_window: Some(128),
+            dash: None,
         }
     }
 

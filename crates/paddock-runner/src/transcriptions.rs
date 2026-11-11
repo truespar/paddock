@@ -149,7 +149,12 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use paddock_api::ErrorBody;
 use paddock_engine::audio::guards::{self, Repetition};
-use paddock_engine::audio::{decode::decode_audio, resample::resample};
+use paddock_engine::audio::{decode::decode_audio_bounded, resample::resample};
+
+/// The longest upload decoded: eight hours. The route's 1 GiB body limit bounds
+/// bytes; this bounds what they decode to (f32 at the file's own rate, then the
+/// 16-kHz copy), since a 64 kbps file of that size would be a day and a half.
+pub const MAX_SECONDS: u32 = 8 * 3600;
 use paddock_engine::sampler::SamplingParams;
 use paddock_engine::service::{GenRequest, MmChunk, TokenEvent};
 use tokio::sync::mpsc::unbounded_channel;
@@ -2717,7 +2722,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
     type Mels = Vec<paddock_engine::audio::MelFeatures>;
     type Decoded = (Vec<f32>, Option<paddock_engine::audio::MelFeatures>, Mels);
     let decoded = tokio::task::spawn_blocking(move || -> Result<Decoded, String> {
-        let wav = decode_audio(&file)?;
+        let wav = decode_audio_bounded(&file, MAX_SECONDS)?;
         if wav.samples.is_empty() {
             return Err("audio file holds no samples".into());
         }

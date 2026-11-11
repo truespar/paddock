@@ -1637,9 +1637,13 @@ struct KernelTableV1 {
     // silently passing the old argument list - the whole consumer set is in
     // this repo (whisper's decode tick and its parity gate), so a rename is
     // cheaper than a second near-identical reduction to keep in parity.
-    // (logits, out_u32, alt_u32, stats_f32, probe, rows, n, stream)
-    int (*argmax_top2_rows)(const void*, void*, void*, void*, uint32_t, uint32_t, uint32_t,
-                            void*);
+    // WIDENED in PLACE again for the suppress list (mask_u32, n_mask <= 8):
+    // ids the pick and the normaliser skip, the reference's SuppressTokens;
+    // the probe still reads the unsuppressed distribution. Same rule: every
+    // in-tree caller changes arity and fails to compile until updated.
+    // (logits, out_u32, alt_u32, stats_f32, probe, mask_u32, n_mask, rows, n, stream)
+    int (*argmax_top2_rows)(const void*, void*, void*, void*, uint32_t, const void*, uint32_t,
+                            uint32_t, uint32_t, void*);
     // 344: whisper's ApplyTimestampRules over a logits block, in place.
     // (logits, state_u32, rows, vocab, eot, no_ts, ts_begin, max_init, stream)
     int (*whisper_ts_rules)(void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t,
@@ -4389,6 +4393,45 @@ struct KernelTableV1 {
                                       void*, const void*, const void*, const void*,
                                       const void*, uint32_t, uint32_t, uint32_t, uint32_t,
                                       uint32_t, uint32_t, uint32_t, float, uint32_t, void*);
+    // 931: up to three 920 planes (q|k|v) over the same rows in one launch
+    // (gemm/nvf4_pf.cuh). Pure append.
+    int (*nvf4_pf_gemm3)(const void*, const void*, float, void*, uint32_t, uint32_t,
+                         const void*, const void*, float, void*, uint32_t, uint32_t,
+                         const void*, const void*, float, void*, uint32_t, uint32_t,
+                         const void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 932: the routed gate|up (926) and the shared expert's (921) in one grid;
+    // 933: the routed down (923) and the shared down (920) in one grid
+    // (gemm/nvf4_pf.cuh). Pure append.
+    int (*nvf4_pf_moe_gu_sh)(const void*, const void*, const void*, const void*, const void*,
+                             const void*, const void*, const void*, const void*, const void*,
+                             void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                             const void*, const void*, float, const void*, const void*, float,
+                             uint32_t, uint32_t, uint32_t, void*);
+    int (*nvf4_pf_moe_dn_sh)(const void*, const void*, const void*, const void*, const void*,
+                             const void*, const void*, const void*, uint32_t, void*, uint32_t,
+                             uint32_t, uint32_t, uint32_t, const void*, const void*, float,
+                             void*, uint32_t, uint32_t, uint32_t, void*);
+    // 934: 931's q|k|v grid with the q / k norm + rope in its epilogues
+    // (gemm/nvf4_pf.cuh). Pure append.
+    int (*nvf4_pf_qkv_nr)(const void*, const void*, float, const void*, const void*, float,
+                          const void*, const void*, float, void*, void*, void*, void*, uint32_t,
+                          uint32_t, const void*, const void*, const void*, uint32_t, float,
+                          const float*, float, const void*, uint32_t, uint32_t, void*);
+    // 935-939: Unlimited-OCR-2's SR-SWA (attn/dash.cuh): the page-2D rope, the
+    // router's block summaries and route / select, the sparse attention over the
+    // paged f16 pool, and the page-count guard. Pure append.
+    int (*dash_rope2d)(void*, void*, void*, void*, const void*, const void*, const void*,
+                       const void*, uint32_t, uint32_t, uint32_t, float, void*);
+    int (*dash_summary)(const void*, uint32_t, void*, void*, const void*, const void*,
+                        uint32_t, uint32_t, void*);
+    int (*dash_route)(const void*, uint32_t, const void*, uint32_t, const void*, void*, void*,
+                      void*, uint32_t, uint32_t, uint32_t, uint32_t, float, float, float, void*);
+    int (*dash_attn_f16)(const void*, const void*, const void*, void*, const void*, uint32_t,
+                         const void*, const void*, const void*, const void*, uint32_t, uint32_t,
+                         float, uint32_t, void*);
+    int (*dash_guard)(void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    int (*f16_gemm_h_act)(const void*, const void*, void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    int (*qkv_bias_split)(const void*, const void*, void*, void*, void*, uint32_t, uint32_t, void*);
 };
 
 } // extern "C"

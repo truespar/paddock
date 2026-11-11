@@ -2129,8 +2129,45 @@ impl GpuLaguna {
             // r==1); the k-norm and softplus consumers read at offsets.
             let qp = layer.proj.quant();
             let qk_fused = r1 && qp.is_some_and(|q| q.qkg.is_some());
+            // NoPE layers at freq_scale 0 - cos 1, sin 0, mscale 1: the
+            // rotation is an exact identity
+            let rp = if layer.nope {
+                let (ts, _, lo, hi, _, _) = hp.rope_swa;
+                (ts, 0.0, lo, hi, 0.0, 1.0)
+            } else {
+                hp.rope_swa
+            };
+            // Flint's prefill tile: q|k|v with the q / k norm + rope in the
+            // epilogues (slot 934) where the f16 attention rung takes the q
+            // in f16 - the f32 q plane and its norm + rope pass are gone
+            let nr_ok = cuts.is_some()
+                && pf
+                && hp.flavor == Flavor::Flint
+                && wmma_pf
+                && kv_dtype == KvDtype::Fp16
+                && hd == 128
+                && !layer.has_gate()
+                && paddock_models::dev_var_os!("PADDOCK_NO_KOLIBRI_NR").is_none()
+                && exec.attn_prefill_q16_ready(nh, n_kv, hd, kv_dtype);
+            let mut nr_done = false;
             if let Proj::Nv { wq, wk, wv, .. } = &layer.proj {
-                super::nv::qkv_rows(&exec, [wq, wk, wv], sc, self.w16r.as_mut(), pf, r)?;
+                if nr_ok {
+                    let nr = super::nv::NrLayer {
+                        qw: &layer.q_norm.buf,
+                        kw: &layer.k_norm.buf,
+                        n_head: nh,
+                        n_kv,
+                        dec: cuts.map_or(0, |c| c.dec),
+                        eps,
+                        rope: rp,
+                        qscale: scale * std::f32::consts::LOG2_E,
+                    };
+                    let ws = self.w16r.as_mut();
+                    nr_done = super::nv::qkv_nr_rows(&exec, [wq, wk, wv], sc, ws, &nr, r)?;
+                }
+                if !nr_done {
+                    super::nv::qkv_rows(&exec, [wq, wk, wv], sc, self.w16r.as_mut(), pf, r)?;
+                }
             } else if let Proj::Bf16 { wqkv, .. } = &layer.proj {
                 // the NVFP4 build's BF16 attention: q|k|v off one plane
                 super::head::bf16_qkv(
@@ -2369,13 +2406,9 @@ impl GpuLaguna {
                 && matches!(hp.flavor, Flavor::Kolibri | Flavor::Flint)
                 && exec.has_qkv_norm_rope_batch()
                 && paddock_models::dev_var_os!("PADDOCK_NO_KOLIBRI_NR").is_none();
-            if !dec_nra && kolibri_pf {
-                let rp = if layer.nope {
-                    let (ts, _, lo, hi, _, _) = hp.rope_swa;
-                    (ts, 0.0, lo, hi, 0.0, 1.0)
-                } else {
-                    hp.rope_swa
-                };
+            if nr_done {
+                // q, k and v landed normed + roped in the projection's grid
+            } else if !dec_nra && kolibri_pf {
                 // q straight into the f16 wide attention rung's halves where
                 // that rung lands this layer's bf16 rows: the same f32
                 // expression rounded once where the rung would round it, at

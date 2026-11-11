@@ -166,7 +166,7 @@ struct Prepared {
     /// Some(top_k) when the request wants logprobs
     logprobs: Option<u8>,
     /// deepseek2-ocr: what the server resolved (echoed on the response;
-    /// `ngram` already folded into `sampler`, `force_base` into `mm_chunks`)
+    /// `ngram` already folded into `sampler`, `crop_force` into `mm_chunks`)
     ocr: Option<crate::deepseek_ocr::OcrResolved>,
     /// request `skip_special_tokens` (vLLM-compat): None = the dialect's own
     /// decode behavior, Some = the caller decides (paddleocr spotting needs
@@ -1585,14 +1585,11 @@ fn prepare(
         (None, prompt_ids.clone())
     };
     // the resolved crop override rides as a directive chunk the OCR engine
-    // consumes in its planning pass (single image forced to base sizing)
+    // consumes in its planning pass (one image forced base, or several tiled)
     if let (Some(o), Some(chunks)) = (&ocr, mm_chunks.as_mut())
-        && o.force_base
+        && let Some(m) = o.crop_force
     {
-        chunks.insert(
-            0,
-            MmChunk::OcrCrop(paddock_engine::service::OcrCropMode::Base),
-        );
+        chunks.insert(0, MmChunk::OcrCrop(m));
     }
     // vLLM-compat per-request pixel budget (paddleocr family): parsed with
     // unknown keys refused, injected as a directive the family consumes in

@@ -752,6 +752,13 @@ impl DeepEncoder {
         &self.exec
     }
 
+    /// Run the tower's seams (bias, activation, residual, the q|k|v split) as
+    /// their own passes instead of in the GEMM landings - the composed
+    /// reference the fused tower must match bit for bit, kept for that gate.
+    pub fn set_composed_seams(&mut self, on: bool) {
+        self.ws.composed = on;
+    }
+
     /// Host bytes the resample sources hold. Small, but they are the reason
     /// `weight_bytes` and the file size do not match, so they are reportable.
     pub fn host_table_bytes(&self) -> usize {

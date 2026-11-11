@@ -276,6 +276,8 @@ fn region_json(plan: &PagePlan, p: &Pending, content: String) -> Value {
         text: (!picture).then_some(content),
         quads: Vec::new(),
         continues: false,
+        level: None,
+        page: None,
     }
     .to_json();
     v["page"] = json!(plan.page);

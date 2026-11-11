@@ -83,6 +83,17 @@ fn gen_err(e: GpuModelError) -> GenError {
     GenError::Backend(e.to_string())
 }
 
+/// A row stream as token ids, image rows as the image token - what the router
+/// lane's page layout is built from.
+fn row_ids(rows: &[Row]) -> Vec<u32> {
+    rows.iter()
+        .map(|row| match row {
+            Row::Token(t) => *t,
+            Row::Image(..) => IMAGE_TOKEN_ID,
+        })
+        .collect()
+}
+
 /// A prompt on the stall-free queue: rows advance inside mixed ticks. Text
 /// entries carry no planes; image rows resolve from `planes[img]` at embed
 /// time (`splice_queued_rows`).
@@ -189,6 +200,7 @@ impl GpuDeepseekOcr {
         self.chunked.retain(|c| c.slot != slot);
         self.enc.retain(|e| e.slot != slot);
         self.admit(slot, tokens.len())?;
+        self.dash_admit(slot, &tokens);
         let cursor = self.prefill_resume_rows(slot, &tokens, tokens.len())?;
         self.chunked.push(ChunkedPrefill {
             slot,
@@ -335,8 +347,9 @@ impl GpuDeepseekOcr {
             }
             let keys = std::mem::take(&mut self.chunked[qi].keys);
             self.prefix_insert(slot, &keys);
+            let base = self.ring_base(slot, n_rows);
             let bs = self.batch.as_mut().expect("batch enabled");
-            bs.ring[slot].prefill_len = Some(n_rows);
+            bs.ring[slot].prefill_len = Some(base);
             if slot == 0 {
                 bs.slot0_pos = n_rows;
             }
@@ -419,6 +432,7 @@ impl GpuDeepseekOcr {
         }
         let mut finished_raw = Vec::with_capacity(fin.len());
         for &(row, qi) in &fin {
+            self.dash_head_guard(self.chunked[qi].slot)?;
             finished_raw.push((qi, self.head_row(row)?));
         }
         let finished = self.commit_chunk(&take, finished_raw);
@@ -477,6 +491,7 @@ impl GpuDeepseekOcr {
         };
         let mut finished_raw = Vec::with_capacity(fin.len());
         for &(row, qi) in &fin {
+            self.dash_head_guard(self.chunked[qi].slot)?;
             finished_raw.push((qi, self.head_row(row)?));
         }
         let finished = self
@@ -522,7 +537,7 @@ impl GpuDeepseekOcr {
         let vis = self.vision.as_ref().ok_or_else(|| {
             GpuModelError::Unsupported("deepseek-ocr: image request but no mmproj attached".into())
         })?;
-        let max_tiles = vis.hp.max_tiles;
+        let max_tiles = self.tile_cap(vis.hp.max_tiles);
         let plan = mm_plan(&chunks, max_tiles)?;
         // admission validates BOUNDS only - the slot's KV state stays
         // untouched until the entry queues (the adoption-ordering invariant:
@@ -549,6 +564,7 @@ impl GpuDeepseekOcr {
             // Encoding state) because the Queued verdict puts this slot into
             // the scheduler's chunking set before its next decode section.
             self.admit(slot, plan.n_rows)?;
+            self.dash_admit(slot, &row_ids(&plan.rows));
             let cursor = self.prefill_resume_rows(slot, &plan.keys, plan.n_rows)?;
             self.chunked.push(ChunkedPrefill {
                 slot,
@@ -566,7 +582,6 @@ impl GpuDeepseekOcr {
         // usually only LENGTHENS the match, so this view rarely under-preps;
         // when eviction shrinks it the assembly loop re-enters and the
         // inline fallback covers the gap.
-        let spec0 = self.prep_spec(plan.layout.mode, plan.layout.grid);
         let img_ci: Vec<usize> = chunks
             .iter()
             .enumerate()
@@ -583,7 +598,8 @@ impl GpuDeepseekOcr {
             }
             let need_from = start.saturating_sub(plan.img_start[k]);
             let blocks = &plan.layout.blocks[plan.img_blocks[k].clone()];
-            let (need_crops, need_global) = prep_need(blocks, plan.layout.grid, need_from);
+            let (need_crops, need_global) = prep_need(blocks, plan.layout.grids[k], need_from);
+            let spec0 = self.prep_spec(plan.layout.mode, plan.layout.grids[k]);
             for crops_job in [true, false] {
                 if !(if crops_job { need_crops } else { need_global }) {
                     continue;
@@ -662,6 +678,7 @@ impl GpuDeepseekOcr {
             Ok(true) => match self.enc_finish(&mut e) {
                 Ok(Some(cursor)) => {
                     let slot = e.slot;
+                    self.dash_admit(slot, &row_ids(&e.plan.rows));
                     self.chunked.push(ChunkedPrefill {
                         slot,
                         rows: std::mem::take(&mut e.plan.rows),
@@ -729,7 +746,8 @@ impl GpuDeepseekOcr {
             }
             let need_from = e.start.saturating_sub(e.plan.img_start[k]);
             let blocks = &e.plan.layout.blocks[e.plan.img_blocks[k].clone()];
-            let (need_crops, need_global) = prep_need(blocks, e.plan.layout.grid, need_from);
+            let grid = e.plan.layout.grids[k];
+            let (need_crops, need_global) = prep_need(blocks, grid, need_from);
             let (base_px, tile_px) = e.plan.layout.mode.px();
             match e.step {
                 EncStep::Crops(i) => {
@@ -743,7 +761,7 @@ impl GpuDeepseekOcr {
                             Fetch::Ready(p) => e.cur_crops = Some(p.crops),
                             Fetch::Wait => return Ok(false),
                             Fetch::Inline => {
-                                let spec = self.prep_spec(e.plan.layout.mode, e.plan.layout.grid);
+                                let spec = self.prep_spec(e.plan.layout.mode, grid);
                                 let (rgb, w, h) = images_of(&e.chunks)[k];
                                 e.cur_crops = Some(
                                     prep_image(
@@ -787,7 +805,7 @@ impl GpuDeepseekOcr {
                         Fetch::Ready(p) => p.global,
                         Fetch::Wait => return Ok(false),
                         Fetch::Inline => {
-                            let spec = self.prep_spec(e.plan.layout.mode, e.plan.layout.grid);
+                            let spec = self.prep_spec(e.plan.layout.mode, grid);
                             let (rgb, w, h) = images_of(&e.chunks)[k];
                             prep_image(
                                 rgb,
@@ -802,15 +820,14 @@ impl GpuDeepseekOcr {
                         }
                     };
                     let pr = pr.expect("need_global spec yields a plane");
-                    self.stage_global(&pr, base_px, tile_px, e.plan.layout.grid)?;
+                    self.stage_global(&pr, base_px, tile_px, grid)?;
                     spent = true;
                     e.step = EncStep::Gather;
                 }
                 EncStep::Gather => {
                     // launch-only: rides the same tick as the image's last
                     // encode instead of costing one of its own
-                    let plane =
-                        self.finish_image_plane(blocks, e.plan.layout.grid, e.plan.layout.mode)?;
+                    let plane = self.finish_image_plane(blocks, grid, e.plan.layout.mode)?;
                     e.planes[k] = Some(plane);
                     e.img += 1;
                     e.step = EncStep::Crops(0);

@@ -213,6 +213,12 @@ impl GpuDeepseekOcr {
 
     /// One token through the whole stack; returns the full logits row.
     pub fn forward_one(&mut self, token: u32) -> Result<Vec<f32>, GpuModelError> {
+        if self.hp.dash.is_some() {
+            // the serial spine has no router: Unlimited-OCR-2 serves batched only
+            return Err(GpuModelError::Unsupported(
+                "unlimited-ocr-2 runs on the batched lane only (paged KV)".into(),
+            ));
+        }
         self.ensure_decode()?;
         let exec = self.exec.clone();
         let hp = &self.hp;

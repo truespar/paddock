@@ -15,6 +15,7 @@
 #include "src/attn/decode_spec.cuh"  // spec-verify attention: GQA walk, FA-lite, spec-FA krs (split from decode.cuh; needs its ldm/mma/cpa helpers)
 #include "src/attn/decode_fp8.cuh"   // fp8-native decode lane v8q/v9q/v9q2 + vdim sync + laguna sigmoid router (split from decode.cuh)
 #include "src/attn/lagd.cuh"        // hd128 v5-class decode partial (needs decode's ldm/mma/cpa helpers; f32_qkv launches it)
+#include "src/attn/dash.cuh"        // Unlimited-OCR-2 SR-SWA: page-2D rope, router summaries + route/select, sparse attention, page guard
 #include "src/gemm/f32_mv_staged.cuh"  // the f32 tile matvec with K staged in smem (cc 10, bit-identical); f32_qkv's batch launcher tries it first
 #include "src/gemm/f32_qkv.cuh"
 #include "src/gemm/f32_gemm.cuh"     // the f32 GEMM entries over f32_qkv.cuh's tiled kernel (pd_gemm_f32, slot 928)
@@ -33,10 +34,12 @@
 #include "src/attn/varlen.cuh"     // packed variable-length bidirectional attention (text encoders: ModernBERT / Laya); needs decode_spec's pd_fa_mma16 + f32_qkv's launch helpers
 #include "src/gemm/int8_mma.cuh"
 #include"src/gemm/f16_dense.cuh"   // in-house f16xf16->f32 wmma GEMM (PADDOCK_INHOUSE_F16 cuBLAS-removal); needs int8_mma's PD_MMA_OK
+#include "src/gemm/f16_tower.cuh"  // tower FFN-up landings, exact / quick GELU with a scratch fallback (needs f16_dense's tile election)
 #include "src/deltanet/split.cuh"   // split walk/o-pass + shared tf32 mma helpers (needs int8_mma's PD_DNC_* defines; stage2_sample's launcher dispatches it)
 #include "src/deltanet/walk_rs.cuh"  // register-state bf16-operand walk (needs split.cuh's pd_dnc_cpa16; stage2_sample's launcher dispatches it)
 #include "src/deltanet/walk_tc5.cuh" // the walk on tcgen05, TMEM-resident state (stage2_sample's varlen launcher routes it)
 #include "src/deltanet/stage2_sample.cuh"
+#include "src/deltanet/argmax_top2.cuh"   // greedy pick + runner-up + confidence readouts (slot 343)
 #include "src/deltanet/conv_step_qkvn.cuh" // decode conv step + silu + split + q/k norms + GQA widening in one launch (slot 875)
 #include "src/deltanet/chunked_vl.cuh"    // varlen chunked-GDN entries (slots 323/447): stage1 + walk per tick
 #include "src/deltanet/stop_mask.cuh"    // reasoning stop mask, run on the logits before the samplers

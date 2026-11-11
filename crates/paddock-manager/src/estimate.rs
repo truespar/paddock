@@ -301,7 +301,7 @@ pub(crate) fn tower_bytes_for(
         .or_else(|| tower().next())
         // file bytes + the persistent workspace the tower pins at attach
         // (catalog data, measured per release - deepseek-ocr's encode slabs
-        // are ~950 MiB, more than its weight file; see CatalogArtifact::
+        // are ~1 GiB, more than its weight file; see CatalogArtifact::
         // workspace for why this is a manifest field and not a constant here)
         .map_or(0, |a| a.total_size() + a.workspace.unwrap_or(0))
 }
@@ -1479,7 +1479,7 @@ mod tests {
             ocr.artifacts
                 .iter()
                 .any(|a| a.workspace.unwrap_or(0) > 900 << 20),
-            "unlimited-ocr's mmproj must declare its ~950 MiB workspace"
+            "unlimited-ocr's mmproj must declare its ~1 GiB workspace"
         );
     }
 

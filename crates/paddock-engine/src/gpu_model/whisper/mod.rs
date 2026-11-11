@@ -225,9 +225,38 @@ pub(crate) struct DecodeTokens {
     /// segment's text there, which is what makes it a vocabulary/style hint
     /// (the API's `prompt`) rather than an instruction.
     pub sot_prev: u32,
+    /// `<|startoflm|>` - a prompt-side token with no decode role here; it is
+    /// read so it can be suppressed like the rest of the prompt block.
+    pub sot_lm: u32,
     /// `<|0.00|>`, the first of whisper's 1501 timestamp tokens. Everything at
     /// or above it is a timestamp; `(id - here) * time_precision` is when.
     pub timestamp_begin: u32,
+}
+
+impl DecodeTokens {
+    /// The ids greedy decoding may never emit, suppressed before the softmax at
+    /// every sampled step: the reference's `SuppressTokens` (openai/whisper
+    /// `decoding.py` `_get_suppress_tokens`: transcribe, translate, sot,
+    /// sot_prev, sot_lm, no_speech) plus `<|notimestamps|>`, which whisper.cpp
+    /// kills unconditionally and the timestamp grammar kills in its own mode.
+    /// vLLM applies none of this and lets a near-empty window come back as a
+    /// confident `<|nospeech|>` token - which is not transcript, and what the
+    /// word-timing pass rightly refuses. Text, timestamps and `<|eot|>` are the
+    /// only things a transcript may hold.
+    pub fn suppressed(&self) -> Vec<u32> {
+        let mut ids = vec![
+            self.sot,
+            self.sot_lm,
+            self.sot_prev,
+            self.nospeech,
+            self.no_timestamps,
+            self.transcribe,
+        ];
+        ids.extend(self.translate);
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
 }
 
 // `exec`/`mel` are held for the encoder graph - the loader skeleton

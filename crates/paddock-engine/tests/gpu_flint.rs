@@ -714,6 +714,75 @@ fn flint_prefill_tile_tracks_the_gemvs_and_is_row_invariant() {
         );
     }
     println!("prefill tile: every task row-invariant");
+
+    // 932 / 933: the shared expert's tiles in the routed grids land the same
+    // bits as their own launches
+    if !exec.has_nvf4_pf_moe_sh() {
+        common::missing("pack has no routed + shared pair grids (slots 932-933)");
+        return;
+    }
+    let (_, x16) = bf(&x[..rows * embd]);
+    let d_idx = exec.to_device_u32(&idx[..rows * k]).expect("idx");
+    let d_w = exec.to_device(&wts[..rows * k]).expect("w");
+    let nb = (rows * k + ne * 63).div_ceil(64).min(rows * k);
+    let mut srow = exec.alloc_u32(nb * 64).expect("srow");
+    let mut sslot = exec.alloc_u32(nb * 64).expect("sslot");
+    let mut bexp = exec.alloc_u32(nb).expect("bexp");
+    exec.moe_align_bm(
+        &d_idx, &mut srow, &mut sslot, &mut bexp, rows, k, ne, 64, nb,
+    )
+    .expect("align");
+    let mut act = exec.stream_alloc_bf16(rows * aw).expect("act");
+    let ran = exec
+        .nvf4_pf_moe_gu_sh(
+            &gate,
+            &up,
+            &srow,
+            &sslot,
+            &bexp,
+            &x16,
+            &mut act,
+            aw,
+            nb,
+            (&sg, &su),
+            k * ff,
+            rows,
+        )
+        .expect("932");
+    let mut y = exec.alloc(rows * embd).expect("y");
+    let mut part = exec.alloc((rows * k * embd).div_ceil(2)).expect("part");
+    let ran = ran
+        && exec
+            .nvf4_pf_moe_dn_sh(
+                &down,
+                &srow,
+                &sslot,
+                &bexp,
+                &d_w,
+                &act,
+                aw,
+                &mut part,
+                k,
+                nb,
+                (&sd, &mut y),
+                k * ff,
+                rows,
+            )
+            .expect("933");
+    if !ran {
+        common::missing("pack's 932 / 933 declined (no register-decode arm on this die)");
+        return;
+    }
+    exec.moe_slot_combine_bf16(&part, &mut y, embd, k, rows)
+        .expect("fold");
+    let got: Vec<f32> = exec.stream.clone_dtoh(&y).expect("back");
+    assert!(
+        got.iter()
+            .zip(&all)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "932 / 933 differ from their own launches"
+    );
+    println!("932 / 933: the shared expert in the routed grids, bit-identical at {rows} rows");
 }
 
 /// Bit-equality of two device planes' host copies.
@@ -1110,4 +1179,249 @@ fn flint_decode_planes_fuse_bit_exactly() {
         );
     }
     println!("927: q|k|v and gate|up bit-identical to their GEMVs at 2 / 4 / 8 rows");
+
+    // 2..4 rows ride the cp.async ring twin of the multi-row body, 5..8 the
+    // body itself: every row of a 2 / 3 / 4-row call must be that row of an
+    // 8-row call, per plane and through 927 (o's 4096-wide K included)
+    let o = {
+        let (c, s) = nv_bytes(2048, 4096, &mut seed);
+        exec.nvf4_upload(&c, &s, s2(&mut seed), 2048, 4096)
+            .expect("plane")
+    };
+    let x8: Vec<f32> = (0..8 * 4096)
+        .map(|_| (lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0)
+        .collect();
+    let run = |w: &paddock_engine::gpu::Nvf4Plane, rows: usize| {
+        let dx = exec.to_device(&x8[..rows * w.in_dim]).expect("x");
+        let mut y = exec.alloc(rows * w.out_dim).expect("y");
+        exec.nvf4_gemv_batch(w, &dx, &mut y, None, rows)
+            .expect("gemv");
+        exec.stream.clone_dtoh(&y).expect("back")
+    };
+    for (w, n) in [(&q, "q"), (&g, "gate"), (&o, "o")] {
+        let want = run(w, 8);
+        for rows in [2usize, 3, 4] {
+            assert!(
+                same_bits(&want[..rows * w.out_dim], &run(w, rows)),
+                "{n} at {rows} rows differs from the 8-row body's rows"
+            );
+        }
+    }
+    let (wq, wk, wv) = (run(&q, 8), run(&k, 8), run(&v, 8));
+    for rows in [2usize, 3, 4] {
+        let dx = exec.to_device(&x8[..rows * 2048]).expect("x");
+        let (mut yq, mut yk, mut yv) = (
+            exec.alloc(rows * 4096).expect("y"),
+            exec.alloc(rows * 512).expect("y"),
+            exec.alloc(rows * 512).expect("y"),
+        );
+        exec.nvf4_gemv_batch3(
+            &mut [(&q, &mut yq), (&k, &mut yk), (&v, &mut yv)],
+            &dx,
+            rows,
+        )
+        .expect("927");
+        for (want, got, n) in [(&wq, &yq, "q"), (&wk, &yk, "k"), (&wv, &yv, "v")] {
+            let got = exec.stream.clone_dtoh(got).expect("back");
+            assert!(
+                same_bits(&want[..got.len()], &got),
+                "927 {n} at {rows} rows differs from the 8-row body's rows"
+            );
+        }
+    }
+    println!("2..4-row ring: every row the 8-row body's, per plane and through 927");
+
+    // 931: the prefill tile's q|k|v in one grid against three 920 launches
+    if !exec.has_nvf4_pf() {
+        common::missing("pack has no W4A16 prefill tile (slots 920-923)");
+        return;
+    }
+    for rows in [64usize, 300, 810] {
+        let x: Vec<half::bf16> = (0..rows * 2048)
+            .map(|_| half::bf16::from_f32((lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0))
+            .collect();
+        let dx = exec.to_device_bf16(&x).expect("x");
+        let one = |w: &paddock_engine::gpu::Nvf4Plane| {
+            let mut y = exec.alloc(rows * w.out_dim).expect("y");
+            exec.nvf4_pf_gemm(w, &dx, 2048, 0, &mut y, w.out_dim, 0, rows)
+                .expect("920");
+            exec.stream.clone_dtoh(&y).expect("back")
+        };
+        let (wq, wk, wv) = (one(&q), one(&k), one(&v));
+        let (mut yq, mut yk, mut yv) = (
+            exec.alloc(rows * 4096).expect("y"),
+            exec.alloc(rows * 512).expect("y"),
+            exec.alloc(rows * 512).expect("y"),
+        );
+        let ran = exec
+            .nvf4_pf_gemm3(
+                &mut [(&q, &mut yq), (&k, &mut yk), (&v, &mut yv)],
+                &dx,
+                rows,
+            )
+            .expect("931");
+        if !ran {
+            common::missing("pack's 931 declined (no register-decode arm on this die)");
+            return;
+        }
+        for (name, a, b) in [("q", &wq, &yq), ("k", &wk, &yk), ("v", &wv, &yv)] {
+            let b: Vec<f32> = exec.stream.clone_dtoh(b).expect("back");
+            let (a, b): (Vec<u32>, Vec<u32>) = (
+                a.iter().map(|v| v.to_bits()).collect(),
+                b.iter().map(|v| v.to_bits()).collect(),
+            );
+            assert!(
+                same_bits(&a, &b),
+                "931 {name} differs from 920 at {rows} rows"
+            );
+        }
+    }
+    println!("931: q|k|v in one grid bit-identical to three 920 launches at 64 / 300 / 810 rows");
+
+    // 934: the same grid with the q / k norm + rope in its epilogues, against
+    // 920 x 3 + the norm + rope passes (929 past the band, the f32 v3 arm on
+    // the band's rows): a roped and a NoPE layer, with and without a band
+    if !exec.has_nvf4_pf_qkv_nr() || !exec.has_qkv_norm_rope_batch_q16() {
+        common::missing("pack has no fused q|k|v norm + rope (slot 934)");
+        return;
+    }
+    let (nh, n_kv, eps) = (32usize, 4usize, 1e-6f32);
+    let qscale = std::f32::consts::LOG2_E / (128f32).sqrt();
+    let mut wvec = || -> Vec<f32> {
+        (0..128)
+            .map(|_| 0.5 + (lcg(&mut seed) % 1000) as f32 / 1000.0)
+            .collect()
+    };
+    let (qw, kw) = (
+        exec.to_device(&wvec()).expect("qw"),
+        exec.to_device(&wvec()).expect("kw"),
+    );
+    let ts = 10000f32.powf(-2.0 / 128.0);
+    let bits = |d: &cudarc::driver::CudaSlice<f32>, n: usize| -> Vec<u32> {
+        let h: Vec<f32> = exec.stream.clone_dtoh(d).expect("back");
+        h[..n].iter().map(|v| v.to_bits()).collect()
+    };
+    let bits16 = |d: &cudarc::driver::CudaSlice<half::f16>, n: usize| -> Vec<u16> {
+        let h: Vec<half::f16> = exec.stream.clone_dtoh(d).expect("back");
+        h[..n].iter().map(|v| v.to_bits()).collect()
+    };
+    for (rows, dec, nope) in [(300usize, 0usize, false), (300, 3, false), (810, 2, true)] {
+        let rp = if nope {
+            (ts, 0.0, 0.0, 0.0, 0.0, 1.0)
+        } else {
+            (ts, 1.0, 0.0, 0.0, 0.0, 1.0)
+        };
+        let x: Vec<half::bf16> = (0..rows * 2048)
+            .map(|_| half::bf16::from_f32((lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0))
+            .collect();
+        let dx = exec.to_device_bf16(&x).expect("x");
+        let pos: Vec<u32> = (0..rows as u32).map(|i| 100 + 7 * i).collect();
+        let pos = exec.to_device_u32(&pos).expect("pos");
+        // reference: the projections, then the norm + rope passes
+        let (mut qa, mut ka, mut va) = (
+            exec.alloc(rows * 4096).expect("q"),
+            exec.alloc(rows * 512).expect("k"),
+            exec.alloc(rows * 512).expect("v"),
+        );
+        exec.nvf4_pf_gemm(&q, &dx, 2048, 0, &mut qa, 4096, 0, rows)
+            .expect("920 q");
+        exec.nvf4_pf_gemm(&k, &dx, 2048, 0, &mut ka, 512, 0, rows)
+            .expect("920 k");
+        exec.nvf4_pf_gemm(&v, &dx, 2048, 0, &mut va, 512, 0, rows)
+            .expect("920 v");
+        let (mut qn_a, mut kn_a) = (
+            exec.alloc(rows * 4096).expect("qn"),
+            exec.alloc(rows * 512).expect("kn"),
+        );
+        let mut q16_a = exec.alloc_f16(rows * 4096).expect("q16");
+        let heads = (nh, n_kv, 128usize);
+        if dec > 0 {
+            exec.qk_norm_rope_batch_at(
+                &qa,
+                &ka,
+                &mut va,
+                &qw,
+                &kw,
+                &mut qn_a,
+                &mut kn_a,
+                &pos,
+                heads,
+                eps,
+                rp,
+                (0, dec),
+            )
+            .expect("f32 band");
+        }
+        let ran = exec
+            .qk_norm_rope_batch_q16(
+                &qa,
+                &ka,
+                &mut va,
+                &qw,
+                &kw,
+                &mut q16_a,
+                &mut kn_a,
+                &pos,
+                heads,
+                eps,
+                rp,
+                (dec, rows - dec),
+                qscale,
+            )
+            .expect("929");
+        assert!(ran, "929 declined");
+        // the fused grid
+        let mut q16_b = exec.alloc_f16(rows * 4096).expect("q16");
+        let (mut qn_b, mut kn_b, mut vb) = (
+            exec.alloc(rows * 4096).expect("qn"),
+            exec.alloc(rows * 512).expect("kn"),
+            exec.alloc(rows * 512).expect("v"),
+        );
+        let out = paddock_engine::gpu::PfQkvOut {
+            q16: &mut q16_b,
+            qn: &mut qn_b,
+            kn: &mut kn_b,
+            v: &mut vb,
+        };
+        let norm = paddock_engine::gpu::PfNorm {
+            qw: &qw,
+            kw: &kw,
+            pos: &pos,
+            n_head: nh,
+            n_kv,
+            dec,
+            eps,
+            rope: rp,
+            qscale,
+        };
+        let ran = exec
+            .nvf4_pf_qkv_nr([&q, &k, &v], out, &norm, &dx, rows)
+            .expect("934");
+        if !ran {
+            common::missing("pack's 934 declined (no register-decode arm on this die)");
+            return;
+        }
+        let tag = format!("{rows} rows, band {dec}, nope {nope}");
+        let (qa16, qb16) = (bits16(&q16_a, rows * 4096), bits16(&q16_b, rows * 4096));
+        let past = dec * 4096..rows * 4096;
+        assert!(
+            same_bits(&qa16[past.clone()], &qb16[past]),
+            "934 q16 differs from 920 + 929 ({tag})"
+        );
+        assert!(
+            same_bits(&bits(&qn_a, dec * 4096), &bits(&qn_b, dec * 4096)),
+            "934 band q differs from the f32 pass ({tag})"
+        );
+        assert!(
+            same_bits(&bits(&kn_a, rows * 512), &bits(&kn_b, rows * 512)),
+            "934 k differs ({tag})"
+        );
+        assert!(
+            same_bits(&bits(&va, rows * 512), &bits(&vb, rows * 512)),
+            "934 v differs ({tag})"
+        );
+    }
+    println!(
+        "934: q|k|v + norm + rope in one grid bit-identical to 920 + 929 / v3, roped and NoPE, band 0 / 2 / 3"
+    );
 }

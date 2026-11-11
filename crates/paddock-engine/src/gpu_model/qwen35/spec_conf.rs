@@ -51,6 +51,7 @@ pub(super) fn pick_draft_step(
                 &mut c.alt,
                 &mut c.stats,
                 vocab as u32,
+                None,
                 b,
                 vocab,
             )?;

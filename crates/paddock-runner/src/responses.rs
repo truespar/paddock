@@ -369,7 +369,7 @@ struct Prepared {
     think_budget: Option<crate::chat::ThinkBudget>,
     single_tool_call: bool,
     /// deepseek2-ocr resolution (echoed on the response; `ngram` already
-    /// folded into `sampler`, `force_base` into `mm_chunks`)
+    /// folded into `sampler`, `crop_force` into `mm_chunks`)
     ocr: Option<crate::deepseek_ocr::OcrResolved>,
 }
 
@@ -623,12 +623,9 @@ fn prepare(
     };
     // resolved crop override -> directive chunk the OCR engine consumes
     if let (Some(o), Some(chunks)) = (&ocr, mm_chunks.as_mut())
-        && o.force_base
+        && let Some(m) = o.crop_force
     {
-        chunks.insert(
-            0,
-            paddock_engine::service::MmChunk::OcrCrop(paddock_engine::service::OcrCropMode::Base),
-        );
+        chunks.insert(0, paddock_engine::service::MmChunk::OcrCrop(m));
     }
     // vLLM-compat per-request pixel budget (paddleocr family) - same seam
     // and same refusal semantics as chat completions

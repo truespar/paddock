@@ -22,6 +22,8 @@ use paddock_models::ggml_type::GgmlType;
 use paddock_models::mapped::MappedGguf;
 
 use super::Hparams;
+use cudarc::driver::CudaSlice;
+
 use crate::gpu::{DeviceTensor, GpuExecutor, KvDtype, QuantTensor, QuantW, RepackedQ8};
 use crate::gpu_model::gpt_oss::GpuModelError;
 
@@ -61,6 +63,21 @@ pub(crate) enum DsFfn {
     Moe(DsMoe),
 }
 
+/// Unlimited-OCR-2's per-layer SR-SWA router (see [`super::Dash`]). F32 in the
+/// file: the routing decisions are discrete, so the planes stay unquantized.
+pub(crate) struct DsRouter {
+    /// `dash_q` | `dash_k` stacked into one [embd, 2 * index_dim] plane - the
+    /// router's query and key projections of the attention input (the rows
+    /// q/k/v read), one matvec landing `[q_r | k_r]` per row.
+    pub wqk: DeviceTensor,
+    /// `1 + dash_{q,k}_norm` [index_dim] - the Gemma-style RMSNorm scales,
+    /// the `1 +` folded in f32 at load (the reference's `1.0 + w.float()`).
+    pub q_norm1: CudaSlice<f32>,
+    pub k_norm1: CudaSlice<f32>,
+    /// `dash_head_cls` [index_dim] - the learned block-summary query.
+    pub head_cls: DeviceTensor,
+}
+
 /// One decoder block. Everything unbiased; norms are RMS eps 1e-6.
 #[allow(dead_code)]
 pub(crate) struct DsLayer {
@@ -72,6 +89,8 @@ pub(crate) struct DsLayer {
     pub wo: QuantW,
     pub ffn_norm: DeviceTensor,
     pub ffn: DsFfn,
+    /// SR-SWA router (Unlimited-OCR-2 only).
+    pub router: Option<DsRouter>,
 }
 
 /// The decoder, weights-resident. KV pool / batch state / the DeepEncoder
@@ -213,6 +232,44 @@ impl GpuDeepseekOcr {
             };
 
             let va = vfree();
+            let router = match &hp.dash {
+                None => None,
+                Some(d) => {
+                    let (wq, wk) = (dt("dash_q.weight")?, dt("dash_k.weight")?);
+                    let (qn, kn) = (dt("dash_q_norm.weight")?, dt("dash_k_norm.weight")?);
+                    let head_cls = dt("dash_head_cls")?;
+                    for (name, t, want) in [
+                        ("dash_q", &wq, vec![hp.n_embd, d.index_dim]),
+                        ("dash_k", &wk, vec![hp.n_embd, d.index_dim]),
+                        ("dash_q_norm", &qn, vec![d.index_dim]),
+                        ("dash_k_norm", &kn, vec![d.index_dim]),
+                        ("dash_head_cls", &head_cls, vec![d.index_dim]),
+                    ] {
+                        if t.dims != want {
+                            return Err(GpuModelError::Unsupported(format!(
+                                "deepseek-ocr blk.{i}: {name} {:?} != {want:?}",
+                                t.dims
+                            )));
+                        }
+                    }
+                    // [out][in] row-major planes: q's rows then k's rows
+                    let mut qk = exec.to_host(&wq.buf)?;
+                    qk.extend(exec.to_host(&wk.buf)?);
+                    let one_plus = |t: &DeviceTensor| -> Result<CudaSlice<f32>, GpuModelError> {
+                        let w: Vec<f32> = exec.to_host(&t.buf)?.iter().map(|w| 1.0 + w).collect();
+                        Ok(exec.to_device(&w)?)
+                    };
+                    Some(DsRouter {
+                        wqk: DeviceTensor {
+                            buf: exec.to_device(&qk)?,
+                            dims: vec![hp.n_embd, 2 * d.index_dim],
+                        },
+                        q_norm1: one_plus(&qn)?,
+                        k_norm1: one_plus(&kn)?,
+                        head_cls,
+                    })
+                }
+            };
             let layer = DsLayer {
                 attn_norm: dt("attn_norm.weight")?,
                 wq: qt("attn_q.weight")?,
@@ -221,6 +278,7 @@ impl GpuDeepseekOcr {
                 wo: qt("attn_output.weight")?,
                 ffn_norm: dt("ffn_norm.weight")?,
                 ffn,
+                router,
             };
             attn_bytes += va.saturating_sub(vfree());
 
@@ -282,12 +340,13 @@ impl GpuDeepseekOcr {
             .unwrap_or_else(|| v_start.saturating_sub(vfree()));
         tracing::info!(
             "deepseek-ocr VRAM  = decoder resident total  {:>6.2} GB  \
-             ({} layers, {} experts top-{}, R-SWA {:?})",
+             ({} layers, {} experts top-{}, R-SWA {:?}, SR-SWA {})",
             gb(weights_bytes),
             hp.n_layer,
             hp.n_expert,
             hp.n_expert_used,
             hp.rswa_window,
+            hp.dash.is_some(),
         );
 
         Ok(Self {

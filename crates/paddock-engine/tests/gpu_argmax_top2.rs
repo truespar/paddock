@@ -97,6 +97,7 @@ fn matches_the_host_log_softmax_and_never_moves_the_pick() {
             &mut d_alt,
             &mut d_stats,
             probe,
+            None,
             rows,
             vocab,
         )
@@ -179,6 +180,7 @@ fn a_peaked_row_reads_as_certain_and_a_flat_one_as_not() {
         &mut d_alt,
         &mut d_stats,
         vocab as u32,
+        None,
         2,
         vocab,
     )
@@ -271,6 +273,7 @@ fn a_two_way_call_and_a_diffuse_row_are_told_apart() {
         &mut d_alt,
         &mut d_stats,
         vocab as u32,
+        None,
         2,
         vocab,
     )
@@ -316,5 +319,96 @@ fn a_two_way_call_and_a_diffuse_row_are_told_apart() {
         "the diffuse row's entropy ({}) should exceed the two-way row's ({})",
         h2(1),
         h2(0)
+    );
+}
+
+#[test]
+fn suppressed_ids_are_never_picked_and_the_probe_still_sees_them() {
+    let Some(e) = exec() else { return };
+    // The whisper case this exists for: a near-empty window where the model's
+    // own argmax is `<|nospeech|>`. The reference masks the prompt block and
+    // `<|nospeech|>` before the softmax, so the pick, the runner-up, their
+    // log-probabilities and H2 are those of the SUPPRESSED distribution -
+    // while `no_speech_prob` keeps reading the model's unsuppressed belief,
+    // which is what the no-speech guard is defined on.
+    let vocab = 51866usize;
+    let probe = 50363u32;
+    let mask: Vec<u32> = vec![50258, 50361, 50362, 50363, 50364, 50360, 50359];
+    let rows = 3usize;
+    let mut host: Vec<f32> = det(rows * vocab, 0xa11ce);
+    // row 0: `<|nospeech|>` wins outright (far above the ~e^12.8 the 51k
+    // random tail sums to), a text token is second
+    host[50363] = 20.0;
+    host[1000] = 9.0;
+    // row 1: `<|nospeech|>` AND `<|startoftranscript|>` beat the field
+    host[vocab + 50363] = 20.0;
+    host[vocab + 50258] = 19.0;
+    // row 2: nothing suppressed is near the top
+    host[2 * vocab + 777] = 11.0;
+    let d_logits = e.to_device(&host).expect("upload");
+    let d_mask = e.to_device_u32(&mask).expect("mask");
+    let mut d_idx = e.to_device_u32(&vec![0u32; rows]).expect("idx");
+    let mut d_alt = e.to_device_u32(&vec![0u32; rows]).expect("alt");
+    let mut d_stats = e.alloc(rows * 4).expect("stats");
+    e.argmax_top2_rows(
+        &d_logits,
+        &mut d_idx,
+        &mut d_alt,
+        &mut d_stats,
+        probe,
+        Some(&d_mask),
+        rows,
+        vocab,
+    )
+    .expect("kernel");
+    let idx = e.to_host_u32(&d_idx).expect("idx back");
+    let alt = e.to_host_u32(&d_alt).expect("alt back");
+    let stats = e.to_host_len(&d_stats, rows * 4).expect("stats back");
+
+    for r in 0..rows {
+        let row = &host[r * vocab..(r + 1) * vocab];
+        // the oracle: the same row with the mask applied as -inf
+        let mut masked = row.to_vec();
+        for &m in &mask {
+            masked[m as usize] = f32::NEG_INFINITY;
+        }
+        let (want1, want2) = host_top2(&masked);
+        assert_eq!(idx[r] as usize, want1, "r={r}: pick");
+        assert_eq!(alt[r] as usize, want2, "r={r}: runner-up");
+        assert!(
+            !mask.contains(&idx[r]) && !mask.contains(&alt[r]),
+            "r={r}: a suppressed id came out"
+        );
+        let lp = host_logprob(&masked, want1);
+        assert!(
+            (stats[r * 4] as f64 - lp).abs() < 2e-3,
+            "r={r}: log p {} vs {lp}",
+            stats[r * 4]
+        );
+        let lp2 = host_logprob(&masked, want2);
+        assert!(
+            (stats[r * 4 + 2] as f64 - lp2).abs() < 2e-3,
+            "r={r}: log p2 {} vs {lp2}",
+            stats[r * 4 + 2]
+        );
+        let h2 = host_entropy2(&masked);
+        assert!(
+            (stats[r * 4 + 3] as f64 - h2).abs() < 2e-3,
+            "r={r}: H2 {} vs {h2}",
+            stats[r * 4 + 3]
+        );
+        // the probe reads the UNSUPPRESSED row
+        let want_probe = host_logprob(row, probe as usize).exp();
+        let got_probe = stats[r * 4 + 1] as f64;
+        assert!(
+            (got_probe - want_probe).abs() < 1e-5,
+            "r={r}: p(probe) {got_probe} vs {want_probe}"
+        );
+    }
+    assert_eq!(idx[0], 1000, "row 0 falls through to the best text token");
+    assert!(
+        stats[1] > 0.9,
+        "row 0's no_speech_prob {} must stay the model's own",
+        stats[1]
     );
 }

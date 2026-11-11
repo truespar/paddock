@@ -418,7 +418,7 @@ struct Prepared {
     /// over-window - that is the point of compacting).
     compact: Option<CompactPlan>,
     /// deepseek2-ocr resolution (echoed on the response; `ngram` already
-    /// folded into `sampler`, `force_base` into `mm_chunks`)
+    /// folded into `sampler`, `crop_force` into `mm_chunks`)
     ocr: Option<crate::deepseek_ocr::OcrResolved>,
 }
 
@@ -677,12 +677,9 @@ fn render_prompt(
     };
     // resolved crop override -> directive chunk the OCR engine consumes
     if let (Some(o), Some(chunks)) = (&ocr, mm_chunks.as_mut())
-        && o.force_base
+        && let Some(m) = o.crop_force
     {
-        chunks.insert(
-            0,
-            paddock_engine::service::MmChunk::OcrCrop(paddock_engine::service::OcrCropMode::Base),
-        );
+        chunks.insert(0, paddock_engine::service::MmChunk::OcrCrop(m));
     }
     Ok((prompt_ids, engine_prompt, thinking_open, mm_chunks, ocr))
 }

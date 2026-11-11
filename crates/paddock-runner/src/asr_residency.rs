@@ -231,23 +231,28 @@ pub(crate) fn error_response(error: String) -> axum::response::Response {
     let permanent = error.contains("model_budget_exceeded:")
         || error.contains("configured VRAM budget")
         || error.contains("model_changed:");
-    let code = if permanent {
-        "model_configuration_error"
+    // Only the residency's own refusals are temporary: the queue, a closing or
+    // failed worker, a cold load still in flight. Anything else is the decode
+    // failing on this request, which a retry repeats - advertising it as 503
+    // with Retry-After cost one client three retries per call.
+    let temporary = error.contains("model_unavailable")
+        || error.contains("model_load_timeout:")
+        || error.contains("insufficient_memory");
+    let (status, code) = if permanent {
+        (StatusCode::BAD_REQUEST, "model_configuration_error")
     } else if error.contains("model_load_timeout:") {
-        "model_load_timeout"
+        (StatusCode::SERVICE_UNAVAILABLE, "model_load_timeout")
+    } else if temporary {
+        (StatusCode::SERVICE_UNAVAILABLE, "model_unavailable")
     } else {
-        "model_unavailable"
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
     };
     let mut response = (
-        if permanent {
-            StatusCode::BAD_REQUEST
-        } else {
-            StatusCode::SERVICE_UNAVAILABLE
-        },
+        status,
         Json(serde_json::json!({"error":{"type":code,"code":code,"message":error}})),
     )
         .into_response();
-    if !permanent {
+    if status == StatusCode::SERVICE_UNAVAILABLE {
         response.headers_mut().insert(
             header::RETRY_AFTER,
             axum::http::HeaderValue::from_static("2"),

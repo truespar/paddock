@@ -75,3 +75,57 @@ fn loads_whisper_and_geometry_matches() {
         );
     }
 }
+
+/// A window holding a sliver of audio used to come back as a confident
+/// `<|nospeech|>` TOKEN: nothing suppressed it, the no-speech guard keeps a
+/// confident window, and the word-timing pass then refused the transcript
+/// (production: every clip whose tail window held under ~3 s failed word
+/// timestamps with "got the special token 50363"). The reference masks the
+/// prompt block and `<|nospeech|>` before every softmax; so does the pick
+/// kernel now. A transcript may hold text, timestamps and `<|eot|>` only -
+/// timestamps included even on the no-timestamps prompt, where the reference
+/// leaves them unsuppressed and the transcriber strips them (a 0.1 s tone
+/// comes back as a lone `<|0.00|>`, i.e. an empty transcript).
+#[test]
+fn a_sliver_window_never_yields_a_special_token() {
+    let Some(path) = model_paths().into_iter().find(|p| p.exists()) else {
+        common::missing("no whisper checkpoint found (set WHISPER_GGUF for one file)");
+        return;
+    };
+    let Some(exec) = common::gpu_arc() else {
+        return;
+    };
+    let map = MappedGguf::open(&path).expect("open gguf");
+    let mut m = GpuWhisper::load(Arc::clone(&exec), &map, 448).expect("load whisper");
+    let (_, eot) = m.contract_tokens();
+    let ts_begin = m.time_scale().begin; // `<|0.00|>`
+    let tone = {
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/data/audio-formats/tone.wav"),
+        )
+        .expect("tone fixture");
+        let wav = paddock_engine::audio::decode::decode_audio(&bytes).expect("decode tone");
+        paddock_engine::audio::resample::resample(&wav.samples, wav.sample_rate, 16000)
+            .expect("resample tone")
+    };
+    // 0.1 s of silence, 0.1 s of tone, 2 s of tone, and a 30.1 s clip whose
+    // second window is the sliver - the shapes that failed in production
+    let silence = vec![0.0f32; 1600];
+    let mut long = vec![0.0f32; 16000 * 30];
+    long.extend_from_slice(&tone[..tone.len().min(1600)]);
+    for (name, clip) in [
+        ("0.1 s silence", silence.as_slice()),
+        ("0.1 s tone", &tone[..tone.len().min(1600)]),
+        ("2 s tone", &tone[..tone.len().min(32000)]),
+        ("30.1 s", long.as_slice()),
+    ] {
+        let (_, windows) = m.transcribe(clip, Some("sv"), 64).expect(name);
+        for (w, ids) in windows.iter().enumerate() {
+            if let Some(&t) = ids.iter().find(|&&t| t >= eot && t < ts_begin) {
+                panic!("{name}: window {w} emitted special token {t} (eot {eot}): {ids:?}");
+            }
+        }
+        eprintln!("{name}: {} window(s), tokens {:?}", windows.len(), windows);
+    }
+}

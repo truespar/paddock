@@ -146,25 +146,24 @@ pub(super) fn images_of(chunks: &[MmChunk]) -> Vec<(&[u8], usize, usize)> {
         .collect()
 }
 
-/// Plan one request: one Layout across all images (mode is elected from the
-/// COUNT - gundam is single-image only), per-image block runs, then the
+/// Plan one request: one Layout across all images (mode elected from the
+/// COUNT unless overridden, a grid per image), per-image block runs, then the
 /// interleaved row stream and its radix keys (content-derived for image rows
 /// - the module doc's whole argument). An `OcrCrop` directive chunk is this
-///   family's per-request override: `Base` forces the no-crop layout; `Gundam`
-///   is only ever the default restated (the runner refuses it for multi-image
-///   before we get here).
+///   family's per-request override: `Base` forces the no-crop layout,
+///   `Gundam` tiles every image (Unlimited-OCR-2's multi-page gundam; the
+///   runner refuses it on v1, whose reference mandates non-crop for
+///   multi-image).
 pub(super) fn mm_plan(chunks: &[MmChunk], max_tiles: usize) -> Result<MmPlan, GpuModelError> {
     let mut sizes: Vec<(usize, usize)> = Vec::new();
-    let mut force_base = false;
+    let mut crop = None;
     for ch in chunks {
         match ch {
             MmChunk::Image { w, h, .. } => {
                 sizes.push((*w, *h));
             }
             MmChunk::Text(_) => {}
-            MmChunk::OcrCrop(m) => {
-                force_base = *m == crate::service::OcrCropMode::Base;
-            }
+            MmChunk::OcrCrop(m) => crop = Some(*m),
             MmChunk::VisionPixels { .. } => {
                 return Err(GpuError::Driver(
                     "pixel-budget directive on deepseek-ocr - its crop planner \
@@ -184,11 +183,8 @@ pub(super) fn mm_plan(chunks: &[MmChunk], max_tiles: usize) -> Result<MmPlan, Gp
     if sizes.is_empty() {
         return Err(GpuError::Driver("multimodal prefill with no image".into()).into());
     }
-    let layout = Layout::plan(&sizes, max_tiles, force_base);
-    let img_blocks: Vec<std::ops::Range<usize>> = match layout.mode {
-        Mode::Gundam { .. } => std::iter::once(0..layout.blocks.len()).collect(),
-        Mode::Base { .. } => (0..sizes.len()).map(|k| 2 * k..2 * k + 2).collect(),
-    };
+    let layout = Layout::plan(&sizes, max_tiles, crop);
+    let img_blocks = layout.img_blocks.clone();
     debug_assert_eq!(img_blocks.len(), sizes.len());
     let img_tokens: Vec<usize> = img_blocks
         .iter()
@@ -359,7 +355,10 @@ impl GpuDeepseekOcr {
     /// global-only bail and get padded up).
     pub(crate) fn vision_budget_impl(&self) -> Option<crate::generator::VisionBudget> {
         let vis = self.vision.as_ref()?;
-        let (tile, max_tiles) = (super::vision::TILE_PX as u64, vis.hp.max_tiles);
+        let (tile, max_tiles) = (
+            super::vision::TILE_PX as u64,
+            self.tile_cap(vis.hp.max_tiles),
+        );
         let max_tok = super::tiling::max_image_tokens(max_tiles) as u32;
         Some(crate::generator::VisionBudget {
             max_pixels: max_tiles as u64 * tile * tile,
@@ -447,7 +446,7 @@ impl GpuDeepseekOcr {
                 })
                 .collect();
         };
-        let max_tiles = vis.hp.max_tiles;
+        let max_tiles = self.tile_cap(vis.hp.max_tiles);
 
         // ── phase 1, serial: plan every slot and probe the radix for its
         // expected resume, which decides what is worth preprocessing.
@@ -468,14 +467,14 @@ impl GpuDeepseekOcr {
         for (wi, (_, planned)) in plans.iter().enumerate() {
             let Ok(plan) = planned else { continue };
             let probe = self.prefix_probe(&plan.keys);
-            let spec = self.prep_spec(plan.layout.mode, plan.layout.grid);
             for (k, &(rgb, w, h)) in imgs[wi].iter().enumerate() {
+                let spec = self.prep_spec(plan.layout.mode, plan.layout.grids[k]);
                 if plan.img_start[k] + plan.img_tokens[k] <= probe {
                     continue; // expected fully resumed: nothing to preprocess
                 }
                 let need_from = probe.saturating_sub(plan.img_start[k]);
                 let blocks = &plan.layout.blocks[plan.img_blocks[k].clone()];
-                let (need_crops, need_global) = prep_need(blocks, plan.layout.grid, need_from);
+                let (need_crops, need_global) = prep_need(blocks, plan.layout.grids[k], need_from);
                 let jc = need_crops.then(|| {
                     jobs.push((
                         rgb,
@@ -580,7 +579,7 @@ impl GpuDeepseekOcr {
                             crops,
                             global,
                             &plan.layout.blocks[plan.img_blocks[k].clone()],
-                            plan.layout.grid,
+                            plan.layout.grids[k],
                             plan.layout.mode,
                             need_from,
                         )?));
@@ -612,6 +611,17 @@ impl GpuDeepseekOcr {
     ) -> Result<(Vec<f32>, usize), GpuModelError> {
         let exec = self.exec.clone();
         let embd = self.hp.n_embd;
+        if self.hp.dash.is_some() {
+            let ids: Vec<u32> = plan
+                .rows
+                .iter()
+                .map(|row| match row {
+                    Row::Token(t) => *t,
+                    Row::Image(..) => IMAGE_TOKEN_ID,
+                })
+                .collect();
+            self.dash_admit(slot, &ids);
+        }
         let mut base = start;
         let mut last_len = 0usize;
         for chunk in plan.rows[start..].chunks(pf_rows()) {
@@ -626,7 +636,7 @@ impl GpuDeepseekOcr {
             let pos: Vec<u32> = (base..base + r).map(|p| p as u32).collect();
             let slots = vec![slot as u32; r];
             self.ensure_rows(&slots, &pos)?;
-            self.upload_rows(&toks, &pos, &pos, &pos, &slots)?;
+            self.upload_rows(&toks, &pos, &pos, &pos, &slots, 0)?;
             self.embed_rows(r)?;
             // splice: overwrite image rows with plane rows, one dtod per
             // contiguous run (dst rows in sc.x and src rows in the plane
@@ -673,7 +683,9 @@ impl GpuDeepseekOcr {
         }
 
         self.prefix_insert(slot, &plan.keys);
-        self.batch.as_mut().expect("batch enabled").ring[slot].prefill_len = Some(plan.n_rows);
+        let ring = self.ring_base(slot, plan.n_rows);
+        self.batch.as_mut().expect("batch enabled").ring[slot].prefill_len = Some(ring);
+        self.dash_head_guard(slot)?;
         let logits = self.head_row(last_len - 1)?;
         Ok((logits, plan.n_rows))
     }
@@ -918,12 +930,15 @@ impl GpuDeepseekOcr {
 mod tests {
     use super::*;
 
-    /// Per-image blocks the way `multimodal_prefill_slot` derives them.
+    use crate::service::OcrCropMode;
+
+    /// Per-image blocks the way `mm_plan` takes them.
     fn per_img(layout: &Layout) -> Vec<&[Block]> {
-        match layout.mode {
-            Mode::Gundam { .. } => vec![&layout.blocks[..]],
-            Mode::Base { .. } => layout.blocks.chunks(2).collect(),
-        }
+        layout
+            .img_blocks
+            .iter()
+            .map(|r| &layout.blocks[r.clone()])
+            .collect()
     }
 
     /// The geometry fold that keeps the radix honest: the same picture
@@ -933,15 +948,15 @@ mod tests {
     /// resumed corrupt rows.
     #[test]
     fn same_image_different_geometry_never_shares_keys() {
-        let gundam = Layout::plan(&[(1240, 1754)], 32, false);
-        let base = Layout::plan(&[(1240, 1754)], 32, true);
+        let gundam = Layout::plan(&[(1240, 1754)], 32, None);
+        let base = Layout::plan(&[(1240, 1754)], 32, Some(OcrCropMode::Base));
         assert_ne!(
             geom_code(per_img(&gundam)[0]),
             geom_code(per_img(&base)[0]),
             "gundam and base rows differ - their key streams must too"
         );
         // ...and a page inside a multi-image request folds like forced base
-        let multi = Layout::plan(&[(1240, 1754), (800, 600)], 32, false);
+        let multi = Layout::plan(&[(1240, 1754), (800, 600)], 32, None);
         assert_eq!(geom_code(per_img(&multi)[0]), geom_code(per_img(&base)[0]));
     }
 
@@ -951,14 +966,14 @@ mod tests {
     /// warm when a multi-page request includes it).
     #[test]
     fn small_image_bail_shares_with_base() {
-        let bail = Layout::plan(&[(640, 480)], 32, false);
-        assert_eq!(bail.grid, None, "under one tile: the bail engaged");
-        let base = Layout::plan(&[(640, 480)], 32, true);
+        let bail = Layout::plan(&[(640, 480)], 32, None);
+        assert!(!bail.tiled(), "under one tile: the bail engaged");
+        let base = Layout::plan(&[(640, 480)], 32, Some(OcrCropMode::Base));
         assert_eq!(geom_code(per_img(&bail)[0]), geom_code(per_img(&base)[0]));
         // different grids must never collide either
-        let g23 = Layout::plan(&[(1240, 1754)], 32, false); // 2x3
-        let g11w = Layout::plan(&[(4000, 1000)], 32, false); // wide grid
-        assert_ne!(g23.grid, g11w.grid);
+        let g23 = Layout::plan(&[(1240, 1754)], 32, None); // 2x3
+        let g11w = Layout::plan(&[(4000, 1000)], 32, None); // wide grid
+        assert_ne!(g23.grids, g11w.grids);
         assert_ne!(geom_code(per_img(&g23)[0]), geom_code(per_img(&g11w)[0]));
     }
 }

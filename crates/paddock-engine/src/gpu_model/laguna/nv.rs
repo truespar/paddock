@@ -69,6 +69,73 @@ pub(crate) fn nv_swiglu(
     nv_rows(exec, down, g, y, rows)
 }
 
+/// A layer's q / k norm + rope inputs for the fused q|k|v grid (slot 934).
+pub(super) struct NrLayer<'a> {
+    pub qw: &'a CudaSlice<f32>,
+    pub kw: &'a CudaSlice<f32>,
+    pub n_head: usize,
+    pub n_kv: usize,
+    /// a fused tick's decode band rows (their q stays f32 for the band's
+    /// decode launches)
+    pub dec: usize,
+    pub eps: f32,
+    pub rope: (f32, f32, f32, f32, f32, f32),
+    pub qscale: f32,
+}
+
+/// Prefill mode on the W4A16 prefill tile: q|k|v with the q / k norm + rope
+/// in the epilogues (slot 934) - q in the f16 attention's halves (the band's
+/// rows f32 in `sc.qn`), k normed + roped in `sc.kn`, v in `sc.v` - and the
+/// layer's q marked f16 for the attention. False, nothing changed, where the
+/// pack or the shape declines; the caller then runs the separate passes.
+pub(super) fn qkv_nr_rows(
+    exec: &GpuExecutor,
+    planes: [&Nvf4Plane; 3],
+    sc: &mut BatchScratch,
+    ws: Option<&mut W16r>,
+    nr: &NrLayer,
+    r: usize,
+) -> Result<bool, GpuError> {
+    let Some(ws) = ws.filter(|w| w.pf && w.q16.is_some()) else {
+        return Ok(false);
+    };
+    if !exec.has_nvf4_pf_qkv_nr() {
+        return Ok(false);
+    }
+    let k = planes[0].in_dim;
+    if !std::mem::take(&mut ws.x16_fresh) {
+        exec.convert_f32_bf16(&sc.xn, &mut ws.x16, r * k)?;
+    }
+    let Some(q16) = ws.q16.as_mut() else {
+        return Ok(false);
+    };
+    let out = crate::gpu::PfQkvOut {
+        q16,
+        qn: &mut sc.qn,
+        kn: &mut sc.kn,
+        v: &mut sc.v,
+    };
+    let norm = crate::gpu::PfNorm {
+        qw: nr.qw,
+        kw: nr.kw,
+        pos: &sc.d_pos,
+        n_head: nr.n_head,
+        n_kv: nr.n_kv,
+        dec: nr.dec,
+        eps: nr.eps,
+        rope: nr.rope,
+        qscale: nr.qscale,
+    };
+    let ran = exec.nvf4_pf_qkv_nr(planes, out, &norm, &ws.x16, r)?;
+    if ran {
+        ws.q16_live = true;
+    } else {
+        // the cast stays for the separate passes' tile
+        ws.x16_fresh = true;
+    }
+    Ok(ran)
+}
+
 /// The batched lane's q, k and v planes over `r` rows of `sc.xn`; prefill
 /// mode on the W4A16 prefill tile (one bf16 cast serves all three).
 pub(super) fn qkv_rows(
@@ -83,6 +150,11 @@ pub(super) fn qkv_rows(
         let k = wq.in_dim;
         if !std::mem::take(&mut ws.x16_fresh) {
             exec.convert_f32_bf16(&sc.xn, &mut ws.x16, r * k)?;
+        }
+        // one grid (slot 931): k's and v's thin grids fill q's last wave
+        let planes = &mut [(wq, &mut sc.q), (wk, &mut sc.k), (wv, &mut sc.v)];
+        if exec.nvf4_pf_gemm3(planes, &ws.x16, r)? {
+            return Ok(());
         }
         exec.nvf4_pf_gemm(wq, &ws.x16, k, 0, &mut sc.q, wq.out_dim, 0, r)?;
         exec.nvf4_pf_gemm(wk, &ws.x16, k, 0, &mut sc.k, wk.out_dim, 0, r)?;
@@ -518,18 +590,59 @@ fn moe_pf_rows(
         bm,
         nb,
     )?;
-    exec.nvf4_pf_moe_gu(
-        &w.gate,
-        &w.up,
-        &sc.srow,
-        &sc.sslot,
-        &sc.bexp,
-        &ws.x16,
-        &mut ws.act,
-        aw,
-        nb,
-    )?;
-    exec.nvf4_pf_gu(sh_gate, sh_up, &ws.x16, embd, &mut ws.act, aw, k * ff, r)?;
+    // the shared expert's tiles ride the routed grids' last waves (slots
+    // 932 / 933; each half its own launch's bits)
+    let sh = exec.has_nvf4_pf_moe_sh();
+    let fused = sh
+        && exec.nvf4_pf_moe_gu_sh(
+            &w.gate,
+            &w.up,
+            &sc.srow,
+            &sc.sslot,
+            &sc.bexp,
+            &ws.x16,
+            &mut ws.act,
+            aw,
+            nb,
+            (sh_gate, sh_up),
+            k * ff,
+            r,
+        )?;
+    if !fused {
+        exec.nvf4_pf_moe_gu(
+            &w.gate,
+            &w.up,
+            &sc.srow,
+            &sc.sslot,
+            &sc.bexp,
+            &ws.x16,
+            &mut ws.act,
+            aw,
+            nb,
+        )?;
+        exec.nvf4_pf_gu(sh_gate, sh_up, &ws.x16, embd, &mut ws.act, aw, k * ff, r)?;
+    }
+    if sh
+        && exec.nvf4_pf_moe_dn_sh(
+            &w.down,
+            &sc.srow,
+            &sc.sslot,
+            &sc.bexp,
+            &sc.moe_w,
+            &ws.act,
+            aw,
+            &mut ws.part,
+            k,
+            nb,
+            (sh_down, &mut sc.proj),
+            k * ff,
+            r,
+        )?
+    {
+        // the fold rides the FFN tail (`ffn_tail`), with the residual add
+        ws.pending = k;
+        return Ok(());
+    }
     exec.nvf4_pf_gemm(sh_down, &ws.act, aw, k * ff, &mut sc.proj, embd, 0, r)?;
     exec.nvf4_pf_moe_dn(
         &w.down,

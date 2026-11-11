@@ -156,6 +156,7 @@ function regionsFromWire(v: unknown): OcrRegion[] {
  *  page finishes. */
 export function parseRegionsLive(raw: string): OcrRegion[] {
   if (raw.includes('<|LOC_')) return parseSpottingLive(raw)
+  if (raw.includes('<BLOCK>')) return parseUocr2Live(raw)
   if (raw.includes('![')) {
     const blocks = parseBlocksLive(raw)
     if (blocks.length) return blocks
@@ -240,6 +241,68 @@ function parseSpottingLive(raw: string): OcrRegion[] {
   return out
 }
 
+/** Unlimited-OCR-2's block header: `<BLOCK>label`, then a `<LEVELn>` and a
+ *  box in either order (each optional), then `<FORK>` - the grammar its
+ *  authors' own Markdown converter reads. Groups: label, level-first level,
+ *  box, box-first level. */
+const U2_HEAD =
+  /<BLOCK>\s*([A-Za-z_]+)(?:\s*<LEVEL\s*(\d*)\s*[>}]?)?(?:\s*\[([-\d\s,，]+)\])?(?:\s*<LEVEL\s*(\d*)\s*[>}]?)?\s*(?:<FORK>)?/g
+/** A header the stream has not finished yet - hidden until it closes: a
+ *  prefix of `<BLOCK>`, or `<BLOCK>label` with partial level tags / boxes and
+ *  at most a prefix of `<FORK>` behind it, at the very end of the text. */
+const U2_TAIL =
+  /(?:<(?:B(?:L(?:O(?:C(?:K)?)?)?)?)?|<BLOCK>\s*[A-Za-z_]*(?:\s*(?:<(?:L(?:E(?:V(?:E(?:L(?:\s*\d*\s*>?)?)?)?)?)?)?|\[[-\d\s,，]*\]?))*\s*(?:<(?:F(?:O(?:R(?:K)?)?)?)?)?)$/
+
+/** Client mirror of the runner's unlimited_ocr2::parse_blocks: pages split
+ *  on `<PAGE>` (0-based, the request's image order), each block owns its
+ *  text up to the next one, `append_<t>` and a `<MERGE>` before a block mark
+ *  it continuing. Boxes are already on the 0-999 grid. A header cut by the
+ *  stream misses its box and is skipped, so this is safe per frame. */
+function parseUocr2Live(raw: string): OcrRegion[] {
+  const out: OcrRegion[] = []
+  let segs = raw.split('<PAGE>')
+  if (segs.length > 1 && !segs[0].trim()) segs = segs.slice(1)
+  segs.forEach((seg, page) => {
+    const heads = [...seg.matchAll(U2_HEAD)]
+    heads.forEach((m, i) => {
+      const end = (m.index ?? 0) + m[0].length
+      const stop = i + 1 < heads.length ? (heads[i + 1].index ?? seg.length) : seg.length
+      const nums = (m[3] ?? '').split(/[,，]/).map((v) => parseInt(v.trim(), 10))
+      if (nums.length < 4 || nums.slice(0, 4).some((n) => Number.isNaN(n))) return
+      const prevEnd =
+        i > 0 ? (heads[i - 1].index ?? 0) + heads[i - 1][0].length : (m.index ?? 0)
+      const merged = i > 0 && seg.slice(prevEnd, m.index).includes('<MERGE>')
+      const label = m[1].toLowerCase()
+      const text = seg.slice(end, stop).split('<MERGE>').join('').trim()
+      out.push({
+        label,
+        boxes: [[nums[0], nums[1], nums[2], nums[3]]],
+        ...(text ? { text } : {}),
+        ...(merged || label.startsWith('append_') ? { continues: true } : {}),
+        page,
+      })
+    })
+  })
+  return out
+}
+
+/** Unlimited-OCR-2's markup lifted out for reading: a page break between
+ *  pages, a title block's words as a heading of its level, every other
+ *  header gone (its text follows it). */
+function cleanUocr2(raw: string): string {
+  return raw
+    .replace(U2_TAIL, '')
+    .replace(U2_HEAD, (_m, label: string, l1?: string, _box?: string, l2?: string) => {
+      if (label.toLowerCase() !== 'title') return '\n'
+      const n = parseInt(l1 || l2 || '1', 10) || 1
+      return `\n${'#'.repeat(Math.min(n, 6))} `
+    })
+    .split('<MERGE>').join('')
+    .replace(/^\s*<PAGE>/, '')
+    .split('<PAGE>').join('\n\n---\n\n')
+    .replace(/^\n+/, '')
+}
+
 /** LightOnOCR-3's grounding marker, its client's MARKER regex verbatim:
  *  `![label](x1,y1,x2,y2)` on a 0..=1000 grid, a trailing `+` on the label
  *  for a block continuing the previous one, and the spaces after it. */
@@ -294,6 +357,7 @@ const PD_PICTURE =
 const PD_CENTER = /<div style="text-align: center;">([\s\S]*?)<\/div>\n?/g
 
 export function cleanOcrText(raw: string): string {
+  if (raw.includes('<BLOCK>') || raw.startsWith('<PAGE>')) return cleanUocr2(raw)
   if (raw.includes('<div style="text-align: center;">')) {
     raw = raw.replace(PD_PICTURE, '').replace(PD_CENTER, '$1')
   }

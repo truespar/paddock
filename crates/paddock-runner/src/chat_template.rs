@@ -684,6 +684,51 @@ pub const DEEPSEEK_OCR_TEMPLATE: &str = "{%- set ns = namespace(sys=\"\", body=\
 {%- endfor -%}
 {{- ns.sys + ns.body -}}";
 
+/// Unlimited-OCR-2's prompt shape (`baidu/Unlimited-OCR-2`, arch
+/// `deepseek2-ocr` with the SR-SWA router keys): [`DEEPSEEK_OCR_TEMPLATE`]
+/// with every injected image written `<PAGE><image>`.
+///
+/// The checkpoint trains one layout only - `"<PAGE><image>" * pages +
+/// "Multi page parsing."` after BOS, single pages included (its `infer()`
+/// builds exactly that, and the card's SGLang client sends it) - and the
+/// `<PAGE>` markers are load-bearing beyond conditioning: the page-2D rope
+/// buckets, the router's candidate pages and the page-count guard all read
+/// the prompt's markers. Pass-through is unchanged: a caller who wrote
+/// `<image>` (the card's recipe writes `<PAGE><image>` per page itself) gets
+/// their text verbatim, exactly as the reference uses a prompt that already
+/// carries one placeholder a page.
+pub const UNLIMITED_OCR2_TEMPLATE: &str = "{%- set ns = namespace(sys=\"\", body=\"\") -%}
+{%- for m in messages -%}
+  {%- if m.role == 'system' -%}
+    {%- if m.content is string -%}
+      {%- set ns.sys = ns.sys + m.content -%}
+    {%- else -%}
+      {%- for c in m.content -%}
+        {%- if c.type == 'text' and (c.text is defined) -%}
+          {%- set ns.sys = ns.sys + c.text -%}
+        {%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
+  {%- elif m.content is string -%}
+    {%- set ns.body = ns.body + m.content -%}
+  {%- else -%}
+    {%- set part = namespace(imgs=\"\", text=\"\") -%}
+    {%- for c in m.content -%}
+      {%- if c.type == 'image' or c.type == 'image_url' or c.type == 'input_image' or ('image' in c) or ('image_url' in c) -%}
+        {%- set part.imgs = part.imgs + '<PAGE><image>' -%}
+      {%- elif c.type == 'text' and (c.text is defined) -%}
+        {%- set part.text = part.text + c.text -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if '<image>' in part.text -%}
+      {%- set ns.body = ns.body + part.text -%}
+    {%- else -%}
+      {%- set ns.body = ns.body + part.imgs + part.text -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{{- ns.sys + ns.body -}}";
+
 /// Collapse each message's content PARTS into the single string the
 /// granite-speech family's own chat templates are written against, writing
 /// `marker` (`<|audio|>`) once per audio part ahead of the message's text.
@@ -1593,6 +1638,26 @@ mod tests {
             super::render(super::DEEPSEEK_OCR_TEMPLATE, &with_sys, None, None).expect("render"),
             "Answer in Swedish.<image>document parsing."
         );
+    }
+
+    /// Unlimited-OCR-2: one `<PAGE><image>` a page at the prefix, the caller's
+    /// own markers untouched.
+    #[test]
+    fn ocr2_template_marks_every_page() {
+        let msgs = [json!({"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}},
+            {"type": "text", "text": "Multi page parsing."},
+        ]})];
+        let out = super::render(super::UNLIMITED_OCR2_TEMPLATE, &msgs, None, None).expect("render");
+        assert_eq!(out, "<PAGE><image><PAGE><image>Multi page parsing.");
+        // the card's own client writes the markers itself
+        let msgs = [json!({"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "text", "text": "<PAGE><image>Multi page parsing."},
+        ]})];
+        let out = super::render(super::UNLIMITED_OCR2_TEMPLATE, &msgs, None, None).expect("render");
+        assert_eq!(out, "<PAGE><image>Multi page parsing.");
     }
 
     /// granite-speech-4.1-2b's own template, verbatim from its GGUF. The

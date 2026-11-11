@@ -12,7 +12,7 @@
 //! contain a 440 Hz sine. A Goertzel at 440 against a control bin catches
 //! every one of those; a length check catches none of them.
 
-use paddock_engine::audio::decode::decode_audio;
+use paddock_engine::audio::decode::{decode_audio, decode_audio_bounded};
 
 /// Power at one frequency, by the Goertzel recurrence - a single-bin DFT, and
 /// all we need to ask "is this the tone we encoded?".
@@ -168,5 +168,20 @@ fn flac_is_bit_identical_to_the_wav_it_was_encoded_from() {
     assert_eq!(flac.samples.len(), wav.samples.len(), "flac length");
     for (i, (f, w)) in flac.samples.iter().zip(&wav.samples).enumerate() {
         assert!((f - w).abs() < 1e-6, "flac sample {i}: {f} != {w}");
+    }
+}
+
+#[test]
+fn bounded_decode_matches_the_lenient_door_and_stops_at_the_bound() {
+    for name in ["tone.wav", "tone.mp3", "tone.flac"] {
+        let bytes = fixture(name);
+        let a = decode_audio(&bytes).expect(name);
+        let b = decode_audio_bounded(&bytes, 3600).expect(name);
+        assert_eq!(a.sample_rate, b.sample_rate, "{name}");
+        assert_eq!(a.samples, b.samples, "{name}");
+        let Err(err) = decode_audio_bounded(&bytes, 0) else {
+            panic!("{name}: decoded past the bound");
+        };
+        assert!(err.contains("exceeds 0 seconds"), "{name}: {err}");
     }
 }

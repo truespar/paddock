@@ -404,6 +404,9 @@ impl GpuWhisper {
             // explicitly by the converter now; the neighbour derivation is
             // the fallback for files written before it was.
             sot_prev: tok("token.sot_prev").unwrap_or(no_timestamps.saturating_sub(2)),
+            // `<|startoflm|>` opens the same block: `<|startoflm|>
+            // <|startofprev|> <|nospeech|> <|notimestamps|>`, three below.
+            sot_lm: tok("token.sot_lm").unwrap_or(no_timestamps.saturating_sub(3)),
         };
         // A timestamp id past the head's width would index off the end of a
         // logits row, so check it here rather than at the first transcript.

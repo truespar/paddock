@@ -34,10 +34,14 @@
 //! Prompting follows the checkpoint's decode contract, ids read from the
 //! file rather than assumed: `<|startoftranscript|><|{lang}|><|transcribe|>
 //! <|notimestamps|>`, then greedy tokens until `<|endoftext|>`. vLLM builds
-//! the identical string (`whisper.py get_generation_prompt`) and applies no
-//! logit suppression on top - audited, so neither do we; the HF generation
-//! config's `suppress_tokens` would be a divergence from the reference, not a
-//! fidelity gain.
+//! the identical string (`whisper.py get_generation_prompt`). On suppression
+//! the reference is openai/whisper, not vLLM: its decoder masks the prompt
+//! block and `<|nospeech|>` before every softmax (`SuppressTokens`), and so
+//! does this one, through the pick kernel's mask (`DecodeTokens::suppressed`).
+//! Without it a window holding a sliver of audio comes back as a confident
+//! `<|nospeech|>` token that the no-speech guard keeps (it is confident) and
+//! the word-timing pass refuses. The HF generation config's wider
+//! `suppress_tokens` list (punctuation and symbols) stays unapplied.
 //!
 //! KV precision: `kv_dtype`, f16 by default and fp8-e4m3 under
 //! `--kv-cache-dtype fp8_e4m3`. f16 is the reference's own class (vLLM serves
@@ -183,6 +187,9 @@ struct Scratch {
     /// per-row `{flags, lowest allowed timestamp}` for the timestamp grammar
     /// - `[rows, 2]`, uploaded per step like `d_pos`
     d_rules: CudaSlice<u32>,
+    /// the ids the pick never returns (`DecodeTokens::suppressed`), resident
+    /// for the graph's lifetime like every other buffer the tick records
+    d_suppress: CudaSlice<u32>,
 }
 
 /// What one batched decode step produced, per ACTIVE row (not per slot).
@@ -239,6 +246,7 @@ impl GpuWhisper {
         hp: &super::Hparams,
         heads: usize,
         hd: usize,
+        suppress: &[u32],
     ) -> Result<Scratch, GpuModelError> {
         let (d, ffn) = (hp.d_model, hp.dec_ffn);
         Ok(Scratch {
@@ -260,6 +268,7 @@ impl GpuWhisper {
             d_alt: exec.to_device_u32(&vec![0u32; rows])?,
             d_stats: exec.alloc(rows * 4)?,
             d_rules: exec.to_device_u32(&vec![0u32; rows * 2])?,
+            d_suppress: exec.to_device_u32(suppress)?,
         })
     }
 
@@ -286,8 +295,8 @@ impl GpuWhisper {
         st.warmed.clear();
         // free the old scratch before asking for the new one, so the peak is
         // one set and not two
-        st.s = Self::alloc_scratch(&exec, 1, &self.hp, heads, hd)?;
-        st.s = Self::alloc_scratch(&exec, n, &self.hp, heads, hd)?;
+        st.s = Self::alloc_scratch(&exec, 1, &self.hp, heads, hd, &self.tokens.suppressed())?;
+        st.s = Self::alloc_scratch(&exec, n, &self.hp, heads, hd, &self.tokens.suppressed())?;
         tracing::debug!(rows = n, "whisper decode scratch widened");
         Ok(())
     }
@@ -340,7 +349,7 @@ impl GpuWhisper {
             cross_v,
             self_k,
             self_v,
-            s: Self::alloc_scratch(&exec, cap, &self.hp, heads, hd)?,
+            s: Self::alloc_scratch(&exec, cap, &self.hp, heads, hd, &self.tokens.suppressed())?,
             enc_stage: exec.alloc_f16(super::encoder::enc_batch_env() * n_enc * d)?,
             // the layer-batched landing scales with the admission batch cap
             //  - 246 MB per window at large-v3, the price of
@@ -904,6 +913,7 @@ impl GpuWhisper {
             &mut st.s.d_alt,
             &mut st.s.d_stats,
             self.tokens.nospeech,
+            Some(&st.s.d_suppress),
             b,
             vocab,
         )?;

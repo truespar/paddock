@@ -498,6 +498,9 @@ impl AppState {
 /// Largest request body the runner will buffer. See the layer below for why
 /// this is far above axum's 2 MB default and why it is still bounded.
 const MAX_BODY: usize = 192 * 1024 * 1024;
+/// Audio uploads outgrow the image ceiling: 1 GiB is ~9 h of 16-kHz WAV; the
+/// decoded minutes are bounded separately by `transcriptions::MAX_SECONDS`.
+const TRANSCRIPTION_BODY: usize = 1024 * 1024 * 1024;
 
 pub fn router(state: Arc<AppState>) -> Router {
     // The inference API + operational endpoints. Every unmatched path gets the
@@ -541,7 +544,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/rerank", post(crate::embeddings::rerank))
         .route(
             "/v1/audio/transcriptions",
-            post(crate::transcriptions::handle),
+            post(crate::transcriptions::handle)
+                .layer(axum::extract::DefaultBodyLimit::max(TRANSCRIPTION_BODY)),
         )
         .route(
             "/v1/audio/speech",
@@ -554,8 +558,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/v1/audio/diarizations",
-            post(crate::diarizations::handle)
-                .layer(axum::extract::DefaultBodyLimit::max(25 * 1024 * 1024)),
+            post(crate::diarizations::handle).layer(axum::extract::DefaultBodyLimit::max(MAX_BODY)),
         )
         .route("/v1/segmentations", post(crate::segmentations::handle))
         .route("/v1/masks", post(crate::masks::handle))

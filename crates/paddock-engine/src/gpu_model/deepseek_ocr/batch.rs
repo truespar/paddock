@@ -53,7 +53,7 @@ use std::collections::HashMap;
 use cudarc::driver::CudaSlice;
 use cudarc::driver::sys::CUstreamCaptureMode;
 
-use crate::gpu::{GpuError, KvDtype};
+use crate::gpu::{DASH_D, GpuError, KvDtype};
 use crate::gpu_model::gpt_oss::GpuModelError;
 use crate::gpu_model::granite::batch::pf_rows;
 use crate::gpu_model::qwen35::{gemv_any, mmq_pre_any, prefill_mm_pre_any, prefill_quant};
@@ -190,6 +190,8 @@ pub(crate) struct BatchState {
     /// Rows the last `prefix_resume` adopted, per slot - `take_prefill_reused`
     /// telemetry (the usage report's `cached` field).
     pub last_reused: Vec<usize>,
+    /// Unlimited-OCR-2's router state (None on the R-SWA members).
+    pub dash: Option<super::dash::DashDev>,
 }
 
 /// Contiguous same-slot runs over a chunk's prefill rows - an attention
@@ -253,7 +255,15 @@ impl GpuDeepseekOcr {
             + (pairs_cap * embd * 4)
             + (rows_pad_cap * hp.n_ff_exp)
             + (256 << 20);
-        let px_on = !super::prefix::prefix_disabled();
+        // the router lane keeps per-block summaries beside the KV; a resumed
+        // prefix would need them restored too, so prefix reuse is off there
+        let px_on = !super::prefix::prefix_disabled() && hp.dash.is_none();
+        if hp.dash.is_some() && (!self.exec.has_dash() || !matches!(self.kv_dtype, KvDtype::Fp16)) {
+            return Err(GpuModelError::Unsupported(
+                "unlimited-ocr-2 needs the pack's SR-SWA kernels (slots 935-939) and an f16 KV"
+                    .into(),
+            ));
+        }
         let retain = if px_on {
             super::prefix::retention_blocks()
         } else {
@@ -381,7 +391,17 @@ impl GpuDeepseekOcr {
             graphs: HashMap::new(),
             slot0_pos: 0,
             last_reused: vec![0; slots],
+            dash: None,
         });
+        if let Some(d) = self.hp.dash {
+            let dd = super::dash::DashDev::new(&self.exec, &d, n_layer, slots, cap, self.max_ctx)?;
+            tracing::info!(
+                "unlimited-ocr-2 router state: {:.1} MiB ({} blocks a slot)",
+                dd.bytes() as f64 / (1u64 << 20) as f64,
+                dd.kbar_blocks
+            );
+            self.batch.as_mut().expect("just built").dash = Some(dd);
+        }
         tracing::info!(
             "deepseek-ocr batch: {slots} slots, {n_layer}-layer pool {pool_blocks} blocks \
              ({:.2} GiB, {} tokens), {} rows/chunk, R-SWA {:?} - KV per slot pins at \
@@ -400,7 +420,10 @@ impl GpuDeepseekOcr {
     /// marked and the warmup is over.
     fn ring_map(&self, slot: usize, pos: usize) -> (usize, usize) {
         let bs = self.batch.as_ref().expect("batch enabled");
-        match (bs.ring[slot].prefill_len, self.hp.rswa_window) {
+        // the router lane's ring is its local window (its attention reads the
+        // window by true position; the bound stream is unused there)
+        let window = self.hp.rswa_window.or(self.hp.dash.map(|d| d.local_window));
+        match (bs.ring[slot].prefill_len, window) {
             (Some(pf), Some(w)) if pos >= pf + w => (pf + (pos - pf) % w, pf + w - 1),
             _ => (pos, pos),
         }
@@ -468,6 +491,9 @@ impl GpuDeepseekOcr {
             if !occ && s < bs.tables.len() && !bs.tables[s].blocks().is_empty() {
                 bs.tables[s].clear(&mut bs.pool);
                 bs.ring[s] = RingState::default();
+                if let Some(dd) = bs.dash.as_mut() {
+                    dd.slots[s] = None;
+                }
             }
         }
     }
@@ -503,6 +529,7 @@ impl GpuDeepseekOcr {
         tokens: &[u32],
     ) -> Result<Vec<f32>, GpuModelError> {
         self.admit(slot, tokens.len())?;
+        self.dash_admit(slot, tokens);
         let mut base = self.prefill_resume_rows(slot, tokens, tokens.len())?;
         let mut last_len = 0usize;
         for chunk in tokens[base..].chunks(pf_rows()) {
@@ -518,7 +545,9 @@ impl GpuDeepseekOcr {
         self.prefix_insert(slot, tokens);
         // Everything appended so far is the globally-visible prefix; the ring
         // covers only what decode appends after this.
-        self.batch.as_mut().expect("batch enabled").ring[slot].prefill_len = Some(tokens.len());
+        let base = self.ring_base(slot, tokens.len());
+        self.batch.as_mut().expect("batch enabled").ring[slot].prefill_len = Some(base);
+        self.dash_head_guard(slot)?;
         self.head_row(last_len - 1)
     }
 
@@ -603,7 +632,7 @@ impl GpuDeepseekOcr {
             }
         }
         self.ensure_rows(&slots_v, &wpos)?;
-        self.upload_rows(&toks, &pos, &wpos, &apos, &slots_v)?;
+        self.upload_rows(&toks, &pos, &wpos, &apos, &slots_v, dec)?;
         self.embed_rows(r)?;
         self.splice_queued_rows(chunk, dec)?;
         // triage (PADDOCK_OCR_CHUNK_DUMP=1): bit-exact hash of the spliced
@@ -679,7 +708,7 @@ impl GpuDeepseekOcr {
         }
         // grown by the WRITE slot: once the ring engages this never grows again
         self.ensure_rows(slots, &wpos)?;
-        self.upload_rows(tokens, positions, &wpos, &apos, slots)?;
+        self.upload_rows(tokens, positions, &wpos, &apos, slots, r)?;
         self.step_replay(r)
     }
 
@@ -737,6 +766,8 @@ impl GpuDeepseekOcr {
         Ok(())
     }
 
+    /// Upload one pass's row streams; the leading `dec` rows are the decode
+    /// band (holes included), the rest prompt rows.
     pub(super) fn upload_rows(
         &mut self,
         tokens: &[u32],
@@ -744,6 +775,7 @@ impl GpuDeepseekOcr {
         wpos: &[u32],
         apos: &[u32],
         slots: &[u32],
+        dec: usize,
     ) -> Result<(), GpuModelError> {
         let bs = self.batch.as_mut().expect("batch enabled");
         self.exec.upload_u32(tokens, &mut bs.sc.d_toks)?;
@@ -751,7 +783,9 @@ impl GpuDeepseekOcr {
         self.exec.upload_u32(wpos, &mut bs.sc.d_wpos)?;
         self.exec.upload_u32(apos, &mut bs.sc.d_apos)?;
         self.exec.upload_u32(slots, &mut bs.sc.d_slots)?;
-        Ok(())
+        // every pass uploads its rows exactly once, here: the router lane's
+        // decode state machine advances with them
+        self.dash_prepare(tokens, pos, slots, dec)
     }
 
     pub(super) fn embed_rows(&mut self, r: usize) -> Result<(), GpuModelError> {
@@ -777,6 +811,7 @@ impl GpuDeepseekOcr {
             (hp.n_expert, hp.n_expert_used, hp.n_ff_exp, hp.shexp_ff());
         let rope = self.rope_params();
         let kv_dtype = self.kv_dtype;
+        let dash_p = self.hp.dash;
         let bs = self.batch.as_mut().expect("batch enabled");
         let bps = bs.bps;
         let pf = cuts.is_some();
@@ -917,65 +952,252 @@ impl GpuDeepseekOcr {
             // one-stream fusions couldn't serve); roped k goes straight to
             // the pool (nothing reads sc.k after the append).
             let kvs = &mut bs.kv[li];
-            if rope_fuse {
-                exec.rope_qk_append_paged_ring(
+            if let (Some(d), Some(rt)) = (dash_p, layer.router.as_ref()) {
+                // SR-SWA: the router's [q_r | k_r] off the same normed rows,
+                // its norms + the page-2D rope on q / k / q_r / k_r, the K / V
+                // appends, then this layer's block summaries, the per-row
+                // route / select and the sparse attention into sc.attn
+                let dd = bs
+                    .dash
+                    .as_mut()
+                    .expect("router state enabled with the lane");
+                exec.matvec_f32_batch(&rt.wqk, &sc.xn, &mut dd.rqk, r)?;
+                exec.dash_rope2d(
                     &mut sc.q,
                     &mut sc.k,
-                    &sc.v,
-                    &mut kvs.k,
-                    &mut kvs.v,
-                    &sc.d_pos,
-                    &sc.d_wpos,
-                    Some(&sc.d_slots),
+                    &mut dd.rqk,
+                    DASH_D,
+                    2 * DASH_D,
+                    &rt.q_norm1,
+                    &rt.k_norm1,
+                    eps,
+                    &dd.d_coords,
+                    &dd.inv_tok,
+                    r,
+                    nh,
+                )?;
+                for (src, dst) in [(&sc.k, &mut kvs.k), (&sc.v, &mut kvs.v)] {
+                    exec.kv_append_batch_paged(
+                        src,
+                        dst,
+                        &sc.d_wpos,
+                        Some(&sc.d_slots),
+                        &bs.d_bt,
+                        bps,
+                        kv_dim,
+                        r,
+                        kv_dtype,
+                    )?;
+                }
+                exec.dash_summary(
+                    &dd.rqk,
+                    DASH_D,
+                    2 * DASH_D,
+                    &mut dd.staging[li],
+                    &mut dd.kbar[li],
+                    &rt.head_cls.buf,
+                    &dd.d_items,
+                    dd.n_items,
+                    dd.kbar_blocks,
+                )?;
+                exec.dash_route(
+                    &dd.rqk,
+                    2 * DASH_D,
+                    &dd.kbar[li],
+                    dd.kbar_blocks,
+                    &dd.d_rinfo,
+                    &mut dd.sel_blk,
+                    &mut dd.sel_bias,
+                    &mut dd.sel_n,
+                    r,
+                    d.local_blocks,
+                    d.entmax_window,
+                    d.topk_blocks,
+                    d.score_scale,
+                    d.floor,
+                    1.0 / d.sigma,
+                )?;
+                exec.dash_attn_f16(
+                    &sc.q,
+                    &kvs.k,
+                    &kvs.v,
+                    &mut sc.attn,
                     &bs.d_bt,
                     bps,
-                    nh,
-                    n_kv,
-                    hd,
-                    rope,
+                    &dd.d_ainfo,
+                    &dd.sel_blk,
+                    &dd.sel_bias,
+                    &dd.sel_n,
                     r,
-                    true,
-                    kv_dtype,
+                    nh,
+                    scale,
+                    d.local_window,
                 )?;
             } else {
-                exec.rope_yarn_batch(&mut sc.q, &sc.d_pos, nh, hd, rope, r)?;
-                exec.rope_yarn_batch(&mut sc.k, &sc.d_pos, n_kv, hd, rope, r)?;
-                exec.kv_append_batch_paged(
-                    &sc.k,
-                    &mut kvs.k,
-                    &sc.d_wpos,
-                    Some(&sc.d_slots),
-                    &bs.d_bt,
-                    bps,
-                    kv_dim,
-                    r,
-                    kv_dtype,
-                )?;
-                exec.kv_append_batch_paged(
-                    &sc.v,
-                    &mut kvs.v,
-                    &sc.d_wpos,
-                    Some(&sc.d_slots),
-                    &bs.d_bt,
-                    bps,
-                    kv_dim,
-                    r,
-                    kv_dtype,
-                )?;
-            }
-            // Attention bounds come from d_apos - clamped once the ring is
-            // full, equal to d_pos everywhere else.
-            match cuts {
-                Some(c) => {
-                    let all: &[(usize, usize)] = if c.runs.len() == 1 && c.dec == 0 {
-                        &[(0, r)]
-                    } else {
-                        &c.runs
-                    };
-                    if c.dec > 0 {
-                        // decode rows sit at [0, c.dec) so the batch-shaped
-                        // partial covers them exactly (row_off is always 0)
-                        let ns = attn_splits_for(nh, c.dec, exec.sm_count());
+                if rope_fuse {
+                    exec.rope_qk_append_paged_ring(
+                        &mut sc.q,
+                        &mut sc.k,
+                        &sc.v,
+                        &mut kvs.k,
+                        &mut kvs.v,
+                        &sc.d_pos,
+                        &sc.d_wpos,
+                        Some(&sc.d_slots),
+                        &bs.d_bt,
+                        bps,
+                        nh,
+                        n_kv,
+                        hd,
+                        rope,
+                        r,
+                        true,
+                        kv_dtype,
+                    )?;
+                } else {
+                    exec.rope_yarn_batch(&mut sc.q, &sc.d_pos, nh, hd, rope, r)?;
+                    exec.rope_yarn_batch(&mut sc.k, &sc.d_pos, n_kv, hd, rope, r)?;
+                    exec.kv_append_batch_paged(
+                        &sc.k,
+                        &mut kvs.k,
+                        &sc.d_wpos,
+                        Some(&sc.d_slots),
+                        &bs.d_bt,
+                        bps,
+                        kv_dim,
+                        r,
+                        kv_dtype,
+                    )?;
+                    exec.kv_append_batch_paged(
+                        &sc.v,
+                        &mut kvs.v,
+                        &sc.d_wpos,
+                        Some(&sc.d_slots),
+                        &bs.d_bt,
+                        bps,
+                        kv_dim,
+                        r,
+                        kv_dtype,
+                    )?;
+                }
+                // Attention bounds come from d_apos - clamped once the ring is
+                // full, equal to d_pos everywhere else.
+                match cuts {
+                    Some(c) => {
+                        let all: &[(usize, usize)] = if c.runs.len() == 1 && c.dec == 0 {
+                            &[(0, r)]
+                        } else {
+                            &c.runs
+                        };
+                        if c.dec > 0 {
+                            // decode rows sit at [0, c.dec) so the batch-shaped
+                            // partial covers them exactly (row_off is always 0)
+                            let ns = attn_splits_for(nh, c.dec, exec.sm_count());
+                            if ns > 1 && exec.has_attn_partial_batch_paged() {
+                                exec.attn_partial_batch_paged(
+                                    &sc.q,
+                                    &kvs.k,
+                                    &kvs.v,
+                                    &mut sc.attn_o,
+                                    &mut sc.attn_ml,
+                                    &sc.d_apos,
+                                    Some(&sc.d_slots),
+                                    &bs.d_bt,
+                                    bps,
+                                    nh,
+                                    n_kv,
+                                    hd,
+                                    kv_dim,
+                                    0,
+                                    ns,
+                                    c.dec,
+                                    scale,
+                                    kv_dtype,
+                                )?;
+                                exec.attn_combine_batch(
+                                    &sc.attn_o,
+                                    &sc.attn_ml,
+                                    &sc.sinks,
+                                    &mut sc.attn,
+                                    nh,
+                                    hd,
+                                    ns,
+                                    c.dec,
+                                )?;
+                            } else {
+                                exec.attn_decode_batch_rows_paged(
+                                    &sc.q,
+                                    &kvs.k,
+                                    &kvs.v,
+                                    &sc.sinks,
+                                    &mut sc.attn,
+                                    &sc.d_apos,
+                                    Some(&sc.d_slots),
+                                    &bs.d_bt,
+                                    bps,
+                                    nh,
+                                    n_kv,
+                                    hd,
+                                    kv_dim,
+                                    0,
+                                    0,
+                                    c.dec,
+                                    scale,
+                                    kv_dtype,
+                                )?;
+                            }
+                        }
+                        for &(off, len) in all {
+                            if off < c.dec {
+                                continue;
+                            }
+                            if wmma_pf {
+                                exec.attn_prefill_f16_paged_at(
+                                    &sc.q,
+                                    &kvs.k,
+                                    &kvs.v,
+                                    &sc.sinks,
+                                    &mut sc.attn,
+                                    &sc.d_apos,
+                                    &sc.d_slots,
+                                    off,
+                                    &bs.d_bt,
+                                    bps,
+                                    nh,
+                                    n_kv,
+                                    hd,
+                                    kv_dim,
+                                    0,
+                                    len,
+                                    scale,
+                                    kv_dtype,
+                                )?;
+                            } else {
+                                exec.attn_decode_batch_rows_paged(
+                                    &sc.q,
+                                    &kvs.k,
+                                    &kvs.v,
+                                    &sc.sinks,
+                                    &mut sc.attn,
+                                    &sc.d_apos,
+                                    Some(&sc.d_slots),
+                                    &bs.d_bt,
+                                    bps,
+                                    nh,
+                                    n_kv,
+                                    hd,
+                                    kv_dim,
+                                    0,
+                                    off,
+                                    len,
+                                    scale,
+                                    kv_dtype,
+                                )?;
+                            }
+                        }
+                    }
+                    None => {
+                        let ns = attn_splits_for(nh, r, exec.sm_count());
                         if ns > 1 && exec.has_attn_partial_batch_paged() {
                             exec.attn_partial_batch_paged(
                                 &sc.q,
@@ -993,7 +1215,7 @@ impl GpuDeepseekOcr {
                                 kv_dim,
                                 0,
                                 ns,
-                                c.dec,
+                                r,
                                 scale,
                                 kv_dtype,
                             )?;
@@ -1005,10 +1227,10 @@ impl GpuDeepseekOcr {
                                 nh,
                                 hd,
                                 ns,
-                                c.dec,
+                                r,
                             )?;
                         } else {
-                            exec.attn_decode_batch_rows_paged(
+                            exec.attn_decode_batch_paged(
                                 &sc.q,
                                 &kvs.k,
                                 &kvs.v,
@@ -1023,115 +1245,11 @@ impl GpuDeepseekOcr {
                                 hd,
                                 kv_dim,
                                 0,
-                                0,
-                                c.dec,
+                                r,
                                 scale,
                                 kv_dtype,
                             )?;
                         }
-                    }
-                    for &(off, len) in all {
-                        if off < c.dec {
-                            continue;
-                        }
-                        if wmma_pf {
-                            exec.attn_prefill_f16_paged_at(
-                                &sc.q,
-                                &kvs.k,
-                                &kvs.v,
-                                &sc.sinks,
-                                &mut sc.attn,
-                                &sc.d_apos,
-                                &sc.d_slots,
-                                off,
-                                &bs.d_bt,
-                                bps,
-                                nh,
-                                n_kv,
-                                hd,
-                                kv_dim,
-                                0,
-                                len,
-                                scale,
-                                kv_dtype,
-                            )?;
-                        } else {
-                            exec.attn_decode_batch_rows_paged(
-                                &sc.q,
-                                &kvs.k,
-                                &kvs.v,
-                                &sc.sinks,
-                                &mut sc.attn,
-                                &sc.d_apos,
-                                Some(&sc.d_slots),
-                                &bs.d_bt,
-                                bps,
-                                nh,
-                                n_kv,
-                                hd,
-                                kv_dim,
-                                0,
-                                off,
-                                len,
-                                scale,
-                                kv_dtype,
-                            )?;
-                        }
-                    }
-                }
-                None => {
-                    let ns = attn_splits_for(nh, r, exec.sm_count());
-                    if ns > 1 && exec.has_attn_partial_batch_paged() {
-                        exec.attn_partial_batch_paged(
-                            &sc.q,
-                            &kvs.k,
-                            &kvs.v,
-                            &mut sc.attn_o,
-                            &mut sc.attn_ml,
-                            &sc.d_apos,
-                            Some(&sc.d_slots),
-                            &bs.d_bt,
-                            bps,
-                            nh,
-                            n_kv,
-                            hd,
-                            kv_dim,
-                            0,
-                            ns,
-                            r,
-                            scale,
-                            kv_dtype,
-                        )?;
-                        exec.attn_combine_batch(
-                            &sc.attn_o,
-                            &sc.attn_ml,
-                            &sc.sinks,
-                            &mut sc.attn,
-                            nh,
-                            hd,
-                            ns,
-                            r,
-                        )?;
-                    } else {
-                        exec.attn_decode_batch_paged(
-                            &sc.q,
-                            &kvs.k,
-                            &kvs.v,
-                            &sc.sinks,
-                            &mut sc.attn,
-                            &sc.d_apos,
-                            Some(&sc.d_slots),
-                            &bs.d_bt,
-                            bps,
-                            nh,
-                            n_kv,
-                            hd,
-                            kv_dim,
-                            0,
-                            r,
-                            scale,
-                            kv_dtype,
-                        )?;
                     }
                 }
             }
@@ -1354,29 +1472,42 @@ impl GpuDeepseekOcr {
                         .unwrap_or(false)
                         && exec.compute_capability().0 >= 8
                         && paddock_models::dev_var_os!("PADDOCK_NO_QMOE_MMA").is_none();
-                    // Read-once at decode is a closed front - three dedup
-                    // shapes were measured, all lost to this
-                    // per-pair streaming. The uniq histogram prices c8 decode
-                    // at ~31 uniq experts under 48 pairs - only 1.55x
-                    // redundant bytes - and every dedup shape paid more than
-                    // that in shape taxes: (a) sorted mma at decode width
-                    // (pad-block waste + align fixed
-                    // costs); (b) a bit-exact dp4a grouped pair, one block
-                    // per (out-row, expert), row staged to shared - gate_up
-                    // med 160.9 us / down 111.7 vs this pair band's
+                    // Read-once at decode was measured closed at c8 - three
+                    // dedup shapes, all lost to this per-pair streaming. The
+                    // uniq histogram prices c8 decode at ~31 uniq experts
+                    // under 48 pairs - only 1.55x redundant bytes - and every
+                    // dedup shape paid more than that in shape taxes: (a)
+                    // sorted mma at decode width (pad-block waste + align
+                    // fixed costs); (b) a bit-exact dp4a grouped pair, one
+                    // block per (out-row, expert), row staged to shared -
+                    // gate_up med 160.9 us / down 111.7 vs this pair band's
                     // 74.1 + 36.9 (the per-CTA scan->stage->dot chain
-                    // dominates at 896-1360 B rows, ~1.55 tokens/expert);
-                    // (c) the walk repair, out-row tiles with
-                    // register-hoisted rows - 150.9 / 47.9
-                    // (block-wide bit-exact reductions serialize
-                    // (row x pair) rounds; even the barrier-free
+                    // dominates at 896-1360 B rows, ~1.55 tokens/expert); (c)
+                    // the walk repair, out-row tiles with register-hoisted
+                    // rows - 150.9 / 47.9 (block-wide bit-exact reductions
+                    // serialize (row x pair) rounds; even the barrier-free
                     // warp-per-row down reached only ~55% of roof vs this
-                    // kernel's ~100%). At sub-1.5 KB expert rows and <2
-                    // tokens per expert, per-pair streaming is the optimal
-                    // shape - do not rebuild dedup here without a new
-                    // routing measurement showing >~3x pair/uniq.
+                    // kernel's ~100%).
+                    //
+                    // WIDE decode is the other side of that bar (2026-11-10,
+                    // GB10, Unlimited-OCR-2 battery, end to end): at c32 the
+                    // pairs are 192 over at most 64 experts and the dp4a pair
+                    // re-streams each expert ~3x - 1.04 + 0.53 ms a layer,
+                    // the step's largest cost. The sorted pair (a) reads each
+                    // touched expert once: pages/s c32 +57%, c16 +25%, c8
+                    // +4%, while at c4 (24 pairs) it LOSES 9% - its pad and
+                    // align costs are fixed. So decode takes it from 3/4 of a
+                    // pair per expert up. Numerically that makes a decode
+                    // step's MoE class depend on the batch width (prefill
+                    // rows stay one class, the cold-vs-cached rule above);
+                    // this family's decode is not row-count invariant anyway.
+                    let wide_pairs: usize =
+                        paddock_models::dev_var!("PADDOCK_QMOE_DECODE_SORTED_PAIRS")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or((3 * n_expert).div_ceil(4));
                     let sorted = mma
-                        && pf
+                        && (pf || pairs >= wide_pairs)
                         && paddock_models::dev_var_os!("PADDOCK_NO_SORTED_QMOE").is_none();
                     if sorted {
                         // BM=64 halves the weight re-reads once blocks
@@ -1635,6 +1766,18 @@ impl GpuDeepseekOcr {
                 &mut sc.part,
                 &mut sc.head_logits,
                 rows,
+            )?;
+        }
+        // the page-count guard on every head row, before any sampler sees it
+        // (modes uploaded per pass; a prompt's first head sets row 0)
+        if let (Some(d), Some(dd)) = (self.hp.dash, bs.dash.as_ref()) {
+            exec.dash_guard(
+                &mut sc.head_logits,
+                &dd.d_guard,
+                rows,
+                self.hp.n_vocab,
+                d.eos_token_id,
+                d.page_token_id,
             )?;
         }
         Ok(())

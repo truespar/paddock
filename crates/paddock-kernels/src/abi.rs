@@ -4028,8 +4028,12 @@ pub struct KernelTableV1 {
     /// no runner-up.
     ///
     /// The pick is bit-identical to `argmax_rows` (same tie rule, applied at
-    /// both ranks), so asking for confidence can never move a transcript.
-    /// `(logits, out_u32, alt_u32 or null, stats_f32 or null, probe, rows, n, stream)`.
+    /// both ranks), so asking for confidence can never move a transcript -
+    /// unless `mask` names ids: those are suppressed before the softmax (never
+    /// picked, out of the normaliser), the reference's `SuppressTokens`; the
+    /// probe alone still reads the unsuppressed distribution. At most 8 ids.
+    /// `(logits, out_u32, alt_u32 or null, stats_f32 or null, probe, mask_u32 or null,
+    /// n_mask, rows, n, stream)`.
     pub argmax_top2_rows: Option<ArgmaxTop2RowsFn>,
     /// Whisper's `ApplyTimestampRules` over a `[rows, vocab]` logits block, in
     /// place. Without it a fine-tune greedily picks `<|notimestamps|>` and
@@ -9746,7 +9750,301 @@ pub struct KernelTableV1 {
     /// q (the same bits as 925 on the f32 plane). batch 0 is the readiness
     /// probe: 0 when the rung takes the shape, cudaErrorNotSupported else.
     pub attn_prefill_f16_paged_q16: Option<AttnPrefillPagedWpFn>,
+    /// Slot 931: `pd_nvf4_pf_gemm3` - up to three slot-920 planes (q|k|v)
+    /// over the same bf16 rows and in_dim in one launch, each plane its 920
+    /// bits; out_dim 0 skips a plane. cudaErrorNotSupported off the register-
+    /// decode arm (sm_90+), and the caller keeps three 920 launches.
+    pub nvf4_pf_gemm3: Option<Nvf4PfGemm3Fn>,
+    /// Slot 932: `pd_nvf4_pf_moe_gu_sh` - slot 926's routed gate|up and slot
+    /// 921's shared gate|up (landing at column `aoff` of the same act rows)
+    /// in one grid, each its own launch's bits. cudaErrorNotSupported off the
+    /// register-decode arm.
+    pub nvf4_pf_moe_gu_sh: Option<Nvf4PfMoeGuShFn>,
+    /// Slot 933: `pd_nvf4_pf_moe_dn_sh` - slot 923's routed down and slot
+    /// 920's shared down (reading act from column `aoff`, into `y`) in one
+    /// grid, each its own launch's bits. cudaErrorNotSupported off 923's
+    /// MPER-4, two-k-tile-copy arm.
+    pub nvf4_pf_moe_dn_sh: Option<Nvf4PfMoeDnShFn>,
+    /// Slot 934: `pd_nvf4_pf_qkv_nr` - slot 931's q|k|v grid with the q / k
+    /// norm + rope (the f32 v3 arm, NEOX, head_dim 128, unnormed V) in its
+    /// epilogues: q as f16 x qscale into q16 from row `dec` on (f32 into qn
+    /// below it), k into kn, v as projected - each row the projection +
+    /// norm + rope passes' bits. `rope` = 6 host floats (theta scale, freq
+    /// scale, corr low, corr high, ext factor, mscale). cudaErrorNotSupported
+    /// off the register-decode arm or under the norm + rope pins.
+    pub nvf4_pf_qkv_nr: Option<Nvf4PfQkvNrFn>,
+    /// Slot 935: `pd_dash_rope2d` - Unlimited-OCR-2's page-2D rope, in place on
+    /// every head of q and k `[rows][n_head * 128]` and the router's q / k
+    /// (`rq` / `rk`, row stride `rstride`), the router planes Gemma-RMS-normed
+    /// first (`rqw` / `rkw` = 1 + w): pair j < 63 turns by `tok * inv_tok[j]`,
+    /// pair 63 by the page parity, from `coords` `[rows][2]` u32 (tok, parity).
+    /// (q, k, rq, rk, rqw, rkw, coords, inv_tok, rows, n_head, rstride, eps,
+    /// stream)
+    pub dash_rope2d: Option<DashRope2dFn>,
+    /// Slot 936: `pd_dash_summary` - router block summaries: per item
+    /// `[slot, blk, row0, n_chunk, n_prev, stage]` u32, the block's keys (n_prev
+    /// staged rows, then n_chunk rows of `rk` at row0) summarized against
+    /// `head_cls` into `kbar[slot][blk]`; `stage` copies the chunk keys into the
+    /// slot's 32-row staging. (rk, rstride, staging, kbar, head_cls, items,
+    /// n_items, kbar_blocks, stream)
+    pub dash_summary: Option<DashSummaryFn>,
+    /// Slot 937: `pd_dash_route` - per row `[slot, pos, lo, hi, nblk_m, cap]`
+    /// u32: scores the remote blocks (none past `cap`) of `[lo, hi]` (every
+    /// remote block when lo > hi or the clip leaves none), the top M,
+    /// 1.5-entmax, the first K with their log-prior biases into `out_blk` /
+    /// `out_bias` (16 a row) and `out_n`.
+    /// (rq, rstride, kbar, kbar_blocks, rinfo, out_blk, out_bias, out_n, rows,
+    /// local_blocks, M, K, score_scale, floor, inv_sigma, stream)
+    pub dash_route: Option<DashRouteFn>,
+    /// Slot 938: `pd_dash_attn_f16` - the sparse attention over the paged f16
+    /// pool: per row `[slot, pos, keep, ring]` u32 (position j at pool row
+    /// `j < keep ? j : keep + (j - keep) % ring`), the 128-key window plus the
+    /// selected blocks with their biases, one fp32 softmax. (q, kpool, vpool,
+    /// out, block_tables, bps, ainfo, sel_blk, sel_bias, sel_n, rows, n_head,
+    /// scale, window, stream)
+    pub dash_attn_f16: Option<DashAttnFn>,
+    /// Slot 939: `pd_dash_guard` - the page-count guard on `[rows][vocab]`
+    /// logits, per row mode 0 none / 1 EOS banned / 2 EOS only / 3 page token
+    /// only. (logits, mode, rows, vocab, eos, page, stream)
+    pub dash_guard: Option<DashGuardFn>,
+    /// Slot 940: `pd_f16_gemm_h_act` - a tower FFN up landing `y16 =
+    /// f16(act(W x + bias))`, act 0 = exact GELU (erf), 1 = quick GELU (`x *
+    /// sigmoid(1.702 x)`): bit-identical to `f16_gemm` + bias add + the
+    /// activation pass(es) + `convert_f32_f16`, which it runs through the f32
+    /// `scratch` plane at shapes the fused landing cannot reproduce (slot 834's
+    /// rule). (w, x, y16, bias, scratch, in_dim, out_dim, batch, act, stream)
+    pub f16_gemm_h_act: Option<F16GemmHActFn>,
+    /// Slot 941: `pd_qkv_bias_split` - a merged `[rows][3d]` f32 q|k|v landing
+    /// split into three `[rows][d]` planes with its `[3d]` bias added: the
+    /// `bias_add` and three `row_slice`s in one pass, bit-identical. d % 4 == 0.
+    /// (qkv, bias, q, k, v, rows, d, stream)
+    pub qkv_bias_split: Option<QkvBiasSplitFn>,
 }
+
+/// See [`KernelTableV1::dash_rope2d`] (slot 935).
+pub type DashRope2dFn = unsafe extern "C" fn(
+    q: *mut core::ffi::c_void,
+    k: *mut core::ffi::c_void,
+    rq: *mut core::ffi::c_void,
+    rk: *mut core::ffi::c_void,
+    rqw: *const core::ffi::c_void,
+    rkw: *const core::ffi::c_void,
+    coords: *const core::ffi::c_void,
+    inv_tok: *const core::ffi::c_void,
+    rows: u32,
+    n_head: u32,
+    rstride: u32,
+    eps: f32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::dash_summary`] (slot 936).
+pub type DashSummaryFn = unsafe extern "C" fn(
+    rk: *const core::ffi::c_void,
+    rstride: u32,
+    staging: *mut core::ffi::c_void,
+    kbar: *mut core::ffi::c_void,
+    head_cls: *const core::ffi::c_void,
+    items: *const core::ffi::c_void,
+    n_items: u32,
+    kbar_blocks: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::dash_route`] (slot 937).
+pub type DashRouteFn = unsafe extern "C" fn(
+    rq: *const core::ffi::c_void,
+    rstride: u32,
+    kbar: *const core::ffi::c_void,
+    kbar_blocks: u32,
+    rinfo: *const core::ffi::c_void,
+    out_blk: *mut core::ffi::c_void,
+    out_bias: *mut core::ffi::c_void,
+    out_n: *mut core::ffi::c_void,
+    rows: u32,
+    local_blocks: u32,
+    m: u32,
+    k: u32,
+    score_scale: f32,
+    floor: f32,
+    inv_sigma: f32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::dash_attn_f16`] (slot 938).
+pub type DashAttnFn = unsafe extern "C" fn(
+    q: *const core::ffi::c_void,
+    kpool: *const core::ffi::c_void,
+    vpool: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    block_tables: *const core::ffi::c_void,
+    bps: u32,
+    ainfo: *const core::ffi::c_void,
+    sel_blk: *const core::ffi::c_void,
+    sel_bias: *const core::ffi::c_void,
+    sel_n: *const core::ffi::c_void,
+    rows: u32,
+    n_head: u32,
+    scale: f32,
+    window: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::dash_guard`] (slot 939).
+pub type DashGuardFn = unsafe extern "C" fn(
+    logits: *mut core::ffi::c_void,
+    mode: *const core::ffi::c_void,
+    rows: u32,
+    vocab: u32,
+    eos: u32,
+    page: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::f16_gemm_h_act`] (slot 940).
+pub type F16GemmHActFn = unsafe extern "C" fn(
+    w: *const core::ffi::c_void,
+    x: *const core::ffi::c_void,
+    y16: *mut core::ffi::c_void,
+    bias: *const core::ffi::c_void,
+    scratch: *mut core::ffi::c_void,
+    in_dim: u32,
+    out_dim: u32,
+    batch: u32,
+    act: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::qkv_bias_split`] (slot 941).
+pub type QkvBiasSplitFn = unsafe extern "C" fn(
+    qkv: *const core::ffi::c_void,
+    bias: *const core::ffi::c_void,
+    q: *mut core::ffi::c_void,
+    k: *mut core::ffi::c_void,
+    v: *mut core::ffi::c_void,
+    rows: u32,
+    d: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::nvf4_pf_qkv_nr`] (slot 934).
+pub type Nvf4PfQkvNrFn = unsafe extern "C" fn(
+    dq: *const core::ffi::c_void,
+    sq: *const core::ffi::c_void,
+    fq: f32,
+    dk: *const core::ffi::c_void,
+    sk: *const core::ffi::c_void,
+    fk: f32,
+    dv: *const core::ffi::c_void,
+    sv: *const core::ffi::c_void,
+    fv: f32,
+    q16: *mut core::ffi::c_void,
+    qn: *mut core::ffi::c_void,
+    kn: *mut core::ffi::c_void,
+    v: *mut core::ffi::c_void,
+    n_head: u32,
+    n_kv: u32,
+    qw: *const core::ffi::c_void,
+    kw: *const core::ffi::c_void,
+    positions: *const core::ffi::c_void,
+    dec: u32,
+    eps: f32,
+    rope: *const f32,
+    qscale: f32,
+    x: *const core::ffi::c_void,
+    in_dim: u32,
+    ntok: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::nvf4_pf_moe_gu_sh`] (slot 932): slot 926's arguments,
+/// then the shared gate (data, scale, s2) and up (data, scale, s2), sff, aoff,
+/// ntok, stream.
+pub type Nvf4PfMoeGuShFn = unsafe extern "C" fn(
+    gdata: *const core::ffi::c_void,
+    gscale: *const core::ffi::c_void,
+    gs2: *const core::ffi::c_void,
+    udata: *const core::ffi::c_void,
+    uscale: *const core::ffi::c_void,
+    us2: *const core::ffi::c_void,
+    sorted_row: *const core::ffi::c_void,
+    sorted_slot: *const core::ffi::c_void,
+    block_expert: *const core::ffi::c_void,
+    x: *const core::ffi::c_void,
+    act: *mut core::ffi::c_void,
+    in_dim: u32,
+    ff: u32,
+    aw: u32,
+    n_blocks: u32,
+    n_expert: u32,
+    sgdata: *const core::ffi::c_void,
+    sgscale: *const core::ffi::c_void,
+    sgs2: f32,
+    sudata: *const core::ffi::c_void,
+    suscale: *const core::ffi::c_void,
+    sus2: f32,
+    sff: u32,
+    aoff: u32,
+    ntok: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::nvf4_pf_moe_dn_sh`] (slot 933): slot 923's
+/// arguments, then the shared down (data, scale, s2), y, sff, aoff, ntok,
+/// stream.
+pub type Nvf4PfMoeDnShFn = unsafe extern "C" fn(
+    data: *const core::ffi::c_void,
+    scale: *const core::ffi::c_void,
+    s2: *const core::ffi::c_void,
+    sorted_row: *const core::ffi::c_void,
+    sorted_slot: *const core::ffi::c_void,
+    block_expert: *const core::ffi::c_void,
+    topk_w: *const core::ffi::c_void,
+    act: *const core::ffi::c_void,
+    aw: u32,
+    part: *mut core::ffi::c_void,
+    ff: u32,
+    embd: u32,
+    k: u32,
+    n_blocks: u32,
+    sdata: *const core::ffi::c_void,
+    sscale: *const core::ffi::c_void,
+    ss2: f32,
+    y: *mut core::ffi::c_void,
+    sff: u32,
+    aoff: u32,
+    ntok: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::nvf4_pf_gemm3`] (slot 931): per plane (data, scale,
+/// s2, y, ldy, out_dim), then x, ldx, xoff, in_dim, ntok, stream.
+pub type Nvf4PfGemm3Fn = unsafe extern "C" fn(
+    d0: *const core::ffi::c_void,
+    s0: *const core::ffi::c_void,
+    f0: f32,
+    y0: *mut core::ffi::c_void,
+    ldy0: u32,
+    n0: u32,
+    d1: *const core::ffi::c_void,
+    s1: *const core::ffi::c_void,
+    f1: f32,
+    y1: *mut core::ffi::c_void,
+    ldy1: u32,
+    n1: u32,
+    d2: *const core::ffi::c_void,
+    s2: *const core::ffi::c_void,
+    f2: f32,
+    y2: *mut core::ffi::c_void,
+    ldy2: u32,
+    n2: u32,
+    x: *const core::ffi::c_void,
+    ldx: u32,
+    xoff: u32,
+    in_dim: u32,
+    ntok: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
 
 /// See [`KernelTableV1::qkv_norm_rope_batch_q16`] (slot 929): (q, k, v, qw,
 /// kw, q16, kn, vn, positions, n_head, n_kv, head_dim, eps, theta_scale,
@@ -12000,7 +12298,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 916;
+pub const KERNEL_TABLE_SLOTS: usize = 927;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,
@@ -14819,6 +15117,8 @@ pub type ArgmaxTop2RowsFn = unsafe extern "C" fn(
     alt: *mut core::ffi::c_void,
     stats: *mut core::ffi::c_void,
     probe: u32,
+    mask: *const core::ffi::c_void,
+    n_mask: u32,
     rows: u32,
     n: u32,
     stream: *mut core::ffi::c_void,
@@ -15963,6 +16263,10 @@ mod tests {
         //   and the rename (argmax_logprob_rows -> argmax_top2_rows) turns a
         //   stale call site into a compile error instead of a shifted
         //   argument list. Rebuild every consumer, examples included.
+        //   WIDENED in PLACE again (mask_u32, n_mask): the reference's
+        //   SuppressTokens for whisper - `<|nospeech|>` and the prompt tokens
+        //   were reaching transcripts on near-empty windows and failing the
+        //   word-timing precondition. Same rule, same rebuild.
         // 344: whisper_ts_rules - whisper's own ApplyTimestampRules as a
         // device-side logit filter; without it greedy decoding picks
         // `<|notimestamps|>` and the timestamp mode silently does nothing.

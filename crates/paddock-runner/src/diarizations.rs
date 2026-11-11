@@ -12,6 +12,14 @@ use paddock_models::diarization::words::{self, Word};
 use serde_json::{Value, json};
 use std::{path::Path, sync::Arc, time::Instant};
 
+/// The longest file accepted: four hours, the same bound as the ASR file
+/// route. The stream itself is duration-independent (speaker cache + FIFO +
+/// <=31 s PCM); what remains is the decoded upload held for the request -
+/// 0.9 GiB of 16-kHz f32 plus the native-rate decode before resampling.
+pub const MAX_SECONDS: u32 = 4 * 3600;
+/// `words` field cap: 100k records with ASR confidence metadata.
+const MAX_WORDS_BYTES: usize = 16 * 1024 * 1024;
+
 pub struct DiarizationModel {
     pub id: String,
     pub service: Diarizer,
@@ -20,7 +28,7 @@ pub struct DiarizationModel {
 impl DiarizationModel {
     pub fn capabilities(&self) -> Value {
         json!({"speaker_diarization":true,"max_speakers":8,"overlap":true,"frame_seconds":0.01,
-        "sample_rate":16000,"max_duration_seconds":600,"transcription":false,"stream":false,
+        "sample_rate":16000,"max_duration_seconds":MAX_SECONDS,"transcription":false,"stream":false,
         "latency_presets":["offline","low","very_low","ultra_low"],
         "realtime_diarization":{"transport":"websocket","path":"/v1/audio/diarizations/stream",
             "audio_format":"pcm_s16le","sample_rate":16000,"channels":1,"max_chunk_samples":16000}})
@@ -145,11 +153,11 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut form: Multipart) -> 
         match name.as_str() {
             "words" => {
                 let bytes = match field.bytes().await {
-                    Ok(b) if b.len() <= 2 * 1024 * 1024 => b,
+                    Ok(b) if b.len() <= MAX_WORDS_BYTES => b,
                     _ => {
                         return err(
                             StatusCode::BAD_REQUEST,
-                            "words must be a JSON array of at most 2 MiB",
+                            "words must be a JSON array of at most 16 MiB",
                         );
                     }
                 };
@@ -158,7 +166,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut form: Multipart) -> 
                     _ => {
                         return err(
                             StatusCode::BAD_REQUEST,
-                            "invalid words; at most 20000 word/start/end records",
+                            "invalid words; at most 100000 word/start/end records",
                         );
                     }
                 };
@@ -216,7 +224,7 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut form: Multipart) -> 
         return err(StatusCode::BAD_REQUEST, "file is required");
     };
     let pcm = match tokio::task::spawn_blocking(move || {
-        let audio = paddock_engine::audio::decode::decode_audio_limited(&file, 600)?;
+        let audio = paddock_engine::audio::decode::decode_audio_limited(&file, MAX_SECONDS)?;
         if audio.samples.iter().any(|v| !v.is_finite()) {
             return Err("audio contains nonfinite samples".to_owned());
         }

@@ -11,6 +11,8 @@
 //! Mirrors `dynamic_preprocess` / `find_closest_aspect_ratio` in the
 //! checkpoint's `modeling_unlimitedocr.py`.
 
+use crate::service::OcrCropMode;
+
 /// Vision patch size (SAM's conv stem), and the 4x token downsample the
 /// projector applies on top. Both are processor_config constants, not config.json.
 const PATCH: usize = 16;
@@ -22,13 +24,15 @@ pub fn num_queries(px: usize) -> usize {
     (px.div_ceil(PATCH)).div_ceil(DOWNSAMPLE)
 }
 
-/// Which rendering mode a request gets. Derived from the request shape, never
-/// configured: the reference mandates non-crop for multi-image, and crop
-/// ("gundam") is only ever used for a single image.
+/// Which rendering mode a request gets. Derived from the request shape unless
+/// the request overrides it: by default one image tiles ("gundam") and several
+/// read base, the references' auto policy. Unlimited-OCR-2 also tiles several
+/// pages on request (its reference reads every page with its own grid); v1's
+/// runner refuses that, its reference mandating non-crop for multi-image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// One image: a whole-page view at `base_px` plus up to `max_tiles` crops
-    /// rendered at `tile_px`.
+    /// Every image: a whole-page view at `base_px` plus up to `max_tiles`
+    /// crops rendered at `tile_px`, each image with its own grid.
     Gundam {
         base_px: usize,
         tile_px: usize,
@@ -40,15 +44,19 @@ pub enum Mode {
 
 impl Mode {
     /// The family default: gundam for a single image, base for several.
-    /// `max_tiles` is 32 on Unlimited-OCR and 6 on the DeepSeek-OCR pair.
+    /// `max_tiles` is 32 on Unlimited-OCR, 16 on Unlimited-OCR-2 and 6 on the
+    /// DeepSeek-OCR pair - a per-IMAGE budget.
     ///
-    /// `force_base` is the request's explicit crop override (the reference's
-    /// `crop_mode=False` single-image config, SGLang's
-    /// `images_config.image_mode = "base"`): base sizing even for one image.
-    /// There is no opposite override - gundam for several images is refused
-    /// upstream, because the reference mandates non-crop for multi-image.
-    pub fn elect(n_images: usize, max_tiles: usize, force_base: bool) -> Self {
-        if n_images == 1 && !force_base {
+    /// `crop` is the request's explicit override (the reference's `crop_mode`,
+    /// SGLang's `images_config`): `Base` sizes even one image base, `Gundam`
+    /// tiles even several.
+    pub fn elect(n_images: usize, max_tiles: usize, crop: Option<OcrCropMode>) -> Self {
+        let tiled = match crop {
+            Some(OcrCropMode::Base) => false,
+            Some(OcrCropMode::Gundam) => true,
+            None => n_images == 1,
+        };
+        if tiled {
             Mode::Gundam {
                 base_px: 1024,
                 tile_px: 640,
@@ -129,12 +137,13 @@ pub fn elect_grid(w: usize, h: usize, tile_px: usize, min_tiles: usize, max_tile
     best
 }
 
-/// How many image tokens a request occupies, and the grid it chose.
+/// How many image tokens a request occupies, and the grids it chose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     pub mode: Mode,
-    /// The crop grid, in gundam mode only.
-    pub grid: Option<Grid>,
+    /// Each image's crop grid, in image order: `None` in base mode and for an
+    /// image that takes gundam's small-image bail.
+    pub grids: Vec<Option<Grid>>,
     /// Total image-id tokens the `<image>` marker(s) expand to.
     pub image_tokens: usize,
     /// Views the vision tower must actually encode (global + crops, or pages).
@@ -143,6 +152,8 @@ pub struct Layout {
     /// their sum, and the graph should walk this rather than re-deriving an
     /// order from the counts.
     pub blocks: Vec<Block>,
+    /// Each image's run of `blocks`, in image order.
+    pub img_blocks: Vec<std::ops::Range<usize>>,
 }
 
 /// Token run for one self-contained view of side `nq` tokens: `nq` rows of
@@ -212,35 +223,30 @@ pub fn max_image_tokens(max_tiles: usize) -> usize {
 }
 
 impl Layout {
-    /// Plan a request. `sizes` is one (width, height) per input image;
-    /// `force_base` is the per-request crop override (see [`Mode::elect`]).
-    pub fn plan(sizes: &[(usize, usize)], max_tiles: usize, force_base: bool) -> Layout {
-        let mode = Mode::elect(sizes.len(), max_tiles, force_base);
-        match mode {
-            Mode::Base { base_px } => {
-                let nq = num_queries(base_px);
-                // Every page is an independent view: rows + newlines + its own
-                // separator. This is what the reference's no-crop branch emits,
-                // and it is why N adjacent <image> markers are token-identical
-                // to the reference's single marker (see the family template).
-                let blocks: Vec<Block> = sizes
-                    .iter()
-                    .flat_map(|_| [Block::Global { side: nq }, Block::Separator])
-                    .collect();
-                Layout {
-                    mode,
-                    grid: None,
-                    image_tokens: sizes.len() * view_tokens(nq),
-                    views: sizes.len(),
-                    blocks,
+    /// Plan a request. `sizes` is one (width, height) per input image; `crop`
+    /// is the per-request override (see [`Mode::elect`]).
+    pub fn plan(sizes: &[(usize, usize)], max_tiles: usize, crop: Option<OcrCropMode>) -> Layout {
+        let mode = Mode::elect(sizes.len(), max_tiles, crop);
+        let mut blocks: Vec<Block> = Vec::new();
+        let mut grids: Vec<Option<Grid>> = Vec::with_capacity(sizes.len());
+        let mut img_blocks = Vec::with_capacity(sizes.len());
+        for &(w, h) in sizes {
+            let start = blocks.len();
+            let grid = match mode {
+                Mode::Base { base_px } => {
+                    // Every page is an independent view: rows + newlines + its
+                    // own separator. This is what the reference's no-crop
+                    // branch emits, and it is why N adjacent <image> markers
+                    // are token-identical to the reference's single marker
+                    // (see the family template).
+                    blocks.extend([
+                        Block::Global {
+                            side: num_queries(base_px),
+                        },
+                        Block::Separator,
+                    ]);
+                    None
                 }
-            }
-            Mode::Gundam {
-                base_px,
-                tile_px,
-                max_tiles,
-            } => {
-                let (w, h) = sizes[0];
                 // The small-image bail, from the reference's prepare loop
                 // (`if image.size[0] <= 640 and image.size[1] <= 640:
                 // crop_ratio = [1, 1]`, vLLM ports it verbatim): an image that
@@ -248,46 +254,70 @@ impl Layout {
                 // view and its separator, 273 tokens. Skipping this branch
                 // would tile a thumbnail into 2+ upscaled crops the reference
                 // never encodes, and every downstream token would be offset.
-                if w <= tile_px && h <= tile_px {
-                    let nq = num_queries(base_px);
-                    return Layout {
-                        mode,
-                        grid: None,
-                        image_tokens: view_tokens(nq),
-                        views: 1,
-                        blocks: vec![Block::Global { side: nq }, Block::Separator],
-                    };
+                Mode::Gundam {
+                    base_px, tile_px, ..
+                } if w <= tile_px && h <= tile_px => {
+                    blocks.extend([
+                        Block::Global {
+                            side: num_queries(base_px),
+                        },
+                        Block::Separator,
+                    ]);
+                    None
                 }
-                let grid = elect_grid(w, h, tile_px, 2, max_tiles);
-                let nq_base = num_queries(base_px);
-                let nq_tile = num_queries(tile_px);
-
-                // The crops are not independent views: they are stitched into
-                // one grid of (rows*nq) token-rows by (cols*nq) token-columns,
-                // and the newline lands at the end of each row of the STITCHED
-                // grid - not per tile. Treating each crop as its own view is the
-                // easy mistake here and inflates the count by (tiles-1) rows'
-                // worth of newlines.
-                //
-                // They also come first, and there is exactly one separator, at
-                // the very end - not one between the two views. See [`Block`].
-                let blocks = vec![
-                    Block::Local {
-                        rows: grid.rows * nq_tile,
-                        cols: grid.cols * nq_tile,
-                    },
-                    Block::Global { side: nq_base },
-                    Block::Separator,
-                ];
-                Layout {
-                    mode,
-                    grid: Some(grid),
-                    image_tokens: blocks.iter().map(Block::tokens).sum(),
-                    views: 1 + grid.tiles(),
-                    blocks,
+                Mode::Gundam {
+                    base_px,
+                    tile_px,
+                    max_tiles,
+                } => {
+                    let grid = elect_grid(w, h, tile_px, 2, max_tiles);
+                    let nq_tile = num_queries(tile_px);
+                    // The crops are not independent views: they are stitched
+                    // into one grid of (rows*nq) token-rows by (cols*nq)
+                    // token-columns, and the newline lands at the end of each
+                    // row of the STITCHED grid - not per tile. Treating each
+                    // crop as its own view is the easy mistake here and
+                    // inflates the count by (tiles-1) rows' worth of newlines.
+                    //
+                    // They also come first, and there is exactly one separator
+                    // an image, at its very end - not one between the two
+                    // views. See [`Block`]. Several tiled pages repeat this
+                    // per page, each with its own grid (the reference's
+                    // per-page loop).
+                    blocks.extend([
+                        Block::Local {
+                            rows: grid.rows * nq_tile,
+                            cols: grid.cols * nq_tile,
+                        },
+                        Block::Global {
+                            side: num_queries(base_px),
+                        },
+                        Block::Separator,
+                    ]);
+                    Some(grid)
                 }
-            }
+            };
+            grids.push(grid);
+            img_blocks.push(start..blocks.len());
         }
+        Layout {
+            mode,
+            image_tokens: blocks.iter().map(Block::tokens).sum(),
+            views: grids.iter().map(|g| 1 + g.map_or(0, |g| g.tiles())).sum(),
+            grids,
+            blocks,
+            img_blocks,
+        }
+    }
+
+    /// Crop tiles across every image.
+    pub fn tiles(&self) -> usize {
+        self.grids.iter().flatten().map(Grid::tiles).sum()
+    }
+
+    /// Any image is tiled.
+    pub fn tiled(&self) -> bool {
+        self.grids.iter().any(Option::is_some)
     }
 }
 
@@ -318,10 +348,10 @@ mod tests {
     /// reference rather than merely with itself.
     #[test]
     fn battery_page_reproduces_the_arbiters_907() {
-        let plan = Layout::plan(&[(1240, 1754)], MAX_TILES, false);
+        let plan = Layout::plan(&[(1240, 1754)], MAX_TILES, None);
         assert_eq!(
-            plan.grid,
-            Some(Grid { cols: 2, rows: 3 }),
+            plan.grids,
+            vec![Some(Grid { cols: 2, rows: 3 })],
             "portrait A4 elects 2 wide x 3 tall"
         );
         assert_eq!(plan.image_tokens, 903);
@@ -354,7 +384,7 @@ mod tests {
     /// request has three, not one.
     #[test]
     fn every_page_gets_its_own_separator() {
-        let plan = Layout::plan(&[(1240, 1754), (1240, 1754), (800, 600)], MAX_TILES, false);
+        let plan = Layout::plan(&[(1240, 1754), (1240, 1754), (800, 600)], MAX_TILES, None);
         assert_eq!(
             plan.blocks
                 .iter()
@@ -390,13 +420,13 @@ mod tests {
     #[test]
     fn multi_page_is_base_mode_and_scales_per_page() {
         let pages = [(1240, 1754), (1240, 1754), (800, 600)];
-        let plan = Layout::plan(&pages, MAX_TILES, false);
+        let plan = Layout::plan(&pages, MAX_TILES, None);
         assert_eq!(
             plan.mode,
             Mode::Base { base_px: 1024 },
             "multi-image must not crop"
         );
-        assert_eq!(plan.grid, None);
+        assert!(!plan.tiled());
         assert_eq!(plan.views, 3);
         assert_eq!(plan.image_tokens, 3 * 273);
     }
@@ -407,15 +437,15 @@ mod tests {
     fn max_image_tokens_is_the_strip_grid() {
         assert_eq!(max_image_tokens(32), 320 * 11 + 273);
         // battery page's 2x3 grid stays well under it
-        assert!(Layout::plan(&[(1240, 1754)], 32, false).image_tokens < max_image_tokens(32));
+        assert!(Layout::plan(&[(1240, 1754)], 32, None).image_tokens < max_image_tokens(32));
     }
 
     /// An image that fits one tile takes the reference's small-image bail:
     /// global view + separator only, no crop grid at all.
     #[test]
     fn small_single_image_gets_no_crops() {
-        let plan = Layout::plan(&[(640, 640)], MAX_TILES, false);
-        assert_eq!(plan.grid, None);
+        let plan = Layout::plan(&[(640, 640)], MAX_TILES, None);
+        assert!(!plan.tiled());
         assert_eq!(plan.views, 1);
         assert_eq!(plan.image_tokens, 273);
         assert_eq!(
@@ -423,8 +453,8 @@ mod tests {
             vec![Block::Global { side: 16 }, Block::Separator]
         );
         // one pixel over the bail on either axis and cropping engages
-        assert!(Layout::plan(&[(641, 640)], MAX_TILES, false).grid.is_some());
-        assert!(Layout::plan(&[(640, 641)], MAX_TILES, false).grid.is_some());
+        assert!(Layout::plan(&[(641, 640)], MAX_TILES, None).tiled());
+        assert!(Layout::plan(&[(640, 641)], MAX_TILES, None).tiled());
     }
 
     /// The crop override: forced base on a single image is exactly the
@@ -433,20 +463,20 @@ mod tests {
     /// `crop_mode=False` single-image config.
     #[test]
     fn forced_base_single_image_is_one_page() {
-        let forced = Layout::plan(&[(1240, 1754)], MAX_TILES, true);
+        let forced = Layout::plan(&[(1240, 1754)], MAX_TILES, Some(OcrCropMode::Base));
         assert_eq!(forced.mode, Mode::Base { base_px: 1024 });
-        assert_eq!(forced.grid, None);
+        assert!(!forced.tiled());
         assert_eq!(forced.views, 1);
         assert_eq!(forced.image_tokens, 273);
         assert_eq!(
             forced.blocks,
             vec![Block::Global { side: 16 }, Block::Separator]
         );
-        // force_base on a multi-image request changes nothing - it already is
+        // forced base on a multi-image request changes nothing - it already is
         let pages = [(1240, 1754), (800, 600)];
         assert_eq!(
-            Layout::plan(&pages, MAX_TILES, true),
-            Layout::plan(&pages, MAX_TILES, false)
+            Layout::plan(&pages, MAX_TILES, Some(OcrCropMode::Base)),
+            Layout::plan(&pages, MAX_TILES, None)
         );
     }
 
@@ -458,5 +488,46 @@ mod tests {
         let g6 = elect_grid(wide.0, wide.1, 640, 2, 6);
         assert!(g32.tiles() <= 32 && g6.tiles() <= 6);
         assert!(g6.tiles() <= g32.tiles());
+    }
+
+    /// Several pages tiled on request (Unlimited-OCR-2): every page its own
+    /// grid and its own [Local, Global, Separator] run, a page that fits one
+    /// tile taking the bail - the reference's per-page loop.
+    #[test]
+    fn forced_gundam_tiles_every_page_with_its_own_grid() {
+        let pages = [(1448, 2048), (2048, 1448), (600, 580)];
+        let plan = Layout::plan(&pages, 16, Some(OcrCropMode::Gundam));
+        assert_eq!(
+            plan.grids,
+            vec![
+                Some(Grid { cols: 2, rows: 3 }),
+                // 4x3 (4:3) sits closer to 2048:1448 than 3x2 does - the
+                // reference's dynamic_preprocess says the same
+                Some(Grid { cols: 4, rows: 3 }),
+                None
+            ]
+        );
+        assert_eq!(plan.img_blocks, vec![0..3, 3..6, 6..8]);
+        assert_eq!(
+            plan.blocks,
+            vec![
+                Block::Local { rows: 30, cols: 20 },
+                Block::Global { side: 16 },
+                Block::Separator,
+                Block::Local { rows: 30, cols: 40 },
+                Block::Global { side: 16 },
+                Block::Separator,
+                Block::Global { side: 16 },
+                Block::Separator,
+            ]
+        );
+        // 273 + 10h(10w + 1) a tiled page, 273 for the bail
+        assert_eq!(plan.image_tokens, (273 + 630) + (273 + 1230) + 273);
+        assert_eq!((plan.views, plan.tiles()), (1 + 6 + 1 + 12 + 1, 18));
+        // one page forced gundam is the single-image default restated
+        assert_eq!(
+            Layout::plan(&pages[..1], 16, Some(OcrCropMode::Gundam)),
+            Layout::plan(&pages[..1], 16, None)
+        );
     }
 }

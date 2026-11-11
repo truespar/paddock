@@ -117,6 +117,10 @@ pub struct ServingModel {
     /// canonical prompt vocabulary, the sliding-ngram sampling default and
     /// the grounding-region parse all key off this (see `crate::deepseek_ocr`).
     pub ocr: bool,
+    /// ...and it is Unlimited-OCR-2 (SR-SWA): `ocr` stays set, with the
+    /// one-instruction vocabulary, the `<PAGE>`-marked prompt and the in-engine
+    /// page-count guard (see `crate::deepseek_ocr::resolve`).
+    pub unlimited_ocr2: bool,
     /// The paddleocr family is serving: its `ocr` request object maps modes
     /// to the checkpoint's six task prompts (see `crate::paddle_ocr`).
     pub paddleocr: bool,
@@ -343,7 +347,7 @@ impl ServingModel {
     /// here - also the test for whether the `ocr` request object is served.
     pub fn ocr_caps(&self) -> Option<serde_json::Value> {
         if self.ocr {
-            Some(crate::deepseek_ocr::caps_json())
+            Some(crate::deepseek_ocr::caps_json(self.unlimited_ocr2))
         } else if self.paddleocr {
             Some(crate::paddle_ocr::caps_json(self.layout.is_some()))
         } else if self.lightonocr {
@@ -437,7 +441,7 @@ impl ServingModel {
                 .engine
                 .vision_budget()
                 .map_or(0, |b| (b.max_pixels / (640 * 640)) as usize);
-            crate::deepseek_ocr::resolve(messages, opts, &sizes, max_tiles)
+            crate::deepseek_ocr::resolve(messages, opts, &sizes, max_tiles, self.unlimited_ocr2)
         } else if self.paddleocr {
             let mode = crate::paddle_ocr::opts_from_request(top, kwargs)?;
             let document = if self.layout.is_none() {
@@ -2395,6 +2399,10 @@ pub(crate) fn load_with_residency(
     // The family override carries the real shape (bare concat, markers at the
     // prefix, caller's own `<image>` wins); see the constant's docs and
     let deepseek_ocr = arch == "deepseek2-ocr";
+    // Unlimited-OCR-2 is this arch plus the SR-SWA router keys: one trained
+    // instruction, a `<PAGE>` before every image, its own block markup
+    let unlimited_ocr2 =
+        deepseek_ocr && paddock_engine::gpu_model::deepseek_ocr::is_unlimited_ocr2(map.gguf());
     // LightOnOCR-3 is a qwen35 file, so only its identity can say it reads
     // pages; its own template (thinking off by default) serves unchanged.
     let lightonocr = crate::lighton_ocr::is_checkpoint(&arch, map.gguf());
@@ -2402,6 +2410,8 @@ pub(crate) fn load_with_residency(
         tokenizer.chat_template.clone()
     } else if audio_serving {
         Some(crate::chat_template::QWEN3_ASR_AUDIO_TEMPLATE.to_owned())
+    } else if unlimited_ocr2 {
+        Some(crate::chat_template::UNLIMITED_OCR2_TEMPLATE.to_owned())
     } else if deepseek_ocr {
         Some(crate::chat_template::DEEPSEEK_OCR_TEMPLATE.to_owned())
     } else if arch == "paddleocr" {
@@ -2564,6 +2574,7 @@ pub(crate) fn load_with_residency(
         audio_inline_marker: granite_audio.then(|| "<|audio|>".to_owned()),
         audio_word_times: granite_plus,
         ocr: deepseek_ocr,
+        unlimited_ocr2,
         paddleocr: arch == "paddleocr",
         lightonocr,
         nemotron_parse: false,
@@ -2860,6 +2871,7 @@ fn load_hf_dir(
         audio_inline_marker: None,
         audio_word_times: false,
         ocr: false,
+        unlimited_ocr2: false,
         paddleocr: false,
         lightonocr,
         nemotron_parse,

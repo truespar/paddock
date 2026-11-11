@@ -26,6 +26,7 @@ mod bf16;
 mod canvas;
 mod clef;
 mod clef_vision;
+mod dash;
 mod deltanet;
 mod dense_pred;
 mod dit;
@@ -105,7 +106,8 @@ mod upload_ring;
 mod vae;
 mod w16;
 mod w16r;
-pub use nvpf::NVPF_MOE_BLOCK;
+pub use dash::{DASH_BLOCK, DASH_D, DASH_KCAP};
+pub use nvpf::{NVPF_MOE_BLOCK, PfNorm, PfQkvOut};
 pub use w16r::W16R_BLOCK;
 
 pub use error::GpuError;

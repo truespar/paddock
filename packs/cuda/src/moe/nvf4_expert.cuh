@@ -500,7 +500,184 @@ __global__ void pd_nvf4_gemm_mr3_kernel(const PdNvMr3 p, const float* __restrict
                                               b - p.start[pl], blockIdx.y);
 }
 
+// Ring twin of pd_nvf4_mr_body for row planes at 2..4 rows. The body above
+// stages x per K-span behind a barrier and only then issues that span's
+// weight loads, so every span pays an L2 trip and a DRAM trip back to back;
+// at 4 rows Flint's q|k|v ran 140 GB/s on it. Here the CTA's weight rows
+// (codes + scales) and x stream through an NST-deep cp.async ring, NST - 1
+// spans ahead, one barrier a span. Each lane reads its u16 / scale byte out
+// of the staged span at the offsets the body reads gmem at, then runs the
+// body's FMA expression, lane partition and reduction verbatim - bit-exact
+// per row with it (and so with the 1-row GEMV's class). Requires in_dim %
+// (KS * 128) == 0 (launcher-gated). GB10, Flint's planes at 4 rows:
+// q|k|v 43.1 -> 33.2 us, shared gate|up 18.4 -> 14.3, o 26.3 -> 22.1, head
+// 799 -> 748; the 1024-wide shared down 8.2 -> 10.3 (its four spans are all
+// prologue) - hence the in_dim gate at the launchers.
+template <uint32_t BR, uint32_t BN, uint32_t KS, uint32_t NST>
+struct PdNvMrsCfg {
+    static constexpr uint32_t R = 8u * BN, SPAN = KS * 128u;
+    static constexpr uint32_t CB = R * SPAN / 2u, SB = R * SPAN / 16u, XB = BR * SPAN * 4u;
+    static constexpr uint32_t STAGE = CB + SB + XB;
+    static constexpr uint32_t SMEM = NST * STAGE;
+};
+
+template <uint32_t BR, uint32_t BN, uint32_t KS, uint32_t NST>
+__device__ __forceinline__ void pd_nvf4_mrs_body(
+    const uint8_t* __restrict__ data, const uint8_t* __restrict__ scale,
+    const float* __restrict__ bias, const float* __restrict__ x,
+    float* __restrict__ y, float scale2, uint32_t in_dim, uint32_t out_dim,
+    uint32_t batch, uint32_t bx, uint32_t by, unsigned char* sm) {
+#if PD_NV4_OK
+    using C = PdNvMrsCfg<BR, BN, KS, NST>;
+    constexpr uint32_t T0 = 0x3C383000u, T1 = 0x4C484440u;
+    constexpr uint32_t SPAN = C::SPAN, R = C::R;
+    static_assert(SPAN % 256u == 0u, "whole 16 B scale chunks a row");
+    const uint32_t warp = threadIdx.x >> 5, lane = threadIdx.x & 31u;
+    const uint32_t ob = bx * R;   // the CTA's first output row
+    const uint32_t o0 = ob + warp * BN;
+    const uint32_t r0 = by * BR;
+    const uint32_t nspan = in_dim / SPAN;
+    // span sp into ring slot sp % NST: R rows of codes and scales, BR rows
+    // of x; rows past out_dim / batch zero-fill
+    auto issue = [&](uint32_t sp) {
+        unsigned char* st = sm + (size_t)(sp % NST) * C::STAGE;
+        const uint32_t k0 = sp * SPAN;
+        constexpr uint32_t CCH = SPAN / 32u, SCH = SPAN / 256u, XCH = SPAN / 4u;
+        for (uint32_t i = threadIdx.x; i < R * CCH; i += 256u) {
+            const uint32_t rr = i / CCH, c = i % CCH;
+            const bool ok = ob + rr < out_dim;
+            pd_cp_async16(st + rr * (SPAN / 2u) + c * 16u,
+                          data + (size_t)(ok ? ob + rr : 0u) * (in_dim >> 1) + (k0 >> 1) + c * 16u,
+                          ok);
+        }
+        for (uint32_t i = threadIdx.x; i < R * SCH; i += 256u) {
+            const uint32_t rr = i / SCH, c = i % SCH;
+            const bool ok = ob + rr < out_dim;
+            pd_cp_async16(st + C::CB + rr * (SPAN / 16u) + c * 16u,
+                          scale + (size_t)(ok ? ob + rr : 0u) * (in_dim >> 4) + (k0 >> 4) + c * 16u,
+                          ok);
+        }
+        for (uint32_t i = threadIdx.x; i < BR * XCH; i += 256u) {
+            const uint32_t ri = i / XCH, c = i % XCH;
+            const bool ok = r0 + ri < batch;
+            pd_cp_async16(st + C::CB + C::SB + (ri * SPAN + c * 4u) * 4u,
+                          x + (size_t)(ok ? r0 + ri : 0u) * in_dim + k0 + c * 4u, ok);
+        }
+    };
+    float acc[BN][BR];
+    #pragma unroll
+    for (uint32_t n = 0; n < BN; ++n)
+        #pragma unroll
+        for (uint32_t i = 0; i < BR; ++i) acc[n][i] = 0.0f;
+    #pragma unroll
+    for (uint32_t s = 0; s + 1u < NST; ++s) {
+        if (s < nspan) issue(s);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+    }
+    for (uint32_t sp = 0; sp < nspan; ++sp) {
+        asm volatile("cp.async.wait_group %0;" ::"n"(NST - 2u) : "memory");
+        // span sp landed for every thread; the slot span sp + NST - 1 takes
+        // was last read in iteration sp - 1, which every warp is past
+        __syncthreads();
+        if (sp + NST - 1u < nspan) issue(sp + NST - 1u);
+        asm volatile("cp.async.commit_group;" ::: "memory");
+        const unsigned char* st = sm + (size_t)(sp % NST) * C::STAGE;
+        const float(*xs)[SPAN] = reinterpret_cast<const float(*)[SPAN]>(st + C::CB + C::SB);
+        uint32_t wbv[KS][BN];
+        float sv[KS][BN];
+        #pragma unroll
+        for (uint32_t ks = 0; ks < KS; ++ks) {
+            #pragma unroll
+            for (uint32_t n = 0; n < BN; ++n) {
+                const uint32_t rr = warp * BN + n, el = ks * 128u + lane * 4u;
+                wbv[ks][n] = *reinterpret_cast<const uint16_t*>(st + rr * (SPAN / 2u) + (el >> 1));
+                sv[ks][n] = (float)reinterpret_cast<const __nv_fp8_e4m3&>(
+                    st[C::CB + rr * (SPAN / 16u) + (el >> 4)]);
+            }
+        }
+        #pragma unroll
+        for (uint32_t ks = 0; ks < KS; ++ks) {
+            const uint32_t c = ks * 128u + lane * 4u;
+            #pragma unroll
+            for (uint32_t n = 0; n < BN; ++n) {
+                const uint32_t wb = wbv[ks][n];
+                const float s = sv[ks][n];
+                const uint32_t v = (wb & 0xFu) | ((wb & 0xF0u) << 4)
+                                 | ((wb & 0xF00u) << 8) | ((wb & 0xF000u) << 12);
+                const uint32_t mag = v & 0x07070707u;
+                const uint32_t t = (mag | (mag >> 4)) & 0x00FF00FFu;
+                const uint32_t e4 = __byte_perm(T0, T1, (t | (t >> 8)) & 0xFFFFu)
+                                  | ((v & 0x08080808u) << 4);
+                const __nv_fp8_e4m3* eb = reinterpret_cast<const __nv_fp8_e4m3*>(&e4);
+                #pragma unroll
+                for (uint32_t i = 0; i < BR; ++i) {
+                    // pd_nvf4_mr_body's expression verbatim
+                    acc[n][i] += s * ((float)eb[0] * xs[i][c]
+                                    + (float)eb[1] * xs[i][c + 1u]
+                                    + (float)eb[2] * xs[i][c + 2u]
+                                    + (float)eb[3] * xs[i][c + 3u]);
+                }
+            }
+        }
+    }
+    #pragma unroll
+    for (uint32_t n = 0; n < BN; ++n) {
+        if (o0 + n >= out_dim) return;
+        #pragma unroll
+        for (uint32_t i = 0; i < BR; ++i) {
+            float a = acc[n][i];
+            for (uint32_t s = 16; s > 0; s >>= 1)
+                a += __shfl_down_sync(0xffffffffu, a, s);
+            if (lane == 0 && r0 + i < batch) {
+                float v = a * scale2;
+                if (bias) v += bias[o0 + n];
+                y[(size_t)(r0 + i) * out_dim + o0 + n] = v;
+            }
+        }
+    }
+#else
+    (void)data; (void)scale; (void)bias; (void)x; (void)y; (void)scale2;
+    (void)in_dim; (void)out_dim; (void)batch; (void)bx; (void)by; (void)sm;
+#endif
+}
+
+template <uint32_t BR, uint32_t BN, uint32_t KS, uint32_t NST>
+__global__ void __launch_bounds__(256) pd_nvf4_gemm_mrs_kernel(
+    const uint8_t* __restrict__ data, const uint8_t* __restrict__ scale,
+    const float* __restrict__ bias, const float* __restrict__ x,
+    float* __restrict__ y, float scale2, uint32_t in_dim, uint32_t out_dim,
+    uint32_t batch) {
+    extern __shared__ __align__(16) unsigned char pd_mrs_sm[];
+    pd_nvf4_mrs_body<BR, BN, KS, NST>(data, scale, bias, x, y, scale2, in_dim, out_dim, batch,
+                                      blockIdx.x, blockIdx.y, pd_mrs_sm);
+}
+
+// slot 927's fused planes on the ring body (same plane walk as
+// pd_nvf4_gemm_mr3_kernel; start[] counts R = 8 * BN rows a block)
+template <uint32_t BR, uint32_t BN, uint32_t KS, uint32_t NST>
+__global__ void __launch_bounds__(256) pd_nvf4_gemm_mrs3_kernel(
+    const PdNvMr3 p, const float* __restrict__ x, uint32_t in_dim, uint32_t batch) {
+    extern __shared__ __align__(16) unsigned char pd_mrs_sm[];
+    const uint32_t b = blockIdx.x;
+    const uint32_t pl = b < p.start[1] ? 0u : (b < p.start[2] ? 1u : 2u);
+    pd_nvf4_mrs_body<BR, BN, KS, NST>(p.data[pl], p.scale[pl], nullptr, x, p.y[pl],
+                                      p.scale2[pl], in_dim, p.out_dim[pl], batch,
+                                      b - p.start[pl], blockIdx.y, pd_mrs_sm);
+}
+
 #ifdef PD_BS_HOST
+// The ring twin's election: row planes at 2..4 rows whose K walks whole
+// 512-element spans and is at least four of them (a 1024-wide K is all
+// prologue). Kill: PADDOCK_NO_NV4_MRS.
+static inline bool pd_nvf4_mrs_ok(uint32_t in_dim, uint32_t batch) {
+    static const bool off = pd_env("PADDOCK_NO_NV4_MRS") != nullptr;
+    return !off && batch >= 2u && batch <= 4u && in_dim % 512u == 0u && in_dim >= 2048u;
+}
+#define PD_NV4_MRS_BR 4u
+#define PD_NV4_MRS_BN 2u
+#define PD_NV4_MRS_KS 4u
+#define PD_NV4_MRS_NST 3u
+
 // Launch election shared by the three layout launchers (row / _tm / _tf -
 // the arms differ only in where the weight word and scale byte come from).
 //
@@ -548,6 +725,17 @@ static int pd_nvf4_mr_launch(const void* data, const void* scale,
     pd_nvf4_mr_go<BR, BN, KS, TM, FRAG>(data, scale, bias, x, y, scale2,      \
                                         in_dim, out_dim, batch, st)
     if (batch <= 8u) {
+        if constexpr (!TM && !FRAG) {
+            if (pd_nvf4_mrs_ok(in_dim, batch)) {
+                using C = PdNvMrsCfg<PD_NV4_MRS_BR, PD_NV4_MRS_BN, PD_NV4_MRS_KS, PD_NV4_MRS_NST>;
+                pd_nvf4_gemm_mrs_kernel<PD_NV4_MRS_BR, PD_NV4_MRS_BN, PD_NV4_MRS_KS, PD_NV4_MRS_NST>
+                    <<<dim3((out_dim + C::R - 1u) / C::R, (batch + PD_NV4_MRS_BR - 1u) / PD_NV4_MRS_BR),
+                       256, C::SMEM, st>>>(
+                        (const uint8_t*)data, (const uint8_t*)scale, (const float*)bias,
+                        (const float*)x, (float*)y, scale2, in_dim, out_dim, batch);
+                return pd_launch_status();
+            }
+        }
         const bool bn2 = (out_dim + 15u) / 16u >= 2u * (uint32_t)nsm;
         // four rows on the wide planes: KS 4 (Flint's o 28.1 -> 26.5 us, its
         // head 833 -> 805 us on GB10, bench/flint_dec_gemv_gb10_bench.cu)
@@ -616,6 +804,23 @@ int pd_nvf4_gemm_mr3(const void* d0, const void* s0, float f0, void* y0, uint32_
     const uint32_t ns[3] = {n0, n1, n2};
     uint32_t total = 0;
     for (int i = 0; i < 3; ++i) total += ns[i];
+    cudaStream_t st = (cudaStream_t)stream;
+    if (pd_nvf4_mrs_ok(in_dim, batch)) {
+        using C = PdNvMrsCfg<PD_NV4_MRS_BR, PD_NV4_MRS_BN, PD_NV4_MRS_KS, PD_NV4_MRS_NST>;
+        p.start[0] = 0;
+        for (int i = 0; i < 3; ++i) {
+            p.data[i] = (const uint8_t*)ds[i];
+            p.scale[i] = (const uint8_t*)ss[i];
+            p.y[i] = (float*)ys[i];
+            p.scale2[i] = fs[i];
+            p.out_dim[i] = ns[i];
+            p.start[i + 1] = p.start[i] + (ns[i] + C::R - 1u) / C::R;
+        }
+        pd_nvf4_gemm_mrs3_kernel<PD_NV4_MRS_BR, PD_NV4_MRS_BN, PD_NV4_MRS_KS, PD_NV4_MRS_NST>
+            <<<dim3(p.start[3], (batch + PD_NV4_MRS_BR - 1u) / PD_NV4_MRS_BR), 256, C::SMEM,
+               st>>>(p, (const float*)x, in_dim, batch);
+        return pd_launch_status();
+    }
     // BN 2 while the fused grid still covers the die twice (the per-plane
     // width gate, over the whole launch; BN never moves a row's bits)
     const bool bn2 = (total + 15u) / 16u >= 2u * (uint32_t)nsm;
@@ -631,7 +836,6 @@ int pd_nvf4_gemm_mr3(const void* d0, const void* s0, float f0, void* y0, uint32_
     }
     const uint32_t br = batch <= 4u ? 4u : 8u;
     dim3 grid(p.start[3], (batch + br - 1u) / br);
-    cudaStream_t st = (cudaStream_t)stream;
     if (br == 4u) {
         if (bn2) pd_nvf4_gemm_mr3_kernel<4u, 2u, 2u><<<grid, 256, 0, st>>>(p, (const float*)x, in_dim, batch);
         else pd_nvf4_gemm_mr3_kernel<4u, 1u, 2u><<<grid, 256, 0, st>>>(p, (const float*)x, in_dim, batch);
