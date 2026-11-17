@@ -109,8 +109,9 @@ Every model below runs on the engine today. Sizes are the checkpoint's own, and
 - **MiniCPM5** - 2B
 - **Muse Glimmer** - 30B
 - **Nemotron 3.5 Lightning** - 30B-A3B
-- **Nemotron 3.5 Super VL** - 120B-A12B; reads pictures and documents, NVIDIA GPUs
-  for now
+- **Nemotron 3.5 Super VL** - 120B-A12B; reads pictures and documents. About
+  75 GB of weights, on a DGX Spark or a 96 GB RTX PRO Blackwell card; not yet
+  on the B200
 - **Kolibri 1** (Aleph Alpha) - 78B with 3.5B active, German and English, text only
 - **Flint** (Recursive) - 40B with 2.5B active, for coding agents; text only, on
   NVIDIA GPUs (Ada or newer)
@@ -165,7 +166,8 @@ Every model below runs on the engine today. Sizes are the checkpoint's own, and
   never revised, in 40 languages and locales. NVIDIA GPUs for now
 - **Nemotron 3.5 Transcribe** (NVIDIA) - 30B-A4B; recordings up to an hour in
   40 languages, with word timestamps and speaker labels, and it translates
-  speech and answers questions about it. Blackwell GPUs (NVFP4)
+  speech and answers questions about it. On RTX 50-series and RTX PRO Blackwell
+  cards and the DGX Spark; not yet on the B200
 - **Phonon** 31M (Gradium) - English text to speech, streamed as it's made, on
   NVIDIA GPUs and the Mac
 - **Whisper Large** fine-tunes - KB-Whisper (Swedish), NB-Whisper (Norwegian),
