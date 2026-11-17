@@ -321,6 +321,144 @@ impl Stream {
         Ok(out)
     }
 }
+/// A whole recording's windows at an explicit geometry, in encoder rows: the
+/// way Nemotron 3.5 Transcribe runs this model inside its speech encoder
+/// (NeMo's ParallelExpertEncoder online inference, Transformers' offline
+/// mode) - chunks of `chunk` rows, each fed after the speaker cache and the
+/// FIFO together with up to `left` rows of look-back (the previous chunk's
+/// tail, fed again) and `right` of look-ahead. Only the chunk's own rows
+/// join the FIFO and only their probabilities are kept; the FIFO holds
+/// `fifo` rows and overflows into the cache at least `update` rows at a
+/// time; the cache holds `cache` rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OfflineGeometry {
+    pub chunk: usize,
+    pub left: usize,
+    pub right: usize,
+    pub fifo: usize,
+    pub update: usize,
+    pub cache: usize,
+}
+
+impl OfflineGeometry {
+    /// Encoder rows of the widest window this geometry feeds.
+    pub fn max_rows(&self) -> usize {
+        self.cache + self.fifo + self.left + self.chunk + self.right
+    }
+}
+
+/// Speaker probabilities `[rows * 8]` (10-ms frames) of a recording's encoder
+/// input rows `[rows][512]` (the stacked-frame projection's output), whose
+/// first `valid` rows are real (the rest padding, zero probability), walked
+/// at `g` - see [`OfflineGeometry`]. Every window is one `predict`.
+pub fn offline_probabilities<B: Backend>(
+    b: &mut B,
+    rows: &[f32],
+    valid: usize,
+    g: OfflineGeometry,
+) -> Result<(Vec<[f32; SPEAKERS]>, f64), String> {
+    if rows.is_empty()
+        || !rows.len().is_multiple_of(HIDDEN)
+        || g.chunk == 0
+        || g.fifo == 0
+        || g.cache < 2 * SPEAKERS
+        || valid > rows.len() / HIDDEN
+    {
+        return Err("invalid offline diarization input".into());
+    }
+    let n = rows.len() / HIDDEN;
+    let mut cache: Vec<f32> = Vec::new();
+    let mut cache_probs: Vec<[f32; SPEAKERS]> = Vec::new();
+    let mut fifo: Vec<f32> = Vec::new();
+    let mut compressed = false;
+    let mut out = Vec::with_capacity(n * STACK);
+    let mut seconds = 0.0;
+    let mut start = 0usize;
+    while start < n {
+        let end = (start + g.chunk).min(n);
+        let ctx0 = start.saturating_sub(g.left);
+        let ctx1 = (end + g.right).min(n);
+        let (cache_len, fifo_len) = (cache.len() / HIDDEN, fifo.len() / HIDDEN);
+        let mut combined = Vec::with_capacity(cache.len() + fifo.len() + (ctx1 - ctx0) * HIDDEN);
+        combined.extend_from_slice(&cache);
+        combined.extend_from_slice(&fifo);
+        combined.extend_from_slice(&rows[ctx0 * HIDDEN..ctx1 * HIDDEN]);
+        // the cached rows are all keys; the window's are up to `valid`
+        let keys = cache_len + fifo_len + valid.min(ctx1).saturating_sub(ctx0);
+        let (high, sec) = b.predict(&combined, keys.max(1))?;
+        seconds += sec;
+        if high.len() != combined.len() / HIDDEN * STACK
+            || high
+                .iter()
+                .flatten()
+                .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+        {
+            return Err("invalid diarization backend output".into());
+        }
+        // speaker probabilities at the encoder rate (padding rows are zero)
+        let low: Vec<[f32; SPEAKERS]> = high
+            .as_chunks::<STACK>()
+            .0
+            .iter()
+            .map(|r| {
+                let mut p = [0.; SPEAKERS];
+                for f in r {
+                    for (s, v) in p.iter_mut().enumerate() {
+                        *v += f[s] / STACK as f32;
+                    }
+                }
+                p
+            })
+            .collect();
+        let cs = cache_len + fifo_len + (start - ctx0);
+        let nc = end - start;
+        out.extend_from_slice(&high[cs * STACK..(cs + nc) * STACK]);
+        // the chunk's rows join the FIFO; on overflow its oldest rows move to
+        // the cache, the probabilities they carry re-estimated by this window
+        // unless the cache is already compressed (out of order)
+        fifo.extend_from_slice(&combined[cs * HIDDEN..(cs + nc) * HIDDEN]);
+        let fifo_rows = fifo_len + nc;
+        if fifo_rows > g.fifo {
+            let pop = g.update.max(fifo_rows - g.fifo).min(fifo_rows);
+            let mut fprobs = low[cache_len..cache_len + fifo_len].to_vec();
+            fprobs.extend_from_slice(&low[cs..cs + nc]);
+            if !compressed {
+                cache_probs = low[..cache_len].to_vec();
+            }
+            cache.extend_from_slice(&fifo[..pop * HIDDEN]);
+            cache_probs.extend_from_slice(&fprobs[..pop]);
+            fifo.drain(..pop * HIDDEN);
+            if cache.len() / HIDDEN > g.cache {
+                let picks =
+                    paddock_models::diarization::cache_selection_len(&cache_probs, g.cache)?;
+                let silence = b.silence();
+                if silence.len() != HIDDEN {
+                    return Err("invalid learned silence embedding".into());
+                }
+                let mut kept = Vec::with_capacity(g.cache * HIDDEN);
+                let mut probs = Vec::with_capacity(g.cache);
+                for pick in picks {
+                    match pick {
+                        Some(i) => {
+                            kept.extend_from_slice(&cache[i * HIDDEN..(i + 1) * HIDDEN]);
+                            probs.push(cache_probs[i]);
+                        }
+                        None => {
+                            kept.extend_from_slice(silence);
+                            probs.push([0.; SPEAKERS]);
+                        }
+                    }
+                }
+                cache = kept;
+                cache_probs = probs;
+                compressed = true;
+            }
+        }
+        start = end;
+    }
+    Ok((out, seconds))
+}
+
 pub struct Output {
     pub segments: Vec<Segment>,
     pub frames: usize,

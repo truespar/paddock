@@ -591,8 +591,18 @@ function onAudioDrop(e: DragEvent): void {
 // A wrong language guess does not cost you a label, it
 // costs you the transcript, and the browser already knows what its owner
 // speaks. Detection stays one click away for anyone who wants it.
+// The languages these lanes can be told (a checkpoint that declares its set -
+// Nemotron 3.5 Transcribe's 40 - narrows the picker to it); undefined = the
+// full list.
+const laneLanguages = computed(() => models.languagesForLanes(sendTo.value))
 const audioLanguage = computed<string>({
-  get: () => chat.active?.audioLanguage || localeLanguage() || LANGUAGE_AUTO,
+  get: () => {
+    const stored = chat.active?.audioLanguage
+    const codes = laneLanguages.value
+    // a choice another lane took that these cannot reads as detection here
+    const usable = stored && (stored === LANGUAGE_AUTO || !codes || codes.includes(stored))
+    return (usable ? stored : undefined) || localeLanguage(codes) || LANGUAGE_AUTO
+  },
   set: (v) => {
     const c = chat.active
     if (!c) return
@@ -1353,12 +1363,14 @@ const transcriber = computed(
   () =>
     transcribers.value.find((m) => m.id === settings.dictateWith) ?? transcribers.value[0],
 )
-/** Which runners the microphone feeds: every armed lane in audio mode (that
- *  is the fan-out), or whichever speech model is running, for dictation. */
+/** Which runners the microphone feeds: every armed lane in a live turn (that
+ *  is the fan-out - audio mode, or Live on lanes that also chat), or whichever
+ *  speech model is running, for dictation. */
+const lanePorts = computed<number[]>(() =>
+  sendTo.value.map((id) => models.portFor(id)).filter((p): p is number => !!p),
+)
 const micPorts = computed<number[]>(() => {
-  if (audioMode.value) {
-    return sendTo.value.map((id) => models.portFor(id)).filter((p): p is number => !!p)
-  }
+  if (liveTurns.value) return lanePorts.value
   const p = transcriber.value?.port
   return p ? [p] : []
 })
@@ -1372,7 +1384,7 @@ const micPorts = computed<number[]>(() => {
  *  of a comparison the user deliberately set up - the same silent-lane-loss as
  * arriving by a different road. */
 const liveOnlyByFile = computed(() =>
-  audioMode.value
+  liveApplies.value
     ? sendTo.value
         .filter((id) => !models.canLiveTranscribe(id))
         .map((id) => models.models.find((m) => m.id === id)?.display ?? id)
@@ -1414,10 +1426,12 @@ const micBlocked = computed(() => liveOnlyByFile.value.length > 0)
 // from every comparison containing a generative ASR model - the exact
 // comparison the feature is best at. See `liveApplies`.
 const recorder = useRecorder()
-const micMode = ref<MicMode>('live')
+// null = the arming's own default (its first job: Live in audio mode, Record
+// on a lane that also chats) until the menu picks something else
+const micMode = ref<MicMode | null>(null)
 /** Live is impossible for this arming - every case is a lane that hears a
  *  finished file only. */
-const liveImpossible = computed(() => micBlocked.value || !micPorts.value.length)
+const liveImpossible = computed(() => micBlocked.value || !lanePorts.value.length)
 /** Live BELONGS to this arming (rows 1 and 4a), whether or not it can run.
  *
  *  This is `audioMode` and nothing else: the composer is in audio mode exactly
@@ -1439,7 +1453,12 @@ const liveImpossible = computed(() => micBlocked.value || !micPorts.value.length
  *  `canChat` answers yes for a model whose entire job in this arming is
  *  hearing. What the mic needs to know is whether the lanes can hear a stream,
  *  never whether one of them could also have been typed at. */
-const liveApplies = computed(() => audioMode.value)
+const liveApplies = computed(() => audioMode.value || micJobs.value.includes('live'))
+/** This session makes TURNS: audio mode, or Live picked on lanes that also
+ *  chat (Transcribe and the generative ASR families) - the same live turn,
+ *  spoken into the thread while the text box stays. Everything below that
+ *  used to read `audioMode` for "the mic feeds the conversation" reads this. */
+const liveTurns = computed(() => audioMode.value || micModeNow.value === 'live')
 /** The jobs this arming can actually do, the one that should be default first. */
 const micJobs = computed<MicMode[]>(() => {
   // a document parser takes no dictation and no clips - nothing to say to it
@@ -1527,7 +1546,7 @@ const micMenu = computed(
  *  never a guess between two jobs the user can see (hard-coding
  *  that guess got it wrong in both directions on consecutive builds). */
 const micModeNow = computed<MicMode>(
-  () => (micJobs.value.includes(micMode.value) ? micMode.value : micJobs.value[0]) ?? 'record',
+  () => (micMode.value && micJobs.value.includes(micMode.value) ? micMode.value : micJobs.value[0]) ?? 'record',
 )
 const micMenuPresentation = computed(() => microphoneMenu({ jobs: micJobs.value, mode: micModeNow.value,
   audioMode: audioMode.value, liveImpossible: liveImpossible.value, namedDevices: audioDevices.named(),
@@ -1606,7 +1625,7 @@ const micStatus = computed(() => {
 let dictated = 0
 
 function drainDictation(): void {
-  if (audioMode.value) return
+  if (liveTurns.value) return
   const items = mic.lanes.value[0]?.items ?? []
   // A session that was cancelled takes its items with it; forget what we had
   // counted rather than waiting for a list that will never get that long again.
@@ -1617,7 +1636,7 @@ function drainDictation(): void {
 }
 watch(() => mic.lanes.value[0]?.items.length ?? 0, drainDictation)
 watch(
-  () => (audioMode.value ? '' : (mic.lanes.value[0]?.open ?? '')),
+  () => (liveTurns.value ? '' : (mic.lanes.value[0]?.open ?? '')),
   (t) => setGhost(editor.value, t),
 )
 // The compare turn grows while you speak. Deep because the lanes mutate in
@@ -1626,7 +1645,7 @@ watch(
 watch(
   () => mic.lanes.value,
   (l) => {
-    if (audioMode.value && (mic.listening.value || mic.finishing.value)) live.apply(l)
+    if (liveTurns.value && (mic.listening.value || mic.finishing.value)) live.apply(l)
   },
   { deep: true },
 )
@@ -1671,7 +1690,7 @@ async function toggleMic(): Promise<void> {
   }
   if (mic.listening.value) {
     const out = await mic.stop()
-    if (audioMode.value) {
+    if (liveTurns.value) {
       // The turn is already in the conversation, growing since you pressed
       // record; this settles it and attaches the clip.
       await live.finish(out)
@@ -1697,8 +1716,8 @@ async function toggleMic(): Promise<void> {
   // ("Hallo, ich teste und sehe, wie es funktioniert"). A speech
   // model told the language transcribes as that language; left to guess from a
   // few seconds it can lose the whole transcript, not just the label.
-  const language = askedLanguage(chat.active?.audioLanguage)
-  if (audioMode.value) {
+  const language = askedLanguage(chat.active?.audioLanguage, laneLanguages.value)
+  if (liveTurns.value) {
     // A conversation has to EXIST before the turn can go in it, and on a draft
     // surface it does not yet - sending is the only thing that ever made one.
     // Without this the messages landed on the uncommitted draft, which the
@@ -1713,7 +1732,7 @@ async function toggleMic(): Promise<void> {
   await mic.start({
     ports: micPorts.value,
     language,
-    record: audioMode.value,
+    record: liveTurns.value,
     // Only the comparison shows word times and confidence, and only on the
     // lanes that can actually answer for them. The generative ASR families
     // have no timestamp vocabulary and REFUSE the field - and a refused
@@ -1722,7 +1741,7 @@ async function toggleMic(): Promise<void> {
     // Qwen3-ASR then heard 16 kHz as 24 kHz and answered three seconds of
     // Swedish with seven seconds of Finnish).
     detail: micPorts.value.map((p) => {
-      if (!audioMode.value) return false
+      if (!liveTurns.value) return false
       const id = models.models.find((m) => m.port === p)?.id
       return !!id && models.canEnrichLive(id)
     }),
@@ -1737,19 +1756,19 @@ async function toggleMic(): Promise<void> {
     // Dictation asks to hear about a quiet room much sooner, because there it
     // ends the session (see the watcher below). A comparison keeps the long
     // one: you are recording a specific clip and may well be setting up.
-    idleMs: audioMode.value ? undefined : DICTATION_IDLE_MS,
+    idleMs: liveTurns.value ? undefined : DICTATION_IDLE_MS,
     // The session ended without anyone stopping it. Close the same way the
     // stop button would: the turn already in the thread has to be finished
     // with what was heard, or it streams forever over words nobody can see.
     onDied: (out) => {
-      if (audioMode.value) void live.finish(out)
+      if (liveTurns.value) void live.finish(out)
       else {
         drainDictation()
         setGhost(editor.value, '')
       }
     },
   })
-  if (audioMode.value && !mic.listening.value) live.abandon()
+  if (liveTurns.value && !mic.listening.value) live.abandon()
 }
 // DICTATION CLOSES itself once you have finished and walked away. A pause
 // never does - pausing to think is not finishing, which is why the utterance
@@ -1761,7 +1780,7 @@ async function toggleMic(): Promise<void> {
 watch(
   () => mic.idle.value,
   (quiet) => {
-    if (!quiet || audioMode.value || !mic.listening.value) return
+    if (!quiet || liveTurns.value || !mic.listening.value) return
     if (!mic.lanes.value[0]?.items.length) return
     void toggleMic()
   },
@@ -2407,7 +2426,7 @@ onBeforeUnmount(() => {
             v-if="audioOk || micOffered"
             v-model="audioLanguage"
             class="composer__lang"
-            :options="languageOptions()"
+            :options="languageOptions(laneLanguages)"
           />
           <!-- Intelligence / context enrichment: what the runner reads from the
                attachments and feeds into context - file metadata (Sift, always

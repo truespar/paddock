@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// The left rail shows one area's items - Manager (servers, instrument) or
+// The left rail shows one area's items - Manager (servers, instrument, batches) or
 // Studio (chat, prompts, tools; settings at the bottom). The header owns
 // switching between areas; the rail never mixes them - that is the
 // manager/studio split. There is no Models item: the catalog lives
@@ -64,6 +64,7 @@ function go(name: string): void {
 }
 function active(name: string): boolean {
   if (name === 'chat') return route.name === 'chat' || route.name === 'chat-new'
+  if (name === 'batches') return route.name === 'batches' || route.name === 'batch-detail'
   return route.name === name
 }
 </script>
@@ -102,6 +103,15 @@ function active(name: string): boolean {
           @click="go('instrument')"
         >
           <Icon name="activity" :size="20" />
+        </button>
+      </Tooltip>
+      <Tooltip label="Batches" side="right">
+        <button
+          class="activity-bar__btn"
+          :class="{ 'activity-bar__btn--active': active('batches') }"
+          @click="go('batches')"
+        >
+          <Icon name="scroll" :size="20" />
         </button>
       </Tooltip>
     </div>

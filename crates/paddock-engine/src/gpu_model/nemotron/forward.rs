@@ -349,6 +349,7 @@ impl GpuNemotron {
         if self.prefill.is_some() {
             return Ok(());
         }
+        let nv4w = self.nvf4_act_width();
         let e = &self.exec;
         let hp = &self.hp;
         let c = self.prefill_chunk;
@@ -398,8 +399,8 @@ impl GpuNemotron {
             d_sh_up: e.alloc(up_rows * hp.shared_ff)?,
             nb_r,
             nb_s,
-            d_xq4: e.alloc_i8(c * hp.hidden / 2)?,
-            d_xs4: e.alloc_u8(c * hp.hidden / 16)?,
+            d_xq4: e.alloc_i8(c * nv4w / 2)?,
+            d_xs4: e.alloc_u8(c * nv4w / 16)?,
             d_srow: e.alloc_u32(nb_r * 32)?,
             d_sslot: e.alloc_u32(nb_r * 32)?,
             d_bexp: e.alloc_u32(nb_r)?,
@@ -656,6 +657,18 @@ impl GpuNemotron {
                             exec.f8row_gemm(wk, &px.d_xq, &px.d_xrs, &mut px.d_k, embd, kv_dim, t)?;
                             exec.f8row_gemm(wv, &px.d_xq, &px.d_xrs, &mut px.d_v, embd, kv_dim, t)?;
                         }
+                        AttnWeights::Nvf4 { wq, wk, wv, .. } => {
+                            super::attn_nvf4_qkv(
+                                &exec,
+                                (wq, wk, wv),
+                                &px.d_xn,
+                                &mut px.d_xq4,
+                                &mut px.d_xs4,
+                                (&mut px.d_q, &mut px.d_k, &mut px.d_v),
+                                t,
+                                false,
+                            )?;
+                        }
                         AttnWeights::Qw { wq, wk, wv, .. } => {
                             let s8 = px.q8.as_mut().expect("q8 prefill scratch");
                             prefill_quant(
@@ -759,6 +772,19 @@ impl GpuNemotron {
                                 q_dim,
                                 embd,
                                 t,
+                            )?;
+                        }
+                        AttnWeights::Nvf4 { wo, .. } => {
+                            super::attn_nvf4_mm(
+                                &exec,
+                                wo,
+                                &px.d_attn,
+                                &mut px.d_xq4,
+                                &mut px.d_xs4,
+                                &mut px.d_proj,
+                                t,
+                                false,
+                                false,
                             )?;
                         }
                         AttnWeights::Qw { wo, .. } => {
@@ -1035,6 +1061,11 @@ impl GpuNemotron {
                                 true,
                             )?;
                         }
+                        MoePlanes::F8 { .. } => {
+                            return Err(GpuModelError::Unsupported(
+                                "FP8 experts are the MTP block's alone".into(),
+                            ));
+                        }
                         MoePlanes::Q8 {
                             up,
                             down,
@@ -1183,6 +1214,7 @@ impl GpuNemotron {
             HeadW::Nvf4(h) => exec.nvf4_gemv(h, &px.d_lastn, &mut px.d_logits, None)?,
             HeadW::Qw(q) => gemv_any(&exec, q, &px.d_lastn, &mut px.d_logits)?,
             HeadW::F8(h) => exec.f8r_gemv(h, &px.d_lastn, &mut px.d_logits, embd, hp.vocab)?,
+            HeadW::Bf16(h) => exec.bf16_gemv(h, None, &px.d_lastn, &mut px.d_logits)?,
         }
         Ok(Some(exec.to_host(&px.d_logits)?))
     }
@@ -1407,6 +1439,11 @@ impl GpuNemotron {
                             exec.f8r_gemv(wk, &sc.d_xn, &mut sc.d_k, embd, kv_dim)?;
                             exec.f8r_gemv(wv, &sc.d_xn, &mut sc.d_v, embd, kv_dim)?;
                         }
+                        AttnWeights::Nvf4 { wq, wk, wv, .. } => {
+                            exec.nvf4_gemv(wq, &sc.d_xn, &mut sc.d_q, None)?;
+                            exec.nvf4_gemv(wk, &sc.d_xn, &mut sc.d_k, None)?;
+                            exec.nvf4_gemv(wv, &sc.d_xn, &mut sc.d_v, None)?;
+                        }
                     }
                     exec.kv_append_batch(
                         &sc.d_k,
@@ -1460,6 +1497,9 @@ impl GpuNemotron {
                         AttnWeights::F8 { wo, .. } => {
                             let q_dim = hp.n_heads * hp.head_dim;
                             exec.f8r_gemv(wo, &sc.d_attn, &mut sc.d_proj, q_dim, embd)?;
+                        }
+                        AttnWeights::Nvf4 { wo, .. } => {
+                            exec.nvf4_gemv(wo, &sc.d_attn, &mut sc.d_proj, None)?;
                         }
                     }
                 }
@@ -1637,6 +1677,11 @@ impl GpuNemotron {
                                 )?;
                             }
                         }
+                        MoePlanes::F8 { .. } => {
+                            return Err(GpuModelError::Unsupported(
+                                "FP8 experts are the MTP block's alone".into(),
+                            ));
+                        }
                         MoePlanes::Q8 {
                             up,
                             down,
@@ -1719,6 +1764,7 @@ impl GpuNemotron {
             HeadW::Nvf4(h) => exec.nvf4_gemv(h, &sc.d_xn, &mut sc.d_logits, None)?,
             HeadW::Qw(q) => gemv_any(&exec, q, &sc.d_xn, &mut sc.d_logits)?,
             HeadW::F8(h) => exec.f8r_gemv(h, &sc.d_xn, &mut sc.d_logits, embd, hp.vocab)?,
+            HeadW::Bf16(h) => exec.bf16_gemv(h, None, &sc.d_xn, &mut sc.d_logits)?,
         }
         Ok(())
     }
@@ -1810,6 +1856,10 @@ impl GpuNemotron {
 impl Generator for GpuNemotron {
     fn release_idle_memory(&mut self) {
         self.exec.trim_mem_pool();
+    }
+
+    fn media_aligner(&self) -> Option<std::sync::Arc<dyn crate::generator::MediaAligner>> {
+        self.audio.as_ref().and_then(|a| a.aligner())
     }
 
     fn tier_pump(&mut self) {
@@ -1956,14 +2006,14 @@ impl Generator for GpuNemotron {
         &mut self,
         chunks: &[crate::service::MmChunk],
     ) -> Result<Option<(Vec<f32>, usize)>, GenError> {
-        if self.vision.is_none() {
+        if self.vision.is_none() && self.audio.is_none() {
             return Ok(None);
         }
         self.mm_prefill_serial(chunks).map(Some).map_err(gen_err)
     }
 
     fn supports_mm_slots(&self) -> bool {
-        self.vision.is_some() && self.batch.is_some()
+        (self.vision.is_some() || self.audio.is_some()) && self.batch.is_some()
     }
 
     fn forward_prefill_multimodal(
@@ -1972,6 +2022,55 @@ impl Generator for GpuNemotron {
         chunks: &[crate::service::MmChunk],
     ) -> Result<(Vec<f32>, usize), GenError> {
         self.mm_prefill_slot(slot, chunks).map_err(gen_err)
+    }
+
+    // Transcribe: recording prompts ride the chunked queue (mm.rs) - their
+    // rows advance under the mixed ticks' row budget beside the decode band
+    fn supports_chunked_multimodal(&self) -> bool {
+        self.audio.is_some()
+            && self.batch.is_some()
+            && paddock_models::dev_var_os!("PADDOCK_MM_NO_CHUNK").is_none()
+    }
+
+    fn prefill_begin_multimodal(
+        &mut self,
+        items: Vec<(usize, Vec<crate::service::MmChunk>)>,
+    ) -> Vec<(usize, crate::generator::MmAdmit)> {
+        self.prefill_begin_audio(items)
+    }
+
+    // Transcribe: a wave of recording prompts shares the speech encoder's
+    // passes and the prefill passes (mm.rs); pictures keep the per-slot loop
+    fn forward_prefill_multimodal_batch(
+        &mut self,
+        items: Vec<(usize, Vec<crate::service::MmChunk>)>,
+    ) -> Vec<(usize, Result<(Vec<f32>, usize), GenError>)> {
+        if self.audio.is_none()
+            || items.len() < 2
+            || paddock_models::dev_var_os!("PADDOCK_NO_AUDIO_WAVE").is_some()
+        {
+            return items
+                .into_iter()
+                .map(|(k, chunks)| {
+                    let r = self.mm_prefill_slot(k, &chunks).map_err(gen_err);
+                    (k, r)
+                })
+                .collect();
+        }
+        match self.mm_prefill_batch(&items) {
+            Ok(out) => items
+                .into_iter()
+                .zip(out)
+                .map(|((k, _), r)| (k, Ok(r)))
+                .collect(),
+            Err(e) => {
+                let msg = e.to_string();
+                items
+                    .into_iter()
+                    .map(|(k, _)| (k, Err(gen_err(GpuModelError::Unsupported(msg.clone())))))
+                    .collect()
+            }
+        }
     }
 
     fn vision_budget(&self) -> Option<crate::generator::VisionBudget> {
@@ -2061,6 +2160,23 @@ impl Generator for GpuNemotron {
             .map_err(gen_err)
     }
 
+    fn forward_mixed_spec_plans(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+        budget: usize,
+        plans: &[crate::sampler::DevicePlan],
+        fin_plans: &[(usize, RowSample)],
+    ) -> Result<
+        (
+            Option<Vec<u32>>,
+            Vec<(usize, crate::generator::FinishSample, usize)>,
+        ),
+        GenError,
+    > {
+        self.forward_mixed_spec_impl(reqs, budget, plans, fin_plans)
+            .map_err(gen_err)
+    }
+
     fn forward_spec_verify(
         &mut self,
         reqs: &[(usize, usize, Vec<u32>)],
@@ -2084,10 +2200,9 @@ impl Generator for GpuNemotron {
         if let Some(d) = self.dflash.as_ref() {
             return Some(d.verify_depth());
         }
-        // Super's in-file MTP (the FP8-head lane, batched drafts): a fixed
-        // depth - see super_mtp_depth
-        (self.mtp_active() && matches!(self.lm_head, HeadW::F8(_)))
-            .then(crate::gpu_model::nemotron::mtp::super_mtp_depth)
+        // the checkpoint lanes' in-file MTP (batched drafts): a fixed depth -
+        // see GpuNemotron::mtp_depth
+        self.mtp_batched().then(|| self.mtp_depth())
     }
 
     fn spec_live_cap(&self) -> usize {
@@ -2098,17 +2213,48 @@ impl Generator for GpuNemotron {
                 .take_while(|&live| d.depth_for_live(live) > 0)
                 .last()
                 .unwrap_or(0),
-            // Super's fixed MTP depth: every live slot's depth + 1 rows
-            None if self.mtp_active() && matches!(self.lm_head, HeadW::F8(_)) => {
-                crate::gpu_model::nemotron::spec::SPEC_ROWS_NEMO
-                    / (crate::gpu_model::nemotron::mtp::super_mtp_depth() + 1)
-            }
+            // Transcribe narrows its depth by the live count (below): a
+            // round holds every live slot down to depth 1
+            None if self.mtp_batched() && self.hp.transcribe => self.spec_rows() / 2,
+            // the checkpoint lanes' fixed MTP depth: every live slot's depth
+            // + 1 rows
+            None if self.mtp_batched() => self.spec_rows() / (self.mtp_depth() + 1),
             None => usize::MAX,
         }
     }
 
     fn spec_batch_draft_budget(&self, live: usize) -> Option<usize> {
-        self.dflash.as_ref().map(|d| d.depth_for_live(live))
+        if let Some(d) = self.dflash.as_ref() {
+            return Some(d.depth_for_live(live));
+        }
+        // Transcribe: the deep chain while the prompt queue is light, a
+        // 3-draft round while it holds more than `deep` rows (those rounds'
+        // passes are bound by their prompt rows, and every draft step
+        // lengthens each of them), and never past the round's rows
+        (self.mtp_batched() && self.hp.transcribe).then(|| {
+            // FLEURS 5 x 100 (GB10, 2026-11-14), c64 / c32 RTFx by the
+            // threshold: 1K rows 210.6 / 175.4, 2K 209.7 / 178.5, 4K 209.5 /
+            // 180.0 (by live count instead, 32 live: 203.4 / 180.1)
+            let deep: usize = paddock_models::dev_var!("PADDOCK_TR_DEEP_PENDING")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4096);
+            let wide: usize = paddock_models::dev_var!("PADDOCK_TR_WIDE_DEPTH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3);
+            let pending: usize = self
+                .chunked
+                .iter()
+                .map(|c| c.tokens.len().saturating_sub(c.cursor))
+                .sum();
+            let d = if pending > deep {
+                wide
+            } else {
+                self.mtp_depth()
+            };
+            d.min((self.spec_rows() / live.max(1)).saturating_sub(1))
+        })
     }
 
     fn spec_sampled_live_cap(&self) -> Option<usize> {
@@ -2117,6 +2263,14 @@ impl Generator for GpuNemotron {
         // at 6 / 8 live: 191 -> 229 and 215 -> 271 tok/s against no drafter
         // (GB10 2026-09-26), where the service's generic 4-live cap had it off
         self.dflash.as_ref().map(|_| self.spec_live_cap())
+    }
+
+    // The drafters' state flows from every walk at KV positions (coverage,
+    // no token replay), and Transcribe's MTP append sees a recording's rows
+    // through the overlay as the trunk does - so a recording slot (its pos
+    // past its token history) drafts like any other
+    fn spec_draft_kv_space(&self) -> bool {
+        self.audio.is_some()
     }
 
     fn spec_ensure_warm(
@@ -2201,7 +2355,7 @@ impl Generator for GpuNemotron {
         if self.mtp.as_ref().and_then(|m| m.state.as_ref()).is_some() {
             let k = k.min(crate::gpu_model::nemotron::mtp::MTP_MAX_DRAFT);
             // the FP8-head lane drafts every warm slot together, a step at a time
-            if pendings.len() > 1 && matches!(self.lm_head, HeadW::F8(_)) {
+            if pendings.len() > 1 && self.mtp_batched() {
                 let mut reqs = Vec::with_capacity(pendings.len());
                 let mut at = Vec::with_capacity(pendings.len());
                 for (i, &(slot, tok)) in pendings.iter().enumerate() {

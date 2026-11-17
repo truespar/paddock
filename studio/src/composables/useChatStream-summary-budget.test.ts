@@ -50,6 +50,7 @@ vi.mock('@/stores/models', () => ({
     maxCtx: mock.window,
     canChat: () => true,
     canTranscribe: () => false,
+    asksInChat: () => false,
     capsFor: async () => ({ mcpServers: [] }),
     ctxFor: () => mock.window,
     outCapFor: () => mock.outCap,

@@ -4432,6 +4432,84 @@ struct KernelTableV1 {
     int (*dash_guard)(void*, const void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
     int (*f16_gemm_h_act)(const void*, const void*, void*, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
     int (*qkv_bias_split)(const void*, const void*, void*, void*, void*, uint32_t, uint32_t, void*);
+    // 942-944: Nemotron 3.5 Transcribe's speech encoder glue (asr/transcribe.cuh):
+    // per-feature mel normalization, per-head q/k LayerNorm + partial rope, the
+    // speaker fusion. Pure append.
+    int (*tr_mel_norm)(const void*, void*, uint32_t, uint32_t, void*);
+    int (*tr_qk_norm_rope)(void*, const void*, const void*, const void*, const void*, const void*,
+                           const void*, uint32_t, uint32_t, uint32_t, float, void*);
+    int (*tr_fuse)(const void*, const void*, const void*, const void*, const void*, void*,
+                   uint32_t, uint32_t, float, void*);
+    // 945-946: the speech LM MTP block's FP8 expert GEMVs (asr/transcribe.cuh).
+    int (*f8r_moe_up_relu2)(const void*, const void*, const void*, const void*, void*, uint32_t,
+                            uint32_t, uint32_t, uint32_t, void*);
+    int (*f8r_moe_down)(const void*, const void*, const void*, const void*, const void*, void*,
+                        uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 947-948: a mamba verify round's runs in one launch each (mamba/core.cuh).
+    int (*mamba_conv_seq_runs)(const void*, void*, const void*, uint32_t, uint32_t, const void*,
+                               const void*, void*, uint32_t, uint32_t, const void*, uint32_t,
+                               uint32_t, void*);
+    int (*mamba2_scan_seq_keep_runs_f16)(const void*, uint32_t, const void*, const void*,
+                                         uint32_t, const void*, const void*, const void*, void*,
+                                         void*, const void*, uint32_t, uint32_t, uint32_t,
+                                         uint32_t, uint32_t, void*);
+    // 949: the speech encoder's speaker activity codes on the device (asr/transcribe.cuh).
+    int (*tr_codes)(const void*, void*, uint32_t, uint32_t, void*);
+    // 950: the diarizer's attention over packed windows (diarization.cuh).
+    int (*diar_attention_varlen)(const void*, const void*, const void*, void*, const void*,
+                                 uint32_t, uint32_t, uint32_t, void*);
+    // 951-953: the MTP block's FP8 experts over expert-sorted blocks (asr/transcribe.cuh).
+    int (*f8r_moe_up_relu2_sorted)(const void*, const void*, const void*, const void*,
+                                   const void*, const void*, void*, uint32_t, uint32_t, uint32_t,
+                                   uint32_t, void*);
+    int (*f8r_moe_down_sorted)(const void*, const void*, const void*, const void*, const void*,
+                               const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    int (*f8r_moe_combine)(const void*, const void*, void*, uint32_t, uint32_t, uint32_t,
+                           uint32_t, void*);
+    // 954: a prompt walk's f16 seq scans over a run table (mamba/core.cuh).
+    int (*mamba2_scan_seq_runs_f16)(void*, uint32_t, const void*, const void*, uint32_t,
+                                    const void*, const void*, const void*, void*, const void*,
+                                    const void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                                    uint32_t, void*);
+    // 955: slot 947's run walk chunked on grid.z, in place allowed (mamba/core.cuh).
+    int (*mamba_conv_seq_runs_chunked)(const void*, void*, const void*, uint32_t, uint32_t,
+                                       const void*, const void*, void*, uint32_t, uint32_t,
+                                       const void*, uint32_t, uint32_t, uint32_t, void*);
+    // 956-957: the skinny / wide tiled down twins, bf16 partials from row vf
+    // on (moe/nvf4_st.cuh).
+    int (*nvf4_moe_down_st_bf16)(const void*, const void*, const void*, const void*,
+                                 const void*, const void*, const void*, const void*,
+                                 const void*, void*, uint32_t, uint32_t, uint32_t,
+                                 uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    int (*nvf4_moe_down_stw_bf16)(const void*, const void*, const void*, const void*,
+                                  const void*, const void*, const void*, const void*,
+                                  const void*, void*, uint32_t, uint32_t, uint32_t,
+                                  uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 958-960: Transcribe's CTC timestamp head (asr/transcribe.cuh).
+    int (*tr_ctc_qk_norm_rope)(void*, const void*, const void*, const void*, const void*,
+                               const void*, uint32_t, uint32_t, uint32_t, uint32_t, float,
+                               void*);
+    int (*tr_ctc_attention)(const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+    int (*tr_ctc_lse_gather)(const void*, const void*, uint32_t, uint32_t, const void*,
+                             uint32_t, void*, void*);
+    // 961-963: Transcribe's W8A8 speech encoder (asr/transcribe_w8a8.cuh).
+    int (*tr_w8a8_gemm)(const void*, const void*, void*, const void*, float, float, float,
+                        uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    int (*tr_ln_e4m3)(const void*, const void*, const void*, void*, uint32_t, uint32_t, float,
+                      float, void*);
+    int (*tr_quant_e4m3_h)(const void*, void*, uint64_t, float, void*);
+    // 964: slot 722's GEMM with the activation's class (bf16 parts) as an
+    // argument (diarization.cuh).
+    int (*diar_gemm_p)(const void*, const void*, const void*, const void*, void*, void*,
+                       const void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                       void*);
+    // 965-967: the diarization encoder in the BF16 class (diar_bf16.cuh,
+    // diarization.cuh).
+    int (*diar_b16_gemm)(const void*, const void*, const void*, void*, void*, const void*,
+                         uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    int (*diar_norm_b16)(const void*, const void*, const void*, void*, uint32_t, uint32_t, void*);
+    int (*diar_attention_b16)(const void*, const void*, const void*, void*, uint32_t, uint32_t,
+                              uint32_t, const void*, uint32_t, uint32_t, void*);
 };
 
 } // extern "C"

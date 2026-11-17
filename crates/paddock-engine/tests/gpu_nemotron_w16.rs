@@ -109,7 +109,8 @@ fn w16_experts_rows_match_one_row_bitexact() {
         .nvf4_moe_upload_tiled(sh.1.packed, sh.1.scales, &[sh.1.scale2], 1, embd, ff)
         .expect("shd");
     let aw = k * ff + ff;
-    let nb = 64usize;
+    // 128 rows (a Transcribe round: 32 slots x depth 3) route 768 picks
+    let nb = 160usize;
     // one launch pair over `rows` rows; returns (activations, partials)
     let run = |idx: &[u32], w: &[f32], x: &[f32], rows: usize| -> (Vec<u16>, Vec<f32>) {
         let d_idx = exec.to_device_u32(idx).unwrap();
@@ -136,7 +137,7 @@ fn w16_experts_rows_match_one_row_bitexact() {
             exec.to_host(&part).unwrap(),
         )
     };
-    for rows in [2usize, 5, 8, 13, 33, 64] {
+    for rows in [2usize, 5, 8, 13, 33, 64, 97, 128] {
         let idx: Vec<u32> = (0..rows)
             .flat_map(|r| [0u32, 1 + (r % 7) as u32, 1 + ((r + 3) % 7) as u32])
             .collect();
@@ -422,7 +423,7 @@ fn w16_dense_e4m3_rows_match_one_row_bitexact() {
                 .expect("dense w16");
             exec.to_host(&d_y).unwrap()
         };
-        for rows in [2usize, 7, 8, 9, 32, 41, 64] {
+        for rows in [2usize, 7, 8, 9, 32, 41, 64, 65, 128] {
             let x = det(rows * v.k, 30 + rows as u64);
             let y = run(&x, rows);
             assert!(
@@ -488,7 +489,7 @@ fn w16_dense_bf16_rows_match_one_row_bitexact() {
                 .expect("dense w16");
             exec.to_host(&d_y).unwrap()
         };
-        for rows in [2usize, 7, 8, 9, 32, 41, 64] {
+        for rows in [2usize, 7, 8, 9, 32, 41, 64, 65, 128] {
             let x = det(rows * in_dim, 50 + rows as u64);
             let y = run(&x, rows);
             assert!(
@@ -891,7 +892,7 @@ fn w16_route_matches_the_unfused_router_bitexact() {
         .unwrap();
     let scale = 2.5f32;
     let mut tickets = exec
-        .alloc_u32(GpuExecutor::moe_route_w16_tickets(64))
+        .alloc_u32(GpuExecutor::moe_route_w16_tickets(128))
         .unwrap();
     struct Routed {
         logits: Vec<f32>,
@@ -979,7 +980,7 @@ fn w16_route_matches_the_unfused_router_bitexact() {
             ),
         }
     };
-    for rows in [1usize, 2, 5, 8, 9, 16, 33, 64] {
+    for rows in [1usize, 2, 5, 8, 9, 16, 33, 64, 97, 128] {
         let nb = nb_of(rows);
         let x = det(rows * in_dim, 90 + rows as u64);
         let d_x = exec.to_device(&x).unwrap();

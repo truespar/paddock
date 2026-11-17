@@ -160,20 +160,28 @@ function uid(): string {
  *  tower and extracts the text layer (sift) for anything else. `fileData` maps
  *  a file part's attachmentId -> its `data:` URI (fetched by the caller's
  *  pre-pass, since PDF bytes don't live in the doc). */
-function toApiContent(m: Message, vision: boolean, fileData: Map<string, string>): unknown {
-  const hasAttachment = m.content.some((p) => p.type === 'image' || p.type === 'file')
-  // An audio clip reaches a CHAT model as a note, never as bytes - and that is
-  // a hard constraint, not a simplification: /v1/responses refuses audio parts
-  // outright (the runner serves them on /v1/chat/completions and
-  // /v1/audio/transcriptions only), so sending one would 400 the whole turn.
-  // Nothing is lost: the transcript is already an ordinary assistant message
-  // in this history, which is exactly what "summarise that" reads. The note
+function toApiContent(
+  m: Message,
+  vision: boolean,
+  fileData: Map<string, string>,
+  hears = false,
+): unknown {
+  const hasAttachment = m.content.some(
+    (p) => p.type === 'image' || p.type === 'file' || (hears && p.type === 'audio'),
+  )
+  // An audio clip reaches a CHAT model as a note, not as bytes - except on a
+  // lane that HEARS in chat (`hears`: Nemotron 3.5 Transcribe, which answers
+  // questions about a recording), where the clip rides as `input_audio`.
+  // Everywhere else the transcript is already an ordinary assistant message
+  // in this history, which is exactly what "summarise that" reads; the note
   // only says a clip was there, so the model doesn't answer as if the user
   // sent an empty message.
-  const clipLead = m.content
-    .filter((p): p is AudioPart => p.type === 'audio')
-    .map((p) => `[audio: ${p.name || 'recording'}]`)
-    .join(' ')
+  const clipLead = hears
+    ? ''
+    : m.content
+        .filter((p): p is AudioPart => p.type === 'audio')
+        .map((p) => `[audio: ${p.name || 'recording'}]`)
+        .join(' ')
   // A graph rides the same way as audio and for the same reason: never bytes.
   // The model reaches it through graph_query; the note only records that the
   // attachment happened in this turn.
@@ -214,6 +222,20 @@ function toApiContent(m: Message, vision: boolean, fileData: Map<string, string>
         if (p.pageRange) part.pages = p.pageRange
         parts.push(part)
       }
+    } else if (p.type === 'audio' && hears) {
+      // the clip's own bytes, base64 without the data: prefix; the runner
+      // sniffs the container, so `format` is the file's kind as a hint
+      const src = p.attachmentId ? fileData.get(p.attachmentId) : undefined
+      const comma = src?.indexOf(',') ?? -1
+      if (src && comma > 0) {
+        parts.push({
+          type: 'input_audio',
+          input_audio: { data: src.slice(comma + 1), format: audioFormat(p) },
+        })
+      } else {
+        // the stored bytes are gone: say a clip was there rather than drop it
+        parts.push({ type: 'input_text', text: `[audio: ${p.name || 'recording'} - no longer stored]` })
+      }
     } else if (p.type === 'file') {
       // PDF -> input_file for any model (page images on vision+pdfium, sift
       // text extraction otherwise - the server routes). Bytes come from the
@@ -236,12 +258,21 @@ function toApiContent(m: Message, vision: boolean, fileData: Map<string, string>
   return parts
 }
 
+/** An audio part's container as `input_audio.format` names it: the mime
+ *  subtype, else the file's extension, else wav. */
+function audioFormat(p: AudioPart): string {
+  const sub = p.mime.split('/')[1]?.split(';')[0]?.trim()
+  if (sub) return sub === 'mpeg' ? 'mp3' : sub === 'x-wav' || sub === 'wave' ? 'wav' : sub
+  const ext = /\.([a-z0-9]+)$/i.exec(p.name)?.[1]
+  return ext ? ext.toLowerCase() : 'wav'
+}
+
 /** Fetch the bytes of every `file` AND `image` part in the conversation (from
  *  the attachments table) as `data:` URIs, so the sync body-builders can inline
  *  them into `input_file` / `input_image` parts. Images ride this path so the
  *  server sees ORIGINAL bytes (EXIF metadata + orientation intact). Failures
  *  are skipped (the part falls back to its inline copy, or drops out). */
-async function resolveFileData(conv: Conversation): Promise<Map<string, string>> {
+async function resolveFileData(conv: Conversation, audio = false): Promise<Map<string, string>> {
   const ids = new Set<string>()
   // Only the branch that will actually be sent - resolving an abandoned
   // branch's attachments would refetch photos nothing is going to reference.
@@ -252,6 +283,8 @@ async function resolveFileData(conv: Conversation): Promise<Map<string, string>>
       // the store on every turn of the conversation and not.
       if (p.type === 'image' && p.unreadable) continue
       if ((p.type === 'file' || p.type === 'image') && p.attachmentId) ids.add(p.attachmentId)
+      // clips only for a lane that hears them in chat (see toApiContent)
+      if (audio && p.type === 'audio' && p.attachmentId) ids.add(p.attachmentId)
     }
   }
   const map = new Map<string, string>()
@@ -294,6 +327,7 @@ function buildInput(
   // before building, so the caps answer is warm here.
   const store = useModelsStore()
   const vision = store.visionFor(modelId)
+  const hears = store.asksInChat(modelId)
   // Preserving prior thinking is both the chat's choice and the lane's
   // capability: a model whose template ignores preserve_thinking would just be
   // sent context it cannot act on. Continue mode never keeps it - that turn is
@@ -331,7 +365,7 @@ function buildInput(
         content: [{ type: 'reasoning_text', text: m.reasoning }],
       })
     }
-    items.push({ type: 'message', role: m.role, content: toApiContent(m, vision, fileData) })
+    items.push({ type: 'message', role: m.role, content: toApiContent(m, vision, fileData, hears) })
   })
   if (cont) {
     items.push({
@@ -1621,11 +1655,17 @@ export function useChatStream() {
     sharedGpu = false,
   ): Promise<void> {
     const modelId = assistant.model ?? (append ? assistant.run?.model : undefined) ?? conv.model
-    // Audio in the turn = transcription, whatever the model is.
+    // Audio in the turn = transcription, whatever the model is - unless the
+    // user asked something about the clip and this lane answers that in chat
+    // (Transcribe: its transcription endpoint would read the question as
+    // spelling hints and hand back the transcript).
     const clip = append ? undefined : clipFor(conv, assistant)
     if (clip) {
-      await runTranscription(conv, assistant, clip, lane, sharedGpu)
-      return
+      if (clip.said) await models.capsFor(modelId)
+      if (!(clip.said && models.asksInChat(modelId))) {
+        await runTranscription(conv, assistant, clip, lane, sharedGpu)
+        return
+      }
     }
     // An image model answers a prompt with a picture - its own path, keyed
     // on the model because the input (text) is the same as a chat's.
@@ -1765,8 +1805,9 @@ export function useChatStream() {
     }
 
     // Pre-pass: fetch PDF attachment bytes (kept out of the doc) so the sync
-    // body-builder can inline them as `input_file` parts.
-    const fileData = await resolveFileData(conv)
+    // body-builder can inline them as `input_file` parts - and the clips, on
+    // a lane that hears them in chat.
+    const fileData = await resolveFileData(conv, models.asksInChat(modelId))
     try {
       // Studio chats go through the manager's relay (doc §10): the manager
       // originates the runner call as a client, keyed by the runner serving

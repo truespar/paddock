@@ -151,6 +151,22 @@
     "temperature": "implemented",
     "timestamp_granularities": "implemented"
   },
+  "audio_translations": {
+    "file": "implemented",
+    "model": "advisory",
+    "prompt": "rejected",
+    "response_format": "partial",
+    "temperature": "implemented"
+  },
+  "_translations_readme": [
+    "`/v1/audio/translations` is the transcription handler run with the lane's",
+    "own translation instruction (translations.rs). `prompt` is refused - the",
+    "instruction IS the model card's translation request on every lane that",
+    "translates - and `response_format` serves json | text | verbose_json, not",
+    "srt | vtt (no lane here times translated text). vLLM's `language`,",
+    "`to_language` and `stream` ride as extensions. Static half only: the",
+    "--audio-only gate runs a whisper checkpoint, which refuses translation."
+  ],
   "images_generations": {
     "background": "implemented",
     "model": "advisory",

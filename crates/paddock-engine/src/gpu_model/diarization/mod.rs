@@ -23,6 +23,7 @@
 //! reference is the model's F64 evaluation instead.
 
 mod forward;
+pub use forward::MAX_PACKED;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -84,7 +85,8 @@ struct Layer {
     down: Linear,
 }
 
-/// The resident pass planes, sized once for [`MAX_ROWS`]: a window never
+/// The resident pass planes, sized once for the load's window ceiling
+/// ([`MAX_ROWS`] for the diarization endpoints): a window never
 /// allocates, and the ledger the catalog carries is this sum.
 struct Workspace {
     pcm: CudaSlice<f32>,
@@ -102,11 +104,34 @@ struct Workspace {
     up: CudaSlice<f32>,
     hidden: CudaSlice<f32>,
     probs: CudaSlice<f32>,
+    /// the BF16 class's operand planes (allocated when it is set): the
+    /// LayerNorms' rows, the attention's output, the FFN's activation
+    b16: Option<B16Planes>,
+}
+
+struct B16Planes {
+    n16: CudaSlice<half::bf16>,
+    att16: CudaSlice<half::bf16>,
+    wide16: CudaSlice<half::bf16>,
+}
+
+impl B16Planes {
+    fn new(e: &GpuExecutor, max_rows: usize) -> Result<Self, GpuModelError> {
+        Ok(Self {
+            n16: e.stream_alloc_bf16(max_rows * 512)?,
+            att16: e.stream_alloc_bf16(max_rows * 512)?,
+            wide16: e.stream_alloc_bf16(max_rows * 2048)?,
+        })
+    }
+
+    fn bytes(max_rows: usize) -> u64 {
+        2 * (max_rows * (512 + 512 + 2048)) as u64
+    }
 }
 
 impl Workspace {
-    fn new(e: &GpuExecutor) -> Result<Self, GpuModelError> {
-        let p = |n: usize| e.kumo_plane(MAX_ROWS * n);
+    fn new(e: &GpuExecutor, max_rows: usize) -> Result<Self, GpuModelError> {
+        let p = |n: usize| e.kumo_plane(max_rows * n);
         Ok(Self {
             pcm: e.kumo_plane(MAX_PCM)?,
             input: p(1024)?,
@@ -121,11 +146,12 @@ impl Workspace {
             up: p(1536)?,
             hidden: p(1536)?,
             probs: p(64)?,
+            b16: None,
         })
     }
 
-    fn bytes() -> u64 {
-        4 * (MAX_PCM + MAX_ROWS * (1024 + 512 * 5 + 1536 * 3 + 2048 + 192 + 576 + 64)) as u64
+    fn bytes(max_rows: usize) -> u64 {
+        4 * (MAX_PCM + max_rows * (1024 + 512 * 5 + 1536 * 3 + 2048 + 192 + 576 + 64)) as u64
     }
 }
 
@@ -150,6 +176,16 @@ pub struct GpuDiarization {
     twiddle: CudaSlice<f32>,
     rope: CudaSlice<f32>,
     ws: Workspace,
+    /// several windows packed in one pass (`predict_packed_device`): its rope
+    /// table, positions restarting at each window, and the attention's
+    /// tiles - allocated at the first packed pass
+    packed: Option<Packed>,
+    /// encoder rows the planes hold (a window's ceiling)
+    max_rows: usize,
+    /// the stored-weight GEMMs' activation class: bf16 parts (3 the F32
+    /// class this lane's own reference holds; 1 the BF16 class a bf16
+    /// reference serves - Transcribe's speaker branch)
+    parts: u32,
     /// the frontend+pre-encode time of the window `predict` completes
     pre_seconds: f64,
     window: Vec<f32>,
@@ -157,16 +193,22 @@ pub struct GpuDiarization {
     silence: Vec<f32>,
 }
 
-/// The rope's (cos, sin) at every position of a window, `[MAX_ROWS][32]`
+/// The packed pass's per-row planes.
+struct Packed {
+    rope: CudaSlice<f32>,
+    tiles: CudaSlice<u32>,
+}
+
+/// The rope's (cos, sin) at every position of a window, `[max_rows][32]`
 /// pairs: inv_freq = 1 / 10000^(2i / 64) and angle = pos * inv_freq rounded
 /// to F32 as the reference forms them, then cos and sin of that F32 angle
 /// correctly rounded (evaluated in F64).
-fn rope_table() -> Vec<f32> {
+fn rope_table(max_rows: usize) -> Vec<f32> {
     let inv: Vec<f32> = (0..32)
         .map(|i| (1.0 / 10000f64.powf(2.0 * i as f64 / 64.0)) as f32)
         .collect();
-    let mut t = Vec::with_capacity(MAX_ROWS * 64);
-    for pos in 0..MAX_ROWS {
+    let mut t = Vec::with_capacity(max_rows * 64);
+    for pos in 0..max_rows {
         for &f in &inv {
             let angle = f64::from(pos as f32 * f);
             t.push(angle.cos() as f32);
@@ -180,6 +222,75 @@ impl GpuDiarization {
     /// Load the MLX BF16 directory or the GGUF Q8_0 file. The whole
     /// inventory is checked before the first allocation.
     pub fn load(exec: Arc<GpuExecutor>, path: &Path) -> Result<Self, GpuModelError> {
+        let bad = |e: String| GpuModelError::Unsupported(format!("Nemotron 3 Diarization: {e}"));
+        let ck = Checkpoint::open(path).map_err(bad)?;
+        // one stream, one owning thread - must precede every alloc
+        exec.disable_event_tracking();
+        Self::from_checkpoint(exec, ck, MAX_ROWS)
+    }
+
+    /// The copy Nemotron 3.5 Transcribe's perception carries (its shards,
+    /// `st`), with planes for windows of `max_rows` encoder rows. The
+    /// executor is the speech LM's, so its event tracking stays as it is.
+    pub fn load_perception(
+        exec: Arc<GpuExecutor>,
+        st: paddock_models::safetensors::ShardedSafetensors,
+        max_rows: usize,
+    ) -> Result<Self, GpuModelError> {
+        Self::from_checkpoint(exec, Checkpoint::perception(st), max_rows)
+    }
+
+    /// Make the BF16 class available (its operand planes, once): the stored-
+    /// weight GEMMs with bf16 operands landed by their producers, one product
+    /// a k16 span (slots 964-967). [`Self::set_bf16_class`] then picks the
+    /// class per pass.
+    pub fn enable_bf16_class(&mut self) -> Result<(), GpuModelError> {
+        if !(self.exec.has_diar_gemm_parts() && self.exec.has_diar_bf16()) {
+            return Err(GpuModelError::Unsupported(
+                "this kernel pack predates the BF16-class diarization encoder (slots 964-967) - \
+                 rebuild or update the pack"
+                    .into(),
+            ));
+        }
+        let stored = self.layers.iter().all(|l| {
+            [&l.qkv, &l.out, &l.up, &l.down]
+                .iter()
+                .all(|lin| matches!(lin.w, Weights::Bf16(_)))
+        });
+        if !stored {
+            return Err(GpuModelError::Unsupported(
+                "Nemotron 3 Diarization: the BF16 class takes the encoder's BF16 rows as stored"
+                    .into(),
+            ));
+        }
+        if self.ws.b16.is_none() {
+            self.ws.b16 = Some(B16Planes::new(&self.exec, self.max_rows)?);
+        }
+        Ok(())
+    }
+
+    /// The class the next passes run: BF16 (`true`, after
+    /// [`Self::enable_bf16_class`]) or the F32 class (`false`, the default).
+    pub fn set_bf16_class(&mut self, on: bool) -> Result<(), GpuModelError> {
+        if on && self.ws.b16.is_none() {
+            return Err(GpuModelError::Unsupported(
+                "Nemotron 3 Diarization: the BF16 class was not enabled".into(),
+            ));
+        }
+        self.parts = if on { 1 } else { 3 };
+        Ok(())
+    }
+
+    /// Whether the stored-weight GEMMs run the BF16 class.
+    pub fn bf16_class(&self) -> bool {
+        self.parts == 1
+    }
+
+    fn from_checkpoint(
+        exec: Arc<GpuExecutor>,
+        ck: Checkpoint,
+        max_rows: usize,
+    ) -> Result<Self, GpuModelError> {
         if !exec.has_diarization() {
             return Err(GpuModelError::Unsupported(
                 "this kernel pack predates the Nemotron 3 Diarization lane (slots 718-723) - \
@@ -188,7 +299,6 @@ impl GpuDiarization {
             ));
         }
         let bad = |e: String| GpuModelError::Unsupported(format!("Nemotron 3 Diarization: {e}"));
-        let ck = Checkpoint::open(path).map_err(bad)?;
         // the stored bytes plus the head's F32 widening (the gate's figure;
         // the ledger below is what was actually allocated)
         let stored = ck.validate().map_err(bad)?;
@@ -196,12 +306,10 @@ impl GpuDiarization {
         let filterbank = ck.filterbank().map_err(bad)?;
         let silence = ck.silence().map_err(bad)?;
         exec.vram_load_gate(
-            stored + (8 << 20) + Workspace::bytes(),
+            stored + (8 << 20) + Workspace::bytes(max_rows),
             "Nemotron 3 Diarization",
         )
         .map_err(GpuModelError::WontFit)?;
-        // one stream, one owning thread - must precede every alloc
-        exec.disable_event_tracking();
         let weight_bytes = std::cell::Cell::new(0u64);
         let up = |v: &[f32]| {
             weight_bytes.set(weight_bytes.get() + 4 * v.len() as u64);
@@ -303,8 +411,8 @@ impl GpuDiarization {
         let fb_gpu = up(&filterbank)?;
         let spans = exec.to_device_u32(&spans)?;
         let twiddle = up(&twiddle)?;
-        let rope = up(&rope_table())?;
-        let ws = Workspace::new(&exec)?;
+        let rope = up(&rope_table(max_rows))?;
+        let ws = Workspace::new(&exec, max_rows)?;
         exec.synchronize()?;
         Ok(Self {
             format: ck.format(),
@@ -324,6 +432,9 @@ impl GpuDiarization {
             twiddle,
             rope,
             ws,
+            packed: None,
+            max_rows,
+            parts: 3,
             pre_seconds: 0.,
             window,
             filterbank,
@@ -339,9 +450,20 @@ impl GpuDiarization {
         self.weight_bytes
     }
 
+    /// Encoder rows one window's planes hold.
+    pub fn max_rows(&self) -> usize {
+        self.max_rows
+    }
+
     /// The resident planes and frontend constants: allocated once at load.
     pub fn workspace_bytes(&self) -> u64 {
-        Workspace::bytes() + 4 * (512 + 128 * 257 + 256 + 512 + MAX_ROWS * 64) as u64
+        Workspace::bytes(self.max_rows)
+            + if self.ws.b16.is_some() {
+                B16Planes::bytes(self.max_rows)
+            } else {
+                0
+            }
+            + 4 * (512 + 128 * 257 + 256 + 512 + self.max_rows * 64) as u64
     }
 
     pub fn executor(&self) -> &Arc<GpuExecutor> {

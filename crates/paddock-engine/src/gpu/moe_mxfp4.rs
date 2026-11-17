@@ -549,6 +549,48 @@ impl GpuExecutor {
         self.kernels.moe_slot_combine_bf16.is_some()
     }
 
+    /// The prompt class's split fold (slots 956-957): residual rows
+    /// `[0, vf)` take the f32 partials from `part`'s start, rows `[vf, rows)`
+    /// the bf16 plane laid from the f32 plane's row `vf` on - each row's
+    /// slots in the fixed order either fold keeps.
+    pub fn moe_slot_combine_split(
+        &self,
+        part: &CudaSlice<f32>,
+        residual: &mut CudaSlice<f32>,
+        embd: usize,
+        n_active: usize,
+        rows: usize,
+        vf: usize,
+    ) -> Result<(), GpuError> {
+        let vf = vf.min(rows);
+        if vf > 0 {
+            self.moe_slot_combine(part, residual, embd, n_active, vf)?;
+        }
+        if vf == rows {
+            return Ok(());
+        }
+        let f = self
+            .kernels
+            .moe_slot_combine_bf16
+            .ok_or(GpuError::MissingOp("moe_slot_combine_bf16"))?;
+        debug_assert!(part.len() >= vf * n_active * embd + (rows - vf) * n_active * embd / 2);
+        debug_assert!(residual.len() >= rows * embd);
+        let (pp, _g1) = part.device_ptr(&self.stream);
+        let (rp, _g2) = residual.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract; the bf16 plane starts at f32 element
+        // vf * n_active * embd, the residual rows at vf * embd
+        check(unsafe {
+            f(
+                (pp + (vf * n_active * embd * 4) as u64) as *const _,
+                (rp + (vf * embd * 4) as u64) as *mut _,
+                embd as u32,
+                n_active as u32,
+                (rows - vf) as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     pub fn moe_slot_combine(
         &self,
         part: &CudaSlice<f32>,
@@ -838,9 +880,7 @@ impl GpuExecutor {
         }
         {
             let mut v = scratch.slice_mut(0..n);
-            self.stream
-                .memcpy_htod(descs, &mut v)
-                .map_err(|e| GpuError::Driver(e.to_string()))?;
+            self.htod(descs, &mut v)?;
         }
         self.batched_copy(scratch, n / 3)
     }

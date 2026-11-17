@@ -25,7 +25,6 @@
 //! through one flat bounce blob, because the SSM arena may be f16 and
 //! widens/narrows only into a contiguous f32 span.
 
-use crate::gpu::GpuError;
 use crate::gpu_model::gpt_oss::GpuModelError;
 use crate::kv_pool::BLOCK_TOKENS;
 
@@ -168,10 +167,7 @@ impl GpuNemotron {
             for (j, &b) in bs.tables[slot].blocks().iter().enumerate() {
                 bs.bt_host[base + j] = b;
             }
-            self.exec
-                .stream
-                .memcpy_htod(&bs.bt_host, &mut bs.d_bt)
-                .map_err(|e| GpuError::Driver(e.to_string()))?;
+            self.exec.htod(&bs.bt_host, &mut bs.d_bt)?;
         }
         self.restore_state(slot, idx)?;
         Ok(pos)

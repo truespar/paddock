@@ -43,6 +43,7 @@ pub mod split;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod torch_zip;
+pub mod transcribe;
 
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;

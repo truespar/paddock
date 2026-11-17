@@ -121,7 +121,7 @@ fn split_request(
                 img = Some((rgb.as_slice(), *w, *h));
             }
             MmChunk::VisionPixels { .. } => {} // the processor fixes the size itself
-            MmChunk::Audio { .. } | MmChunk::OcrCrop(_) => {
+            MmChunk::Audio { .. } | MmChunk::OcrCrop(_) | MmChunk::CtcTimestamps { .. } => {
                 return Err(GpuModelError::Unsupported(
                     "nemotron-parse takes a page picture and text - routing bug".into(),
                 ));

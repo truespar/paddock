@@ -721,18 +721,40 @@ async fn a_batch_waits_out_its_service_and_yields_to_live_traffic() {
     r.fleet.up.store(false, Ordering::SeqCst);
     let v = wait_state(&r.app, &id, "waiting_for_service").await;
     assert_eq!(v["status"], "in_progress");
-    // it comes back as a new process, with somebody else's request on it
+    // it comes back as a new process, with somebody else's request on it.
+    // The yield reads the runner's in-flight count minus the batch's own
+    // requests on the wire, and a request still in transit hides a live one
+    // for that sample - so the rest of the batch runs slower than a few ticks,
+    // or a loaded test machine can finish it before any sample sees the live
+    // request
+    r.fake.delay_ms.store(100, Ordering::SeqCst);
     r.fake.live.store(1, Ordering::SeqCst);
     r.fleet.pid.store(4343, Ordering::SeqCst);
     r.fleet.up.store(true, Ordering::SeqCst);
     wait_state(&r.app, &id, "yielding").await;
-    // what was already sent finishes; nothing new goes out while it lasts
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    let s1 = r.db.batch_get(&id).unwrap().unwrap().succeeded;
+    // what was already sent finishes; nothing new goes out while it lasts.
+    // Counted where the requests arrive, once the batch has none of its own
+    // in flight: the stored count trails the answers by a group commit, and a
+    // loaded test machine stretches that past any fixed sleep, so a late
+    // commit of work sent before the yield read as new work
+    let mut drained = false;
+    for _ in 0..200 {
+        let (_, v) = call(&r.app, get(&format!("/v1/batches/{id}"))).await;
+        if v["paddock"]["state"] == "yielding" && v["paddock"]["in_flight"] == 0 {
+            drained = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        drained,
+        "the batch's own requests never drained while it yielded"
+    );
+    let sent = || r.fake.calls.lock().unwrap().values().sum::<u32>();
+    let c1 = sent();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let s2 = r.db.batch_get(&id).unwrap().unwrap().succeeded;
-    assert_eq!(s1, s2, "no batch work while live traffic runs");
-    assert!(s2 < 30);
+    assert_eq!(c1, sent(), "no batch work while live traffic runs");
+    assert!(r.db.batch_get(&id).unwrap().unwrap().succeeded < 30);
     // live traffic ends; after the dwell the batch finishes
     r.fake.live.store(0, Ordering::SeqCst);
     let row = wait_terminal(&r.db, &id).await;
@@ -1469,5 +1491,197 @@ async fn an_interrupted_completion_resumes_where_it_stopped() {
         "{v}"
     );
     assert_eq!(r.db.upload_get(&id2).unwrap().unwrap().status, "cancelled");
+    let _ = std::fs::remove_dir_all(&r.root);
+}
+
+/// The Studio's monitor (`/api/batches`): both dialects in one list with the
+/// active / ended split, results paged out of the files with the ok / failed
+/// split each dialect stores differently, a full line on demand, downloads,
+/// cancel from the monitor, and delete only once ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_monitor_lists_both_dialects_and_pages_their_results() {
+    let r = rig(4).await;
+    tokio::spawn(dispatch::run(r.b.clone()));
+
+    // an OpenAI batch with one failure
+    let jsonl: Vec<String> = (0..30)
+        .map(|i| chat_line(&format!("o-{i}"), if i == 5 { "bad" } else { "hello" }))
+        .collect();
+    let file = upload(&r.app, &jsonl.join("\n")).await;
+    let oa = create_openai(&r.app, &file, json!({})).await;
+    wait_terminal(&r.db, &oa).await;
+    // an Anthropic batch with one failure
+    let requests: Vec<Value> = (0..12)
+        .map(|i| {
+            json!({"custom_id": format!("a-{i}"), "params": {"model": MODEL, "max_tokens": 16,
+                "messages": [{"role": "user", "content": if i == 2 { "bad" } else { "hi" }}]}})
+        })
+        .collect();
+    let (s, v) = call(
+        &r.app,
+        post_json("/v1/messages/batches", json!({"requests": requests})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let an = v["id"].as_str().unwrap().to_owned();
+    wait_terminal(&r.db, &an).await;
+    // a slow one that is still running when the monitor looks
+    r.fake.delay_ms.store(150, Ordering::SeqCst);
+    let slow: Vec<String> = (0..40)
+        .map(|i| chat_line(&format!("s-{i}"), "slow"))
+        .collect();
+    let file = upload(&r.app, &slow.join("\n")).await;
+    let running = create_openai(&r.app, &file, json!({})).await;
+    wait_state(&r.app, &running, "running").await;
+
+    let (s, v) = call(&r.app, get("/api/batches")).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let ids: Vec<&str> = v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        [running.as_str(), an.as_str(), oa.as_str()],
+        "newest first, both dialects"
+    );
+    let (_, act) = call(&r.app, get("/api/batches?state=active")).await;
+    assert_eq!(act["data"].as_array().unwrap().len(), 1);
+    assert_eq!(act["data"][0]["id"], running.as_str());
+    assert!(
+        act["data"][0]["progress"]["state"].is_string(),
+        "a running batch carries its live block"
+    );
+    let (_, ended) = call(&r.app, get("/api/batches?state=ended&limit=1")).await;
+    assert_eq!(
+        (ended["data"][0]["id"].as_str(), ended["has_more"].as_bool()),
+        (Some(an.as_str()), Some(true))
+    );
+    let (_, o) = call(&r.app, get(&format!("/api/batches/{oa}"))).await;
+    assert_eq!(o["dialect"], "openai");
+    assert_eq!(
+        o["counts"],
+        json!({"total": 30, "succeeded": 29, "errored": 1, "canceled": 0, "expired": 0, "pending": 0})
+    );
+    assert!(o["progress"].is_null() && o["ended_ms"].is_i64());
+
+    // OpenAI: successes paged out of the output file, failures from their own
+    let mut cursor = 0u64;
+    let mut ok = Vec::new();
+    loop {
+        let (_, p) = call(
+            &r.app,
+            get(&format!(
+                "/api/batches/{oa}/results?kind=ok&limit=7&cursor={cursor}"
+            )),
+        )
+        .await;
+        ok.extend(p["items"].as_array().unwrap().iter().cloned());
+        cursor = p["next_cursor"].as_u64().unwrap();
+        if p["end"] == true {
+            break;
+        }
+    }
+    assert_eq!(ok.len(), 29);
+    assert!(
+        ok.iter()
+            .all(|i| i["ok"] == true && i["preview"] == "echo:hello" && i["output_tokens"] == 5)
+    );
+    let (_, f) = call(
+        &r.app,
+        get(&format!("/api/batches/{oa}/results?kind=failed")),
+    )
+    .await;
+    let f = f["items"].as_array().unwrap();
+    assert_eq!(f.len(), 1);
+    assert_eq!(
+        (f[0]["custom_id"].as_str(), f[0]["status"].as_u64()),
+        (Some("o-5"), Some(400))
+    );
+    assert_eq!(f[0]["error"], "the picture cannot be read");
+    // one line in full, by the offset a page handed out
+    let off = ok[3]["offset"].as_u64().unwrap();
+    let (_, full) = call(
+        &r.app,
+        get(&format!(
+            "/api/batches/{oa}/results/line?kind=ok&offset={off}"
+        )),
+    )
+    .await;
+    assert_eq!(full["custom_id"], ok[3]["custom_id"]);
+    assert_eq!(
+        full["response"]["body"]["choices"][0]["message"]["content"],
+        "echo:hello"
+    );
+    let (s, _) = call(
+        &r.app,
+        get(&format!(
+            "/api/batches/{oa}/results/line?kind=ok&offset={}",
+            off + 3
+        )),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "a mid-line offset is refused");
+
+    // Anthropic: one results file, split by result type
+    let (_, a_ok) = call(&r.app, get(&format!("/api/batches/{an}/results?kind=ok"))).await;
+    let (_, a_bad) = call(
+        &r.app,
+        get(&format!("/api/batches/{an}/results?kind=failed")),
+    )
+    .await;
+    assert_eq!(a_ok["items"].as_array().unwrap().len(), 11);
+    assert_eq!(a_ok["items"][0]["preview"], "echo:hi");
+    assert_eq!(a_bad["items"].as_array().unwrap().len(), 1);
+    assert_eq!(a_bad["items"][0]["custom_id"], "a-2");
+    assert_eq!(a_bad["items"][0]["status"], "errored");
+
+    // downloads: the files a person keeps
+    let (s, out) = raw(&r.app, get(&format!("/api/batches/{oa}/files/output"))).await;
+    assert_eq!((s, lines(&out).len()), (StatusCode::OK, 29));
+    let (_, errs) = raw(&r.app, get(&format!("/api/batches/{oa}/files/errors"))).await;
+    assert_eq!(lines(&errs).len(), 1);
+    let (_, inp) = raw(&r.app, get(&format!("/api/batches/{oa}/files/input"))).await;
+    assert_eq!(lines(&inp).len(), 30);
+    let (s, _) = raw(&r.app, get(&format!("/api/batches/{an}/files/errors"))).await;
+    assert_eq!(
+        s,
+        StatusCode::NOT_FOUND,
+        "an Anthropic batch has one results file"
+    );
+
+    // delete waits for the end; cancel from the monitor gets it there
+    let (s, _) = call(
+        &r.app,
+        Request::delete(format!("/api/batches/{running}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    let (s, v) = call(
+        &r.app,
+        post_json(&format!("/api/batches/{running}/cancel"), json!({})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let row = wait_terminal(&r.db, &running).await;
+    assert_eq!(row.status, "cancelled");
+    let (s, _) = call(
+        &r.app,
+        Request::delete(format!("/api/batches/{running}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = call(&r.app, get(&format!("/api/batches/{running}"))).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert!(
+        !r.b.job_dir(&running).exists(),
+        "its result files went with it"
+    );
     let _ = std::fs::remove_dir_all(&r.root);
 }

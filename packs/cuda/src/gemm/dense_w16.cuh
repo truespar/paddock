@@ -277,10 +277,12 @@ static int pd_dense_w16_go(const void* w, const void* rscale, const void* x,
     // a column's arithmetic. The f16 class (Parse's verify rounds: 2 rows a
     // slot, 64 at 32 slots) also takes 64 columns, so a 64-row call streams
     // its plane once instead of once per 32-column block; the bf16 / e4m3
-    // elections stay as they were measured.
+    // elections stay as they were measured up to 64 rows. Past 64 (a
+    // Transcribe round: 32 slots x 4 rows) every class takes 64 columns -
+    // 32 left a 128-row call streaming each plane four times.
     const uint32_t nt = rows <= 8u ? 1u
                       : rows <= 16u ? 2u
-                      : (rows <= 32u || dtype != 2u) ? 4u : 8u;
+                      : (rows <= 32u || (dtype != 2u && rows <= 64u)) ? 4u : 8u;
     dim3 grid((out_dim + 15u) / 16u, (rows + 8u * nt - 1u) / (8u * nt));
     const cudaStream_t st = (cudaStream_t)stream;
     const bool cw128 = dtype == 1u && (in_dim & 127u) == 0u;
@@ -300,14 +302,14 @@ static int pd_dense_w16_go(const void* w, const void* rscale, const void* x,
     } while (0)
     if (dtype == 1u) {
         if (cw128) {
-            if (x16) PD_DW16_NT(true, true, true, 128u); else PD_DW16_NT(true, true, false, 128u);
+            if (x16) PD_DW16_NT8(true, true, true, 128u); else PD_DW16_NT8(true, true, false, 128u);
         } else {
-            if (x16) PD_DW16_NT(true, true, true, 64u); else PD_DW16_NT(true, true, false, 64u);
+            if (x16) PD_DW16_NT8(true, true, true, 64u); else PD_DW16_NT8(true, true, false, 64u);
         }
     } else if (dtype == 2u) {
         if (x16) PD_DW16_NT8(false, true, true, 64u); else PD_DW16_NT8(false, true, false, 64u);
     } else {
-        if (x16) PD_DW16_NT(false, false, true, 64u); else PD_DW16_NT(false, false, false, 64u);
+        if (x16) PD_DW16_NT8(false, false, true, 64u); else PD_DW16_NT8(false, false, false, 64u);
     }
 #undef PD_DW16_NT8
 #undef PD_DW16_NT

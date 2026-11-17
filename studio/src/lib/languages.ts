@@ -111,11 +111,11 @@ export interface LanguageOption {
  *  variants, and a locale we do not serve falls back to detection rather than
  *  to something close-ish - `nn` is not `no`, and guessing on the user's
  *  behalf is the thing this exists to avoid. */
-export function localeLanguage(): string | undefined {
+export function localeLanguage(codes: readonly string[] = WHISPER_CODES): string | undefined {
   const tags = navigator.languages?.length ? navigator.languages : [navigator.language]
   for (const tag of tags) {
     const code = tag?.split('-')[0]?.toLowerCase()
-    if (code && WHISPER_CODES.includes(code)) return code
+    if (code && codes.includes(code)) return code
   }
   return undefined
 }
@@ -132,19 +132,30 @@ export const LANGUAGE_AUTO = 'auto'
 
 /** The code that rides on the wire for a stored setting - the one place the
  *  three states collapse into the two the API has. */
-export function askedLanguage(stored: string | undefined): string | undefined {
+export function askedLanguage(
+  stored: string | undefined,
+  codes: readonly string[] = WHISPER_CODES,
+): string | undefined {
   if (stored === LANGUAGE_AUTO) return undefined
-  return stored || localeLanguage()
+  // a choice this lane cannot take (picked for another model) is detection
+  // here, not a refusal from the runner
+  if (stored && !codes.includes(stored)) return undefined
+  return stored || localeLanguage(codes)
 }
 
 /** Auto first (it is the default and the right answer most of the time), then
- *  every language by name. Built once - the list never changes at runtime. */
-let cached: LanguageOption[] | undefined
-export function languageOptions(): LanguageOption[] {
-  if (cached) return cached
-  const rest = WHISPER_CODES.map((value) => ({ value, label: languageName(value) })).sort((a, b) =>
+ *  every language by name - whisper's set, or the lane's own where its
+ *  checkpoint declares one (`codes`, from the endpoint's caps). Built once
+ *  per set. */
+const cached = new Map<string, LanguageOption[]>()
+export function languageOptions(codes: readonly string[] = WHISPER_CODES): LanguageOption[] {
+  const key = codes.join(',')
+  const hit = cached.get(key)
+  if (hit) return hit
+  const rest = codes.map((value) => ({ value, label: languageName(value) })).sort((a, b) =>
     a.label.localeCompare(b.label),
   )
-  cached = [{ value: LANGUAGE_AUTO, label: 'Detect automatically' }, ...rest]
-  return cached
+  const out = [{ value: LANGUAGE_AUTO, label: 'Detect automatically' }, ...rest]
+  cached.set(key, out)
+  return out
 }

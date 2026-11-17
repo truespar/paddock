@@ -77,6 +77,15 @@ impl Handle {
             Inner::Loaded(e) => e.vision_budget(),
         }
     }
+    /// Word timestamps (Transcribe's CTC head), on a loaded engine only: a
+    /// resident pool may release its engine - and the captures with it -
+    /// between the reply and the alignment.
+    pub fn media_aligner(&self) -> Option<Arc<dyn paddock_engine::generator::MediaAligner>> {
+        match &self.0 {
+            Inner::Loaded(e) => e.media_aligner(),
+            Inner::Resident(_) => None,
+        }
+    }
     pub async fn shutdown(&self, timeout: Duration) -> bool {
         match &self.0 {
             Inner::Loaded(e) => {

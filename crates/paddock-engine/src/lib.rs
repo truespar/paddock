@@ -15,6 +15,9 @@ pub mod audio;
 pub mod backend;
 pub mod ckpt_pages;
 pub mod clef_decision;
+/// Word timestamps + speaker labels from Transcribe's CTC head (host side).
+#[cfg(feature = "cuda")]
+pub mod ctc_align;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod cv_resize;

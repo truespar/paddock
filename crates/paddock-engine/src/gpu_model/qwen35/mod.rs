@@ -2002,6 +2002,11 @@ fn build_mm_layout(
                     "OCR crop directive on qwen35 - routing bug".into(),
                 ));
             }
+            MmChunk::CtcTimestamps { .. } => {
+                return Err(GpuModelError::Unsupported(
+                    "CTC timestamp directive on qwen35 - routing bug".into(),
+                ));
+            }
             MmChunk::VisionPixels { .. } => {
                 return Err(GpuModelError::Unsupported(
                     "pixel-budget directive on qwen35 - routing bug".into(),

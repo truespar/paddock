@@ -54,6 +54,11 @@ pub(super) struct PfCuts {
     pub(super) run_pos: Vec<u32>,
     pub(super) dec: usize,
     pub(super) breaks: Vec<(usize, usize)>,
+    /// a fused round's leading VERIFY runs inside a prompt walk (Transcribe:
+    /// a spec round and the prompt chunk in one pass): their mamba advance
+    /// keeps the live state pre-round as a verify walk's does, every other
+    /// lane is the prompt class's for all rows. 0 = a plain prompt walk.
+    pub(super) vruns: usize,
 }
 
 /// VRAM slack the slot-fit math leaves untouched (graph/scratch churn).
@@ -294,7 +299,7 @@ pub(crate) struct NemoBatchScratch {
     /// r=1 decode keeps the serial lane's fused wave-dense MoE pair (the bs
     /// tiles pad 1 row to 32); these are its activation + partial planes
     pub d_act: CudaSlice<f32>,
-    /// the W16 decode class's 16-bit planes (W16_ROWS rows): activations cast
+    /// the W16 decode class's 16-bit planes (`w16_max` rows): activations cast
     /// once for the experts and wide attention calls (bf16), for the wide FP8
     /// projections (f16), and the experts' up output (bf16)
     pub d_x16b: CudaSlice<half::bf16>,
@@ -304,7 +309,7 @@ pub(crate) struct NemoBatchScratch {
     /// them zero)
     pub d_route_tickets: CudaSlice<u32>,
     /// a mixed tick's decode band: its residual rows, held while the
-    /// chunk's MoE folds over every row (W16_ROWS rows)
+    /// chunk's MoE folds over every row (`w16_max` rows)
     pub d_band_x: CudaSlice<f32>,
     /// the W16 class's attention: fixed-split partial planes for up to
     /// `w16_rows` rows x `w16_ns` splits, the law word (`w16_split_size`:
@@ -424,6 +429,9 @@ pub(crate) struct NemoBatch {
     pub state_ckpt_f32: usize,
     /// per-pass staging blobs the layer walk fills at break rows
     pub d_ckpt_stage: Vec<CudaSlice<f32>>,
+    /// a prompt pass's run table (u32 triples slot, first row, rows; a slot
+    /// a run), uploaded once a walk for slots 954-955
+    pub d_prompt_runs: CudaSlice<u32>,
     /// spec verify planes  - lazily allocated at first spec use
     pub verify: Option<super::spec::VerifyPlanes>,
     /// Stage F: per-slot tracked sequence (prompt keys, then every fed
@@ -448,6 +456,9 @@ pub(crate) struct ChunkedPrefill {
     /// next row to compute (starts at the prefix-resume point)
     pub cursor: usize,
     pub keys: Vec<u32>,
+    /// a recording prompt's media rows (mm.rs) - lent to the overlay for
+    /// the ticks that carry its rows; None for a text prompt
+    pub media: Option<super::mm::QueuedMedia>,
 }
 
 /// Batched depth-2 decode-pipe state (stage E - granite's PipeStateG shape):
@@ -596,9 +607,9 @@ pub(crate) fn w16_attn_splits(max_ctx: usize) -> (usize, usize) {
 
 /// The W16 decode class serves `rows` rows: the pack carries its kernels and
 /// `PADDOCK_NO_NEMO_W16` does not pin the old lanes back (dev: the A/B).
-pub(crate) fn w16_class(exec: &GpuExecutor, rows: usize) -> bool {
+pub(crate) fn w16_class(exec: &GpuExecutor, rows: usize, max: usize) -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    (1..=W16_ROWS).contains(&rows)
+    (1..=max).contains(&rows)
         && exec.has_nvf4_moe_w16()
         && exec.has_dense_w16()
         && exec.has_nvf4_gemm_tc()
@@ -721,6 +732,7 @@ impl GpuNemotron {
         let (embd, nh, n_kv, hd) = (hp.hidden, hp.n_heads, hp.n_kv_heads, hp.head_dim);
         let kv_dim = n_kv * hd;
         let q_dim = nh * hd;
+        let nv4w = self.nvf4_act_width();
         let d_inner = hp.d_inner();
         let conv_dim = hp.conv_dim();
         let kvb = self.kv_dtype.bytes();
@@ -799,6 +811,17 @@ impl GpuNemotron {
         // one row to a whole tick when the shared expert moved onto the dense
         // ladder - an estimate that misses a cap-scaled plane hands the pool
         // memory the scratch still needs
+        // the W16 class's planes past W16_ROWS, which the slack below always
+        // carried (Transcribe's rounds run the class to 128 rows)
+        let w16_est = {
+            let (_, ns) = w16_attn_splits(self.max_ctx);
+            let per_row = 2 * embd.max(q_dim)
+                + 2 * embd.max(d_inner)
+                + 2 * (hp.n_active * hp.moe_ff + hp.shared_ff)
+                + 4 * embd
+                + nh * ns * (hd + 2) * 4;
+            self.w16_max().min(cap).saturating_sub(W16_ROWS) * per_row
+        };
         let scratch_est = cap
             * (4 * embd
                 + hp.in_proj_rows()
@@ -811,11 +834,12 @@ impl GpuNemotron {
             * 4
             + latent_est
             + cap * qmax
-            + cap * (embd / 2 + embd / 16)
+            + cap * (nv4w / 2 + nv4w / 16)
             + nb_r * 32 * (hp.moe_ff / 2 + hp.moe_ff / 16)
             + nb_s * 32 * (hp.shared_ff / 2 + hp.shared_ff / 16)
             + max_batch * hp.vocab * 4
             + nh * attn_partial_rows(nh, n_kv, hd, self.exec.sm_count(), max_batch) * (hd + 2) * 4
+            + w16_est
             + (128 << 20);
         let px_on = !super::prefix::prefix_disabled();
         let retain = if px_on {
@@ -975,7 +999,11 @@ impl GpuNemotron {
             // 745 attends by its TILE law: whole waves at every depth
             w16_split = 0x4000_0000 | kh_tile_budget(e.sm_count(), hp.n_kv_heads, w16_ns);
         }
-        let w16_rows = slots.clamp(super::spec::SPEC_ROWS_NEMO, W16_ROWS).min(cap);
+        let w16_max = self.w16_max();
+        let w16_rows = slots
+            .clamp(super::spec::SPEC_ROWS_NEMO, W16_ROWS)
+            .max(if self.hp.transcribe { w16_max } else { 0 })
+            .min(cap);
         let d_sh_w = e.to_device(&vec![1.0f32; cap])?;
         let sc = NemoBatchScratch {
             d_tok: e.alloc_u32(cap)?,
@@ -1012,8 +1040,8 @@ impl GpuNemotron {
             d_sh_w,
             nb_r,
             nb_s,
-            d_xq4: e.alloc_i8(cap * embd / 2)?,
-            d_xs4: e.alloc_u8(cap * embd / 16)?,
+            d_xq4: e.alloc_i8(cap * nv4w / 2)?,
+            d_xs4: e.alloc_u8(cap * nv4w / 16)?,
             d_srow: e.alloc_u32(nb_r * 32)?,
             d_sslot: e.alloc_u32(nb_r * 32)?,
             d_bexp: e.alloc_u32(nb_r)?,
@@ -1026,12 +1054,12 @@ impl GpuNemotron {
             d_fs_s: e.alloc_u8(nb_s * 32 * hp.shared_ff / 16)?,
             d_part: e.alloc(cap * part_row)?,
             d_act: e.alloc(hp.n_active * hp.moe_ff + hp.shared_ff)?,
-            d_x16b: e.stream_alloc_bf16(W16_ROWS.min(cap) * embd.max(q_dim))?,
-            d_x16h: e.alloc_f16(W16_ROWS.min(cap) * embd.max(d_inner))?,
+            d_x16b: e.stream_alloc_bf16(w16_max.min(cap) * embd.max(q_dim))?,
+            d_x16h: e.alloc_f16(w16_max.min(cap) * embd.max(d_inner))?,
             d_act16: e
-                .stream_alloc_bf16(W16_ROWS.min(cap) * (hp.n_active * hp.moe_ff + hp.shared_ff))?,
-            d_route_tickets: e.alloc_u32(GpuExecutor::moe_route_w16_tickets(W16_ROWS.min(cap)))?,
-            d_band_x: e.alloc(W16_ROWS.min(cap) * embd)?,
+                .stream_alloc_bf16(w16_max.min(cap) * (hp.n_active * hp.moe_ff + hp.shared_ff))?,
+            d_route_tickets: e.alloc_u32(GpuExecutor::moe_route_w16_tickets(w16_max.min(cap)))?,
+            d_band_x: e.alloc(w16_max.min(cap) * embd)?,
             w16_split,
             w16_ns,
             w16_rows,
@@ -1214,6 +1242,7 @@ impl GpuNemotron {
             d_ckpt_desc,
             state_ckpt_f32,
             d_ckpt_stage,
+            d_prompt_runs: e.alloc_u32(slots * 3)?,
             verify: None,
             seq: vec![Vec::new(); slots],
             reply_ckpt: vec![None; slots],
@@ -1315,10 +1344,7 @@ impl GpuNemotron {
             }
         }
         if grew {
-            self.exec
-                .stream
-                .memcpy_htod(&bs.bt_host, &mut bs.d_bt)
-                .map_err(drv)?;
+            self.exec.htod(&bs.bt_host, &mut bs.d_bt)?;
         }
         Ok(())
     }
@@ -1463,6 +1489,7 @@ impl GpuNemotron {
                 run_pos,
                 dec,
                 breaks,
+                vruns: 0,
             }),
             false,
         )?;
@@ -1503,22 +1530,22 @@ impl GpuNemotron {
         let r = tokens.len();
         let bs = self.batch.as_mut().expect("batch enabled");
         let sc = &mut bs.sc;
-        let st = &self.exec.stream;
+        let ex = &self.exec;
         let mut t = sc
             .d_tok
             .try_slice_mut(0..r)
             .ok_or_else(|| GpuError::Driver("d_tok".into()))?;
-        st.memcpy_htod(tokens, &mut t).map_err(drv)?;
+        ex.htod(tokens, &mut t)?;
         let mut p = sc
             .d_pos
             .try_slice_mut(0..r)
             .ok_or_else(|| GpuError::Driver("d_pos".into()))?;
-        st.memcpy_htod(positions, &mut p).map_err(drv)?;
+        ex.htod(positions, &mut p)?;
         let mut s = sc
             .d_slots
             .try_slice_mut(0..r)
             .ok_or_else(|| GpuError::Driver("d_slots".into()))?;
-        st.memcpy_htod(slots, &mut s).map_err(drv)?;
+        ex.htod(slots, &mut s)?;
         Ok(())
     }
 
@@ -1550,6 +1577,7 @@ impl GpuNemotron {
     /// head_logits (row-batched GEMV - bit-exact per row vs the serial head).
     pub(super) fn head_rows(&mut self, rows: usize) -> Result<(), GpuModelError> {
         let exec = self.exec.clone();
+        let w16_max = self.w16_max();
         let (embd, eps) = (self.hp.hidden, self.hp.eps);
         let final_norm = self.final_norm.buf.clone();
         let vocab = self.hp.vocab;
@@ -1574,7 +1602,15 @@ impl GpuNemotron {
                 &sc.d_xn,
                 &mut sc.head_logits,
                 rows,
-                w16_class(&exec, rows),
+                w16_class(&exec, rows, w16_max),
+            )?,
+            HeadW::Bf16(h) => super::head_bf16_batch(
+                &exec,
+                h,
+                &sc.d_xn,
+                &mut sc.head_logits,
+                rows,
+                w16_class(&exec, rows, w16_max),
             )?,
             // GGUF lane: the mmq ladder at batch=rows (strided mma at the
             // decode widths) - row-batched, same class as the serial head
@@ -1628,6 +1664,26 @@ impl GpuNemotron {
             exec.stream.memcpy_dtod(&ps, &mut xd).map_err(drv)?;
         }
         self.head_rows(1)
+    }
+
+    /// Head over several residual rows at once (a tick's prompt tails):
+    /// rows gather into [0, n) through d_proj (a source row may sit inside
+    /// [0, n)), then one head call - head_logits row i is rows[i]'s. Only
+    /// for a head that scores one class at every row count (`w16_class`),
+    /// or a tail's bits would depend on how many prompts finish beside it.
+    pub(super) fn head_rows_at(&mut self, rows: &[usize]) -> Result<(), GpuModelError> {
+        let embd = self.hp.hidden;
+        let n = rows.len();
+        if rows.iter().enumerate().any(|(i, &r)| r != i) {
+            let exec = self.exec.clone();
+            let bs = self.batch.as_mut().expect("batch enabled");
+            let sc = &mut bs.sc;
+            for (i, &r) in rows.iter().enumerate() {
+                exec.copy_region(&sc.d_x, r * embd, &mut sc.d_proj, i * embd, embd)?;
+            }
+            exec.copy_region(&sc.d_proj, 0, &mut sc.d_x, 0, n * embd)?;
+        }
+        self.head_rows(n)
     }
 
     /// Prefill tail: head over residual row `row`, one vocab row to host.
@@ -1779,11 +1835,44 @@ impl GpuNemotron {
         self.ensure_rows(&[slot as u32], &[(n_rows - 1) as u32])
     }
 
+    /// The bf16 head (Transcribe) over host rows `x` [rows][hidden] in the
+    /// W16 tile class, one call - the gate compares its rows across call
+    /// widths. None on another head.
+    #[doc(hidden)]
+    pub fn head_tile_probe(&self, x: &[f32], rows: usize) -> Option<Vec<f32>> {
+        let HeadW::Bf16(h) = &self.lm_head else {
+            return None;
+        };
+        let xd = self.exec.stream.clone_htod(x).ok()?;
+        let mut yd = self
+            .exec
+            .stream
+            .alloc_zeros::<f32>(rows * self.hp.vocab)
+            .ok()?;
+        super::head_bf16_batch(&self.exec, h, &xd, &mut yd, rows, true).ok()?;
+        self.exec.stream.clone_dtoh(&yd).ok()
+    }
+
+    /// Whether this pack advances a verify round's mamba runs in one launch
+    /// a layer (slots 947-948) - the gate compares it against the per-run
+    /// launches.
+    #[doc(hidden)]
+    pub fn verify_runs_probe(&self) -> bool {
+        self.exec.has_mamba_verify_runs()
+    }
+
+    /// Whether this pack runs a prompt pass's mamba advance on the run table
+    /// (slots 954-955) - the gate that A/Bs it against the per-run walk.
+    #[doc(hidden)]
+    pub fn prompt_runs_probe(&self) -> bool {
+        self.exec.has_mamba_prompt_runs()
+    }
+
     /// Whether `rows` decode-class rows ride the W16 class on this pack -
     /// the gates assert bit-exactness only where the class serves.
     #[doc(hidden)]
     pub fn w16_class_probe(&self, rows: usize) -> bool {
-        self.w16_lane() && w16_class(&self.exec, rows)
+        self.w16_lane() && w16_class(&self.exec, rows, self.w16_max())
     }
 
     /// The model is on the lane whose kernels define the W16 class: the
@@ -1796,8 +1885,24 @@ impl GpuNemotron {
     /// 7 drafts and spec_serve_cadence left the greedy stream (GB10,
     /// 2026-09-27, bisected to the class's first commit). The GGUF lane keeps
     /// its own decode class.
+    /// The W16 class's row ceiling on this checkpoint: every row that stands
+    /// for a decode step has to fit it, or a round's verify rows score in
+    /// another class than the decode tick they stand for. Transcribe's rounds
+    /// run fused in the prompt class (fused.rs), so its W16 rows are a decode
+    /// tick's; the verify walk's fallback (PADDOCK_TR_NO_FUSED) takes rounds
+    /// to 128 rows in the class.
+    pub(crate) fn w16_max(&self) -> usize {
+        if self.hp.transcribe && !self.fused_rounds() {
+            128
+        } else {
+            W16_ROWS
+        }
+    }
+
     pub(super) fn w16_lane(&self) -> bool {
-        matches!(self.lm_head, HeadW::Nvf4(_))
+        // Transcribe's NVFP4 checkpoint carries a bf16 head beside the same
+        // NVFP4 experts
+        matches!(self.lm_head, HeadW::Nvf4(_) | HeadW::Bf16(_))
     }
 
     /// Diagnostic: host copies of one slot's per-mamba-layer SSM state and

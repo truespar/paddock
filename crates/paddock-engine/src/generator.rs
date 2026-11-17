@@ -331,6 +331,13 @@ pub trait Generator: Send {
         0
     }
 
+    /// The word-timestamp pass of a backend with a timestamp head (a
+    /// request opts in with `MmChunk::CtcTimestamps`), handed to the server
+    /// once at startup and called from its request threads.
+    fn media_aligner(&self) -> Option<std::sync::Arc<dyn MediaAligner>> {
+        None
+    }
+
     /// Denoise ONE block of `w` positions at `[base, base + w)` past the
     /// committed rows and return its ids (the argmax canvas) plus the number
     /// of denoising steps it took. `temperature`: `Some(0.0)` is
@@ -1222,6 +1229,16 @@ pub trait Generator: Send {
     fn vision_budget(&self) -> Option<VisionBudget> {
         None
     }
+}
+
+/// Word timestamps and speaker labels for a captured recording: vLLM's
+/// `ctc_timestamps` object (`words`, `diarization`,
+/// `speaker_tag_to_diarization_speaker`, `error`) for the transcript the
+/// request generated. Taking the capture ends it; `forget` drops one no
+/// transcript will come for.
+pub trait MediaAligner: Send + Sync {
+    fn align(&self, id: u64, transcript: &str) -> serde_json::Value;
+    fn forget(&self, id: u64);
 }
 
 /// How large an image this endpoint's vision tower can actually use.

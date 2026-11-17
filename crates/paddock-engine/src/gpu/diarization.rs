@@ -206,14 +206,50 @@ impl GpuExecutor {
         w: DiarWeights<'_>,
         bias: Option<&CudaSlice<f32>>,
         y: &mut CudaSlice<f32>,
-        (k, n, m): (usize, usize, usize),
+        shape: (usize, usize, usize),
         epi: DiarEpi,
         rope: Option<(&mut CudaSlice<f32>, &CudaSlice<f32>)>,
     ) -> Result<(), GpuError> {
+        self.diar_gemm_parts(x, w, bias, y, shape, epi, rope, 3)
+    }
+
+    /// Whether the pack takes the activation's class as an argument (slot
+    /// 964): [`Self::diar_gemm_parts`] below 3 parts.
+    pub fn has_diar_gemm_parts(&self) -> bool {
+        self.kernels.diar_gemm_p.is_some()
+    }
+
+    /// [`Self::diar_gemm`] with the activation in `parts` bf16 parts: 3 the
+    /// F32 class (slot 722), 2 to 16 significant bits, 1 rounded once to
+    /// bf16 - the BF16 class (slot 964).
+    #[allow(clippy::too_many_arguments)]
+    pub fn diar_gemm_parts(
+        &self,
+        x: KumoIn<'_>,
+        w: DiarWeights<'_>,
+        bias: Option<&CudaSlice<f32>>,
+        y: &mut CudaSlice<f32>,
+        (k, n, m): (usize, usize, usize),
+        epi: DiarEpi,
+        rope: Option<(&mut CudaSlice<f32>, &CudaSlice<f32>)>,
+        parts: u32,
+    ) -> Result<(), GpuError> {
+        if !(1..=3).contains(&parts) {
+            return Err(oob("diar_gemm: parts must be 1, 2 or 3"));
+        }
         let f = self
             .kernels
             .diar_gemm
             .ok_or(GpuError::MissingOp("diar_gemm"))?;
+        let fp = if parts == 3 {
+            None
+        } else {
+            Some(
+                self.kernels
+                    .diar_gemm_p
+                    .ok_or(GpuError::MissingOp("diar_gemm_p"))?,
+            )
+        };
         if m == 0 {
             return Ok(());
         }
@@ -258,25 +294,53 @@ impl GpuExecutor {
             ),
             None => (None, None),
         };
-        // SAFETY: ABI contract (slot 722); bounds checked above, null scale
-        // only with BF16 weights, null bias = none, the q plane and table
-        // only with the rope epilogue
+        let args = (
+            (xp + 4 * x.1 as u64) as *const _,
+            wp as *const _,
+            sp.as_ref().map_or(0, |(p, _)| *p) as *const _,
+            bp.as_ref().map_or(0, |(p, _)| *p) as *const _,
+            yp as *mut _,
+            qp.as_ref().map_or(0, |(p, _)| *p) as *mut _,
+            tp.as_ref().map_or(0, |(p, _)| *p) as *const _,
+        );
+        let wtype = u32::from(matches!(w, DiarWeights::Q8 { .. }));
+        // SAFETY: ABI contract (slots 722 / 964); bounds checked above, null
+        // scale only with BF16 weights, null bias = none, the q plane and
+        // table only with the rope epilogue
         check(unsafe {
-            f(
-                (xp + 4 * x.1 as u64) as *const _,
-                wp as *const _,
-                sp.as_ref().map_or(0, |(p, _)| *p) as *const _,
-                bp.as_ref().map_or(0, |(p, _)| *p) as *const _,
-                yp as *mut _,
-                qp.as_ref().map_or(0, |(p, _)| *p) as *mut _,
-                tp.as_ref().map_or(0, |(p, _)| *p) as *const _,
-                k as u32,
-                n as u32,
-                m as u32,
-                u32::from(matches!(w, DiarWeights::Q8 { .. })),
-                epi as u32,
-                self.stream_ptr(),
-            )
+            match fp {
+                None => f(
+                    args.0,
+                    args.1,
+                    args.2,
+                    args.3,
+                    args.4,
+                    args.5,
+                    args.6,
+                    k as u32,
+                    n as u32,
+                    m as u32,
+                    wtype,
+                    epi as u32,
+                    self.stream_ptr(),
+                ),
+                Some(fp) => fp(
+                    args.0,
+                    args.1,
+                    args.2,
+                    args.3,
+                    args.4,
+                    args.5,
+                    args.6,
+                    k as u32,
+                    n as u32,
+                    m as u32,
+                    wtype,
+                    epi as u32,
+                    parts,
+                    self.stream_ptr(),
+                ),
+            }
         })
     }
 
@@ -325,6 +389,61 @@ impl GpuExecutor {
         })
     }
 
+    /// Slot 950: the attention over several windows packed in one pass.
+    pub fn has_diar_attention_varlen(&self) -> bool {
+        self.kernels.diar_attention_varlen.is_some()
+    }
+
+    /// [`Self::diar_attention`] over packed windows (slot 950): `tiles`
+    /// (device, `n_tiles` u32 quads {first query row, queries, the window's
+    /// first row, its keys}) cut `warps` (2 or 4) x 16 queries high, each
+    /// inside one window of the `rows` packed rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn diar_attention_varlen(
+        &self,
+        q: &CudaSlice<f32>,
+        qkv: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        rows: usize,
+        tiles: &CudaSlice<u32>,
+        n_tiles: usize,
+        warps: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .diar_attention_varlen
+            .ok_or(GpuError::MissingOp("diar_attention_varlen"))?;
+        if n_tiles == 0 {
+            return Ok(());
+        }
+        if q.len() < rows * 512
+            || qkv.len() < rows * 1536
+            || out.len() < rows * 512
+            || tiles.len() < 4 * n_tiles
+        {
+            return Err(oob("diar_attention_varlen: buffers under the geometry"));
+        }
+        let (qp, _g1) = q.device_ptr(&self.stream);
+        let (kp, _g2) = qkv.device_ptr(&self.stream);
+        let (op, _g3) = out.device_ptr_mut(&self.stream);
+        let (tp, _g4) = tiles.device_ptr(&self.stream);
+        // SAFETY: ABI contract (slot 950); the caller's tiles index rows
+        // inside the packed planes checked above
+        check(unsafe {
+            f(
+                qp as *const _,
+                (kp + 4 * 512) as *const _,
+                (kp + 4 * 1024) as *const _,
+                op as *mut _,
+                tp as *const _,
+                n_tiles as u32,
+                warps as u32,
+                24,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// ReLU or sigmoid over the first `n` values of `x`, in place (slot 721).
     pub fn diar_act(&self, x: &mut CudaSlice<f32>, n: usize, op: DiarAct) -> Result<(), GpuError> {
         let f = self
@@ -341,4 +460,207 @@ impl GpuExecutor {
         // SAFETY: ABI contract (slot 721); bounds checked above
         check(unsafe { f(xp as *mut _, n as u64, op as u32, self.stream_ptr()) })
     }
+}
+
+/// The attention's keys for [`GpuExecutor::diar_attention_b16`]: one window
+/// over its first `klen` keys, or the packed pass's tiles.
+pub enum DiarKeys<'a> {
+    Window(usize),
+    Packed {
+        tiles: &'a CudaSlice<u32>,
+        n_tiles: usize,
+        warps: usize,
+    },
+}
+
+impl GpuExecutor {
+    /// Slots 965-967: the diarization encoder in the BF16 class.
+    pub fn has_diar_bf16(&self) -> bool {
+        let k = &self.kernels;
+        k.diar_b16_gemm.is_some() && k.diar_norm_b16.is_some() && k.diar_attention_b16.is_some()
+    }
+
+    /// Slot 965: `y = epi(x16 . W + bias)` over `rows` bf16 rows, W the
+    /// stored BF16 rows `[f][k]` (raw bytes). [`DiarEpi::Gelu`] lands bf16 in
+    /// `y16`; the others land f32 in `y` (Rope: f 1536, q into `rope.0`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn diar_b16_gemm(
+        &self,
+        x16: &CudaSlice<half::bf16>,
+        w: &CudaSlice<u8>,
+        bias: Option<&CudaSlice<f32>>,
+        y: DiarB16Out<'_>,
+        (k, f, rows): (usize, usize, usize),
+        rope: Option<(&mut CudaSlice<f32>, &CudaSlice<f32>)>,
+    ) -> Result<(), GpuError> {
+        let func = self
+            .kernels
+            .diar_b16_gemm
+            .ok_or(GpuError::MissingOp("diar_b16_gemm"))?;
+        if rows == 0 {
+            return Ok(());
+        }
+        let (epi, ylen) = match &y {
+            DiarB16Out::F32(o, e) => (*e as u32, o.len()),
+            DiarB16Out::GeluB16(o) => (DiarEpi::Gelu as u32, o.len()),
+        };
+        let rope_ok = match &rope {
+            Some((q, t)) => {
+                epi == DiarEpi::Rope as u32
+                    && f == 1536
+                    && q.len() >= rows * 512
+                    && t.len() >= rows * 64
+            }
+            None => epi != DiarEpi::Rope as u32,
+        };
+        if !k.is_multiple_of(8)
+            || !f.is_multiple_of(64)
+            || !(epi == 0 || epi == 1 || epi == 2 || epi == 3)
+            || matches!(&y, DiarB16Out::F32(_, e) if *e == DiarEpi::Gelu)
+            || !rope_ok
+            || x16.len() < rows * k
+            || w.len() < 2 * f * k
+            || bias.is_some_and(|b| b.len() < f)
+            || ylen < rows * f
+        {
+            return Err(oob("diar_b16_gemm: buffers under the GEMM geometry"));
+        }
+        let (xp, _g1) = x16.device_ptr(&self.stream);
+        let (wp, _g2) = w.device_ptr(&self.stream);
+        let bp = bias.map(|b| b.device_ptr(&self.stream));
+        let (yp, _g3) = match y {
+            DiarB16Out::F32(o, _) => o.device_ptr_mut(&self.stream),
+            DiarB16Out::GeluB16(o) => o.device_ptr_mut(&self.stream),
+        };
+        let (qp, tp) = match rope {
+            Some((q, t)) => (
+                Some(q.device_ptr_mut(&self.stream)),
+                Some(t.device_ptr(&self.stream)),
+            ),
+            None => (None, None),
+        };
+        // SAFETY: ABI contract (slot 965); bounds checked above, null bias =
+        // none, the q plane and table only with the rope epilogue
+        check(unsafe {
+            func(
+                xp as *const _,
+                wp as *const _,
+                bp.as_ref().map_or(0, |(p, _)| *p) as *const _,
+                yp as *mut _,
+                qp.as_ref().map_or(0, |(p, _)| *p) as *mut _,
+                tp.as_ref().map_or(0, |(p, _)| *p) as *const _,
+                k as u32,
+                f as u32,
+                rows as u32,
+                epi,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// Slot 966: slot 719's LayerNorm landed as bf16 `[rows][512]`.
+    pub fn diar_norm_b16(
+        &self,
+        x: KumoIn<'_>,
+        (w, b): (&CudaSlice<f32>, &CudaSlice<f32>),
+        y16: &mut CudaSlice<half::bf16>,
+        rows: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .diar_norm_b16
+            .ok_or(GpuError::MissingOp("diar_norm_b16"))?;
+        if rows == 0 {
+            return Ok(());
+        }
+        if x.0.len() < x.1 + rows * 512 || w.len() < 512 || b.len() < 512 || y16.len() < rows * 512
+        {
+            return Err(oob("diar_norm_b16: buffers under the geometry"));
+        }
+        let (xp, _g1) = x.0.device_ptr(&self.stream);
+        let (wp, _g2) = w.device_ptr(&self.stream);
+        let (bp, _g3) = b.device_ptr(&self.stream);
+        let (yp, _g4) = y16.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slot 966); bounds checked above
+        check(unsafe {
+            f(
+                (xp + 4 * x.1 as u64) as *const _,
+                wp as *const _,
+                bp as *const _,
+                yp as *mut _,
+                512,
+                rows as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// Slot 967: the attention ([`Self::diar_attention`] or the packed
+    /// [`Self::diar_attention_varlen`]) landed as bf16 `[rows][512]`.
+    pub fn diar_attention_b16(
+        &self,
+        q: &CudaSlice<f32>,
+        qkv: &CudaSlice<f32>,
+        out16: &mut CudaSlice<half::bf16>,
+        rows: usize,
+        keys: DiarKeys<'_>,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .diar_attention_b16
+            .ok_or(GpuError::MissingOp("diar_attention_b16"))?;
+        if rows == 0 {
+            return Ok(());
+        }
+        if q.len() < rows * 512 || qkv.len() < rows * 1536 || out16.len() < rows * 512 {
+            return Err(oob("diar_attention_b16: buffers under the geometry"));
+        }
+        let (klen, tiles, n_tiles, warps) = match keys {
+            DiarKeys::Window(klen) => {
+                if klen == 0 || klen > rows {
+                    return Err(oob("diar_attention_b16: keys past the window"));
+                }
+                (klen, None, 0, 0)
+            }
+            DiarKeys::Packed {
+                tiles,
+                n_tiles,
+                warps,
+            } => {
+                if tiles.len() < 4 * n_tiles {
+                    return Err(oob("diar_attention_b16: tiles under the geometry"));
+                }
+                (0, Some(tiles.device_ptr(&self.stream)), n_tiles, warps)
+            }
+        };
+        let (qp, _g1) = q.device_ptr(&self.stream);
+        let (kp, _g2) = qkv.device_ptr(&self.stream);
+        let (op, _g3) = out16.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slot 967); bounds checked above - the last key
+        // read is inside rows * 1536 of the qkv rows
+        check(unsafe {
+            f(
+                qp as *const _,
+                (kp + 4 * 512) as *const _,
+                (kp + 4 * 1024) as *const _,
+                op as *mut _,
+                rows as u32,
+                klen as u32,
+                24,
+                tiles.as_ref().map_or(0, |(p, _)| *p) as *const _,
+                n_tiles as u32,
+                warps as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+}
+
+/// Where [`GpuExecutor::diar_b16_gemm`] lands.
+pub enum DiarB16Out<'a> {
+    /// f32 `[rows][f]`: [`DiarEpi::Store`], [`DiarEpi::Resid`] (accumulate)
+    /// or [`DiarEpi::Rope`]
+    F32(&'a mut CudaSlice<f32>, DiarEpi),
+    /// bf16 `[rows][f]` through the GELU
+    GeluB16(&'a mut CudaSlice<half::bf16>),
 }

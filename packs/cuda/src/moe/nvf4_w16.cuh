@@ -476,7 +476,7 @@ __global__ void __launch_bounds__(256) pd_moe_route_w16_kernel(
 
 // ABI 685. rows <= PD_W16_ROUTE_ROWS; `tickets` >= 1 + ceil(rows / 2) u32,
 // zero at the first launch (the kernel leaves them zero).
-#define PD_W16_ROUTE_ROWS 64u
+#define PD_W16_ROUTE_ROWS 128u
 PD_EXPORT
 int pd_moe_route_w16(const void* router_w, const void* x, void* logits, const void* bias,
                      float routed_scale, uint32_t in_dim, uint32_t n_expert, uint32_t k,

@@ -12,9 +12,11 @@ describe('shared web/native audio arming policy', () => {
   })
   it.each([
     [[text], 0, false, []], [[text], 1, false, ['dictate']],
-    [[whisper], 1, true, ['live', 'record']], [[generative], 1, false, ['record', 'dictate']],
+    [[whisper], 1, true, ['live', 'record']], [[generative], 1, false, ['record', 'live', 'dictate']],
+    [[generative], 0, false, ['record', 'live']],
+    [[{ ...generative, live: false }], 1, false, ['record', 'dictate']],
     [[whisper, generative], 2, true, ['live', 'record']],
-    [[generative, generative], 2, false, ['record']],
+    [[generative, generative], 2, false, ['record', 'live']],
     [[text, generative], 1, false, ['dictate']],
     [[whisper, cloud], 1, true, ['record']], [[cloud], 0, true, ['record']],
   ] as const)('resolves %j with %i transcribers', (lanes, ears, mode, jobs) => {

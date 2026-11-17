@@ -220,6 +220,103 @@ impl SsmArena {
         }
     }
 
+    /// [`Self::scan_seq_keep_at`] for every run of a verify round in one
+    /// launch (slot 948; `runs` = u32 triples slot, first row, rows). The
+    /// xbc / y / keep rows start at row 0 of their planes, dt at `dt_off`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_seq_keep_runs(
+        &self,
+        e: &GpuExecutor,
+        state_elems: usize,
+        xbc: &CudaSlice<f32>,
+        dt: &CudaSlice<f32>,
+        dt_off: usize,
+        dt_stride: usize,
+        a: &CudaSlice<f32>,
+        d: &CudaSlice<f32>,
+        dt_bias: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        keep: &mut CudaSlice<f32>,
+        runs: &CudaSlice<u32>,
+        n_runs: usize,
+        n_heads: usize,
+        head_dim: usize,
+        d_state: usize,
+        n_groups: usize,
+    ) -> Result<(), GpuError> {
+        match self {
+            SsmArena::F16(s) => e.mamba2_scan_seq_keep_runs_f16(
+                s,
+                state_elems,
+                xbc,
+                dt,
+                dt_off,
+                dt_stride,
+                a,
+                d,
+                dt_bias,
+                y,
+                keep,
+                runs,
+                n_runs,
+                n_heads,
+                head_dim,
+                d_state,
+                n_groups,
+            ),
+            SsmArena::F32(_) => Err(GpuError::MissingOp(
+                "rollback by replay is the f16 state class's",
+            )),
+        }
+    }
+
+    /// A prompt walk's seq scans for every run in one launch (slot 954; f16
+    /// class): each run's slot state advanced in place over its rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_seq_runs(
+        &mut self,
+        e: &GpuExecutor,
+        state_elems: usize,
+        xbc: &CudaSlice<f32>,
+        dt: &CudaSlice<f32>,
+        dt_off: usize,
+        dt_stride: usize,
+        a: &CudaSlice<f32>,
+        d: &CudaSlice<f32>,
+        dt_bias: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        runs: &CudaSlice<u32>,
+        host: &[u32],
+        n_heads: usize,
+        head_dim: usize,
+        d_state: usize,
+        n_groups: usize,
+    ) -> Result<(), GpuError> {
+        match self {
+            SsmArena::F16(s) => e.mamba2_scan_seq_runs_f16(
+                s,
+                state_elems,
+                xbc,
+                dt,
+                dt_off,
+                dt_stride,
+                a,
+                d,
+                dt_bias,
+                y,
+                runs,
+                host,
+                n_heads,
+                head_dim,
+                d_state,
+                n_groups,
+            ),
+            SsmArena::F32(_) => Err(GpuError::MissingOp(
+                "the prompt run table is the f16 state class's",
+            )),
+        }
+    }
+
     /// Copy a slot's state into the f32 checkpoint blob.
     pub fn save_to_blob(
         &self,

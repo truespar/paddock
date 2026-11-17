@@ -1,8 +1,10 @@
-//! Pinned staging for large one-shot host->device uploads - a page's RGB
-//! canvas, megabytes a request - see [`GpuExecutor::to_device_u8_staged`].
+//! Pinned staging for host->device uploads: large one-shot ones - a page's
+//! RGB canvas, megabytes a request - see [`GpuExecutor::to_device_u8_staged`],
+//! and a pass's small tables - see [`GpuExecutor::htod`].
 
 use super::*;
-use cudarc::driver::{CudaEvent, CudaSlice, DevicePtrMut};
+use cudarc::driver::{CudaEvent, CudaSlice, DevicePtrMut, DeviceRepr, DeviceSlice};
+use std::collections::VecDeque;
 
 /// Uploads below this stay pageable: the driver stages one whole and returns.
 const STAGED_MIN: usize = 1 << 20;
@@ -135,5 +137,169 @@ impl GpuExecutor {
         }
         s.done = Some(self.stream.record_event(None).map_err(drv)?);
         Ok(dst)
+    }
+}
+
+/// The small-upload ring's pinned bytes, and the largest upload it stages.
+const SMALL_RING: usize = 16 << 20;
+const SMALL_MAX: usize = 2 << 20;
+const SMALL_ALIGN: usize = 256;
+
+/// A bump ring of cached pinned memory for a pass's uploads (block tables,
+/// run tables, copy descriptors, token / position rows). Each upload takes
+/// the next span, its DMA is queued in stream order, and the span comes back
+/// once the event recorded after the DMA has fired - in practice long before
+/// the ring wraps onto it.
+pub(super) struct SmallRing {
+    ptr: *mut u8,
+    head: usize,
+    /// in-flight spans in allocation order: (start, end, event after the DMA)
+    busy: VecDeque<(usize, usize, CudaEvent)>,
+    /// fired events, re-recorded instead of created (an event create took
+    /// up to 13 ms on a busy GB10)
+    spare: Vec<CudaEvent>,
+}
+
+// SAFETY: the pointer is a driver allocation this value alone owns, and every
+// access goes through the executor's mutex.
+unsafe impl Send for SmallRing {}
+
+impl SmallRing {
+    fn new() -> Option<Self> {
+        // SAFETY: the pointer is owned here until Drop.
+        let ptr = unsafe {
+            cudarc::driver::result::malloc_host(
+                SMALL_RING,
+                cudarc::driver::sys::CU_MEMHOSTALLOC_PORTABLE,
+            )
+        }
+        .ok()?;
+        Some(Self {
+            ptr: ptr.cast(),
+            head: 0,
+            busy: VecDeque::new(),
+            spare: Vec::new(),
+        })
+    }
+
+    /// A span of `n` bytes no DMA still reads: fired spans retire from the
+    /// front, and a span the new one would overlap is waited out.
+    fn reserve(&mut self, n: usize) -> Result<usize, GpuError> {
+        let n = n.next_multiple_of(SMALL_ALIGN);
+        while let Some((_, _, ev)) = self.busy.front() {
+            if !ev.is_complete() {
+                break;
+            }
+            let (_, _, ev) = self.busy.pop_front().expect("front");
+            self.spare.push(ev);
+        }
+        if self.head + n > SMALL_RING {
+            self.head = 0;
+        }
+        let (a, b) = (self.head, self.head + n);
+        // any span the new one overlaps - not only the front: after a wrap
+        // the front can be a span from the lap before, past the old head,
+        // while this lap's spans at the ring's start are still in flight.
+        // The events fire in stream order, so waiting on the newest
+        // overlapping span retires every older one with it.
+        while let Some(i) = self.busy.iter().rposition(|&(s, e, _)| s < b && a < e) {
+            self.busy[i].2.synchronize().map_err(drv)?;
+            for _ in 0..=i {
+                let (_, _, ev) = self.busy.pop_front().expect("front");
+                self.spare.push(ev);
+            }
+        }
+        self.head = b;
+        Ok(a)
+    }
+}
+
+impl Drop for SmallRing {
+    fn drop(&mut self) {
+        for (_, _, ev) in self.busy.drain(..) {
+            let _ = ev.synchronize(); // never free pages a DMA still reads
+        }
+        if !self.ptr.is_null() {
+            // SAFETY: ptr came from malloc_host and is freed exactly once.
+            let _ = unsafe { cudarc::driver::result::free_host(self.ptr.cast()) };
+        }
+    }
+}
+
+impl GpuExecutor {
+    /// `src` into `dst` (its first `src.len()` elements) on the compute
+    /// stream, staged through the pinned small-upload ring: the call copies
+    /// into pinned pages and returns, the DMA runs in stream order. A
+    /// pageable copy is staged by the driver, and on GB10 that held the
+    /// engine thread ~1 ms for a 512 KB block table (14 us of DMA) and, with
+    /// a second pageable copy queued behind it, until the stream reached it;
+    /// the GPU then idled while the thread caught up (5-9 ms between a
+    /// Transcribe round's passes). Large uploads and a refused pinned
+    /// allocation take the pageable path. Never inside a graph capture.
+    pub fn htod<T: DeviceRepr, D: DevicePtrMut<T> + DeviceSlice<T>>(
+        &self,
+        src: &[T],
+        dst: &mut D,
+    ) -> Result<(), GpuError> {
+        let n = std::mem::size_of_val(src);
+        if src.is_empty() {
+            return Ok(());
+        }
+        if src.len() > dst.len() {
+            return Err(GpuError::Driver(format!(
+                "htod: {} elements into {}",
+                src.len(),
+                dst.len()
+            )));
+        }
+        let pageable = |dst: &mut D| {
+            let (dptr, _g) = dst.device_ptr_mut(&self.stream);
+            // SAFETY: dst holds src.len() elements (checked above); the
+            // driver stages the pageable bytes before returning.
+            unsafe { cudarc::driver::result::memcpy_htod_async(dptr, src, self.stream.cu_stream()) }
+                .map_err(drv)
+        };
+        if n > SMALL_MAX || paddock_models::dev_var_os!("PADDOCK_NO_HTOD_RING").is_some() {
+            return pageable(dst);
+        }
+        let mut ring = self
+            .small_ring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if ring.is_none() {
+            *ring = SmallRing::new();
+        }
+        let Some(r) = ring.as_mut() else {
+            drop(ring);
+            return pageable(dst);
+        };
+        let off = r.reserve(n)?;
+        // SAFETY: [off, off + n) lies in the ring and no DMA reads it
+        // (reserve waited out any span it overlaps); src is host memory
+        // disjoint from the pinned pages.
+        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr().cast::<u8>(), r.ptr.add(off), n) };
+        {
+            let (dptr, _g) = dst.device_ptr_mut(&self.stream);
+            // SAFETY: n pinned bytes at ptr + off, kept from reuse until the
+            // event below fires - after this DMA, in stream order.
+            unsafe {
+                cudarc::driver::result::memcpy_htod_async(
+                    dptr,
+                    std::slice::from_raw_parts(r.ptr.add(off), n),
+                    self.stream.cu_stream(),
+                )
+            }
+            .map_err(drv)?;
+        }
+        let ev = match r.spare.pop() {
+            Some(ev) => {
+                ev.record(&self.stream).map_err(drv)?;
+                ev
+            }
+            None => self.stream.record_event(None).map_err(drv)?,
+        };
+        r.busy
+            .push_back((off, off + n.next_multiple_of(SMALL_ALIGN), ev));
+        Ok(())
     }
 }

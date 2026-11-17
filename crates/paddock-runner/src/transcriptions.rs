@@ -809,7 +809,7 @@ struct Guard {
     start: f64,
     end: f64,
     /// `no_speech` | `repetition` | `length` | `context` | `language_mismatch`
-    /// - see `reason_note`
+    /// | `timestamps` - see `reason_note`
     reason: &'static str,
     /// whether the span's text was DISCARDED. True only for `no_speech`,
     /// where there is a positive signal the audio held nothing; a cut decode
@@ -855,6 +855,14 @@ fn reason_note(reason: &str) -> &'static str {
         // and the result is fluent and grammatical with nothing to notice.
         // Nothing else here can catch that, because nothing else compares the
         // language asked for against the language written.
+        "timestamps" => concat!(
+            "the word times and speaker turns could not be aligned to the audio; the ",
+            "transcript stands, its words are untimed",
+        ),
+        "translation" => concat!(
+            "the model did not mark where its translation begins (its card's answer ",
+            "format), so no translation is returned rather than its transcript",
+        ),
         "language_mismatch" => concat!(
             "the transcript is not written in the language this decode ran under; a ",
             "speech model told to expect the wrong language translates rather than ",
@@ -896,6 +904,58 @@ fn language_guard(rep: &LanguageReport, duration_s: f64) -> Option<Guard> {
              `language` to let the model decide (it ran as {asked})",
             found.code,
         )),
+    })
+}
+
+/// The word-timestamp notice: the CTC alignment (Nemotron 3.5 Transcribe)
+/// answered with an error, so `words` / `segments` are empty. The whole clip,
+/// like the language notice - the alignment is one pass over the recording.
+/// A translation's text from the model's raw answer: the part its lane marks
+/// as the answer, through Transcribe's loop guardrail (the card scores its
+/// translations after it, as it does its transcripts).
+fn translated(
+    plan: Option<&crate::translations::Plan>,
+    frontend: crate::serving::AudioFrontend,
+    raw: &str,
+) -> String {
+    let v = plan.map_or(raw, |p| p.visible(raw));
+    if frontend == crate::serving::AudioFrontend::Transcribe {
+        paddock_models::transcribe::loop_cleanup(v)
+    } else {
+        v.to_owned()
+    }
+}
+
+/// The translation notice: a lane that writes its transcript before the
+/// translation (Gemma 4) and never wrote the marker between them.
+fn translation_guard(
+    plan: Option<&crate::translations::Plan>,
+    raw: &str,
+    duration_s: f64,
+) -> Option<Guard> {
+    plan.filter(|p| !p.answered(raw)).map(|_| Guard {
+        start: 0.0,
+        end: duration_s,
+        reason: "translation",
+        dropped: true,
+        no_speech_prob: None,
+        avg_logprob: None,
+        entropy: None,
+        hint: None,
+    })
+}
+
+fn timestamps_guard(ctc: Option<&serde_json::Value>, duration_s: f64) -> Option<Guard> {
+    let why = crate::transcribe_ctc::error(ctc?)?;
+    Some(Guard {
+        start: 0.0,
+        end: duration_s,
+        reason: "timestamps",
+        dropped: false,
+        no_speech_prob: None,
+        avg_logprob: None,
+        entropy: None,
+        hint: Some(format!("the alignment reported `{why}`")),
     })
 }
 
@@ -1970,13 +2030,21 @@ fn stream_whisper(
 /// confidence wrapped around it, none of which a re-transcribe-the-buffer pass
 /// wants. Returns the transcript and the language, which on Qwen3-ASR the
 /// model itself names inside its answer.
+///
+/// `enrich` is a closed utterance's final pass on a session that asked for
+/// `paddock_verbose`, on a lane that can time its words (Transcribe's CTC
+/// head): the pass then carries logprobs and a CTC capture, and the third
+/// value is the `verbose_json` the file endpoint would return for this
+/// audio - timed words with their confidence, no speakers (each utterance
+/// numbers its own, so they would not agree across a session).
 pub(crate) async fn generative_pass(
     model: &crate::serving::ServingModel,
     samples: Vec<f32>,
     context: Option<&str>,
     language: Option<&str>,
     max_ctx: usize,
-) -> Result<(String, Option<String>), String> {
+    enrich: bool,
+) -> Result<(String, Option<String>, Option<serde_json::Value>), String> {
     let frontend = model.audio_frontend;
     // the mel runs off the async threads for the same reason the file lane's
     // does: host DSP on a runtime worker stalls every other request on it
@@ -1987,7 +2055,7 @@ pub(crate) async fn generative_pass(
     .await
     .map_err(|e| e.to_string())??;
 
-    let (pre_ids, post_ids) = generative_prompt(model, context, language, false)?;
+    let (pre_ids, post_ids) = generative_prompt(model, context, language, false, false, None)?;
     let prompt_rows = pre_ids.len() + frontend.prompt_rows(samples.len()) + post_ids.len();
     if max_ctx > 0 && prompt_rows + 16 > max_ctx {
         return Err(format!(
@@ -2004,6 +2072,18 @@ pub(crate) async fn generative_pass(
         .max(16);
     let mut text_ids = pre_ids.clone();
     text_ids.extend_from_slice(&post_ids);
+    let mut chunks = vec![
+        MmChunk::Text(pre_ids),
+        MmChunk::Audio { samples, mel },
+        MmChunk::Text(post_ids),
+    ];
+    let enrich = enrich && model.ctc_word_times();
+    let ctc = crate::ctc_timestamps::CtcPlan::arm(
+        model.engine.media_aligner(),
+        enrich,
+        1,
+        Some(&mut chunks),
+    )?;
     let (tx, mut rx) = unbounded_channel();
     model.engine.submit(GenRequest {
         prompt: text_ids,
@@ -2014,15 +2094,12 @@ pub(crate) async fn generative_pass(
         },
         stop_tokens: model.stop_tokens.clone(),
         events: tx,
-        mm_chunks: Some(vec![
-            MmChunk::Text(pre_ids),
-            MmChunk::Audio { samples, mel },
-            MmChunk::Text(post_ids),
-        ]),
+        mm_chunks: Some(chunks),
         constraint: None,
-        // no logprobs: a live pass has no wire to carry per-word confidence on,
-        // and asking for them drops the slot out of the decode-overlap path
-        logprobs: None,
+        // logprobs only on an enriched final pass: they are what its words'
+        // confidence is, and asking for them drops the slot out of the
+        // decode-overlap path - a cost the hypothesis passes do not pay
+        logprobs: enrich.then_some(2),
         submitted: None,
         canvas_read: None,
         user_turn: false,
@@ -2030,13 +2107,19 @@ pub(crate) async fn generative_pass(
     })?;
 
     let mut ids = Vec::new();
+    let mut lps: Vec<f32> = Vec::new();
+    let mut runners: Vec<Option<(u32, f32)>> = Vec::new();
     // a live pass never runs the timestamp instruction (see `generative_prompt`
     // above: `ts_mode` is false), so this is plain transcript text
     let mut guard = GenGuard::new(false);
     while let Some(ev) = rx.recv().await {
         match ev {
-            TokenEvent::Token { id, .. } => {
+            TokenEvent::Token { id, logprobs } => {
                 ids.push(id);
+                if let Some(lp) = logprobs {
+                    lps.push(lp.chosen);
+                    runners.push(lp.top.get(1).copied());
+                }
                 if guard.token(id) {
                     break;
                 }
@@ -2069,7 +2152,7 @@ pub(crate) async fn generative_pass(
     // Qwen3-ASR wraps its answer in `language X<asr_text>...` unless the language
     // was forced, in which case the envelope is in the prompt and the answer is
     // bare.
-    Ok(match frontend {
+    let (text, lang) = match frontend {
         crate::serving::AudioFrontend::Qwen3Asr | crate::serving::AudioFrontend::Qwen3AsrMetal
             if language.is_none() =>
         {
@@ -2077,7 +2160,44 @@ pub(crate) async fn generative_pass(
             (text.trim().to_owned(), lang)
         }
         _ => (raw.trim().to_owned(), language.map(str::to_owned)),
-    })
+    };
+    let Some(plan) = ctc else {
+        return Ok((text, lang, None));
+    };
+    // the enriched object, built the way the file lane builds verbose_json:
+    // the alignment reads the transcript with its tags, the words carry the
+    // decode's confidence, and what stopped or failed rides as guards
+    let tagged = model.tokenizer.decode(&ids, false).unwrap_or_default();
+    let obj = plan
+        .finish(paddock_models::transcribe::loop_cleanup(&tagged))
+        .await;
+    let words = generative_words(
+        &model.tokenizer,
+        &ids,
+        &lps,
+        &runners,
+        transcript_start(&model.tokenizer, &ids),
+    );
+    let mut guards = guard.guards(duration_s);
+    let rep = generative_report(language, lang.as_deref(), &text);
+    guards.extend(language_guard(&rep, duration_s));
+    guards.extend(timestamps_guard(Some(&obj), duration_s));
+    let mut body = verbose_body(
+        &text,
+        lang.as_deref(),
+        duration_s,
+        None,
+        0.0,
+        Some(&rep),
+        words.as_deref(),
+    );
+    body["words"] = serde_json::json!(crate::transcribe_ctc::timed_words(
+        &obj,
+        words.as_deref(),
+        duration_s,
+        false
+    ));
+    Ok((text, lang, Some(with_guards(body, &guards))))
 }
 
 /// Build the prompt halves that surround the audio rows for a generative ASR
@@ -2088,11 +2208,48 @@ pub(crate) async fn generative_pass(
 /// INSTRUCTION on granite-speech (which is what selects raw vs punctuated vs
 /// timed on that family). `ts_mode` picks granite's timestamp instruction and
 /// is never set by a lane that cannot parse the tags back out.
+/// Nemotron 3.5 Transcribe's request: the checkpoint's own template over a
+/// user turn of [instruction, audio] with reasoning off and the system block
+/// empty, split at the `<|audio|>` its audio part renders.
+fn transcribe_turn(
+    model: &crate::serving::ServingModel,
+    instruction: &str,
+) -> Result<(Vec<u32>, Vec<u32>), String> {
+    let (Some(template), Some(pad)) = (model.chat_template.as_deref(), model.audio_pad_id) else {
+        return Err(
+            "Nemotron 3.5 Transcribe loaded without its chat template or audio marker".into(),
+        );
+    };
+    let messages = [serde_json::json!({
+        "role": "user",
+        "content": [
+            { "type": "text", "text": instruction },
+            { "type": "audio" },
+        ],
+    })];
+    let kwargs = serde_json::json!({ "enable_thinking": false });
+    let rendered = crate::chat_template::render(template, &messages, None, Some(&kwargs))?;
+    let ids = model
+        .tokenizer
+        .encode(&rendered)
+        .map_err(|e| e.to_string())?;
+    let Some(at) = ids.iter().position(|&t| t == pad) else {
+        return Err("the Transcribe template dropped the audio marker".into());
+    };
+    Ok((ids[..at].to_vec(), ids[at + 1..].to_vec()))
+}
+
 pub(crate) fn generative_prompt(
     model: &crate::serving::ServingModel,
     context: Option<&str>,
     language: Option<&str>,
     ts_mode: bool,
+    // Transcribe: the card's speaker-attribution instruction instead of the
+    // plain transcription one (diarized_json)
+    speakers: bool,
+    // /v1/audio/translations: the lane's own translation instruction in
+    // place of its transcription one (`translations::Plan`)
+    translate: Option<&crate::translations::Plan>,
 ) -> Result<(Vec<u32>, Vec<u32>), String> {
     Ok(match model.audio_frontend {
         // Qwen3-ASR: the vLLM-parity ChatML envelope (module doc). Written out
@@ -2145,7 +2302,9 @@ pub(crate) fn generative_prompt(
         // capitalization."`). Absent, we send the card's headline prompt.
         crate::serving::AudioFrontend::GraniteSpeech
         | crate::serving::AudioFrontend::GraniteSpeechMetal => {
-            let instruction = if ts_mode {
+            let instruction = if let Some(t) = translate {
+                t.instruction.clone()
+            } else if ts_mode {
                 // `prompt` and this are mutually exclusive and the handler
                 // already refused the pair, so nothing of the caller's is
                 // being dropped here.
@@ -2195,6 +2354,9 @@ pub(crate) fn generative_prompt(
         // split at the `<|audio|>` its audio part renders.
         crate::serving::AudioFrontend::Gemma4Raw => {
             let instruction = match (context.map(sanitize_user_text), language) {
+                _ if translate.is_some() => {
+                    translate.map(|t| t.instruction.clone()).unwrap_or_default()
+                }
                 (Some(c), _) if !c.is_empty() => c,
                 (_, Some(code)) => GEMMA4_ASR_PROMPT.replace(
                     "in its original language",
@@ -2229,15 +2391,57 @@ pub(crate) fn generative_prompt(
             };
             (ids[..at].to_vec(), ids[at + 1..].to_vec())
         }
+        // Nemotron 3.5 Transcribe: the checkpoint's own template over a user
+        // turn of [instruction, audio] with reasoning off and the system
+        // block empty - the card's transcription request - split at the
+        // `<|audio|>` its audio part renders. The instruction is the
+        // processor's default; a `language` names the language in its
+        // Language slot, and a `prompt` rides as the card's context terms.
+        crate::serving::AudioFrontend::Transcribe => {
+            let mut instruction = match language {
+                // the card's translation request carries no language slot
+                // and no context terms
+                _ if translate.is_some() => {
+                    return transcribe_turn(
+                        model,
+                        &translate.map(|t| t.instruction.clone()).unwrap_or_default(),
+                    );
+                }
+                _ if speakers => crate::transcribe_ctc::SPEAKER_PROMPT.to_owned(),
+                Some(code) => paddock_models::transcribe::DEFAULT_PROMPT.replace(
+                    "Language: as spoken.",
+                    &format!("Language: {}.", language_name(code)),
+                ),
+                None => paddock_models::transcribe::DEFAULT_PROMPT.to_owned(),
+            };
+            if let Some(c) = context.map(sanitize_user_text).filter(|c| !c.is_empty()) {
+                instruction.push_str(&format!(" Context terms: {c}"));
+            }
+            transcribe_turn(model, &instruction)?
+        }
         crate::serving::AudioFrontend::None => {
             return Err("this model does not serve transcription".into());
         }
     })
 }
 
-pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Response {
+pub async fn handle(State(state): State<Arc<AppState>>, mp: Multipart) -> Response {
+    serve(state, mp, false).await
+}
+
+/// The transcription surface, or with `translate` the translation one
+/// (`translations.rs`): one form parser, one set of refusals, one decode -
+/// the task changes the instruction and what the answer is called.
+pub(crate) async fn serve(state: Arc<AppState>, mut mp: Multipart, translate: bool) -> Response {
     // the native streaming RNN-T lane parses its own form (rnnt_asr.rs)
     if state.rnnt_asr.is_some() {
+        if translate {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "this streaming speech model transcribes; it does not translate",
+            );
+        }
         return crate::rnnt_asr::handle(State(state), mp).await;
     }
     // Two lanes serve this endpoint with one wire contract: a dedicated
@@ -2252,6 +2456,15 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
     // is worse than the reset a still-uploading client may see instead of the
     // 400. Every refusal that is about the form waits for the whole body.
     let whisper = state.asr.as_ref();
+    if translate && whisper.is_some() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "the whisper checkpoints served here are fine-tuned to transcribe one language; \
+             translation is not served on them (Nemotron 3.5 Transcribe, granite-speech and \
+             Gemma 4 12B translate)",
+        );
+    }
     if whisper.is_none() {
         let Some(model) = state.serving.as_ref() else {
             return err(
@@ -2287,6 +2500,8 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
     let mut unknown_include: Option<String> = None;
     let mut unsupported: Vec<String> = Vec::new();
     let mut unknown: Vec<String> = Vec::new();
+    // translations: the text's language (vLLM's `to_language`)
+    let mut to_language: Option<String> = None;
     loop {
         let field = match mp.next_field().await {
             Ok(Some(f)) => f,
@@ -2305,6 +2520,27 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
         // below is spelled once, and a spec array param cannot slip past the
         // named-refusal list just because the client used brackets.
         match name.trim_end_matches("[]") {
+            // OpenAI's translation params are file, model, prompt,
+            // response_format and temperature; these transcription-only
+            // ones are unknown there, and refused the way any unknown is
+            n if translate
+                && matches!(
+                    n,
+                    "timestamp_granularities"
+                        | "include"
+                        | "languages"
+                        | "chunking_strategy"
+                        | "keywords"
+                        | "known_speaker_names"
+                        | "known_speaker_references"
+                ) =>
+            {
+                unknown.push(n.to_owned());
+                let _ = field.bytes().await;
+            }
+            "to_language" if translate => {
+                to_language = field.text().await.ok().filter(|s| !s.is_empty());
+            }
             "file" => match field.bytes().await {
                 Ok(b) => file = Some(b.to_vec()),
                 Err(e) => {
@@ -2457,7 +2693,8 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
                            granite-speech lane takes it through `prompt`"
             }
             "known_speaker_names" | "known_speaker_references" => {
-                "speaker diarization is not served"
+                "naming speakers from reference clips is not served - response_format=\
+                 diarized_json labels them A, B, ... on Nemotron 3.5 Transcribe"
             }
             _ => "not served",
         };
@@ -2478,6 +2715,38 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
             ),
         );
     }
+    // ---- translation: the lane's own task, checked before any audio ----
+    let tplan = if translate {
+        if context.is_some() {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "`prompt` is not served on translations here: the instruction is the model \
+                 card's own translation request",
+            );
+        }
+        if !matches!(response_format.as_str(), "json" | "text" | "verbose_json") {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!(
+                    "response_format '{response_format}' is not served on translations here \
+                     (json | text | verbose_json): these models time no translated text"
+                ),
+            );
+        }
+        let frontend = state
+            .serving
+            .as_ref()
+            .map_or(Default::default(), |s| s.audio_frontend);
+        match crate::translations::Plan::new(frontend, language.as_deref(), to_language.as_deref())
+        {
+            Ok(p) => Some(p),
+            Err(e) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+        }
+    } else {
+        None
+    };
     // ---- language, and the candidate set  ----
     //
     // Both refusals here exist because the alternative is a field the server
@@ -2535,17 +2804,48 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
     }
     if !matches!(
         response_format.as_str(),
-        "json" | "text" | "verbose_json" | "srt" | "vtt"
+        "json" | "text" | "verbose_json" | "srt" | "vtt" | "diarized_json"
     ) {
         return err(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             format!(
                 "unsupported response_format '{response_format}' \
-                 (json | text | verbose_json | srt | vtt)"
+                 (json | text | verbose_json | srt | vtt | diarized_json)"
             ),
         );
     }
+    // Nemotron 3.5 Transcribe times words and labels speakers with its CTC
+    // timestamp head (transcribe_ctc.rs) - the lane's own refusals first
+    let diarized = response_format == "diarized_json";
+    let ctc_head = whisper.is_none()
+        && state.serving.as_ref().is_some_and(|s| {
+            s.audio_frontend == crate::serving::AudioFrontend::Transcribe
+                && s.engine.media_aligner().is_some()
+        });
+    if let Some(why) = crate::transcribe_ctc::refusal(
+        diarized,
+        ctc_head,
+        grans.any(),
+        want_logprobs,
+        language.is_some(),
+        context.is_some(),
+    ) {
+        return err(StatusCode::BAD_REQUEST, "invalid_request_error", why);
+    }
+    // Transcribe writes a forced language into its prompt's Language slot, so
+    // a code outside the card's set would decode as a guess at a language it
+    // was never trained on
+    if let Some(code) = language.as_deref()
+        && whisper.is_none()
+        && let Some(why) = state
+            .serving
+            .as_ref()
+            .and_then(|s| crate::language::unserved_language(s, code))
+    {
+        return err(StatusCode::BAD_REQUEST, "invalid_request_error", why);
+    }
+    let ctc_words = grans.word && ctc_head;
     // A subtitle file is timestamps - asking for one is asking for segments,
     // so the granularity is implied rather than something the caller has to
     // remember to send (OpenAI does not require it either).
@@ -2671,13 +2971,14 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
             "word timestamps are not implemented on this Whisper backend; segment timestamps are available",
         );
     }
-    if grans.word && whisper.is_none() && !ts_mode {
+    if grans.word && whisper.is_none() && !ts_mode && !ctc_words {
         return err(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             "this model does not produce word timestamps - whisper recovers them from \
-             cross-attention and granite-speech-plus writes them into its transcript; \
-             neither Qwen3-ASR nor the base granite-speech has any way to answer",
+             cross-attention, granite-speech-plus writes them into its transcript and \
+             Nemotron 3.5 Transcribe aligns them with its CTC head; neither Qwen3-ASR nor \
+             the base granite-speech has any way to answer",
         );
     }
     if ts_mode && context.is_some() {
@@ -3003,11 +3304,17 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
             "this model does not serve transcription",
         );
     }
-    let (pre_ids, post_ids) =
-        match generative_prompt(model, context.as_deref(), language.as_deref(), ts_mode) {
-            Ok(p) => p,
-            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e),
-        };
+    let (pre_ids, post_ids) = match generative_prompt(
+        model,
+        context.as_deref(),
+        language.as_deref(),
+        ts_mode,
+        diarized,
+        tplan.as_ref(),
+    ) {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e),
+    };
     let prompt_rows = pre_ids.len() + audio_tokens + post_ids.len();
     if state.max_ctx > 0 && prompt_rows + 16 > state.max_ctx {
         return err(
@@ -3031,11 +3338,21 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
 
     let mut text_ids = pre_ids.clone();
     text_ids.extend_from_slice(&post_ids);
-    let chunks = vec![
+    let mut chunks = vec![
         MmChunk::Text(pre_ids),
         MmChunk::Audio { samples, mel },
         MmChunk::Text(post_ids),
     ];
+    // word times / speaker turns: the recording keeps its CTC capture
+    let ctc = match crate::ctc_timestamps::CtcPlan::arm(
+        model.engine.media_aligner(),
+        ctc_words || diarized,
+        1,
+        Some(&mut chunks),
+    ) {
+        Ok(p) => p,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, "internal_error", e),
+    };
 
     let (tx, mut rx) = unbounded_channel();
     let gen_req = GenRequest {
@@ -3076,6 +3393,8 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
         let tok = model.tokenizer.clone();
         let forced = language.clone();
         let verbose = response_format == "verbose_json";
+        let model_id = model.id.clone();
+        let tplan = tplan.clone();
         let sse = stream! {
             let mut ids: Vec<u32> = Vec::new();
             let mut lps: Vec<f32> = Vec::new();
@@ -3102,6 +3421,11 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
                         // envelope never reaches a delta - while it is still
                         // being emitted the transcript half is empty.
                         let body = match frontend {
+                            // a translation: only the answer part (Gemma 4
+                            // writes its transcript first)
+                            _ if tplan.is_some() => {
+                                tplan.as_ref().map_or("", |p| p.visible(&raw)).to_owned()
+                            }
                             crate::serving::AudioFrontend::Qwen3Asr | crate::serving::AudioFrontend::Qwen3AsrMetal if forced.is_none() => {
                                 let (lang, t) = parse_output(&raw);
                                 if lang.is_some() {
@@ -3115,6 +3439,8 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
                             // out on the way to the delta, and a tag still being
                             // typed waits (see `granite_stream_ts`).
                             _ if ts_mode => granite_stream_ts(&raw),
+                            // the dropped speaker tags leave doubled spaces
+                            _ if diarized => crate::transcribe_ctc::plain_text(&raw),
                             _ => raw,
                         };
                         if let Some(d) = emitted.advance(stable(body.trim_start())) {
@@ -3141,7 +3467,9 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
             drop(rx);
             let mut guards = guard.guards(duration_s);
             let raw = tok.decode(&ids, true).unwrap_or_default();
+            let unmarked = translation_guard(tplan.as_ref(), &raw, duration_s);
             let text = match frontend {
+                _ if tplan.is_some() => translated(tplan.as_ref(), frontend, &raw),
                 crate::serving::AudioFrontend::Qwen3Asr | crate::serving::AudioFrontend::Qwen3AsrMetal if forced.is_none() => {
                     let (lang, t) = parse_output(&raw);
                     if lang.is_some() {
@@ -3150,31 +3478,68 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
                     t
                 }
                 _ if ts_mode => granite_strip_ts(&raw),
+                crate::serving::AudioFrontend::Transcribe if diarized => {
+                    crate::transcribe_ctc::plain_text(&paddock_models::transcribe::loop_cleanup(&raw))
+                }
                 _ => raw,
             };
             let text = text.trim();
             if let Some(d) = emitted.advance(text) {
                 yield sse_data(ev_delta(&d));
             }
+            // the alignment reads the transcript with its speaker tags
+            let ctc_obj = match ctc {
+                Some(plan) => {
+                    let tagged = tok.decode(&ids, false).unwrap_or_default();
+                    Some(plan.finish(paddock_models::transcribe::loop_cleanup(&tagged)).await)
+                }
+                None => None,
+            };
+            // OpenAI's diarized stream: one `transcript.text.segment` event a
+            // segment, ahead of the done event
+            if diarized && let Some(obj) = &ctc_obj {
+                for seg in crate::transcribe_ctc::segments(obj) {
+                    yield sse_data(seg.to_string());
+                }
+            }
             let words = want_logprobs
                 .then(|| generative_words(&tok, &ids, &lps, &runners, transcript_start(&tok, &ids)))
                 .flatten()
                 .map(|w| if ts_mode { granite_timed_words(&w, duration_s) } else { w });
             let rep = generative_report(forced.as_deref(), detected.as_deref(), text);
-            guards.extend(language_guard(&rep, duration_s));
+            // a translation is SUPPOSED to be in another language
+            if tplan.is_none() {
+                guards.extend(language_guard(&rep, duration_s));
+            }
+            guards.extend(unmarked);
+            guards.extend(timestamps_guard(ctc_obj.as_ref(), duration_s));
+            if let Some(p) = &tplan {
+                detected = Some(p.to.clone());
+            }
             let verbose_json = verbose.then(|| {
-                with_guards(
-                    verbose_body(
-                        text,
-                        detected.as_deref(),
-                        duration_s,
-                        None,
-                        0.0,
-                        Some(&rep),
+                let mut body = verbose_body(
+                    text,
+                    detected.as_deref(),
+                    duration_s,
+                    None,
+                    0.0,
+                    Some(&rep),
+                    words.as_deref(),
+                );
+                if tplan.is_some() {
+                    body["task"] = serde_json::json!("translate");
+                }
+                if let Some(obj) = &ctc_obj {
+                    body["words"] = serde_json::json!(crate::transcribe_ctc::timed_words(
+                        obj,
                         words.as_deref(),
-                    ),
-                    &guards,
-                )
+                        duration_s,
+                        true
+                    ));
+                    body["paddock_diarization"] =
+                        crate::transcribe_ctc::speaker_timeline(obj, &model_id, duration_s);
+                }
+                with_guards(body, &guards)
             });
             yield sse_data(ev_done(
                 text,
@@ -3237,7 +3602,13 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
             );
         }
     };
+    let unmarked = translation_guard(tplan.as_ref(), &raw, duration_s);
     let (detected, text) = match frontend {
+        // a translation, in the language it was asked for
+        _ if tplan.is_some() => (
+            tplan.as_ref().map(|p| p.to.clone()),
+            translated(tplan.as_ref(), frontend, &raw),
+        ),
         // Qwen3-ASR: the forced-language path already put the envelope head
         // in the PROMPT, so raw output is bare transcript there; otherwise
         // strip the `language {X}<asr_text>` envelope the model emits.
@@ -3268,19 +3639,58 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
         // Gemma 4 12B answers with the bare transcript (thinking off); like
         // granite it reports no language, so a hint is echoed, never invented
         crate::serving::AudioFrontend::Gemma4Raw => (language.clone(), raw),
+        // Transcribe: the bare transcript through the card's loop guardrail
+        // (what every result NVIDIA reports was scored after); no language
+        // is reported, so a hint is echoed
+        crate::serving::AudioFrontend::Transcribe if diarized => (
+            None,
+            crate::transcribe_ctc::plain_text(&paddock_models::transcribe::loop_cleanup(&raw)),
+        ),
+        crate::serving::AudioFrontend::Transcribe => (
+            language.clone(),
+            paddock_models::transcribe::loop_cleanup(&raw),
+        ),
         crate::serving::AudioFrontend::None => (None, raw),
     };
     let text = text.trim().to_owned();
+    // word times / speaker turns: the alignment reads the transcript with
+    // its speaker tags
+    let ctc_obj = match ctc {
+        Some(plan) => {
+            let tagged = model.tokenizer.decode(&ids, false).unwrap_or_default();
+            Some(
+                plan.finish(paddock_models::transcribe::loop_cleanup(&tagged))
+                    .await,
+            )
+        }
+        None => None,
+    };
     let stats = if want_stats {
         guard.stats(duration_s, ids.len(), &text, &lps)
     } else {
         Vec::new()
     };
     let rep = generative_report(language.as_deref(), detected.as_deref(), &text);
-    guards.extend(language_guard(&rep, duration_s));
+    // a translation is SUPPOSED to be in another language
+    if tplan.is_none() {
+        guards.extend(language_guard(&rep, duration_s));
+    }
+    guards.extend(unmarked);
+    guards.extend(timestamps_guard(ctc_obj.as_ref(), duration_s));
 
     match response_format.as_str() {
         "text" => (StatusCode::OK, text).into_response(),
+        "diarized_json" => Json(with_guards(
+            crate::transcribe_ctc::diarized_body(
+                &text,
+                duration_s,
+                ctc_obj.as_ref().unwrap_or(&serde_json::Value::Null),
+                audio_tokens,
+                ids.len(),
+            ),
+            &guards,
+        ))
+        .into_response(),
         "verbose_json" => {
             let words = want_logprobs
                 .then(|| {
@@ -3300,22 +3710,29 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
                         w
                     }
                 });
-            Json(with_stats(
-                with_guards(
-                    verbose_body(
-                        &text,
-                        detected.as_deref(),
-                        duration_s,
-                        None,
-                        0.0,
-                        Some(&rep),
-                        words.as_deref(),
-                    ),
-                    &guards,
-                ),
-                &stats,
-            ))
-            .into_response()
+            let mut body = verbose_body(
+                &text,
+                detected.as_deref(),
+                duration_s,
+                None,
+                0.0,
+                Some(&rep),
+                words.as_deref(),
+            );
+            if tplan.is_some() {
+                body["task"] = serde_json::json!("translate");
+            }
+            if let Some(obj) = &ctc_obj {
+                body["words"] = serde_json::json!(crate::transcribe_ctc::timed_words(
+                    obj,
+                    words.as_deref(),
+                    duration_s,
+                    true
+                ));
+                body["paddock_diarization"] =
+                    crate::transcribe_ctc::speaker_timeline(obj, &model.id, duration_s);
+            }
+            Json(with_stats(with_guards(body, &guards), &stats)).into_response()
         }
         _ => Json(with_stats(
             with_guards(serde_json::json!({ "text": text }), &guards),
@@ -3326,668 +3743,5 @@ pub async fn handle(State(state): State<Arc<AppState>>, mut mp: Multipart) -> Re
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The alternative is what makes a mark ACTIONABLE - "nearly said vill"
-    /// against "38%" - so the rules for when it is shown are worth pinning:
-    /// first token only (mid-word the runner-up is a BPE fragment), and never
-    /// when it decodes to the word we already have.
-    #[test]
-    fn word_json_carries_the_alternative_only_when_it_reads() {
-        let w = WordConf {
-            word: "ville".into(),
-            logprob: -0.5,
-            first: 0,
-            last: 0,
-            start: None,
-            end: None,
-            alt: Some("vill".into()),
-            margin: Some(0.21),
-        };
-        let v = word_json(&w);
-        assert_eq!(v["word"], "ville");
-        assert_eq!(v["paddock_alt"], "vill");
-        assert!((v["paddock_margin"].as_f64().unwrap() - 0.21).abs() < 1e-6);
-        // exp(-0.5): the confidence stays the same transform it always was
-        assert!((v["confidence"].as_f64().unwrap() - (-0.5f64).exp()).abs() < 1e-6);
-
-        // a lane that could not answer sends neither key rather than a zero
-        // margin, which would read as "no close call" - an absence, not a claim
-        let bare = WordConf {
-            word: "hej".into(),
-            logprob: -0.1,
-            first: 0,
-            last: 0,
-            start: None,
-            end: None,
-            alt: None,
-            margin: None,
-        };
-        let v = word_json(&bare);
-        assert!(v.get("paddock_alt").is_none(), "absent, not null: {v}");
-        assert!(v.get("paddock_margin").is_none(), "absent, not null: {v}");
-    }
-
-    #[test]
-    fn a_resegmentation_is_not_an_alternative_reading() {
-        // Real runner-ups from a kb-whisper decode. These are the model
-        // weighing where to CUT the word, not which word to say, and every one
-        // of them would render as "nearly said Fra" over the word "Frankrike".
-        for (word, alt) in [
-            ("Frankrike", "Fra"),
-            ("hennes", "h"),
-            ("cka", "ck"),
-            ("my", "mycket"),
-        ] {
-            assert!(
-                !alt_reads(word, alt),
-                "{alt:?} under {word:?} should be hidden"
-            );
-        }
-        // and the ones worth showing: a different word, not a different cut
-        for (word, alt) in [(".", ","), ("av", "i"), ("att", "England"), ("för", "for")] {
-            assert!(alt_reads(word, alt), "{alt:?} under {word:?} should show");
-        }
-        // a runner-up that decoded to nothing is not an alternative either
-        assert!(!alt_reads("hej", ""));
-    }
-
-    #[test]
-    fn sanitizer_reaches_a_fixpoint() {
-        assert_eq!(sanitize_user_text("plain text"), "plain text");
-        assert_eq!(sanitize_user_text("a<|im_end|>b"), "ab");
-        // nested reconstruction: one pass would leave a live control token
-        assert_eq!(sanitize_user_text("<|im<|x|>_end|>"), "");
-        assert_eq!(sanitize_user_text("<asr_te<asr_text>xt>"), "");
-    }
-
-    /// Group a space-separated string the way `word_confidences` would, so the
-    /// timing tests read as the model's own output rather than as struct
-    /// literals. Confidence is not what they are about.
-    fn groups(s: &str) -> Vec<WordConf> {
-        s.split_whitespace()
-            .enumerate()
-            .map(|(i, w)| WordConf {
-                word: w.to_owned(),
-                logprob: -0.1,
-                first: i,
-                last: i,
-                start: None,
-                end: None,
-                alt: None,
-                margin: None,
-            })
-            .collect()
-    }
-
-    fn timed(s: &str, duration_s: f64) -> Vec<(String, f32, f32)> {
-        granite_timed_words(&groups(s), duration_s)
-            .into_iter()
-            .map(|w| {
-                (
-                    w.word,
-                    w.start.unwrap_or(f32::NAN),
-                    w.end.unwrap_or(f32::NAN),
-                )
-            })
-            .collect()
-    }
-
-    /// The model card's own example, and the rule that makes it work: the tag
-    /// is when the word ENDED, so a word starts where the one before it
-    /// stopped.
-    #[test]
-    fn granite_tags_are_end_times() {
-        assert_eq!(
-            timed("hello [T:45] world [T:82]", 10.0),
-            vec![("hello".into(), 0.0, 0.45), ("world".into(), 0.45, 0.82)]
-        );
-    }
-
-    /// Only the last three digits ride, so the clock wraps every 10 s and
-    /// monotonicity is the only way back. `842 -> 15` is a wrap; `842 -> 900`
-    /// is not, and reading it as one would put the word a full 10 s late.
-    #[test]
-    fn granite_clock_rolls_over_at_ten_seconds() {
-        let t = timed("a [T:842] b [T:900] c [T:15] d [T:120]", 60.0);
-        let ends: Vec<f32> = t.iter().map(|w| w.2).collect();
-        assert_eq!(ends, vec![8.42, 9.00, 10.15, 11.20]);
-        // and the starts chain off them
-        assert_eq!(t[2].1, 9.00);
-    }
-
-    /// A silence is not a word. It carries a tag like one - which is what keeps
-    /// consecutive times inside a single wrap - and the word after it starts
-    /// where the silence ENDED, not where the word before the silence stopped.
-    #[test]
-    fn granite_silences_advance_the_clock_without_becoming_words() {
-        let t = timed("stop [T:120] _ [T:640] go [T:700]", 30.0);
-        assert_eq!(
-            t,
-            vec![("stop".into(), 0.0, 1.20), ("go".into(), 6.40, 7.00)]
-        );
-    }
-
-    /// A tag that never arrived costs its word the times, not its place in the
-    /// transcript - `verbose_body` then ships the array as `paddock_words`
-    /// rather than a spec `words[]` with an invented start.
-    #[test]
-    fn granite_word_without_a_tag_keeps_no_times() {
-        let w = granite_timed_words(&groups("one [T:50] two three [T:90]"), 10.0);
-        let words: Vec<&str> = w.iter().map(|w| w.word.as_str()).collect();
-        assert_eq!(words, vec!["one", "two", "three"]);
-        assert!(
-            w[1].start.is_none() && w[1].end.is_none(),
-            "{:?}",
-            (w[1].start, w[1].end)
-        );
-        // the ones that did get a tag still have theirs
-        assert_eq!(w[2].end, Some(0.90));
-    }
-
-    /// Times land inside the clip. The model counts in its own three-digit
-    /// clock and nothing stops it running past the end of a short file; a word
-    /// that seeks past the audio is wrong where a listener notices.
-    #[test]
-    fn granite_times_are_clamped_to_the_clip() {
-        let t = timed("late [T:500]", 2.0);
-        assert_eq!(t, vec![("late".into(), 0.0, 2.0)]);
-    }
-
-    #[test]
-    fn granite_strips_tags_and_silences_from_the_transcript() {
-        assert_eq!(
-            granite_strip_ts("hello [T:45] _ [T:60] world [T:82]"),
-            "hello world"
-        );
-        // a near-miss is TEXT: swallowing characters to salvage a malformed tag
-        // corrupts the answer to save a number nobody can use
-        assert_eq!(granite_strip_ts("a [T:] b [T:x] c"), "a [T:] b [T:x] c");
-        // and the words rejoin to exactly that text, which is the invariant
-        let g = groups("hello [T:45] _ [T:60] world [T:82]");
-        let joined = granite_timed_words(&g, 10.0)
-            .iter()
-            .map(|w| w.word.clone())
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert_eq!(
-            joined,
-            granite_strip_ts("hello [T:45] _ [T:60] world [T:82]")
-        );
-    }
-
-    /// The delta stream's one guarantee is that it only ever EXTENDS. A tag
-    /// being typed would break it - `hello [` renders as a word and then
-    /// vanishes two tokens later - so an unclosed bracket holds everything
-    /// after it back.
-    #[test]
-    fn granite_stream_text_never_shrinks() {
-        let full = "hello [T:45] world [T:82]";
-        let mut prev = String::new();
-        for i in 0..=full.len() {
-            if !full.is_char_boundary(i) {
-                continue;
-            }
-            let now = granite_stream_ts(&full[..i]);
-            assert!(now.starts_with(&prev), "{prev:?} -> {now:?} at {i}");
-            prev = now;
-        }
-        assert_eq!(granite_strip_ts(full), "hello world");
-    }
-
-    // ---- decode guards  ----
-
-    fn win(no_speech: f32, avg: f32, stop: paddock_engine::audio::guards::Stop) -> WinOut {
-        WinOut {
-            no_speech_prob: no_speech,
-            avg_logprob: avg,
-            stop,
-            suppressed: paddock_engine::audio::guards::is_no_speech(no_speech, avg),
-            tokens: vec![1, 2, 3],
-            ..Default::default()
-        }
-    }
-
-    use paddock_engine::audio::guards::Stop;
-    use paddock_engine::transcriber::{Transcript, Window as WinOut};
-
-    fn clip(windows: Vec<WinOut>, _duration_s: f64) -> Transcript {
-        Transcript {
-            language: "sv".into(),
-            windows,
-            timestamps: false,
-            language_probs: Vec::new(),
-            language_prior_moved: None,
-        }
-    }
-
-    /// A clean transcription must carry no notice at all - not an empty array.
-    /// Every clip in the WER battery goes through here, and a key that is
-    /// always present is a key every client learns to ignore.
-    #[test]
-    fn a_clean_clip_carries_no_notices() {
-        let out = clip(
-            vec![win(0.01, -0.2, Stop::Eot), win(0.03, -0.15, Stop::Eot)],
-            45.0,
-        );
-        let g = whisper_guards(&out, 30.0, 45.0);
-        assert!(g.is_empty(), "{} notices on a clean clip", g.len());
-        let body = with_guards(serde_json::json!({ "text": "hej" }), &g);
-        assert!(
-            body.get("paddock_guards").is_none(),
-            "absent, not empty: {body}"
-        );
-    }
-
-    /// The silence arm, and the span is the point of it: a caller has to learn
-    /// which seconds of their recording produced nothing, not just that
-    /// something somewhere was dropped.
-    #[test]
-    fn a_suppressed_window_names_its_span_and_says_the_text_went() {
-        let out = clip(
-            vec![
-                win(0.02, -0.2, Stop::Eot),
-                win(0.91, -1.6, Stop::Eot),
-                win(0.02, -0.3, Stop::Eot),
-            ],
-            72.0,
-        );
-        let g = whisper_guards(&out, 30.0, 72.0);
-        assert_eq!(g.len(), 1);
-        assert_eq!((g[0].start, g[0].end), (30.0, 60.0));
-        assert_eq!(g[0].reason, "no_speech");
-        assert!(g[0].dropped);
-        let v = guard_json(&g[0]);
-        assert_eq!(v["text_dropped"], true);
-        assert!(v["note"].as_str().unwrap().contains("discarded"), "{v}");
-        // the numbers the verdict was made from ride along, so a caller can
-        // disagree with our threshold rather than take it on faith
-        assert!((v["no_speech_prob"].as_f64().unwrap() - 0.91).abs() < 1e-5);
-    }
-
-    /// The last window is short - the clip ends inside it - and a notice that
-    /// seeks past the end of the file is wrong in the one place a listener
-    /// would check.
-    #[test]
-    fn the_last_windows_notice_is_clamped_to_the_clip() {
-        let out = clip(
-            vec![win(0.02, -0.2, Stop::Eot), win(0.95, -2.0, Stop::Eot)],
-            41.7,
-        );
-        let g = whisper_guards(&out, 30.0, 41.7);
-        assert_eq!(g.len(), 1);
-        assert!((g[0].end - 41.7).abs() < 1e-9, "{}", g[0].end);
-    }
-
-    /// A cut is not a drop, and the difference is the whole shape of the
-    /// answer: a looping window had real speech in front of the loop, so its
-    /// text stays and the notice says where to stop trusting it.
-    #[test]
-    fn a_repetition_cut_keeps_its_text() {
-        let out = clip(vec![win(0.02, -0.4, Stop::Repetition)], 30.0);
-        let g = whisper_guards(&out, 30.0, 30.0);
-        assert_eq!(g.len(), 1);
-        assert_eq!(g[0].reason, "repetition");
-        assert!(!g[0].dropped);
-        assert!(guard_json(&g[0])["note"].as_str().unwrap().contains("kept"));
-    }
-
-    /// Truncation used to be a 200 with a silently short transcript on both
-    /// generative lanes - the engine reported `Length` and nobody read it.
-    #[test]
-    fn the_generative_lane_reports_its_own_truncation() {
-        use paddock_engine::service::FinishReason;
-        let mut g = GenGuard::new(false);
-        g.finished(FinishReason::Length);
-        let out = g.guards(7.8);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].reason, "length");
-        assert_eq!((out[0].start, out[0].end), (0.0, 7.8));
-
-        // and a decode that simply stopped says nothing
-        let mut clean = GenGuard::new(false);
-        clean.finished(FinishReason::Stop);
-        assert!(clean.guards(7.8).is_empty());
-    }
-
-    /// The shape: one character forever. The guard has to say stop, and
-    /// the first stop is what saves the 4000 tokens.
-    ///
-    /// Both lane kinds, because the split between them is exactly what the
-    /// granite regression forced (see `Repetition`) and a structured lane
-    /// dropping the entropy test must not have dropped its teeth with it.
-    #[test]
-    fn the_generative_lane_cuts_a_loop() {
-        for structured in [false, true] {
-            let mut g = GenGuard::new(structured);
-            let mut stopped_at = None;
-            for i in 0..500u32 {
-                if g.token(7) && stopped_at.is_none() {
-                    stopped_at = Some(i);
-                }
-            }
-            assert_eq!(
-                stopped_at,
-                Some(paddock_engine::audio::guards::PERIOD_MIN_TOKENS as u32 - 1),
-                "structured={structured}"
-            );
-            assert_eq!(g.guards(7.8)[0].reason, "repetition");
-        }
-    }
-
-    // ---- the delta stream's emit rule ----
-
-    fn parts(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| (*s).to_owned()).collect()
-    }
-
-    /// The ordinary case, unchanged by the guards: closed windows in full,
-    /// the open one's stable prefix, nothing past the gap.
-    #[test]
-    fn the_open_window_streams_its_stable_prefix() {
-        let p = parts(&["one", "two ", "three"]);
-        assert_eq!(emittable(&p, 1, &[false; 3]), vec!["one", "two"]);
-        // window 2 exists but window 1 is still open, so it waits
-        assert_eq!(emittable(&p, 0, &[false; 3]), vec!["one"]);
-    }
-
-    /// And the guard's half: a window that might yet be suppressed puts
-    /// nothing on the wire. It is the only thing standing between a
-    /// hallucination over silence and a delta stream that has to take bytes
-    /// back, which it cannot do.
-    #[test]
-    fn a_provisional_window_streams_nothing() {
-        let p = parts(&["real speech", "thank you for watching"]);
-        assert_eq!(emittable(&p, 1, &[false, true]), vec!["real speech"]);
-        // once it closes clean it flows normally - provisional is a hold, not
-        // a verdict
-        assert_eq!(
-            emittable(&p, 2, &[false, false]),
-            vec!["real speech", "thank you for watching"]
-        );
-    }
-
-    // ---- no-speech markers  ----
-
-    /// The measured bug: nb-whisper-large answers 8 s of digital silence with
-    /// the seven ORDINARY TEXT tokens `[2627, 91, 1771, 496, 9799, 91, 29]`,
-    /// which spell `<|nocaptions|>`. Every one is far below `<|endoftext|>`
-    /// (50257), so the control-token filter this looked like a job for cannot
-    /// see them at all - the model is typing the string, not emitting the id.
-    #[test]
-    fn a_typed_marker_is_a_no_speech_answer_not_a_transcript() {
-        assert!(is_no_speech_marker("<|nocaptions|>"));
-        assert!(is_no_speech_marker("  <|nospeech|> "));
-    }
-
-    /// The safety, and the reason the rule is whole-text rather than
-    /// substring: a transcript that merely mentions the marker is a
-    /// transcript.
-    #[test]
-    fn a_transcript_that_merely_contains_a_marker_survives() {
-        assert!(!is_no_speech_marker(
-            "the tag <|nocaptions|> appears in the file"
-        ));
-        assert!(!is_no_speech_marker("<|nocaptions|> and then she spoke"));
-        assert!(!is_no_speech_marker(""));
-        assert!(!is_no_speech_marker("Ja"));
-    }
-
-    /// The streaming half. `<|noc` must never reach a delta - two tokens later
-    /// the whole thing is withdrawn, and a delta stream cannot take bytes
-    /// back. Same rule `granite_stream_ts` uses for a tag being typed.
-    #[test]
-    fn a_marker_being_typed_never_reaches_a_delta() {
-        let full = "<|nocaptions|>";
-        for i in 1..=full.len() {
-            if !full.is_char_boundary(i) {
-                continue;
-            }
-            assert!(marker_hold(&full[..i]), "{:?} should be held", &full[..i]);
-        }
-        // ...and a window that carries on into real words stops matching
-        assert!(!marker_hold("<|nocaptions|> and then she spoke"));
-        assert!(!marker_hold("Ja det er det"));
-    }
-
-    /// The whole point, at the seam that matters: a held marker contributes
-    /// nothing to the view, so `done.text` (which is built after suppression)
-    /// and the deltas agree - the invariant the gate asserts.
-    #[test]
-    fn the_stream_emits_nothing_for_a_marker_window() {
-        let p = parts(&["real speech", "<|nocaptions|>"]);
-        assert_eq!(emittable(&p, 1, &[false; 2]), vec!["real speech"]);
-        // even complete, because complete is exactly when it is about to be
-        // suppressed
-        assert_eq!(
-            emittable(&p, 2, &[false; 2]),
-            vec!["real speech", "<|nocaptions|>"]
-        );
-    }
-
-    // ---- the VAD window gate  ----
-
-    /// Deterministic broadband noise at `amp`, `secs` long at 16 kHz - a
-    /// quiet room, or a loud one, with no RNG state to depend on.
-    fn noise(secs: f32, amp: f32) -> Vec<f32> {
-        let mut st: u32 = 12345;
-        (0..(16000.0 * secs) as usize)
-            .map(|_| {
-                st = st.wrapping_mul(1103515245).wrapping_add(12345) & 0x7FFF_FFFF;
-                amp * (st as f32 / 0x3FFF_FFFF as f32 - 1.0)
-            })
-            .collect()
-    }
-
-    /// The case the gate exists for. roest-v3 answers 8 s of quiet room tone
-    /// with "Ja det er det. Det er det. Det er det. Det er det" and no decode
-    /// guard catches it; a window marked speechless
-    /// never reaches the encoder to say it.
-    #[test]
-    fn a_quiet_room_is_not_a_window_worth_decoding() {
-        assert_eq!(
-            window_speech(&noise(8.0, 0.004), 16000, VAD_GATE_THRESHOLD),
-            vec![false]
-        );
-    }
-
-    #[test]
-    fn a_window_with_sound_in_it_is_kept() {
-        assert_eq!(
-            window_speech(&noise(8.0, 0.30), 16000, VAD_GATE_THRESHOLD),
-            vec![true]
-        );
-    }
-
-    /// The gate is per WINDOW, so a clip that is quiet for its first 30 s and
-    /// speaks after must lose the first and keep the second - that asymmetry
-    /// is the whole saving on a real recording.
-    #[test]
-    fn the_gate_is_per_window_not_per_clip() {
-        let mut pcm = noise(30.0, 0.004);
-        pcm.extend(noise(20.0, 0.30));
-        assert_eq!(
-            window_speech(&pcm, 16000, VAD_GATE_THRESHOLD),
-            vec![false, true]
-        );
-    }
-
-    /// An empty or sub-window clip still gets exactly one flag: the engine
-    /// indexes this parallel to the mel windows, and a short read there would
-    /// silently gate a window that was never judged.
-    #[test]
-    fn the_flags_are_parallel_to_the_windows() {
-        assert_eq!(window_speech(&[], 16000, VAD_GATE_THRESHOLD).len(), 1);
-        assert_eq!(
-            window_speech(&noise(0.4, 0.30), 16000, VAD_GATE_THRESHOLD).len(),
-            1
-        );
-        // 61 s is three windows even though the last is a sliver
-        assert_eq!(
-            window_speech(&noise(61.0, 0.30), 16000, VAD_GATE_THRESHOLD).len(),
-            3
-        );
-    }
-
-    // ---- the language contradiction  ----
-
-    /// The whole point, end to end at the response layer: a forced language,
-    /// a transcript in another one, and a notice that says so on every body
-    /// shape - including plain `json`, which has no verbose object to look
-    /// inside and is exactly where this failure was invisible.
-    #[test]
-    fn a_translated_transcript_gets_a_notice_on_every_body() {
-        let german = "Hallo, ich teste und sehe, wie es funktioniert.";
-        let rep = generative_report(Some("sv"), None, german);
-        let g = language_guard(&rep, 6.0).expect("sv asked, German written");
-        assert_eq!(g.reason, "language_mismatch");
-        // the text STAYS - it may be a perfectly good translation, and that is
-        // the caller's call to make, not this endpoint's
-        assert!(!g.dropped);
-        assert_eq!((g.start, g.end), (0.0, 6.0));
-        let v = guard_json(&g);
-        assert!(v["note"].as_str().unwrap().contains("translat"), "{v}");
-        // the remedy names the language it actually came back in
-        let hint = v["hint"].as_str().unwrap();
-        assert!(hint.contains("language=de"), "{hint}");
-        assert!(hint.contains("German"), "{hint}");
-        // and the plain-json body carries it
-        let body = with_guards(serde_json::json!({ "text": german }), &[g]);
-        assert_eq!(body["paddock_guards"][0]["reason"], "language_mismatch");
-    }
-
-    /// A correct transcript carries nothing. Same rule as every other notice
-    /// here: the key is absent, and a warning that fires on good output is
-    /// worse than no warning at all.
-    #[test]
-    fn a_transcript_in_the_asked_language_carries_no_notice() {
-        let swedish = "Jag testar transkriberingen och ser hur den fungerar i praktiken.";
-        let rep = generative_report(Some("sv"), None, swedish);
-        assert!(language_guard(&rep, 6.0).is_none());
-        let body = with_guards(serde_json::json!({ "text": swedish }), &[]);
-        assert!(body.get("paddock_guards").is_none(), "{body}");
-    }
-
-    /// Qwen3-ASR names its language as an English NAME inside its own answer
-    /// ("language Swedish<asr_text>...") while everything else here speaks
-    /// codes. The report normalises, or the check could never compare
-    /// anything on this lane (is the standing question of what the
-    /// spec `language` field itself should carry).
-    #[test]
-    fn a_model_that_names_its_language_is_normalised_to_a_code() {
-        let german = "Hallo, ich teste und sehe, wie es funktioniert.";
-        let rep = generative_report(None, Some("Swedish"), german);
-        assert_eq!(rep.code.as_deref(), Some("sv"));
-        let v = rep.json().unwrap();
-        // "reported", not "detected": the model said so, we did not measure it
-        assert_eq!(v["source"], "reported");
-        assert!(
-            v.get("probability").is_none(),
-            "no number was ever produced: {v}"
-        );
-        assert!(language_guard(&rep, 6.0).is_some());
-        // lowercase too - the same checkpoint has been seen writing both
-        assert_eq!(
-            generative_report(None, Some("swedish"), german)
-                .code
-                .as_deref(),
-            Some("sv")
-        );
-    }
-
-    /// granite-speech detects the input language and reports nothing. With no
-    /// hint from the caller either there is genuinely nothing to say, and the
-    /// response says exactly that rather than inventing a language.
-    #[test]
-    fn a_lane_that_reports_no_language_says_so() {
-        let rep = generative_report(
-            None,
-            None,
-            "Jag testar transkriberingen och ser hur den går.",
-        );
-        assert!(rep.code.is_none());
-        assert!(language_guard(&rep, 6.0).is_none(), "nothing to contradict");
-        let v = rep.json();
-        // the text check still ran; whether it could ANSWER is a separate
-        // question, and either way no language is asserted
-        assert!(v.as_ref().is_none_or(|v| v.get("code").is_none()), "{v:?}");
-    }
-
-    #[test]
-    fn output_envelope_parses() {
-        let (l, t) = parse_output("language English<asr_text>hello world");
-        assert_eq!(l.as_deref(), Some("English"));
-        assert_eq!(t, "hello world");
-        let (l, t) = parse_output("no envelope at all");
-        assert!(l.is_none());
-        assert_eq!(t, "no envelope at all");
-    }
-
-    /// `chunking_strategy` parsing. The param_surface probes cannot reach this:
-    /// the endpoint needs an ASR model loaded before it looks at the form, so
-    /// the parser is checked on its own OUTPUT here - the same lesson as
-    /// output_config, where "parse it then discard it" survived every HTTP test.
-    mod chunking {
-        use super::super::{VAD_GATE_THRESHOLD, parse_chunking_strategy};
-
-        #[test]
-        fn auto_and_server_vad_both_mean_server_vad() {
-            // server VAD is the only chunking this endpoint does, so "let the
-            // server decide" and "use server VAD" resolve to the same thing
-            for raw in ["auto", "\"auto\"", r#"{"type":"server_vad"}"#] {
-                assert_eq!(
-                    parse_chunking_strategy(raw).expect("ok"),
-                    Some(VAD_GATE_THRESHOLD),
-                    "{raw}"
-                );
-            }
-        }
-
-        #[test]
-        fn threshold_is_a_real_dial() {
-            let got = parse_chunking_strategy(r#"{"type":"server_vad","threshold":0.8}"#)
-                .expect("ok")
-                .expect("some");
-            assert!((got - 0.8).abs() < 1e-6, "got {got}");
-        }
-
-        #[test]
-        fn the_millisecond_dials_are_refused_rather_than_swallowed() {
-            // They move where a live session cuts an utterance. This endpoint
-            // gates whole 30 s encoder windows on whether they hold speech, so
-            // there is no boundary for them to move - accepting them would let
-            // a caller believe they had tuned something.
-            for k in ["prefix_padding_ms", "silence_duration_ms"] {
-                let raw = format!(r#"{{"type":"server_vad","{k}":300}}"#);
-                let e = parse_chunking_strategy(&raw).expect_err("should refuse");
-                assert!(e.contains(k), "{e}");
-                assert!(e.contains("encoder windows"), "should say why: {e}");
-            }
-        }
-
-        #[test]
-        fn malformed_shapes_name_themselves() {
-            for (raw, want) in [
-                ("\"eager\"", "must be \"auto\""),
-                (
-                    r#"{"type":"semantic_vad"}"#,
-                    "unsupported chunking_strategy type",
-                ),
-                (r#"{"threshold":0.5}"#, "needs a `type`"),
-                (r#"{"type":"server_vad","threshold":3}"#, "must be 0..=1"),
-                (
-                    r#"{"type":"server_vad","threshold":"loud"}"#,
-                    "must be a number",
-                ),
-                (
-                    r#"{"type":"server_vad","nope":1}"#,
-                    "unsupported chunking_strategy field",
-                ),
-            ] {
-                let e = parse_chunking_strategy(raw).expect_err("should refuse");
-                assert!(e.contains(want), "expected {want:?} for {raw}, got {e}");
-            }
-        }
-    }
-}
+#[path = "transcriptions_tests.rs"]
+mod tests;

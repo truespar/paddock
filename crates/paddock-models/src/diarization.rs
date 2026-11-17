@@ -174,7 +174,22 @@ pub fn segments(probs: &[[f32; SPEAKERS]], first_frame: usize, threshold: f32) -
 /// silence embedding, not a zero vector. Do not reorder the result by score:
 /// speaker-major temporal ordering is part of the model's input contract.
 pub fn cache_selection(probs: &[[f32; SPEAKERS]]) -> Result<Vec<Option<usize>>, String> {
-    if probs.len() <= CACHE
+    cache_selection_len(probs, CACHE)
+}
+
+/// [`cache_selection`] into a cache of `cache` rows (Nemotron 3.5 Transcribe
+/// runs the model with 188). The score policy's frame counts follow the
+/// cache: each speaker's budget is `cache / 8 - 1` rows (its silence slot
+/// excluded), the positive-score floor half of it, the strong boost three
+/// quarters, the weak boost one and a half - 16 / 24 / 48 at 264.
+pub fn cache_selection_len(
+    probs: &[[f32; SPEAKERS]],
+    cache: usize,
+) -> Result<Vec<Option<usize>>, String> {
+    let budget = cache / SPEAKERS - 1;
+    let (min_pos, strong, weak) = (budget / 2, budget * 3 / 4, budget * 3 / 2);
+    if cache < 2 * SPEAKERS
+        || probs.len() <= cache
         || probs.len() > 1024
         || probs
             .iter()
@@ -195,17 +210,17 @@ pub fn cache_selection(probs: &[[f32; SPEAKERS]]) -> Result<Vec<Option<usize>>, 
         }
     }
     for score in &mut scores {
-        if score[..n].iter().filter(|&&s| s > 0.0).count() >= 16 {
+        if score[..n].iter().filter(|&&s| s > 0.0).count() >= min_pos {
             for s in &mut score[..n] {
                 if *s <= 0.0 {
                     *s = f32::NEG_INFINITY;
                 }
             }
         }
-        for s in &mut score[CACHE..n] {
+        for s in &mut score[cache..n] {
             *s += 0.05;
         }
-        for (count, scale) in [(24, 2.0f32), (48, 1.0f32)] {
+        for (count, scale) in [(strong, 2.0f32), (weak, 1.0f32)] {
             let mut order: Vec<_> = (0..n).collect();
             select_best(&mut order, count, |i| score[i]);
             for &i in order.iter().take(count) {
@@ -216,8 +231,8 @@ pub fn cache_selection(probs: &[[f32; SPEAKERS]]) -> Result<Vec<Option<usize>>, 
     }
     let mut order: Vec<_> = (0..SPEAKERS * (n + 1)).collect();
     let value = |i: usize| scores[i / (n + 1)][i % (n + 1)];
-    select_best(&mut order, CACHE, value);
-    order.truncate(CACHE);
+    select_best(&mut order, cache, value);
+    order.truncate(cache);
     // NeMo replaces disabled indices with a sentinel BEFORE temporal sorting.
     order.sort_by_key(|&i| {
         if value(i) == f32::NEG_INFINITY {

@@ -61,11 +61,18 @@ pub(crate) fn super_mtp_depth() -> usize {
 }
 
 /// A dense projection of the block in its file's class: the GGUF nextn's
-/// Q8_0 (repacked GEMV at one row, the mmq ladder past it), or Super's bf16
-/// (the bf16 GEMM/GEMV - exact products against f32 rows), [in, out] dims.
+/// Q8_0 (repacked GEMV at one row, the mmq ladder past it), Super's bf16
+/// (the bf16 GEMM/GEMV - exact products against f32 rows), [in, out] dims,
+/// or Transcribe's FP8 rows (the exact W8A16 GEMV at one row, W8A8 past it -
+/// the trunk's FP8 projection classes).
 pub(crate) enum MtpProj {
     Qw(QuantW),
     Bf16(QuantTensor),
+    F8 {
+        w: F8RowPlane,
+        inn: usize,
+        out: usize,
+    },
 }
 
 /// The block's attention planes (NoPE; q, k, v, o).
@@ -94,17 +101,28 @@ pub(crate) struct MtpWeights {
     pub head_norm: DeviceTensor,
 }
 
-/// `y = W x` over `rows` rows for a bf16 block plane; Q8_0 planes take the
-/// pass's own quantize-once dispatch at the call site.
-fn mtp_bf16(
+/// `y = W x` over `rows` rows for a bf16 or FP8 block plane (`xq` / `xrs`:
+/// the FP8 class's activation image); Q8_0 planes take the pass's own
+/// quantize-once dispatch at the call site (false).
+fn mtp_dense(
     exec: &GpuExecutor,
     w: &MtpProj,
     x: &CudaSlice<f32>,
     y: &mut CudaSlice<f32>,
     rows: usize,
+    (xq, xrs): (&mut CudaSlice<i8>, &mut CudaSlice<f32>),
 ) -> Result<bool, GpuError> {
     match w {
         MtpProj::Bf16(t) => exec.bf16_gemm(t, None, x, y, rows).map(|()| true),
+        MtpProj::F8 { w, inn, out } => {
+            if rows == 1 {
+                exec.f8r_gemv(w, x, y, *inn, *out)?;
+            } else {
+                exec.quantize_e4m3_row(x, xq, xrs, *inn, rows)?;
+                exec.f8row_gemm(w, xq, xrs, y, *inn, *out, rows)?;
+            }
+            Ok(true)
+        }
         MtpProj::Qw(_) => Ok(false),
     }
 }
@@ -112,8 +130,22 @@ fn mtp_bf16(
 fn mtp_qw(w: &MtpProj) -> &QuantW {
     match w {
         MtpProj::Qw(q) => q,
-        MtpProj::Bf16(_) => unreachable!("bf16 planes dispatch through mtp_bf16"),
+        _ => unreachable!("bf16 / FP8 planes dispatch through mtp_dense"),
     }
+}
+
+/// Transcribe's MTP draft depth per round (the batched drafter drafts every
+/// slot to one depth; the round budget narrows it by live count to 3 at 64
+/// live). Transcripts accept ~0.95 a draft and a draft step is a sliver of
+/// a round, so deep chains repay below 64 live: FLEURS 5 x 100 RTFx (GB10,
+/// 2026-11-14) at depth 3 / 5 / 7 - c16 114.5 / 124.4 / 126.9, c32 164.1 /
+/// 173.5 / 177.1 (8: c16 126.7). Overridable for the election's A/B only.
+pub(crate) fn transcribe_mtp_depth() -> usize {
+    paddock_models::dev_var!("PADDOCK_TRANSCRIBE_MTP_DEPTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&d| (1..=MTP_MAX_DRAFT).contains(&d))
+        .unwrap_or(7)
 }
 
 pub(crate) struct MtpDrafter {
@@ -152,6 +184,25 @@ pub(crate) struct MtpState {
     pub d_pick: CudaSlice<u32>,
     /// stays zero - pending_h resets copy from here
     pub d_zero: CudaSlice<f32>,
+    /// the batched copies' descriptors (two a run: a pass carries at most a
+    /// run a slot of verify rows and one of prompt rows)
+    pub d_cp_desc: CudaSlice<u64>,
+    /// the FP8 experts over sorted blocks (slots 951-953, Transcribe): one
+    /// row chunk's per-pick down rows and its align planes
+    pub sorted: Option<MtpSorted>,
+    /// the eh_proj input's concat as one batched copy: two descriptors a
+    /// pass row
+    pub d_cat_desc: CudaSlice<u64>,
+}
+
+/// Rows a sorted-expert chunk of the MTP block's MoE takes.
+pub(crate) const MTP_SORT_CHUNK: usize = 256;
+
+pub(crate) struct MtpSorted {
+    pub part: CudaSlice<f32>,
+    pub srow: CudaSlice<u32>,
+    pub sslot: CudaSlice<u32>,
+    pub bexp: CudaSlice<u32>,
 }
 
 impl GpuNemotron {
@@ -159,6 +210,23 @@ impl GpuNemotron {
     /// (an explicit `--mtp` attach wins over the in-file block).
     pub(crate) fn mtp_active(&self) -> bool {
         self.mtp.is_some() && self.dflash.is_none()
+    }
+
+    /// The in-file MTP drafts every warm slot together at a fixed depth - the
+    /// checkpoint lanes whose head takes rows (Super's FP8 head, Transcribe's
+    /// bf16 one); the GGUF lane chains per slot.
+    pub(crate) fn mtp_batched(&self) -> bool {
+        self.mtp_active() && matches!(self.lm_head, HeadW::F8(_) | HeadW::Bf16(_))
+    }
+
+    /// The batched drafter's depth (see [`super_mtp_depth`] and
+    /// [`transcribe_mtp_depth`]).
+    pub(crate) fn mtp_depth(&self) -> usize {
+        if self.hp.transcribe {
+            transcribe_mtp_depth()
+        } else {
+            super_mtp_depth()
+        }
     }
 
     /// Bytes the block's stripes add to every pool block (its one layer's K
@@ -204,6 +272,21 @@ impl GpuNemotron {
             d_hd: e.alloc(n_slots * hp.hidden)?,
             d_pick: e.alloc_u32(n_slots)?,
             d_zero: e.alloc(hp.hidden)?,
+            d_cp_desc: e.alloc_u64(3 * 2 * (2 * n_slots + 2))?,
+            sorted: match &mtp.w.moe.planes {
+                MoePlanes::F8 { .. } if e.has_f8r_moe_sorted() => {
+                    let (c, k) = (MTP_SORT_CHUNK, hp.n_active);
+                    let nb = c * k / 8 + hp.n_expert.min(c * k) + 1;
+                    Some(MtpSorted {
+                        part: e.alloc(c * k * hp.hidden)?,
+                        srow: e.alloc_u32(nb * 8)?,
+                        sslot: e.alloc_u32(nb * 8)?,
+                        bexp: e.alloc_u32(nb)?,
+                    })
+                }
+                _ => None,
+            },
+            d_cat_desc: e.alloc_u64(6 * band)?,
         });
         tracing::info!(
             kv_gib = (2 * kv_bytes) as f64 / (1u64 << 30) as f64,
@@ -301,6 +384,53 @@ impl GpuNemotron {
         Ok(())
     }
 
+    /// [`Self::mtp_advance`] for several slots, the chain copies in one
+    /// batched launch (each slot at most once).
+    pub(crate) fn mtp_advance_many(
+        &mut self,
+        adv: &[(usize, usize, usize, usize)],
+    ) -> Result<(), GpuModelError> {
+        let embd = self.hp.hidden;
+        let exec = self.exec.clone();
+        let row = (embd * 4) as u64;
+        let batched = exec.has_batched_copy() && row.is_multiple_of(16);
+        let Some(st) = self.mtp.as_mut().and_then(|m| m.state.as_mut()) else {
+            return Ok(());
+        };
+        if !batched || 3 * adv.len() > st.d_cp_desc.len() {
+            for &(slot, start, end, h_row) in adv {
+                self.mtp_advance(slot, start, end, h_row)?;
+            }
+            return Ok(());
+        }
+        use cudarc::driver::{DevicePtr, DevicePtrMut};
+        let mut d = Vec::with_capacity(3 * adv.len());
+        {
+            let (h, _g1) = st.d_h.device_ptr(&exec.stream);
+            let (ph, _g2) = st.pending_h.device_ptr_mut(&exec.stream);
+            for &(slot, start, end, h_row) in adv {
+                if slot >= st.feat.len() {
+                    continue;
+                }
+                let (s, e) = st.feat[slot];
+                if s == 0 && start <= e as usize && end as u32 > e {
+                    st.feat[slot] = (0, end as u32);
+                    d.extend([h + h_row as u64 * row, ph + slot as u64 * row, row]);
+                    if let Some(bs) = self.batch.as_ref() {
+                        let blocks = bs.tables[slot].blocks();
+                        let done = (end / 16).min(blocks.len());
+                        let from = (e as usize / 16).min(done);
+                        for &b in &blocks[from..done] {
+                            st.page_gen[b as usize] = bs.pool.generation(b);
+                        }
+                    }
+                }
+            }
+        }
+        exec.batched_copy_upload(&mut st.d_cp_desc, &d)?;
+        Ok(())
+    }
+
     /// The walk hook: run the MTP block over the pass's `runs` (contiguous
     /// same-slot spans as (slot, row offset, len), rows 0..r in order),
     /// consuming the walk's staged tokens/positions/slots and the trunk's
@@ -333,12 +463,40 @@ impl GpuNemotron {
                 .expect("mtp state");
             exec.rmsnorm_batch(&bs.sc.d_x, &final_norm, &mut st.d_h, embd, eps, r)?;
             // shifted h inputs: row 0 of each run pairs with the slot's
-            // pending_h, row i with the run's own h row i-1
-            for &(slot, off, len) in runs {
-                exec.copy_region(&st.pending_h, slot * embd, &mut st.d_hin, off * embd, embd)?;
-                if len > 1 {
-                    let n = (len - 1) * embd;
-                    exec.copy_region(&st.d_h, off * embd, &mut st.d_hin, (off + 1) * embd, n)?;
+            // pending_h, row i with the run's own h row i-1 - one batched
+            // launch for every run where the pack has it (two copies a run
+            // were ~70 host-submitted copies a c32 round, the GPU idle
+            // between them)
+            let row = (embd * 4) as u64;
+            if exec.has_batched_copy()
+                && row.is_multiple_of(16)
+                && 6 * runs.len() <= st.d_cp_desc.len()
+            {
+                use cudarc::driver::{DevicePtr, DevicePtrMut};
+                let mut d = Vec::with_capacity(6 * runs.len());
+                {
+                    let (ph, _g1) = st.pending_h.device_ptr(&exec.stream);
+                    let (h, _g2) = st.d_h.device_ptr(&exec.stream);
+                    let (hin, _g3) = st.d_hin.device_ptr_mut(&exec.stream);
+                    for &(slot, off, len) in runs {
+                        d.extend([ph + slot as u64 * row, hin + off as u64 * row, row]);
+                        if len > 1 {
+                            d.extend([
+                                h + off as u64 * row,
+                                hin + (off + 1) as u64 * row,
+                                (len - 1) as u64 * row,
+                            ]);
+                        }
+                    }
+                }
+                exec.batched_copy_upload(&mut st.d_cp_desc, &d)?;
+            } else {
+                for &(slot, off, len) in runs {
+                    exec.copy_region(&st.pending_h, slot * embd, &mut st.d_hin, off * embd, embd)?;
+                    if len > 1 {
+                        let n = (len - 1) * embd;
+                        exec.copy_region(&st.d_h, off * embd, &mut st.d_hin, (off + 1) * embd, n)?;
+                    }
                 }
             }
         }
@@ -382,6 +540,7 @@ impl GpuNemotron {
         let scale = 1.0 / (hp.head_dim as f32).sqrt();
         let dec1 = r == 1;
         let tok_embd = &self.tok_embd;
+        let mm = self.mm.as_ref();
         let mtp = self.mtp.as_mut().expect("mtp weights");
         let m = &mtp.w;
         let st = mtp.state.as_mut().expect("mtp state");
@@ -403,20 +562,50 @@ impl GpuNemotron {
                 exec.embed_gather_batch_q8(tab, &sc.d_tok, &mut st.d_mx, embd, r)?
             }
         }
+        // a recording's rows over its placeholders (mm.rs), as the trunk's
+        // gather got them: the block was trained on the same mixed stream,
+        // and its rows are the walk's rows
+        Self::apply_overlay(&exec, mm, &mut st.d_mx, embd)?;
         exec.rmsnorm_batch(&st.d_mx, &m.enorm.buf, &mut sc.d_xn, embd, eps, r)?;
         exec.rmsnorm_batch(&st.d_hin, &m.hnorm.buf, &mut sc.d_proj, embd, eps, r)?;
-        for i in 0..r {
-            exec.copy_region(&sc.d_xn, i * embd, &mut sc.d_zxbcdt, i * 2 * embd, embd)?;
-            exec.copy_region(
-                &sc.d_proj,
-                i * embd,
-                &mut sc.d_zxbcdt,
-                i * 2 * embd + embd,
-                embd,
-            )?;
+        // the concat in one batched launch where the pack has it - two copies
+        // a row were ~1,400 host-submitted copies for a 700-row append, an
+        // idle die for ~13 ms (GB10 2026-11-14, c64)
+        let row = (embd * 4) as u64;
+        if exec.has_batched_copy() && row.is_multiple_of(16) && 6 * r <= st.d_cat_desc.len() {
+            use cudarc::driver::{DevicePtr, DevicePtrMut};
+            let mut d = Vec::with_capacity(6 * r);
+            {
+                let (xn, _g1) = sc.d_xn.device_ptr(&exec.stream);
+                let (pj, _g2) = sc.d_proj.device_ptr(&exec.stream);
+                let (zx, _g3) = sc.d_zxbcdt.device_ptr_mut(&exec.stream);
+                for i in 0..r as u64 {
+                    d.extend([xn + i * row, zx + 2 * i * row, row]);
+                    d.extend([pj + i * row, zx + (2 * i + 1) * row, row]);
+                }
+            }
+            exec.batched_copy_upload(&mut st.d_cat_desc, &d)?;
+        } else {
+            for i in 0..r {
+                exec.copy_region(&sc.d_xn, i * embd, &mut sc.d_zxbcdt, i * 2 * embd, embd)?;
+                exec.copy_region(
+                    &sc.d_proj,
+                    i * embd,
+                    &mut sc.d_zxbcdt,
+                    i * 2 * embd + embd,
+                    embd,
+                )?;
+            }
         }
-        if mtp_bf16(&exec, &m.eh_proj, &sc.d_zxbcdt, &mut st.d_mx, r)? {
-            // Super's bf16 plane: done
+        if mtp_dense(
+            &exec,
+            &m.eh_proj,
+            &sc.d_zxbcdt,
+            &mut st.d_mx,
+            r,
+            (&mut sc.d_xq, &mut sc.d_xrs),
+        )? {
+            // Super's bf16 / Transcribe's FP8 plane: done
         } else if dec1 {
             gemv_any(&exec, mtp_qw(&m.eh_proj), &sc.d_zxbcdt, &mut st.d_mx)?;
         } else {
@@ -448,7 +637,7 @@ impl GpuNemotron {
         // causal window [0, pos_i] (the decode kernel is exactly that)
         exec.rmsnorm_batch(&st.d_mx, &m.attn_norm.buf, &mut sc.d_xn, embd, eps, r)?;
         let MtpAttn { wq, wk, wv, wo } = &m.attn;
-        let bf16 = matches!(wq, MtpProj::Bf16(_));
+        let dense = !matches!(wq, MtpProj::Qw(_));
         // An append pass (head_out false: prefill chunks, decode ticks,
         // verify commits) only has to leave this position's K/V behind - a
         // cell is k/v(attn_norm(x0)), and x0 pairs the token with the TRUNK's
@@ -459,12 +648,27 @@ impl GpuNemotron {
         // whole prefix, so an 11.7K-token append at 130K depth spent ~65 s
         // here (GB10, Claude Code replay; the trunk's own chunk took ~9 s).
         // The K/V bytes are unchanged, so drafts are bit-identical.
-        if bf16 {
+        if dense {
+            let img = (&mut sc.d_xq, &mut sc.d_xrs);
             if head_out {
-                mtp_bf16(&exec, wq, &sc.d_xn, &mut sc.d_q, r)?;
+                mtp_dense(
+                    &exec,
+                    wq,
+                    &sc.d_xn,
+                    &mut sc.d_q,
+                    r,
+                    (&mut *img.0, &mut *img.1),
+                )?;
             }
-            mtp_bf16(&exec, wk, &sc.d_xn, &mut sc.d_k, r)?;
-            mtp_bf16(&exec, wv, &sc.d_xn, &mut sc.d_v, r)?;
+            mtp_dense(
+                &exec,
+                wk,
+                &sc.d_xn,
+                &mut sc.d_k,
+                r,
+                (&mut *img.0, &mut *img.1),
+            )?;
+            mtp_dense(&exec, wv, &sc.d_xn, &mut sc.d_v, r, img)?;
         } else if dec1 {
             let (wq, wk, wv) = (mtp_qw(wq), mtp_qw(wk), mtp_qw(wv));
             if head_out {
@@ -609,8 +813,15 @@ impl GpuNemotron {
                 KvDtype::Fp16,
             )?;
         }
-        if mtp_bf16(&exec, wo, &sc.d_attn, &mut sc.d_proj, r)? {
-            // Super's bf16 plane: done
+        if mtp_dense(
+            &exec,
+            wo,
+            &sc.d_attn,
+            &mut sc.d_proj,
+            r,
+            (&mut sc.d_xq, &mut sc.d_xrs),
+        )? {
+            // Super's bf16 / Transcribe's FP8 plane: done
         } else if dec1 {
             gemv_any(&exec, mtp_qw(wo), &sc.d_attn, &mut sc.d_proj)?;
         } else {
@@ -681,6 +892,104 @@ impl GpuNemotron {
                 &mut sc.d_proj,
                 r,
                 class,
+            )?;
+            exec.add(&mut st.d_mx, &sc.d_proj, r * embd)?;
+            if head_out {
+                exec.rmsnorm_batch(&st.d_mx, &m.head_norm.buf, &mut st.d_hd, embd, eps, r)?;
+            }
+            return Ok(());
+        }
+        // Transcribe: the checkpoint's FP8 experts on the exact decode GEMVs
+        // (a draft step's rows are few), routed then shared into one sum
+        if let MoePlanes::F8 {
+            up,
+            down,
+            sh_up,
+            sh_down,
+        } = &m.moe.planes
+        {
+            // expert-sorted blocks (951-953, the same bits): every expert's
+            // rows streamed once a block, not once a pick
+            if let Some(so) = st.sorted.as_mut()
+                && paddock_models::dev_var_os!("PADDOCK_NO_F8R_SORTED").is_none()
+            {
+                exec.f8r_moe_sorted(
+                    (up, down),
+                    &sc.d_idx,
+                    &sc.d_w,
+                    &sc.d_xn,
+                    &mut sc.d_part,
+                    &mut so.part,
+                    &mut sc.d_proj,
+                    (&mut so.srow, &mut so.sslot, &mut so.bexp),
+                    (embd, hp.moe_ff, embd, hp.n_active, hp.n_expert),
+                    r,
+                    MTP_SORT_CHUNK,
+                    false,
+                )?;
+                exec.f8r_moe_sorted(
+                    (sh_up, sh_down),
+                    &sc.d_sh_idx,
+                    &sc.d_sh_w,
+                    &sc.d_xn,
+                    &mut sc.d_part,
+                    &mut so.part,
+                    &mut sc.d_proj,
+                    (&mut so.srow, &mut so.sslot, &mut so.bexp),
+                    (embd, hp.shared_ff, embd, 1, 1),
+                    r,
+                    MTP_SORT_CHUNK,
+                    true,
+                )?;
+                exec.add(&mut st.d_mx, &sc.d_proj, r * embd)?;
+                if head_out {
+                    exec.rmsnorm_batch(&st.d_mx, &m.head_norm.buf, &mut st.d_hd, embd, eps, r)?;
+                }
+                return Ok(());
+            }
+            exec.f8r_moe_up_relu2(
+                up,
+                &sc.d_idx,
+                &sc.d_xn,
+                &mut sc.d_part,
+                embd,
+                hp.moe_ff,
+                hp.n_active,
+                r,
+            )?;
+            exec.f8r_moe_down(
+                down,
+                &sc.d_idx,
+                &sc.d_w,
+                &sc.d_part,
+                &mut sc.d_proj,
+                hp.moe_ff,
+                embd,
+                hp.n_active,
+                r,
+                false,
+            )?;
+            exec.f8r_moe_up_relu2(
+                sh_up,
+                &sc.d_sh_idx,
+                &sc.d_xn,
+                &mut sc.d_part,
+                embd,
+                hp.shared_ff,
+                1,
+                r,
+            )?;
+            exec.f8r_moe_down(
+                sh_down,
+                &sc.d_sh_idx,
+                &sc.d_sh_w,
+                &sc.d_part,
+                &mut sc.d_proj,
+                hp.shared_ff,
+                embd,
+                1,
+                r,
+                true,
             )?;
             exec.add(&mut st.d_mx, &sc.d_proj, r * embd)?;
             if head_out {
@@ -849,30 +1158,28 @@ impl GpuNemotron {
         }
         let exec = self.exec.clone();
         let (embd, vocab) = (self.hp.hidden, self.hp.vocab);
-        let drv = |e: cudarc::driver::DriverError| crate::gpu::from_driver(e);
         let mut drafts = vec![Vec::with_capacity(k); r];
         let mut toks: Vec<u32> = reqs.iter().map(|&(_, _, t)| t).collect();
         for i in 0..k {
             {
                 let bs = self.batch.as_mut().expect("batch enabled");
                 let sc = &mut bs.sc;
-                let stm = &exec.stream;
                 let pos: Vec<u32> = reqs.iter().map(|&(_, p, _)| (p + i) as u32).collect();
                 let mut t = sc
                     .d_tok
                     .try_slice_mut(0..r)
                     .ok_or_else(|| GpuError::Driver("tok".into()))?;
-                stm.memcpy_htod(&toks, &mut t).map_err(drv)?;
+                exec.htod(&toks, &mut t)?;
                 let mut p = sc
                     .d_pos
                     .try_slice_mut(0..r)
                     .ok_or_else(|| GpuError::Driver("pos".into()))?;
-                stm.memcpy_htod(&pos, &mut p).map_err(drv)?;
+                exec.htod(&pos, &mut p)?;
                 let mut s = sc
                     .d_slots
                     .try_slice_mut(0..r)
                     .ok_or_else(|| GpuError::Driver("slots".into()))?;
-                stm.memcpy_htod(&slots, &mut s).map_err(drv)?;
+                exec.htod(&slots, &mut s)?;
             }
             {
                 let st = self
@@ -898,11 +1205,6 @@ impl GpuNemotron {
             }
             self.mtp_block_rows(r, true)?;
             {
-                let HeadW::F8(h) = &self.lm_head else {
-                    return Err(GpuModelError::Unsupported(
-                        "batched MTP drafting is the FP8-head lane's".into(),
-                    ));
-                };
                 let st = self
                     .mtp
                     .as_mut()
@@ -912,17 +1214,48 @@ impl GpuNemotron {
                     .expect("mtp state");
                 let bs = self.batch.as_mut().expect("batch enabled");
                 let sc = &mut bs.sc;
-                head_f8_batch(
-                    &exec,
-                    h,
-                    &st.d_hd,
-                    &mut sc.d_xq,
-                    &mut sc.d_xrs,
-                    &mut sc.head_logits,
-                    embd,
-                    vocab,
-                    r,
-                )?;
+                // Transcribe drafts on its per-row e4m3 copy of the head
+                // (the verify scores with the bf16 one)
+                let head = match &self.draft_head {
+                    Some(h) => Some(h),
+                    None => match &self.lm_head {
+                        HeadW::F8(h) => Some(h),
+                        _ => None,
+                    },
+                };
+                match (&self.lm_head, head) {
+                    (_, Some(h)) => head_f8_batch(
+                        &exec,
+                        h,
+                        &st.d_hd,
+                        &mut sc.d_xq,
+                        &mut sc.d_xrs,
+                        &mut sc.head_logits,
+                        embd,
+                        vocab,
+                        r,
+                    )?,
+                    (HeadW::F8(h), None) => head_f8_batch(
+                        &exec,
+                        h,
+                        &st.d_hd,
+                        &mut sc.d_xq,
+                        &mut sc.d_xrs,
+                        &mut sc.head_logits,
+                        embd,
+                        vocab,
+                        r,
+                    )?,
+                    (HeadW::Bf16(h), None) => {
+                        super::head_bf16_batch(&exec, h, &st.d_hd, &mut sc.head_logits, r, false)?
+                    }
+                    _ => {
+                        return Err(GpuModelError::Unsupported(
+                            "batched MTP drafting is the checkpoint lanes' (FP8 / bf16 head)"
+                                .into(),
+                        ));
+                    }
+                }
                 exec.argmax_rows(&sc.head_logits, &mut st.d_pick, r, vocab)?;
                 let view = st
                     .d_pick
@@ -1032,6 +1365,7 @@ impl GpuNemotron {
                         vocab,
                         1,
                     )?,
+                    HeadW::Bf16(h) => exec.bf16_gemv(h, None, &st.d_hd, &mut sc.head_logits)?,
                     HeadW::Nvf4(_) => {
                         return Err(GpuModelError::Unsupported(
                             "the NVFP4-head lane has no in-file MTP".into(),

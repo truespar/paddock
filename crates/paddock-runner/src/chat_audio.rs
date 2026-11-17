@@ -8,7 +8,8 @@ use crate::serving::ServingModel;
 
 /// Prefill rows a request's clips take, for the usage split: exact on Gemma 4
 /// 12B (its frames plus the `<|audio>` / `<audio|>` pair the engine adds
-/// around each - it also takes pictures, so the two must be told apart),
+/// around each - it also takes pictures, so the two must be told apart) and
+/// on Nemotron 3.5 Transcribe (its 80-ms rows),
 /// "all of them" (usize::MAX) on the audio-only families, 0 without audio.
 pub(crate) fn audio_rows(model: &ServingModel, mm_chunks: Option<&[MmChunk]>) -> usize {
     match model.audio_frontend {
@@ -20,6 +21,15 @@ pub(crate) fn audio_rows(model: &ServingModel, mm_chunks: Option<&[MmChunk]>) ->
                 MmChunk::Audio { samples, .. } => {
                     model.audio_frontend.prompt_rows(samples.len()) + 2
                 }
+                _ => 0,
+            })
+            .sum(),
+        // Transcribe also answers text: its clips' rows exactly
+        crate::serving::AudioFrontend::Transcribe => mm_chunks
+            .unwrap_or_default()
+            .iter()
+            .map(|c| match c {
+                MmChunk::Audio { samples, .. } => model.audio_frontend.prompt_rows(samples.len()),
                 _ => 0,
             })
             .sum(),

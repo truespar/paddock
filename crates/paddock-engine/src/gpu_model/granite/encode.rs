@@ -211,7 +211,8 @@ fn image_at(items: &[(usize, Vec<MmChunk>)], at: (usize, usize)) -> (&[u8], usiz
         MmChunk::Text(_)
         | MmChunk::Audio { .. }
         | MmChunk::OcrCrop(_)
-        | MmChunk::VisionPixels { .. } => {
+        | MmChunk::VisionPixels { .. }
+        | MmChunk::CtcTimestamps { .. } => {
             unreachable!("flat indexes image chunks only")
         }
     }

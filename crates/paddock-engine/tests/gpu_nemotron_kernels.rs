@@ -120,11 +120,15 @@ fn mamba_conv_seq_matches_serial_steps() {
     }
     const X_OFF: usize = 33;
     const STRIDE: usize = CONV_DIM + 77; // fused-row layout: junk around the span
-    // 13 rows = the serial kernel; 200 and 1022 = the T-chunked twin the
-    // launcher elects from 128 rows (64-row chunks, a ragged last chunk, a
-    // halo read from xbc for every chunk but the first, the window written
-    // back by the last chunk only) - GB10 2026-09-11.
-    for t_len in [13usize, 200, 1022] {
+    // 13 rows = the serial kernel; 129, 196, 200 and 1022 = the T-chunked
+    // twin the launcher elects from 128 rows (64-row chunks, a ragged last
+    // chunk, a halo read from xbc for every chunk but the first) - GB10
+    // 2026-09-11. The chunked spans repeat: chunk 0 reads the old window and
+    // writes the new one; when the last chunk wrote it, a 1- or 4-row last
+    // chunk could beat chunk 0's read (2026-11-14 - it showed with another
+    // stream busy on the die, the transcribe gate's encoder lane, never on
+    // an idle one, so this only guards the arithmetic).
+    for t_len in [13usize, 129, 196, 200, 1022] {
         #[allow(non_snake_case)]
         let T = t_len;
         let win0 = det(3 * CONV_DIM, 11);
@@ -156,43 +160,46 @@ fn mamba_conv_seq_matches_serial_steps() {
         let win_serial = exec.to_host(&d_win_s).expect("win serial host");
 
         // bulk: one launch over the span
-        let mut d_win_b = exec.to_device(&win0).expect("win bulk");
-        let mut d_out = exec.alloc(T * CONV_DIM).expect("bulk out");
-        exec.mamba_conv_seq(
-            &mut d_win_b,
-            &d_xbc,
-            X_OFF,
-            STRIDE,
-            &d_w,
-            &d_b,
-            &mut d_out,
-            CONV_DIM,
-            K_CONV,
-            T,
-        )
-        .expect("conv seq");
-        let bulk_out = exec.to_host(&d_out).expect("bulk host");
-        let win_bulk = exec.to_host(&d_win_b).expect("win bulk host");
+        let reps = if T >= 128 { 32 } else { 1 };
+        for _ in 0..reps {
+            let mut d_win_b = exec.to_device(&win0).expect("win bulk");
+            let mut d_out = exec.alloc(T * CONV_DIM).expect("bulk out");
+            exec.mamba_conv_seq(
+                &mut d_win_b,
+                &d_xbc,
+                X_OFF,
+                STRIDE,
+                &d_w,
+                &d_b,
+                &mut d_out,
+                CONV_DIM,
+                K_CONV,
+                T,
+            )
+            .expect("conv seq");
+            let bulk_out = exec.to_host(&d_out).expect("bulk host");
+            let win_bulk = exec.to_host(&d_win_b).expect("win bulk host");
 
-        for i in 0..T * CONV_DIM {
-            assert_eq!(
-                bulk_out[i].to_bits(),
-                serial_out[i].to_bits(),
-                "out[{i}] (t {}, c {}): bulk {} vs serial {}",
-                i / CONV_DIM,
-                i % CONV_DIM,
-                bulk_out[i],
-                serial_out[i]
-            );
+            for i in 0..T * CONV_DIM {
+                assert_eq!(
+                    bulk_out[i].to_bits(),
+                    serial_out[i].to_bits(),
+                    "out[{i}] (t {}, c {}): bulk {} vs serial {}",
+                    i / CONV_DIM,
+                    i % CONV_DIM,
+                    bulk_out[i],
+                    serial_out[i]
+                );
+            }
+            for c in 0..2 * CONV_DIM {
+                assert_eq!(
+                    win_bulk[c].to_bits(),
+                    win_serial[c].to_bits(),
+                    "window[{c}]"
+                );
+            }
         }
-        for c in 0..2 * CONV_DIM {
-            assert_eq!(
-                win_bulk[c].to_bits(),
-                win_serial[c].to_bits(),
-                "window[{c}]"
-            );
-        }
-        println!("conv seq: {T} tokens bit-exact vs serial steps (incl. final window)");
+        println!("conv seq: {T} tokens bit-exact vs serial steps (incl. final window), {reps}x");
     }
 }
 

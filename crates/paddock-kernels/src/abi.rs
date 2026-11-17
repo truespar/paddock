@@ -9819,7 +9819,511 @@ pub struct KernelTableV1 {
     /// `bias_add` and three `row_slice`s in one pass, bit-identical. d % 4 == 0.
     /// (qkv, bias, q, k, v, rows, d, stream)
     pub qkv_bias_split: Option<QkvBiasSplitFn>,
+    /// Slot 942: `pd_tr_mel_norm` - Nemotron 3.5 Transcribe's per-feature
+    /// log-mel normalization: each of the 128 bins over the first `valid`
+    /// frames of `[frames][128]` f32 (f64 sums, unbiased variance, 1e-5 on
+    /// the std), f16 out with frames past `valid` zero - eight frames a stacked
+    /// encoder row. (mel, out, valid, frames, stream)
+    pub tr_mel_norm: Option<TrMelNormFn>,
+    /// Slot 943: `pd_tr_qk_norm_rope` - per head of a `[rows][3][heads][128]`
+    /// f16 q|k|v landing, in place: LayerNorm (weight + bias) on q and on k,
+    /// then the rope on the first 64 dims (rotate-half pairs c / c + 32) at
+    /// `pos[row]` from the `[pos][32][cos, sin]` table. (qkv, wq, bq, wk, bk,
+    /// pos, rope, rows, heads, head_dim, eps, stream)
+    pub tr_qk_norm_rope: Option<TrQkNormRopeFn>,
+    /// Slot 944: `pd_tr_fuse` - `f16(LN(x) * w + b + table[codes[row]])` per
+    /// row: the speech encoder's states with their speaker infusion row (one
+    /// of 256 activity patterns). (x, w, b, codes, table, out, rows, n, eps,
+    /// stream)
+    pub tr_fuse: Option<TrFuseFn>,
+    /// Slot 945: `pd_f8r_moe_up_relu2` - the MTP block's FP8 expert up rows
+    /// (e4m3 `[n_expert * ff][in]`, f32 per-row scales) over `rows` x `k`
+    /// picks: `out[r][j][o] = relu(scale * W[idx * ff + o] . x[r])^2`, f32
+    /// activations. (data, rs, idx, x, out, in, ff, k, rows, stream)
+    pub f8r_moe_up_relu2: Option<F8rMoeUpRelu2Fn>,
+    /// Slot 946: `pd_f8r_moe_down` - the FP8 expert down rows weighted by
+    /// the picks' `w` and summed in pick order into `out [rows][hidden]`
+    /// (`acc` 1 adds onto it). (data, rs, idx, w, act, out, ff, hidden, k,
+    /// rows, acc, stream)
+    pub f8r_moe_down: Option<F8rMoeDownFn>,
+    /// Slot 947: `pd_mamba_conv_seq_runs` - `mamba_conv_seq`'s walk for every
+    /// run of a verify round in one launch: `runs` holds u32 triples (slot,
+    /// first row, rows); a run reads its slot's window from `win` (left
+    /// alone), writes the advanced window to `win_out` (`win_elems` a slot),
+    /// its conv rows into `out` at its first row. Bit-exact per run vs the
+    /// window copy + `mamba_conv_seq`. (win, win_out, xbc, x_off, x_stride,
+    /// w, b, out, conv_dim, k, runs, n_runs, win_elems, stream)
+    pub mamba_conv_seq_runs: Option<MambaConvSeqRunsFn>,
+    /// Slot 948: `pd_mamba2_scan_seq_keep_runs_f16` - slot 746's keep scan
+    /// for every run of a verify round in one launch (the run table as slot
+    /// 947's; `state_elems` a slot). Bit-exact per run vs slot 746.
+    /// (state, state_elems, xbc, dt_raw, dt_stride, A, D, dt_bias, y, keep,
+    /// runs, n_runs, n_heads, head_dim, d_state, n_groups, stream)
+    pub mamba2_scan_seq_keep_runs_f16: Option<Mamba2ScanSeqKeepRunsF16Fn>,
+    /// Slot 949: `pd_tr_codes` - a recording's encoder-rate speaker activity
+    /// patterns from the diarizer's `[rows * 8][8]` probabilities: row r's
+    /// bit s set when speaker s's eight-frame mean exceeds 0.5, rows from
+    /// `valid` on 0 - the host walk's sum order, so the host's bits.
+    /// (probs, codes, rows, valid, stream)
+    pub tr_codes: Option<TrCodesFn>,
+    /// Slot 950: `pd_diar_attention_varlen` - slot 723's attention over
+    /// several windows packed in one pass: `tiles` (device) holds `n_tiles`
+    /// u32 quads {first query row, queries, the window's first row, its
+    /// keys}, each inside one window, cut `warps` (2 or 4) x 16 queries
+    /// high. A row's bits are its window's alone. (q, k, v, out, tiles,
+    /// n_tiles, warps, kvh, stream)
+    pub diar_attention_varlen: Option<DiarAttentionVarlenFn>,
+    /// Slot 951: `pd_f8r_moe_up_relu2_sorted` - slot 945 over expert-sorted
+    /// blocks (`pd_moe_align_bm`, BM 8): a warp walks one output row of a
+    /// block's expert against every token of the block, `out[r k + j][o]`
+    /// as 945's bits. (data, rs, sorted_row, sorted_slot, block_expert, x,
+    /// out, in, ff, k, nb, stream)
+    pub f8r_moe_up_relu2_sorted: Option<F8rMoeUpRelu2SortedFn>,
+    /// Slot 952: `pd_f8r_moe_down_sorted` - slot 946's per-pick scaled dots
+    /// over sorted blocks into `part[r k + j][o]` (the pick weight is 953's).
+    /// (data, rs, sorted_row, sorted_slot, block_expert, act, part, ff,
+    /// hidden, k, nb, stream)
+    pub f8r_moe_down_sorted: Option<F8rMoeDownSortedFn>,
+    /// Slot 953: `pd_f8r_moe_combine` - `out[r][o] (+)= sum_j w[r][j] *
+    /// part[r k + j][o]` in pick order, one fma a pick (946's sum).
+    /// (part, w, out, hidden, k, rows, acc, stream)
+    pub f8r_moe_combine: Option<F8rMoeCombineFn>,
+    /// Slot 954: `pd_mamba2_scan_seq_runs_f16` - a prompt walk's f16 seq
+    /// scans for every run of the pass in one launch (the seq walk's body a
+    /// run, each slot's state read and written back); the runs the per-run
+    /// entry would hand the chunked SSD scan go there from `runs_host`, one
+    /// by one. `runs` (device) and `runs_host` hold the same u32 triples
+    /// (slot, first row, rows). (state, state_elems, xbc, dt_raw, dt_stride,
+    /// A, D, dt_bias, y, runs, runs_host, n_runs, n_heads, head_dim,
+    /// d_state, n_groups, stream)
+    pub mamba2_scan_seq_runs_f16: Option<Mamba2ScanSeqRunsF16Fn>,
+    /// Slot 955: `pd_mamba_conv_seq_runs_chunked` - slot 947's run walk cut
+    /// into 64-row chunks on grid.z (`max_rows` = the longest run sizes the
+    /// grid), bit-exact with the serial walk; chunk 0 writes the advanced
+    /// window, so `win == win_out` (a prompt walk, in place) is allowed.
+    /// (win, win_out, xbc, x_off, x_stride, w, b, out, conv_dim, k, runs,
+    /// n_runs, max_rows, win_elems, stream)
+    pub mamba_conv_seq_runs_chunked: Option<MambaConvSeqRunsChunkedFn>,
+    /// Slots 956-957: `pd_nvf4_moe_down_st_bf16` / `pd_nvf4_moe_down_stw_bf16`,
+    /// the skinny (bm 8) and wide (bm 32) tiled down twins where token rows
+    /// from `vf` on round their partials to bf16 at the store, into a bf16
+    /// plane laid from the f32 plane's row `vf` on (folded by
+    /// `moe_slot_combine_bf16`); the rows before `vf` keep f32. The f32
+    /// twins' arguments plus `vf` after `nb`.
+    pub nvf4_moe_down_st_bf16: Option<Nvf4MoeDownSplitFn>,
+    pub nvf4_moe_down_stw_bf16: Option<Nvf4MoeDownSplitFn>,
+    /// Slots 958-960: Transcribe's CTC timestamp head pieces (asr/
+    /// transcribe.cuh). `tr_ctc_qk_norm_rope(qkv, qn_w, qn_b, kn_w, kn_b,
+    /// rope, rows, heads, hd, rot, eps, stream)`: per-head LayerNorm on q and
+    /// k of fused [q|k|v] f32 rows and NeoX rope on each head's first `rot`
+    /// dims from a [rows][rot/2][2] (cos, sin) table. `tr_ctc_attention(qkv,
+    /// out, rows, heads, hd 80, stream)`: unmasked f32 attention over the
+    /// rows. `tr_ctc_lse_gather(logits, bias, rows, classes, cols, n_cols,
+    /// out, stream)`: each row's log-softmax (with bias) at `cols` only.
+    pub tr_ctc_qk_norm_rope: Option<TrCtcQkNormRopeFn>,
+    pub tr_ctc_attention: Option<TrCtcAttentionFn>,
+    pub tr_ctc_lse_gather: Option<TrCtcLseGatherFn>,
+    /// Slots 961-963: Transcribe's speech encoder in the checkpoint's W8A8
+    /// class (ModelOpt FP8, static per-tensor scales). `tr_w8a8_gemm(w, x,
+    /// y, bias, sw, sx, inv_next, in, out, batch, epi, stream)`: e4m3 `w`
+    /// `[out][in]` times e4m3 `x` `[batch][in]` into f32, landed as
+    /// `sx * (sw * acc)` - epi 0 f16 `[batch][out]`, 1 `y += v + bias` on an
+    /// f32 residual, 2 `e4m3(gelu(v + bias) * inv_next)`. `tr_ln_e4m3(x, w,
+    /// b, out, rows, n, eps, inv, stream)`: a row LayerNorm landed as e4m3 at
+    /// `inv` = 1 / scale. `tr_quant_e4m3_h(in, out, n, inv, stream)`: an f16
+    /// plane to e4m3 (`n` a multiple of 8).
+    pub tr_w8a8_gemm: Option<TrW8a8GemmFn>,
+    pub tr_ln_e4m3: Option<TrLnE4m3Fn>,
+    pub tr_quant_e4m3_h: Option<TrQuantE4m3HFn>,
+    /// Slot 964: `pd_diar_gemm_p` - slot 722's GEMM with the activation's
+    /// class as an argument: `parts` bf16 parts (3 slot 722's F32 class, 2
+    /// to 16 significant bits, 1 the activation rounded once to bf16 - the
+    /// BF16 class), `(x, w, scale, bias, y, y2, rope, K, N, M, wtype, mode,
+    /// parts, stream)`.
+    pub diar_gemm_p: Option<DiarGemmPFn>,
+    /// Slots 965-967: the diarization encoder in the BF16 class (both GEMM
+    /// operands bf16, landed so by their producers). `diar_b16_gemm(x16, w,
+    /// bias, y, y2, rope, K, F, rows, epi, stream)`: epi 0 store f32, 1 GELU
+    /// landed bf16, 2 accumulate into y, 3 the qkv projection's rope (F 1536,
+    /// q into y2). `diar_norm_b16(x, w, b, y16, 512, rows, stream)`: slot
+    /// 719's LayerNorm landed bf16. `diar_attention_b16(q, k, v, out16, rows,
+    /// klen, kvh, tiles, n_tiles, warps, stream)`: slot 723 (tiles null) or
+    /// 950's packed pass landed bf16.
+    pub diar_b16_gemm: Option<DiarB16GemmFn>,
+    pub diar_norm_b16: Option<DiarNormB16Fn>,
+    pub diar_attention_b16: Option<DiarAttentionB16Fn>,
 }
+
+/// See [`KernelTableV1::tr_ctc_qk_norm_rope`] (slot 958).
+pub type TrCtcQkNormRopeFn = unsafe extern "C" fn(
+    qkv: *mut core::ffi::c_void,
+    qn_w: *const core::ffi::c_void,
+    qn_b: *const core::ffi::c_void,
+    kn_w: *const core::ffi::c_void,
+    kn_b: *const core::ffi::c_void,
+    rope: *const core::ffi::c_void,
+    rows: u32,
+    heads: u32,
+    hd: u32,
+    rot: u32,
+    eps: f32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::tr_ctc_attention`] (slot 959).
+pub type TrCtcAttentionFn = unsafe extern "C" fn(
+    qkv: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    rows: u32,
+    heads: u32,
+    hd: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::tr_ctc_lse_gather`] (slot 960).
+pub type TrCtcLseGatherFn = unsafe extern "C" fn(
+    logits: *const core::ffi::c_void,
+    bias: *const core::ffi::c_void,
+    rows: u32,
+    classes: u32,
+    cols: *const core::ffi::c_void,
+    n_cols: u32,
+    out: *mut core::ffi::c_void,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::tr_w8a8_gemm`] (slot 961).
+pub type TrW8a8GemmFn = unsafe extern "C" fn(
+    w: *const core::ffi::c_void,
+    x: *const core::ffi::c_void,
+    y: *mut core::ffi::c_void,
+    bias: *const core::ffi::c_void,
+    sw: f32,
+    sx: f32,
+    inv_next: f32,
+    in_dim: u32,
+    out_dim: u32,
+    batch: u32,
+    epi: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::tr_ln_e4m3`] (slot 962).
+pub type TrLnE4m3Fn = unsafe extern "C" fn(
+    x: *const core::ffi::c_void,
+    w: *const core::ffi::c_void,
+    b: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    rows: u32,
+    n: u32,
+    eps: f32,
+    inv: f32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::tr_quant_e4m3_h`] (slot 963).
+pub type TrQuantE4m3HFn = unsafe extern "C" fn(
+    input: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    n: u64,
+    inv: f32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::diar_b16_gemm`] (slot 965).
+pub type DiarB16GemmFn = unsafe extern "C" fn(
+    x16: *const core::ffi::c_void,
+    w: *const core::ffi::c_void,
+    bias: *const core::ffi::c_void,
+    y: *mut core::ffi::c_void,
+    y2: *mut core::ffi::c_void,
+    rope: *const core::ffi::c_void,
+    k: u32,
+    f: u32,
+    rows: u32,
+    epi: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::diar_norm_b16`] (slot 966).
+pub type DiarNormB16Fn = unsafe extern "C" fn(
+    x: *const core::ffi::c_void,
+    w: *const core::ffi::c_void,
+    b: *const core::ffi::c_void,
+    y16: *mut core::ffi::c_void,
+    d: u32,
+    rows: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::diar_attention_b16`] (slot 967).
+pub type DiarAttentionB16Fn = unsafe extern "C" fn(
+    q: *const core::ffi::c_void,
+    k: *const core::ffi::c_void,
+    v: *const core::ffi::c_void,
+    out16: *mut core::ffi::c_void,
+    rows: u32,
+    klen: u32,
+    kvh: u32,
+    tiles: *const core::ffi::c_void,
+    n_tiles: u32,
+    warps: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::diar_gemm_p`] (slot 964).
+pub type DiarGemmPFn = unsafe extern "C" fn(
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *const core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *mut core::ffi::c_void,
+    *const core::ffi::c_void,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::nvf4_moe_down_st_bf16`] (slots 956-957).
+pub type Nvf4MoeDownSplitFn = unsafe extern "C" fn(
+    data: *const core::ffi::c_void,
+    scale: *const core::ffi::c_void,
+    scale2: *const core::ffi::c_void,
+    sorted_row: *const core::ffi::c_void,
+    sorted_slot: *const core::ffi::c_void,
+    block_expert: *const core::ffi::c_void,
+    topk_w: *const core::ffi::c_void,
+    fq: *const core::ffi::c_void,
+    fs: *const core::ffi::c_void,
+    part: *mut core::ffi::c_void,
+    ff: u32,
+    embd: u32,
+    kw: u32,
+    np: u32,
+    slot_off: u32,
+    nb: u32,
+    vf: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::mamba_conv_seq_runs_chunked`] (slot 955).
+pub type MambaConvSeqRunsChunkedFn = unsafe extern "C" fn(
+    win: *const core::ffi::c_void,
+    win_out: *mut core::ffi::c_void,
+    xbc: *const core::ffi::c_void,
+    x_off: u32,
+    x_stride: u32,
+    w: *const core::ffi::c_void,
+    b: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    conv_dim: u32,
+    k: u32,
+    runs: *const core::ffi::c_void,
+    n_runs: u32,
+    max_rows: u32,
+    win_elems: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::mamba2_scan_seq_runs_f16`] (slot 954).
+pub type Mamba2ScanSeqRunsF16Fn = unsafe extern "C" fn(
+    state: *mut core::ffi::c_void,
+    state_elems: u32,
+    xbc: *const core::ffi::c_void,
+    dt_raw: *const core::ffi::c_void,
+    dt_stride: u32,
+    a: *const core::ffi::c_void,
+    d: *const core::ffi::c_void,
+    dt_bias: *const core::ffi::c_void,
+    y: *mut core::ffi::c_void,
+    runs: *const core::ffi::c_void,
+    runs_host: *const core::ffi::c_void,
+    n_runs: u32,
+    n_heads: u32,
+    head_dim: u32,
+    d_state: u32,
+    n_groups: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::f8r_moe_up_relu2_sorted`] (slot 951).
+pub type F8rMoeUpRelu2SortedFn = unsafe extern "C" fn(
+    data: *const core::ffi::c_void,
+    rs: *const core::ffi::c_void,
+    sorted_row: *const core::ffi::c_void,
+    sorted_slot: *const core::ffi::c_void,
+    block_expert: *const core::ffi::c_void,
+    x: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    in_dim: u32,
+    ff: u32,
+    k: u32,
+    nb: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::f8r_moe_down_sorted`] (slot 952).
+pub type F8rMoeDownSortedFn = unsafe extern "C" fn(
+    data: *const core::ffi::c_void,
+    rs: *const core::ffi::c_void,
+    sorted_row: *const core::ffi::c_void,
+    sorted_slot: *const core::ffi::c_void,
+    block_expert: *const core::ffi::c_void,
+    act: *const core::ffi::c_void,
+    part: *mut core::ffi::c_void,
+    ff: u32,
+    hidden: u32,
+    k: u32,
+    nb: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::f8r_moe_combine`] (slot 953).
+pub type F8rMoeCombineFn = unsafe extern "C" fn(
+    part: *const core::ffi::c_void,
+    w: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    hidden: u32,
+    k: u32,
+    rows: u32,
+    acc: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::diar_attention_varlen`] (slot 950).
+pub type DiarAttentionVarlenFn = unsafe extern "C" fn(
+    q: *const core::ffi::c_void,
+    k: *const core::ffi::c_void,
+    v: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    tiles: *const core::ffi::c_void,
+    n_tiles: u32,
+    warps: u32,
+    kvh: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::tr_codes`] (slot 949).
+pub type TrCodesFn = unsafe extern "C" fn(
+    probs: *const core::ffi::c_void,
+    codes: *mut core::ffi::c_void,
+    rows: u32,
+    valid: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::mamba_conv_seq_runs`] (slot 947).
+pub type MambaConvSeqRunsFn = unsafe extern "C" fn(
+    win: *const core::ffi::c_void,
+    win_out: *mut core::ffi::c_void,
+    xbc: *const core::ffi::c_void,
+    x_off: u32,
+    x_stride: u32,
+    w: *const core::ffi::c_void,
+    b: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    conv_dim: u32,
+    k: u32,
+    runs: *const core::ffi::c_void,
+    n_runs: u32,
+    win_elems: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::mamba2_scan_seq_keep_runs_f16`] (slot 948).
+pub type Mamba2ScanSeqKeepRunsF16Fn = unsafe extern "C" fn(
+    state: *const core::ffi::c_void,
+    state_elems: u32,
+    xbc: *const core::ffi::c_void,
+    dt_raw: *const core::ffi::c_void,
+    dt_stride: u32,
+    a: *const core::ffi::c_void,
+    d: *const core::ffi::c_void,
+    dt_bias: *const core::ffi::c_void,
+    y: *mut core::ffi::c_void,
+    keep: *mut core::ffi::c_void,
+    runs: *const core::ffi::c_void,
+    n_runs: u32,
+    n_heads: u32,
+    head_dim: u32,
+    d_state: u32,
+    n_groups: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::f8r_moe_up_relu2`] (slot 945).
+pub type F8rMoeUpRelu2Fn = unsafe extern "C" fn(
+    data: *const core::ffi::c_void,
+    rs: *const core::ffi::c_void,
+    idx: *const core::ffi::c_void,
+    x: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    in_dim: u32,
+    ff: u32,
+    k: u32,
+    rows: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::f8r_moe_down`] (slot 946).
+pub type F8rMoeDownFn = unsafe extern "C" fn(
+    data: *const core::ffi::c_void,
+    rs: *const core::ffi::c_void,
+    idx: *const core::ffi::c_void,
+    w: *const core::ffi::c_void,
+    act: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    ff: u32,
+    hidden: u32,
+    k: u32,
+    rows: u32,
+    acc: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::tr_mel_norm`] (slot 942).
+pub type TrMelNormFn = unsafe extern "C" fn(
+    mel: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    valid: u32,
+    frames: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::tr_qk_norm_rope`] (slot 943).
+pub type TrQkNormRopeFn = unsafe extern "C" fn(
+    qkv: *mut core::ffi::c_void,
+    wq: *const core::ffi::c_void,
+    bq: *const core::ffi::c_void,
+    wk: *const core::ffi::c_void,
+    bk: *const core::ffi::c_void,
+    pos: *const core::ffi::c_void,
+    rope: *const core::ffi::c_void,
+    rows: u32,
+    heads: u32,
+    head_dim: u32,
+    eps: f32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::tr_fuse`] (slot 944).
+pub type TrFuseFn = unsafe extern "C" fn(
+    x: *const core::ffi::c_void,
+    w: *const core::ffi::c_void,
+    b: *const core::ffi::c_void,
+    codes: *const core::ffi::c_void,
+    table: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    rows: u32,
+    n: u32,
+    eps: f32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
 
 /// See [`KernelTableV1::dash_rope2d`] (slot 935).
 pub type DashRope2dFn = unsafe extern "C" fn(
@@ -12298,7 +12802,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 927;
+pub const KERNEL_TABLE_SLOTS: usize = 953;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,

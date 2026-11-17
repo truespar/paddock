@@ -45,7 +45,7 @@ mod spec_budget;
 use spec_budget::{
     async_spec_on, backend_spec_k_budget, serve_spec_k_budget, serve_spec_k_floor,
     serve_spec_max_k, serve_spec_max_rows, serve_spec_mixed_k_cap, serve_spec_policy, slot_spec_k,
-    spec_book_mixed,
+    spec_book_mixed, spec_live_slots,
 };
 mod idle;
 mod tick_rows;
@@ -201,6 +201,12 @@ pub enum MmChunk {
     VisionPixels {
         min_pixels: Option<u64>,
         max_pixels: Option<u64>,
+    },
+    /// Keep the recording for word timestamps (vLLM's `capture_ctc_timestamps`):
+    /// the server aligns the transcript via `Engine::media_aligner` under `id`.
+    /// No rows of its own; families without a timestamp head refuse it.
+    CtcTimestamps {
+        id: u64,
     },
 }
 
@@ -556,6 +562,8 @@ pub struct Engine {
     /// image prompts (the serial loop's whole-prompt pass, or the batched
     /// loop's slot path).
     canvas_images: bool,
+    /// The word-timestamp pass of a backend that has one (`media_aligner`).
+    aligner: Option<Arc<dyn crate::generator::MediaAligner>>,
 }
 
 /// The step cap of a multi-step structured read - the reference example
@@ -569,6 +577,7 @@ struct Ready {
     canvas_width: usize,
     canvas_read_steps: u32,
     canvas_images: bool,
+    aligner: Option<Arc<dyn crate::generator::MediaAligner>>,
 }
 
 impl Engine {
@@ -944,6 +953,7 @@ impl Engine {
                 let batched_canvas = batched && diffusion;
                 let _ = ready_tx.send(Ok(Ready {
                     vision_budget: generator.vision_budget(),
+                    aligner: generator.media_aligner(),
                     canvas_width,
                     canvas_read_steps: if canvas_width == 0 {
                         0
@@ -1011,6 +1021,7 @@ impl Engine {
                 canvas_width: ready.canvas_width,
                 canvas_read_steps: ready.canvas_read_steps,
                 canvas_images: ready.canvas_images,
+                aligner: ready.aligner,
             }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err("engine thread died during startup".into()),
@@ -1053,6 +1064,11 @@ impl Engine {
         self.canvas_images
     }
 
+    /// Word timestamps for requests that sent `MmChunk::CtcTimestamps`.
+    pub fn media_aligner(&self) -> Option<Arc<dyn crate::generator::MediaAligner>> {
+        self.aligner.clone()
+    }
+
     pub fn submit(&self, mut req: GenRequest) -> Result<(), String> {
         req.submitted.get_or_insert_with(std::time::Instant::now);
         dump::tap(&mut req);
@@ -1074,22 +1090,6 @@ impl Drop for IdleOnDrop<'_> {
         self.0.active_slots.store(0, Relaxed);
         self.0.phase.store(PHASE_IDLE, Relaxed);
     }
-}
-
-/// Encoder-owned and queued slots have no valid decoder cursor yet.
-fn spec_live_slots(
-    slots: &[Option<Slot>],
-    chunking: &std::collections::HashSet<usize>,
-) -> Vec<usize> {
-    slots
-        .iter()
-        .enumerate()
-        .filter_map(|(k, s)| {
-            s.as_ref()
-                .filter(|s| s.prefilled && !chunking.contains(&k))
-                .map(|_| k)
-        })
-        .collect()
 }
 
 /// Per-slot spec warmth for one round, in the order the round will see the

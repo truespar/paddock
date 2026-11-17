@@ -463,6 +463,256 @@ impl GpuExecutor {
         })
     }
 
+    /// Slots 947-948: a verify round's runs advance in one conv launch and
+    /// one keep-scan launch per mamba layer instead of three launches a run.
+    pub fn has_mamba_verify_runs(&self) -> bool {
+        self.kernels.mamba_conv_seq_runs.is_some()
+            && self.kernels.mamba2_scan_seq_keep_runs_f16.is_some()
+    }
+
+    /// Slot 947: [`Self::mamba_conv_seq_at`] for every run of `runs` (u32
+    /// triples: slot, first row, rows; `n_runs` of them) in one launch. Each
+    /// run reads its slot's window from `win` and writes the advanced one to
+    /// `win_out` (`win_elems` a slot); `x_off` is the conv span's column in a
+    /// fused `x_stride` row, out rows are `conv_dim` wide from the run's
+    /// first row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mamba_conv_seq_runs(
+        &self,
+        win: &CudaSlice<f32>,
+        win_out: &mut CudaSlice<f32>,
+        xbc: &CudaSlice<f32>,
+        x_off: usize,
+        x_stride: usize,
+        w: &CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        conv_dim: usize,
+        k: usize,
+        runs: &CudaSlice<u32>,
+        n_runs: usize,
+        win_elems: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .mamba_conv_seq_runs
+            .ok_or(GpuError::MissingOp("mamba_conv_seq_runs"))?;
+        debug_assert!(runs.len() >= 3 * n_runs);
+        debug_assert_eq!(win.len(), win_out.len());
+        let (wp, _g1) = win.device_ptr(&self.stream);
+        let (op, _g2) = win_out.device_ptr_mut(&self.stream);
+        let (xp, _g3) = xbc.device_ptr(&self.stream);
+        let (cp, _g4) = w.device_ptr(&self.stream);
+        let (bp, _g5) = b.device_ptr(&self.stream);
+        let (yp, _g6) = out.device_ptr_mut(&self.stream);
+        let (rp, _g7) = runs.device_ptr(&self.stream);
+        // SAFETY: ABI contract; the run table indexes rows the walk sized
+        check(unsafe {
+            f(
+                wp as *const _,
+                op as *mut _,
+                xp as *const _,
+                x_off as u32,
+                x_stride as u32,
+                cp as *const _,
+                bp as *const _,
+                yp as *mut _,
+                conv_dim as u32,
+                k as u32,
+                rp as *const _,
+                n_runs as u32,
+                win_elems as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// Slot 955 in place: a prompt walk's conv advance for every run of
+    /// `runs` (each slot's live window read and advanced, a slot in one run),
+    /// chunked along the rows; `max_rows` = the longest run.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mamba_conv_seq_runs_inplace(
+        &self,
+        win: &mut CudaSlice<f32>,
+        xbc: &CudaSlice<f32>,
+        x_off: usize,
+        x_stride: usize,
+        w: &CudaSlice<f32>,
+        b: &CudaSlice<f32>,
+        out: &mut CudaSlice<f32>,
+        conv_dim: usize,
+        k: usize,
+        runs: &CudaSlice<u32>,
+        n_runs: usize,
+        max_rows: usize,
+        win_elems: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .mamba_conv_seq_runs_chunked
+            .ok_or(GpuError::MissingOp("mamba_conv_seq_runs_chunked"))?;
+        debug_assert!(runs.len() >= 3 * n_runs);
+        let (wp, _g1) = win.device_ptr_mut(&self.stream);
+        let (xp, _g2) = xbc.device_ptr(&self.stream);
+        let (cp, _g3) = w.device_ptr(&self.stream);
+        let (bp, _g4) = b.device_ptr(&self.stream);
+        let (yp, _g5) = out.device_ptr_mut(&self.stream);
+        let (rp, _g6) = runs.device_ptr(&self.stream);
+        // SAFETY: ABI contract; in place is the slot's contract (chunk 0
+        // alone reads and writes a run's window), each run's slot distinct
+        check(unsafe {
+            f(
+                wp as *const _,
+                wp as *mut _,
+                xp as *const _,
+                x_off as u32,
+                x_stride as u32,
+                cp as *const _,
+                bp as *const _,
+                yp as *mut _,
+                conv_dim as u32,
+                k as u32,
+                rp as *const _,
+                n_runs as u32,
+                max_rows as u32,
+                win_elems as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// Slots 954-955: a prompt walk's runs advance in one conv launch and
+    /// one scan launch a mamba layer (the SSD-elected runs still take their
+    /// own scan inside 954's launcher).
+    pub fn has_mamba_prompt_runs(&self) -> bool {
+        self.kernels.mamba2_scan_seq_runs_f16.is_some()
+            && self.kernels.mamba_conv_seq_runs_chunked.is_some()
+    }
+
+    /// Slot 954: the f16 seq scans over the run table (device `runs`, the
+    /// same triples in `host`); xbc / y rows start at row 0 of their planes,
+    /// dt at `dt_off`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mamba2_scan_seq_runs_f16(
+        &self,
+        state: &mut CudaSlice<f16>,
+        state_elems: usize,
+        xbc: &CudaSlice<f32>,
+        dt: &CudaSlice<f32>,
+        dt_off: usize,
+        dt_stride: usize,
+        a: &CudaSlice<f32>,
+        d: &CudaSlice<f32>,
+        dt_bias: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        runs: &CudaSlice<u32>,
+        host: &[u32],
+        n_heads: usize,
+        head_dim: usize,
+        d_state: usize,
+        n_groups: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .mamba2_scan_seq_runs_f16
+            .ok_or(GpuError::MissingOp("mamba2_scan_seq_runs_f16"))?;
+        let n_runs = host.len() / 3;
+        debug_assert!(runs.len() >= host.len());
+        let (sp, _g1) = state.device_ptr_mut(&self.stream);
+        let (xp, _g2) = xbc.device_ptr(&self.stream);
+        let (tp, _g3) = dt.device_ptr(&self.stream);
+        let (ap, _g4) = a.device_ptr(&self.stream);
+        let (dp, _g5) = d.device_ptr(&self.stream);
+        let (bp, _g6) = dt_bias.device_ptr(&self.stream);
+        let (yp, _g7) = y.device_ptr_mut(&self.stream);
+        let (rp, _g8) = runs.device_ptr(&self.stream);
+        // SAFETY: ABI contract; the host table is read during the call only
+        check(unsafe {
+            f(
+                sp as *mut _,
+                state_elems as u32,
+                xp as *const _,
+                (tp + (dt_off * 4) as u64) as *const _,
+                dt_stride as u32,
+                ap as *const _,
+                dp as *const _,
+                bp as *const _,
+                yp as *mut _,
+                rp as *const _,
+                host.as_ptr() as *const _,
+                n_runs as u32,
+                n_heads as u32,
+                head_dim as u32,
+                d_state as u32,
+                n_groups as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// Slot 948: [`Self::mamba2_scan_seq_keep_at_f16`] for every run of
+    /// `runs` (slot 947's table) in one launch; a run's state is its slot's
+    /// (`state_elems` a slot), its rows of xbc / dt / y / keep start at its
+    /// first row. `dt_off` is dt's column inside a `dt_stride` row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mamba2_scan_seq_keep_runs_f16(
+        &self,
+        state: &CudaSlice<f16>,
+        state_elems: usize,
+        xbc: &CudaSlice<f32>,
+        dt: &CudaSlice<f32>,
+        dt_off: usize,
+        dt_stride: usize,
+        a: &CudaSlice<f32>,
+        d: &CudaSlice<f32>,
+        dt_bias: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        keep: &mut CudaSlice<f32>,
+        runs: &CudaSlice<u32>,
+        n_runs: usize,
+        n_heads: usize,
+        head_dim: usize,
+        d_state: usize,
+        n_groups: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .mamba2_scan_seq_keep_runs_f16
+            .ok_or(GpuError::MissingOp("mamba2_scan_seq_keep_runs_f16"))?;
+        debug_assert!(runs.len() >= 3 * n_runs);
+        let (sp, _g1) = state.device_ptr(&self.stream);
+        let (xp, _g2) = xbc.device_ptr(&self.stream);
+        let (tp, _g3) = dt.device_ptr(&self.stream);
+        let (ap, _g4) = a.device_ptr(&self.stream);
+        let (dp, _g5) = d.device_ptr(&self.stream);
+        let (bp, _g6) = dt_bias.device_ptr(&self.stream);
+        let (yp, _g7) = y.device_ptr_mut(&self.stream);
+        let (kp, _g8) = keep.device_ptr_mut(&self.stream);
+        let (rp, _g9) = runs.device_ptr(&self.stream);
+        // SAFETY: ABI contract; dt's offset is an f32 element count
+        check(unsafe {
+            f(
+                sp as *const _,
+                state_elems as u32,
+                xp as *const _,
+                (tp + (dt_off * 4) as u64) as *const _,
+                dt_stride as u32,
+                ap as *const _,
+                dp as *const _,
+                bp as *const _,
+                yp as *mut _,
+                kp as *mut _,
+                rp as *const _,
+                n_runs as u32,
+                n_heads as u32,
+                head_dim as u32,
+                d_state as u32,
+                n_groups as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// Slot 747: upload `descs` (six words a replay: src f16 state, dst f16
     /// state, keep rows, A, dt_bias, rows - device addresses) into `scratch`
     /// and replay them all in one launch. Stream-ordered, so `scratch` may be

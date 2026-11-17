@@ -302,4 +302,10 @@ pub struct ChatCompletionResponse {
     /// every other model - hence skipped, never null.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ocr: Option<serde_json::Value>,
+    /// Nemotron 3.5 Transcribe's word timestamps and speaker labels, when
+    /// the request opted in (`mm_processor_kwargs.capture_ctc_timestamps`,
+    /// vLLM + NeMo's contract): `words`, `diarization`,
+    /// `speaker_tag_to_diarization_speaker`, `error`. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ctc_timestamps: Option<serde_json::Value>,
 }

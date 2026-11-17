@@ -267,6 +267,9 @@ impl GpuGranite {
             MmChunk::OcrCrop(_) => Err(GpuError::Driver(
                 "OCR crop directive on granite - routing bug".into(),
             )),
+            MmChunk::CtcTimestamps { .. } => Err(GpuError::Driver(
+                "CTC timestamp directive on granite - routing bug".into(),
+            )),
             MmChunk::VisionPixels { .. } => Err(GpuError::Driver(
                 "pixel-budget directive on granite - routing bug".into(),
             )),
@@ -321,7 +324,10 @@ impl GpuGranite {
                         format!("{:.2}s clip", samples.len() as f64 / 16000.0),
                     )
                 }
-                MmChunk::Text(_) | MmChunk::OcrCrop(_) | MmChunk::VisionPixels { .. } => {
+                MmChunk::Text(_)
+                | MmChunk::OcrCrop(_)
+                | MmChunk::VisionPixels { .. }
+                | MmChunk::CtcTimestamps { .. } => {
                     unreachable!("placement indexes a media chunk")
                 }
             };
@@ -399,7 +405,10 @@ mod tests {
                 crate::audio::granite::audio_tokens_for_samples(samples.len()),
                 crate::gpu_model::granite::deepstack::audio_key(samples),
             )),
-            MmChunk::Text(_) | MmChunk::OcrCrop(_) | MmChunk::VisionPixels { .. } => {
+            MmChunk::Text(_)
+            | MmChunk::OcrCrop(_)
+            | MmChunk::VisionPixels { .. }
+            | MmChunk::CtcTimestamps { .. } => {
                 unreachable!()
             }
         })

@@ -127,8 +127,10 @@ export interface MicWord {
   word: string
   start: number
   end: number
-  /** `exp(logprob)` - what the confidence colouring reads */
-  confidence: number
+  /** `exp(logprob)` - what the confidence colouring reads. Absent on a word
+   *  the lane timed but could not score (Transcribe's alignment times every
+   *  word; a word the decode spelled differently carries no figure). */
+  confidence?: number
 }
 
 /** Why a span of this utterance produced nothing trustworthy - the runner's
@@ -450,7 +452,7 @@ export function useMicTranscribe() {
   function finalise(l: MicLane, msg: Record<string, unknown>): void {
     const v = msg.paddock_verbose as Record<string, unknown> | undefined
     const words = v?.words as
-      | { word: string; start: number; end: number; paddock_confidence: number }[]
+      | { word: string; start: number; end: number; paddock_confidence?: number }[]
       | undefined
     const guards = v?.paddock_guards as
       | { reason: string; note: string; text_dropped?: boolean }[]

@@ -34,6 +34,16 @@ fn arch_has_infile_heads(arch: &str) -> bool {
     )
 }
 
+/// Nemotron 3.5 Transcribe's tag tokens - `<spk:N>` speaker turns, `<ev:*>`
+/// events, `<sty:*>` styles - read off the vocabulary (they sit among the
+/// low added ids).
+pub(crate) fn transcribe_tags(tok: &paddock_tokenizer::GgufTokenizer) -> Vec<String> {
+    (0..1024u32)
+        .filter_map(|id| tok.id_to_token(id))
+        .filter(|t| ["<spk:", "<ev:", "<sty:"].iter().any(|p| t.starts_with(p)) && t.ends_with('>'))
+        .collect()
+}
+
 pub struct ServingModel {
     pub id: String,
     /// speculation mechanisms this load wired (see [`SpecReport`])
@@ -103,6 +113,12 @@ pub struct ServingModel {
     /// both variants), so the OpenAI wire's parts list has to be flattened
     /// before rendering. See `chat_template::inline_audio_content`.
     pub audio_inline_marker: Option<String>,
+    /// Special tokens that are CONTENT markup a request writes on purpose,
+    /// not control tokens: Nemotron 3.5 Transcribe's speaker, event and style
+    /// tags. The card's speaker-attribution instruction names `<spk:0>` ...
+    /// `<spk:3>` in the user text and the reference tokenizes them as the
+    /// tag tokens, so the content shield lets them through.
+    pub content_tags: Vec<String>,
     /// This checkpoint can be INSTRUCTED to emit word end times in its
     /// transcript (granite-speech-plus).
     ///
@@ -148,138 +164,7 @@ pub struct ServingModel {
     vocab_cache: std::sync::OnceLock<Arc<crate::constrained::VocabBytes>>,
 }
 
-/// Which host mel contract a served audio model consumes.
-///
-/// The frontend runs on the runner's blocking pool rather than engine-side
-/// so the runner has to know which one - and they agree on
-/// nothing: 400-point transform / 128 Slaney mels / 100 frames per second
-/// for Qwen3-ASR, 512-point / 80 HTK mels / pair-stacked 50 frames per
-/// second for granite-speech. Feeding one to the other's tower is caught by
-/// a width check rather than transcribed as noise, but the point of naming
-/// the choice here is that it never gets that far.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum AudioFrontend {
-    /// this model takes no audio
-    #[default]
-    None,
-    /// transformers `Qwen3ASRFeatureExtractor` (whisper-derived)
-    Qwen3Asr,
-    /// Same author frontend, bounded by the native Metal tower's admission.
-    Qwen3AsrMetal,
-    /// transformers `GraniteSpeechFeatureExtractor` (torchaudio-derived)
-    GraniteSpeech,
-    /// Same extractor, bounded by the experimental native Metal tower.
-    GraniteSpeechMetal,
-    /// Gemma 4 12B's `Gemma4UnifiedAudioFeatureExtractor`: no spectrogram at
-    /// all - the engine takes the raw clip in 640-sample (40 ms) frames, one
-    /// prompt row each.
-    Gemma4Raw,
-}
-
-impl AudioFrontend {
-    /// The clip's features as `MmChunk::Audio` carries them: the mel for the
-    /// spectrogram families, None for the raw-frame one (whose engine reads
-    /// the samples themselves).
-    pub fn mel(
-        self,
-        samples: &[f32],
-    ) -> Result<Option<paddock_engine::audio::MelFeatures>, String> {
-        match self {
-            AudioFrontend::Gemma4Raw => {
-                if samples.is_empty() {
-                    Err("audio clip holds no samples".into())
-                } else {
-                    Ok(None)
-                }
-            }
-            _ => self.features(samples).map(Some),
-        }
-    }
-
-    /// Run this frontend over a 16 kHz mono clip.
-    pub fn features(self, samples: &[f32]) -> Result<paddock_engine::audio::MelFeatures, String> {
-        match self {
-            AudioFrontend::Qwen3AsrMetal if samples.len() > 120 * 16000 => {
-                Err("Qwen3-ASR Metal clip exceeds the 120-second implementation limit".into())
-            }
-            AudioFrontend::Qwen3Asr | AudioFrontend::Qwen3AsrMetal => {
-                paddock_engine::audio::qwen3_asr_features(samples)
-            }
-            AudioFrontend::GraniteSpeechMetal if samples.len() > 120 * 16000 => {
-                Err("Granite Speech Metal clip exceeds the 120-second implementation limit".into())
-            }
-            AudioFrontend::GraniteSpeech | AudioFrontend::GraniteSpeechMetal => {
-                paddock_engine::audio::granite::speech_features(samples)
-            }
-            AudioFrontend::Gemma4Raw => {
-                Err("Gemma 4 12B takes raw audio frames, not a spectrogram".into())
-            }
-            AudioFrontend::None => Err("this model does not take audio input".into()),
-        }
-    }
-
-    /// Prompt rows a clip of `len` samples will occupy - the same rule the
-    /// engine's admission uses, so the context check the handler runs against
-    /// it is the one that will actually bind.
-    pub fn prompt_rows(self, len: usize) -> usize {
-        match self {
-            AudioFrontend::Qwen3Asr | AudioFrontend::Qwen3AsrMetal => {
-                paddock_engine::audio::audio_tokens_for_samples(len)
-            }
-            AudioFrontend::GraniteSpeech | AudioFrontend::GraniteSpeechMetal => {
-                paddock_engine::audio::granite::audio_tokens_for_samples(len)
-            }
-            AudioFrontend::Gemma4Raw => len.div_ceil(640),
-            AudioFrontend::None => 0,
-        }
-    }
-
-    /// The longest clip, in seconds, whose audio rows still fit in `rows` -
-    /// `prompt_rows` run backwards.
-    ///
-    /// A generative ASR lane spends the whole clip as prompt rows, so its
-    /// ceiling is the context window and it is far lower than people expect:
-    /// Qwen3-ASR bills 13 rows a second, which puts a 32k-token server at
-    /// roughly 42 minutes and an 8k one at ten. Whisper has no such ceiling -
-    /// it windows - and answers `None` from the caller.
-    ///
-    /// Found by bisection rather than algebra on PURPOSE. The forward rule is
-    /// a chunked convolution stack whose closed form differs per family and
-    /// has already changed once; bisecting the real function cannot drift from
-    /// it, and this runs once per `/server` call.
-    pub fn max_clip_s(self, rows: usize) -> Option<f64> {
-        if self == AudioFrontend::None || rows == 0 {
-            return None;
-        }
-        let rate = paddock_engine::audio::SAMPLE_RATE;
-        // 24 h is a ceiling for the search, not a promise - anything near it
-        // means the context is enormous and the answer stops being the binding
-        // constraint anyway.
-        let (mut lo, mut hi) = (
-            0usize,
-            if matches!(
-                self,
-                AudioFrontend::GraniteSpeechMetal | AudioFrontend::Qwen3AsrMetal
-            ) {
-                rate * 120
-            } else {
-                rate * 60 * 60 * 24
-            },
-        );
-        if self.prompt_rows(hi) <= rows {
-            return Some(hi as f64 / rate as f64);
-        }
-        while lo < hi {
-            let mid = lo + (hi - lo).div_ceil(2);
-            if self.prompt_rows(mid) <= rows {
-                lo = mid;
-            } else {
-                hi = mid - 1;
-            }
-        }
-        Some(lo as f64 / rate as f64)
-    }
-}
+pub use crate::audio_frontend::AudioFrontend;
 
 impl ServingModel {
     /// The vocab byte table (lazy; ~1MB, a one-time full-vocab decode).
@@ -320,6 +205,7 @@ impl ServingModel {
             .flatten()
             .filter_map(|id| self.tokenizer.id_to_token(id))
             .chain(self.audio_inline_marker.clone())
+            .chain(self.content_tags.iter().cloned())
             .collect();
         let exempt: Vec<&str> = pads.iter().map(String::as_str).collect();
         self.tokenizer.shield(&exempt)
@@ -366,11 +252,28 @@ impl ServingModel {
         self.document_parser && !self.lightonocr
     }
 
+    /// Word times from Transcribe's CTC timestamp head - the same test the
+    /// transcription handler serves `word` granularity by, so the
+    /// advertisement and the endpoint cannot disagree.
+    pub fn ctc_word_times(&self) -> bool {
+        self.audio_frontend == AudioFrontend::Transcribe && self.engine.media_aligner().is_some()
+    }
+
+    /// What `/v1/audio/transcriptions` reads its `prompt` as, where that is
+    /// pinned: Transcribe takes it as the card's context terms (names and
+    /// jargon to spell right) - its task is fixed by the endpoint, and
+    /// questions about a clip go to chat, which takes audio.
+    pub fn transcription_prompt(&self) -> Option<&'static str> {
+        (self.audio_frontend == AudioFrontend::Transcribe).then_some("context")
+    }
+
     /// The key the elected-sampling table is read with: the arch, except for
     /// a fine-tune that keeps a base graph but publishes its own sampling.
     pub fn sampling_key(&self) -> &str {
         if self.lightonocr {
             paddock_models::sampling::LIGHTONOCR3
+        } else if self.audio_frontend == AudioFrontend::Transcribe {
+            paddock_models::sampling::TRANSCRIBE
         } else {
             &self.arch
         }
@@ -2572,6 +2475,7 @@ pub(crate) fn load_with_residency(
         // Only granite-speech: Qwen3-ASR renders its clips through the audio
         // slots in its own (overridden) template, so its parts must stay parts.
         audio_inline_marker: granite_audio.then(|| "<|audio|>".to_owned()),
+        content_tags: Vec::new(),
         audio_word_times: granite_plus,
         ocr: deepseek_ocr,
         unlimited_ocr2,
@@ -2713,6 +2617,19 @@ fn load_hf_dir(
                 .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
             "nemotron".to_owned()
         }
+        // Nemotron 3.5 Transcribe: NeMo's speech LM around the same family's
+        // language model (CUDA only, the NVFP4 checkpoint)
+        "nemo_speechlm" => {
+            if device != "cuda" {
+                return Err(ServeError::Open(
+                    dir.to_path_buf(),
+                    format!("Nemotron 3.5 Transcribe serves on CUDA only (got {device:?})"),
+                ));
+            }
+            paddock_models::nemotron::NemotronConfig::read(dir)
+                .map_err(|e| ServeError::Open(dir.to_path_buf(), e.to_string()))?;
+            "nemotron".to_owned()
+        }
         // granite 4.2's NVFP4 export ships no GGUF, so this is the only way to
         // serve it. Same arch string as the GGUF lane deliberately - it is the
         // same decoder, and everything keyed on family (dialect, sampling,
@@ -2787,6 +2704,18 @@ fn load_hf_dir(
         });
     let bonsai = model_type == "prism_hadamard_qwen35";
     let nemotron_parse = arch == crate::nemotron_parse::ARCH;
+    // Nemotron 3.5 Transcribe: the speech encoder ships inside the
+    // checkpoint (CUDA only, gated above); its template renders one
+    // `<|audio|>` a recording
+    let transcribe = model_type == "nemo_speechlm";
+    let transcribe_pad = transcribe
+        .then(|| tokenizer.token_to_id("<|audio|>"))
+        .flatten();
+    if transcribe && transcribe_pad.is_none() {
+        return Err(ServeError::Tokenizer(
+            "Nemotron 3.5 Transcribe checkpoint lacks its <|audio|> placeholder".into(),
+        ));
+    }
     // Super VL's tower ships inside the checkpoint (CUDA only, gated above)
     let super_vl = model_type == "nemotron_h_omni";
     let supports_vision = nemotron_parse
@@ -2836,6 +2765,11 @@ fn load_hf_dir(
         lightonocr,
     )?;
 
+    let content_tags = if transcribe {
+        transcribe_tags(&tokenizer)
+    } else {
+        Vec::new()
+    };
     Ok(ServingModel {
         vision_off: false,
         id,
@@ -2864,11 +2798,16 @@ fn load_hf_dir(
         dialect,
         reasoning,
         supports_vision,
-        supports_audio: false,
-        audio_frontend: AudioFrontend::None,
+        supports_audio: transcribe,
+        audio_frontend: if transcribe {
+            AudioFrontend::Transcribe
+        } else {
+            AudioFrontend::None
+        },
         image_pad_id,
-        audio_pad_id: None,
+        audio_pad_id: transcribe_pad,
         audio_inline_marker: None,
+        content_tags,
         audio_word_times: false,
         ocr: false,
         unlimited_ocr2: false,

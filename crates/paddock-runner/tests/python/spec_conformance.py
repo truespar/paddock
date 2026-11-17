@@ -56,6 +56,7 @@ from openai.types.chat import completion_create_params as chat_params
 from openai.types import completion_create_params as comp_params
 from openai.types.responses import response_create_params as resp_params
 from openai.types.audio import transcription_create_params as audio_params
+from openai.types.audio import translation_create_params as translation_params
 from openai.types import image_generate_params as img_gen_params
 from openai.types import image_edit_params as img_edit_params
 from anthropic.types import message_create_params as anth_params
@@ -183,6 +184,14 @@ AUDIO_PROBE_400 = {
 # split (partial) means naming the value, not the field.
 AUDIO_PROBE_NAMES = {"include": "logprobs", "languages": "xx"}
 AUDIO_PROBE_200 = {"model": [("model", "whisper-1")]}
+# /v1/audio/translations: `prompt` is refused outright (the instruction is the
+# card's translation request) and srt/vtt are the half of response_format no
+# lane serves
+TRANSLATION_PROBE_400 = {
+    "prompt": [("prompt", "Use British spelling.")],
+    "response_format": [("response_format", "srt")],
+}
+TRANSLATION_PROBE_200 = {"model": [("model", "whisper-1")]}
 # `timestamp_granularities` needs neither probe now that both of its values are
 # served (landed `word`): it is `implemented`, and what an implemented
 # param is worth is checked by the functional half posting it for real -
@@ -510,10 +519,13 @@ def sdk_params(family):
         "responses": resp_params.ResponseCreateParamsBase,
         "anthropic_messages": anth_params.MessageCreateParamsBase,
         "audio_transcriptions": audio_params.TranscriptionCreateParamsBase,
+        # one TypedDict, no streaming variant - `stream` is vLLM's extension
+        "audio_translations": translation_params.TranslationCreateParams,
         "images_generations": img_gen_params.ImageGenerateParamsBase,
         "images_edits": img_edit_params.ImageEditParamsBase,
     }[family]
-    return set(base.__annotations__.keys()) | {"stream"}
+    extra = set() if family == "audio_translations" else {"stream"}
+    return set(base.__annotations__.keys()) | extra
 
 
 class Family:
@@ -798,6 +810,27 @@ def sec_strict_anthropic(client, model):
 #                      under --audio-only (sdk_conformance.rs::spec_gate_whisper
 #                      starts a whisper server for exactly this).
 # ---------------------------------------------------------------------------
+
+
+def sec_translation_matrix(matrix):
+    """Completeness of the translation matrix against the pinned SDK, and a
+    probe for every disposition that claims a refusal - static, like the
+    transcription audit above."""
+    spec = sdk_params("audio_translations")
+    listed = set(matrix["audio_translations"].keys())
+    assert not (spec - listed), f"audio_translations: spec params without a disposition: {sorted(spec - listed)}"
+    assert not (listed - spec), f"audio_translations: stale matrix entries: {sorted(listed - spec)}"
+    for param, disposition in sorted(matrix["audio_translations"].items()):
+        assert disposition in ("implemented", "partial", "advisory", "rejected"), (
+            f"audio_translations.{param}: bad disposition {disposition}")
+        if disposition in ("rejected", "partial"):
+            assert param in TRANSLATION_PROBE_400, f"audio_translations.{param}: no 400-probe"
+        elif disposition == "advisory":
+            assert param in TRANSLATION_PROBE_200, f"audio_translations.{param}: no 200-probe"
+    unused = (set(TRANSLATION_PROBE_400) | set(TRANSLATION_PROBE_200)) - listed
+    assert not unused, f"audio_translations: probes for params not in the matrix: {sorted(unused)}"
+    print(f"  audio_translations: {len(listed)} spec params", flush=True)
+    ok("audio_translations matrix (static)")
 
 
 def sec_audio_matrix(matrix):
@@ -1514,7 +1547,7 @@ def check_paddock_guards(body, duration):
     for n in g:
         assert n["reason"] in {"no_speech", "no_speech_marker", "vad",
                                "repetition", "length", "context",
-                               "language_mismatch"}, n
+                               "language_mismatch", "timestamps"}, n
         assert isinstance(n["text_dropped"], bool), n
         # the note is the difference between a machine-readable reason and a
         # caller having to read our source to know whether to re-record
@@ -2578,6 +2611,7 @@ def main():
     # Static, and therefore unconditional: this is the half that fails when the
     # SDK grows a param, and it must not depend on the box owning a checkpoint.
     sec_audio_matrix(matrix)
+    sec_translation_matrix(matrix)
     sec_images_matrix(matrix)
 
     if args.images_only:

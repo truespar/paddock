@@ -543,6 +543,11 @@ impl GpuQwen3Asr {
                         "OCR crop directive on qwen3-asr - routing bug".into(),
                     ));
                 }
+                MmChunk::CtcTimestamps { .. } => {
+                    return Err(GpuModelError::Unsupported(
+                        "CTC timestamp directive on qwen3-asr - routing bug".into(),
+                    ));
+                }
                 MmChunk::VisionPixels { .. } => {
                     return Err(GpuModelError::Unsupported(
                         "pixel-budget directive on qwen3-asr - routing bug".into(),
@@ -585,7 +590,10 @@ impl GpuQwen3Asr {
                     || crate::audio::audio_tokens_for_samples(samples.len()),
                     |m| crate::audio::audio_token_count(m.n_frames),
                 ),
-                MmChunk::Image { .. } | MmChunk::OcrCrop(_) | MmChunk::VisionPixels { .. } => 0,
+                MmChunk::Image { .. }
+                | MmChunk::OcrCrop(_)
+                | MmChunk::VisionPixels { .. }
+                | MmChunk::CtcTimestamps { .. } => 0,
             })
             .sum();
         self.admit_rows(slot, n_rows.max(1))?;
@@ -1396,7 +1404,8 @@ impl GpuQwen3Asr {
                             ),
                             MmChunk::Image { .. }
                             | MmChunk::OcrCrop(_)
-                            | MmChunk::VisionPixels { .. } => 0,
+                            | MmChunk::VisionPixels { .. }
+                            | MmChunk::CtcTimestamps { .. } => 0,
                         })
                         .sum();
                     self.admit_rows(slot, n_rows.max(1))?;

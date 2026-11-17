@@ -30,7 +30,10 @@
 //! - `openai`, `anthropic`: the two HTTP dialects.
 //! - `uploads`: OpenAI's resumable Uploads API, the way in for big inputs.
 //! - `webhook`: completion delivery.
+//! - `admin`: the Studio's monitor, `/api/batches` (both dialects, results
+//!   paged out of the files, cancel / delete / download).
 
+pub(crate) mod admin;
 pub(crate) mod anthropic;
 pub(crate) mod dispatch;
 pub(crate) mod files;
@@ -259,7 +262,9 @@ impl Batches {
 /// The HTTP surface, both dialects. Mounted at the manager's root so vendor
 /// SDKs work with nothing but a base URL.
 pub fn routes() -> Router<Arc<AppState>> {
-    openai::routes().merge(anthropic::routes())
+    openai::routes()
+        .merge(anthropic::routes())
+        .merge(admin::routes())
 }
 
 /// A vendor-style id: the prefix plus 32 hex digits.

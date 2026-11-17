@@ -263,6 +263,29 @@ pub fn elected(arch: &str) -> Option<Elected> {
                      Sampling (temperature 1.0, top_p 0.95), mirrored by \
                      unsloth's GGUF card",
         },
+        // Nemotron 3.5 Transcribe keeps Lightning's graph and publishes its
+        // own two rows: the card's "Recommended Sampling" (and its evaluation
+        // settings) - audio understanding with reasoning on at temperature
+        // 0.6, top_p 0.95, top-k disabled; transcription, translation and
+        // language id with reasoning off at temperature 0. Its
+        // generation_config.json carries token ids only.
+        TRANSCRIBE => Elected {
+            thinking: Knobs {
+                temperature: 0.6,
+                top_k: 0,
+                top_p: 0.95,
+                min_p: 0.0,
+            },
+            instruct: Some(Knobs {
+                temperature: 0.0,
+                top_k: 0,
+                top_p: 1.0,
+                min_p: 0.0,
+            }),
+            source: "NVIDIA Nemotron 3.5 Transcribe 30B-A4B card, Recommended Sampling \
+                     (reasoning on: temperature 0.6, top_p 0.95, top-k disabled; \
+                     reasoning off: temperature 0)",
+        },
         // gpt-oss: generation_config.json has do_sample and token ids, nothing
         // else, and the card names no sampling parameters.
         // granite 4.1: generation_config.json is `_from_model_config` - token
@@ -276,6 +299,10 @@ pub fn elected(arch: &str) -> Option<Elected> {
 
 /// The identity key for LightOnOCR-3 checkpoints - see [`elected`].
 pub const LIGHTONOCR3: &str = "lightonocr-3";
+
+/// The identity key for Nemotron 3.5 Transcribe - a `nemotron_h` graph whose
+/// card samples nothing like Lightning's ([`elected`]).
+pub const TRANSCRIBE: &str = "nemotron-3.5-transcribe";
 
 /// What the CHECKPOINT itself publishes, read off its own header.
 ///
@@ -390,6 +417,10 @@ mod tests {
         assert_eq!(lo.thinking.top_k, 0, "unstated, so off");
         // the identity key must not inherit its base graph's row
         assert_ne!(lo.thinking, q.thinking);
+        let tr = elected(TRANSCRIBE).expect("the Transcribe card publishes sampling");
+        assert_eq!((tr.thinking.temperature, tr.thinking.top_p), (0.6, 0.95));
+        assert_eq!(tr.knobs(false).temperature, 0.0, "reasoning off is greedy");
+        assert_ne!(tr.thinking, elected("nemotron_h_moe").unwrap().thinking);
     }
 
     fn hdr(kv: &[(&str, f32)]) -> crate::gguf::GgufFile {
@@ -499,6 +530,7 @@ mod tests {
             "laguna",
             "nemotron_h_moe",
             LIGHTONOCR3,
+            TRANSCRIBE,
         ] {
             let e = elected(arch).unwrap();
             assert!(
@@ -544,6 +576,7 @@ mod tests {
             "laguna",
             "nemotron_h_moe",
             LIGHTONOCR3,
+            TRANSCRIBE,
         ] {
             let Some(e) = elected(arch) else { continue };
             for k in [Some(&e.thinking), e.instruct.as_ref()]

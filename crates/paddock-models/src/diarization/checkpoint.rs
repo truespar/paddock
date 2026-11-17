@@ -28,11 +28,21 @@ pub enum Format {
     MlxBf16,
     /// NVIDIA's GGUF: Q8_0 projections, F32 norms/biases/head, F16 convolution
     GgufQ8,
+    /// Nemotron 3.5 Transcribe's perception module, which carries the model
+    /// frozen: NeMo's names under [`PERCEPTION_PREFIX`], BF16 - the MLX
+    /// export's bytes exactly (the convolution in NeMo's [out][in][k] order) -
+    /// and the speech LM's own preprocessor buffers, which are the diarizer's
+    /// too.
+    PerceptionBf16,
 }
+
+/// Where Transcribe's perception keeps the diarizer.
+pub const PERCEPTION_PREFIX: &str = "perception.encoder.diarization_model.";
 
 enum Source {
     Mlx(ShardedSafetensors),
     Gguf(MappedGguf),
+    Perception(ShardedSafetensors),
 }
 
 pub struct Checkpoint {
@@ -231,7 +241,34 @@ fn gguf_name(name: &str) -> String {
     }
 }
 
+/// The one convolution (stored [out][k][in] in MLX's layout).
+fn is_conv(name: &str) -> bool {
+    name == "sortformer_modules.subpixel_upsample.weight"
+}
+
+/// Transcribe's perception name for an MLX-named tensor.
+fn perception_name(name: &str) -> String {
+    match name {
+        "preprocessor.window" => "perception.preprocessor.featurizer.window".to_owned(),
+        "preprocessor.fb" => "perception.preprocessor.featurizer.fb".to_owned(),
+        _ => format!(
+            "{PERCEPTION_PREFIX}{}",
+            name.replace(".ffn.linear1.", ".ffn.net.0.")
+                .replace(".ffn.linear2.", ".ffn.net.3.")
+        ),
+    }
+}
+
 impl Checkpoint {
+    /// The diarizer inside Transcribe's perception tensors (the checkpoint's
+    /// shards, opened by the caller). Shapes and types are checked by
+    /// [`Self::validate`]; the configuration is the speech LM's to check.
+    pub fn perception(st: ShardedSafetensors) -> Self {
+        Self {
+            source: Source::Perception(st),
+        }
+    }
+
     /// A directory is the MLX export, a file the GGUF. Configuration and
     /// metadata are checked here; [`Self::validate`] checks every tensor.
     pub fn open(path: &Path) -> Result<Self, String> {
@@ -250,6 +287,7 @@ impl Checkpoint {
         match self.source {
             Source::Mlx(_) => Format::MlxBf16,
             Source::Gguf(_) => Format::GgufQ8,
+            Source::Perception(_) => Format::PerceptionBf16,
         }
     }
 
@@ -274,6 +312,25 @@ impl Checkpoint {
                     return Err(format!("{name}: shape mismatch"));
                 }
                 Ok(Raw { ty, bytes })
+            }
+            Source::Perception(s) => {
+                let renamed = perception_name(name);
+                let (info, bytes) = s
+                    .bytes(&renamed)
+                    .ok_or_else(|| format!("missing {renamed}"))?;
+                // NeMo's convolution is [out][in][k] where MLX's is [out][k][in]
+                let expected: Vec<usize> = if is_conv(name) {
+                    vec![shape[0], shape[2], shape[1]]
+                } else {
+                    shape.to_vec()
+                };
+                if info.dtype != StDtype::Bf16
+                    || info.shape != expected
+                    || bytes.len() != shape.iter().product::<usize>() * 2
+                {
+                    return Err(format!("{renamed}: expected BF16 {expected:?}"));
+                }
+                Ok(Raw { ty: BF16, bytes })
             }
             Source::Gguf(g) => {
                 let renamed = gguf_name(name);
@@ -310,7 +367,12 @@ impl Checkpoint {
     pub fn values(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>, String> {
         let raw = self.raw(name, shape)?;
         let mut v = decode(&raw)?;
-        if shape.len() == 3 && matches!(self.source, Source::Gguf(_)) {
+        let reorder = match self.source {
+            Source::Gguf(_) => shape.len() == 3,
+            Source::Perception(_) => is_conv(name),
+            Source::Mlx(_) => false,
+        };
+        if reorder {
             let (o, t, c) = (shape[0], shape[1], shape[2]);
             let src = v;
             v = vec![0.; src.len()];
@@ -336,7 +398,7 @@ impl Checkpoint {
         for (name, shape, projection) in inventory() {
             let raw = self.raw(&name, &shape)?;
             let allowed = match self.format() {
-                Format::MlxBf16 => raw.ty == BF16,
+                Format::MlxBf16 | Format::PerceptionBf16 => raw.ty == BF16,
                 Format::GgufQ8 => {
                     matches!(raw.ty, F32 | F16 | BF16) || (projection && raw.ty == Q8_0)
                 }
@@ -360,7 +422,7 @@ impl Checkpoint {
     /// and means the symmetric Hann window, F64 evaluated and rounded once.
     pub fn window(&self) -> Result<Vec<f32>, String> {
         match self.format() {
-            Format::MlxBf16 => self.values("preprocessor.window", &[400]),
+            Format::MlxBf16 | Format::PerceptionBf16 => self.values("preprocessor.window", &[400]),
             Format::GgufQ8 => Ok((0..400)
                 .map(|i| {
                     (0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / 399.0).cos())) as f32
@@ -372,7 +434,9 @@ impl Checkpoint {
     /// The mel filterbank, [128][257].
     pub fn filterbank(&self) -> Result<Vec<f32>, String> {
         match self.format() {
-            Format::MlxBf16 => self.values("preprocessor.fb", &[1, 128, 257]),
+            Format::MlxBf16 | Format::PerceptionBf16 => {
+                self.values("preprocessor.fb", &[1, 128, 257])
+            }
             Format::GgufQ8 => self.values("preprocessor.fb", &[128, 257]),
         }
     }
@@ -444,6 +508,14 @@ mod tests {
         assert_eq!(
             gguf_name("sortformer_modules.learnable_sil_emb"),
             "learnable_sil_emb"
+        );
+        assert_eq!(
+            perception_name("encoder.layers.3.ffn.linear1.weight"),
+            "perception.encoder.diarization_model.encoder.layers.3.ffn.net.0.weight"
+        );
+        assert_eq!(
+            perception_name("preprocessor.fb"),
+            "perception.preprocessor.featurizer.fb"
         );
         let inv = inventory();
         assert_eq!(

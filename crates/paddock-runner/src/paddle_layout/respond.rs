@@ -125,6 +125,7 @@ pub(crate) async fn respond(
                             prompt_tokens_details: None,
                         },
                         ocr: Some(echo(&ocr, &sum, n_pages)),
+                        ctc_timestamps: None,
                     })
                     .into_response();
                 }

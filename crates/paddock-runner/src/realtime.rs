@@ -202,10 +202,12 @@ pub(crate) const MAX_BUFFER_S: f32 = 600.0;
 /// File word timestamps do not imply live enrichment (Granite Plus emits
 /// them under a different instruction). Both clients consume this explicit
 /// contract instead of inferring it from the file endpoint's granularities.
-pub(crate) fn capabilities(audio: bool, whisper: bool, max_clip_s: Option<f64>) -> Value {
+/// `enrichment`: a closed utterance can come back with timed, scored words -
+/// whisper's alignment pass, or Transcribe's CTC timestamp head.
+pub(crate) fn capabilities(audio: bool, enrichment: bool, max_clip_s: Option<f64>) -> Value {
     json!({
         "supported": audio,
-        "enrichment": audio && whisper,
+        "enrichment": audio && enrichment,
         "drain": audio,
         "final_revision": audio,
         "utterance_max_s": if audio { Some(max_clip_s.unwrap_or(MAX_BUFFER_S as f64).min(MAX_BUFFER_S as f64)) } else { None },
@@ -293,7 +295,8 @@ pub async fn handle(
                 state: state.clone(),
             },
             model: m.id.clone(),
-            word_times: false,
+            // Transcribe times a closed utterance's words with its CTC head
+            word_times: m.ctc_word_times(),
         },
         (None, Some(_)) => {
             return err(
@@ -551,12 +554,15 @@ async fn pass(
             .await
             .map_err(|e| e.to_string())??;
             let instruction = Some(ctx.asked.trim()).filter(|s| !s.is_empty());
-            let (text, lang) = crate::transcriptions::generative_pass(
+            // a verbose session's final pass on a lane that times words
+            // (Transcribe): the enriched object rides back with it
+            let (text, lang, verbose) = crate::transcriptions::generative_pass(
                 model,
                 samples,
                 instruction,
                 language.as_deref(),
                 state.max_ctx,
+                times.verbose && times.words,
             )
             .await?;
             // One "window": these families take the whole buffer as a single
@@ -564,14 +570,13 @@ async fn pass(
             // the module note). The session's own cap and server VAD are what
             // bound the buffer here.
             //
-            // No `verbose` either, and `session.update` refuses the opt-in on
-            // this lane by name rather than accepting it and answering with
-            // nothing: these families have no timestamp vocabulary at all
-            // so there is no enriched pass to run.
+            // `verbose` only where the lane times words (Transcribe);
+            // `session.update` refuses the opt-in by name on the others rather
+            // than accepting it and answering with nothing.
             Ok(PassOut {
                 parts: vec![text],
                 language: lang.unwrap_or_default(),
-                verbose: None,
+                verbose,
             })
         }
     }
@@ -1152,6 +1157,7 @@ async fn run(mut socket: WebSocket, lane: Lane) {
                         // one refusal that depends on the lane rather than on
                         // the object, so it cannot live inside the parser.
                         if matches!(lane.kind, LaneKind::Generative { .. })
+                            && !lane.word_times
                             && ev
                                 .pointer("/session/audio/input/transcription/paddock_verbose")
                                 .and_then(Value::as_bool)
@@ -1160,9 +1166,29 @@ async fn run(mut socket: WebSocket, lane: Lane) {
                             let msg = concat!(
                                 "`paddock_verbose` is not served on this model: these families ",
                                 "have no timestamp vocabulary, so a closed utterance has no ",
-                                "segments and no word times to report",
+                                "segments and no word times to report (Nemotron 3.5 Transcribe ",
+                                "times them with its CTC head)",
                             );
                             if send(&mut socket, error_event("invalid_request_error", msg))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            continue;
+                        }
+                        // the lane's own language set (Transcribe's 40) - also
+                        // before anything is applied
+                        if let LaneKind::Generative { state } = &lane.kind
+                            && let Some(code) = ev
+                                .pointer("/session/audio/input/transcription/language")
+                                .and_then(Value::as_str)
+                            && let Some(why) = state
+                                .serving
+                                .as_ref()
+                                .and_then(|s| crate::language::unserved_language(s, code))
+                        {
+                            if send(&mut socket, error_event("invalid_request_error", &why))
                                 .await
                                 .is_err()
                             {

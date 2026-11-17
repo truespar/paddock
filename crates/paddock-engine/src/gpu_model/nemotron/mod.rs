@@ -20,10 +20,13 @@
 //!     gather widens in-kernel); routers, norms, conv, A/D/dt_bias:
 //!     bf16/f32 -> f32 (exact widening)
 
+mod audio;
 pub(crate) mod batch;
 mod chunked;
+mod ctc;
 pub(crate) mod dflash;
 mod forward;
+mod fused;
 mod load;
 mod mm;
 pub use mm::PictureProbe;
@@ -43,8 +46,10 @@ use crate::gpu::{
     DeviceTensor, F8RowPlane, GpuExecutor, KvDtype, Nvf4MoePlane, Nvf4Plane, QuantTensor, QuantW,
     RepackedQ8,
 };
+use crate::gpu_model::gpt_oss::GpuModelError;
 use paddock_models::nemotron::NemotronConfig;
 
+pub use audio::ProbeStages;
 pub(crate) use forward::{DecodeState, PipeState, PrefillScratch, Scratch, SendGraph};
 
 /// One linear plane in either weight class: the NVFP4 checkpoint's fp8
@@ -105,6 +110,84 @@ pub(crate) enum AttnWeights {
         wv: F8RowPlane,
         wo: F8RowPlane,
     },
+    /// Transcribe's ModelOpt NVFP4 projections: the checkpoint's triples as
+    /// row-major planes (see [`attn_nvf4_mm`] for the row classes).
+    Nvf4 {
+        wq: Nvf4Plane,
+        wk: Nvf4Plane,
+        wv: Nvf4Plane,
+        wo: Nvf4Plane,
+    },
+}
+
+/// One NVFP4 attention projection over `rows` rows of `x`. A single row is
+/// the exact gemv (the serial spine); `decode` rows - a decode tick's or a
+/// verify round's, in the W16 decode class - take the row-batched gemv,
+/// bit-exact per row against that single-row gemv, so a stream's bits do
+/// not depend on how many slots decode beside it; prompt rows take the
+/// checkpoint recipe's W4A4 mma (activations quantized per 16-element block,
+/// the class the NVFP4 FFN chains run), with the qwen3.8 lane's election as
+/// the fallback on a pack without the fp4 arm. `xq`/`xs` are the activation
+/// image's scratch, `quantized` = they already hold `x`'s image (q/k/v share
+/// one).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attn_nvf4_mm(
+    exec: &GpuExecutor,
+    w: &Nvf4Plane,
+    x: &CudaSlice<f32>,
+    xq: &mut CudaSlice<i8>,
+    xs: &mut CudaSlice<u8>,
+    y: &mut CudaSlice<f32>,
+    rows: usize,
+    decode: bool,
+    quantized: bool,
+) -> Result<(), GpuModelError> {
+    if rows == 1 {
+        exec.nvf4_gemv(w, x, y, None)?;
+    } else if decode {
+        exec.nvf4_gemv_batch(w, x, y, None, rows)?;
+    } else if attn_nvf4_w4a4(exec, rows) {
+        if !quantized {
+            exec.quantize_nvf4(x, xq, xs, rows * w.in_dim)?;
+        }
+        // part None: the unsplit GEMM, whose per-row sums do not depend on
+        // how many rows ride with them (a K split would fold differently)
+        exec.nvf4_gemm_f4(w, xq, xs, y, None, rows, None)?;
+    } else {
+        crate::gpu_model::qwen35::nvf4_mm(exec, w, x, y, rows)?;
+    }
+    Ok(())
+}
+
+/// Whether [`attn_nvf4_mm`] runs `rows` prompt rows on the W4A4 arm - the
+/// q/k/v call sites quantize the shared input once when it does.
+pub(crate) fn attn_nvf4_w4a4(exec: &GpuExecutor, rows: usize) -> bool {
+    rows >= crate::gpu_model::qwen35::nvf4_w4a4_min_rows() && exec.has_nvf4_gemm_f4()
+}
+
+/// q/k/v over one input through [`attn_nvf4_mm`], quantizing it once.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attn_nvf4_qkv(
+    exec: &GpuExecutor,
+    (wq, wk, wv): (&Nvf4Plane, &Nvf4Plane, &Nvf4Plane),
+    x: &CudaSlice<f32>,
+    xq: &mut CudaSlice<i8>,
+    xs: &mut CudaSlice<u8>,
+    (q, k, v): (
+        &mut CudaSlice<f32>,
+        &mut CudaSlice<f32>,
+        &mut CudaSlice<f32>,
+    ),
+    rows: usize,
+    decode: bool,
+) -> Result<(), GpuModelError> {
+    let pre = rows > 1 && !decode && attn_nvf4_w4a4(exec, rows);
+    if pre {
+        exec.quantize_nvf4(x, xq, xs, rows * wq.in_dim)?;
+    }
+    attn_nvf4_mm(exec, wq, x, xq, xs, q, rows, decode, pre)?;
+    attn_nvf4_mm(exec, wk, x, xq, xs, k, rows, decode, pre)?;
+    attn_nvf4_mm(exec, wv, x, xq, xs, v, rows, decode, pre)
 }
 
 /// Checkpoint-byte twins of the attention planes ([in, out] dims, the bf16
@@ -506,14 +589,73 @@ pub(crate) enum MoePlanes {
         sh_up: RepackedQ8,
         sh_down: RepackedQ8,
     },
+    /// Transcribe's MTP block only: the checkpoint's FP8 experts, e4m3 rows
+    /// with each expert's per-tensor scale broadcast per row (up `[n_expert *
+    /// ff][hidden]`, down `[n_expert * hidden][ff]`, the shared expert as a
+    /// one-expert plane). The block's MoE runs on draft rows alone, so these
+    /// feed the exact decode GEMVs (slots 945-946); no trunk layer carries
+    /// them.
+    F8 {
+        up: F8RowPlane,
+        down: F8RowPlane,
+        sh_up: F8RowPlane,
+        sh_down: F8RowPlane,
+    },
 }
 
-/// lm_head residency (untied): NVFP4 plane, a GGUF quant plane, or Super's
-/// ModelOpt FP8 rows.
+/// lm_head residency (untied): NVFP4 plane, a GGUF quant plane, Super's
+/// ModelOpt FP8 rows, or Transcribe's unquantized bf16 bytes ([hidden,
+/// vocab] dims).
 pub(crate) enum HeadW {
     Nvf4(Nvf4Plane),
     Qw(QuantW),
     F8(F8RowPlane),
+    Bf16(QuantTensor),
+}
+
+impl GpuNemotron {
+    /// The widest row an NVFP4 activation image (the W4A4 arm's xq/xs
+    /// pair) holds: the hidden, or the attention output when the attention
+    /// projections are NVFP4 too (o_proj reads q_dim, wider than the hidden).
+    pub(crate) fn nvf4_act_width(&self) -> usize {
+        let nv4_attn = self
+            .layers
+            .iter()
+            .any(|l| matches!(l.mixer, Mixer::Attn(AttnWeights::Nvf4 { .. })));
+        if nv4_attn {
+            self.hp.hidden.max(self.hp.n_heads * self.hp.head_dim)
+        } else {
+            self.hp.hidden
+        }
+    }
+}
+
+/// The bf16 lm_head (Transcribe) over `rows` rows: the exact f32-product
+/// gemv for one row, the tensor-core tile from two up (the bf16 activation
+/// cast vLLM's own bf16 head applies) - every multi-row count the same
+/// class, so a decode row's logits do not depend on the batch beside it
+/// past one.
+/// Batched bf16 lm_head (Transcribe). `w16` = the rows run the W16 decode
+/// class: the tile serves one row as well, so a one-row tick or a prompt's
+/// tail scores in the class of a wider tick's rows and a verify round's -
+/// the exact GEMV sums in another order and a near-tie could part a round
+/// from the ticks it stands for. Drafter heads (proposals, not picks) keep
+/// the GEMV at one row: ~2x the tile's pace there.
+pub(crate) fn head_bf16_batch(
+    exec: &GpuExecutor,
+    h: &QuantTensor,
+    x: &CudaSlice<f32>,
+    y: &mut CudaSlice<f32>,
+    rows: usize,
+    w16: bool,
+) -> Result<(), crate::gpu::GpuError> {
+    if w16 {
+        return exec.bf16_head_tile(h, x, y, h.dims[1], rows);
+    }
+    if rows == 1 {
+        return exec.bf16_gemv(h, None, x, y);
+    }
+    exec.bf16_gemm_tile(h, None, x, y, h.dims[1], rows)
 }
 
 /// Batched NVFP4 lm_head election, shared by the decode
@@ -606,6 +748,10 @@ pub struct GpuNemotron {
     pub(crate) tok_embd: TokEmbd,
     pub(crate) final_norm: DeviceTensor,
     pub(crate) lm_head: HeadW,
+    /// Transcribe's draft-only head: the bf16 lm_head re-encoded per-row
+    /// e4m3, which the MTP draft steps score with (half the head's bytes a
+    /// step); the verify and every committed pick keep the bf16 head.
+    pub(crate) draft_head: Option<crate::gpu::F8RowPlane>,
     pub(crate) kv_dtype: KvDtype,
     /// Storage class for the recurrent SSM state. f16 is the elected default
     /// (NLL-gated quality-neutral); PADDOCK_SSM_DTYPE=f32 (dev builds only) selects the
@@ -653,4 +799,7 @@ pub struct GpuNemotron {
     /// The picture rows the current prefill pass carries (`mm.rs`) - set
     /// around a picture prompt's passes only.
     pub(crate) mm: Option<mm::MmOverlay>,
+    /// Nemotron 3.5 Transcribe's speech encoder (`audio.rs`); None on a text
+    /// or picture checkpoint.
+    pub(crate) audio: Option<audio::AudioWorker>,
 }

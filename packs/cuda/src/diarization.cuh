@@ -115,6 +115,7 @@ int pd_diar_frontend(const void* pcm, const void* window, const void* fb, const 
 // owning channels lane + 32i; the mean, then the biased variance of the
 // centered values, each lane summing upward and a fixed xor tree across
 // lanes; y = (x - mean) * rstd * w + b.
+template <bool B16 = false>
 __global__ void __launch_bounds__(256)
 pd_diar_norm_kernel(const float* __restrict__ x, const float* __restrict__ w,
                     const float* __restrict__ b, float* __restrict__ y, uint32_t rows) {
@@ -142,10 +143,16 @@ pd_diar_norm_kernel(const float* __restrict__ x, const float* __restrict__ w,
     for (uint32_t o = 16; o > 0; o >>= 1) q = __fadd_rn(q, __shfl_xor_sync(0xffffffffu, q, o));
     const float rstd = __frsqrt_rn(__fadd_rn(__fdiv_rn(q, (float)D), 1e-5f));
     float* py = y + (size_t)row * D;
+    // B16 (slot 966): the same value landed as bf16, round to nearest
+    __nv_bfloat16* py16 = reinterpret_cast<__nv_bfloat16*>(y) + (size_t)row * D;
 #pragma unroll
     for (uint32_t i = 0; i < V; ++i) {
         const uint32_t c = lane + 32u * i;
-        py[c] = fmaf(__fmul_rn(v[i], rstd), w[c], b[c]);
+        const float o = fmaf(__fmul_rn(v[i], rstd), w[c], b[c]);
+        if constexpr (B16)
+            py16[c] = __float2bfloat16_rn(o);
+        else
+            py[c] = o;
     }
 }
 
@@ -154,8 +161,20 @@ int pd_diar_norm(const void* x, const void* w, const void* b, void* y, uint32_t 
                  void* stream) {
     if (rows == 0) return 0;
     if (d != 512u) return (int)cudaErrorInvalidValue;
-    pd_pdl_go(pd_diar_norm_kernel, dim3((rows + 7u) / 8u), dim3(256), 0, (cudaStream_t)stream,
+    pd_pdl_go(pd_diar_norm_kernel<false>, dim3((rows + 7u) / 8u), dim3(256), 0, (cudaStream_t)stream,
               (const float*)x, (const float*)w, (const float*)b, (float*)y, rows);
+    return pd_launch_status();
+}
+
+// 966: the LayerNorm landed as bf16 `[rows][512]` - the next GEMM's operand
+// in the bf16 class (Transcribe's speaker branch, diar_bf16.cuh)
+PD_EXPORT
+int pd_diar_norm_b16(const void* x, const void* w, const void* b, void* y16, uint32_t d,
+                     uint32_t rows, void* stream) {
+    if (rows == 0) return 0;
+    if (d != 512u) return (int)cudaErrorInvalidValue;
+    pd_pdl_go(pd_diar_norm_kernel<true>, dim3((rows + 7u) / 8u), dim3(256), 0, (cudaStream_t)stream,
+              (const float*)x, (const float*)w, (const float*)b, (float*)y16, rows);
     return pd_launch_status();
 }
 
@@ -457,8 +476,10 @@ pd_diar_gemm_kernel(const float* __restrict__ x, const uint8_t* __restrict__ w,
                     const float2 v = *reinterpret_cast<const float2*>(ar + (e & 1u) * 8u * SA + (e >> 1) * 8u);
                     if constexpr (P == 3u)
                         pd_diar_split(v, ah[mt][e], am[mt][e], al[mt][e]);
-                    else
+                    else if constexpr (P == 2u)
                         pd_diar_split2(v, ah[mt][e], am[mt][e]);
+                    else
+                        ah[mt][e] = pd_diar_bf2(v.x, v.y);
                 }
             }
             uint32_t b0[NT], b1[NT];
@@ -491,10 +512,12 @@ pd_diar_gemm_kernel(const float* __restrict__ x, const uint8_t* __restrict__ w,
                     else
                         pd_diar_mma(acc[mt][nt], ah[mt], b0[nt], b1[nt]);
                 }
+            if constexpr (P >= 2u) {
 #pragma unroll
-            for (uint32_t mt = 0; mt < MT; ++mt)
+                for (uint32_t mt = 0; mt < MT; ++mt)
 #pragma unroll
-                for (uint32_t nt = 0; nt < NT; ++nt) pd_diar_mma(acc[mt][nt], am[mt], b0[nt], b1[nt]);
+                    for (uint32_t nt = 0; nt < NT; ++nt) pd_diar_mma(acc[mt][nt], am[mt], b0[nt], b1[nt]);
+            }
             if constexpr (P == 3u) {
 #pragma unroll
                 for (uint32_t mt = 0; mt < MT; ++mt)
@@ -684,10 +707,36 @@ static void pd_diar_gemm_elect(const float* x, const uint8_t* w, const float* sc
 #undef PD_DIAR_GO
 }
 
+// 964: the same GEMM in a narrower activation class - `parts` bf16 parts of
+// the activation (3 the F32 class above; 2 to 16 significant bits; 1 the
+// activation rounded once to bf16, one mma a k16 span: the BF16 class a
+// bf16 reference serves, e.g. Transcribe's speaker branch as vLLM's NeMo
+// plugin runs it). Same ring, tiles and drain; only the split and the
+// number of products move.
+static int pd_diar_gemm_parts_go(const void* x, const void* w, const void* scale, const void* bias,
+                                 void* y, void* y2, const void* rope, uint32_t K, uint32_t N,
+                                 uint32_t M, uint32_t wtype, uint32_t mode, uint32_t parts,
+                                 void* stream);
+
+PD_EXPORT
+int pd_diar_gemm_p(const void* x, const void* w, const void* scale, const void* bias, void* y,
+                   void* y2, const void* rope, uint32_t K, uint32_t N, uint32_t M, uint32_t wtype,
+                   uint32_t mode, uint32_t parts, void* stream) {
+    if (parts < 1u || parts > 3u) return (int)cudaErrorInvalidValue;
+    return pd_diar_gemm_parts_go(x, w, scale, bias, y, y2, rope, K, N, M, wtype, mode, parts, stream);
+}
+
 PD_EXPORT
 int pd_diar_gemm(const void* x, const void* w, const void* scale, const void* bias, void* y, void* y2,
                  const void* rope, uint32_t K, uint32_t N, uint32_t M, uint32_t wtype, uint32_t mode,
                  void* stream) {
+    return pd_diar_gemm_parts_go(x, w, scale, bias, y, y2, rope, K, N, M, wtype, mode, 3u, stream);
+}
+
+static int pd_diar_gemm_parts_go(const void* x, const void* w, const void* scale, const void* bias,
+                                 void* y, void* y2, const void* rope, uint32_t K, uint32_t N,
+                                 uint32_t M, uint32_t wtype, uint32_t mode, uint32_t parts,
+                                 void* stream) {
     if (M == 0 || N == 0) return 0;
     // 16 B cp.async rows: K a multiple of the k tile (= the Q8_0 block), N
     // of 4 (whole scale chunks), operands 16 B aligned; the rope epilogue
@@ -698,13 +747,20 @@ int pd_diar_gemm(const void* x, const void* w, const void* scale, const void* bi
         ((uintptr_t)scale & 15u) || (M + 15u) / 16u > 65535u)
         return (int)cudaErrorInvalidValue;
     const cudaStream_t s = (cudaStream_t)stream;
-    if (wtype == PD_DIAR_W_BF16)
-        pd_diar_gemm_elect<PD_DIAR_W_BF16>((const float*)x, (const uint8_t*)w, nullptr, (const float*)bias,
-                                           (float*)y, (float*)y2, (const float2*)rope, K, N, M, mode, s);
-    else
-        pd_diar_gemm_elect<PD_DIAR_W_Q8>((const float*)x, (const uint8_t*)w, (const float*)scale,
-                                         (const float*)bias, (float*)y, (float*)y2, (const float2*)rope, K, N,
-                                         M, mode, s);
+#define PD_DIAR_PARTS(WT, P)                                                                        \
+    pd_diar_gemm_elect<WT, P>((const float*)x, (const uint8_t*)w, (const float*)scale,               \
+                              (const float*)bias, (float*)y, (float*)y2, (const float2*)rope, K, N, M, \
+                              mode, s)
+    if (wtype == PD_DIAR_W_BF16) {
+        if (parts == 1u) PD_DIAR_PARTS(PD_DIAR_W_BF16, 1u);
+        else if (parts == 2u) PD_DIAR_PARTS(PD_DIAR_W_BF16, 2u);
+        else PD_DIAR_PARTS(PD_DIAR_W_BF16, 3u);
+    } else {
+        if (parts == 1u) PD_DIAR_PARTS(PD_DIAR_W_Q8, 1u);
+        else if (parts == 2u) PD_DIAR_PARTS(PD_DIAR_W_Q8, 2u);
+        else PD_DIAR_PARTS(PD_DIAR_W_Q8, 3u);
+    }
+#undef PD_DIAR_PARTS
     return pd_launch_status();
 }
 
@@ -722,17 +778,35 @@ int pd_diar_gemm(const void* x, const void* w, const void* scale, const void* bi
 // V by every warp at fragment load. Row-invariant and deterministic: keys
 // walk in fixed 64-key chunks from the first, whatever query tile holds a
 // row. Launched as a programmatic dependent like every pass of a window.
-template <uint32_t W>
+//
+// VL (slot 950): several windows packed in one pass - `tiles` gives each CTA
+// its query rows and its window (first query row, queries, the window's
+// first row, its keys), so a tile never straddles two windows and keys walk
+// from the window's own first row in the same 64-key chunks: a row's bits
+// are its window's alone.
+template <uint32_t W, bool VL, bool B16 = false>
 __global__ void __launch_bounds__(W * 32u)
 pd_diar_attn_kernel(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v,
-                    float* __restrict__ out, uint32_t rows, uint32_t klen, uint32_t kvh) {
+                    float* __restrict__ out, uint32_t rows, uint32_t klen, uint32_t kvh,
+                    const uint4* __restrict__ tiles) {
     constexpr uint32_t HD = 64u, H = 8u, BQ = 16u * W, BKV = 64u, SK = HD + 4u, KT8 = HD / 8u,
                        NTK = BKV / 8u, NTD = HD / 8u, THREADS = W * 32u;
     extern __shared__ __align__(16) float diar_asm[];
     float* Ks = diar_asm;       // [BKV][SK]
     float* Vs = Ks + BKV * SK;  // [BKV][SK]
     const uint32_t tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5, gr = lane >> 2, t4 = lane & 3u;
-    const uint32_t head = blockIdx.y, first = blockIdx.x * BQ, count = min(BQ, rows - first);
+    uint32_t first, count, kbase = 0u;
+    if constexpr (VL) {
+        const uint4 t = tiles[blockIdx.x];
+        first = t.x;
+        count = t.y;
+        kbase = t.z;
+        klen = t.w;
+    } else {
+        first = blockIdx.x * BQ;
+        count = min(BQ, rows - first);
+    }
+    const uint32_t head = blockIdx.y;
     PD_PDL_ARM();
     // this warp's rows r0 = warp * 16 + gr and r0 + 8; Q split once into
     // registers, the A fragments of every k8 step of the head
@@ -760,8 +834,8 @@ pd_diar_attn_kernel(const float* __restrict__ q, const float* __restrict__ k, co
 #pragma unroll
         for (uint32_t e = 0; e < 4u; ++e) o[i][e] = 0.f;
     const size_t pitch = (size_t)kvh * HD;
-    const float* kb = k + head * HD;
-    const float* vb = v + head * HD;
+    const float* kb = k + (size_t)kbase * pitch + head * HD;
+    const float* vb = v + (size_t)kbase * pitch + head * HD;
     for (uint32_t base = 0; base < klen; base += BKV) {
         __syncthreads();  // the previous chunk's readers are done
         for (uint32_t f = tid; f < BKV * HD / 4u; f += THREADS) {
@@ -883,11 +957,18 @@ pd_diar_attn_kernel(const float* __restrict__ q, const float* __restrict__ k, co
     for (uint32_t h = 0; h < 2u; ++h) {
         const uint32_t r = r0 + 8u * h;
         if (r >= count) continue;
-        float* po = out + (size_t)(first + r) * (H * HD) + head * HD;
+        const size_t ro = (size_t)(first + r) * (H * HD) + head * HD;
+        float* po = out + ro;
+        // B16 (slot 967): the same quotients landed as bf16
+        __nv_bfloat16* po16 = reinterpret_cast<__nv_bfloat16*>(out) + ro;
 #pragma unroll
-        for (uint32_t nd = 0; nd < NTD; ++nd)
-            *reinterpret_cast<float2*>(po + nd * 8u + 2u * t4) =
-                make_float2(__fdiv_rn(o[nd][2u * h], l[h]), __fdiv_rn(o[nd][2u * h + 1u], l[h]));
+        for (uint32_t nd = 0; nd < NTD; ++nd) {
+            const float a = __fdiv_rn(o[nd][2u * h], l[h]), c = __fdiv_rn(o[nd][2u * h + 1u], l[h]);
+            if constexpr (B16)
+                *reinterpret_cast<__nv_bfloat162*>(po16 + nd * 8u + 2u * t4) = __floats2bfloat162_rn(a, c);
+            else
+                *reinterpret_cast<float2*>(po + nd * 8u + 2u * t4) = make_float2(a, c);
+        }
     }
 }
 
@@ -895,8 +976,9 @@ template <uint32_t W>
 static void pd_diar_attn_go(const void* q, const void* k, const void* v, void* out, uint32_t rows,
                             uint32_t klen, uint32_t kvh, cudaStream_t s) {
     constexpr uint32_t smem = 2u * 64u * (64u + 4u) * 4u;
-    pd_pdl_go(pd_diar_attn_kernel<W>, dim3((rows + 16u * W - 1u) / (16u * W), 8u, 1u), dim3(W * 32u), smem, s,
-              (const float*)q, (const float*)k, (const float*)v, (float*)out, rows, klen, kvh);
+    pd_pdl_go(pd_diar_attn_kernel<W, false>, dim3((rows + 16u * W - 1u) / (16u * W), 8u, 1u),
+              dim3(W * 32u), smem, s, (const float*)q, (const float*)k, (const float*)v, (float*)out,
+              rows, klen, kvh, (const uint4*)nullptr);
 }
 
 PD_EXPORT
@@ -919,5 +1001,74 @@ int pd_diar_attention(const void* q, const void* k, const void* v, void* out, ui
         pd_diar_attn_go<4u>(q, k, v, out, rows, klen, kvh, (cudaStream_t)stream);
     else
         pd_diar_attn_go<2u>(q, k, v, out, rows, klen, kvh, (cudaStream_t)stream);
+    return pd_launch_status();
+}
+
+// 950: the attention over several packed windows. `tiles` (device) holds
+// n_tiles uint4 {first query row, queries (<= 16 * warps), the window's first
+// row, its keys}, each tile inside one window; `warps` 2 or 4 is the tile
+// height the caller cut them for (the bits do not depend on it).
+PD_EXPORT
+int pd_diar_attention_varlen(const void* q, const void* k, const void* v, void* out,
+                             const void* tiles, uint32_t n_tiles, uint32_t warps, uint32_t kvh,
+                             void* stream) {
+    if (n_tiles == 0) return 0;
+    if ((warps != 2u && warps != 4u) || n_tiles > 65535u || kvh < 8u || tiles == nullptr ||
+        (((uintptr_t)q | (uintptr_t)k | (uintptr_t)v) & 15u))
+        return (int)cudaErrorInvalidValue;
+    constexpr uint32_t smem = 2u * 64u * (64u + 4u) * 4u;
+    const dim3 grid(n_tiles, 8u, 1u);
+    if (warps == 4u)
+        pd_pdl_go(pd_diar_attn_kernel<4u, true>, grid, dim3(128u), smem, (cudaStream_t)stream,
+                  (const float*)q, (const float*)k, (const float*)v, (float*)out, 0u, 0u, kvh,
+                  (const uint4*)tiles);
+    else
+        pd_pdl_go(pd_diar_attn_kernel<2u, true>, grid, dim3(64u), smem, (cudaStream_t)stream,
+                  (const float*)q, (const float*)k, (const float*)v, (float*)out, 0u, 0u, kvh,
+                  (const uint4*)tiles);
+    return pd_launch_status();
+}
+
+// 967: the attention (window or packed) landed as bf16 `[rows][512]` - the
+// out projection's operand in the bf16 class. `tiles` null: one window of
+// `rows` queries over `klen` keys (slot 723's election); else the packed
+// pass (slot 950's tiles, `warps` 2 or 4). Same quotients, rounded once.
+PD_EXPORT
+int pd_diar_attention_b16(const void* q, const void* k, const void* v, void* out16, uint32_t rows,
+                          uint32_t klen, uint32_t kvh, const void* tiles, uint32_t n_tiles,
+                          uint32_t warps, void* stream) {
+    constexpr uint32_t smem = 2u * 64u * (64u + 4u) * 4u;
+    const cudaStream_t s = (cudaStream_t)stream;
+    if (((uintptr_t)q | (uintptr_t)k | (uintptr_t)v | (uintptr_t)out16) & 15u || kvh < 8u)
+        return (int)cudaErrorInvalidValue;
+    if (tiles != nullptr) {
+        if (n_tiles == 0) return 0;
+        if ((warps != 2u && warps != 4u) || n_tiles > 65535u) return (int)cudaErrorInvalidValue;
+        const dim3 grid(n_tiles, 8u, 1u);
+        if (warps == 4u)
+            pd_pdl_go(pd_diar_attn_kernel<4u, true, true>, grid, dim3(128u), smem, s, (const float*)q,
+                      (const float*)k, (const float*)v, (float*)out16, 0u, 0u, kvh, (const uint4*)tiles);
+        else
+            pd_pdl_go(pd_diar_attn_kernel<2u, true, true>, grid, dim3(64u), smem, s, (const float*)q,
+                      (const float*)k, (const float*)v, (float*)out16, 0u, 0u, kvh, (const uint4*)tiles);
+        return pd_launch_status();
+    }
+    if (rows == 0) return 0;
+    if (klen == 0 || klen > rows) return (int)cudaErrorInvalidValue;
+    static int nsm = 0;
+    if (nsm == 0) {
+        int d = 0;
+        cudaGetDevice(&d);
+        cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, d);
+        if (nsm <= 0) nsm = 48;
+    }
+    if ((rows + 63u) / 64u * 8u >= (uint32_t)nsm)
+        pd_pdl_go(pd_diar_attn_kernel<4u, false, true>, dim3((rows + 63u) / 64u, 8u, 1u), dim3(128u), smem,
+                  s, (const float*)q, (const float*)k, (const float*)v, (float*)out16, rows, klen, kvh,
+                  (const uint4*)nullptr);
+    else
+        pd_pdl_go(pd_diar_attn_kernel<2u, false, true>, dim3((rows + 31u) / 32u, 8u, 1u), dim3(64u), smem,
+                  s, (const float*)q, (const float*)k, (const float*)v, (float*)out16, rows, klen, kvh,
+                  (const uint4*)nullptr);
     return pd_launch_status();
 }

@@ -1357,7 +1357,7 @@ __global__ void __launch_bounds__(NWARP * 32) pd_bf16_gemm_mma_kernel(
 // Every ldmatrix address here applies it. The B (activation) plane keeps its
 // plain padded staging - it is 32 rows, not the traffic.
 #if defined(PD_BS_HOST) || defined(PD_TC5_HOST)
-template <uint32_t BN, uint32_t NWARP, uint32_t ST, uint32_t RG, uint32_t CG>
+template <uint32_t BN, uint32_t NWARP, uint32_t ST, uint32_t RG, uint32_t CG, bool CX = false>
 __global__ void __launch_bounds__(NWARP * 32) pd_bf16_gemm_tma_kernel(
         const __grid_constant__ PdTmap wmap, const float* __restrict__ X,
         const float* __restrict__ bias, float* __restrict__ Y,
@@ -1384,7 +1384,11 @@ __global__ void __launch_bounds__(NWARP * 32) pd_bf16_gemm_tma_kernel(
     const uint32_t lane = tid & 31u, warp = tid >> 5;
     const uint32_t g = lane >> 2, t = lane & 3u;
     const uint32_t wr = (warp % WR) * WM, wc = (warp / WR) * WN;
-    const uint32_t row_base = blockIdx.x * BM, col_base = blockIdx.y * BN;
+    // CX: the column (batch) tiles on x, so a row tile's CTAs launch side by
+    // side and share its weight boxes through L2 - row tiles on x stream
+    // the whole plane once per column tile. Ownership only, never the k walk.
+    const uint32_t row_base = (CX ? blockIdx.y : blockIdx.x) * BM;
+    const uint32_t col_base = (CX ? blockIdx.x : blockIdx.y) * BN;
     const __nv_bfloat16 zero = __float2bfloat16(0.0f);
 
     if (tid < ST) {
@@ -1676,7 +1680,7 @@ static CUtensorMap* pd_bf16_tmap(const void* base, uint64_t inner, uint64_t rows
     return &tab[n++].m;
 }
 
-template <uint32_t BN, uint32_t NW, uint32_t ST, uint32_t RG, uint32_t CG>
+template <uint32_t BN, uint32_t NW, uint32_t ST, uint32_t RG, uint32_t CG, bool CX = false>
 static int pd_bf16_tma_cfg(const __nv_bfloat16* w, const float* x,
                            const float* bias, float* y, uint32_t in_dim,
                            uint32_t out_dim, uint32_t batch, cudaStream_t st) {
@@ -1688,14 +1692,15 @@ static int pd_bf16_tma_cfg(const __nv_bfloat16* w, const float* x,
     if (!map) return -1;
     static bool set = false;
     if (!set) {
-        if (cudaFuncSetAttribute(pd_bf16_gemm_tma_kernel<BN, NW, ST, RG, CG>,
+        if (cudaFuncSetAttribute(pd_bf16_gemm_tma_kernel<BN, NW, ST, RG, CG, CX>,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  smem) != cudaSuccess)
             return -1;
         set = true;
     }
-    dim3 grid((out_dim + BM - 1u) / BM, (batch + BN - 1u) / BN);
-    pd_bf16_gemm_tma_kernel<BN, NW, ST, RG, CG><<<grid, NW * 32u, smem, st>>>(
+    const uint32_t rt = (out_dim + BM - 1u) / BM, ct = (batch + BN - 1u) / BN;
+    const dim3 grid = CX ? dim3(ct, rt) : dim3(rt, ct);
+    pd_bf16_gemm_tma_kernel<BN, NW, ST, RG, CG, CX><<<grid, NW * 32u, smem, st>>>(
             *map, x, bias, y, in_dim, out_dim, batch);
     return (int)cudaGetLastError();
 }
@@ -1911,7 +1916,7 @@ int pd_bf16_seg2_gemm_mma(const void* w, const void* x, void* ya, void* yb,
                           uint32_t in_dim, uint32_t oq, uint32_t ob,
                           uint32_t batch, void* stream) {
     if (in_dim == 0 || oq == 0 || ob == 0 || batch == 0) return 0;
-    if (batch < 2u || (in_dim & 15u)) return -2;
+    if (in_dim & 15u) return -2;
     cudaStream_t st = (cudaStream_t)stream;
     const __nv_bfloat16* wp = (const __nv_bfloat16*)w;
     const float* xp = (const float*)x;
@@ -2078,7 +2083,7 @@ int pd_bf16_gemm_mma(const void* w, const void* bias, const void* x, void* y,
     // issue-bound arm). The ENGINE elects
     // by out width - small-out planes keep the mr class this entry used to
     // refuse into.
-    if (batch < 2u || (in_dim & 15u)) return -2;
+    if (in_dim & 15u) return -2;
     cudaStream_t st = (cudaStream_t)stream;
     const __nv_bfloat16* wp = (const __nv_bfloat16*)w;
     const float* xp = (const float*)x;
@@ -2092,6 +2097,11 @@ int pd_bf16_gemm_mma(const void* w, const void* bias, const void* x, void* y,
                 != cudaSuccess || sms <= 0)
             sms = 1; // query failure: fall through to the batch-only rule
     }
+    // one row only on the vocab-scale arm: a head whose decode rows run one
+    // tile class at every row count (Transcribe's bf16 head - its one-row
+    // ticks and prompt tails score like the rows of a wider tick); every
+    // other one-row call is a GEMV's
+    if (batch < 2u && out_dim < 256u * (uint32_t)sms) return -2;
     // HUGE-out_dim arm (rung 5: the lm_head memory path). Same-instrument nsys
     // at c32 put our lm_head at 439.9 us / 2.89 TB/s = 36% of the 8 TB/s roof
     // against the rival's nvjet at 194.2 us / 6.54 TB/s = 82%, on a 3880-block
@@ -2150,8 +2160,16 @@ int pd_bf16_gemm_mma(const void* w, const void* bias, const void* x, void* y,
         // i.e. only the vocab-scale plane pays, which is exactly the gate it
         // sits behind. Declines (returns -1) on any shape it cannot serve.
         if (bp == nullptr) {
-            const int r = pd_bf16_tma_cfg<32u, 8u, 2u, 1u, 4u>(
-                    wp, xp, bp, yp, in_dim, out_dim, batch, st);
+            // past one column tile (a verify round's rows: 128 on a
+            // Transcribe round) the column tiles go on x - each row tile's
+            // boxes stream from DRAM once, not once per 32 rows (GB10
+            // 2026-11-14: a 128-row bf16 head over 131072 x 2688 ran 12.8 ms,
+            // four streams of the plane). Bit-exact: same tiles, same walk.
+            const int r = batch > 32u
+                ? pd_bf16_tma_cfg<32u, 8u, 2u, 1u, 4u, true>(
+                        wp, xp, bp, yp, in_dim, out_dim, batch, st)
+                : pd_bf16_tma_cfg<32u, 8u, 2u, 1u, 4u>(
+                        wp, xp, bp, yp, in_dim, out_dim, batch, st);
             if (r >= 0) return r;
         }
 #endif
@@ -2241,7 +2259,7 @@ int pd_bf16_qkv_gemm_mma(const void* w, const void* x, void* yq, void* yk,
                          void* yv, uint32_t in_dim, uint32_t oq, uint32_t okv,
                          uint32_t batch, void* stream) {
     if (in_dim == 0 || (oq == 0 && okv == 0) || batch == 0) return 0;
-    if (batch < 2u || (in_dim & 15u)) return -2;
+    if (in_dim & 15u) return -2;
     cudaStream_t st = (cudaStream_t)stream;
     const __nv_bfloat16* wp = (const __nv_bfloat16*)w;
     const float* xp = (const float*)x;

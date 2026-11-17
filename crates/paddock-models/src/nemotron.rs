@@ -64,6 +64,11 @@ pub struct NemotronConfig {
     /// `nemotron_h_omni` (tensors under `language_model.`, a RADIO tower
     /// and projector beside it).
     pub omni: bool,
+    /// The checkpoint is Nemotron 3.5 Transcribe's speech LM (NeMo's
+    /// `nemo_speechlm`): the language model's tensors at the root as usual,
+    /// the audio perception beside them in `perception.safetensors`, the MTP
+    /// block in `model-mtp-fp8.safetensors` under `llm.mtp.`.
+    pub transcribe: bool,
     /// MTP blocks the checkpoint carries (`num_nextn_predict_layers`).
     pub mtp_layers: usize,
 
@@ -91,12 +96,14 @@ impl NemotronConfig {
         let top: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)
                 .map_err(|e| StError::Header(e.to_string()))?;
-        // the vision-language wrapper carries the language model's config
-        // whole, under `llm_config`
-        let omni = top.get("model_type").and_then(|x| x.as_str()) == Some("nemotron_h_omni");
-        let v = if omni {
+        // the vision-language and speech-LM wrappers carry the language
+        // model's config whole, under `llm_config`
+        let wrapper = top.get("model_type").and_then(|x| x.as_str());
+        let omni = wrapper == Some("nemotron_h_omni");
+        let transcribe = wrapper == Some("nemo_speechlm");
+        let v = if omni || transcribe {
             top.get("llm_config").cloned().ok_or_else(|| {
-                StError::Header("nemotron_h_omni config.json: missing llm_config".into())
+                StError::Header(format!("{wrapper:?} config.json: missing llm_config"))
             })?
         } else {
             top
@@ -137,7 +144,7 @@ impl NemotronConfig {
             })
             .collect::<Result<_, _>>()?;
 
-        // the omni wrapper's llm_config leaves the count to the block list
+        // the wrappers' llm_config leaves the count to the block list
         let n_layer = if v.get("num_hidden_layers").is_some() {
             u("num_hidden_layers")?
         } else {
@@ -207,6 +214,7 @@ impl NemotronConfig {
                 .and_then(|x| x.as_u64())
                 .map(|x| x as usize),
             omni,
+            transcribe,
             mtp_layers: v
                 .get("num_nextn_predict_layers")
                 .and_then(|x| x.as_u64())
@@ -388,6 +396,7 @@ impl NemotronConfig {
             routed_scale: f("expert_weights_scale")?,
             latent: None,
             omni: false,
+            transcribe: false,
             mtp_layers: nextn,
             eos_ids,
             bos_id: g
@@ -510,8 +519,55 @@ mod tests {
         flat["num_hidden_layers"] = serde_json::json!(88);
         std::fs::write(dir.path().join("config.json"), flat.to_string()).expect("write");
         let c = NemotronConfig::read(dir.path()).expect("flat config parses");
-        assert!(!c.omni && c.latent.is_none());
+        assert!(!c.omni && !c.transcribe && c.latent.is_none());
         assert_eq!(c.expert_in(), 4096);
+    }
+
+    /// Nemotron 3.5 Transcribe's speech-LM wrapper: Lightning's geometry
+    /// under `llm_config`, eos from generation_config ([11]).
+    #[test]
+    fn speech_lm_wrapper_unwraps_the_language_model_config() {
+        let blocks: Vec<&str> = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+            .chars()
+            .map(|c| match c {
+                'M' => "mamba",
+                'E' => "moe",
+                _ => "attention",
+            })
+            .collect();
+        let llm = serde_json::json!({
+            "model_type": "nemotron_h", "hidden_size": 2688,
+            "layers_block_type": blocks, "vocab_size": 131072,
+            "max_position_embeddings": 262144, "layer_norm_epsilon": 1e-5,
+            "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+            "mamba_num_heads": 64, "mamba_head_dim": 64, "ssm_state_size": 128,
+            "conv_kernel": 4, "n_groups": 8, "chunk_size": 128,
+            "n_routed_experts": 128, "num_experts_per_tok": 6,
+            "moe_intermediate_size": 1856, "moe_shared_expert_intermediate_size": 3712,
+            "moe_latent_size": null, "routed_scaling_factor": 2.5,
+            "num_nextn_predict_layers": 1, "eos_token_id": 2, "bos_token_id": 1
+        });
+        let top = serde_json::json!({
+            "model_type": "nemo_speechlm",
+            "architectures": ["Nemotron3_5TranscribeForConditionalGeneration"],
+            "llm_config": llm,
+        });
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.json"), top.to_string()).expect("write");
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            r#"{"eos_token_id": [11], "pad_token_id": 0}"#,
+        )
+        .expect("write");
+        let c = NemotronConfig::read(dir.path()).expect("speech-LM config parses");
+        assert!(c.transcribe && !c.omni && c.latent.is_none());
+        assert_eq!((c.n_layer, c.hidden, c.vocab), (52, 2688, 131072));
+        let attn: Vec<usize> = (0..c.n_layer)
+            .filter(|&i| c.blocks[i] == NemotronBlock::Attention)
+            .collect();
+        assert_eq!(attn, vec![5, 12, 19, 26, 33, 42]);
+        assert_eq!(c.mtp_layers, 1);
+        assert_eq!(c.eos_ids, vec![11]);
     }
 
     /// The two official drafters' configs as NVIDIA ships them (quantization

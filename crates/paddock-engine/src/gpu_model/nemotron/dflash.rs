@@ -1127,6 +1127,9 @@ impl GpuNemotron {
                 HeadW::Nvf4(h) => {
                     super::head_nvf4_batch(&exec, h, &st.d_hx, &mut st.d_logits, hrows, false)?
                 }
+                HeadW::Bf16(h) => {
+                    super::head_bf16_batch(&exec, h, &st.d_hx, &mut st.d_logits, hrows, false)?
+                }
                 HeadW::F8(_) => {
                     return Err(GpuModelError::Unsupported(
                         "DFlash drafting is wired for the NVFP4 / GGUF heads".into(),

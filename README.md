@@ -159,10 +159,13 @@ Every model below runs on the engine today. Sizes are the checkpoint's own, and
 - **Qwen3-ASR** 1.7B, and **Qwen3 Forced Aligner** 0.6B
 - **Granite Speech 4.1** - 2B and 2B Plus
 - **Nemotron 3 Diarization** (NVIDIA) - who spoke when, overlapping speakers
-  included, in recordings up to 10 minutes; the Studio draws it as a speaker
+  included, in recordings up to 4 hours; the Studio draws it as a speaker
   timeline
 - **Nemotron 3.5 ASR Streaming** (NVIDIA) - 0.6B; live transcripts that are
   never revised, in 40 languages and locales. NVIDIA GPUs for now
+- **Nemotron 3.5 Transcribe** (NVIDIA) - 30B-A4B; recordings up to an hour in
+  40 languages, with word timestamps and speaker labels, and it translates
+  speech and answers questions about it. Blackwell GPUs (NVFP4)
 - **Phonon** 31M (Gradium) - English text to speech, streamed as it's made, on
   NVIDIA GPUs and the Mac
 - **Whisper Large** fine-tunes - KB-Whisper (Swedish), NB-Whisper (Norwegian),

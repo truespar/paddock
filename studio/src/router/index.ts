@@ -11,6 +11,8 @@ import ApiReference from '@/components/manage/ApiReference.vue'
 import InstrumentPanel from '@/components/manage/InstrumentPanel.vue'
 import GpuSupportPanel from '@/components/manage/GpuSupportPanel.vue'
 import TrustPanel from '@/components/manage/TrustPanel.vue'
+import BatchesPanel from '@/components/manage/BatchesPanel.vue'
+import BatchDetail from '@/components/manage/BatchDetail.vue'
 import PromptsPanel from '@/components/prompts/PromptsPanel.vue'
 import EmbeddingsPanel from '@/components/embeddings/EmbeddingsPanel.vue'
 import ReadsPanel from '@/components/reads/ReadsPanel.vue'
@@ -76,6 +78,12 @@ const router = createRouter({
         // link to and search, not a fold-out inside a notice - it wants a
         // separate url with a real, clear table.
         { path: 'gpus', name: 'gpus', component: GpuSupportPanel },
+        // Batches: the manager runs the vendors' batch APIs against the
+        // models it serves - a control-plane job queue, so it lives here
+        // beside the fleet. The list, then one batch (results, files,
+        // cancel / delete) by its id.
+        { path: 'batches', name: 'batches', component: BatchesPanel },
+        { path: 'batches/:id', name: 'batch-detail', component: BatchDetail },
         // Installing this box's certificate. Its own URL because you open it
         // on the device that needs it - the phone, the other laptop - so it
         // has to be something you can type or send, not a panel nested inside

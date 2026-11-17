@@ -549,6 +549,42 @@ impl Store {
         Ok(rows)
     }
 
+    /// Every batch on the box, both dialects, newest first - the Studio's
+    /// monitor. `active` keeps only batches still running (`Some(true)`) or
+    /// only ended ones (`Some(false)`); `after` pages towards older ones.
+    pub fn batch_list_any(
+        &self,
+        after: Option<&str>,
+        active: Option<bool>,
+        limit: usize,
+    ) -> Result<Vec<BatchRow>, StoreError> {
+        let conn = self.lock();
+        let key: Option<(i64, String)> = match after {
+            Some(i) => conn
+                .query_row(
+                    "SELECT created_ms, id FROM batches WHERE id = ?1",
+                    params![i],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?,
+            None => None,
+        };
+        let (ms, id) = key.map_or((None, None), |(m, i)| (Some(m), Some(i)));
+        let ended = "status IN ('completed', 'failed', 'expired', 'cancelled')";
+        let filter = match active {
+            Some(true) => format!("AND NOT ({ended})"),
+            Some(false) => format!("AND {ended}"),
+            None => String::new(),
+        };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {BATCH_COLS} FROM batches
+              WHERE (?1 IS NULL OR (created_ms, id) < (?1, ?2)) {filter}
+              ORDER BY created_ms DESC, id DESC LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(params![ms, id, limit as i64], batch_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Every batch that still has work or a pending webhook, oldest first -
     /// the dispatcher's order of service.
     pub fn batch_open(&self) -> Result<Vec<BatchRow>, StoreError> {

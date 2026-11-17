@@ -199,6 +199,7 @@ impl GpuNemotron {
                 keys: tokens.clone(),
                 tokens,
                 cursor,
+                media: None,
             },
         );
         Ok(())
@@ -220,16 +221,46 @@ impl GpuNemotron {
     /// streams the experts once instead of once per base width (GB10
     /// 2026-09-11: 2048 / 4096 / 8192 rows per tick measured on the 8x1k
     /// cohort and on 4k / 8k prompts).
+    /// `wait`: a pass with nothing else to run takes the first queued prompt
+    /// even when its encode has not landed (lending waits for it) rather than
+    /// running empty; a round's pass never waits.
     pub(super) fn plan_chunk(
         &self,
         budget: usize,
+        wait: bool,
     ) -> (Vec<(u32, u32, u32)>, Vec<(usize, usize, bool)>) {
         let mut rows: Vec<(u32, u32, u32)> = Vec::new();
         let mut take: Vec<(usize, usize, bool)> = Vec::new();
-        if self.chunked.is_empty() {
-            return (rows, take);
+        // PADDOCK_TR_SKIP_UNLANDED (dev): a recording prompt whose encode is
+        // still on the speech lane sits the pass out instead of the pass
+        // waiting for it. Measured worse (GB10 2026-11-14, FLEURS c32 RTFx
+        // 137.3 -> 134.1): the wait costs the die ~10 ms a round, a skipped
+        // prompt costs its slot the whole round. Off: every queued prompt is
+        // eligible and lending waits on the encode.
+        let skip = paddock_models::dev_var_os!("PADDOCK_TR_SKIP_UNLANDED").is_some();
+        let mut landed: Vec<usize> = (0..self.chunked.len())
+            .filter(|&qi| {
+                !skip
+                    || match self.chunked[qi]
+                        .media
+                        .as_ref()
+                        .and_then(|m| m.encode.as_ref())
+                    {
+                        Some((sh, _)) => sh
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .landed(&self.exec),
+                        None => true,
+                    }
+            })
+            .collect();
+        if landed.is_empty() && wait {
+            landed.push(0);
         }
-        let first_rem = self.chunked[0].tokens.len() - self.chunked[0].cursor;
+        let Some(&q0) = landed.first() else {
+            return (rows, take);
+        };
+        let first_rem = self.chunked[q0].tokens.len() - self.chunked[q0].cursor;
         let width = super::forward::PREFILL_TICK_BASE.max(first_rem);
         let cap = budget.clamp(1, self.prefill_chunk).min(width.max(1));
         // Prompt-aligned ticks (GB10, 2026-09-11):
@@ -252,13 +283,14 @@ impl GpuNemotron {
         } else {
             cap
         };
-        for (qi, c) in self.chunked.iter().enumerate() {
+        for (k, &qi) in landed.iter().enumerate() {
+            let c = &self.chunked[qi];
             if rows.len() >= cap {
                 break;
             }
             let remaining = c.tokens.len() - c.cursor;
-            let limit = if qi == 0 { cap } else { slack_cap };
-            if align && qi > 0 && rows.len() + remaining > limit {
+            let limit = if k == 0 { cap } else { slack_cap };
+            if align && k > 0 && rows.len() + remaining > limit {
                 break;
             }
             let n = remaining.min(limit - rows.len()).max(1);
@@ -285,7 +317,10 @@ impl GpuNemotron {
             let slot = self.chunked[qi].slot;
             let toks = std::mem::take(&mut self.chunked[qi].tokens);
             let keys = std::mem::take(&mut self.chunked[qi].keys);
-            self.prefix_insert(slot, &keys);
+            // a recording prompt's placeholder ids key nothing (mm.rs)
+            if self.chunked[qi].media.is_none() {
+                self.prefix_insert(slot, &keys);
+            }
             out.push((slot, fs, toks.len()));
         }
         self.chunked.retain(|c| !c.tokens.is_empty());
@@ -328,7 +363,7 @@ impl GpuNemotron {
         let (chunk_rows, take) = if room == 0 {
             (Vec::new(), Vec::new())
         } else {
-            self.plan_chunk(budget.min(room))
+            self.plan_chunk(budget.min(room), dec_n == 0)
         };
         rows.extend_from_slice(&chunk_rows);
         let mut fin: Vec<(usize, usize)> = Vec::new();
@@ -365,6 +400,11 @@ impl GpuNemotron {
         let max_stages = self.ckpt_stage_count();
         for &(qi, n, _) in take {
             let c = &self.chunked[qi];
+            if c.media.is_some() {
+                // a recording prompt never feeds the cache (mm.rs)
+                row_base += n;
+                continue;
+            }
             for cut in super::prefix::ckpt_cuts(c.tokens.len(), step) {
                 if cut > c.cursor && cut <= c.cursor + n && stage < max_stages {
                     breaks.push((row_base + (cut - c.cursor), stage));
@@ -401,7 +441,7 @@ impl GpuNemotron {
         ),
         GpuModelError,
     > {
-        use crate::generator::{FinishSample, SampledStep};
+        use crate::generator::SampledStep;
         // Nothing queued -> a plain decode tick on the captured graph.
         if self.chunked.is_empty() {
             let step = if decodes.is_empty() {
@@ -427,7 +467,10 @@ impl GpuNemotron {
         for &(slot, tok, pos) in decodes {
             self.reply_feed(slot, pos, tok);
         }
-        self.rows_pass_body(&rows, dec_n, breaks)?;
+        let lent = self.lend_media(&take, dec_n)?;
+        let pass = self.rows_pass_body(&rows, dec_n, breaks);
+        self.return_media(lent);
+        pass?;
         self.mixed_stage_commit(after);
         {
             let dslots: Vec<u32> = decodes.iter().map(|d| d.0 as u32).collect();
@@ -446,22 +489,122 @@ impl GpuNemotron {
                 host_rows: Vec::new(),
             }
         };
-        let mut finished_raw = Vec::with_capacity(fin.len());
-        for &(row, qi) in &fin {
-            let slot = self.chunked[qi].slot;
-            let plan = fin_plans.iter().find(|(s, _)| *s == slot).map(|(_, p)| *p);
-            let fs = match plan {
-                Some(p @ crate::generator::RowSample::Device(_)) => {
-                    self.head_row_at(row)?;
-                    let s = self.sample_head_rows(1, std::slice::from_ref(&p), false)?;
-                    FinishSample::Sampled(s.ids[0])
-                }
-                _ => FinishSample::Logits(self.head_row(row)?),
-            };
-            finished_raw.push((qi, fs));
-        }
+        let finished_raw = self.finish_prompts(&fin, fin_plans)?;
         let finished = self.commit_chunk(&take, finished_raw);
         Ok((step, finished))
+    }
+
+    /// The prompts a pass finished: each one's tail row `(pass row, queue
+    /// index)` through the head, sampled on device where its plan allows,
+    /// else its logits to the host.
+    pub(super) fn finish_prompts(
+        &mut self,
+        fin: &[(usize, usize)],
+        fin_plans: &[(usize, crate::generator::RowSample)],
+    ) -> Result<Vec<(usize, crate::generator::FinishSample)>, GpuModelError> {
+        use crate::generator::FinishSample;
+        let mut finished_raw = Vec::with_capacity(fin.len());
+        if fin.len() > 1 && self.w16_class_probe(fin.len()) {
+            // the tails in one head call: a cohort of short prompts (a
+            // recording wave) finishes several a tick, and each one-row head
+            // re-streamed the whole vocab plane (4 x 2.7 ms a tick, GB10
+            // 2026-11-14). The W16 head scores a row alike at any count.
+            use crate::generator::RowSample;
+            let rows: Vec<usize> = fin.iter().map(|&(row, _)| row).collect();
+            let plans: Vec<RowSample> = fin
+                .iter()
+                .map(|&(_, qi)| {
+                    let slot = self.chunked[qi].slot;
+                    match fin_plans.iter().find(|(s, _)| *s == slot).map(|(_, p)| *p) {
+                        Some(p @ RowSample::Device(_)) => p,
+                        _ => RowSample::Host,
+                    }
+                })
+                .collect();
+            self.head_rows_at(&rows)?;
+            let s = self.sample_head_rows(rows.len(), &plans, false)?;
+            let mut host = s.host_rows.into_iter();
+            for (i, &(_, qi)) in fin.iter().enumerate() {
+                let fs = match plans[i] {
+                    RowSample::Device(_) => FinishSample::Sampled(s.ids[i]),
+                    _ => FinishSample::Logits(host.next().expect("host row").1),
+                };
+                finished_raw.push((qi, fs));
+            }
+        } else {
+            for &(row, qi) in fin {
+                let slot = self.chunked[qi].slot;
+                let plan = fin_plans.iter().find(|(s, _)| *s == slot).map(|(_, p)| *p);
+                let fs = match plan {
+                    Some(p @ crate::generator::RowSample::Device(_)) => {
+                        self.head_row_at(row)?;
+                        let s = self.sample_head_rows(1, std::slice::from_ref(&p), false)?;
+                        FinishSample::Sampled(s.ids[0])
+                    }
+                    _ => FinishSample::Logits(self.head_row(row)?),
+                };
+                finished_raw.push((qi, fs));
+            }
+        }
+        Ok(finished_raw)
+    }
+
+    /// Speculative mixed tick: the decode rows' verify round, then the
+    /// prefill chunk as a span of its own. Without it the trait's decline
+    /// sent every mixed tick to the plain one AFTER the service had drafted
+    /// (the drafts were thrown away) and its decode rows advanced one token
+    /// each - at c32 on a recording cohort that was every other tick (GB10
+    /// 2026-11-14: a 128-row round, then 3 wasted MTP steps and a 1-token
+    /// band beside a ~700-row chunk). Two passes rather than one walk: the
+    /// verify rows stand for decode steps and keep their class (W16), the
+    /// chunk keeps the block-scaled lanes, and the two cannot share a
+    /// launch - the band recompute a fused walk would need re-streams the
+    /// experts anyway. The span carries no decode rows, so no band either.
+    /// The round goes first: a decline leaves the chunk untouched, which is
+    /// the service's fallback contract.
+    pub(crate) fn forward_mixed_spec_impl(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+        budget: usize,
+        plans: &[crate::sampler::DevicePlan],
+        fin_plans: &[(usize, crate::generator::RowSample)],
+    ) -> Result<
+        (
+            Option<Vec<u32>>,
+            Vec<(usize, crate::generator::FinishSample, usize)>,
+        ),
+        GpuModelError,
+    > {
+        if self.fused_rounds() {
+            // the round and the chunk in one pass (fused.rs), the plans'
+            // checks as the round alone takes them
+            use crate::sampler::DevicePlan;
+            let total: usize = reqs.iter().map(|r| r.2.len()).sum();
+            let runnable = plans.iter().all(|p| match p {
+                DevicePlan::Greedy | DevicePlan::Categorical { .. } => true,
+                DevicePlan::TruncCat { .. } => self.device_trunc_supported(),
+                DevicePlan::RsVerify { .. } | DevicePlan::RsTrunc { .. } => false,
+            });
+            if plans.len() != total || !runnable || !self.supports_device_sampling_impl() {
+                return Ok((None, Vec::new()));
+            }
+            return Ok(
+                match self.forward_fused_round(
+                    reqs,
+                    budget,
+                    super::spec::VerifyPick::Plans(plans),
+                    fin_plans,
+                )? {
+                    Some((picks, finished)) => (Some(picks), finished),
+                    None => (None, Vec::new()),
+                },
+            );
+        }
+        let Some(picks) = self.forward_spec_batch_plans_impl(reqs, plans)? else {
+            return Ok((None, Vec::new()));
+        };
+        let (_, finished) = self.forward_mixed_sampled_impl(&[], budget, &[], fin_plans)?;
+        Ok((Some(picks), finished))
     }
 
     /// The unsampled mixed tick (full logits readback).
@@ -490,7 +633,10 @@ impl GpuNemotron {
         for &(slot, tok, pos) in decodes {
             self.reply_feed(slot, pos, tok);
         }
-        self.rows_pass_body(&rows, dec_n, breaks)?;
+        let lent = self.lend_media(&take, dec_n)?;
+        let pass = self.rows_pass_body(&rows, dec_n, breaks);
+        self.return_media(lent);
+        pass?;
         self.mixed_stage_commit(after);
         {
             let dslots: Vec<u32> = decodes.iter().map(|d| d.0 as u32).collect();

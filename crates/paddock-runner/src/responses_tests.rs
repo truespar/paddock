@@ -650,6 +650,25 @@ fn image_bearing_content_arrays_pass_through() {
     );
 }
 
+/// A clip in a message used to be flattened away with its array (only image
+/// arrays were kept), so the model answered a question about audio it never
+/// received - a 200 with the input quietly gone.
+#[test]
+fn an_audio_part_keeps_its_content_array() {
+    let input = json!([{
+        "type": "message", "role": "user",
+        "content": [
+            {"type": "input_text", "text": "What is said here?"},
+            {"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}}
+        ]
+    }]);
+    let msgs = messages_from_input(None, &input).unwrap();
+    assert!(msgs[0]["content"].is_array(), "{:?}", msgs[0]);
+    let clips = crate::chat::find_audio(&msgs).unwrap();
+    assert_eq!(clips.len(), 1);
+    assert_eq!(clips[0].format, "wav");
+}
+
 #[test]
 fn text_only_content_arrays_flatten() {
     let input = json!([{

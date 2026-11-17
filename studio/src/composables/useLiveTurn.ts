@@ -36,6 +36,12 @@ function uid(): string {
   return uuid()
 }
 
+/** The mean of what was scored; undefined where nothing was - a word the lane
+ *  timed but could not score is not a zero. */
+function mean(xs: number[]): number | undefined {
+  return xs.length ? xs.reduce((s, x) => s + x, 0) / xs.length : undefined
+}
+
 /** One lane's utterances as the transcript machinery wants them.
  *
  *  Times arrive UTTERANCE-LOCAL - `paddock_verbose` is the object the file
@@ -68,10 +74,7 @@ function metaOf(lane: MicLane): TranscriptMeta {
         // the span's own figure is the mean of its words, which is the same
         // shape the file lane's `exp(avg_logprob)` has - absent where the lane
         // could not answer per-word confidence at all
-        confidence: timed.length
-          ? // `?? 0` is for the type only: live-lane words always carry one
-            timed.reduce((s, w) => s + (w.confidence ?? 0), 0) / timed.length
-          : undefined,
+        confidence: mean(timed.flatMap((w) => (w.confidence === undefined ? [] : [w.confidence]))),
         words: timed.length ? timed : undefined,
       })
     }

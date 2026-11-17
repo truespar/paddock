@@ -9046,6 +9046,249 @@ revision = "2026-10-29"
     sha256 = "14e03de50a523c1b6b4542c22d38ec11cadc515a95752e5a4c8246967f620857"
     size = 2490
 
+# NVIDIA's NVFP4 release of Nemotron 3.5 Transcribe, served from its own
+# checkpoint directory on CUDA: the Lightning-geometry language model
+# (ModelOpt mixed: NVFP4 attention and experts, a bf16 head), the speech
+# encoder - the ASR branch's FP8 W8A8 linears as shipped and the Nemotron 3
+# Diarization speaker branch - in perception.safetensors, the FP8 MTP block
+# (model-mtp-fp8) and the CTC timestamp head (model-ctc-bf16) that word
+# timestamps and speaker labels come from. 23 files mirrored under
+# models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/ - the shards and their
+# index, the three side files, configs, tokenizer, chat template, licences
+# and model card - every byte checked against revision 66c6adc4's LFS ids /
+# blobs (its .gitattributes left out). The release ships its OpenMDW-1.1
+# LICENSE and the third-party licences it carries.
+[[model]]
+id = "nemotron-3.5-transcribe-30b"
+# KV8 by default: the family default
+kv_default = "fp8_e4m3"
+# the MTP block ships in the checkpoint directory (model-mtp-fp8)
+mtp_in_file = true
+vendor = "NVIDIA"
+display = "Nemotron 3.5 Transcribe 30B-A4B"
+family = "nemotron-h"
+capability = ["transcription", "chat", "reasoning", "speculative"]
+license = "openmdw-1.1"
+revision = "2026-11-15"
+
+  [model.specs]
+  params = "34B total, 4.3B active (audio encoder included)"
+  context = "64K"
+  published_at = "2026-10-12"
+  published_source = "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4"
+  homepage = "https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4"
+  about = "NVIDIA's speech model - transcribes recordings of up to an hour in 40 languages, with word timestamps and speaker labels, and also translates speech and answers questions about it."
+  strengths = [
+    "Transcribes 40 languages, verbatim or as clean written text, with optional context terms for names and jargon",
+    "Word timestamps and speaker labels from the same request (diarized transcripts)",
+    "Built for throughput - many recordings at once on one card",
+  ]
+  tradeoffs = [
+    "Needs a Blackwell card (NVFP4) and about 22 GB of weights",
+    "Whole recordings, not a live microphone stream",
+    "Speaker labels tell the voices in a recording apart; they do not identify who is speaking",
+  ]
+
+  [[model.artifact]]
+  id = "nvfp4"
+  kind = "weights"
+  format = "safetensors"
+  label = "Compact (Blackwell)"
+  quant = "NVFP4"
+  default = true
+  # sm_120a or better: the NVFP4 consumers (the sorted W4A4 expert pair, the
+  # W16 decode class) compile under PD_BS_OK.
+  min_cc = [12, 0]
+  # Device bytes beyond the weights, the KV pool and the mamba arenas at the
+  # default 65536 x 64, measured serving the registry pull (GB10): the speech
+  # encoder's workspace 169,951,316 (the speaker branch's planes and the
+  # encode pass's scratch, reserved at load), the 8192-row prefill scratch
+  # 2.31 GiB, the prefix state staging 1.53 GiB and the MTP verify planes
+  # 0.14 GiB - rounded up from the loader's reserves. The VRAM audit after
+  # enable_batch: 0 MiB unplanned.
+  workspace = 4460000000
+
+  [model.artifact.source]
+  repo = "nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4"
+  base_model = "nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B"
+  revision = "66c6adc4020179567074d0399cda2a4eeb2bb347"
+  license = "openmdw-1.1"
+  license_url = "https://openmdw.ai/license/1-1/"
+
+  [model.artifact.runtime]
+  backends = ["cuda"]
+  checkpoint_dir = true
+  companions = []
+  # the card's serving profile: its trained 64K context (an hour of audio
+  # plus the transcript) at 64 sequences - batched transcription is what
+  # this model is for - fitted to the card at admission
+  default_max_ctx = 65536
+  default_max_batch = 64
+
+  [model.artifact.shape]
+  # resident at load: the NVFP4 language model with its shared-expert
+  # fold-in, the speech encoder + speaker branch + CTC head (0.97 GiB) and
+  # the MTP block (nextn_bytes, loaded only when speculating)
+  weight_bytes = 21837320444
+  kind = "generative"
+  vocab = 131072
+  # the trained context (the card: recordings up to an hour, 65,536 tokens)
+  max_ctx = 65536
+  nextn_bytes = 1338790912
+  source = "measured"
+  # 6 attention layers at 256/256, plus the MTP block's attention K/V: it
+  # rides the pool as f16 stripes (1 KB a token), exactly two more 256/256
+  # layers at the fp8 element size
+  kv_layers = [
+    { k_dim = 256, v_dim = 256, count = 8 },
+  ]
+
+    # 23 mamba-2 layers: 64 heads x 64 x 128 state, a 6144-wide conv of 4 taps
+    [model.artifact.shape.recurrent]
+    layers = 23
+    state_elems = 524288
+    conv_elems = 18432
+    conv_dim = 6144
+    elem_bytes = 4
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/model-00001-of-00002.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/model-00001-of-00002.safetensors"
+    sha256 = "633b7ca55c9bd105e03499ad238f65193b949b4f0003226a5b2639b970162fe3"
+    size = 9988250728
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/model-00002-of-00002.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/model-00002-of-00002.safetensors"
+    sha256 = "75666c368d00e037216cd86e0086df242f126a2f1def78a71c93fe06c66ea676"
+    size = 9192549192
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/CONTRIBUTING.md"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/CONTRIBUTING.md"
+    sha256 = "a7454a46e4dfa3803f1d6049cfda5292ea1e7643b3a62bae075befe0bb0232a6"
+    size = 2179
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/LICENSE"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/LICENSE"
+    sha256 = "18c3a96fd1ee779263aa9210e3d962d5899511890254f3f3efd70ece81d89866"
+    size = 2694
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/README.md"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/README.md"
+    sha256 = "dc4049b66d750e2a40351e4c2b64cbf56f1f7d9fb354bf03c7d618bfec1d9336"
+    size = 127568
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/THIRD_PARTY_NOTICES.md"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/THIRD_PARTY_NOTICES.md"
+    sha256 = "d61d7ca8e896ccc5de6573ce75cc91335fe7460718b8cd84a8f1312fd5b1b72c"
+    size = 2305
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/architecture.png"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/architecture.png"
+    sha256 = "bcf8a0ae24191ed08feede766aedb2cca1431dd389badc8c691f6d85c4cad712"
+    size = 57225
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/chat_template.jinja"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/chat_template.jinja"
+    sha256 = "c439e20c5565d590915ff8777c519b3ebcd3da685e677893bee56f73036eb67c"
+    size = 12482
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/config.json"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/config.json"
+    sha256 = "c6509c7a68ae4bd94fca06a39216029c233f8dc43428d6228fe425cfe4926313"
+    size = 472362
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/finetune_gains.png"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/finetune_gains.png"
+    sha256 = "2f3543adfd622fcd474bb42a04b4b331be63899fbe133d26b0c90e15fbaab74b"
+    size = 55125
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/generation_config.json"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/generation_config.json"
+    sha256 = "1ff3bfb8a60751cc1f68d756dc05b20910c3d124f38ef8ac5aed59e374aa7f09"
+    size = 92
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/hero.png"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/hero.png"
+    sha256 = "a7a120da10970753a539fc8426238bab866725ce75cf4e2b54d3a5dd75948efc"
+    size = 174864
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/hf_quant_config.json"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/hf_quant_config.json"
+    sha256 = "dff9458dd0e62f9c10551b152452a79bfe3e36b3d803a43a28dad27706894d4c"
+    size = 31826
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/licenses/Qwen3-ASR-LICENSE.txt"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/licenses/Qwen3-ASR-LICENSE.txt"
+    sha256 = "a44a6081c73ad75f0255bb2bb5cab74ef1829565a895a24e53a4f11290ab7655"
+    size = 11343
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/licenses/vLLM-LICENSE.txt"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/licenses/vLLM-LICENSE.txt"
+    sha256 = "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    size = 11357
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/llm_backbone/config.json"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/llm_backbone/config.json"
+    sha256 = "8f11ffe191b8ade26ff9b43196a2cfcc356f6ee73cfb3c6a6336968f178611d0"
+    size = 2403
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/model-ctc-bf16.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/model-ctc-bf16.safetensors"
+    sha256 = "fd902c40ab19dcb1a9f0a77a70043a2e5a3cadf682d0aa28ad10d57ce978f42e"
+    size = 201897998
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/model-mtp-fp8.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/model-mtp-fp8.safetensors"
+    sha256 = "b6569930eb0de2b020487e2002c99f841f3462c6741e7edcbb8527bfe332ac18"
+    size = 1335778712
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/model.safetensors.index.json"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/model.safetensors.index.json"
+    sha256 = "841f8f120aca973398891436b32e5de7444ce784a61217ccbf46e26738a7bd92"
+    size = 2587718
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/perception.safetensors"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/perception.safetensors"
+    sha256 = "e08b3c7f5f0056515a9772c9fd3f87af1120d1d9e900d406d046c487fa0a9e4a"
+    size = 838256800
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/serving_performance.png"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/serving_performance.png"
+    sha256 = "6da08005d04388bace9ada9219d54dcf60296bbbbb91d8601205ec7b5eb1479f"
+    size = 50684
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/tokenizer.json"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/tokenizer.json"
+    sha256 = "d071004cb4450d3aa31f87aab979cd09ffc99c4e709e6cf72c324346cd948d0d"
+    size = 17078144
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/tokenizer_config.json"
+    dest = "NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4/tokenizer_config.json"
+    sha256 = "e11d0bb1b107a182a6db567822b605db852edcb01e87368bd8e28c62c2991d15"
+    size = 11782
+
 # Nemotron 3.5 Embed 8B (NVIDIA, Oct 2026): the multimodal embedder - a
 # Pixtral picture tower and Mistral 3's projector in front of a
 # bidirectional Ministral 3 8B body, mean-pooled and L2-normalized

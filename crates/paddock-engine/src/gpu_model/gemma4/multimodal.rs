@@ -465,6 +465,11 @@ impl GpuGemma4 {
                         "OCR crop directive on gemma4 - routing bug".into(),
                     ));
                 }
+                MmChunk::CtcTimestamps { .. } => {
+                    return Err(GpuError::Driver(
+                        "CTC timestamp directive on gemma4 - routing bug".into(),
+                    ));
+                }
                 MmChunk::VisionPixels { .. } => {
                     return Err(GpuError::Driver(
                         "pixel-budget directive on gemma4 - routing bug".into(),

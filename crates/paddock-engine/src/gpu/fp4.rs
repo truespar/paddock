@@ -3575,6 +3575,14 @@ impl GpuExecutor {
         })
     }
 
+    /// Whether the tiled down twins have their bf16-partial arms (slots
+    /// 956-957) - see [`Self::nvf4_moe_down_st_into`].
+    pub fn has_nvf4_moe_down_st_bf16(&self) -> bool {
+        self.kernels.nvf4_moe_down_st_bf16.is_some()
+            && self.kernels.nvf4_moe_down_stw_bf16.is_some()
+            && self.kernels.moe_slot_combine_bf16.is_some()
+    }
+
     /// Skinny/wide sorted-tile down over a TILED plane - the twin of
     /// [`Self::nvf4_moe_down_bs`] at the given `bm` block width.
     #[allow(clippy::too_many_arguments)]
@@ -3594,16 +3602,66 @@ impl GpuExecutor {
         nb: usize,
         bm: usize,
     ) -> Result<(), GpuError> {
+        self.nvf4_moe_down_st_into(
+            w,
+            sorted_row,
+            sorted_slot,
+            block_expert,
+            topk_w,
+            fq,
+            fs,
+            part,
+            kw,
+            np,
+            slot_off,
+            nb,
+            bm,
+            None,
+        )
+    }
+
+    /// [`Self::nvf4_moe_down_st`]; with `vf` the token rows from it on round
+    /// their partials to bf16 at the store, into a bf16 plane laid from
+    /// `part`'s row vf on (slots 956-957; fold with
+    /// [`Self::moe_slot_combine_split`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn nvf4_moe_down_st_into(
+        &self,
+        w: &Nvf4MoePlane,
+        sorted_row: &CudaSlice<u32>,
+        sorted_slot: &CudaSlice<u32>,
+        block_expert: &CudaSlice<u32>,
+        topk_w: Option<&CudaSlice<f32>>,
+        fq: &CudaSlice<u8>,
+        fs: &CudaSlice<u8>,
+        part: &mut CudaSlice<f32>,
+        kw: usize,
+        np: usize,
+        slot_off: usize,
+        nb: usize,
+        bm: usize,
+        vf: Option<usize>,
+    ) -> Result<(), GpuError> {
+        let k = &self.kernels;
         let f = match bm {
-            8 => self
-                .kernels
+            8 => k
                 .nvf4_moe_down_st
                 .ok_or(GpuError::MissingOp("nvf4_moe_down_st"))?,
-            32 => self
-                .kernels
+            32 => k
                 .nvf4_moe_down_stw
                 .ok_or(GpuError::MissingOp("nvf4_moe_down_stw"))?,
             _ => return Err(GpuError::Unsupported(format!("nvf4_moe_down_st: bm {bm}"))),
+        };
+        let split = match (bm, vf) {
+            (_, None) => None,
+            (8, Some(_)) => Some(
+                k.nvf4_moe_down_st_bf16
+                    .ok_or(GpuError::MissingOp("nvf4_moe_down_st_bf16"))?,
+            ),
+            (_, Some(_)) => Some(
+                k.nvf4_moe_down_stw_bf16
+                    .ok_or(GpuError::MissingOp("nvf4_moe_down_stw_bf16"))?,
+            ),
         };
         Self::moe_layout_ok(w, Nvf4MoeLayout::Tiled64, "nvf4_moe_down_st")?;
         debug_assert!(sorted_row.len() >= nb * bm);
@@ -3628,6 +3686,31 @@ impl GpuExecutor {
         let (fqp, _g7) = fq.device_ptr(&self.stream);
         let (fsp, _g8) = fs.device_ptr(&self.stream);
         let (pp, _g9) = part.device_ptr_mut(&self.stream);
+        if let (Some(g), Some(vf)) = (split, vf) {
+            // SAFETY: ABI contract; sizes checked above
+            return check(unsafe {
+                g(
+                    dp as *const _,
+                    sp as *const _,
+                    s2p as *const _,
+                    rp as *const _,
+                    slp as *const _,
+                    bp as *const _,
+                    wp,
+                    fqp as *const _,
+                    fsp as *const _,
+                    pp as *mut _,
+                    w.in_dim as u32,
+                    w.ff as u32,
+                    kw as u32,
+                    np as u32,
+                    slot_off as u32,
+                    nb as u32,
+                    vf as u32,
+                    self.stream_ptr(),
+                )
+            });
+        }
         // SAFETY: ABI contract; sizes checked above
         check(unsafe {
             f(

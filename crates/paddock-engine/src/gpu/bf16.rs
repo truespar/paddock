@@ -652,6 +652,44 @@ impl GpuExecutor {
         self.bf16_gemm_dispatch(w, first_row, out_dim, None, x, y, batch, true)
     }
 
+    /// [`Self::bf16_gemm_tile`] that keeps the tile at one row too, for a
+    /// vocab-scale head whose rows must score in one class at every row
+    /// count (the pack admits one row only there; a narrower plane refuses).
+    pub fn bf16_head_tile(
+        &self,
+        w: &QuantTensor,
+        x: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        out_dim: usize,
+        batch: usize,
+    ) -> Result<(), GpuError> {
+        if batch > 1 {
+            return self.bf16_gemm_tile(w, None, x, y, out_dim, batch);
+        }
+        let f = self
+            .kernels
+            .bf16_gemm_mma
+            .ok_or(GpuError::MissingOp("bf16_gemm_mma"))?;
+        let w = self.bf16_plane(w, "bf16_head_tile")?;
+        let in_dim = w.dims[0];
+        let (wp, _g1) = w.bytes.device_ptr(&self.stream);
+        let (xp, _g2) = x.device_ptr(&self.stream);
+        let (yp, _g3) = y.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract; x holds one in_dim row, y one out_dim row
+        check(unsafe {
+            f(
+                wp as *const _,
+                core::ptr::null(),
+                xp as *const _,
+                yp as *mut _,
+                in_dim as u32,
+                out_dim as u32,
+                1,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// `bf16_gemm` with the 2..=8 multi-row GEMV band SKIPPED - the caller
     /// wants the tensor-core tile there.
     ///

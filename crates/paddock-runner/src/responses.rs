@@ -141,8 +141,19 @@ fn is_image_part(p: &Value) -> bool {
         )
 }
 
+/// True when a content part is an audio clip (`input_audio`, or vLLM's
+/// `audio_url` extension) - the condition `find_audio` reads.
+fn is_audio_part(p: &Value) -> bool {
+    p.get("input_audio").is_some()
+        || p.get("audio_url").is_some()
+        || matches!(
+            p.get("type").and_then(Value::as_str),
+            Some("input_audio") | Some("audio_url")
+        )
+}
+
 /// Normalize `instructions` + `input` into chat-template messages. Content
-/// arrays that carry image parts pass through VERBATIM: the qwen template's
+/// arrays that carry image or audio parts pass through VERBATIM: the qwen template's
 /// item conditions (`'image_url' in item`, `'text' in item`) match the
 /// Responses part shapes directly, so the template emits the
 /// `<|image_pad|>` slots; text-only arrays flatten to a string.
@@ -207,8 +218,13 @@ fn messages_from_input(instructions: Option<&str>, input: &Value) -> Result<Vec<
                                 "content": parts.clone()
                             })])?;
                         }
+                        // a clip flattened to text would vanish with a 200
                         let content = match raw {
-                            Value::Array(parts) if parts.iter().any(is_image_part) => raw.clone(),
+                            Value::Array(parts)
+                                if parts.iter().any(|p| is_image_part(p) || is_audio_part(p)) =>
+                            {
+                                raw.clone()
+                            }
                             other => Value::String(content_text(other)),
                         };
                         let mut m = json!({"role": role, "content": content});
@@ -405,17 +421,17 @@ fn prepare(
     // had it inverted, so images never worked on either.
     let image_refs = find_images(messages)?;
 
-    // Audio parts are served on /v1/chat/completions and
-    // /v1/audio/transcriptions only - refuse here rather than let the
-    // template drop them silently now that `input_audio` passes part
-    // validation.
-    if !crate::chat::find_audio(messages)?.is_empty() {
-        return Err(
-            "audio input is served on /v1/chat/completions and /v1/audio/transcriptions, \
-             not on this endpoint"
-                .into(),
-        );
+    // Audio parts: the same capability-first split as images, and the same
+    // decode chat completions does (16 kHz mono; the template renders one
+    // audio slot per part and build_mm_chunks interleaves the clips there).
+    let audio_refs = crate::chat::find_audio(messages)?;
+    if !audio_refs.is_empty() && !model.supports_audio {
+        return Err(crate::chat::no_audio().into());
     }
+    if !audio_refs.is_empty() && !image_refs.is_empty() {
+        return Err(crate::chat::PICTURES_AND_AUDIO.into());
+    }
+    let audio = crate::chat::decode_audio_parts(audio_refs, model.audio_frontend)?;
     if !image_refs.is_empty() && !model.supports_vision {
         return Err(crate::chat::no_vision(model));
     }
@@ -607,7 +623,13 @@ fn prepare(
         prompt_ids.insert(0, bos);
     }
 
-    let (mut mm_chunks, engine_prompt) = if images.is_empty() {
+    let (mut mm_chunks, engine_prompt) = if !audio.is_empty() {
+        let pad = model
+            .audio_pad_id
+            .ok_or("model has no <|audio_pad|> token")?;
+        let mm = build_mm_chunks(&prompt_ids, pad, audio, None)?;
+        (Some(mm.chunks), mm.text_ids)
+    } else if images.is_empty() {
         (None, prompt_ids.clone())
     } else {
         let pad = model

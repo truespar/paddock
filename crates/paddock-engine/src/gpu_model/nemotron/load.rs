@@ -11,7 +11,7 @@ use std::sync::Arc;
 use cudarc::driver::CudaSlice;
 
 use crate::gpu::{
-    DeviceTensor, F8RowPlane, GpuError, GpuExecutor, KvDtype, Nvf4MoePlane, QuantTensor,
+    DeviceTensor, F8RowPlane, GpuError, GpuExecutor, KvDtype, Nvf4MoePlane, Nvf4Plane, QuantTensor,
 };
 use crate::gpu_model::gpt_oss::GpuModelError;
 use paddock_models::ggml_type::GgmlType;
@@ -217,7 +217,10 @@ impl GpuNemotron {
                 NemotronBlock::Attention
                     if st
                         .bytes(&format!("{pfx}.mixer.q_proj.weight_scale"))
-                        .is_some() =>
+                        .is_some()
+                        && st
+                            .bytes(&format!("{pfx}.mixer.q_proj.weight_scale_2"))
+                            .is_none() =>
                 {
                     // Super: ModelOpt FP8 projections - kept as e4m3 rows with
                     // the per-tensor scale broadcast, like mamba in/out_proj
@@ -242,6 +245,38 @@ impl GpuNemotron {
                         wk: f8("k_proj", kv_dim, hp.hidden)?,
                         wv: f8("v_proj", kv_dim, hp.hidden)?,
                         wo: f8("o_proj", hp.hidden, q_dim)?,
+                    })
+                }
+                NemotronBlock::Attention
+                    if st
+                        .bytes(&format!("{pfx}.mixer.q_proj.weight_scale_2"))
+                        .is_some() =>
+                {
+                    // Transcribe: ModelOpt NVFP4 projections, the checkpoint's
+                    // triples as row-major planes (the W4A4 GEMM and the
+                    // gemv family both read that layout)
+                    let q_dim = hp.n_heads * hp.head_dim;
+                    let kv_dim = hp.n_kv_heads * hp.head_dim;
+                    let mut nv4 =
+                        |name: &str, out: usize, inn: usize| -> Result<Nvf4Plane, GpuModelError> {
+                            let v =
+                                nvfp4_view(&st, &format!("{pfx}.mixer.{name}")).map_err(|e| {
+                                    GpuModelError::Unsupported(format!("{pfx} {name}: {e}"))
+                                })?;
+                            if (v.n, v.k) != (out, inn) {
+                                return Err(GpuModelError::Unsupported(format!(
+                                    "{pfx} {name} is [{}, {}], expected [{out}, {inn}]",
+                                    v.n, v.k
+                                )));
+                            }
+                            count(v.n * v.k / 2 + v.n * v.k / 16);
+                            Ok(exec.nvf4_upload(v.packed, v.scales, v.scale2, v.n, v.k)?)
+                        };
+                    Mixer::Attn(AttnWeights::Nvf4 {
+                        wq: nv4("q_proj", q_dim, hp.hidden)?,
+                        wk: nv4("k_proj", kv_dim, hp.hidden)?,
+                        wv: nv4("v_proj", kv_dim, hp.hidden)?,
+                        wo: nv4("o_proj", hp.hidden, q_dim)?,
                     })
                 }
                 NemotronBlock::Attention => {
@@ -346,10 +381,20 @@ impl GpuNemotron {
             vec![hp.hidden],
         )?;
         let head_name = format!("{lm}lm_head");
-        // Super ships an FP8 head (weight_scale, no weight_scale_2)
+        // Super ships an FP8 head (weight_scale, no weight_scale_2),
+        // Transcribe an unquantized bf16 one (neither)
         let fp8_head = st.bytes(&format!("{head_name}.weight_scale")).is_some()
             && st.bytes(&format!("{head_name}.weight_scale_2")).is_none();
-        let lm_head = if fp8_head {
+        let bf16_head = st.bytes(&format!("{head_name}.weight_scale")).is_none();
+        let lm_head = if bf16_head {
+            let raw = bf16_bytes(&st, &format!("{head_name}.weight"), hp.vocab * hp.hidden)?;
+            count(hp.vocab * hp.hidden * 2);
+            HeadW::Bf16(QuantTensor {
+                bytes: exec.to_device_u8(raw).map_err(GpuModelError::from)?,
+                ty: GgmlType::Bf16,
+                dims: vec![hp.hidden, hp.vocab],
+            })
+        } else if fp8_head {
             let v = fp8_view(&st, &head_name)
                 .map_err(|e| GpuModelError::Unsupported(format!("lm_head: {e}")))?;
             if (v.n, v.k) != (hp.vocab, hp.hidden) {
@@ -369,7 +414,23 @@ impl GpuNemotron {
         // final_layernorm (vLLM's nemotron_h_mtp, pattern "*E"). The drafter
         // on this lane; PADDOCK_NO_SPEC leaves it unloaded.
         let mtp_pfx = format!("{lm}mtp.layers");
-        let mtp = if hp.mtp_layers == 0
+        // Transcribe's MTP block rides its own file (`llm.mtp.layers.{0,1}`,
+        // every linear FP8)
+        let transcribe_mtp = hp.transcribe && st.bytes("llm.mtp.layers.0.eh_proj.weight").is_some();
+        let mtp = if transcribe_mtp {
+            if std::env::var_os("PADDOCK_NO_SPEC").is_some() {
+                tracing::info!("nemotron: PADDOCK_NO_SPEC - the MTP block left unloaded");
+                None
+            } else {
+                let (d, b) = load_transcribe_mtp(&exec, &st, &hp)?;
+                count(b);
+                tracing::info!(
+                    gib = b as f64 / (1u64 << 30) as f64,
+                    "nemotron: Transcribe MTP block loaded (FP8 attention + FP8 MoE)"
+                );
+                Some(d)
+            }
+        } else if hp.mtp_layers == 0
             || hp.latent.is_none()
             || st.bytes(&format!("{mtp_pfx}.0.eh_proj.weight")).is_none()
         {
@@ -441,6 +502,19 @@ impl GpuNemotron {
                 "nemotron: Super VL picture tower + projector loaded"
             );
         }
+        // Transcribe: the speech encoder beside the language model
+        let audio = if hp.transcribe {
+            let a = super::audio::TranscribeAudio::load(exec.clone(), &st, dir, hp.hidden)?;
+            weights_bytes += a.weight_bytes;
+            tracing::info!(
+                encoder_gib = a.weight_bytes as f64 / (1u64 << 30) as f64,
+                workspace_gib = a.workspace_bytes() as f64 / (1u64 << 30) as f64,
+                "nemotron: Transcribe speech encoder + speaker branch loaded"
+            );
+            Some(super::audio::AudioWorker::spawn(a)?)
+        } else {
+            None
+        };
         let ssm_dtype = super::ssm_arena::ssm_dtype_from_env();
         // label-must-reflect-configuration: stamp the elected MoE plane layout
         let moe_layout = layers.iter().find_map(|l| match &l.mixer {
@@ -463,6 +537,41 @@ impl GpuNemotron {
 
         let prefill_chunk = super::forward::prefill_chunk_rows(exec.sm_count());
         small_die_defaults(&exec);
+        // Transcribe's draft head: the MTP's draft steps score with a per-row
+        // e4m3 copy of the bf16 head (352 MB), streaming half its bytes a
+        // step - the drafts only, so outputs are untouched and the
+        // acceptance is the measure (FLEURS 2026-11-14).
+        // PADDOCK_TR_DRAFT_HEAD_BF16 keeps the drafts on the bf16 head.
+        let draft_head = match &lm_head {
+            HeadW::Bf16(_)
+                if hp.transcribe
+                    && mtp.is_some()
+                    && exec.has_bf16_to_f8row()
+                    && paddock_models::dev_var_os!("PADDOCK_TR_DRAFT_HEAD_BF16").is_none() =>
+            {
+                let raw = bf16_bytes(&st, &format!("{head_name}.weight"), hp.vocab * hp.hidden)?;
+                weights_bytes += (hp.vocab * hp.hidden + hp.vocab * 4) as u64;
+                Some(exec.bf16_to_f8row(raw, hp.hidden, hp.vocab)?)
+            }
+            _ => None,
+        };
+        // Transcribe's MTP rounds repay at every width (drafts land ~0.95 on
+        // transcripts): the round budget, and the device-plans gate at every
+        // live count a round holds at depth 1 (the depth narrows by live
+        // count) - the qwen35 MTP lane's width election. Explicit env always
+        // wins.
+        if hp.transcribe && mtp.is_some() {
+            let rows = super::spec::spec_rows_transcribe();
+            if std::env::var_os("PADDOCK_SPEC_MAX_ROWS").is_none() {
+                crate::envset::set_env("PADDOCK_SPEC_MAX_ROWS", &rows.to_string());
+            }
+            if std::env::var_os("PADDOCK_QWEN35_SPEC_PLANS_LIVE_MAX").is_none() {
+                crate::envset::set_env(
+                    "PADDOCK_QWEN35_SPEC_PLANS_LIVE_MAX",
+                    &(rows / 2).to_string(),
+                );
+            }
+        }
         Ok(Self {
             exec,
             hp,
@@ -470,6 +579,7 @@ impl GpuNemotron {
             tok_embd,
             final_norm,
             lm_head,
+            draft_head,
             kv_dtype: default_kv_dtype(),
             ssm_dtype,
             prefill_chunk,
@@ -495,6 +605,7 @@ impl GpuNemotron {
             mtp,
             vision,
             mm: None,
+            audio,
         })
     }
 
@@ -887,6 +998,7 @@ impl GpuNemotron {
             tok_embd,
             final_norm,
             lm_head,
+            draft_head: None,
             kv_dtype: default_kv_dtype(),
             ssm_dtype,
             prefill_chunk,
@@ -909,6 +1021,7 @@ impl GpuNemotron {
             mtp,
             vision: None,
             mm: None,
+            audio: None,
         })
     }
 
@@ -956,6 +1069,136 @@ impl GpuNemotron {
 /// to f16 (serving.rs), and an explicit kv_cache_dtype wins.
 pub(crate) fn default_kv_dtype() -> KvDtype {
     KvDtype::Fp8E4m3
+}
+
+/// Transcribe's MTP block from `model-mtp-fp8.safetensors`: `llm.mtp.layers.0`
+/// is eh_proj / enorm / hnorm and the attention sublayer, `.1` the MoE
+/// sublayer and its final_layernorm (vLLM's nemotron_h_mtp, pattern "*E"),
+/// every linear FP8 with a per-tensor scale - kept as e4m3 rows, the scale
+/// broadcast per row, no requantization. Returns the drafter and the bytes it
+/// made resident.
+fn load_transcribe_mtp(
+    exec: &Arc<GpuExecutor>,
+    st: &ShardedSafetensors,
+    hp: &NemotronConfig,
+) -> Result<(super::mtp::MtpDrafter, usize), GpuModelError> {
+    let (p0, p1) = ("llm.mtp.layers.0", "llm.mtp.layers.1");
+    let mut bytes = 0usize;
+    let norm = |name: String, bytes: &mut usize| -> Result<DeviceTensor, GpuModelError> {
+        *bytes += hp.hidden * 4;
+        Ok(DeviceTensor {
+            buf: exec.to_device(&f32_tensor(st, &name, hp.hidden)?)?,
+            dims: vec![hp.hidden],
+        })
+    };
+    let f8 = |name: String, out: usize, inn: usize, bytes: &mut usize| {
+        let v =
+            fp8_view(st, &name).map_err(|e| GpuModelError::Unsupported(format!("{name}: {e}")))?;
+        if (v.n, v.k) != (out, inn) {
+            return Err(GpuModelError::Unsupported(format!(
+                "{name} is [{}, {}], expected [{out}, {inn}]",
+                v.n, v.k
+            )));
+        }
+        *bytes += v.n * v.k + v.n * 4;
+        Ok::<_, GpuModelError>(super::mtp::MtpProj::F8 {
+            w: exec.fp8_ckpt_to_f8row(v.weight, v.weight_scale, v.k, v.n)?,
+            inn,
+            out,
+        })
+    };
+    let q_dim = hp.n_heads * hp.head_dim;
+    let kv_dim = hp.n_kv_heads * hp.head_dim;
+    let eh_proj = f8(
+        format!("{p0}.eh_proj"),
+        hp.hidden,
+        2 * hp.hidden,
+        &mut bytes,
+    )?;
+    let attn = super::mtp::MtpAttn {
+        wq: f8(format!("{p0}.mixer.q_proj"), q_dim, hp.hidden, &mut bytes)?,
+        wk: f8(format!("{p0}.mixer.k_proj"), kv_dim, hp.hidden, &mut bytes)?,
+        wv: f8(format!("{p0}.mixer.v_proj"), kv_dim, hp.hidden, &mut bytes)?,
+        wo: f8(format!("{p0}.mixer.o_proj"), hp.hidden, q_dim, &mut bytes)?,
+    };
+    // the routed experts as one row stack per role, each expert's scale on
+    // its rows
+    let stack = |role: &str, rows: usize, inn: usize, bytes: &mut usize| {
+        let mut data = Vec::with_capacity(hp.n_expert * rows * inn);
+        let mut scales = Vec::with_capacity(hp.n_expert * rows);
+        for e in 0..hp.n_expert {
+            let name = format!("{p1}.mixer.experts.{e}.{role}");
+            let v = fp8_view(st, &name)
+                .map_err(|err| GpuModelError::Unsupported(format!("{name}: {err}")))?;
+            if (v.n, v.k) != (rows, inn) {
+                return Err(GpuModelError::Unsupported(format!(
+                    "{name} is [{}, {}], expected [{rows}, {inn}]",
+                    v.n, v.k
+                )));
+            }
+            data.extend_from_slice(v.weight);
+            scales.extend(std::iter::repeat_n(v.weight_scale, rows));
+        }
+        *bytes += data.len() + scales.len() * 4;
+        Ok::<_, GpuModelError>(exec.fp8_ckpt_to_f8row_rows(
+            &data,
+            &scales,
+            inn,
+            hp.n_expert * rows,
+        )?)
+    };
+    let shared = |role: &str, out: usize, inn: usize, bytes: &mut usize| {
+        let name = format!("{p1}.mixer.shared_experts.{role}");
+        let v =
+            fp8_view(st, &name).map_err(|e| GpuModelError::Unsupported(format!("{name}: {e}")))?;
+        if (v.n, v.k) != (out, inn) {
+            return Err(GpuModelError::Unsupported(format!(
+                "{name} is [{}, {}], expected [{out}, {inn}]",
+                v.n, v.k
+            )));
+        }
+        *bytes += v.n * v.k + v.n * 4;
+        Ok::<_, GpuModelError>(exec.fp8_ckpt_to_f8row(v.weight, v.weight_scale, v.k, v.n)?)
+    };
+    let planes = MoePlanes::F8 {
+        up: stack("up_proj", hp.moe_ff, hp.hidden, &mut bytes)?,
+        down: stack("down_proj", hp.hidden, hp.moe_ff, &mut bytes)?,
+        sh_up: shared("up_proj", hp.shared_ff, hp.hidden, &mut bytes)?,
+        sh_down: shared("down_proj", hp.hidden, hp.shared_ff, &mut bytes)?,
+    };
+    let router = DeviceTensor {
+        buf: exec.to_device(&f32_tensor(
+            st,
+            &format!("{p1}.mixer.gate.weight"),
+            hp.n_expert * hp.hidden,
+        )?)?,
+        dims: vec![hp.hidden, hp.n_expert],
+    };
+    let bias = DeviceTensor {
+        buf: exec.to_device(&f32_tensor(
+            st,
+            &format!("{p1}.mixer.gate.e_score_correction_bias"),
+            hp.n_expert,
+        )?)?,
+        dims: vec![hp.n_expert],
+    };
+    bytes += hp.n_expert * (hp.hidden + 1) * 4;
+    let w = super::mtp::MtpWeights {
+        enorm: norm(format!("{p0}.enorm.weight"), &mut bytes)?,
+        hnorm: norm(format!("{p0}.hnorm.weight"), &mut bytes)?,
+        eh_proj,
+        attn_norm: norm(format!("{p0}.norm.weight"), &mut bytes)?,
+        attn,
+        post_norm: norm(format!("{p1}.norm.weight"), &mut bytes)?,
+        moe: MoeWeights {
+            router,
+            bias,
+            planes,
+            latent: None,
+        },
+        head_norm: norm(format!("{p1}.final_layernorm.weight"), &mut bytes)?,
+    };
+    Ok((super::mtp::MtpDrafter { w, state: None }, bytes))
 }
 
 /// One NVFP4 MoE mixer under `pfx` (a trunk layer, or Super's MTP block's

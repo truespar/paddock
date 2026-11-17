@@ -36,6 +36,10 @@ paddock-kernels = { workspace = true }
 paddock-models = { workspace = true }
 # Phonon tokenizes its own input on the CUDA lane, as the Metal one does
 paddock-tokenizer = { workspace = true, optional = true }
+# the CTC timestamp aligner's lexical characters (NFC + general category)
+unicode-normalization = { workspace = true }
+unicode-properties = { workspace = true }
+serde_json = { workspace = true }
 libc = "0.2.189"
 # the KV disk store reads its volume's free space (statvfs / GetDiskFreeSpaceEx)
 # to keep a reserve free - same crate the runner and manager already use

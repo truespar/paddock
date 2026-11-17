@@ -250,3 +250,19 @@ pub(super) fn serve_spec_policy() -> SpecPolicy {
         }
     })
 }
+
+/// Encoder-owned and queued slots have no valid decoder cursor yet.
+pub(super) fn spec_live_slots(
+    slots: &[Option<super::Slot>],
+    chunking: &std::collections::HashSet<usize>,
+) -> Vec<usize> {
+    slots
+        .iter()
+        .enumerate()
+        .filter_map(|(k, s)| {
+            s.as_ref()
+                .filter(|s| s.prefilled && !chunking.contains(&k))
+                .map(|_| k)
+        })
+        .collect()
+}

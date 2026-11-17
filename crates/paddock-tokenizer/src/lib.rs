@@ -14,6 +14,7 @@
 mod pre_tokenizer;
 mod prompt;
 pub mod sam3;
+pub mod spm;
 
 pub use prompt::Shield;
 
@@ -688,5 +689,7 @@ fn get_str_array<'a>(f: &'a GgufFile, key: &'static str) -> Result<Vec<&'a str>,
 
 #[cfg(test)]
 mod prompt_tests;
+#[cfg(test)]
+mod spm_tests;
 #[cfg(test)]
 mod tests;

@@ -51,6 +51,15 @@ const route = useRoute()
 const router = useRouter()
 const { isStreaming, send, regenerate, editAndResend, continueLast, stop } = useChatStream()
 
+/** The languages this chat's lanes can be told - the set the composer's
+ *  picker offers - so a clip is stamped with a code its lane takes. */
+function clipLanguages(): string[] | undefined {
+  const c = chat.active
+  if (!c) return undefined
+  const one = c.model && c.model !== 'default' ? c.model : models.currentId
+  return models.languagesForLanes(c.compareModels?.length ? c.compareModels : one ? [one] : [])
+}
+
 // ── graph import auto-repair ─────────────────────────────────────────────
 // The artifact tools return success when the TEXT stores; the import runs
 // browser-side, so the model has announced finished graphs
@@ -612,7 +621,7 @@ async function onSubmit(text: string): Promise<void> {
         // The chat's language choice is stamped onto the part, so the turn
         // records what actually rode even if the setting changes later.
         parts.push(
-          await readAudioPart(f, chat.active?.id, askedLanguage(chat.active?.audioLanguage)),
+          await readAudioPart(f, chat.active?.id, askedLanguage(chat.active?.audioLanguage, clipLanguages())),
         )
       } else if (isGraphFile(f)) {
         // A .tvdb never rides to a model - it becomes the conversation's live

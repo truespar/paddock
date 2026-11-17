@@ -42,6 +42,35 @@ use paddock_models::nemotron::NemotronBlock;
 /// across 23 layers is ~1.5 GiB, allocated lazily at first spec use).
 pub(crate) const SPEC_ROWS_NEMO: usize = 32;
 
+/// Transcribe's round budget: depth 3 at 64 live (4 rows a slot), the
+/// depth narrowing past it (two rows a slot at 128). Its rounds keep rows
+/// for a replay rollback (~1.2 MiB a row across the mamba layers) rather
+/// than full snapshots, so the width costs ~0.5 GiB, and its drafts land at
+/// ~0.95 on transcripts - the rounds repay at every width.
+pub(crate) const SPEC_ROWS_TRANSCRIBE: usize = 256;
+
+/// [`SPEC_ROWS_TRANSCRIBE`], or PADDOCK_TR_SPEC_ROWS for the depth A/B
+/// (the depth narrows to rows / live - 1, so deeper rounds at a live count
+/// need the wider budget).
+pub(crate) fn spec_rows_transcribe() -> usize {
+    paddock_models::dev_var!("PADDOCK_TR_SPEC_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&r: &usize| (16..=1024).contains(&r))
+        .unwrap_or(SPEC_ROWS_TRANSCRIBE)
+}
+
+impl GpuNemotron {
+    /// This checkpoint's verify-round row budget.
+    pub(crate) fn spec_rows(&self) -> usize {
+        if self.hp.transcribe {
+            spec_rows_transcribe()
+        } else {
+            SPEC_ROWS_NEMO
+        }
+    }
+}
+
 /// Partially-accepted requests one batched-rollback launch pair rebuilds
 /// (each needs a bounce window per mamba layer); more take more pairs.
 const ROLLBACK_REQS: usize = 4;
@@ -92,12 +121,15 @@ pub(crate) struct VerifyPlanes {
     /// the multi-row attention partial's groups + partial planes (sized for
     /// the worst grouping of SPEC_ROWS rows - see `rows_partial_cap`)
     pub d_groups: CudaSlice<u32>,
+    /// the round's run table for the one-launch mamba advance (slots
+    /// 947-948): u32 triples slot, first row, rows - one run a request
+    pub d_runs: CudaSlice<u32>,
     pub attn_o: CudaSlice<f32>,
     pub attn_ml: CudaSlice<f32>,
 }
 
 /// How a verify round's rows are picked on device before the commit.
-enum VerifyPick<'a> {
+pub(super) enum VerifyPick<'a> {
     /// argmax - the greedy round
     Greedy,
     /// one sampler plan per row - the device-sampled round
@@ -110,9 +142,10 @@ impl GpuNemotron {
         self.exec.has_spec_verify_mamba() && self.exec.has_argmax_rows()
     }
 
-    fn ensure_verify_planes(&mut self) -> Result<(), GpuModelError> {
+    pub(super) fn ensure_verify_planes(&mut self) -> Result<(), GpuModelError> {
         let hp = self.hp.clone();
         let e = self.exec.clone();
+        let spec_rows = self.spec_rows();
         let bs = self.batch.as_mut().expect("batch enabled");
         if bs.verify.is_some() {
             return Ok(());
@@ -120,7 +153,7 @@ impl GpuNemotron {
         let state_elems = hp.mamba_heads * hp.mamba_head_dim * hp.d_state;
         let win_elems = (hp.d_conv - 1) * hp.conv_dim();
         let ssm_dt = self.ssm_dtype;
-        let rows_cap = super::batch::rows_partial_cap(hp.n_kv_heads, e.sm_count(), SPEC_ROWS_NEMO);
+        let rows_cap = super::batch::rows_partial_cap(hp.n_kv_heads, e.sm_count(), spec_rows);
         let n_mamba = hp
             .blocks
             .iter()
@@ -139,16 +172,12 @@ impl GpuNemotron {
             if matches!(hp.blocks[li], NemotronBlock::Mamba) {
                 if rescan {
                     snap.push(None);
-                    keep.push(Some(e.alloc(SPEC_ROWS_NEMO * keep_row)?));
+                    keep.push(Some(e.alloc(spec_rows * keep_row)?));
                 } else {
-                    snap.push(Some(SsmArena::alloc(
-                        &e,
-                        SPEC_ROWS_NEMO * state_elems,
-                        ssm_dt,
-                    )?));
+                    snap.push(Some(SsmArena::alloc(&e, spec_rows * state_elems, ssm_dt)?));
                     keep.push(None);
                 }
-                xbc.push(Some(e.alloc(SPEC_ROWS_NEMO * hp.conv_dim())?));
+                xbc.push(Some(e.alloc(spec_rows * hp.conv_dim())?));
                 vwin.push(Some(e.alloc(bs.n_slots * win_elems)?));
             } else {
                 snap.push(None);
@@ -161,7 +190,7 @@ impl GpuNemotron {
             snap,
             rescan,
             keep,
-            d_rs_desc: e.alloc_u64(6 * SPEC_ROWS_NEMO * n_mamba)?,
+            d_rs_desc: e.alloc_u64(6 * spec_rows * n_mamba)?,
             d_rs_tmp: if rescan {
                 Some(e.alloc_f16(n_mamba * state_elems)?)
             } else {
@@ -173,25 +202,26 @@ impl GpuNemotron {
             d_rb_bounce: e.alloc(ROLLBACK_REQS * n_mamba * win_elems)?,
             // per request and mamba layer: a state copy, (k-1) window rows,
             // the xBC rows and the bounce write-back, three words apiece
-            d_rb_desc: e.alloc_u64(3 * SPEC_ROWS_NEMO * n_mamba * (hp.d_conv + 2))?,
-            d_logits: e.alloc(SPEC_ROWS_NEMO * hp.vocab)?,
-            d_h: e.alloc(SPEC_ROWS_NEMO * hp.hidden)?,
-            d_picks: e.alloc_u32(SPEC_ROWS_NEMO)?,
-            d_par: e.alloc_u32(SPEC_ROWS_NEMO * 4)?,
-            d_tpar: e.alloc_u32(SPEC_ROWS_NEMO * 4)?,
+            d_rb_desc: e.alloc_u64(3 * spec_rows * n_mamba * (hp.d_conv + 2))?,
+            d_logits: e.alloc(spec_rows * hp.vocab)?,
+            d_h: e.alloc(spec_rows * hp.hidden)?,
+            d_picks: e.alloc_u32(spec_rows)?,
+            d_par: e.alloc_u32(spec_rows * 4)?,
+            d_tpar: e.alloc_u32(spec_rows * 4)?,
             open: None,
-            d_groups: e.alloc_u32(SPEC_ROWS_NEMO * 2)?,
+            d_groups: e.alloc_u32(spec_rows * 2)?,
+            d_runs: e.alloc_u32(spec_rows * 3)?,
             attn_o: e.alloc(hp.n_heads * rows_cap * hp.head_dim)?,
             attn_ml: e.alloc(hp.n_heads * rows_cap * 2)?,
         });
         let rollback = if rescan {
-            (n_mamba * (SPEC_ROWS_NEMO * keep_row * 4 + state_elems * 2)) as f64
+            (n_mamba * (spec_rows * keep_row * 4 + state_elems * 2)) as f64
         } else {
-            (n_mamba * SPEC_ROWS_NEMO * state_elems * ssm_dt.bytes()) as f64
+            (n_mamba * spec_rows * state_elems * ssm_dt.bytes()) as f64
         };
         tracing::info!(
             "nemotron spec: verify planes up ({} rows, {:.2} GiB {})",
-            SPEC_ROWS_NEMO,
+            spec_rows,
             rollback / (1u64 << 30) as f64,
             if rescan {
                 "kept rows (rollback by replay)"
@@ -210,6 +240,11 @@ impl GpuNemotron {
         &mut self,
         reqs: &[(usize, usize, Vec<u32>)],
     ) -> Result<Option<Vec<u32>>, GpuModelError> {
+        if self.fused_rounds() {
+            return Ok(self
+                .forward_fused_round(reqs, 0, VerifyPick::Greedy, &[])?
+                .map(|(p, _)| p));
+        }
         self.spec_verify_picked(reqs, VerifyPick::Greedy)
     }
 
@@ -234,6 +269,11 @@ impl GpuNemotron {
         });
         if plans.len() != total || !runnable || !self.supports_device_sampling_impl() {
             return Ok(None);
+        }
+        if self.fused_rounds() {
+            return Ok(self
+                .forward_fused_round(reqs, 0, VerifyPick::Plans(plans), &[])?
+                .map(|(p, _)| p));
         }
         self.spec_verify_picked(reqs, VerifyPick::Plans(plans))
     }
@@ -294,7 +334,7 @@ impl GpuNemotron {
             accepts.push((slot, off, c));
             off += chunk.len();
         }
-        self.spec_round_commit(&reqs, &accepts, false)
+        self.spec_round_commit(&reqs, &accepts, false, true)
     }
 
     /// The verify walk every round shares: flatten the ragged chunks, run
@@ -305,7 +345,7 @@ impl GpuNemotron {
         reqs: &[(usize, usize, Vec<u32>)],
     ) -> Result<Option<usize>, GpuModelError> {
         let total: usize = reqs.iter().map(|r| r.2.len()).sum();
-        if total == 0 || total > SPEC_ROWS_NEMO || !self.spec_verify_ready() {
+        if total == 0 || total > self.spec_rows() || !self.spec_verify_ready() {
             return Ok(None);
         }
         if self.batch.is_none() {
@@ -345,14 +385,20 @@ impl GpuNemotron {
             run_pos,
             dec: 0,
             breaks: Vec::new(),
+            vruns: 0,
         };
         self.layer_walk(total, Some(&cuts), true)?;
+        self.verify_head(total)?;
+        Ok(Some(total))
+    }
 
-        // head over every row: final norm -> h (the drafters' h source) ->
-        // logits
+    /// A round's head over its `total` verify rows (rows `[0, total)` of the
+    /// walk): final norm -> h (the drafters' h source) -> logits.
+    pub(super) fn verify_head(&mut self, total: usize) -> Result<(), GpuModelError> {
         let exec = self.exec.clone();
         let (embd, eps) = (self.hp.hidden, self.hp.eps);
         let final_norm = self.final_norm.buf.clone();
+        let w16_max = self.w16_max();
         let bs = self.batch.as_mut().expect("batch enabled");
         let sc = &mut bs.sc;
         let vp = bs.verify.as_mut().expect("verify planes");
@@ -378,7 +424,15 @@ impl GpuNemotron {
                 &vp.d_h,
                 &mut vp.d_logits,
                 total,
-                super::batch::w16_class(&exec, total),
+                super::batch::w16_class(&exec, total, w16_max),
+            )?,
+            HeadW::Bf16(h) => super::head_bf16_batch(
+                &exec,
+                h,
+                &vp.d_h,
+                &mut vp.d_logits,
+                total,
+                super::batch::w16_class(&exec, total, w16_max),
             )?,
             HeadW::Qw(q) => {
                 let s8 = sc.q8.as_mut().expect("q8 batch scratch");
@@ -399,7 +453,7 @@ impl GpuNemotron {
                 )?;
             }
         }
-        Ok(Some(total))
+        Ok(())
     }
 
     /// Walk, pick every row on device, accept per slot and commit.
@@ -411,6 +465,22 @@ impl GpuNemotron {
         let Some(total) = self.spec_verify_walk(reqs)? else {
             return Ok(None);
         };
+        self.verify_pick_commit(reqs, total, pick, false)
+            .map(|(p, _)| Some(p))
+    }
+
+    /// A walked round's picks (its head already over rows `[0, total)`):
+    /// every row picked on device, accepted per slot, committed.
+    /// `defer_mtp`: the drafter's append is the caller's (a fused round
+    /// appends the verify and the prompt rows in one block pass) - the
+    /// accepts come back for its coverage advance.
+    pub(super) fn verify_pick_commit(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+        total: usize,
+        pick: VerifyPick<'_>,
+        defer_mtp: bool,
+    ) -> Result<(Vec<u32>, Vec<(usize, usize, usize)>), GpuModelError> {
         let exec = self.exec.clone();
         let vocab = self.hp.vocab;
         {
@@ -429,12 +499,11 @@ impl GpuNemotron {
                         .map(|&p| crate::generator::RowSample::Device(p))
                         .collect();
                     let (par, tpar, any5, any6) = Self::pack_samp_par(&rows);
-                    let drv = |e: cudarc::driver::DriverError| crate::gpu::from_driver(e);
                     let mut v = vp
                         .d_par
                         .try_slice_mut(0..total * 4)
                         .ok_or_else(|| GpuError::Driver("verify d_par".into()))?;
-                    exec.stream.memcpy_htod(&par, &mut v).map_err(drv)?;
+                    exec.htod(&par, &mut v)?;
                     exec.sample_rows_at(
                         &vp.d_logits,
                         &vp.d_par,
@@ -449,7 +518,7 @@ impl GpuNemotron {
                             .d_tpar
                             .try_slice_mut(0..total * 4)
                             .ok_or_else(|| GpuError::Driver("verify d_tpar".into()))?;
-                        exec.stream.memcpy_htod(t, &mut v).map_err(drv)?;
+                        exec.htod(t, &mut v)?;
                         if any5 {
                             exec.sample_rows_t_at(
                                 &vp.d_logits,
@@ -520,8 +589,8 @@ impl GpuNemotron {
                 (slot, off, a + 1)
             })
             .collect();
-        self.spec_round_commit(reqs, &accepts, features_early)?;
-        Ok(Some(picks))
+        self.spec_round_commit(reqs, &accepts, features_early, !defer_mtp)?;
+        Ok((picks, accepts))
     }
 
     /// Commit a verified round: `accepts[i] = (slot, first row, committed
@@ -533,6 +602,8 @@ impl GpuNemotron {
         accepts: &[(usize, usize, usize)],
         // the drafter's features were appended ahead of the picks readback
         features_done: bool,
+        // run the MTP block's append here (a fused round defers it)
+        mtp: bool,
     ) -> Result<(), GpuModelError> {
         self.reply_after_spec(reqs, accepts)?;
         self.spec_verify_commit(reqs, accepts)?;
@@ -548,7 +619,7 @@ impl GpuNemotron {
                 self.dflash_note_rows(slot, pos0, acc);
             }
         }
-        if self.mtp.as_ref().is_some_and(|m| m.state.is_some()) {
+        if mtp && self.mtp.as_ref().is_some_and(|m| m.state.is_some()) {
             // the MTP block consumes the round's rows with the verify h
             // (still in sc.d_x); coverage and the h chain advance only
             // through ACCEPTED rows - rejected cells get rewritten by the

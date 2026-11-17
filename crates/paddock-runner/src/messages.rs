@@ -534,14 +534,14 @@ fn render_prompt(
     // at all. The order is convert -> extract -> normalize.
     let image_refs = find_images(&msgs)?;
 
-    // Audio parts are served on /v1/chat/completions and
-    // /v1/audio/transcriptions only - refuse here rather than let the
-    // template drop them silently now that `input_audio` passes part
-    // validation.
+    // Audio parts are served on /v1/chat/completions,
+    // /v1/responses and /v1/audio/transcriptions only (Anthropic's API has no
+    // audio block) - refuse here rather than let the template drop them
+    // silently now that `input_audio` passes part validation.
     if !crate::chat::find_audio(&msgs)?.is_empty() {
         return Err(
-            "audio input is served on /v1/chat/completions and /v1/audio/transcriptions, \
-             not on this endpoint"
+            "audio input is served on /v1/chat/completions, /v1/responses and \
+             /v1/audio/transcriptions, not on this endpoint"
                 .into(),
         );
     }

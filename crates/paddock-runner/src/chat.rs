@@ -106,7 +106,10 @@ pub(crate) fn admitted_rows(
             }
             // directives add no rows (a crop or pixel budget can only SHRINK
             // the per-image estimate above - admission stays conservative)
-            MmChunk::Text(_) | MmChunk::OcrCrop(_) | MmChunk::VisionPixels { .. } => {}
+            MmChunk::Text(_)
+            | MmChunk::OcrCrop(_)
+            | MmChunk::VisionPixels { .. }
+            | MmChunk::CtcTimestamps { .. } => {}
         }
     }
     (text_len + rows, rows, n)
@@ -172,6 +175,9 @@ struct Prepared {
     /// decode behavior, Some = the caller decides (paddleocr spotting needs
     /// `false` so its `<|LOC_END|>`/`<|LOC_SEP|>` separators survive)
     skip_special: Option<bool>,
+    /// word timestamps armed (`mm_processor_kwargs.capture_ctc_timestamps`
+    /// on a model with the head)
+    ctc: Option<crate::ctc_timestamps::CtcPlan>,
     /// the request arrived in the DEPRECATED `functions` spelling, so its
     /// answer has to go back in the matching `function_call` shape - a client
     /// that asked that way cannot read `tool_calls`. Set by
@@ -643,6 +649,18 @@ pub(crate) fn no_vision(model: &crate::serving::ServingModel) -> String {
             .into()
     }
 }
+
+/// The refusal for audio input on an endpoint that serves none, shared by
+/// chat completions and Responses.
+pub(crate) fn no_audio() -> &'static str {
+    "this model is not serving audio (an ASR model needs its audio `mmproj` companion file set \
+     in the config to accept audio input)"
+}
+
+/// Pictures and a clip in one request: the prompt builder interleaves one
+/// media kind, so the other would be dropped - refused instead.
+pub(crate) const PICTURES_AND_AUDIO: &str =
+    "this endpoint takes pictures or audio in one request, not both - send them in separate turns";
 
 /// Find image content parts, in render order. The detection condition
 /// MIRRORS the qwen chat template's (`'image' in item or 'image_url' in item
@@ -1411,11 +1429,12 @@ fn prepare(
     // slot per part and build_mm_chunks interleaves the clips at the slots.
     let audio_refs = find_audio(&req.messages)?;
     if !audio_refs.is_empty() && !model.supports_audio {
-        return Err(
-            "this model is not serving audio (an ASR model needs its audio `mmproj` \
-             companion file set in the config to accept audio input)"
-                .into(),
-        );
+        return Err(no_audio().into());
+    }
+    // one media kind a request: the prompt builder interleaves one, and a
+    // clip beside a picture was dropped with a 200 before this said so
+    if !audio_refs.is_empty() && !images.is_empty() {
+        return Err(PICTURES_AND_AUDIO.into());
     }
     let audio = decode_audio_parts(audio_refs, model.audio_frontend)?;
 
@@ -1595,7 +1614,16 @@ fn prepare(
     // unknown keys refused, injected as a directive the family consumes in
     // its own bit-exact resize. Sending it without an image is a caller bug
     // worth a 400, not a silently dropped knob.
-    if let Some((min_px, max_px)) = parse_mm_processor_kwargs(req.mm_processor_kwargs.as_ref())? {
+    // Transcribe's word timestamps ride the same kwargs (vLLM's contract);
+    // the flag comes off before the families' parser sees the rest
+    let (wants_ctc, kwargs) = crate::ctc_timestamps::split(req.mm_processor_kwargs.as_ref());
+    let ctc = crate::ctc_timestamps::CtcPlan::arm(
+        model.engine.media_aligner(),
+        wants_ctc,
+        req.n as usize,
+        mm_chunks.as_mut(),
+    )?;
+    if let Some((min_px, max_px)) = parse_mm_processor_kwargs(kwargs.as_ref())? {
         let Some(chunks) = mm_chunks.as_mut() else {
             return Err("mm_processor_kwargs was sent but the request carries no image".into());
         };
@@ -1695,6 +1723,7 @@ fn prepare(
         logprobs,
         ocr,
         skip_special: req.skip_special_tokens,
+        ctc,
         legacy_functions: req.functions.is_some(),
     })
 }
@@ -1727,6 +1756,8 @@ struct Meta {
     /// request `skip_special_tokens` - applied to the content decode when the
     /// caller sent it; None keeps the dialect's own behavior
     skip_special: Option<bool>,
+    /// word timestamps for choice 0's transcript, when armed
+    ctc: Option<crate::ctc_timestamps::CtcPlan>,
     /// Event-record slots (§8.1); no-op unless the events middleware planted one.
     scope: crate::events::EventScope,
 }
@@ -2248,7 +2279,7 @@ pub async fn handle(
         }
     }
     let t_prep = std::time::Instant::now();
-    let prepared = match prepare(model, &req, state.output_caps(), &state.sampling) {
+    let mut prepared = match prepare(model, &req, state.output_caps(), &state.sampling) {
         Ok(p) => p,
         Err(e) => return err(StatusCode::BAD_REQUEST, "invalid_request_error", e),
     };
@@ -2283,6 +2314,7 @@ pub async fn handle(
         audio_rows: audio_rows(model, prepared.mm_chunks.as_deref()),
         ocr: prepared.ocr.clone(),
         skip_special: prepared.skip_special,
+        ctc: prepared.ctc.take(),
         scope,
     };
 
@@ -2341,6 +2373,8 @@ async fn collect_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>
     // whether the repetition stop fired)
     let mut first_ids: Vec<u32> = Vec::new();
     let mut first_reason = None;
+    // choice 0's content, the transcript word timestamps align
+    let mut first_content = String::new();
     for (index, mut rx) in rxs.into_iter().enumerate() {
         let mut ids = Vec::new();
         let mut lps: Vec<TokenLogprobs> = Vec::new();
@@ -2395,6 +2429,9 @@ async fn collect_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>
             reason.as_str()
         };
 
+        if index == 0 && meta.ctc.is_some() {
+            first_content = parsed.content.clone().unwrap_or_default();
+        }
         let tool_calls = to_wire_calls(&parsed);
         let message = ChatMessage::assistant(parsed.content, parsed.reasoning, tool_calls);
         // A legacy `functions` request cannot read `tool_calls` - it looks at
@@ -2429,6 +2466,10 @@ async fn collect_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>
         meta.audio_rows,
     );
     let ocr = meta.ocr_json(&first_ids, first_reason);
+    let ctc_timestamps = match meta.ctc.take() {
+        Some(plan) => Some(plan.finish(first_content).await),
+        None => None,
+    };
     Json(ChatCompletionResponse {
         id: meta.id,
         object: "chat.completion",
@@ -2442,6 +2483,7 @@ async fn collect_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>
             prompt_tokens_details: details,
         },
         ocr,
+        ctc_timestamps,
     })
     .into_response()
 }
@@ -2608,8 +2650,12 @@ fn stream_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>>) -> R
                             cs.done = true;
                             cs.reason = FinishReason::Stop;
                             open -= 1;
-                            yield sse_data(&chunk(&meta, created, i, serde_json::json!({}), Some("stop"), None));
-                            cs.finish_sent = true;
+                            // armed word timestamps ride the finish chunk:
+                            // the terminal pass sends it once they are aligned
+                            if meta.ctc.is_none() {
+                                yield sse_data(&chunk(&meta, created, i, serde_json::json!({}), Some("stop"), None));
+                                cs.finish_sent = true;
+                            }
                             // n == 1: dropping the whole merged stream stops
                             // the engine slot; with n > 1 the stopped choice
                             // drains silently until its Done
@@ -2678,6 +2724,7 @@ fn stream_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>>) -> R
                     ));
                 }
             }
+            let mut transcript = String::new();
             if let Some(c) = &parsed.content {
                 // a stop string the holdback was still disambiguating can
                 // complete exactly at the cut - it still truncates and stops
@@ -2685,6 +2732,7 @@ fn stream_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>>) -> R
                 if hit {
                     cs.stop_hit = true;
                 }
+                transcript.clone_from(&trunc);
                 while cs.c_emitted < trunc.len() && !trunc.is_char_boundary(cs.c_emitted) {
                     cs.c_emitted += 1;
                 }
@@ -2716,7 +2764,15 @@ fn stream_response(mut meta: Meta, rxs: Vec<UnboundedReceiver<TokenEvent>>) -> R
                 }
             }
             meta.scope.finish(finish);
-            yield sse_data(&chunk(&meta, created, i, serde_json::json!({}), Some(finish), None));
+            let mut done = chunk(&meta, created, i, serde_json::json!({}), Some(finish), None);
+            // the reference's terminal chunk: `delta: {}` and the aligned
+            // transcript (every content delta above) as a top-level key
+            if i == 0 && let Some(plan) = meta.ctc.take() {
+                let mut v: serde_json::Value = serde_json::from_str(&done).expect("own chunk");
+                v["ctc_timestamps"] = plan.finish(transcript).await;
+                done = v.to_string();
+            }
+            yield sse_data(&done);
         }
         meta.scope.usage(meta.prompt_len, completion_tokens);
         meta.scope.cached(cached);
@@ -3556,7 +3612,8 @@ mod tests {
                 MmChunk::Image { .. }
                 | MmChunk::Audio { .. }
                 | MmChunk::OcrCrop(_)
-                | MmChunk::VisionPixels { .. } => None,
+                | MmChunk::VisionPixels { .. }
+                | MmChunk::CtcTimestamps { .. } => None,
             })
             .flatten()
             .collect();

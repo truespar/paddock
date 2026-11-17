@@ -96,13 +96,13 @@ impl GpuNemotron {
                 .d_par
                 .try_slice_mut(0..r * 4)
                 .ok_or_else(|| GpuError::Driver("d_par slice".into()))?;
-            exec.stream.memcpy_htod(&par, &mut v).map_err(drv)?;
+            exec.htod(&par, &mut v)?;
             if let Some(t) = &tpar {
                 let mut v = sc
                     .d_tpar
                     .try_slice_mut(0..r * 4)
                     .ok_or_else(|| GpuError::Driver("d_tpar slice".into()))?;
-                exec.stream.memcpy_htod(t, &mut v).map_err(drv)?;
+                exec.htod(t, &mut v)?;
             }
             if masked {
                 let at: Vec<usize> = (0..r).collect();
@@ -239,13 +239,13 @@ impl GpuNemotron {
                 .d_pipe_par
                 .try_slice_mut(off..off + b * 4)
                 .ok_or_else(|| GpuError::Driver("d_pipe_par slice".into()))?;
-            exec.stream.memcpy_htod(&par, &mut v).map_err(drv)?;
+            exec.htod(&par, &mut v)?;
             if let Some(t) = &tpar {
                 let mut v = sc
                     .d_pipe_tpar
                     .try_slice_mut(off..off + b * 4)
                     .ok_or_else(|| GpuError::Driver("d_pipe_tpar slice".into()))?;
-                exec.stream.memcpy_htod(t, &mut v).map_err(drv)?;
+                exec.htod(t, &mut v)?;
             }
         }
         if advance {

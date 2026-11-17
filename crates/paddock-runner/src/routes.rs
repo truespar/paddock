@@ -548,6 +548,11 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .layer(axum::extract::DefaultBodyLimit::max(TRANSCRIPTION_BODY)),
         )
         .route(
+            "/v1/audio/translations",
+            post(crate::translations::handle)
+                .layer(axum::extract::DefaultBodyLimit::max(TRANSCRIPTION_BODY)),
+        )
+        .route(
             "/v1/audio/speech",
             post(crate::phonon::handle).layer(axum::extract::DefaultBodyLimit::max(32 * 1024)),
         )
@@ -964,7 +969,7 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
         "audio": state.serving.as_ref().is_some_and(|s| s.supports_audio) || state.asr.is_some() || state.rnnt_asr.is_some(),
         "realtime_transcription": crate::realtime::capabilities(
             state.asr.is_some() || state.serving.as_ref().is_some_and(|s| s.supports_audio),
-            state.asr.is_some(),
+            state.asr.is_some() || state.serving.as_ref().is_some_and(|s| s.ctc_word_times()),
             state.serving.as_ref().filter(|s| s.supports_audio).and_then(|s| s.audio_frontend.max_clip_s(state.max_ctx.saturating_sub(512))),
         ),
         "asr": state.asr.as_ref().map(|a| a.id.clone())
@@ -1095,11 +1100,31 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
         // whisper lane when a runner carries both.
         "timestamp_granularities": if let Some(asr) = &state.asr {
             asr.timestamp_granularities()
-        } else if state.serving.as_ref().is_some_and(|s| s.audio_word_times) {
+        } else if state
+            .serving
+            .as_ref()
+            .is_some_and(|s| s.audio_word_times || s.ctc_word_times())
+        {
             serde_json::json!(["word"])
         } else {
             serde_json::json!([])
         },
+        // How the transcription endpoint reads `prompt`, where a lane pins
+        // it: "context" = terms to spell right (Transcribe), so a client
+        // sends a question about a clip to chat, not here. Absent elsewhere.
+        "transcription_prompt": state
+            .serving
+            .as_ref()
+            .filter(|_| state.asr.is_none())
+            .and_then(|s| s.transcription_prompt()),
+        // /v1/audio/translations: the languages this lane translates to and
+        // from, whether pairs go through English, whether the speech's
+        // language must be named. Absent where it does not translate.
+        "translation": state
+            .serving
+            .as_ref()
+            .filter(|_| state.asr.is_none() && state.rnnt_asr.is_none())
+            .and_then(crate::translations::caps_json),
         // What this runner can do about LANGUAGE: whether the lane
         // can name the spoken language at all, whether it returns a posterior
         // with it, whether `languages` biases that detection, and the exact
@@ -1342,7 +1367,7 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
             // prompt), so a client should gate its composer on this.
             "document_parser": s.document_parser,
             "transcription": s.supports_audio,
-            "realtime_transcription": crate::realtime::capabilities(s.supports_audio, false, s.audio_frontend.max_clip_s(state.max_ctx.saturating_sub(512))),
+            "realtime_transcription": crate::realtime::capabilities(s.supports_audio, s.ctc_word_times(), s.audio_frontend.max_clip_s(state.max_ctx.saturating_sub(512))),
             // Usually empty even when transcription works: Qwen3-ASR and the
             // base granite-speech emit a bare transcript with no timestamp
             // vocabulary at all, so there is no granularity they can answer,
@@ -1351,7 +1376,10 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
             // makes it write the times into its transcript  - but
             // `segment` stays out of reach even there: that mode emits no
             // punctuation, so there are no sentences to cut cues on.
-            "timestamp_granularities": if s.audio_word_times { vec!["word"] } else { vec![] },
+            // Transcribe times words with its CTC timestamp head
+            "timestamp_granularities": if s.audio_word_times || s.ctc_word_times() { vec!["word"] } else { vec![] },
+            "transcription_prompt": s.transcription_prompt(),
+            "translation": crate::translations::caps_json(s),
         });
         // Only on a lane that transcribes - `caps_json` returns None
         // otherwise, and a null capability is noise on a chat model.

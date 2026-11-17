@@ -896,6 +896,11 @@ impl Generator for GpuQwen3Asr {
                         "OCR crop directive on qwen3-asr - routing bug".into(),
                     ));
                 }
+                MmChunk::CtcTimestamps { .. } => {
+                    return Err(GenError::Backend(
+                        "CTC timestamp directive on qwen3-asr - routing bug".into(),
+                    ));
+                }
                 MmChunk::VisionPixels { .. } => {
                     return Err(GenError::Backend(
                         "pixel-budget directive on qwen3-asr - routing bug".into(),

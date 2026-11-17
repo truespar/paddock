@@ -164,6 +164,12 @@ pub(super) fn mm_plan(chunks: &[MmChunk], max_tiles: usize) -> Result<MmPlan, Gp
             }
             MmChunk::Text(_) => {}
             MmChunk::OcrCrop(m) => crop = Some(*m),
+            MmChunk::CtcTimestamps { .. } => {
+                return Err(GpuError::Driver(
+                    "CTC timestamp directive on deepseek-ocr - routing bug".into(),
+                )
+                .into());
+            }
             MmChunk::VisionPixels { .. } => {
                 return Err(GpuError::Driver(
                     "pixel-budget directive on deepseek-ocr - its crop planner \
@@ -210,7 +216,9 @@ pub(super) fn mm_plan(chunks: &[MmChunk], max_tiles: usize) -> Result<MmPlan, Gp
                 img_k += 1;
             }
             MmChunk::OcrCrop(_) => {} // consumed in the sizing pass
-            MmChunk::Audio { .. } | MmChunk::VisionPixels { .. } => {
+            MmChunk::Audio { .. }
+            | MmChunk::VisionPixels { .. }
+            | MmChunk::CtcTimestamps { .. } => {
                 unreachable!("rejected above")
             }
         }

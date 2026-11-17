@@ -68,7 +68,8 @@ impl GpuNemotron {
         // w16_class) - one-row decode included
         // the class is the NVFP4 lane's (w16_lane): the GGUF lane keeps its own
         let w16_lane = self.w16_lane();
-        let w16 = (!pf || verify) && w16_lane && w16_class(&exec, r);
+        let w16_max = self.w16_max();
+        let w16 = (!pf || verify) && w16_lane && w16_class(&exec, r, w16_max);
         // KV splits for the batched decode attention - see
         // attn_split_election (the head-packed arm, both KV classes, one
         // live CTA per SM; the scratch is sized from the same function).
@@ -112,7 +113,7 @@ impl GpuNemotron {
                     && c.dec > 0
                     && c.dec <= bs.sc.w16_rows
                     && w16_lane
-                    && w16_class(&exec, c.dec)
+                    && w16_class(&exec, c.dec, w16_max)
                     && exec.has_dense_w16_seg()
                     && exec.has_moe_route_w16() =>
             {
@@ -162,13 +163,113 @@ impl GpuNemotron {
                     .d_groups
                     .try_slice_mut(0..groups.len())
                     .ok_or_else(|| GpuError::Driver("verify groups".into()))?;
-                exec.stream
-                    .memcpy_htod(&groups, &mut v)
-                    .map_err(crate::gpu::from_driver)?;
+                exec.htod(&groups, &mut v)?;
                 Some((ng, rows_split(n_kv, ng, exec.sm_count()), gmax))
             }
             _ => None,
         };
+        // a verify round's mamba advance in two launches a layer (slots
+        // 947-948, the replay class): the run table uploads once per walk.
+        // PADDOCK_NO_MAMBA_RUNS pins the per-run launches for the A/B.
+        // A fused round's leading verify runs take the same two launches
+        // (and nothing else: the table is the only path they have).
+        let runs_dev = match cuts {
+            Some(c)
+                if (verify || c.vruns > 0)
+                    && exec.has_mamba_verify_runs()
+                    && bs.verify.as_ref().is_some_and(|v| v.rescan)
+                    && (c.vruns > 0
+                        || paddock_models::dev_var_os!("PADDOCK_NO_MAMBA_RUNS").is_none()) =>
+            {
+                let vr = if verify { c.runs.len() } else { c.vruns };
+                let table: Vec<u32> = c.runs[..vr]
+                    .iter()
+                    .flat_map(|&(off, len, slot)| [slot, off as u32, len as u32])
+                    .collect();
+                let vp = bs.verify.as_mut().expect("verify planes");
+                let mut v = vp
+                    .d_runs
+                    .try_slice_mut(0..table.len())
+                    .ok_or_else(|| GpuError::Driver("verify runs".into()))?;
+                exec.htod(&table, &mut v)?;
+                true
+            }
+            Some(c) if c.vruns > 0 => {
+                return Err(GpuModelError::Unsupported(
+                    "a fused verify round needs the replay class and slots 947-948".into(),
+                ));
+            }
+            _ => false,
+        };
+        // a prompt pass's runs advance in one conv and one scan launch a
+        // mamba layer (slots 954-955, f16 state class) instead of two
+        // launches a run that each fill a fraction of the die; a run holding
+        // a checkpoint break keeps the per-run walk (the state is copied at
+        // the break). Bit-identical to the per-run launches.
+        // PADDOCK_NO_MAMBA_PROMPT_RUNS pins the per-run walk for the A/B.
+        let (prompt_runs, prompt_max, in_table) = match cuts {
+            Some(c)
+                if !verify
+                    && c.runs.len() > c.vruns
+                    && exec.has_mamba_prompt_runs()
+                    && paddock_models::dev_var_os!("PADDOCK_NO_MAMBA_PROMPT_RUNS").is_none() =>
+            {
+                let mut table = Vec::new();
+                let mut max = 0usize;
+                let in_table: Vec<bool> = c.runs[c.vruns..]
+                    .iter()
+                    .map(|&(off, len, slot)| {
+                        let whole = !c.breaks.iter().any(|&(b, _)| b > off && b <= off + len);
+                        if whole {
+                            table.extend([slot, off as u32, len as u32]);
+                            max = max.max(len);
+                        }
+                        whole
+                    })
+                    .collect();
+                // in place needs a slot in one run (a pass never splits one;
+                // the per-run walk stays the answer if it ever did)
+                let mut seen = vec![false; bs.n_slots];
+                if table
+                    .chunks(3)
+                    .any(|t| std::mem::replace(&mut seen[t[0] as usize], true))
+                {
+                    table.clear();
+                }
+                if !table.is_empty() {
+                    let mut v = bs
+                        .d_prompt_runs
+                        .try_slice_mut(0..table.len())
+                        .ok_or_else(|| GpuError::Driver("prompt runs".into()))?;
+                    exec.htod(&table, &mut v)?;
+                }
+                (table, max, in_table)
+            }
+            _ => (Vec::new(), 0, Vec::new()),
+        };
+        // Transcribe's prompt rows fold bf16 MoE partials (slots 956-957, f32
+        // sums in the same fixed order): at a 2.4K-row pass the f32 planes
+        // were 210 MB a layer written and read back, a written byte costing
+        // twice a read on this die. The rows before the pass's first prompt
+        // row - a mixed tick's decode band, a fused round's verify rows -
+        // keep f32 partials, so a round scores its rows as the decode ticks
+        // they stand for do. PADDOCK_TR_PART_F32 pins f32 everywhere.
+        let part_vf: Option<usize> = cuts
+            .filter(|_| {
+                !verify
+                    && self.hp.transcribe
+                    && exec.has_nvf4_moe_down_st_bf16()
+                    && paddock_models::dev_var_os!("PADDOCK_TR_PART_F32").is_none()
+            })
+            .and_then(|c| c.runs[c.vruns..].iter().map(|r| r.0).min())
+            .filter(|&vf| {
+                cuts.is_some_and(|c| {
+                    c.dec <= vf && c.runs[..c.vruns].iter().all(|&(o, l, _)| o + l <= vf)
+                })
+            });
+        // the fused round's verify rows (the leading runs), whose conv inputs
+        // the rollback snapshots
+        let vrows: usize = cuts.map_or(0, |c| c.runs[..c.vruns].iter().map(|r| r.1).sum());
         // running mamba-layer index: the checkpoint blob offset for a layer
         // is mi * (state + win), matching the pool/restore layout
         let mut mi = 0usize;
@@ -345,7 +446,57 @@ impl GpuNemotron {
                                     hp.n_groups,
                                 )?;
                             }
-                            if verify {
+                            if verify && runs_dev {
+                                // the same advance for every run in two
+                                // launches (slots 947-948): the conv reads
+                                // the live window and writes the scratch
+                                // one, the scan keeps every row
+                                let vp = bs.verify.as_mut().expect("verify planes");
+                                exec.mamba_conv_seq_runs(
+                                    win,
+                                    vp.vwin[li].as_mut().expect("vwin"),
+                                    &sc.d_zxbcdt,
+                                    d_inner,
+                                    in_rows,
+                                    &w.conv_w,
+                                    &w.conv_b,
+                                    &mut sc.d_conv,
+                                    conv_dim,
+                                    hp.d_conv,
+                                    &vp.d_runs,
+                                    c.runs.len(),
+                                    win_elems,
+                                )?;
+                                ssm.scan_seq_keep_runs(
+                                    &exec,
+                                    state_elems,
+                                    &sc.d_conv,
+                                    &sc.d_zxbcdt,
+                                    d_inner + conv_dim,
+                                    in_rows,
+                                    &w.a,
+                                    &w.d,
+                                    &w.dt_bias,
+                                    &mut sc.d_y,
+                                    vp.keep[li].as_mut().expect("keep"),
+                                    &vp.d_runs,
+                                    c.runs.len(),
+                                    hp.mamba_heads,
+                                    hp.mamba_head_dim,
+                                    hp.d_state,
+                                    hp.n_groups,
+                                )?;
+                                exec.copy_rows_strided(
+                                    &sc.d_zxbcdt,
+                                    d_inner,
+                                    in_rows,
+                                    vp.xbc[li].as_mut().expect("xbc"),
+                                    0,
+                                    conv_dim,
+                                    r,
+                                )?;
+                                // falls through to the arm's shared tail
+                            } else if verify {
                                 // spec verify: conv on the slot's SCRATCH
                                 // window (live stays pre-round), scan on the
                                 // live state with per-row snapshots, xBC rows
@@ -442,13 +593,103 @@ impl GpuNemotron {
                                 // falls through to the arm's shared tail
                                 // (gated norm + out_proj + residual)
                             } else {
+                                if c.vruns > 0 {
+                                    // a fused round's verify runs: the verify
+                                    // walk's advance on the run table (the
+                                    // table holds just these runs)
+                                    let vp = bs.verify.as_mut().expect("verify planes");
+                                    exec.mamba_conv_seq_runs(
+                                        win,
+                                        vp.vwin[li].as_mut().expect("vwin"),
+                                        &sc.d_zxbcdt,
+                                        d_inner,
+                                        in_rows,
+                                        &w.conv_w,
+                                        &w.conv_b,
+                                        &mut sc.d_conv,
+                                        conv_dim,
+                                        hp.d_conv,
+                                        &vp.d_runs,
+                                        c.vruns,
+                                        win_elems,
+                                    )?;
+                                    ssm.scan_seq_keep_runs(
+                                        &exec,
+                                        state_elems,
+                                        &sc.d_conv,
+                                        &sc.d_zxbcdt,
+                                        d_inner + conv_dim,
+                                        in_rows,
+                                        &w.a,
+                                        &w.d,
+                                        &w.dt_bias,
+                                        &mut sc.d_y,
+                                        vp.keep[li].as_mut().expect("keep"),
+                                        &vp.d_runs,
+                                        c.vruns,
+                                        hp.mamba_heads,
+                                        hp.mamba_head_dim,
+                                        hp.d_state,
+                                        hp.n_groups,
+                                    )?;
+                                    exec.copy_rows_strided(
+                                        &sc.d_zxbcdt,
+                                        d_inner,
+                                        in_rows,
+                                        vp.xbc[li].as_mut().expect("xbc"),
+                                        0,
+                                        conv_dim,
+                                        vrows,
+                                    )?;
+                                }
+                                let batched = !prompt_runs.is_empty()
+                                    && matches!(ssm, super::ssm_arena::SsmArena::F16(_));
+                                if batched {
+                                    exec.mamba_conv_seq_runs_inplace(
+                                        win,
+                                        &sc.d_zxbcdt,
+                                        d_inner,
+                                        in_rows,
+                                        &w.conv_w,
+                                        &w.conv_b,
+                                        &mut sc.d_conv,
+                                        conv_dim,
+                                        hp.d_conv,
+                                        &bs.d_prompt_runs,
+                                        prompt_runs.len() / 3,
+                                        prompt_max,
+                                        win_elems,
+                                    )?;
+                                    ssm.scan_seq_runs(
+                                        &exec,
+                                        state_elems,
+                                        &sc.d_conv,
+                                        &sc.d_zxbcdt,
+                                        d_inner + conv_dim,
+                                        in_rows,
+                                        &w.a,
+                                        &w.d,
+                                        &w.dt_bias,
+                                        &mut sc.d_y,
+                                        &bs.d_prompt_runs,
+                                        &prompt_runs,
+                                        hp.mamba_heads,
+                                        hp.mamba_head_dim,
+                                        hp.d_state,
+                                        hp.n_groups,
+                                    )?;
+                                }
                                 // each chunk run advances its slot's arena
                                 // sequentially - the run walk is the whole reason
                                 // runs carry their slot. Checkpoint break rows
                                 // split the ADVANCE only (never the pass): the
                                 // state at the break is copied into the staging
                                 // blob before the tail of the run continues.
-                                for &(off, len, slot) in &c.runs {
+                                for (ri, &(off, len, slot)) in c.runs[c.vruns..].iter().enumerate()
+                                {
+                                    if batched && in_table[ri] {
+                                        continue;
+                                    }
                                     let s = slot as usize;
                                     let mut seg = off;
                                     for &(brow, stg) in
@@ -815,6 +1056,35 @@ impl GpuNemotron {
                                     embd,
                                     kv_dim,
                                     r,
+                                )?;
+                            }
+                        }
+                        // NVFP4 projections (Transcribe): decode rows in the
+                        // W16 class take the row-batched gemv (bit-exact per
+                        // row vs a one-row decode), prompt rows the W4A4 mma;
+                        // a mixed tick's band is recomputed in the decode
+                        // class over the chunk's result
+                        AttnWeights::Nvf4 { wq, wk, wv, .. } => {
+                            super::attn_nvf4_qkv(
+                                &exec,
+                                (wq, wk, wv),
+                                &sc.d_xn,
+                                &mut sc.d_xq4,
+                                &mut sc.d_xs4,
+                                (&mut sc.d_q, &mut sc.d_k, &mut sc.d_v),
+                                r,
+                                w16,
+                            )?;
+                            if band > 0 {
+                                super::attn_nvf4_qkv(
+                                    &exec,
+                                    (wq, wk, wv),
+                                    &sc.d_xn,
+                                    &mut sc.d_xq4,
+                                    &mut sc.d_xs4,
+                                    (&mut sc.d_q, &mut sc.d_k, &mut sc.d_v),
+                                    band,
+                                    true,
                                 )?;
                             }
                         }
@@ -1269,6 +1539,32 @@ impl GpuNemotron {
                                 )?;
                             }
                         }
+                        AttnWeights::Nvf4 { wo, .. } => {
+                            super::attn_nvf4_mm(
+                                &exec,
+                                wo,
+                                &sc.d_attn,
+                                &mut sc.d_xq4,
+                                &mut sc.d_xs4,
+                                &mut sc.d_proj,
+                                r,
+                                w16,
+                                false,
+                            )?;
+                            if band > 0 {
+                                super::attn_nvf4_mm(
+                                    &exec,
+                                    wo,
+                                    &sc.d_attn,
+                                    &mut sc.d_xq4,
+                                    &mut sc.d_xs4,
+                                    &mut sc.d_proj,
+                                    band,
+                                    true,
+                                    false,
+                                )?;
+                            }
+                        }
                         AttnWeights::Qw { wo, .. } => {
                             if dec1 {
                                 gemv_any(&exec, wo, &sc.d_attn, &mut sc.d_proj)?;
@@ -1448,6 +1744,8 @@ impl GpuNemotron {
                     // blocks of a launch that streams at ~93% of the roof.
                     // PADDOCK_NO_NEMO_SH_FOLD8=1 keeps the separate pair.
                     let fold8 = skinny && ns_sh > 0 && r <= 8 && sh_fold8_on();
+                    // the pass's prompt rows' bf16 partials (see part_vf)
+                    let pb16 = if moe_tiled { part_vf } else { None };
                     exec.matvec_f32_batch(&w.router, &sc.d_xn, &mut sc.d_logits_r, r)?;
                     if ns_sh > 0 && !dec1 && (!skinny || fold8) {
                         exec.moe_topk_sigmoid_batch_sh(
@@ -1881,7 +2179,7 @@ impl GpuNemotron {
                             nbr,
                             8,
                         )?;
-                        exec.nvf4_moe_down_st(
+                        exec.nvf4_moe_down_st_into(
                             down,
                             &sc.d_srow,
                             &sc.d_sslot,
@@ -1895,6 +2193,7 @@ impl GpuNemotron {
                             0,
                             nbr,
                             8,
+                            pb16,
                         )?;
                         if !fold8 {
                             // shared expert: resident sh planes, WIDE tiled
@@ -1922,7 +2221,7 @@ impl GpuNemotron {
                                 nbs,
                                 32,
                             )?;
-                            exec.nvf4_moe_down_st(
+                            exec.nvf4_moe_down_st_into(
                                 sh_down,
                                 &sc.d_srow_s,
                                 &sc.d_sslot_s,
@@ -1936,9 +2235,10 @@ impl GpuNemotron {
                                 hp.n_active,
                                 nbs,
                                 32,
+                                pb16,
                             )?;
                         }
-                        exec.moe_slot_combine(&sc.d_part, &mut sc.d_x, embd, np, r)?;
+                        prompt_fold(&exec, pb16, &sc.d_part, &mut sc.d_x, embd, np, r)?;
                         continue;
                     }
                     let kw = hp.n_active + ns_sh;
@@ -1973,7 +2273,7 @@ impl GpuNemotron {
                             nbr,
                             32,
                         )?;
-                        exec.nvf4_moe_down_st(
+                        exec.nvf4_moe_down_st_into(
                             down,
                             &sc.d_srow,
                             &sc.d_sslot,
@@ -1987,6 +2287,7 @@ impl GpuNemotron {
                             0,
                             nbr,
                             32,
+                            pb16,
                         )?;
                     } else {
                         exec.nvf4_moe_up_relu2_bs(
@@ -2046,7 +2347,7 @@ impl GpuNemotron {
                                 nbs,
                                 32,
                             )?;
-                            exec.nvf4_moe_down_st(
+                            exec.nvf4_moe_down_st_into(
                                 sh_down,
                                 &sc.d_srow_s,
                                 &sc.d_sslot_s,
@@ -2060,6 +2361,7 @@ impl GpuNemotron {
                                 hp.n_active,
                                 nbs,
                                 32,
+                                pb16,
                             )?;
                         } else {
                             exec.nvf4_moe_up_relu2_bs(
@@ -2095,7 +2397,7 @@ impl GpuNemotron {
                     if band_moe {
                         exec.copy_region(&sc.d_x, 0, &mut sc.d_band_x, 0, band * embd)?;
                     }
-                    exec.moe_slot_combine(&sc.d_part, &mut sc.d_x, embd, np, r)?;
+                    prompt_fold(&exec, pb16, &sc.d_part, &mut sc.d_x, embd, np, r)?;
                     if band_moe {
                         exec.copy_region(&sc.d_band_x, 0, &mut sc.d_x, 0, band * embd)?;
                         moe_w16_rows(&exec, &hp, w, sc, band)?;
@@ -2253,6 +2555,23 @@ fn moe_w16_rows(
 /// append at 247K depth spent 6.6 of its 16.2 s in it (GB10, Claude Code
 /// replay), routed and shared expert alike. PADDOCK_NO_NEMO_QMMA pins the
 /// dp4a pair for the A/B; a pack without slot 743 keeps it too.
+/// The prompt class's slot fold: f32 partials, or split at the pass's first
+/// prompt row (`vf`, bf16 partials from it on).
+fn prompt_fold(
+    exec: &GpuExecutor,
+    vf: Option<usize>,
+    part: &CudaSlice<f32>,
+    x: &mut CudaSlice<f32>,
+    embd: usize,
+    np: usize,
+    rows: usize,
+) -> Result<(), GpuError> {
+    match vf {
+        Some(vf) => exec.moe_slot_combine_split(part, x, embd, np, rows, vf),
+        None => exec.moe_slot_combine(part, x, embd, np, rows),
+    }
+}
+
 fn nemo_qmma_on(exec: &GpuExecutor) -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     exec.has_q8_moe_relu2_mma()

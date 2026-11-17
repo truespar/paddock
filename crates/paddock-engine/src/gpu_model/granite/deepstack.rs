@@ -443,7 +443,8 @@ impl crate::gpu_model::granite::GpuGranite {
                     MmChunk::Text(_)
                     | MmChunk::Audio { .. }
                     | MmChunk::OcrCrop(_)
-                    | MmChunk::VisionPixels { .. } => None,
+                    | MmChunk::VisionPixels { .. }
+                    | MmChunk::CtcTimestamps { .. } => None,
                 })
             })
             .collect();

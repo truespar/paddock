@@ -11,8 +11,13 @@ export function audioPolicy(lanes: AudioLane[], transcribers: number, docParser 
   const audioOk = lanes.length > 0 && lanes.every(l => l.audio)
   const audioMode = audioOk && !lanes.every(l => l.chat)
   const liveBlocked = audioMode && lanes.some(l => !l.live)
+  // Lanes that chat AND hear a stream (Nemotron 3.5 Transcribe, the generative
+  // ASR families) can take the live turn too - spoken into the thread while the
+  // text box stays - but a clip stays their default: Live comes second.
+  const live: MicMode[] = audioOk && !audioMode && lanes.every(l => l.live) ? ['live'] : []
   const jobs: MicMode[] = docParser ? [] : !audioOk ? (transcribers ? ['dictate'] : [])
     : audioMode ? (liveBlocked ? ['record'] : ['live', 'record'])
-      : lanes.length > 1 ? ['record'] : transcribers ? ['record', 'dictate'] : ['record']
+      : lanes.length > 1 ? ['record', ...live]
+        : transcribers ? ['record', ...live, 'dictate'] : ['record', ...live]
   return { audioOk, audioMode, liveBlocked, jobs }
 }

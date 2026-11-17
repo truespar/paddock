@@ -657,6 +657,25 @@ impl LanguageReport {
 ///
 /// `None` on a runner that does not transcribe at all, so the key is absent
 /// rather than a set of falses nobody can act on.
+/// The refusal for a forced `language` a lane was never trained on, or None:
+/// Transcribe writes it into its prompt's Language slot, so a code outside
+/// the card's set would decode as a guess. Shared by the file endpoint and
+/// the realtime session.
+pub(crate) fn unserved_language(
+    model: &crate::serving::ServingModel,
+    code: &str,
+) -> Option<String> {
+    let set = &paddock_models::transcribe::LANGUAGES;
+    (model.audio_frontend == crate::serving::AudioFrontend::Transcribe && !set.contains(&code))
+        .then(|| {
+            format!(
+                "language {code:?} is not one of this model's languages (ISO 639-1: {}); \
+                 omit `language` to transcribe the language it hears",
+                set.join(", ")
+            )
+        })
+}
+
 pub fn caps_json(
     asr: Option<&crate::serving::AsrModel>,
     serving: Option<&crate::serving::ServingModel>,
@@ -682,14 +701,21 @@ pub fn caps_json(
         s.audio_frontend,
         AudioFrontend::Qwen3Asr | AudioFrontend::Qwen3AsrMetal
     );
+    // Nemotron 3.5 Transcribe's card declares its set (40 languages): a
+    // forced `language` outside it is refused, so a client offers exactly
+    // these. The others carry no language map to read, so we genuinely do
+    // not know their set and say so by not listing one - unpublished, not
+    // empty-because-none.
+    let languages: &[&str] = if s.audio_frontend == AudioFrontend::Transcribe {
+        &paddock_models::transcribe::LANGUAGES
+    } else {
+        &[]
+    };
     Some(serde_json::json!({
         "supported": names_it,
         "probabilities": false,
         "hints": false,
-        // Unpublished, not empty-because-none: these checkpoints carry no
-        // language map to read, so we genuinely do not know their set and say
-        // so by not listing one.
-        "languages": [],
+        "languages": languages,
     }))
 }
 

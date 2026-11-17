@@ -212,6 +212,11 @@ pub(super) fn mm_plan(
                     "deepseek-ocr crop directive on paddleocr-vl - routing bug".into(),
                 ));
             }
+            MmChunk::CtcTimestamps { .. } => {
+                return Err(GpuModelError::Unsupported(
+                    "CTC timestamp directive on paddleocr-vl - routing bug".into(),
+                ));
+            }
         }
     }
     if grids.is_empty() {
@@ -349,6 +354,11 @@ impl GpuPaddleOcrVl {
                 MmChunk::OcrCrop(_) => {
                     return Err(GpuModelError::Unsupported(
                         "deepseek-ocr crop directive on paddleocr-vl - routing bug".into(),
+                    ));
+                }
+                MmChunk::CtcTimestamps { .. } => {
+                    return Err(GpuModelError::Unsupported(
+                        "CTC timestamp directive on paddleocr-vl - routing bug".into(),
                     ));
                 }
             }

@@ -63,7 +63,7 @@ pub use kumo::{KumoEpi, KumoFuse, KumoHeads, KumoIn};
 mod diarization;
 pub use clef::{ClefIn, ClefQ8, ClefScoreIn};
 pub use clef_vision::{ClefPlanMem, ClefResamplePlan, clef_resample_taps};
-pub use diarization::{DiarAct, DiarEpi, DiarFrontendPlanes, DiarWeights};
+pub use diarization::{DiarAct, DiarB16Out, DiarEpi, DiarFrontendPlanes, DiarKeys, DiarWeights};
 mod types;
 pub use kquant::q40_to_q8_blocks;
 mod mamba;
@@ -80,6 +80,7 @@ pub use nemotron_asr::{
 };
 pub use nemotron_vl::ResampleAxis;
 pub use phonon::{PhEpi, PhExtra, PhHint, PhPro, PhRope, PhWeight};
+pub use transcribe::TrW8Out;
 mod moe_bs;
 mod moe_mxfp4;
 mod moe_q8;
@@ -99,6 +100,7 @@ pub use stop_mask::StopMaskLane;
 mod nvpf;
 mod ternary;
 mod tier_xfer;
+mod transcribe;
 mod transfer;
 mod unified_mem;
 mod upload;
@@ -244,6 +246,9 @@ pub struct GpuExecutor {
     retained: std::sync::Arc<std::sync::Mutex<Option<unified_mem::RetainedCredit>>>,
     /// Pinned staging for large one-shot uploads (`to_device_u8_staged`).
     upload_ring: std::sync::Mutex<Vec<upload_ring::Stage>>,
+    /// Pinned bump ring for a pass's small uploads (`htod`), built on first
+    /// use.
+    small_ring: std::sync::Mutex<Option<upload_ring::SmallRing>>,
 }
 impl GpuExecutor {
     /// See the `dense_iq_seen` field.
@@ -467,6 +472,7 @@ impl GpuExecutor {
             conv_scratch: std::sync::Mutex::new(None),
             retained: Default::default(),
             upload_ring: std::sync::Mutex::new(Vec::new()),
+            small_ring: std::sync::Mutex::new(None),
         };
         exec.preflight()?;
         Ok(exec)
@@ -1057,13 +1063,19 @@ impl GpuExecutor {
 
     /// (event tracking is disabled by design).
     pub fn fork_stream(&self) -> Result<Self, GpuError> {
+        self.fork_stream_at(lane_prio() != LanePrio::Spans)
+    }
+
+    /// [`Self::fork_stream`] with the lane's priority chosen by the caller:
+    /// `greatest` = the parent compute stream's own (their blocks interleave
+    /// at dispatch), else the default least (the lane fills what the parent
+    /// leaves idle).
+    pub fn fork_stream_at(&self, greatest: bool) -> Result<Self, GpuError> {
         self.stream.synchronize().map_err(drv)?;
         // default (least) priority - the parent's greatest-priority compute
         // stream must win dispatch over forked lanes (see `new`; PADDOCK_LANE_PRIO)
         let stream = match cudarc::driver::result::stream::get_priority_range() {
-            Ok((_least, greatest)) if lane_prio() != LanePrio::Spans => {
-                self.ctx.new_stream_with_priority(greatest).map_err(drv)?
-            }
+            Ok((_least, top)) if greatest => self.ctx.new_stream_with_priority(top).map_err(drv)?,
             _ => self.ctx.new_stream().map_err(drv)?,
         };
         let copy_stream = self.ctx.new_stream().map_err(drv)?;
@@ -1092,6 +1104,7 @@ impl GpuExecutor {
             conv_scratch: std::sync::Mutex::new(None),
             retained: self.retained.clone(),
             upload_ring: std::sync::Mutex::new(Vec::new()),
+            small_ring: std::sync::Mutex::new(None),
         })
     }
 

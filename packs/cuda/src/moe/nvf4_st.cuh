@@ -268,7 +268,7 @@ __global__ void __launch_bounds__(ROWS * 2u, (BM >= 128u ? 1 : 2)) pd_nv4st_dn_k
     const uint32_t* __restrict__ block_expert, const float* __restrict__ topk_w,
     const uint8_t* __restrict__ fq, const uint8_t* __restrict__ fs,
     float* __restrict__ part, uint32_t ff, uint32_t embd, uint32_t kw,
-    uint32_t np, uint32_t slot_off) {
+    uint32_t np, uint32_t slot_off, uint32_t vf = 0xffffffffu) {
 #if PD_BS_OK
     constexpr uint32_t THR = ROWS * 2u;
     constexpr uint32_t YROW = PD_STT_YROW;
@@ -411,7 +411,11 @@ __global__ void __launch_bounds__(ROWS * 2u, (BM >= 128u ? 1 : 2)) pd_nv4st_dn_k
     #undef PD_STT_PREFETCH
 
     // weighted scatter to the per-(token, slot) partial rows - the shipped
-    // down epilogue with the j0 groups walked 8 columns at a time.
+    // down epilogue with the j0 groups walked 8 columns at a time. Token rows
+    // from `vf` on (slots 956-957: a pass's prompt rows) round their partials
+    // to bf16 at the store, into a bf16 plane laid from the f32 plane's row
+    // vf on - half the bytes it writes and the combine reads back; the rows
+    // before vf (a round's verify rows) keep the f32 partials.
     const float s2 = scale2[e];
     #pragma unroll
     for (uint32_t j0 = 0; j0 < BM; j0 += 8u) {
@@ -422,17 +426,25 @@ __global__ void __launch_bounds__(ROWS * 2u, (BM >= 128u ? 1 : 2)) pd_nv4st_dn_k
             if (t == PD_MOE_PAD) continue;
             const uint32_t slt = sorted_slot[(size_t)blk * BM + c];
             const float w = (topk_w ? topk_w[(size_t)t * kw + slt] : 1.0f) * s2;
-            float* prow = part + ((size_t)t * np + slt + slot_off) * embd;
             const uint32_t r0 = row_base + i0 + g;
             const uint32_t r8 = r0 + 8u;
-            if (r0 < embd) prow[r0] = acc[j0 >> 3][qc] * w;
-            if (r8 < embd) prow[r8] = acc[j0 >> 3][qc + 2u] * w;
+            if (t >= vf) {
+                __nv_bfloat16* prow =
+                    reinterpret_cast<__nv_bfloat16*>(part + (size_t)vf * np * embd) +
+                    ((size_t)(t - vf) * np + slt + slot_off) * embd;
+                if (r0 < embd) prow[r0] = __float2bfloat16_rn(acc[j0 >> 3][qc] * w);
+                if (r8 < embd) prow[r8] = __float2bfloat16_rn(acc[j0 >> 3][qc + 2u] * w);
+            } else {
+                float* prow = part + ((size_t)t * np + slt + slot_off) * embd;
+                if (r0 < embd) prow[r0] = acc[j0 >> 3][qc] * w;
+                if (r8 < embd) prow[r8] = acc[j0 >> 3][qc + 2u] * w;
+            }
         }
     }
 #else
     (void)data; (void)scale; (void)scale2; (void)sorted_row; (void)sorted_slot;
     (void)block_expert; (void)topk_w; (void)fq; (void)fs; (void)part; (void)ff;
-    (void)embd; (void)kw; (void)np; (void)slot_off;
+    (void)embd; (void)kw; (void)np; (void)slot_off; (void)vf;
 #endif
 }
 
@@ -1227,6 +1239,63 @@ int pd_nvf4_moe_down_st(const void* data, const void* scale, const void* scale2,
 #endif
 }
 
+// 956-957: pd_nvf4_moe_down_st / _stw with token rows from `vf` on folding
+// bf16 partials (see the kernel's epilogue; pd_moe_slot_combine_bf16 folds
+// that plane, pd_moe_slot_combine the f32 rows before it). The skinny and
+// wide twins both take it, so a prompt class keeps one partial type a row
+// at every width.
+PD_EXPORT
+int pd_nvf4_moe_down_st_bf16(const void* data, const void* scale, const void* scale2,
+                             const void* sorted_row, const void* sorted_slot,
+                             const void* block_expert, const void* topk_w, const void* fq,
+                             const void* fs, void* part, uint32_t ff, uint32_t embd, uint32_t kw,
+                             uint32_t np, uint32_t slot_off, uint32_t nb, uint32_t vf,
+                             void* stream) {
+#ifndef PD_BS_HOST
+    (void)data; (void)scale; (void)scale2; (void)sorted_row; (void)sorted_slot;
+    (void)block_expert; (void)topk_w; (void)fq; (void)fs; (void)part; (void)ff;
+    (void)embd; (void)kw; (void)np; (void)slot_off; (void)nb; (void)vf; (void)stream;
+    return cudaErrorNotSupported;
+#else
+    if (nb == 0) return 0;
+    if ((ff & 63u) != 0 || (embd & 63u) != 0) return cudaErrorInvalidValue;
+    dim3 grid(nb, embd >> 6);
+    pd_nv4st_dn_kernel<8u, 64u>
+        <<<grid, 128u, PD_STT_SMEM(8u, 64u), (cudaStream_t)stream>>>(
+            (const uint8_t*)data, (const uint8_t*)scale, (const float*)scale2,
+            (const uint32_t*)sorted_row, (const uint32_t*)sorted_slot,
+            (const uint32_t*)block_expert, (const float*)topk_w, (const uint8_t*)fq,
+            (const uint8_t*)fs, (float*)part, ff, embd, kw, np, slot_off, vf);
+    return pd_launch_status();
+#endif
+}
+
+PD_EXPORT
+int pd_nvf4_moe_down_stw_bf16(const void* data, const void* scale, const void* scale2,
+                              const void* sorted_row, const void* sorted_slot,
+                              const void* block_expert, const void* topk_w, const void* fq,
+                              const void* fs, void* part, uint32_t ff, uint32_t embd,
+                              uint32_t kw, uint32_t np, uint32_t slot_off, uint32_t nb,
+                              uint32_t vf, void* stream) {
+#ifndef PD_BS_HOST
+    (void)data; (void)scale; (void)scale2; (void)sorted_row; (void)sorted_slot;
+    (void)block_expert; (void)topk_w; (void)fq; (void)fs; (void)part; (void)ff;
+    (void)embd; (void)kw; (void)np; (void)slot_off; (void)nb; (void)vf; (void)stream;
+    return cudaErrorNotSupported;
+#else
+    if (nb == 0) return 0;
+    if ((ff & 63u) != 0 || (embd & 63u) != 0 || nb > 65535u) return cudaErrorInvalidValue;
+    dim3 grid((embd + 127u) >> 7, nb);
+    pd_nv4st_dn_kernel<32u, 128u, 0u, true>
+        <<<grid, 256u, PD_STT_SMEM(32u, 128u), (cudaStream_t)stream>>>(
+            (const uint8_t*)data, (const uint8_t*)scale, (const float*)scale2,
+            (const uint32_t*)sorted_row, (const uint32_t*)sorted_slot,
+            (const uint32_t*)block_expert, (const float*)topk_w, (const uint8_t*)fq,
+            (const uint8_t*)fs, (float*)part, ff, embd, kw, np, slot_off, vf);
+    return pd_launch_status();
+#endif
+}
+
 // Wide prefill pair: BM=32 blocks (the shipped align), 128-row CTAs over
 // the tiled plane. Bit-exact vs the row-major bs pair on identical routing.
 PD_EXPORT
@@ -1259,8 +1328,14 @@ int pd_nvf4_moe_up_relu2_stw(const void* data, const void* scale,
                                      in_dim, ff, nb, (cudaStream_t)stream);
     default: break;
     }
-    dim3 grid(nb, (ff + 127u) >> 7);
-    pd_nv4st_up_kernel<32u, 128u>
+    // row tiles fastest (YB): a block's CTAs run back to back, so its
+    // gathered activation rows and its expert's plane stay in L2 across
+    // them instead of a full sweep of every block per row tile -
+    // bit-identical (scheduling order only), -5..-16% on this twin at
+    // 200..2400 rows (GB10)
+    if (nb > 65535u) return cudaErrorInvalidValue;
+    dim3 grid((ff + 127u) >> 7, nb);
+    pd_nv4st_up_kernel<32u, 128u, 0u, true>
         <<<grid, 256u, PD_STT_SMEM(32u, 128u), (cudaStream_t)stream>>>(
             (const uint8_t*)data, (const uint8_t*)scale, (const float*)scale2,
             (const uint32_t*)sorted_row, (const uint32_t*)block_expert,
@@ -1304,8 +1379,17 @@ int pd_nvf4_moe_down_stw(const void* data, const void* scale,
                                      kw, np, slot_off, nb, (cudaStream_t)stream);
     default: break;
     }
-    dim3 grid(nb, (embd + 127u) >> 7);
-    pd_nv4st_dn_kernel<32u, 128u>
+    // row tiles fastest (YB): the down twin's input is per PAIR (six rows a
+    // token, ~15 MB of fq at a 2.4K-row pass), and with blocks fastest
+    // every one of the 21 row-tile sweeps re-streamed all of it past the
+    // 24 MB L2 beside the expert planes - the twin ran at twice the up
+    // twin's time with its mma removed. Back to back, a block's 30 KB of
+    // fq serves its 21 tiles from L2: dn 4.45 -> 2.60 ms at 2400 rows,
+    // 2.76 -> 1.92 at 1024, 1.79 -> 1.63 at 200 (GB10, uniq 128),
+    // bit-identical (scheduling order only)
+    if (nb > 65535u) return cudaErrorInvalidValue;
+    dim3 grid((embd + 127u) >> 7, nb);
+    pd_nv4st_dn_kernel<32u, 128u, 0u, true>
         <<<grid, 256u, PD_STT_SMEM(32u, 128u), (cudaStream_t)stream>>>(
             (const uint8_t*)data, (const uint8_t*)scale, (const float*)scale2,
             (const uint32_t*)sorted_row, (const uint32_t*)sorted_slot,

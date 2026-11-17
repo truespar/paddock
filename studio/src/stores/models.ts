@@ -303,6 +303,14 @@ export interface ModelCaps {
    *  people guess (~42 min at 32k on Qwen3-ASR). The recorder stops at this
    * instead of letting you find out from a refusal an hour. */
   transcriptionMaxClipS?: number
+  /** How /v1/audio/transcriptions reads `prompt`, where the lane pins it.
+   *  `context` (Nemotron 3.5 Transcribe) = terms to spell right, never an
+   *  instruction - so a question typed beside a clip goes to CHAT, which
+   *  takes the audio, instead of becoming a transcript's spelling hints. */
+  transcriptionPrompt?: string
+  /** The languages this lane can be told to expect (ISO 639-1), where the
+   *  checkpoint declares them; empty = unpublished, offer the full list. */
+  languages: string[]
   /** The server's own sampling defaults (what an untouched dial means) -
    *  advertised so the popover can show the number instead of a blind word.
    *  `source` names where they came from: usually the model's own published
@@ -393,6 +401,8 @@ interface ServerBody {
   alignment_max_clip_s?: number | null
   transcription_max_clip_s?: number | null
   timestamp_granularities?: string[] | null
+  transcription_prompt?: string | null
+  language_detection?: { languages?: string[] } | null
   include?: string[] | null
   max_ctx?: number
   default_max_output_tokens?: number
@@ -464,6 +474,8 @@ function parseCaps(body: ServerBody): ModelCaps {
     alignmentMaxClipS: body.alignment_max_clip_s ?? undefined,
     transcriptionMaxClipS: body.transcription_max_clip_s ?? undefined,
     timestampGranularities: body.timestamp_granularities ?? [],
+    transcriptionPrompt: body.transcription_prompt ?? undefined,
+    languages: body.language_detection?.languages ?? [],
     include: body.include ?? [],
     reasoning: (body.reasoning as ModelCaps['reasoning']) ?? undefined,
     reasoningLevels: body.reasoning_levels ?? undefined,
@@ -718,6 +730,7 @@ export const useModelsStore = defineStore('models', () => {
       mcpServers: [],
       taskTags: [],
       timestampGranularities: [],
+      languages: [],
       include: [],
     }
     // a cloud model has no /api/server to ask, and no paddock server tools
@@ -1045,6 +1058,30 @@ export const useModelsStore = defineStore('models', () => {
    *  granite-speech-plus times words and cannot cut segments at all. */
   function canTimeWords(id: string): boolean {
     return (caps.value[id]?.timestampGranularities ?? []).includes('word')
+  }
+
+  /** Whether a question typed beside a clip should go to CHAT on this lane:
+   *  its transcription endpoint reads `prompt` as context terms (so the
+   *  question would be spelling hints there), and it chats. Fetched caps only
+   *  - a lane that never said keeps the transcription route it always had. */
+  function asksInChat(id: string): boolean {
+    return caps.value[id]?.transcriptionPrompt === 'context' && canChat(id) && canTranscribe(id)
+  }
+
+  /** The languages to offer for this lane's clips: the checkpoint's own set
+   *  where it declares one, else undefined (the full list). */
+  function languagesFor(id: string): string[] | undefined {
+    const l = caps.value[id]?.languages
+    return l?.length ? l : undefined
+  }
+
+  /** The languages a turn to these lanes can be told: the intersection of
+   *  the sets the lanes declare (a lane that declares none takes any code), or
+   *  undefined when none declares one. */
+  function languagesForLanes(ids: string[]): string[] | undefined {
+    const sets = ids.map(languagesFor).filter((l): l is string[] => !!l)
+    if (!sets.length) return undefined
+    return sets.reduce((acc, l) => acc.filter((c) => l.includes(c)))
   }
 
   /** Whether this endpoint can say how sure it was of each word. Separate from
@@ -1392,6 +1429,9 @@ export const useModelsStore = defineStore('models', () => {
     canTimeSegments,
     canTimeWords,
     canWordConfidence,
+    asksInChat,
+    languagesFor,
+    languagesForLanes,
     reasoningStyleFor,
     integrateRunnerRows,
     reasoningLadderFor,

@@ -10,6 +10,7 @@
 // The dispatch between them is one `kind === 'transcriber'` branch in `run`.
 
 import type {
+  SpeakerTimeline,
   TranscriptGuard,
   TranscriptMeta,
   TranscriptSegment,
@@ -34,6 +35,23 @@ interface WireWord {
   paddock_confidence?: number
   paddock_alt?: string
   paddock_margin?: number
+  /** The speaker under a timed word, where the lane has a speaker timeline
+   *  of its own (Nemotron 3.5 Transcribe): the shared time-overlap
+   *  attribution, under `paddock_` names on the spec array. */
+  paddock_speaker?: number | null
+  paddock_speakers?: number[]
+  paddock_speaker_status?: TranscriptWord['speaker_status']
+  paddock_speaker_coverage?: number[]
+}
+
+/** A lane's own speaker timeline (`paddock_verbose.paddock_diarization`) -
+ *  the same shape a diarization model answers with, minus its words. */
+interface WireTimeline {
+  model?: string
+  duration?: number
+  segments?: { speaker?: number; start?: number; end?: number }[]
+  preset?: string
+  attribution?: string
 }
 
 /** One segment as the runner sends it (`paddock_verbose.segments[]`). The
@@ -75,6 +93,7 @@ interface DoneEvent {
       */
     paddock_words?: WireWord[]
     paddock_guards?: WireGuard[]
+    paddock_diarization?: WireTimeline
   }
   /** Also at the top level of the done event, so a caller who streamed plain
    * `json` still learns a span was refused. */
@@ -192,23 +211,51 @@ export async function audioDuration(blob: Blob | string): Promise<number | undef
 function wordsOf(raw: WireWord[] | undefined): TranscriptWord[] | undefined {
   const out = (raw ?? []).flatMap((w) => {
     const confidence = w.confidence ?? w.paddock_confidence
-    if (w.word === undefined || confidence === undefined) return []
     // Times ride only as a PAIR. Half a span would put a seek on a word whose
     // end nothing knows, and the runner never sends one - this is the guard
     // that keeps that true on the reading side too.
     const timed = w.start !== undefined && w.end !== undefined
-    return [
-      {
-        word: w.word,
-        confidence,
-        start: timed ? w.start : undefined,
-        end: timed ? w.end : undefined,
-        alt: w.paddock_alt,
-        margin: w.paddock_margin,
-      },
-    ]
+    // A word needs something to say: a confidence, or a time. A timed word
+    // without one is real (Transcribe's alignment times every word, and the
+    // decode's confidence rides only when asked for and matched) - dropping
+    // it would lose the seek for a number that was never there.
+    if (w.word === undefined || (confidence === undefined && !timed)) return []
+    const word: TranscriptWord = {
+      word: w.word,
+      confidence,
+      start: timed ? w.start : undefined,
+      end: timed ? w.end : undefined,
+      alt: w.paddock_alt,
+      margin: w.paddock_margin,
+    }
+    if (w.paddock_speaker_status !== undefined) {
+      word.speaker = w.paddock_speaker ?? null
+      word.speakers = w.paddock_speakers ?? []
+      word.speaker_status = w.paddock_speaker_status
+      word.speaker_coverage = w.paddock_speaker_coverage
+    }
+    return [word]
   })
   return out.length ? out : undefined
+}
+
+/** The lane's own speaker timeline, or undefined. Only the attribution the
+ *  speaker view knows how to read is taken - a timeline under some other
+ *  contract would be words labelled by rules this client does not show. */
+export function timelineOf(raw: WireTimeline | undefined, fallbackModel: string): SpeakerTimeline | undefined {
+  if (!raw || raw.attribution !== 'time_overlap_v1' || !(raw.duration && raw.duration > 0)) return undefined
+  const segments = (raw.segments ?? []).flatMap((s) =>
+    Number.isInteger(s.speaker) && s.start !== undefined && s.end !== undefined && s.end > s.start
+      ? [{ speaker: s.speaker as number, start: s.start, end: s.end }]
+      : [],
+  )
+  return {
+    model: raw.model ?? fallbackModel,
+    duration: raw.duration,
+    segments,
+    preset: raw.preset ?? '',
+    attribution: 'time_overlap_v1',
+  }
 }
 
 /** The runner answers `"unknown"` where no lane could name the language:
@@ -417,6 +464,7 @@ export async function transcribeClip(
       // that is the one worth keeping
       words: wordsOf(done?.paddock_verbose?.words ?? done?.paddock_verbose?.paddock_words),
       guards: guardsOf(done),
+      diarization: timelineOf(done?.paddock_verbose?.paddock_diarization, opts.model ?? ''),
     },
     usage: {
       // The audio side is billed in ENCODER ROWS, which is what the server

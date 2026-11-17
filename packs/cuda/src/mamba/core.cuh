@@ -85,12 +85,18 @@ __global__ void pd_mamba_conv_seq_kernel(
 
 // The same conv over a span cut into TCH-token chunks along T (grid.y): a
 // chunk's k-1 deep halo is the previous chunk's last k-1 inputs, which are
-// plain rows of xbc (chunk 0 takes them from `win`), and only the last chunk
-// writes the window back. Every output token runs the serial kernel's FMA
+// plain rows of xbc (chunk 0 takes them from `win`). Every output token runs
+// the serial kernel's FMA
 // sequence verbatim (same wc[j] * vals[j] order, same bias seed), so
 // chunked-vs-serial is bit-exact - the halo is data the serial walk would
-// have shifted through `vals` anyway. Why: the serial kernel is 24 CTAs of
-// 256 threads on a 6144-channel plane (grid = conv_dim / 256), each thread
+// have shifted through `vals` anyway. Chunk 0 writes the advanced window
+// back (the span's last k-1 inputs, from xbc or the old window), by the same
+// thread that read its halo from it: when the last chunk wrote it, a short
+// last chunk could land the new window before chunk 0 read the old one, and
+// the span's first k-1 outputs came out of the wrong inputs (seen as a
+// fresh 196-row prompt's logits moving by 9-18 between identical runs).
+// Why chunk at all: the serial kernel is 24 CTAs of 256 threads on a
+// 6144-channel plane (grid = conv_dim / 256), each thread
 // walking the whole span - on GB10's 48 SMs a 1022-row span cost 75-190 us
 // per launch and 172 launches per 1k prefill request (12.9 ms, vLLM's
 // triton conv 2.2), half the die idle and every thread latency-bound on
@@ -117,6 +123,13 @@ __global__ void pd_mamba_conv_seq_chunked_kernel(
         vals[j] = tr >= 0 ? xbc[(size_t)tr * x_stride + x_off + c]
                           : win[(size_t)(tr + (int32_t)km1) * conv_dim + c];
     }
+    float nw[PD_CONV_K_MAX];
+    if (blockIdx.y == 0)
+        for (uint32_t j = 0; j < km1; ++j) {
+            const int32_t tr = (int32_t)n_tokens - (int32_t)km1 + (int32_t)j;
+            nw[j] = tr >= 0 ? xbc[(size_t)tr * x_stride + x_off + c]
+                            : win[(size_t)(tr + (int32_t)km1) * conv_dim + c];
+        }
     float wc[PD_CONV_K_MAX];
     for (uint32_t j = 0; j < k; ++j) wc[j] = w[(size_t)c * k + j];
     const float bc = b[c];
@@ -127,8 +140,8 @@ __global__ void pd_mamba_conv_seq_chunked_kernel(
         out[(size_t)t * conv_dim + c] = acc / (1.0f + expf(-acc));
         for (uint32_t j = 0; j < km1; ++j) vals[j] = vals[j + 1];
     }
-    if (t1 == n_tokens)
-        for (uint32_t j = 0; j < km1; ++j) win[(size_t)j * conv_dim + c] = vals[j];
+    if (blockIdx.y == 0)
+        for (uint32_t j = 0; j < km1; ++j) win[(size_t)j * conv_dim + c] = nw[j];
 }
 
 // Chunk width and the election floor for the chunked conv: spans of at
@@ -701,17 +714,18 @@ int pd_mamba2_scan_step_batch(void* state, const void* xbc, const void* dt_raw,
 // f32 state: the rounding is a storage decision, never an arithmetic one.
 
 // Seq walk, f16 arena. Interior math identical to pd_mamba2_scan_seq_kernel.
+// The body is shared with slot 954's run-table walk (`cta` = the head block).
 template <uint32_t S_, uint32_t HD_ = 0u>
-__global__ void __launch_bounds__(128, 1) pd_mamba2_scan_seq_f16_kernel(
+__device__ __forceinline__ void pd_m2_seq_f16_body(
         __half* __restrict__ state, const float* __restrict__ xbc,
         const float* __restrict__ dt_raw, uint32_t dt_stride,
         const float* __restrict__ A, const float* __restrict__ D,
         const float* __restrict__ dt_bias, float* __restrict__ y,
         uint32_t n_tokens, uint32_t n_heads, uint32_t head_dim_rt,
-        uint32_t n_groups) {
+        uint32_t n_groups, uint32_t cta) {
     const uint32_t head_dim = HD_ ? HD_ : head_dim_rt;
     const uint32_t hpb = blockDim.x / head_dim;
-    const uint32_t h = blockIdx.x * hpb + threadIdx.x / head_dim;
+    const uint32_t h = cta * hpb + threadIdx.x / head_dim;
     const uint32_t i = threadIdx.x % head_dim;
     const uint32_t d_inner = n_heads * head_dim;
     const uint32_t conv_dim = d_inner + 2u * n_groups * S_;
@@ -750,6 +764,18 @@ __global__ void __launch_bounds__(128, 1) pd_mamba2_scan_seq_f16_kernel(
     #pragma unroll
     for (uint32_t j = 0; j < S_; ++j)
         srow[(size_t)j * head_dim] = __float2half_rn(st[j]);
+}
+
+template <uint32_t S_, uint32_t HD_ = 0u>
+__global__ void __launch_bounds__(128, 1) pd_mamba2_scan_seq_f16_kernel(
+        __half* __restrict__ state, const float* __restrict__ xbc,
+        const float* __restrict__ dt_raw, uint32_t dt_stride,
+        const float* __restrict__ A, const float* __restrict__ D,
+        const float* __restrict__ dt_bias, float* __restrict__ y,
+        uint32_t n_tokens, uint32_t n_heads, uint32_t head_dim_rt,
+        uint32_t n_groups) {
+    pd_m2_seq_f16_body<S_, HD_>(state, xbc, dt_raw, dt_stride, A, D, dt_bias, y, n_tokens,
+                                n_heads, head_dim_rt, n_groups, blockIdx.x);
 }
 
 PD_EXPORT
@@ -1059,6 +1085,221 @@ int pd_mamba2_rescan_f16(const void* descs, uint32_t n, uint32_t n_heads, uint32
     else
         pd_mamba2_rescan_f16_kernel<128u><<<grid, 128u, 0, (cudaStream_t)stream>>>(
             (const unsigned long long*)descs, n_heads, head_dim, n_groups);
+    return pd_launch_status();
+}
+
+// ---- a verify round's runs in one launch each (slots 947-948) -------------
+// The verify walk advanced every request's run on its own: a window copy to
+// the slot's scratch, the conv (24 CTAs) and the keep scan (32 CTAs of four
+// rows' work) per run per mamba layer - at 32 runs a layer ~100 launches that
+// each fill a fraction of the die, ~1 ms of a layer's span for ~0.5 ms of
+// work (GB10 2026-11-14, a 128-row Transcribe round). These take the run
+// table (u32 triples: slot, first row, rows) on grid.y and run every run's
+// arithmetic verbatim: per run the outputs are the per-run kernels' bits.
+
+// 947: pd_mamba_conv_seq's walk per run. A run reads its slot's window from
+// `win` (left as it was) and writes the advanced window to `win_out` - the
+// verify keeps the live window pre-round, so the scratch copy folds in.
+// `x_off` is the conv span's column inside a fused row; a run's rows start
+// at its first row.
+//
+// 955 runs the same walk cut into `tch`-row chunks along grid.z (the
+// chunked conv's halo rule: a chunk's k-1 deep halo is plain xbc rows, chunk
+// 0 takes it from the window), which keeps a long prompt run off a 24-CTA
+// serial walk; chunked and serial are bit-exact. Chunk 0 also writes the
+// advanced window - the run's last k-1 inputs, read from xbc or the old
+// window by the same thread that read its halo - so in place (win ==
+// win_out, a prompt walk) no other block reads what it writes. 947 is the
+// one-chunk case.
+__global__ void pd_mamba_conv_seq_runs_kernel(
+        const float* win, float* win_out,
+        const float* __restrict__ xbc, uint32_t x_off, uint32_t x_stride,
+        const float* __restrict__ w, const float* __restrict__ b,
+        float* __restrict__ out, uint32_t conv_dim, uint32_t k,
+        const uint32_t* __restrict__ runs, uint32_t win_elems, uint32_t tch) {
+    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= conv_dim) return;
+    const uint32_t* run = runs + 3u * blockIdx.y;
+    const uint32_t slot = run[0], off = run[1], n_tokens = run[2];
+    const uint32_t t0 = blockIdx.z * tch;
+    if (t0 >= n_tokens) return;
+    const uint32_t t1 = (n_tokens - t0 > tch) ? t0 + tch : n_tokens;
+    const float* wi = win + (size_t)slot * win_elems;
+    float* wo = win_out + (size_t)slot * win_elems;
+    const float* xr = xbc + (size_t)off * x_stride + x_off;
+    float* orow = out + (size_t)off * conv_dim;
+    const uint32_t km1 = k - 1u;
+    float vals[PD_CONV_K_MAX];
+    for (uint32_t j = 0; j < km1; ++j) {
+        const int32_t tr = (int32_t)t0 - (int32_t)km1 + (int32_t)j;
+        vals[j] = tr >= 0 ? xr[(size_t)tr * x_stride + c]
+                          : wi[(size_t)(tr + (int32_t)km1) * conv_dim + c];
+    }
+    float nw[PD_CONV_K_MAX];
+    if (blockIdx.z == 0)
+        for (uint32_t j = 0; j < km1; ++j) {
+            const int32_t tr = (int32_t)n_tokens - (int32_t)km1 + (int32_t)j;
+            nw[j] = tr >= 0 ? xr[(size_t)tr * x_stride + c]
+                            : wi[(size_t)(tr + (int32_t)km1) * conv_dim + c];
+        }
+    float wc[PD_CONV_K_MAX];
+    for (uint32_t j = 0; j < k; ++j) wc[j] = w[(size_t)c * k + j];
+    const float bc = b[c];
+    for (uint32_t t = t0; t < t1; ++t) {
+        vals[km1] = xr[(size_t)t * x_stride + c];
+        float acc = bc;
+        for (uint32_t j = 0; j < k; ++j) acc += wc[j] * vals[j];
+        orow[(size_t)t * conv_dim + c] = acc / (1.0f + expf(-acc));
+        for (uint32_t j = 0; j < km1; ++j) vals[j] = vals[j + 1];
+    }
+    if (blockIdx.z == 0)
+        for (uint32_t j = 0; j < km1; ++j) wo[(size_t)j * conv_dim + c] = nw[j];
+}
+
+PD_EXPORT
+int pd_mamba_conv_seq_runs(const void* win, void* win_out, const void* xbc, uint32_t x_off,
+                           uint32_t x_stride, const void* w, const void* b, void* out,
+                           uint32_t conv_dim, uint32_t k, const void* runs, uint32_t n_runs,
+                           uint32_t win_elems, void* stream) {
+    if (conv_dim == 0 || n_runs == 0) return 0;
+    if (k > PD_CONV_K_MAX || k == 0 || n_runs > 65535u) return cudaErrorInvalidValue;
+    const dim3 grid((conv_dim + 255u) / 256u, n_runs, 1u);
+    pd_mamba_conv_seq_runs_kernel<<<grid, 256u, 0, (cudaStream_t)stream>>>(
+        (const float*)win, (float*)win_out, (const float*)xbc, x_off, x_stride,
+        (const float*)w, (const float*)b, (float*)out, conv_dim, k, (const uint32_t*)runs,
+        win_elems, UINT32_MAX);
+    return pd_launch_status();
+}
+
+PD_EXPORT
+int pd_mamba_conv_seq_runs_chunked(const void* win, void* win_out, const void* xbc,
+                                   uint32_t x_off, uint32_t x_stride, const void* w,
+                                   const void* b, void* out, uint32_t conv_dim, uint32_t k,
+                                   const void* runs, uint32_t n_runs, uint32_t max_rows,
+                                   uint32_t win_elems, void* stream) {
+    if (conv_dim == 0 || n_runs == 0 || max_rows == 0) return 0;
+    if (k > PD_CONV_K_MAX || k == 0 || n_runs > 65535u) return cudaErrorInvalidValue;
+    const dim3 grid((conv_dim + 255u) / 256u, n_runs,
+                    (max_rows + PD_CONV_TCH - 1u) / PD_CONV_TCH);
+    pd_mamba_conv_seq_runs_kernel<<<grid, 256u, 0, (cudaStream_t)stream>>>(
+        (const float*)win, (float*)win_out, (const float*)xbc, x_off, x_stride,
+        (const float*)w, (const float*)b, (float*)out, conv_dim, k, (const uint32_t*)runs,
+        win_elems, PD_CONV_TCH);
+    return pd_launch_status();
+}
+
+// 948: slot 746's keep scan per run - the run's slot state (read, never
+// written), its rows of the conv output, raw dt, y and keep.
+template <uint32_t S_, uint32_t HD_ = 0u>
+__global__ void __launch_bounds__(128, 1) pd_mamba2_scan_seq_keep_runs_f16_kernel(
+        const __half* __restrict__ state, uint32_t state_elems, const float* __restrict__ xbc,
+        const float* __restrict__ dt_raw, uint32_t dt_stride,
+        const float* __restrict__ A, const float* __restrict__ D,
+        const float* __restrict__ dt_bias, float* __restrict__ y,
+        float* __restrict__ keep, const uint32_t* __restrict__ runs, uint32_t n_heads,
+        uint32_t head_dim_rt, uint32_t n_groups) {
+    const uint32_t d_inner = n_heads * (HD_ ? HD_ : head_dim_rt);
+    const uint32_t xs = d_inner + 2u * n_groups * S_;
+    const uint32_t ks = d_inner + n_groups * S_ + n_heads;
+    const uint32_t* run = runs + 3u * blockIdx.y;
+    const uint32_t slot = run[0], off = run[1], n_tokens = run[2];
+    pd_m2_rows_f16<S_, HD_, true>(state + (size_t)slot * state_elems, nullptr,
+                                  xbc + (size_t)off * xs, xs,
+                                  dt_raw + (size_t)off * dt_stride, dt_stride, A, D, dt_bias,
+                                  y + (size_t)off * d_inner, keep + (size_t)off * ks, n_tokens,
+                                  n_heads, head_dim_rt, n_groups, blockIdx.x);
+}
+
+PD_EXPORT
+int pd_mamba2_scan_seq_keep_runs_f16(const void* state, uint32_t state_elems, const void* xbc,
+                                     const void* dt_raw, uint32_t dt_stride, const void* A,
+                                     const void* D, const void* dt_bias, void* y, void* keep,
+                                     const void* runs, uint32_t n_runs, uint32_t n_heads,
+                                     uint32_t head_dim, uint32_t d_state, uint32_t n_groups,
+                                     void* stream) {
+    if (n_runs == 0) return 0;
+    if (const int e = pd_m2_rows_geometry(n_heads, head_dim, d_state, n_groups)) return e;
+    if (keep == nullptr || n_runs > 65535u) return cudaErrorInvalidValue;
+    const dim3 grid(n_heads / (128u / head_dim), n_runs);
+    if (head_dim == 64u)
+        pd_mamba2_scan_seq_keep_runs_f16_kernel<128u, 64u>
+            <<<grid, 128u, 0, (cudaStream_t)stream>>>(
+                (const __half*)state, state_elems, (const float*)xbc, (const float*)dt_raw,
+                dt_stride, (const float*)A, (const float*)D, (const float*)dt_bias, (float*)y,
+                (float*)keep, (const uint32_t*)runs, n_heads, head_dim, n_groups);
+    else
+        pd_mamba2_scan_seq_keep_runs_f16_kernel<128u>
+            <<<grid, 128u, 0, (cudaStream_t)stream>>>(
+                (const __half*)state, state_elems, (const float*)xbc, (const float*)dt_raw,
+                dt_stride, (const float*)A, (const float*)D, (const float*)dt_bias, (float*)y,
+                (float*)keep, (const uint32_t*)runs, n_heads, head_dim, n_groups);
+    return pd_launch_status();
+}
+
+// 954: a prompt walk's sequential scans for every run of the pass in one
+// launch - the seq walk's body per (run, head block), the slot's state read
+// and written back. Runs the pack hands the chunked SSD scan (n_tokens at or
+// past its election) stay per-run launches from `runs_host`, exactly as the
+// per-run entry would run them; the kernel skips them. `runs` (device) and
+// `runs_host` hold the same u32 triples (slot, first row, rows).
+template <uint32_t S_, uint32_t HD_ = 0u>
+__global__ void __launch_bounds__(128, 1) pd_mamba2_scan_seq_runs_f16_kernel(
+        __half* __restrict__ state, uint32_t state_elems, const float* __restrict__ xbc,
+        const float* __restrict__ dt_raw, uint32_t dt_stride, const float* __restrict__ A,
+        const float* __restrict__ D, const float* __restrict__ dt_bias, float* __restrict__ y,
+        const uint32_t* __restrict__ runs, uint32_t ssd_min, uint32_t n_heads,
+        uint32_t head_dim_rt, uint32_t n_groups) {
+    const uint32_t* run = runs + 3u * blockIdx.y;
+    const uint32_t slot = run[0], off = run[1], n_tokens = run[2];
+    if (n_tokens >= ssd_min) return;
+    const uint32_t d_inner = n_heads * (HD_ ? HD_ : head_dim_rt);
+    const uint32_t conv_dim = d_inner + 2u * n_groups * S_;
+    pd_m2_seq_f16_body<S_, HD_>(state + (size_t)slot * state_elems,
+                                xbc + (size_t)off * conv_dim, dt_raw + (size_t)off * dt_stride,
+                                dt_stride, A, D, dt_bias, y + (size_t)off * d_inner, n_tokens,
+                                n_heads, head_dim_rt, n_groups, blockIdx.x);
+}
+
+PD_EXPORT
+int pd_mamba2_scan_seq_runs_f16(void* state, uint32_t state_elems, const void* xbc,
+                                const void* dt_raw, uint32_t dt_stride, const void* A,
+                                const void* D, const void* dt_bias, void* y, const void* runs,
+                                const void* runs_host, uint32_t n_runs, uint32_t n_heads,
+                                uint32_t head_dim, uint32_t d_state, uint32_t n_groups,
+                                void* stream) {
+    if (n_runs == 0) return 0;
+    if (const int e = pd_m2_rows_geometry(n_heads, head_dim, d_state, n_groups)) return e;
+    if (runs == nullptr || runs_host == nullptr || n_runs > 65535u) return cudaErrorInvalidValue;
+    const uint32_t* hr = (const uint32_t*)runs_host;
+    const uint32_t d_inner = n_heads * head_dim;
+    const uint32_t conv_dim = d_inner + 2u * n_groups * d_state;
+    // the per-run entry's election is a row floor for this geometry: the
+    // kernel skips the runs at or past it and they take the per-run entry
+    // here, one launch chain each (its SSD scan, or its own fallback)
+    const uint32_t ssd_min =
+        pd_m2_ssd_elect(256u, n_heads, head_dim, d_state, n_groups) ? 256u : UINT32_MAX;
+    for (uint32_t i = 0; i < n_runs; ++i) {
+        const uint32_t slot = hr[3u * i], off = hr[3u * i + 1u], n = hr[3u * i + 2u];
+        if (n < ssd_min) continue;
+        const int r = pd_mamba2_scan_seq_f16((__half*)state + (size_t)slot * state_elems,
+                                             (const float*)xbc + (size_t)off * conv_dim,
+                                             (const float*)dt_raw + (size_t)off * dt_stride,
+                                             dt_stride, A, D, dt_bias,
+                                             (float*)y + (size_t)off * d_inner, n, n_heads,
+                                             head_dim, d_state, n_groups, stream);
+        if (r != 0) return r;
+    }
+    const dim3 grid(n_heads / (128u / head_dim), n_runs);
+    if (head_dim == 64u)
+        pd_mamba2_scan_seq_runs_f16_kernel<128u, 64u><<<grid, 128u, 0, (cudaStream_t)stream>>>(
+            (__half*)state, state_elems, (const float*)xbc, (const float*)dt_raw, dt_stride,
+            (const float*)A, (const float*)D, (const float*)dt_bias, (float*)y,
+            (const uint32_t*)runs, ssd_min, n_heads, head_dim, n_groups);
+    else
+        pd_mamba2_scan_seq_runs_f16_kernel<128u><<<grid, 128u, 0, (cudaStream_t)stream>>>(
+            (__half*)state, state_elems, (const float*)xbc, (const float*)dt_raw, dt_stride,
+            (const float*)A, (const float*)D, (const float*)dt_bias, (float*)y,
+            (const uint32_t*)runs, ssd_min, n_heads, head_dim, n_groups);
     return pd_launch_status();
 }
 
