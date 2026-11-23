@@ -746,6 +746,15 @@ pub trait Generator: Send {
         false
     }
 
+    /// True when every spec round must ride the ARMED protocol (begin ->
+    /// verify -> fetch) - a backend whose drafts are only known after the
+    /// verify (a draft tree: the accepted path is the round's draft).
+    /// All-greedy cohorts then take the device-plans round (greedy plans)
+    /// instead of the synchronous greedy one.
+    fn spec_armed_rounds(&self) -> bool {
+        false
+    }
+
     /// Arm the one-ahead spec pipeline on the shape of
     /// the strip round that just ran. False = not steady / not supported.
     fn spec_pipe_arm(&mut self) -> bool {

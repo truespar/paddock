@@ -286,6 +286,10 @@ impl GpuLaguna {
             .map_err(|e| GpuError::Driver(e.to_string()))?;
         self.exec.batched_copy(&d, descs.len() / 3)?;
         pf.last_reused[slot] = pos;
+        // Ripple's drafter: its stripes rode the adopted pages (the blob
+        // pointer's guard holds the batch borrow until it goes)
+        drop(_g);
+        self.d2_adopt_slot(slot, pos);
         Ok(pos)
     }
 
@@ -388,8 +392,12 @@ impl GpuLaguna {
     ) -> Result<(), GpuModelError> {
         // Laguna's own template renders every earlier assistant turn with an
         // empty think block - a reply's reasoning never comes back, so its pin
-        // could only take a window slot from prompts that do resume
-        if self.hp.flavor != super::Flavor::Kolibri {
+        // could only take a window slot from prompts that do resume (Kolibri's
+        // and Ripple's keep it)
+        if !matches!(
+            self.hp.flavor,
+            super::Flavor::Kolibri | super::Flavor::Ripple
+        ) {
             return Ok(());
         }
         let cut = pos as usize / BLOCK_TOKENS * BLOCK_TOKENS;

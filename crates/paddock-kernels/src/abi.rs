@@ -9952,7 +9952,184 @@ pub struct KernelTableV1 {
     pub diar_b16_gemm: Option<DiarB16GemmFn>,
     pub diar_norm_b16: Option<DiarNormB16Fn>,
     pub diar_attention_b16: Option<DiarAttentionB16Fn>,
+    /// Slot 968: Ripple-65B's clamped SwiGLU in place on gate,
+    /// `gate = silu(min(gate, L)) * clamp(up, -L, L)`,
+    /// `ripple_swiglu_clamp(gate, up, n, L, stream)`.
+    pub ripple_swiglu_clamp: Option<RippleSwigluClampFn>,
+    /// Slot 969: the value-residual blend `out = e + t * (x - e)` (the
+    /// layer's v-projection input), `ripple_valres_mix(out, e, x, n, t,
+    /// stream)`.
+    pub ripple_valres_mix: Option<RippleValresMixFn>,
+    /// Slot 970: `pd_nvf4_pf_gu_clamp` - slot 921's tile with Ripple's FFN
+    /// clamp in the epilogue: `act = bf16(silu(min(g, L)) * clamp(u, -L,
+    /// L))`; L 0 is slot 921 exactly.
+    pub nvf4_pf_gu_clamp: Option<Nvf4PfGuClampFn>,
+    /// Slot 971: `pd_quantize_nvf4_gs` - `quantize_nvf4` against a static
+    /// per-tensor scale `gs` (ModelOpt's 1 / input_scale): block scale
+    /// `e4m3(gs * amax / 6)`, elements at `gs / scale`. `(x, q, scale, n, gs,
+    /// stream)`; n % 32 == 0.
+    pub quantize_nvf4_gs: Option<QuantizeNvf4GsFn>,
+    /// Slot 972: `pd_nvf4_gemm_f4tn64` - slot 597's tile over a 64-column
+    /// batch tile (a verify round's 33..64 rows), batch <= 64; same contract
+    /// and per-acc K order (bit-exact vs 430 / 597). NULL wherever 597 is.
+    pub nvf4_gemm_f4tn64: Option<Nvf4GemmF4tn64Fn>,
+    /// Slot 973: `pd_bf16_gemm_vb` - the bf16 dense GEMM's TMA weight arm at
+    /// verify widths, `(w, x f32 [batch, in], y f32 [batch, out], in_dim,
+    /// out_dim, batch, stream)`; the unsplit tile's k walk. -2 = declined
+    /// (no TMA host, shape outside the box), the caller keeps its ladder.
+    pub bf16_gemm_vb: Option<Bf16GemmVbFn>,
+    /// Slot 974: `pd_dflash_lattice` - the DFlash2 selector's whole edge
+    /// lattice (slot `dflash_select`'s edge expression for every predecessor):
+    /// `(topk, pred, succ, hs, scores, ids, scale, cap, rank, k, rows, r,
+    /// stream)`; scores `[blocks * (rows - 1), k, k]` (predecessor-major),
+    /// ids `[blocks * (rows - 1), k]`.
+    pub dflash_lattice: Option<DflashLatticeFn>,
+    /// Slot 975: `pd_attn_prefill_tree` - one same-slot run of a draft
+    /// tree's verify rows on the pf7rp wide rung with the ancestor mask:
+    /// `(q, pool_k, pool_v, sinks, out, positions = cache slots, win_pos =
+    /// logical positions, tmask = (mask, base) a row, block_tables, bps,
+    /// slots, n_heads, n_kv_heads, head_dim, kv_dim, swa_window, rows, scale,
+    /// kv_dtype, stream)`; -2 = declined (shape the rung does not take).
+    pub attn_prefill_tree: Option<AttnPrefillTreeFn>,
+    /// Slot 976: `pd_kv_tree_move` - the accepted paths' K/V rows down to
+    /// their true positions in every layer, one launch: `(kp, vp, kind,
+    /// layers, bt0, bps0, bt1, bps1, plan, n_groups, stride, row_bytes,
+    /// stream)`; plan records `[slot, n, (src, dst) x n]` in depth order.
+    pub kv_tree_move: Option<KvTreeMoveFn>,
 }
+
+/// See [`KernelTableV1::attn_prefill_tree`] (slot 975).
+pub type AttnPrefillTreeFn = unsafe extern "C" fn(
+    q: *const core::ffi::c_void,
+    pool_k: *const core::ffi::c_void,
+    pool_v: *const core::ffi::c_void,
+    sinks: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    positions: *const core::ffi::c_void,
+    win_pos: *const core::ffi::c_void,
+    tmask: *const core::ffi::c_void,
+    block_tables: *const core::ffi::c_void,
+    blocks_per_slot: u32,
+    slots: *const core::ffi::c_void,
+    n_heads: u32,
+    n_kv_heads: u32,
+    head_dim: u32,
+    kv_dim: u32,
+    swa_window: u32,
+    rows: u32,
+    scale: f32,
+    kv_dtype: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::kv_tree_move`] (slot 976).
+pub type KvTreeMoveFn = unsafe extern "C" fn(
+    kp: *const core::ffi::c_void,
+    vp: *const core::ffi::c_void,
+    kind: *const core::ffi::c_void,
+    layers: u32,
+    bt0: *const core::ffi::c_void,
+    bps0: u32,
+    bt1: *const core::ffi::c_void,
+    bps1: u32,
+    plan: *const core::ffi::c_void,
+    n_groups: u32,
+    stride: u32,
+    row_bytes: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::dflash_lattice`] (slot 974).
+pub type DflashLatticeFn = unsafe extern "C" fn(
+    topk: *const core::ffi::c_void,
+    pred: *const core::ffi::c_void,
+    succ: *const core::ffi::c_void,
+    hs: *const core::ffi::c_void,
+    scores: *mut core::ffi::c_void,
+    ids: *mut core::ffi::c_void,
+    scale: f32,
+    cap: f32,
+    rank: u32,
+    k: u32,
+    rows: u32,
+    r: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::nvf4_gemm_f4tn64`] (slot 972).
+pub type Nvf4GemmF4tn64Fn = unsafe extern "C" fn(
+    data: *const core::ffi::c_void,
+    scale: *const core::ffi::c_void,
+    bias: *const core::ffi::c_void,
+    xq: *const core::ffi::c_void,
+    xs: *const core::ffi::c_void,
+    y: *mut core::ffi::c_void,
+    scale2: f32,
+    in_dim: u32,
+    out_dim: u32,
+    batch: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::bf16_gemm_vb`] (slot 973).
+pub type Bf16GemmVbFn = unsafe extern "C" fn(
+    w: *const core::ffi::c_void,
+    x: *const core::ffi::c_void,
+    y: *mut core::ffi::c_void,
+    in_dim: u32,
+    out_dim: u32,
+    batch: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::quantize_nvf4_gs`] (slot 971).
+pub type QuantizeNvf4GsFn = unsafe extern "C" fn(
+    x: *const core::ffi::c_void,
+    q: *mut core::ffi::c_void,
+    scale: *mut core::ffi::c_void,
+    n: u32,
+    gs: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::nvf4_pf_gu_clamp`] (slot 970).
+pub type Nvf4PfGuClampFn = unsafe extern "C" fn(
+    gdata: *const core::ffi::c_void,
+    gscale: *const core::ffi::c_void,
+    gs2: f32,
+    udata: *const core::ffi::c_void,
+    uscale: *const core::ffi::c_void,
+    us2: f32,
+    x: *const core::ffi::c_void,
+    ldx: u32,
+    act: *mut core::ffi::c_void,
+    lda: u32,
+    aoff: u32,
+    in_dim: u32,
+    ff: u32,
+    ntok: u32,
+    limit: f32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::ripple_swiglu_clamp`] (slot 968).
+pub type RippleSwigluClampFn = unsafe extern "C" fn(
+    gate: *mut core::ffi::c_void,
+    up: *const core::ffi::c_void,
+    n: u32,
+    limit: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::ripple_valres_mix`] (slot 969).
+pub type RippleValresMixFn = unsafe extern "C" fn(
+    out: *mut core::ffi::c_void,
+    e: *const core::ffi::c_void,
+    x: *const core::ffi::c_void,
+    n: u32,
+    t: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
 
 /// See [`KernelTableV1::tr_ctc_qk_norm_rope`] (slot 958).
 pub type TrCtcQkNormRopeFn = unsafe extern "C" fn(
@@ -12802,7 +12979,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 953;
+pub const KERNEL_TABLE_SLOTS: usize = 962;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,

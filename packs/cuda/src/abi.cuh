@@ -4510,6 +4510,35 @@ struct KernelTableV1 {
     int (*diar_norm_b16)(const void*, const void*, const void*, void*, uint32_t, uint32_t, void*);
     int (*diar_attention_b16)(const void*, const void*, const void*, void*, uint32_t, uint32_t,
                               uint32_t, const void*, uint32_t, uint32_t, void*);
+    // 968-969: Ripple-65B's elementwise glue (ripple.cuh)
+    int (*ripple_swiglu_clamp)(void*, const void*, uint32_t, float, void*);
+    int (*ripple_valres_mix)(void*, const void*, const void*, uint32_t, float, void*);
+    // 970: the W4A16 prefill tile's gate|up with Ripple's clamp (gemm/nvf4_pf.cuh)
+    int (*nvf4_pf_gu_clamp)(const void*, const void*, float, const void*, const void*, float,
+                            const void*, uint32_t, void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                            uint32_t, float, void*);
+    // 971: nvf4 activation quantize against a static per-tensor scale (quant/nvf4.cuh)
+    int (*quantize_nvf4_gs)(const void*, void*, void*, uint32_t, float, void*);
+    // 972: the f4t tile at verify width - slot 597's contract over a 64-column
+    // batch tile, batch <= 64 (quant/nvf4_f4tn.cuh)
+    int (*nvf4_gemm_f4tn64)(const void*, const void*, const void*, const void*, const void*,
+                            void*, float, uint32_t, uint32_t, uint32_t, void*);
+    // 973: the bf16 dense GEMM's TMA arm at verify widths, (w, x f32, y f32,
+    // in_dim, out_dim, batch, stream); -2 = declined (gemm/bf16_dense.cuh)
+    int (*bf16_gemm_vb)(const void*, const void*, void*, uint32_t, uint32_t, uint32_t, void*);
+    // 974: the DFlash2 selector's whole K x K edge lattice (dflash.cuh)
+    int (*dflash_lattice)(const void*, const void*, const void*, const void*, void*, void*,
+                          float, float, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    // 975: a draft tree's verify attention - one run on the pf7rp wide rung
+    // with the ancestor mask (attn/prefill_tree.cuh)
+    int (*attn_prefill_tree)(const void*, const void*, const void*, const void*, void*,
+                             const void*, const void*, const void*, const void*, uint32_t,
+                             const void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                             uint32_t, float, uint32_t, void*);
+    // 976: the accepted paths' K/V rows to their true positions, all layers
+    // in one launch (attn/prefill_tree.cuh)
+    int (*kv_tree_move)(const void*, const void*, const void*, uint32_t, const void*, uint32_t,
+                        const void*, uint32_t, const void*, uint32_t, uint32_t, uint32_t, void*);
 };
 
 } // extern "C"
@@ -4587,6 +4616,28 @@ static unsigned int pd_pf_runs_maxn = 0;
 #define PD_PDL_ARM_WAIT() asm volatile("griddepcontrol.wait;" ::: "memory")
 #define PD_PDL_RELEASE() asm volatile("griddepcontrol.launch_dependents;")
 #endif
+
+// pd_pdl_after(p): a predecessor's plane, read only after the PDL wait.
+// The wait orders ordinary loads, but not a load through a `const T*
+// __restrict__` parameter: NVVM emits that one as ld.global.nc, whose
+// contract is "these bytes never change while this kernel runs" - and under
+// PDL the kernel runs BEFORE its producer is done. NVVM keeps the PTX in
+// order; ptxas takes the contract at its word and schedules LDG.CONSTANT
+// above ACQBULK (griddepcontrol.wait) when it likes the latency. It did in
+// pd_quantize_e4m3_row1p_kernel<V=8> (13.3, sm_121a): all eight x loads
+// ahead of the wait, so the quantizer read rows its predecessor was still
+// writing - DFlash2 drafted garbage at 96+ rows on GB10 with no error
+// anywhere, while V=4 and the C-chunk twin kept their order by luck of the
+// schedule. The empty asm sequenced after the wait makes every load depend
+// on it and drops the restrict provenance; the assume keeps them LDG (a
+// plain coherent global load) instead of generic LD. Same bytes as the
+// ordered read - bit-identical by construction.
+template <typename T>
+__device__ __forceinline__ const T* pd_pdl_after(const T* p) {
+    asm volatile("" : "+l"(p));
+    __builtin_assume(__isGlobal(p));
+    return p;
+}
 
 // L2 bulk prefetch of a contiguous byte range (sm_90+; 16 B aligned, size a
 // multiple of 16). A hint: no data dependency, no numerics - and safe ahead

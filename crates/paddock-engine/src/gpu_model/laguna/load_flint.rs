@@ -331,6 +331,8 @@ impl GpuLaguna {
                 is_swa,
                 nope: !is_swa,
                 n_heads,
+                valres: None,
+                ffn_act: None,
             });
         }
         let vh = vfree();
@@ -384,6 +386,9 @@ impl GpuLaguna {
                 rope_full,
                 rope_swa,
                 moe,
+                embed_scale: 1.0,
+                ffn_clamp: None,
+                pf_w4a4: false,
             },
             tok_embd,
             layers,
@@ -403,6 +408,7 @@ impl GpuLaguna {
             batch: None,
             pipe: None,
             dflash: None,
+            dflash2: None,
             chunked: Vec::new(),
             w16r: None,
         })

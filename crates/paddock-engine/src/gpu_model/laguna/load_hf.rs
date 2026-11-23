@@ -197,6 +197,8 @@ impl GpuLaguna {
                 is_swa: swa,
                 nope: !swa,
                 n_heads: kolibri::HEADS,
+                valres: None,
+                ffn_act: None,
             });
         }
         let output_norm = f32_dt("model.norm.weight", vec![n_embd])?;
@@ -244,6 +246,9 @@ impl GpuLaguna {
                 rope_full,
                 rope_swa,
                 moe,
+                embed_scale: 1.0,
+                ffn_clamp: None,
+                pf_w4a4: false,
             },
             tok_embd,
             layers,
@@ -259,6 +264,7 @@ impl GpuLaguna {
             batch: None,
             pipe: None,
             dflash: None,
+            dflash2: None,
             chunked: Vec::new(),
             w16r: None,
         })

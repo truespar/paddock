@@ -39,4 +39,17 @@ __device__ __forceinline__ unsigned pd_nvf4_scale(float amax, float* inv) {
     return s.__x;
 }
 
+// The static-scale twin (slot 971): the block scale against a per-tensor
+// global `gs` (ModelOpt NVFP4's 1 / input_scale, the checkpoint's own
+// calibration), as the W4A4 recipe the scales were made for computes it:
+// SF = e4m3(gs * amax / 6), the elements at gs / SF (so x ~ code * SF / gs).
+// A zero SF (the block underflows against the global) zeroes the block.
+__device__ __forceinline__ unsigned pd_nvf4_scale_gs(float amax, float gs, float* inv) {
+    __nv_fp8_e4m3 s;
+    s.__x = __nv_fp8_e4m3(gs * (amax * (1.0f / 6.0f))).__x;
+    const float sf = (float)s;
+    *inv = sf != 0.0f ? gs / sf : 0.0f;
+    return s.__x;
+}
+
 // pd_nvf4_swz_off (the swizzled scale atoms' byte offset) lives in tma_desc.cuh.

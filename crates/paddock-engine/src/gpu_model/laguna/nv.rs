@@ -57,6 +57,8 @@ pub(crate) fn nv_swiglu(
     u: &mut CudaSlice<f32>,
     y: &mut CudaSlice<f32>,
     rows: usize,
+    // Ripple's clamp (gate <= it, up in [-it, it]) - None is plain SwiGLU
+    clamp: Option<f32>,
 ) -> Result<(), GpuError> {
     // the decode band's gate|up in one launch (slot 927; rows bit-identical)
     let pair = (2..=TC_FLOOR).contains(&rows)
@@ -65,7 +67,10 @@ pub(crate) fn nv_swiglu(
         nv_rows(exec, gate, x, g, rows)?;
         nv_rows(exec, up, x, u, rows)?;
     }
-    exec.swiglu(g, u, rows * gate.out_dim)?;
+    match clamp {
+        Some(limit) => exec.ripple_swiglu_clamp(g, u, rows * gate.out_dim, limit)?,
+        None => exec.swiglu(g, u, rows * gate.out_dim)?,
+    }
     nv_rows(exec, down, g, y, rows)
 }
 
@@ -202,13 +207,40 @@ pub(super) fn dense_rows(
     ws: Option<&mut W16r>,
     pf: bool,
     r: usize,
+    clamp: Option<f32>,
+    w4a4: Option<[f32; 2]>,
 ) -> Result<(), GpuError> {
-    if let Some(ws) = ws.filter(|w| pf && w.pf) {
+    // W4A4 (Ripple's prompt rows and wide verify rounds - the caller's
+    // election): nvfp4 rows quantized against the checkpoint's static input
+    // scales on the block-scaled fp4 GEMM, which carries scale2 *
+    // input_scale; the unsplit arm (part None - a K-split folds in another
+    // order)
+    if let Some([s_in, s_dn]) =
+        w4a4.filter(|_| r >= 2 && exec.has_nvf4_gemm_f4() && exec.has_quantize_nvf4_gs())
+    {
+        let (k, ff) = (gate.in_dim, gate.out_dim);
+        let (xq, xs) = (&mut sc.xq4, &mut sc.xs4);
+        exec.quantize_nvf4_gs(&sc.xn, xq, xs, r * k, 1.0 / s_in)?;
+        exec.nvf4_gemm_f4_scaled(gate, s_in, xq, xs, &mut sc.ffn_gate, None, r, None)?;
+        exec.nvf4_gemm_f4_scaled(up, s_in, xq, xs, &mut sc.ffn_up, None, r, None)?;
+        match clamp {
+            Some(l) => exec.ripple_swiglu_clamp(&mut sc.ffn_gate, &sc.ffn_up, r * ff, l)?,
+            None => exec.swiglu(&mut sc.ffn_gate, &sc.ffn_up, r * ff)?,
+        }
+        exec.quantize_nvf4_gs(&sc.ffn_gate, xq, xs, r * ff, 1.0 / s_dn)?;
+        return exec.nvf4_gemm_f4_scaled(down, s_dn, xq, xs, &mut sc.proj, None, r, None);
+    }
+    // a clamped FFN (Ripple) needs the clamping epilogue's slot
+    let tile = |w: &&mut W16r| pf && w.pf && (clamp.is_none() || exec.has_nvf4_pf_gu_clamp());
+    if let Some(ws) = ws.filter(tile) {
         let (k, ff) = (gate.in_dim, gate.out_dim);
         if !std::mem::take(&mut ws.x16_fresh) {
             exec.convert_f32_bf16(&sc.xn, &mut ws.x16, r * k)?;
         }
-        exec.nvf4_pf_gu(gate, up, &ws.x16, k, &mut ws.act, ff, 0, r)?;
+        match clamp {
+            None => exec.nvf4_pf_gu(gate, up, &ws.x16, k, &mut ws.act, ff, 0, r)?,
+            Some(l) => exec.nvf4_pf_gu_clamp(gate, up, &ws.x16, k, &mut ws.act, ff, 0, r, l)?,
+        }
         return exec.nvf4_pf_gemm(down, &ws.act, ff, 0, &mut sc.proj, down.out_dim, 0, r);
     }
     nv_swiglu(
@@ -221,6 +253,7 @@ pub(super) fn dense_rows(
         &mut sc.ffn_up,
         &mut sc.proj,
         r,
+        clamp,
     )
 }
 
@@ -249,8 +282,10 @@ pub(crate) struct W16r {
 
 impl W16r {
     /// Allocated beside the batch state for a model whose MoE is NVFP4 with
-    /// an NVFP4 shared expert (Flint); None everywhere else, and None when
-    /// the pack lacks the pair (the GEMVs then serve every width).
+    /// an NVFP4 shared expert (Flint), or whose dense FFN is NVFP4 (Ripple:
+    /// its prefill rides the tile through `dense_rows`); None everywhere
+    /// else, and None when the pack lacks the pair or the tile (the GEMVs
+    /// then serve every width).
     pub(crate) fn new(
         exec: &GpuExecutor,
         hp: &super::Hparams,
@@ -260,7 +295,11 @@ impl W16r {
         let nv_shared = layers.iter().any(|l| {
             matches!(&l.ffn, super::Ffn::MoeNv(w) if matches!(w.shared, super::SharedNv::Nv { .. }))
         });
-        if !nv_shared || !exec.has_nvf4_moe_w16r() {
+        let dense_nv = hp.flavor == super::Flavor::Ripple
+            && layers
+                .iter()
+                .any(|l| matches!(l.ffn, super::Ffn::DenseNv { .. }));
+        if !(nv_shared && exec.has_nvf4_moe_w16r()) && !(dense_nv && exec.has_nvf4_pf()) {
             return Ok(None);
         }
         let m = &hp.moe;

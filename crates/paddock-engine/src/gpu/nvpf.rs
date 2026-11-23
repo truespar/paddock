@@ -305,8 +305,45 @@ impl GpuExecutor {
         aoff: usize,
         ntok: usize,
     ) -> Result<(), GpuError> {
+        self.nvf4_pf_gu_any([gate, up], x, ldx, act, lda, aoff, ntok, None)
+    }
+
+    /// Slot 970 is in the pack (the gate|up tile with Ripple's clamp).
+    pub fn has_nvf4_pf_gu_clamp(&self) -> bool {
+        self.kernels.nvf4_pf_gu_clamp.is_some()
+    }
+
+    /// [`Self::nvf4_pf_gu`] with the FFN clamp in the epilogue (slot 970):
+    /// `bf16(silu(min(g, limit)) * clamp(u, -limit, limit))`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn nvf4_pf_gu_clamp(
+        &self,
+        gate: &Nvf4Plane,
+        up: &Nvf4Plane,
+        x: &CudaSlice<half::bf16>,
+        ldx: usize,
+        act: &mut CudaSlice<half::bf16>,
+        lda: usize,
+        aoff: usize,
+        ntok: usize,
+        limit: f32,
+    ) -> Result<(), GpuError> {
+        self.nvf4_pf_gu_any([gate, up], x, ldx, act, lda, aoff, ntok, Some(limit))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn nvf4_pf_gu_any(
+        &self,
+        [gate, up]: [&Nvf4Plane; 2],
+        x: &CudaSlice<half::bf16>,
+        ldx: usize,
+        act: &mut CudaSlice<half::bf16>,
+        lda: usize,
+        aoff: usize,
+        ntok: usize,
+        clamp: Option<f32>,
+    ) -> Result<(), GpuError> {
         const OP: &str = "nvf4_pf_gu";
-        let f = self.kernels.nvf4_pf_gu.ok_or(GpuError::MissingOp(OP))?;
         row_plane(gate, OP)?;
         row_plane(up, OP)?;
         let (k, ff) = (gate.in_dim, gate.out_dim);
@@ -326,25 +363,66 @@ impl GpuExecutor {
         let (us, _a4) = up.scale.device_ptr(&self.stream);
         let (xp, _a5) = x.device_ptr(&self.stream);
         let (ap, _a6) = act.device_ptr_mut(&self.stream);
-        // SAFETY: ABI contract; spans checked above
-        check(unsafe {
-            f(
-                gd as *const _,
-                gs as *const _,
-                gate.scale2,
-                ud as *const _,
-                us as *const _,
-                up.scale2,
-                xp as *const _,
-                ldx as u32,
-                ap as *mut _,
-                lda as u32,
-                aoff as u32,
-                k as u32,
-                ff as u32,
-                ntok as u32,
-                self.stream_ptr(),
-            )
+        let (gs2, us2) = (gate.scale2, up.scale2);
+        let (ldx, lda, aoff) = (ldx as u32, lda as u32, aoff as u32);
+        let (k, ff, ntok) = (k as u32, ff as u32, ntok as u32);
+        let (gd, gs, ud, us) = (
+            gd as *const _,
+            gs as *const _,
+            ud as *const _,
+            us as *const _,
+        );
+        let (xp, ap) = (xp as *const _, ap as *mut _);
+        // SAFETY: ABI contract (slots 921 / 970); spans checked above
+        check(match clamp {
+            None => {
+                let f = self.kernels.nvf4_pf_gu.ok_or(GpuError::MissingOp(OP))?;
+                unsafe {
+                    f(
+                        gd,
+                        gs,
+                        gs2,
+                        ud,
+                        us,
+                        us2,
+                        xp,
+                        ldx,
+                        ap,
+                        lda,
+                        aoff,
+                        k,
+                        ff,
+                        ntok,
+                        self.stream_ptr(),
+                    )
+                }
+            }
+            Some(limit) => {
+                let f = self
+                    .kernels
+                    .nvf4_pf_gu_clamp
+                    .ok_or(GpuError::MissingOp("nvf4_pf_gu_clamp"))?;
+                unsafe {
+                    f(
+                        gd,
+                        gs,
+                        gs2,
+                        ud,
+                        us,
+                        us2,
+                        xp,
+                        ldx,
+                        ap,
+                        lda,
+                        aoff,
+                        k,
+                        ff,
+                        ntok,
+                        limit,
+                        self.stream_ptr(),
+                    )
+                }
+            }
         })
     }
 

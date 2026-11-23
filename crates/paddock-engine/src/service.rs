@@ -5280,7 +5280,6 @@ fn run_batched(
         // pass (per slot: pending token + n-gram drafts) instead of the
         // dense one-token step. Each slot commits its accepted run plus the
         // verify pass's own next token - several tokens per weight read.
-        // Any sampling slot forces the dense path (it needs full logits).
         spec_ticks += 1;
         if spec_supported && spec_ticks >= spec_retry_at && !generator.spec_deferred() {
             // chunking slots are mid-prefill - Never decodable rows. The
@@ -5291,9 +5290,10 @@ fn run_batched(
             // published it into `chunking`: absence from that set alone is
             // not evidence of a valid decode cursor.
             let live = spec_live_slots(&slots, &chunking);
-            // constrained slots force the dense path too: spec picks are
-            // device argmaxes, computed where no mask can apply
+            // constrained slots force the dense path too (spec picks are device
+            // argmaxes); an armed-round backend takes greedy cohorts below too
             let greedy = !live.is_empty()
+                && !generator.spec_armed_rounds()
                 && live.len() <= serve_spec_max_rows()
                 && live.len() <= spec_live_cap
                 && live.iter().all(|&k| {

@@ -2109,6 +2109,20 @@ static const KernelTableV1 PD_KERNELS = {
     pd_diar_b16_gemm,
     pd_diar_norm_b16,
     pd_diar_attention_b16,
+    pd_ripple_swiglu_clamp,
+    pd_ripple_valres_mix,
+    pd_nvf4_pf_gu_clamp,
+    pd_quantize_nvf4_gs,
+    // 972: f4tn's 64-column twin (block-scale SASS like 597; NULLed with it)
+    pd_nvf4_gemm_f4tn64,
+    // 973: the bf16 TMA arm at verify widths (declines off the TMA hosts)
+    pd_bf16_gemm_vb,
+    // 974: the DFlash2 selector lattice (plain CUDA, no NULL rule)
+    pd_dflash_lattice,
+    // 975: tree verify attention (the pf7rp body's gate; declines with -2)
+    pd_attn_prefill_tree,
+    // 976: tree KV compaction (plain CUDA)
+    pd_kv_tree_move,
 };
 
 PD_EXPORT const PackInfo* paddock_pack_info(void) {
@@ -2162,6 +2176,7 @@ PD_EXPORT const KernelTableV1* paddock_pack_kernels_v1(void) {
             t.nvf4_gemm_f4t = NULL;
             t.nvf4_gemm_f4t4 = NULL;
             t.nvf4_gemm_f4tn = NULL;
+            t.nvf4_gemm_f4tn64 = NULL;
             // the rest of the same mma.sync kind::mxf4nvf4 family: block-scale
             // SASS, empty off cc12 like the entries above. Unreachable on B200
             // while nothing there elected W4A4; once slot 867 lit the W4A4
@@ -2258,6 +2273,7 @@ PD_EXPORT const KernelTableV1* paddock_pack_kernels_v1(void) {
             // the W4A16 prefill tile: the same decode + bf16 mma
             t.nvf4_pf_gemm = NULL;
             t.nvf4_pf_gu = NULL;
+            t.nvf4_pf_gu_clamp = NULL;
             t.nvf4_pf_moe_gu = NULL;
             t.nvf4_pf_moe_dn = NULL;
             t.nvf4_pf_moe_gu_ne = NULL;
@@ -2376,6 +2392,7 @@ PD_EXPORT const KernelTableV1* paddock_pack_kernels_v1(void) {
             t.nvf4_gemm_f4t = NULL;
             t.nvf4_gemm_f4t4 = NULL;
             t.nvf4_gemm_f4tn = NULL;
+            t.nvf4_gemm_f4tn64 = NULL;
             t.nvf4_gemm_f4t_swq = NULL;
             t.q8_0_moe_gate_up_g2_geglu = NULL;
             t.q8_0_moe_gate_up_mma2t_geglu = NULL;

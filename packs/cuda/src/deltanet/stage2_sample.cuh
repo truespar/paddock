@@ -3561,7 +3561,7 @@ __global__ void __launch_bounds__(1024) pd_sample_rows_p_kernel(
 // f8 repack hook or lazy when not capturing; fin self-cleans the row.
 // Kill: PADDOCK_NO_TOPP_MB (one-block fallback).
 #define PD_TOPP_MB_SEG 32u
-#define PD_TOPP_MB_MAXR 64u
+#define PD_TOPP_MB_MAXR 128u  // a verify round's rows (one-block: ~4.5 ms at 128 on GB10)
 // per-row u32 scratch layout (rest state all-zero):
 //   [0..1] amax composite (okey<<32 | ~id)  [2] reqc  [3] reqg  [4] reqd
 //   [5] reqq  [6] done  [7] gcnt  [8] D  [9] S  [10] cum_cut  [11] M

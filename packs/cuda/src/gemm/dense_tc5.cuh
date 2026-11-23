@@ -2209,7 +2209,7 @@ __global__ void pd_rowmax_part_kernel(const TI* __restrict__ x,
     PD_PDL_ARM();  // no-op below sm_90 (multi-arch fatbin: raw asm breaks ptxas)
     const uint32_t row = blockIdx.x, c = blockIdx.y, C = gridDim.y;
     const uint32_t tid = threadIdx.x, nth = blockDim.x;
-    const TI* xr = x + (size_t)row * n_dim;
+    const TI* xr = pd_pdl_after(x) + (size_t)row * n_dim;   // read after the PDL wait
     const size_t np = (size_t)gridDim.x * n_dim;
     const uint32_t n4 = n_dim >> 2;
     const uint32_t n4c = (n4 + C - 1u) / C;
@@ -2260,10 +2260,10 @@ __global__ void pd_quantize_e4m3_row2_kernel(const TI* __restrict__ x,
     PD_PDL_ARM();  // no-op below sm_90 (multi-arch fatbin: raw asm breaks ptxas)
     const uint32_t row = blockIdx.x, c = blockIdx.y, C = gridDim.y;
     const uint32_t tid = threadIdx.x, nth = blockDim.x;
-    const int e = pd_rowq_exp_from_parts(parts, row, C);
+    const int e = pd_rowq_exp_from_parts(pd_pdl_after(parts), row, C);
     if (c == 0 && tid == 0) rscale[row] = ldexpf(1.0f, e);
     const float inv = ldexpf(1.0f, -e);
-    const TI* xr = x + (size_t)row * n_dim;
+    const TI* xr = pd_pdl_after(x) + (size_t)row * n_dim;   // read after the PDL wait
     const size_t np = (size_t)gridDim.x * n_dim;
     unsigned char* qr = q + (size_t)row * n_dim;
     const uint32_t n4 = n_dim >> 2;

@@ -36,6 +36,9 @@ pub(super) struct PfAttend<'a> {
     pub kv_dtype: KvDtype,
     /// the f16 WMMA-class prefill tile serves this layer's prefill spans
     pub wmma_pf: bool,
+    /// a draft tree's verify rows: every span takes the masked rung (slot
+    /// 975) - no other kernel reads the masks, so a refusal is an error
+    pub tree: bool,
 }
 
 /// The f16 prefill tile over rows `[off, off + len)`: into `out16` when the
@@ -57,8 +60,34 @@ fn tile(
     first: bool,
     off: usize,
     len: usize,
+    tree: Option<(&CudaSlice<u32>, &CudaSlice<u32>)>,
 ) -> Result<(), GpuError> {
     let (k, v) = (&kvs.k, &kvs.v);
+    if let Some((tpos, tmask)) = tree {
+        let geo = (a.nh, a.n_kv, a.hd, a.kv_dim);
+        let served = exec.attn_prefill_tree_at(
+            q,
+            k,
+            v,
+            sinks,
+            out,
+            (pos, tpos, tmask),
+            slots,
+            off,
+            (a.bt, a.bps),
+            geo,
+            a.window,
+            len,
+            a.scale,
+            a.kv_dtype,
+        )?;
+        if !served {
+            return Err(GpuError::Unsupported(
+                "attn tree: the masked rung refused a tree span".into(),
+            ));
+        }
+        return Ok(());
+    }
     if let Some(o) = out16.as_deref_mut() {
         let (bt, bps, nh, n_kv, hd) = (a.bt, a.bps, a.nh, a.n_kv, a.hd);
         let qp = q16.map_or(PfQ::F32(q), PfQ::F16);
@@ -174,6 +203,12 @@ pub(super) fn attend_pf(
     r: usize,
     ws: Option<&mut W16r>,
 ) -> Result<(), GpuError> {
+    if a.tree && (!a.wmma_pf || dec > 0) {
+        // only the tile path carries the ancestor masks
+        return Err(GpuError::Unsupported(
+            "attn tree: a tree round off the prefill tile".into(),
+        ));
+    }
     let sinks = a.sinks.unwrap_or(&sc.sinks);
     let (bt, bps, nh, n_kv, hd, kv_dim) = (a.bt, a.bps, a.nh, a.n_kv, a.hd, a.kv_dim);
     let (window, scale, kv_dtype) = (a.window, a.scale, a.kv_dtype);
@@ -230,8 +265,9 @@ pub(super) fn attend_pf(
                 band(exec, kvs, a, sinks, ins, outs, off, len)?;
             } else if a.wmma_pf {
                 let (q, o, p, s) = (&sc.qn, &mut sc.attn, &sc.d_pos, &sc.d_slots);
+                let t = a.tree.then_some((&sc.d_tpos, &sc.d_tmask));
                 tile(
-                    exec, a, sinks, q, q16, o, p, s, kvs, &mut out16, first, off, len,
+                    exec, a, sinks, q, q16, o, p, s, kvs, &mut out16, first, off, len, t,
                 )?;
                 first = false;
             } else if len > 24 && exec.has_attn_prefill_paged() {
@@ -310,8 +346,9 @@ pub(super) fn attend_pf(
             if a.wmma_pf {
                 // the row-offset entry at 0 is the whole-chunk call's launch
                 let (q, o, p, s) = (&sc.qn, &mut sc.attn, &sc.d_pos, &sc.d_slots);
+                let t = a.tree.then_some((&sc.d_tpos, &sc.d_tmask));
                 tile(
-                    exec, a, sinks, q, q16, o, p, s, kvs, &mut out16, first, 0, r,
+                    exec, a, sinks, q, q16, o, p, s, kvs, &mut out16, first, 0, r, t,
                 )?;
             } else if r > 24 && exec.has_attn_prefill_paged() {
                 exec.attn_prefill_paged(
@@ -363,8 +400,9 @@ pub(super) fn attend_pf(
                     band(exec, kvs, a, sinks, ins, outs, off, len)?;
                 } else if a.wmma_pf {
                     let (q, o, p, s) = (&sc.qn, &mut sc.attn, &sc.d_pos, &sc.d_slots);
+                    let t = a.tree.then_some((&sc.d_tpos, &sc.d_tmask));
                     tile(
-                        exec, a, sinks, q, q16, o, p, s, kvs, &mut out16, first, off, len,
+                        exec, a, sinks, q, q16, o, p, s, kvs, &mut out16, first, off, len, t,
                     )?;
                     first = false;
                 } else if len > 24 && exec.has_attn_prefill_paged() {

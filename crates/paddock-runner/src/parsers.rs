@@ -111,7 +111,9 @@ impl Dialect {
             "laguna" | "flint" => Dialect::Laguna,
             "muse-glimmer" => Dialect::MuseChannel,
             "granite" => Dialect::JsonToolCall,
-            "kolibri1" => Dialect::JsonThinking,
+            // Ripple's template: Hermes JSON calls in `<tool_call>` and a
+            // `<think>` block the model opens itself
+            "kolibri1" | "ripple" => Dialect::JsonThinking,
             _ => Dialect::Plain,
         }
     }

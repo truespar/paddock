@@ -214,6 +214,63 @@ int pd_dflash_select(const void* topk, const void* pred, const void* succ,
     return pd_launch_status();
 }
 
+// slot 974: the whole selector LATTICE, for a tree of drafts. The greedy walk
+// above needs one row of each position's K x K edge matrix (the predecessor
+// it committed to); a tree keeps several predecessors alive, so this scores
+// every edge: scores[(blk * (rows - 1) + j - 1) * k * k + p * k + c] = the
+// walk's edge (unary + rank-r bilinear form, the same expression and order)
+// from candidate p one position back - the anchor at the first position,
+// where every p row is the anchor's - to candidate c at position j, and
+// ids[(blk * (rows - 1) + j - 1) * k + c] = candidate c's token. One CTA a
+// (block, position), a warp a (p, c) edge with its lanes across the rank.
+__global__ void pd_dflash_lattice_kernel(const uint32_t* __restrict__ topk,
+                                         const float* __restrict__ pred,
+                                         const float* __restrict__ succ,
+                                         const float* __restrict__ hs,
+                                         float* __restrict__ scores,
+                                         uint32_t* __restrict__ ids,
+                                         float scale, float cap,
+                                         uint32_t rank, uint32_t k,
+                                         uint32_t rows, uint32_t r) {
+    const uint32_t e = blockIdx.x;                  // (block, position) edge set
+    const uint32_t b = e / (rows - 1u), j = e % (rows - 1u) + 1u;
+    const uint32_t row = b * rows + j;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u, warp = tid >> 5, nwarp = blockDim.x >> 5;
+    const uint32_t nk = r * k;
+    const float* h = hs + (size_t)row * rank;
+    float* out = scores + (size_t)e * k * k;
+    if (tid < k) ids[(size_t)e * k + tid] = topk[((size_t)row * k + tid) * 2u];
+    for (uint32_t pc = warp; pc < k * k; pc += nwarp) {
+        const uint32_t p = pc / k, c = pc % k;
+        const float* pe = (j == 1u) ? pred + (size_t)(nk + b) * rank
+                                    : pred + ((size_t)(row - 1u) * k + p) * rank;
+        const float* se = succ + ((size_t)row * k + c) * rank;
+        float acc = 0.0f;
+        for (uint32_t t = lane; t < rank; t += 32u) acc += pe[t] * h[t] * se[t];
+        for (uint32_t s = 16; s > 0; s >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, s);
+        if (lane == 0) {
+            float u = __uint_as_float(topk[((size_t)row * k + c) * 2u + 1u]) * scale;
+            if (cap > 0.0f) u = tanhf(u / cap) * cap;
+            out[pc] = u + acc;
+        }
+    }
+}
+
+PD_EXPORT
+int pd_dflash_lattice(const void* topk, const void* pred, const void* succ, const void* hs,
+                      void* scores, void* ids, float scale, float cap, uint32_t rank,
+                      uint32_t k, uint32_t rows, uint32_t r, void* stream) {
+    if (r == 0u || rows < 2u) return 0;
+    if (r % rows) return cudaErrorInvalidValue;
+    if (k == 0u || k > 64u || (rank & 31u)) return -2;
+    const uint32_t edges = (r / rows) * (rows - 1u);
+    pd_dflash_lattice_kernel<<<edges, 256u, 0, (cudaStream_t)stream>>>(
+        (const uint32_t*)topk, (const float*)pred, (const float*)succ, (const float*)hs,
+        (float*)scores, (uint32_t*)ids, scale, cap, rank, k, rows, r);
+    return pd_launch_status();
+}
+
 // ---- rung G: SAMPLED selector walk + 16-candidate
 // canonical rejection sampling -------------------------------------------
 //

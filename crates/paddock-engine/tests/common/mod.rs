@@ -318,6 +318,10 @@ pub const KOLIBRI_Q4KM: &[&str] = &[
 ];
 /// The compressed-tensors NVFP4 checkpoint directory.
 pub const KOLIBRI_NVFP4: &[&str] = &["Kolibri-1-NVFP4"];
+/// Ricursive's Ripple-65B Preview, the official ModelOpt NVFP4 dir.
+pub const RIPPLE_NVFP4: &[&str] = &["Ripple-65B-Preview-NVFP4"];
+/// Its official DFlash2 drafter (BF16 safetensors dir).
+pub const RIPPLE_DFLASH2: &[&str] = &["Ripple-65B-Preview-DFlash2"];
 /// Recursive's Flint, the official NVFP4 GGUF (the laguna body's Flint
 /// flavor); llama.cpp reads `flint` since PR #30928.
 pub const FLINT_NVFP4: &[&str] = &["Flint-NVFP4-GGUF/flint-nvfp4.gguf", "flint-nvfp4.gguf"];

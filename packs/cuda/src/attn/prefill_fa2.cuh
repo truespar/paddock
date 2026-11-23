@@ -1125,8 +1125,17 @@ template <bool B> struct PdPfIn { static constexpr bool value = B; };
 // the f32 output put through convert_f32_bf16.
 // Q16: q arrives as f16 already scaled (slot 929 wrote f16(value * qscale)),
 // so the Q stage only copies - the halves this kernel would have formed.
+// TM: a draft TREE's verify rows (slot 975). Each row carries (mask, base)
+// in `tmask`: keys at or past `base` (the slot's committed end, where the
+// tree's own nodes sit by node index) are visible only where the row's
+// ancestor bit is set; `positions` are the rows' cache slots (the causal
+// bound), `win_pos` their logical positions (the window floor). The
+// unmasked interior ends at the lowest row's BASE (the tree's root, every
+// row's ancestor) - not at its slot: a CTA tile of deep nodes has slots
+// well past the root, and the tree keys between are its siblings'.
 template <uint32_t G, bool VL = false, uint32_t HD = 256u, uint32_t TK = 64u,
-          uint32_t SUB = 1u, bool K16 = false, bool O16 = false, bool Q16 = false>
+          uint32_t SUB = 1u, bool K16 = false, bool O16 = false, bool Q16 = false,
+          bool TM = false>
 __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
     const float* __restrict__ q, const unsigned char* __restrict__ pool_k,
     const unsigned char* __restrict__ pool_v, const float* __restrict__ sinks,
@@ -1135,7 +1144,7 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
     const unsigned int* __restrict__ slots, uint32_t n_heads, uint32_t kv_dim,
     uint32_t swa_window, uint32_t n_rows, float scale,
     const uint32_t* __restrict__ vl_items, const uint32_t* __restrict__ run_offs,
-    const unsigned int* __restrict__ win_pos) {
+    const unsigned int* __restrict__ win_pos, const uint32_t* __restrict__ tmask = nullptr) {
 #if PD_FA_OK
     constexpr uint32_t MR = 64u * SUB, NKC = TK / 16u;
     constexpr uint32_t QROW = HD + 8u;   // pane (and SUB=1 sh_q) halves per row (+8 pad)
@@ -1196,9 +1205,12 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
     // loop's first barrier, and the pane's first write is K0's repack after
     // it. Their own 512 B put the hd256 tile 256 B past GB10's 101,376-byte
     // opt-in (static included), so it could not launch there at all.
-    static_assert(2u * MR * 4u <= TK * QROW * 2u, "positions must fit the pane");
+    static_assert((TM ? 4u : 2u) * MR * 4u <= TK * QROW * 2u, "positions must fit the pane");
     unsigned int* sh_rpos = (unsigned int*)pane;
     unsigned int* sh_rwin = sh_rpos + MR;
+    // TM: the rows' ancestor masks and tree bases, beside them
+    unsigned int* sh_rtm = sh_rwin + MR;
+    unsigned int* sh_rtb = sh_rtm + MR;
 
     // positions first: hi/lo gate the K0/V0 cp.async, which must be in
     // flight before the (much longer) Q stage - pf7's Q-then-stage order
@@ -1209,6 +1221,12 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
             (row0 + d) < Rtot ? positions[qr0 + (row0 + d) / G] : 0xFFFFFFFFu;
         sh_rwin[d] =
             (row0 + d) < Rtot ? wp[qr0 + (row0 + d) / G] : 0xFFFFFFFFu;
+        if constexpr (TM) {
+            const bool live = (row0 + d) < Rtot;
+            const uint32_t tr = qr0 + (row0 + d) / G;
+            sh_rtm[d] = live ? tmask[2u * tr] : 0u;
+            sh_rtb[d] = live ? tmask[2u * tr + 1u] : 0xFFFFFFFFu;
+        }
     }
     __syncthreads();
 
@@ -1223,7 +1241,10 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
             hi = max(hi, p + 1u);
             const uint32_t f = pd_pf_floor(sh_rwin[r], swa_window);
             lo = min(lo, f);
-            pmin = min(pmin, p);
+            // TM: a row sees every key up to its tree's base (the committed
+            // prefix and the root) - past it only its ancestors, so the
+            // unmasked interior stops at the base, not at the row's slot
+            pmin = min(pmin, TM ? sh_rtb[r] : p);
             fmax = max(fmax, f);
         }
     }
@@ -1238,6 +1259,8 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
 
     // warp w owns rows [16*SUB*w, 16*SUB*(w+1)), as SUB m16 sub-tiles
     uint32_t r_lo[SUB], r_hi[SUB], pos_lo[SUB], pos_hi[SUB], win_lo[SUB], win_hi[SUB];
+    uint32_t tm_lo[SUB], tm_hi[SUB], tb_lo[SUB], tb_hi[SUB];
+    (void)tm_lo; (void)tm_hi; (void)tb_lo; (void)tb_hi;
     #pragma unroll
     for (uint32_t sb = 0; sb < SUB; ++sb) {
         r_lo[sb] = (warp * SUB + sb) * 16u + (lane >> 2);
@@ -1246,6 +1269,12 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
         pos_hi[sb] = sh_rpos[r_hi[sb]];
         win_lo[sb] = sh_rwin[r_lo[sb]];
         win_hi[sb] = sh_rwin[r_hi[sb]];
+        if constexpr (TM) {
+            tm_lo[sb] = sh_rtm[r_lo[sb]];
+            tm_hi[sb] = sh_rtm[r_hi[sb]];
+            tb_lo[sb] = sh_rtb[r_lo[sb]];
+            tb_hi[sb] = sh_rtb[r_hi[sb]];
+        }
     }
     const uint32_t c2 = 2u * (lane & 3u);
 
@@ -1558,8 +1587,14 @@ __global__ void __launch_bounds__(128) pd_attn_prefill_pf7rp_kernel(
                             const uint32_t p = k0 + c2 + (i & 1u) + ((i >> 2) ? 8u : 0u);
                             const uint32_t pos = hirow ? pos_hi[sb] : pos_lo[sb];
                             const uint32_t wpos = hirow ? win_hi[sb] : win_lo[sb];
-                            const bool valid = p < hi && p <= pos
+                            bool valid = p < hi && p <= pos
                                 && (!swa_window || p + swa_window > wpos);
+                            if constexpr (TM) {
+                                const uint32_t tb = hirow ? tb_hi[sb] : tb_lo[sb];
+                                const uint32_t tm = hirow ? tm_hi[sb] : tm_lo[sb];
+                                valid = valid
+                                    && (p < tb || (p - tb < 32u && ((tm >> (p - tb)) & 1u)));
+                            }
                             v = valid ? v : -1e30f;
                             s[sb][kc][i] = v;
                         }
@@ -1744,7 +1779,8 @@ static inline bool pd_pf7rp16_ok(uint32_t g_) {
     // an 8192-row hd128 G=8 prompt (Flint's full layers). Kill:
     // PADDOCK_NO_PF7RP16 -> v4.
     static const bool rp16 = pd_env("PADDOCK_NO_PF7RP16") == nullptr;
-    const bool g_ok = g_ == 4u || g_ == 6u || g_ == 8u || g_ == 9u || g_ == 12u || g_ == 16u;
+    const bool g_ok = g_ == 4u || g_ == 6u || g_ == 8u || g_ == 9u || g_ == 10u || g_ == 12u
+        || g_ == 16u;
     if (!rp16 || no_rp128 || !rp128w || !g_ok) return false;
 #define PD_PF7RP16_FITS(GV, OV, QV)                                            \
 pd_smem_fits((const void*)pd_attn_prefill_pf7rp_kernel<GV, false, WHD,     \
@@ -1819,7 +1855,8 @@ static inline bool pd_pf7rp128_go(int* rc, bool f8v4n, uint32_t g_, const void* 
     // output is unchanged (relRMS 1.9e-3..2.4e-3, both arms).
     // Kill: PADDOCK_NO_PF7RP_SUB2 -> the 64-row arm below.
     static const bool rp128w = pd_env("PADDOCK_NO_PF7RP_SUB2") == nullptr;
-    const bool g_ok = g_ == 4u || g_ == 6u || g_ == 8u || g_ == 9u || g_ == 12u || g_ == 16u;
+    const bool g_ok = g_ == 4u || g_ == 6u || g_ == 8u || g_ == 9u || g_ == 10u || g_ == 12u
+        || g_ == 16u;
     if (!f8v4n && pd_pf7rp16_ok(g_)) {
         constexpr uint32_t WMR = 128u, WTK = 32u, WHD = 128u;
         constexpr uint32_t WSM = WMR * WHD * 2u + 2u * WTK * (WHD + 8u) * 2u;
@@ -1843,6 +1880,7 @@ pd_attn_prefill_pf7rp_kernel<GV, false, WHD, WTK, 2u, true, OV, QV>        \
         else if (g_ == 6u) PD_PF7RP16_LAUNCH(6u, OV, QV);                      \
         else if (g_ == 8u) PD_PF7RP16_LAUNCH(8u, OV, QV);                      \
         else if (g_ == 9u) PD_PF7RP16_LAUNCH(9u, OV, QV);                      \
+        else if (g_ == 10u) PD_PF7RP16_LAUNCH(10u, OV, QV);                    \
         else if (g_ == 12u) PD_PF7RP16_LAUNCH(12u, OV, QV);                    \
         else PD_PF7RP16_LAUNCH(16u, OV, QV);
         if (q16) { PD_PF7RP16_G(true, true) }
@@ -1864,7 +1902,8 @@ pd_attn_prefill_pf7rp_kernel<GV, false, WHD, WTK, 2u, true, OV, QV>        \
 pd_smem_fits((const void*)pd_attn_prefill_pf7rp_kernel<GV, false, WHD,     \
                                                        WTK, 2u>, WSM)
         static const bool w_fits = PD_PF7RPW_FITS(4u) && PD_PF7RPW_FITS(6u)
-            && PD_PF7RPW_FITS(8u) && PD_PF7RPW_FITS(9u) && PD_PF7RPW_FITS(12u)
+            && PD_PF7RPW_FITS(8u) && PD_PF7RPW_FITS(9u) && PD_PF7RPW_FITS(10u)
+            && PD_PF7RPW_FITS(12u)
             && PD_PF7RPW_FITS(16u);
 #undef PD_PF7RPW_FITS
         if (w_fits) {
@@ -1887,6 +1926,7 @@ pd_attn_prefill_pf7rp_kernel<GV, false, WHD, WTK, 2u>                      \
             else if (g_ == 6u) PD_PF7RPW_LAUNCH(6u);
             else if (g_ == 8u) PD_PF7RPW_LAUNCH(8u);
             else if (g_ == 9u) PD_PF7RPW_LAUNCH(9u);
+            else if (g_ == 10u) PD_PF7RPW_LAUNCH(10u);
             else if (g_ == 12u) PD_PF7RPW_LAUNCH(12u);
             else PD_PF7RPW_LAUNCH(16u);
 #undef PD_PF7RPW_LAUNCH
@@ -1895,7 +1935,7 @@ pd_attn_prefill_pf7rp_kernel<GV, false, WHD, WTK, 2u>                      \
         }
     }
     if (f8v4n && !no_rp128 && (g_ == 4u || g_ == 6u || g_ == 8u
-                               || g_ == 9u || g_ == 12u || g_ == 16u)) {
+                               || g_ == 9u || g_ == 10u || g_ == 12u || g_ == 16u)) {
         constexpr uint32_t RPMR = 64u, RPTK = 48u, RPHD = 128u;
         // Q MR*(HD+8)h | pane TK*(HD+8)h | raw K,V TK*HD B each (the
         // per-row positions ride the pane). Every term carries its own
@@ -1908,7 +1948,7 @@ pd_smem_fits((const void*)pd_attn_prefill_pf7rp_kernel<GV, false, RPHD,    \
                                                        RPTK>, RPSM)
         static const bool rp128_fits = PD_PF7RP_128_FITS(4u)
             && PD_PF7RP_128_FITS(6u) && PD_PF7RP_128_FITS(8u)
-            && PD_PF7RP_128_FITS(9u) && PD_PF7RP_128_FITS(12u)
+            && PD_PF7RP_128_FITS(9u) && PD_PF7RP_128_FITS(10u) && PD_PF7RP_128_FITS(12u)
             && PD_PF7RP_128_FITS(16u);
 #undef PD_PF7RP_128_FITS
         if (rp128_fits) {
@@ -1931,6 +1971,7 @@ pd_attn_prefill_pf7rp_kernel<GV, false, RPHD, RPTK>                        \
             else if (g_ == 6u) PD_PF7RP_128_LAUNCH(6u);
             else if (g_ == 8u) PD_PF7RP_128_LAUNCH(8u);
             else if (g_ == 9u) PD_PF7RP_128_LAUNCH(9u);
+            else if (g_ == 10u) PD_PF7RP_128_LAUNCH(10u);
             else if (g_ == 12u) PD_PF7RP_128_LAUNCH(12u);
             else PD_PF7RP_128_LAUNCH(16u);
 #undef PD_PF7RP_128_LAUNCH

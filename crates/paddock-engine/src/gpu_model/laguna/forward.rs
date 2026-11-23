@@ -54,6 +54,12 @@ pub(crate) struct Scratch {
     pub d_v: CudaSlice<f32>,
     /// per-head gate, pre-softplus [n_heads_max]
     pub d_gate_h: CudaSlice<f32>,
+    /// Ripple: the elementwise gate, pre-sigmoid [q_max]; the scaled token
+    /// embedding (the value residual's `e`) and the v projection's blended
+    /// input [embd]
+    pub d_gate: CudaSlice<f32>,
+    pub d_emb: CudaSlice<f32>,
+    pub d_vin: CudaSlice<f32>,
     pub d_attn: CudaSlice<f32>,
     pub d_proj: CudaSlice<f32>,
     /// no-op sinks [n_heads_max] - Laguna ships no attention sinks, so this is
@@ -127,6 +133,9 @@ impl GpuLaguna {
             d_kn: e.alloc(kv_dim)?,
             d_v: e.alloc(kv_dim)?,
             d_gate_h: e.alloc(n_heads_max)?,
+            d_gate: e.alloc(q_max)?,
+            d_emb: e.alloc(hp.n_embd)?,
+            d_vin: e.alloc(hp.n_embd)?,
             d_attn: e.alloc(q_max)?,
             d_proj: e.alloc(hp.n_embd)?,
             d_sinks: e.alloc_no_sinks(n_heads_max)?,
@@ -188,8 +197,13 @@ impl GpuLaguna {
             TokEmbd::Q8(t) => exec.embed_gather_batch_q8(t, &ds.d_token, &mut sc.d_x, embd, 1)?,
             TokEmbd::Kq(t) => exec.kquant_gather(t, &ds.d_token, &mut sc.d_x, embd, 1)?,
             TokEmbd::Bf16(t) => {
-                exec.embed_gather_bf16(t, &ds.d_token, &mut sc.d_x, embd, 1, 1.0)?
+                exec.embed_gather_bf16(t, &ds.d_token, &mut sc.d_x, embd, 1, hp.embed_scale)?
             }
+        }
+        // the value residual's `e`: the scaled embedding, before any layer
+        // touches the residual stream
+        if self.layers.first().is_some_and(|l| l.valres.is_some()) {
+            exec.copy_f32(&sc.d_x, &mut sc.d_emb, embd)?;
         }
 
         for (li, layer) in self.layers.iter().enumerate() {
@@ -221,6 +235,15 @@ impl GpuLaguna {
                     super::nv::nv_rows(&exec, wq, &sc.d_xn, &mut sc.d_q, 1)?;
                     super::nv::nv_rows(&exec, wk, &sc.d_xn, &mut sc.d_k, 1)?;
                     super::nv::nv_rows(&exec, wv, &sc.d_xn, &mut sc.d_v, 1)?;
+                }
+                Proj::Ripple { wqkg, wv, .. } => {
+                    let q_dim = n_heads * head_dim;
+                    exec.bf16_gemm_rows(wqkg, 0, q_dim, &sc.d_xn, &mut sc.d_q, 1)?;
+                    exec.bf16_gemm_rows(wqkg, q_dim, kv_dim, &sc.d_xn, &mut sc.d_k, 1)?;
+                    exec.bf16_gemm_rows(wqkg, q_dim + kv_dim, q_dim, &sc.d_xn, &mut sc.d_gate, 1)?;
+                    let t = layer.valres.unwrap_or(1.0);
+                    exec.ripple_valres_mix(&mut sc.d_vin, &sc.d_emb, &sc.d_xn, embd, t)?;
+                    exec.bf16_gemm(wv, None, &sc.d_vin, &mut sc.d_v, 1)?;
                 }
             }
             exec.rmsnorm_batch(
@@ -317,9 +340,15 @@ impl GpuLaguna {
             if layer.has_gate() {
                 exec.mul_softplus_head(&mut sc.d_attn, &sc.d_gate_h, n_heads, head_dim, 1)?;
             }
+            if matches!(layer.proj, Proj::Ripple { .. }) {
+                // Ripple's gate: sigmoid(g) elementwise over the whole width
+                exec.mul_sigmoid(&mut sc.d_attn, &sc.d_gate, n_heads * head_dim)?;
+            }
             match &layer.proj {
                 Proj::Quant(q) => gemv_any(&exec, &q.wo, &sc.d_attn, &mut sc.d_proj)?,
-                Proj::Bf16 { wo, .. } => exec.bf16_gemm(wo, None, &sc.d_attn, &mut sc.d_proj, 1)?,
+                Proj::Bf16 { wo, .. } | Proj::Ripple { wo, .. } => {
+                    exec.bf16_gemm(wo, None, &sc.d_attn, &mut sc.d_proj, 1)?
+                }
                 Proj::Nv { wo, .. } => {
                     super::nv::nv_rows(&exec, wo, &sc.d_attn, &mut sc.d_proj, 1)?
                 }
@@ -357,6 +386,7 @@ impl GpuLaguna {
                     &mut sc.d_ffn_up,
                     &mut sc.d_proj,
                     1,
+                    hp.ffn_clamp,
                 )?,
                 Ffn::MoeNv(w) => {
                     // W4A16 routed GEMVs off f32 + the BF16 shared expert
@@ -407,6 +437,7 @@ impl GpuLaguna {
                             &mut sc.d_sh_up,
                             &mut sc.d_sh_out,
                             1,
+                            None,
                         )?,
                     }
                     exec.add(&mut sc.d_proj, &sc.d_sh_out, embd)?;
@@ -783,6 +814,30 @@ impl Generator for GpuLaguna {
         self.serve_spec_on()
     }
 
+    // Ripple's DFlash2: the whole trained block every round - the verify
+    // rows ride a dense target's weight stream - for as many slots as a
+    // round's rows hold, each slot judged warm on its own
+    fn spec_block_width(&self) -> Option<usize> {
+        self.dflash2
+            .as_ref()
+            .map(|_| paddock_models::ripple::draft::BLOCK)
+    }
+
+    fn spec_fixed_draft_depth(&self) -> Option<usize> {
+        self.dflash2.as_ref().map(|_| super::dflash2::MAX_DRAFT)
+    }
+
+    fn spec_live_cap(&self) -> usize {
+        match self.dflash2 {
+            Some(_) => super::batch::SPEC_ROWS / paddock_models::ripple::draft::BLOCK,
+            None => usize::MAX,
+        }
+    }
+
+    fn spec_draft_per_slot_warm(&self) -> bool {
+        self.dflash2.is_some()
+    }
+
     fn spec_ensure_warm(
         &mut self,
         slot: usize,
@@ -806,6 +861,9 @@ impl Generator for GpuLaguna {
         &mut self,
         reqs: &[(usize, usize, Vec<u32>)],
     ) -> Result<Option<Vec<u32>>, GenError> {
+        if self.tree_armed() {
+            return self.tree_chain_picks(reqs, None).map_err(gen_err);
+        }
         self.forward_spec_batch_impl(reqs).map_err(gen_err)
     }
 
@@ -814,8 +872,59 @@ impl Generator for GpuLaguna {
         reqs: &[(usize, usize, Vec<u32>)],
         plans: &[crate::sampler::DevicePlan],
     ) -> Result<Option<Vec<u32>>, GenError> {
+        if self.tree_armed() {
+            return self.tree_chain_picks(reqs, Some(plans)).map_err(gen_err);
+        }
         self.forward_spec_batch_plans_impl(reqs, plans)
             .map_err(gen_err)
+    }
+
+    // Ripple's draft-tree rounds ride the armed protocol (tree.rs): begin
+    // drafts and grows the trees, the strip / plans entries verify them,
+    // fetch hands the plans entry's replay its chain-shaped drafts.
+    fn spec_draft_begin(
+        &mut self,
+        pendings: &[(usize, u32)],
+        k: usize,
+    ) -> Result<Option<(usize, Vec<bool>)>, GenError> {
+        self.tree_begin(pendings, k).map_err(gen_err)
+    }
+
+    fn spec_draft_fetch(&mut self) -> Result<Option<Vec<Vec<u32>>>, GenError> {
+        Ok(self.tree_fetch())
+    }
+
+    fn supports_spec_strip(&self) -> bool {
+        self.tree_on()
+    }
+
+    fn spec_armed_rounds(&self) -> bool {
+        self.tree_on()
+    }
+
+    fn forward_spec_batch_strip(
+        &mut self,
+        reqs: &[(usize, usize, Vec<u32>)],
+        plans: &[crate::sampler::DevicePlan],
+    ) -> Result<Option<Vec<crate::generator::SpecAccepted>>, GenError> {
+        let Some(outs) = self.tree_round(reqs, Some(plans)).map_err(gen_err)? else {
+            return Ok(None);
+        };
+        // the strip carries the tokens itself: no replay to fetch for
+        let _ = self.tree_fetch();
+        Ok(Some(
+            outs.into_iter()
+                .map(|o| {
+                    let mut tokens = o.path;
+                    tokens.push(o.bonus);
+                    crate::generator::SpecAccepted {
+                        accepted: tokens.len(),
+                        pending: o.bonus,
+                        tokens,
+                    }
+                })
+                .collect(),
+        ))
     }
 
     fn tier_pump(&mut self) {

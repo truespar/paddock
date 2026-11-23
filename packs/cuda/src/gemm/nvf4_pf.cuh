@@ -184,6 +184,9 @@ struct PdNvPfArgs {
     uint32_t nr, dec;
     const float* nw; const unsigned int* pos; __half* q16; float* y2;
     float eps, ts, fs, clo, chi, ext, msc, qsc;
+    // GU: clamp the gate at gclamp and the up into [-gclamp, gclamp] before
+    // the SwiGLU (Ripple's FFN, slot 970); 0 = none
+    float gclamp;
 };
 
 
@@ -475,7 +478,11 @@ __device__ __forceinline__ void pd_nvpf_body(const PdNvPfArgs& p, uint32_t bx) {
                     const uint32_t ch = tm * 64u + ((wr >> 4) + rg) * 8u + g;
                     const float gf = (MOE ? p.fa[e] : p.fa1) * LIFT;
                     const float uf = (MOE ? p.fb[e] : p.fb1) * LIFT;
-                    const float gv = acc[rg][cg][h] * gf, uv = acc[rg][cg][2u + h] * uf;
+                    float gv = acc[rg][cg][h] * gf, uv = acc[rg][cg][2u + h] * uf;
+                    if (p.gclamp > 0.0f) {
+                        gv = fminf(gv, p.gclamp);
+                        uv = fminf(fmaxf(uv, -p.gclamp), p.gclamp);
+                    }
                     const float v = gv * (1.0f / (1.0f + expf(-gv))) * uv;
                     const uint32_t slot = MOE ? (uint32_t)owt[col] : 0u;
                     p.act[(size_t)orw * p.ldy + p.yoff + slot * p.M + ch] = __float2bfloat16_rn(v);
@@ -960,19 +967,19 @@ int pd_nvf4_pf_qkv_nr(const void* dq, const void* sq, float fq, const void* dk, 
 }
 
 // 921: act[c * lda + aoff + ch] = bf16(silu(g * gs2) * (u * us2)), ch < ff.
-PD_EXPORT
-int pd_nvf4_pf_gu(const void* gdata, const void* gscale, float gs2, const void* udata,
-                  const void* uscale, float us2, const void* x, uint32_t ldx, void* act,
-                  uint32_t lda, uint32_t aoff, uint32_t in_dim, uint32_t ff, uint32_t ntok,
-                  void* stream) {
+static int pd_nvf4_pf_gu_impl(const void* gdata, const void* gscale, float gs2,
+                              const void* udata, const void* uscale, float us2, const void* x,
+                              uint32_t ldx, void* act, uint32_t lda, uint32_t aoff,
+                              uint32_t in_dim, uint32_t ff, uint32_t ntok, float gclamp,
+                              void* stream) {
 #ifndef PD_BS_HOST
     (void)gdata; (void)gscale; (void)gs2; (void)udata; (void)uscale; (void)us2; (void)x;
     (void)ldx; (void)act; (void)lda; (void)aoff; (void)in_dim; (void)ff; (void)ntok;
-    (void)stream;
+    (void)gclamp; (void)stream;
     return cudaErrorNotSupported;
 #else
     if (ff == 0u || ntok == 0u) return 0;
-    if ((in_dim & 63u) != 0u || (ff & 63u) != 0u || (ldx & 7u) != 0u)
+    if ((in_dim & 63u) != 0u || (ff & 63u) != 0u || (ldx & 7u) != 0u || !(gclamp >= 0.0f))
         return cudaErrorInvalidValue;
     PdNvPfArgs a = {};
     a.da = (const uint8_t*)gdata; a.sa = (const uint8_t*)gscale; a.fa1 = gs2;
@@ -980,6 +987,7 @@ int pd_nvf4_pf_gu(const void* gdata, const void* gscale, float gs2, const void* 
     a.x = (const __nv_bfloat16*)x; a.ldx = ldx;
     a.act = (__nv_bfloat16*)act; a.ldy = lda; a.yoff = aoff;
     a.K = in_dim; a.M = ff; a.ntok = ntok;
+    a.gclamp = gclamp;
     const uint32_t grid = pd_nvpf_dense_grid(ff / 64u, ntok, PD_NVPF_BN_DENSE);
     if (pd_nvpf_rd_ok() && PD_NVPF_KT_DENSE == 64u)
         return pd_nvpf_launch<PD_NVPF_GU, PD_NVPF_BN_DENSE, PD_NVPF_RING_DENSE, false, 1u, 64u,
@@ -987,6 +995,27 @@ int pd_nvf4_pf_gu(const void* gdata, const void* gscale, float gs2, const void* 
     return pd_nvpf_launch<PD_NVPF_GU, PD_NVPF_BN_DENSE, PD_NVPF_RING_DENSE,
                           PD_NVPF_OVL_DEFAULT, 1u, PD_NVPF_KT_DENSE>(a, grid, (cudaStream_t)stream);
 #endif
+}
+
+PD_EXPORT
+int pd_nvf4_pf_gu(const void* gdata, const void* gscale, float gs2, const void* udata,
+                  const void* uscale, float us2, const void* x, uint32_t ldx, void* act,
+                  uint32_t lda, uint32_t aoff, uint32_t in_dim, uint32_t ff, uint32_t ntok,
+                  void* stream) {
+    return pd_nvf4_pf_gu_impl(gdata, gscale, gs2, udata, uscale, us2, x, ldx, act, lda, aoff,
+                              in_dim, ff, ntok, 0.0f, stream);
+}
+
+// 970: the same tile with Ripple's FFN clamp in the epilogue: act =
+// bf16(silu(min(g, L)) * clamp(u, -L, L)), g and u with their factors folded
+// in. gclamp 0 is slot 921 exactly.
+PD_EXPORT
+int pd_nvf4_pf_gu_clamp(const void* gdata, const void* gscale, float gs2, const void* udata,
+                        const void* uscale, float us2, const void* x, uint32_t ldx, void* act,
+                        uint32_t lda, uint32_t aoff, uint32_t in_dim, uint32_t ff,
+                        uint32_t ntok, float gclamp, void* stream) {
+    return pd_nvf4_pf_gu_impl(gdata, gscale, gs2, udata, uscale, us2, x, ldx, act, lda, aoff,
+                              in_dim, ff, ntok, gclamp, stream);
 }
 
 // 922 / 926: the routed gate|up. n_expert (926; 0 from 922) elects the

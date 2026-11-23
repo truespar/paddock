@@ -620,7 +620,15 @@ impl GpuLaguna {
     /// facts only (no serving state), so the single-user routing decision
     /// reads it correctly before enable_batch runs.
     pub(crate) fn serve_spec_on(&self) -> bool {
-        super::batch::laguna_spec_on() && self.dflash.is_some() && self.exec.has_argmax_rows()
+        self.spec_lane_on()
+            && (self.dflash.is_some() || self.dflash2.is_some())
+            && self.exec.has_argmax_rows()
+    }
+
+    /// The speculative lane runs: Ripple's whenever its drafter is attached
+    /// (the default there), the GGUF laguna builds' under the dev opt-in.
+    pub(crate) fn spec_lane_on(&self) -> bool {
+        self.dflash2.is_some() || super::batch::laguna_spec_on()
     }
 
     /// True when the serving state is live - built at enable_batch only
@@ -629,6 +637,7 @@ impl GpuLaguna {
     /// merely attached.
     pub(crate) fn dflash_armed(&self) -> bool {
         self.dflash.as_ref().is_some_and(|d| d.state.is_some())
+            || self.dflash2.as_ref().is_some_and(|d| d.state.is_some())
     }
 
     /// Build the rings + staging once the batch lane knows its slot count.
@@ -713,6 +722,7 @@ impl GpuLaguna {
     /// Reset a slot's drafter coverage (fresh sequence / prefix restore /
     /// slot release: the ring content no longer matches what will serve).
     pub(crate) fn dflash_clear_slot(&mut self, slot: usize) {
+        self.d2_reset_slot(slot);
         if let Some(st) = self.dflash.as_mut().and_then(|d| d.state.as_mut())
             && let Some(f) = st.feat.get_mut(slot)
         {
@@ -741,6 +751,21 @@ impl GpuLaguna {
         assert_eq!(r, slots.len());
         if r == 0 {
             return Ok(());
+        }
+        if self.dflash2.is_some() {
+            // a verify round's accepted rows commit packed (d2_commit_rows)
+            let Some(sp) = spans else {
+                return self.d2_append(positions, slots, None);
+            };
+            let rows: Vec<(u32, u32, u32)> =
+                (0..r).map(|i| (i as u32, positions[i], slots[i])).collect();
+            let mut packed = Vec::new();
+            let mut psp = Vec::with_capacity(sp.len());
+            for &(off, len) in sp {
+                psp.push((packed.len(), len));
+                packed.extend_from_slice(&rows[off..off + len]);
+            }
+            return self.d2_commit_rows(&packed, &psp);
         }
         // a fused mixed tick appends for chunk rows AND the decode band, so
         // the bound is the scratch row capacity, not the chunk size
@@ -934,6 +959,9 @@ impl GpuLaguna {
     /// still run then (n-gram drafts) and decode appends extend coverage
     /// until the window fills.
     pub(crate) fn spec_ensure_warm_impl(&self, slot: usize, want_pos: u32) -> bool {
+        if self.dflash2.is_some() {
+            return self.d2_warm(slot, want_pos as usize + 1);
+        }
         self.dflash_armed() && self.dflash_warm(slot, want_pos as usize + 1)
     }
 
@@ -948,6 +976,9 @@ impl GpuLaguna {
         pendings: &[(usize, u32)],
         k: usize,
     ) -> Result<Option<Vec<Vec<u32>>>, GpuModelError> {
+        if self.dflash2.is_some() {
+            return self.d2_draft_batch(pendings, k);
+        }
         if !self.dflash_armed() || k == 0 {
             return Ok(None);
         }

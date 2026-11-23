@@ -1665,19 +1665,30 @@ static float* pd_bf16ks_scr() {
 #if defined(PD_BS_HOST) || defined(PD_TC5_HOST)
 // Tensormaps are encoded once per weight plane, not per call: cuTensorMapEncodeTiled
 // is a driver round-trip and this runs inside captured decode ticks. Keyed by
-// (base, inner, rows) like the f8 lane's caches. Small fixed table; a miss past
-// the end declines to the cp.async arm rather than evicting.
+// (base, inner, rows) like the f8 lane's caches, open-addressed on the base.
+// Sized for a whole model's planes: the verify-band arm (slot 973) maps three
+// segments a layer (Ripple: 240 + the head), and the old 64-entry table
+// silently sent every plane past the 64th back to the cp.async tile. A full
+// table still declines to that tile rather than evicting.
 struct PdBf16Tmap { const void* base; uint64_t inner, rows; CUtensorMap m; };
 static CUtensorMap* pd_bf16_tmap(const void* base, uint64_t inner, uint64_t rows) {
-    static PdBf16Tmap tab[64];
-    static int n = 0;
-    for (int i = 0; i < n; ++i)
-        if (tab[i].base == base && tab[i].inner == inner && tab[i].rows == rows)
-            return &tab[i].m;
-    if (n >= 64) return nullptr;
-    if (!pd_tmap_2d(&tab[n].m, base, inner, rows)) return nullptr;
-    tab[n].base = base; tab[n].inner = inner; tab[n].rows = rows;
-    return &tab[n++].m;
+    constexpr uint32_t CAP = 1024u;
+    static PdBf16Tmap tab[CAP];
+    static uint32_t n = 0;
+    const uint64_t key = (uint64_t)(uintptr_t)base;
+    uint32_t i = (uint32_t)((key >> 8) * 0x9E3779B97F4A7C15ull >> 54) & (CAP - 1u);
+    for (uint32_t probe = 0; probe < CAP; ++probe, i = (i + 1u) & (CAP - 1u)) {
+        PdBf16Tmap& e = tab[i];
+        if (e.base == nullptr) {
+            if (n >= CAP * 3u / 4u) return nullptr;
+            if (!pd_tmap_2d(&e.m, base, inner, rows)) return nullptr;
+            e.base = base; e.inner = inner; e.rows = rows;
+            ++n;
+            return &e.m;
+        }
+        if (e.base == base && e.inner == inner && e.rows == rows) return &e.m;
+    }
+    return nullptr;
 }
 
 template <uint32_t BN, uint32_t NW, uint32_t ST, uint32_t RG, uint32_t CG, bool CX = false>
@@ -2241,6 +2252,49 @@ int pd_bf16_gemm_mma(const void* w, const void* bias, const void* x, void* y,
                 wp, xp, bp, yp, in_dim, out_dim, batch, st);
     return pd_bf16_mma_cfg<128u, 128u, 8u, 3u, 32u, 4u, 4u>(
             wp, xp, bp, yp, in_dim, out_dim, batch, st);
+}
+
+// Slot 973: the TMA weight arm at VERIFY widths (a spec round's 16 rows a
+// slot), for a caller that elects it per plane. The tile ladder above keeps
+// these widths on the cp.async tiles, which on GB10 stream Ripple's 10240 x
+// 5120 q / gate planes at 176 / 141 GB/s at 16 / 64 rows where this arm holds
+// 213 / 194 - the TMA box bypasses L1, one CTA a 128-row tile
+// (ripple_verify_gemm_gb10_bench.cu). No K-split: the unsplit tile's k walk
+// and per-warp mma order, the class the ladder's unsplit tiles already have.
+// Ownership: row tiles on x while every column tile of the grid can be
+// resident at once (two CTAs an SM: a row tile's later column tiles then
+// re-read its boxes from L2), column tiles on x past that (a row tile's
+// columns launch side by side). Measured, us, 16 / 32 / 48 / 64 / 96 / 128
+// rows: q 493 / 503 / 536cx / 541cx / 564cx / 612cx (row tiles on x at 48:
+// 897); o (5120 x 10240) 511 / 524 / 545 / 553 / 680cx / 621cx (cx at 64:
+// 575). -2 = declined (no TMA host, K under the box, the map table full) -
+// the caller keeps its ladder.
+PD_EXPORT
+int pd_bf16_gemm_vb(const void* w, const void* x, void* y, uint32_t in_dim, uint32_t out_dim,
+                    uint32_t batch, void* stream) {
+    if (out_dim == 0 || in_dim == 0 || batch == 0) return 0;
+#if defined(PD_BS_HOST) || defined(PD_TC5_HOST)
+    static int sms = -1;
+    if (sms < 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess ||
+            sms <= 0)
+            sms = 1;
+    }
+    const uint32_t tiles = ((out_dim + 127u) / 128u) * ((batch + 31u) / 32u);
+    const auto wp = (const __nv_bfloat16*)w;
+    const auto st = (cudaStream_t)stream;
+    const int r = batch > 32u && tiles > 2u * (uint32_t)sms
+        ? pd_bf16_tma_cfg<32u, 8u, 2u, 1u, 4u, true>(wp, (const float*)x, nullptr, (float*)y,
+                                                     in_dim, out_dim, batch, st)
+        : pd_bf16_tma_cfg<32u, 8u, 2u, 1u, 4u>(wp, (const float*)x, nullptr, (float*)y,
+                                               in_dim, out_dim, batch, st);
+    return r >= 0 ? r : -2;
+#else
+    (void)w; (void)x; (void)y; (void)in_dim; (void)out_dim; (void)batch; (void)stream;
+    return -2;
+#endif
 }
 
 // Fused q|k|v decode-band entry (thin-k/v rung): one launch over

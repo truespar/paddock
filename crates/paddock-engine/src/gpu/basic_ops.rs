@@ -689,6 +689,69 @@ impl GpuExecutor {
         })
     }
 
+    /// Slot 974: the selector's whole edge lattice over `r` rows of
+    /// `rows_per_block`-row blocks - [`Self::dflash_select`]'s edge for every
+    /// predecessor. `scores` gets `[blocks * (rows - 1), k, k]` (p-major),
+    /// `ids` the candidates' tokens `[blocks * (rows - 1), k]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dflash_lattice(
+        &self,
+        topk: &CudaSlice<u32>,
+        pred: &CudaSlice<f32>,
+        succ: &CudaSlice<f32>,
+        hs: &CudaSlice<f32>,
+        scores: &mut CudaSlice<f32>,
+        ids: &mut CudaSlice<u32>,
+        (scale, cap): (f32, f32),
+        rank: usize,
+        k: usize,
+        rows_per_block: usize,
+        r: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .dflash_lattice
+            .ok_or(GpuError::MissingOp("dflash_lattice"))?;
+        let edges = (r / rows_per_block.max(1)) * rows_per_block.saturating_sub(1);
+        if scores.len() < edges * k * k || ids.len() < edges * k {
+            return Err(GpuError::Unsupported(format!(
+                "dflash_lattice: scores {} / ids {} under {edges} edge sets of {k}",
+                scores.len(),
+                ids.len()
+            )));
+        }
+        let (tp, _g1) = topk.device_ptr(&self.stream);
+        let (pp, _g2) = pred.device_ptr(&self.stream);
+        let (sp, _g3) = succ.device_ptr(&self.stream);
+        let (hp, _g4) = hs.device_ptr(&self.stream);
+        let (op, _g5) = scores.device_ptr_mut(&self.stream);
+        let (ip, _g6) = ids.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slot 974); output sizes checked above, the
+        // inputs are the selector planes of the same draft pass
+        check(unsafe {
+            f(
+                tp as *const _,
+                pp as *const _,
+                sp as *const _,
+                hp as *const _,
+                op as *mut _,
+                ip as *mut _,
+                scale,
+                cap,
+                rank as u32,
+                k as u32,
+                rows_per_block as u32,
+                r as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
+    /// Slot 974 is in the pack.
+    pub fn has_dflash_lattice(&self) -> bool {
+        self.kernels.dflash_lattice.is_some()
+    }
+
     /// slots 470+471 presence - the DFlash2 rejection-sampling arm.
     pub fn has_dflash_rs(&self) -> bool {
         self.kernels.dflash_select_rs.is_some() && self.kernels.dflash_rs_resolve.is_some()

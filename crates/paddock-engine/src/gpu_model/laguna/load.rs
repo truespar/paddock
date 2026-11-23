@@ -45,7 +45,8 @@ impl GpuLaguna {
             _ => Flavor::Laguna,
         };
         // From here the flavor is Laguna or Kolibri: Flint loaded above, and
-        // it rides the Kolibri arms below only to keep the matches total.
+        // it (and Ripple, which ships no GGUF - load_ripple_nvfp4) rides the
+        // Kolibri arms below only to keep the matches total.
         let fam = flavor.name();
         exec.vram_load_gate(map.total_len(), fam)
             .map_err(GpuModelError::WontFit)?;
@@ -82,7 +83,9 @@ impl GpuLaguna {
                 .into_iter()
                 .map(|v| v as usize)
                 .collect(),
-            Flavor::Kolibri | Flavor::Flint => vec![u("attention.head_count")? as usize; n_layer],
+            Flavor::Kolibri | Flavor::Flint | Flavor::Ripple => {
+                vec![u("attention.head_count")? as usize; n_layer]
+            }
         };
         if n_heads.len() != n_layer {
             return Err(GpuModelError::Unsupported(format!(
@@ -116,7 +119,7 @@ impl GpuLaguna {
         }
         let swa_pattern: Vec<bool> = match flavor {
             Flavor::Laguna => (0..n_layer).map(|i| !i.is_multiple_of(4)).collect(),
-            Flavor::Kolibri | Flavor::Flint => {
+            Flavor::Kolibri | Flavor::Flint | Flavor::Ripple => {
                 match map.gguf().arch_field("attention.sliding_window_pattern") {
                     Some(Value::Array(items)) if items.len() == n_layer => items
                         .iter()
@@ -156,12 +159,14 @@ impl GpuLaguna {
             routed_scale: f("expert_weights_scale").unwrap_or(1.0),
             router: match flavor {
                 Flavor::Laguna => Router::SigmoidNorm,
-                Flavor::Kolibri | Flavor::Flint => Router::LogitSigmoid,
+                Flavor::Kolibri | Flavor::Flint | Flavor::Ripple => Router::LogitSigmoid,
             },
         };
         let (want_gating, want_name) = match flavor {
             Flavor::Laguna => (GATING_FUNC_SIGMOID, "sigmoid"),
-            Flavor::Kolibri | Flavor::Flint => (GATING_FUNC_SIGMOID_LOGIT_ADD, "sigmoid_logit_add"),
+            Flavor::Kolibri | Flavor::Flint | Flavor::Ripple => {
+                (GATING_FUNC_SIGMOID_LOGIT_ADD, "sigmoid_logit_add")
+            }
         };
         let gating = u("expert_gating_func").unwrap_or(GATING_FUNC_SIGMOID);
         if gating != want_gating {
@@ -189,7 +194,7 @@ impl GpuLaguna {
         // Kolibri routes every layer (no dense lead, no key)
         let n_dense_lead = match flavor {
             Flavor::Laguna => u("leading_dense_block_count")? as usize,
-            Flavor::Kolibri | Flavor::Flint => 0,
+            Flavor::Kolibri | Flavor::Flint | Flavor::Ripple => 0,
         };
 
         // Rope, per layer type. Full layers: YaRN over n_rot=64 of 128 dims
@@ -203,7 +208,7 @@ impl GpuLaguna {
         // never read there.
         let n_rot = match flavor {
             Flavor::Laguna => u("rope.dimension_count")? as usize,
-            Flavor::Kolibri | Flavor::Flint => {
+            Flavor::Kolibri | Flavor::Flint | Flavor::Ripple => {
                 u("rope.dimension_count").map_or(head_dim, |v| v as usize)
             }
         };
@@ -214,7 +219,7 @@ impl GpuLaguna {
             .ok_or_else(|| GpuModelError::MissingMeta("rope.freq_base".into()))?;
         let rope_base_swa = f("rope.freq_base_swa").unwrap_or(match flavor {
             Flavor::Laguna => 10_000.0,
-            Flavor::Kolibri | Flavor::Flint => rope_base,
+            Flavor::Kolibri | Flavor::Flint | Flavor::Ripple => rope_base,
         });
         if flavor == Flavor::Kolibri && (n_rot_swa != head_dim || n_rot != head_dim) {
             return Err(GpuModelError::Unsupported(format!(
@@ -408,7 +413,7 @@ impl GpuLaguna {
             let sandwich = |name: &str| -> Result<Option<DeviceTensor>, GpuError> {
                 match flavor {
                     Flavor::Laguna => Ok(None),
-                    Flavor::Kolibri | Flavor::Flint => dt(name).map(Some),
+                    Flavor::Kolibri | Flavor::Flint | Flavor::Ripple => dt(name).map(Some),
                 }
             };
             let layer = LagunaLayer {
@@ -435,6 +440,8 @@ impl GpuLaguna {
                 is_swa: swa,
                 nope: !swa && flavor == Flavor::Kolibri,
                 n_heads: n_heads[i],
+                valres: None,
+                ffn_act: None,
             };
             let q = layer.proj.quant().expect("GGUF planes");
             attn_bytes += va.saturating_sub(vfree());
@@ -536,6 +543,9 @@ impl GpuLaguna {
                 rope_full,
                 rope_swa,
                 moe,
+                embed_scale: 1.0,
+                ffn_clamp: None,
+                pf_w4a4: false,
             },
             tok_embd,
             layers,
@@ -557,6 +567,7 @@ impl GpuLaguna {
             batch: None,
             pipe: None,
             dflash: None,
+            dflash2: None,
             chunked: Vec::new(),
             w16r: None,
         })

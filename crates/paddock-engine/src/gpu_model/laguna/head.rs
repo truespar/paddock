@@ -115,10 +115,18 @@ impl GpuLaguna {
                 self.exec
                     .kquant_gather(t, &sc.d_toks, &mut sc.x, self.hp.n_embd, r)?
             }
-            TokEmbd::Bf16(t) => {
-                self.exec
-                    .embed_gather_bf16(t, &sc.d_toks, &mut sc.x, self.hp.n_embd, r, 1.0)?
-            }
+            TokEmbd::Bf16(t) => self.exec.embed_gather_bf16(
+                t,
+                &sc.d_toks,
+                &mut sc.x,
+                self.hp.n_embd,
+                r,
+                self.hp.embed_scale,
+            )?,
+        }
+        // Ripple's value residual reads the layer-0 input in every layer
+        if self.hp.flavor == Flavor::Ripple {
+            self.exec.copy_f32(&sc.x, &mut sc.emb, r * self.hp.n_embd)?;
         }
         Ok(())
     }
@@ -193,6 +201,86 @@ impl GpuLaguna {
                 &mut sc.head_logits,
                 rows,
             )?,
+        }
+        Ok(())
+    }
+
+    /// Test hook - the teacher-forced gate of the BATCHED prefill: every
+    /// prompt row's logits, handed to `f(row, logits)` in row order. The
+    /// prompt must fit one walk (`pf_wide` rows) and resume nothing (run with
+    /// the prefix cache off, or a slot whose prompt nothing shares): the
+    /// walk's residual rows are then the whole prompt's. Row 0's residual is
+    /// the one the tail's head bounce overwrites, so it comes off a one-token
+    /// prefill of its own.
+    #[doc(hidden)]
+    pub fn prefill_rows_logits(
+        &mut self,
+        slot: usize,
+        tokens: &[u32],
+        mut f: impl FnMut(usize, &[f32]),
+    ) -> Result<(), GpuModelError> {
+        let (n, embd, vocab) = (tokens.len(), self.hp.n_embd, self.hp.n_vocab);
+        let wide = self.batch.as_ref().map_or(0, |b| b.pf_wide);
+        if n == 0 || n > wide {
+            return Err(GpuModelError::Unsupported(format!(
+                "prefill_rows_logits: {n} tokens, one walk holds {wide}"
+            )));
+        }
+        self.forward_prefill_impl(slot, tokens)?;
+        if crate::generator::Generator::take_prefill_reused(self, slot) != 0 {
+            return Err(GpuModelError::Unsupported(
+                "prefill_rows_logits: the prompt resumed off the prefix cache".into(),
+            ));
+        }
+        let exec = self.exec.clone();
+        let rows = {
+            let sc = &self.batch.as_ref().expect("batch enabled").sc;
+            let v =
+                sc.x.try_slice(0..n * embd)
+                    .ok_or_else(|| GpuError::Driver("x rows".into()))?;
+            exec.stream.clone_dtoh(&v).map_err(drv)?
+        };
+        let cap = (self
+            .batch
+            .as_ref()
+            .expect("batch enabled")
+            .sc
+            .head_logits
+            .len()
+            / vocab)
+            .min(128);
+        let mut r0 = 1;
+        while r0 < n {
+            let b = (n - r0).min(cap);
+            {
+                let sc = &mut self.batch.as_mut().expect("batch enabled").sc;
+                let mut dst =
+                    sc.x.try_slice_mut(0..b * embd)
+                        .ok_or_else(|| GpuError::Driver("x block".into()))?;
+                exec.stream
+                    .memcpy_htod(&rows[r0 * embd..(r0 + b) * embd], &mut dst)
+                    .map_err(drv)?;
+            }
+            self.head_rows(b)?;
+            let sc = &self.batch.as_ref().expect("batch enabled").sc;
+            let v = sc
+                .head_logits
+                .try_slice(0..b * vocab)
+                .ok_or_else(|| GpuError::Driver("logit block".into()))?;
+            let l = exec.stream.clone_dtoh(&v).map_err(drv)?;
+            if r0 == 1 {
+                // row 0 first, so the caller sees rows in order
+                let first = self.forward_prefill_impl(slot, &tokens[..1])?;
+                f(0, &first);
+            }
+            for i in 0..b {
+                f(r0 + i, &l[i * vocab..(i + 1) * vocab]);
+            }
+            r0 += b;
+        }
+        if n == 1 {
+            let first = self.forward_prefill_impl(slot, tokens)?;
+            f(0, &first);
         }
         Ok(())
     }

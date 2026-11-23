@@ -87,7 +87,7 @@ __global__ void __launch_bounds__(256) pd_kquant_moe_gate_up_kernel(
     // bit-identical output.
     const uint32_t o = LIST ? blockIdx.x : blockIdx.z;
     const uint32_t tid = threadIdx.x, nth = blockDim.x;
-    const uint32_t p_hi = LIST ? *n_list : 1u;
+    const uint32_t p_hi = LIST ? *pd_pdl_after(n_list) : 1u;   // the mask kernel's count
     for (uint32_t p = LIST ? blockIdx.y : 0u; p < p_hi; p += LIST ? gridDim.y : 1u) {
     uint32_t slot, b;
     if (LIST) {

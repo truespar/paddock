@@ -12204,3 +12204,248 @@ revision = "2026-10-08"
     dest = "tic-forestry-v1/README.md"
     sha256 = "7c2fe664a72bd601e520b8b475a64f093fe3ee4bffdf73afe64b4c9948e81d1a"
     size = 17750
+
+# Ricursive's Ripple-65B Preview, the official ModelOpt NVFP4 build (weights
+# unchanged since 2026-11-04): the MLP linears NVFP4 with static input scales,
+# every attention projection, the embeddings and the head BF16 as shipped -
+# 57.2 GB in 6 shards (the 129.6 GB BF16 original does not fit a 128 GB box).
+# CUDA serves it on the laguna body's Ripple flavor: prompt rows and wide
+# verify rounds W4A4 on the checkpoint's own input scales, decode W4A16 off the
+# same planes, fp8 KV. Teacher-forced against Ricursive's Spark bundle (SGLang
+# 0.5.19) on this checkpoint: 97.9% top-1 on the serial lane, 97.5% through
+# the batched prefill, over 5565 positions. Mirrored under
+# models/Ripple-65B-Preview-NVFP4/ - the shards and their index, configs,
+# tokenizer, chat template, the release's custom code, LICENSE and card, every
+# byte matching revision b4b4e36d's LFS ids (its inference/ serving bundle and
+# .gitattributes are left out).
+[[model]]
+id = "ripple-65b"
+# KV8 by default: the laguna family's default
+kv_default = "fp8_e4m3"
+vendor = "Ricursive"
+display = "Ripple 65B Preview"
+family = "ripple"
+capability = ["chat", "tools", "reasoning", "speculative"]
+license = "apache-2.0"
+revision = "2026-11-22"
+
+  [model.specs]
+  params = "65B dense"
+  context = "1M native; 128K default on CUDA"
+  published_at = "2026-11-04"
+  published_source = "https://huggingface.co/ricursiveAI/Ripple-65B-Preview-NVFP4"
+  homepage = "https://huggingface.co/ricursiveAI/Ripple-65B-Preview"
+  about = "Ricursive's dense 65B model for agentic coding - terminal work, multi-step tool use and long codebases - reasoning when a task calls for it. CUDA serves Ricursive's own NVFP4 build with its DFlash2 draft model."
+  strengths = [
+    "Agentic coding: terminal tasks, tool calls, long codebases",
+    "Reasons in a thinking block of its own when it needs to",
+    "DFlash2 drafts 15 tokens a round - single chats decode several times faster than the dense model alone",
+  ]
+  tradeoffs = [
+    "65 GB download (57 GB weights + 8 GB draft model); plan for a 128 GB unified-memory box such as a DGX Spark",
+    "Dense: every token reads all 65B parameters - without the draft model it decodes ~4 tokens a second",
+    "Text only; Blackwell only (NVFP4 W4A4 kernels)",
+  ]
+
+  [[model.artifact]]
+  id = "nvfp4"
+  kind = "weights"
+  format = "safetensors"
+  label = "NVFP4 (Blackwell)"
+  quant = "NVFP4"
+  default = true
+  # sm_120a or better: the W4A4 block-scaled fp4 GEMMs the prompt rows ride
+  # and the W4A16 prefill tile compile under PD_BS_OK.
+  min_cc = [12, 0]
+  # The engine's own ledger at 131072 x 2 on GB10 (2026-11-22), the drafter
+  # attached: 81.27 GiB after enable_batch, 0 MiB unplanned, less the weights
+  # below, the drafter's 4.09 GB of e4m3 twins, the 21.0 GiB pool and the
+  # 0.38 GiB of sliding rings = 2.99 GB (the 2052-row prefill scratch, the W16
+  # ring, the drafter's round and fusion planes, the prefix checkpoints), plus
+  # the 0.14 GB by which the rings (97 blocks a slot) exceed the window the
+  # shape prices.
+  workspace = 3150000000
+
+  [model.artifact.source]
+  repo = "ricursiveAI/Ripple-65B-Preview-NVFP4"
+  base_model = "ricursiveAI/Ripple-65B-Preview"
+  revision = "b4b4e36de43b5401f95c8e467cb3d1a355fd1e9f"
+  license = "apache-2.0"
+  license_url = "https://huggingface.co/ricursiveAI/Ripple-65B-Preview-NVFP4/blob/b4b4e36de43b5401f95c8e467cb3d1a355fd1e9f/LICENSE"
+
+  [model.artifact.runtime]
+  backends = ["cuda"]
+  checkpoint_dir = true
+  companions = ["drafter"]
+  # 128K for two sessions, fitted at admission: 21 GiB of pool with the
+  # prefix-retention slack, 33.8 GiB of the box free once warm (four slots at
+  # 128K price a 42 GiB pool and leave under 18 GB)
+  default_max_ctx = 131072
+  default_max_batch = 2
+
+  # weight_bytes is the device-resident count (the q|k|g plane fused at load
+  # rides at the file's bytes). KV: 64 sliding layers on per-slot rings, the
+  # 16 full layers in the paged pool - plus the drafter's five layers of
+  # features as stripes beside them (pulled by default), priced as five more.
+  [model.artifact.shape]
+  weight_bytes = 57220000000
+  kind = "generative"
+  vocab = 100352
+  max_ctx = 1048576
+  nextn_bytes = 0
+  source = "measured"
+  kv_layers = [
+    { k_dim = 1024, v_dim = 1024, window = 1024, count = 64 },
+    { k_dim = 1024, v_dim = 1024, count = 21 },
+  ]
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ripple-65B-Preview-NVFP4/model-00001-of-00006.safetensors"
+    dest = "Ripple-65B-Preview-NVFP4/model-00001-of-00006.safetensors"
+    sha256 = "eaa330c20b3774b201349acbbdc72d2c37fc08cdda5b57a241ef3df0580cb497"
+    size = 9990882364
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ripple-65B-Preview-NVFP4/model-00002-of-00006.safetensors"
+    dest = "Ripple-65B-Preview-NVFP4/model-00002-of-00006.safetensors"
+    sha256 = "f460bca35a7b99faaee131f898a54c9d54b808d05fd1ad59493c2403538f8c96"
+    size = 9988306372
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ripple-65B-Preview-NVFP4/model-00003-of-00006.safetensors"
+    dest = "Ripple-65B-Preview-NVFP4/model-00003-of-00006.safetensors"
+    sha256 = "4c570c1435b733c51183221cf5473918c6f9cbb658c97eb322879e5995d96416"
+    size = 9993548868
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ripple-65B-Preview-NVFP4/model-00004-of-00006.safetensors"
+    dest = "Ripple-65B-Preview-NVFP4/model-00004-of-00006.safetensors"
+    sha256 = "372a737fb2e758e3911dfb49f1b6be2a26f2c99533337dc7e4390cc082b747ad"
+    size = 9896597694
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ripple-65B-Preview-NVFP4/model-00005-of-00006.safetensors"
+    dest = "Ripple-65B-Preview-NVFP4/model-00005-of-00006.safetensors"
+    sha256 = "d2448f900b27958228fa703903fa9b4ff0bd14590a31fe0c7627bf88715e98ce"
+    size = 9993548908
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ripple-65B-Preview-NVFP4/model-00006-of-00006.safetensors"
+    dest = "Ripple-65B-Preview-NVFP4/model-00006-of-00006.safetensors"
+    sha256 = "d7cf2508852befa8303153f441a588745270ef3ce163188072d35963d7413578"
+    size = 7350967818
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ripple-65B-Preview-NVFP4/LICENSE"
+    dest = "Ripple-65B-Preview-NVFP4/LICENSE"
+    sha256 = "58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd"
+    size = 11357
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ripple-65B-Preview-NVFP4/README.md"
+    dest = "Ripple-65B-Preview-NVFP4/README.md"
+    sha256 = "c978400264653eca63128732eee9101424aa134b339c87584f406daa63d5e9c1"
+    size = 6551
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ripple-65B-Preview-NVFP4/chat_template.jinja"
+    dest = "Ripple-65B-Preview-NVFP4/chat_template.jinja"
+    sha256 = "877c2dbf365243dda14738ca250b31398059b35ffd91d4ed0ec68be45ca6ebd3"
+    size = 2652
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ripple-65B-Preview-NVFP4/config.json"
+    dest = "Ripple-65B-Preview-NVFP4/config.json"
+    sha256 = "46e68394f1ceda2385c2458b883957510c07cc60cfb8ffc6a898be70507a126f"
+    size = 8486
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ripple-65B-Preview-NVFP4/configuration_ricursive.py"
+    dest = "Ripple-65B-Preview-NVFP4/configuration_ricursive.py"
+    sha256 = "002cb3915be9685eb962d617623bec14d45b5d6b5d46e689fac98a3b38cb6cf6"
+    size = 5238
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ripple-65B-Preview-NVFP4/generation_config.json"
+    dest = "Ripple-65B-Preview-NVFP4/generation_config.json"
+    sha256 = "64ccf6b8d36e683dd612b7362836cd7ce972a42f38d5f5df86ec3b5b31bbc606"
+    size = 220
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ripple-65B-Preview-NVFP4/model.safetensors.index.json"
+    dest = "Ripple-65B-Preview-NVFP4/model.safetensors.index.json"
+    sha256 = "4dc55a07fad0710c1a9686f5bfa0a24ff67bafcf21141c853a66243d090cd0d4"
+    size = 162781
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ripple-65B-Preview-NVFP4/modeling_ricursive.py"
+    dest = "Ripple-65B-Preview-NVFP4/modeling_ricursive.py"
+    sha256 = "f83865ef643e273a6c9aecf1575e85c95ad01fd995b1e43c3c7a892765006bb3"
+    size = 23717
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ripple-65B-Preview-NVFP4/special_tokens_map.json"
+    dest = "Ripple-65B-Preview-NVFP4/special_tokens_map.json"
+    sha256 = "3f7cd7d0cfb20f9faa47c75fd4df91b1c9a78aef0be27ded12cb705b23951341"
+    size = 382
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ripple-65B-Preview-NVFP4/tokenizer.json"
+    dest = "Ripple-65B-Preview-NVFP4/tokenizer.json"
+    sha256 = "18e309ad7f9c60037eaf26aca401a96128187cad2bdfa01a508dca7526bf6300"
+    size = 7137558
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ripple-65B-Preview-NVFP4/tokenizer_config.json"
+    dest = "Ripple-65B-Preview-NVFP4/tokenizer_config.json"
+    sha256 = "eef580161a5d941607f7ec7ca95c50bfcd24812d2921c110ac049c620345ed85"
+    size = 375
+
+  # Ricursive's DFlash2 drafter for this checkpoint (BF16, 4.04B): 16-token
+  # blocks, grouped dynamic convolutions and a rank-256 candidate selector,
+  # conditioned on five of the target's layers (laguna/dflash2.rs). Loaded as
+  # per-row e4m3 twins (4.09 GB resident). Speculation is lossless - the
+  # verify judges every token - so it is an artifact of this model, not a
+  # second one. On GB10 (32K): one code chat 3.8 -> 24-31 tok/s greedy, ~17
+  # at the model's own sampling; a prefix-cache resume drafts as well as a
+  # cold turn. Mirrored under models/Ripple-65B-Preview-DFlash2/, every byte
+  # matching revision 35609b3b's LFS ids.
+  [[model.artifact]]
+  id = "drafter"
+  kind = "drafter"
+  format = "safetensors"
+  label = "Speed boost (DFlash2)"
+  default = true
+  min_cc = [12, 0]
+  runtime = { backends = ["cuda"] }
+
+  [model.artifact.source]
+  repo = "ricursiveAI/Ripple-65B-Preview-DFlash2"
+  base_model = "ricursiveAI/Ripple-65B-Preview"
+  revision = "35609b3be3dd08a822b3ba1257c1ea5dd6f87632"
+  license = "apache-2.0"
+  license_url = "https://huggingface.co/ricursiveAI/Ripple-65B-Preview-DFlash2/blob/35609b3be3dd08a822b3ba1257c1ea5dd6f87632/LICENSE"
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ripple-65B-Preview-DFlash2/model.safetensors"
+    dest = "Ripple-65B-Preview-DFlash2/model.safetensors"
+    sha256 = "a55ef8535d1be85480359e1fdb0a9aa43fbcab3fca7aa4374b0eb957b00eb9ba"
+    size = 8075513104
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ripple-65B-Preview-DFlash2/LICENSE"
+    dest = "Ripple-65B-Preview-DFlash2/LICENSE"
+    sha256 = "58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd"
+    size = 11357
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ripple-65B-Preview-DFlash2/README.md"
+    dest = "Ripple-65B-Preview-DFlash2/README.md"
+    sha256 = "f36c71e6a0524fbe42a065c7acc9ea7e783047dc354f82634873bda275629837"
+    size = 4635
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Ripple-65B-Preview-DFlash2/config.json"
+    dest = "Ripple-65B-Preview-DFlash2/config.json"
+    sha256 = "868841f16379f34f97e8a17575c6a9f1f4cab4eae214e6d947e2641c38962171"
+    size = 1348

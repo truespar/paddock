@@ -53,7 +53,9 @@
 #include "src/moe/mmq.cuh"
 #include "src/attn/prefill.cuh"
 #include "src/attn/prefill_fa2.cuh"  // FA-2 prefill tile, f16 v4, pf7/pf7rp (split from prefill.cuh); also carries the shared CK macro
-#include "src/attn/prefill_pf5.cuh"  // tcgen05 prefill pf5/pf6 family + batch f16 WMMA (split from prefill.cuh); all PD_TC5_OK-gated, so verify changes here on sm_100
+#include "src/attn/prefill_pf5.cuh"  // tcgen05 prefill pf5/pf6 family (split from prefill.cuh); all PD_TC5_OK-gated, so verify changes here on sm_100
+#include "src/attn/prefill_batch_f16.cuh"  // the multi-slot WMMA prefill (split from prefill_pf5.cuh)
+#include "src/attn/prefill_tree.cuh"  // a draft tree's verify attention (slot 975) + its KV compaction (976); needs prefill_fa2's pf7rp
 #include "src/attn/prefill_tc5.cuh"  // hd256 fp8 varlen prefill with both GEMMs on tcgen05 (slot 872); needs prefill.cuh + f32_qkv maps + vision_tc5 tmem helpers
 #include "src/moe/block_scale_quant.cuh"
 #include "src/moe/decode_block_scale.cuh"
@@ -69,7 +71,9 @@
 #include "src/attn/decode_tc5d.cuh"  // qwen3.8 G6 decode on tcgen05 with a decoupled TMA ring; pd_attn_decode_tc5_paged routes to it
 #include"src/attn/decode_tc5.cuh"  // tcgen05 decode attention (needs tma_desc's pd_tc5_sdesc + f32_qkv's pd_attn_tmap_kv_f8s - no longer tied to dense_fp4_w8)
 #include "src/quant/nvf4.cuh"
+#include "src/quant/nvf4_f4tn.cuh" // the f4t tile at decode / verify widths (slots 597, 972), split from quant/nvf4.cuh
 #include "src/quant/nvf4_il.cuh"   // swiglu_fused_nvf4_il(_sw), split from quant/nvf4.cuh
+#include "src/quant/nvf4_gs.cuh"   // quantize_nvf4_gs (slot 971), split from quant/nvf4.cuh
 #include "src/moe/nvf4_expert.cuh"   // NVFP4 MoE expert consumers + persistent raw-ring + TM/TF plane twins (split from quant/nvf4.cuh); needs its quantizers/mma helpers
 #include "src/moe/nvf4_sorted.cuh"   // NVFP4 MoE over the sorted layout + sm_100 sorted-tile arm + decode expert GEMVs; follows nvf4_expert
 #include"src/moe/nvf4_st.cuh"      // tiled-layout MoE consumers (skinny-tile pair; needs nvf4's mma/dot4w helpers)
@@ -105,6 +109,7 @@
 #include "src/tier/xfer.cuh"     // KV tier extent gather/scatter (kv-offload 1a.2; abi.cuh helpers only)
 #include "src/kumo.cuh"         // Kumo-Tabular F32 graph: GEMM, norms, head transforms, attention, cell embedding (needs f32_qkv's pd_launch_status)
 #include "src/diarization.cuh"  // Nemotron 3 Diarization: log-mel frontend, LayerNorm, rope, conv rows, activations (needs f32_qkv's pd_launch_status)
+#include "src/ripple.cuh"  // Ripple-65B: the clamped SwiGLU, the value-residual blend (abi.cuh helpers only)
 #include "src/diar_bf16.cuh"  // the diarization encoder's projections in the BF16 class (Transcribe's speaker branch): the bf16 twin of the f16 blocked tile with slot 722's epilogues (needs f16_dense's ring helpers, kumo's GELU)
 #include "src/clef.cuh"         // Clef's joint schema head: LayerNorm, span/lexical means, varlen F32 attention, option routing, scorer (needs f32_qkv's pd_launch_status)
 #include "src/asr/nemotron_asr.cuh"  // Nemotron 3.5 ASR: cache-aware FastConformer subsampler, rel-position chunked attention, causal dwconv, RNN-T greedy walk (needs diarization.cuh's stored-weight GEMM + f32_qkv's pd_launch_status)

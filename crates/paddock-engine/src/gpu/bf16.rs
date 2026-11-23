@@ -652,6 +652,58 @@ impl GpuExecutor {
         self.bf16_gemm_dispatch(w, first_row, out_dim, None, x, y, batch, true)
     }
 
+    /// `bf16_gemm_rows` on the TMA weight arm (slot 973) - the verify-width
+    /// election of a caller that has measured it for its planes. Ok(false)
+    /// when the pack lacks the slot or declines the shape (the caller keeps
+    /// the ladder); same bf16 x bf16, f32-accumulate class, the unsplit k
+    /// walk.
+    pub fn bf16_gemm_vb_rows(
+        &self,
+        w: &QuantTensor,
+        first_row: usize,
+        out_dim: usize,
+        x: &CudaSlice<f32>,
+        y: &mut CudaSlice<f32>,
+        batch: usize,
+    ) -> Result<bool, GpuError> {
+        let Some(f) = self.kernels.bf16_gemm_vb else {
+            return Ok(false);
+        };
+        let w = self.bf16_plane(w, "bf16_gemm_vb")?;
+        let in_dim = w.dims[0];
+        if first_row + out_dim > w.dims[1] || x.len() < batch * in_dim || y.len() < batch * out_dim
+        {
+            return Err(GpuError::Unsupported(format!(
+                "bf16_gemm_vb: rows {first_row}..{} of {} / x {} / y {} for {batch} rows",
+                first_row + out_dim,
+                w.dims[1],
+                x.len(),
+                y.len()
+            )));
+        }
+        let woff = (first_row * in_dim * 2) as u64;
+        let (wp, _g1) = w.bytes.device_ptr(&self.stream);
+        let (xp, _g2) = x.device_ptr(&self.stream);
+        let (yp, _g3) = y.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slot 973); sizes checked above, the segment
+        // stays inside the plane
+        let rc = unsafe {
+            f(
+                (wp + woff) as *const _,
+                xp as *const _,
+                yp as *mut _,
+                in_dim as u32,
+                out_dim as u32,
+                batch as u32,
+                self.stream_ptr(),
+            )
+        };
+        if rc == -2 {
+            return Ok(false);
+        }
+        check(rc).map(|()| true)
+    }
+
     /// [`Self::bf16_gemm_tile`] that keeps the tile at one row too, for a
     /// vocab-scale head whose rows must score in one class at every row
     /// count (the pack admits one row only there; a narrower plane refuses).
@@ -932,20 +984,59 @@ impl GpuExecutor {
         y: &mut CudaSlice<f32>,
         batch: usize,
     ) -> Result<(), GpuError> {
+        self.bf16_gemm_pf_seg(w, 0, w.dims[1], bias, x16, y, batch)
+    }
+
+    /// [`Self::bf16_gemm_pf`] over the row segment `[first_row, first_row +
+    /// out_dim)` of a fused plane (see `bf16_gemm_rows`): the tile reads only
+    /// the rows it is pointed at, so a segment is the plane's base moved.
+    pub fn bf16_gemm_pf_rows(
+        &self,
+        w: &QuantTensor,
+        first_row: usize,
+        out_dim: usize,
+        x16: &CudaSlice<half::bf16>,
+        y: &mut CudaSlice<f32>,
+        batch: usize,
+    ) -> Result<(), GpuError> {
+        self.bf16_gemm_pf_seg(w, first_row, out_dim, None, x16, y, batch)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bf16_gemm_pf_seg(
+        &self,
+        w: &QuantTensor,
+        first_row: usize,
+        out_dim: usize,
+        bias: Option<&CudaSlice<f32>>,
+        x16: &CudaSlice<half::bf16>,
+        y: &mut CudaSlice<f32>,
+        batch: usize,
+    ) -> Result<(), GpuError> {
         let w = self.bf16_plane(w, "bf16_gemm_pf")?;
         let f = self
             .kernels
             .bf16_gemm_pf
             .ok_or(GpuError::MissingOp("bf16_gemm_pf"))?;
-        let (in_dim, out_dim) = (w.dims[0], w.dims[1]);
+        let in_dim = w.dims[0];
+        if first_row + out_dim > w.dims[1] {
+            return Err(GpuError::Unsupported(format!(
+                "bf16_gemm_pf: rows {first_row}..{} past the plane's {}",
+                first_row + out_dim,
+                w.dims[1]
+            )));
+        }
+        // byte offset of the segment's first row (2 bytes per bf16 element)
+        let woff = (first_row * in_dim * 2) as u64;
         let (wp, _g1) = w.bytes.device_ptr(&self.stream);
         let bp = bias.map(|b| b.device_ptr(&self.stream));
         let (xp, _g3) = x16.device_ptr(&self.stream);
         let (yp, _g4) = y.device_ptr_mut(&self.stream);
-        // SAFETY: ABI contract (slot 756); x16 holds batch * in_dim, y batch * out_dim
+        // SAFETY: ABI contract (slot 756); x16 holds batch * in_dim, y batch *
+        // out_dim, the segment stays inside the plane
         check(unsafe {
             f(
-                wp as *const _,
+                (wp + woff) as *const _,
                 bp.as_ref()
                     .map_or(std::ptr::null(), |(p, _)| *p as *const _),
                 xp as *const _,

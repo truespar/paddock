@@ -129,6 +129,9 @@ struct PfCuts {
     swa: Vec<(usize, usize)>,
     runs: Vec<(usize, usize)>,
     spec: bool,
+    /// a draft tree's verify rows (Ripple, see `tree`): RoPE and the window
+    /// read the rows' logical positions, attention their ancestor masks
+    tree: bool,
     /// Leading rows that are DECODE rows (q_len 1, one per slot) in a fused
     /// mixed tick. They form one band - `runs[0]` = `swa[0]` = (0, dec) - and
     /// the attention dispatch sends that band to the DECODE-batch kernel.
@@ -160,6 +163,7 @@ impl PfCuts {
             swa,
             runs,
             spec: false,
+            tree: false,
             dec: 0,
         }
     }
@@ -183,6 +187,14 @@ impl PfCuts {
         Self {
             spec: true,
             ..Self::new(runs)
+        }
+    }
+
+    /// A draft tree's verify rounds: one run a slot (its tree's nodes).
+    pub(super) fn tree(runs: Vec<(usize, usize)>) -> Self {
+        Self {
+            tree: true,
+            ..Self::spec(runs)
         }
     }
 }
@@ -327,7 +339,7 @@ fn pf_attn_dtype_ok(kv_dtype: KvDtype, n_heads: usize, n_kv_heads: usize) -> boo
             *ON.get_or_init(|| paddock_models::dev_var_os!("PADDOCK_NO_NPF8").is_none())
                 && n_kv_heads > 0
                 && n_heads.is_multiple_of(n_kv_heads)
-                && matches!(n_heads / n_kv_heads, 4 | 6 | 9 | 12)
+                && matches!(n_heads / n_kv_heads, 4 | 6 | 9 | 10 | 12)
         }
     }
 }
@@ -505,12 +517,22 @@ pub(crate) struct BatchScratch {
     // the BF16-projection builds' rows narrowed to bf16 for the prefill pair
     // [PF, max(embd, q)] (1-element on the GGUF builds)
     pub x16: CudaSlice<half::bf16>,
+    // Ripple (1-element elsewhere): the scaled embedding rows the value
+    // residual blends from and the blend v reads [PF, embd], and the
+    // elementwise output gate [PF, q]
+    pub emb: CudaSlice<f32>,
+    pub vin: CudaSlice<f32>,
+    pub gfull: CudaSlice<f32>,
     pub sh_gate: CudaSlice<f32>, // [PF, shexp_ff]
     pub sh_up: CudaSlice<f32>,
     pub sh_out: CudaSlice<f32>,  // [PF, embd]
     pub d_toks: CudaSlice<u32>,  // [PF]
     pub d_pos: CudaSlice<u32>,   // [PF]
     pub d_slots: CudaSlice<u32>, // [PF]
+    /// a tree round's logical positions and (ancestor mask, base) pairs
+    /// ([SPEC_ROWS], [2 * SPEC_ROWS]; `d_pos` carries the cache slots)
+    pub d_tpos: CudaSlice<u32>,
+    pub d_tmask: CudaSlice<u32>,
     /// axis-major [4, PF] mrope positions - text collapses all four axes to
     /// the plain position; only axis 0 is live under sections [n_rot/2,0,0,0]
     pub d_mrope: CudaSlice<u32>,
@@ -629,6 +651,9 @@ impl GpuLaguna {
         if let Some(d) = self.dflash.as_mut() {
             d.state = None;
         }
+        if let Some(d) = self.dflash2.as_mut() {
+            d.state = None;
+        }
         self.exec.trim_mem_pool();
 
         let hp = &self.hp;
@@ -642,7 +667,8 @@ impl GpuLaguna {
         // slot-fit: rings are the only per-slot KV cost; the full layers ride
         // the shared pool
         let per_slot = n_swa * ring * 16 * kv_dim * 2 * kvb;
-        let block_bytes = n_full * 16 * kv_dim * 2 * kvb;
+        // (+ Ripple's drafter stripes beside every pool block)
+        let block_bytes = n_full * 16 * kv_dim * 2 * kvb + self.d2_stripe_bytes();
         // Prefill scratch PROFILED at load (the qwen35/granite shape,
         // 2026-09-06): allocated here, before the grant is read, so the plan
         // meets its true cost in the ledger. It was a flat 512 MiB reserve.
@@ -692,7 +718,9 @@ impl GpuLaguna {
         let bf16_proj = self
             .layers
             .iter()
-            .any(|l| matches!(l.proj, Proj::Bf16 { .. }));
+            .any(|l| matches!(l.proj, Proj::Bf16 { .. } | Proj::Ripple { .. }));
+        let ripple = |n: usize| if hp.flavor == Flavor::Ripple { n } else { 1 };
+        let w4 = hp.n_embd.max(dense_ff);
         // ROW CAPACITY of every scratch plane. A fused mixed tick carries the
         // decode band (≤ one row per slot) on TOP of a full pf_rows() chunk,
         // so the planes hold both - sizing them at pf_rows() alone would make
@@ -701,7 +729,7 @@ impl GpuLaguna {
         // measured -3.2% on 2048×128 c32). Costs slots/pf_rows of the scratch
         // (~3% at the 32-slot / 1024-row default).
         let pf_wide = match hp.flavor {
-            Flavor::Kolibri | Flavor::Flint => pf_rows_wide(nv),
+            Flavor::Kolibri | Flavor::Flint | Flavor::Ripple => pf_rows_wide(nv),
             Flavor::Laguna => pf_rows(),
         };
         let cap = pf_wide + max_batch;
@@ -744,8 +772,17 @@ impl GpuLaguna {
             sslot: e.alloc_u32(sorted_rows)?,
             bexp: e.alloc_u32(sorted_rows / 32)?,
             moe_part: e.alloc(cap * m.n_active * hp.n_embd)?,
-            xq4: e.alloc_i8(if nv { cap * hp.n_embd / 2 } else { 1 })?,
-            xs4: e.alloc_u8(if nv { cap * hp.n_embd / 16 } else { 1 })?,
+            // (the W4A4 dense FFN's rows run to its intermediate width)
+            xq4: e.alloc_i8(if nv {
+                cap * hp.n_embd / 2
+            } else {
+                ripple(cap * w4 / 2)
+            })?,
+            xs4: e.alloc_u8(if nv {
+                cap * hp.n_embd / 16
+            } else {
+                ripple(cap * w4 / 16)
+            })?,
             nfq: e.alloc_u8(if nv { sorted_rows * m.moe_ff / 2 } else { 1 })?,
             nfs: e.alloc_u8(if nv { sorted_rows * m.moe_ff / 16 } else { 1 })?,
             x16: e.stream_alloc_bf16(if bf16_proj {
@@ -753,12 +790,17 @@ impl GpuLaguna {
             } else {
                 1
             })?,
+            emb: e.alloc(ripple(cap * hp.n_embd))?,
+            vin: e.alloc(ripple(cap * hp.n_embd))?,
+            gfull: e.alloc(ripple(cap * q_max))?,
             sh_gate: e.alloc(cap * m.shexp_ff)?,
             sh_up: e.alloc(cap * m.shexp_ff)?,
             sh_out: e.alloc(cap * hp.n_embd)?,
             d_toks: e.alloc_u32(cap)?,
             d_pos: e.alloc_u32(cap)?,
             d_slots: e.alloc_u32(cap)?,
+            d_tpos: e.alloc_u32(SPEC_ROWS)?,
+            d_tmask: e.alloc_u32(2 * SPEC_ROWS)?,
             d_mrope: e.alloc_u32(4 * cap)?,
             head_logits: e.alloc(max_batch.max(SPEC_ROWS) * hp.n_vocab)?,
             d_spec_par: e.alloc_u32(SPEC_ROWS * 4)?,
@@ -892,6 +934,8 @@ impl GpuLaguna {
         if self.dflash.is_some() && laguna_spec_on() {
             self.dflash_ensure_state()?;
         }
+        // Ripple's drafter arms with the lane (its spec lane is the default)
+        self.d2_ensure_state()?;
         // the checkpoint blob allocates dead last (address stability for
         // everything the decode tick touches, as gemma4 does)
         self.build_prefix(slots)?;
@@ -920,7 +964,11 @@ impl GpuLaguna {
     /// full-layer pool block, re-uploading the device table once on growth.
     /// PoolExhausted surfaces to the scheduler, which preempts (no prefix
     /// radix to evict yet -).
-    fn ensure_full_rows(&mut self, slots: &[u32], positions: &[u32]) -> Result<(), GpuModelError> {
+    pub(super) fn ensure_full_rows(
+        &mut self,
+        slots: &[u32],
+        positions: &[u32],
+    ) -> Result<(), GpuModelError> {
         let bs = self.batch.as_mut().expect("batch enabled");
         let mut grew = false;
         for (i, &s) in slots.iter().enumerate() {
@@ -1704,7 +1752,7 @@ impl GpuLaguna {
         &mut self,
         reqs: &[(usize, usize, Vec<u32>)],
     ) -> Result<Option<Vec<u32>>, GpuModelError> {
-        if !laguna_spec_on() || self.batch.is_none() || !self.exec.has_argmax_rows() {
+        if !self.spec_lane_on() || self.batch.is_none() || !self.exec.has_argmax_rows() {
             return Ok(None);
         }
         let Some(r) = self.spec_verify_rows(reqs)? else {
@@ -1735,7 +1783,7 @@ impl GpuLaguna {
     /// q-probabilities this lane doesn't carry yet - decline (None).
     /// TruncCat verify rows pack mode 5 + the tpar side plane -
     /// sampled verify + accept-while-match stays exact for them.
-    fn pack_spec_par(
+    pub(super) fn pack_spec_par(
         plans: &[crate::sampler::DevicePlan],
         dev_trunc: bool,
     ) -> Option<(Vec<u32>, Option<Vec<u32>>)> {
@@ -1780,84 +1828,155 @@ impl GpuLaguna {
         reqs: &[(usize, usize, Vec<u32>)],
         plans: &[crate::sampler::DevicePlan],
     ) -> Result<Option<Vec<u32>>, GpuModelError> {
-        if !laguna_spec_on() || self.batch.is_none() || !self.exec.has_sample_rows() {
+        if !self.spec_lane_on() || self.batch.is_none() || !self.exec.has_sample_rows() {
             return Ok(None);
         }
         let total: usize = reqs.iter().map(|q| q.2.len()).sum();
         if plans.len() != total || total == 0 || total > SPEC_ROWS {
             return Ok(None);
         }
-        let Some((par, tpar)) = Self::pack_spec_par(plans, self.device_trunc_supported()) else {
+        let Some(packed) = Self::pack_spec_par(plans, self.device_trunc_supported()) else {
             return Ok(None);
         };
-        let exec = self.exec.clone();
-        {
-            let sc = &mut self.batch.as_mut().expect("batch enabled").sc;
-            let mut v = sc
-                .d_spec_par
-                .try_slice_mut(0..total * 4)
-                .ok_or_else(|| GpuError::Driver("d_spec_par slice".into()))?;
-            exec.stream.memcpy_htod(&par, &mut v).map_err(drv)?;
-            if let Some(t) = &tpar {
-                let mut v = sc
-                    .d_spec_tpar
-                    .try_slice_mut(0..total * 4)
-                    .ok_or_else(|| GpuError::Driver("d_spec_tpar slice".into()))?;
-                exec.stream.memcpy_htod(t, &mut v).map_err(drv)?;
-            }
-        }
         let Some(r) = self.spec_verify_rows(reqs)? else {
             return Ok(None);
         };
-        let vocab = self.hp.n_vocab;
-        let picks = {
-            let sc = &mut self.batch.as_mut().expect("batch enabled").sc;
-            exec.sample_rows_at(
-                &sc.head_logits,
-                &sc.d_spec_par,
-                0,
-                &mut sc.d_spec_out,
-                0,
-                r,
-                vocab,
-            )?;
-            if tpar.is_some() {
-                Self::trunc_dev5_witness(r);
-                exec.sample_rows_t_at(
-                    &sc.head_logits,
-                    &sc.d_spec_par,
-                    0,
-                    &sc.d_spec_tpar,
-                    0,
-                    &mut sc.d_spec_out,
-                    0,
-                    r,
-                    vocab,
-                )?;
-                exec.sample_rows_p_at(
-                    &sc.head_logits,
-                    &sc.d_spec_par,
-                    0,
-                    &sc.d_spec_tpar,
-                    0,
-                    &mut sc.d_spec_out,
-                    0,
-                    r,
-                    vocab,
-                )?;
-            }
-            let v = sc
-                .d_spec_out
-                .try_slice(0..r)
-                .ok_or_else(|| GpuError::Driver("d_spec_out slice".into()))?;
-            exec.stream.clone_dtoh(&v).map_err(drv)?
-        };
+        let picks = self.spec_picks(Some(&packed), r)?;
         // same accept-walk replay as the greedy round: the service commits
         // off these exact picks, so the internal walk matches it bit-for-bit
         if self.dflash_armed() {
             self.dflash_spec_commit(reqs, &picks)?;
         }
         Ok(Some(picks))
+    }
+
+    /// A verified round's picks over its `r` rows: the device argmax
+    /// (`packed` None) or `sample_rows` with the packed per-row plans
+    /// (`pack_spec_par`) - the head logits stay on device either way.
+    pub(super) fn spec_picks(
+        &mut self,
+        packed: Option<&(Vec<u32>, Option<Vec<u32>>)>,
+        r: usize,
+    ) -> Result<Vec<u32>, GpuModelError> {
+        let exec = self.exec.clone();
+        let vocab = self.hp.n_vocab;
+        let sc = &mut self.batch.as_mut().expect("batch enabled").sc;
+        let Some((par, tpar)) = packed else {
+            exec.argmax_rows(&sc.head_logits, &mut sc.d_spec_out, r, vocab)?;
+            let v = sc
+                .d_spec_out
+                .try_slice(0..r)
+                .ok_or_else(|| GpuError::Driver("d_spec_out slice".into()))?;
+            return Ok(exec.stream.clone_dtoh(&v).map_err(drv)?);
+        };
+        let mut v = sc
+            .d_spec_par
+            .try_slice_mut(0..r * 4)
+            .ok_or_else(|| GpuError::Driver("d_spec_par slice".into()))?;
+        exec.stream.memcpy_htod(par, &mut v).map_err(drv)?;
+        if let Some(t) = tpar {
+            let mut v = sc
+                .d_spec_tpar
+                .try_slice_mut(0..r * 4)
+                .ok_or_else(|| GpuError::Driver("d_spec_tpar slice".into()))?;
+            exec.stream.memcpy_htod(t, &mut v).map_err(drv)?;
+        }
+        exec.sample_rows_at(
+            &sc.head_logits,
+            &sc.d_spec_par,
+            0,
+            &mut sc.d_spec_out,
+            0,
+            r,
+            vocab,
+        )?;
+        if tpar.is_some() {
+            Self::trunc_dev5_witness(r);
+            exec.sample_rows_t_at(
+                &sc.head_logits,
+                &sc.d_spec_par,
+                0,
+                &sc.d_spec_tpar,
+                0,
+                &mut sc.d_spec_out,
+                0,
+                r,
+                vocab,
+            )?;
+            exec.sample_rows_p_at(
+                &sc.head_logits,
+                &sc.d_spec_par,
+                0,
+                &sc.d_spec_tpar,
+                0,
+                &mut sc.d_spec_out,
+                0,
+                r,
+                vocab,
+            )?;
+        }
+        let v = sc
+            .d_spec_out
+            .try_slice(0..r)
+            .ok_or_else(|| GpuError::Driver("d_spec_out slice".into()))?;
+        Ok(exec.stream.clone_dtoh(&v).map_err(drv)?)
+    }
+
+    /// A draft tree's verify rows (Ripple, `tree.rs`): stage the rows - cache
+    /// slots in `d_pos`, logical positions and (ancestor mask, base) pairs in
+    /// the tree planes - and run the tree-flavored verify, one captured
+    /// replay per run-length signature like the chain's.
+    pub(super) fn tree_verify_rows(
+        &mut self,
+        rows: (&[u32], &[u32], &[u32]),
+        tree: (&[u32], &[u32]),
+        runs: &[(usize, usize)],
+    ) -> Result<(), GpuModelError> {
+        let total = rows.0.len();
+        self.upload_rows(rows.0, rows.1, rows.2)?;
+        {
+            let st = &self.exec.stream;
+            let sc = &mut self.batch.as_mut().expect("batch enabled").sc;
+            let mut p = sc
+                .d_tpos
+                .try_slice_mut(0..total)
+                .ok_or_else(|| GpuError::Driver("d_tpos".into()))?;
+            st.memcpy_htod(tree.0, &mut p).map_err(drv)?;
+            let mut m = sc
+                .d_tmask
+                .try_slice_mut(0..2 * total)
+                .ok_or_else(|| GpuError::Driver("d_tmask".into()))?;
+            st.memcpy_htod(tree.1, &mut m).map_err(drv)?;
+        }
+        let mut key: Vec<u32> = vec![u32::MAX];
+        key.extend(runs.iter().map(|&(_, l)| l as u32));
+        let bs = self.batch.as_ref().expect("batch enabled");
+        let have = bs.spec_graphs.contains_key(&key);
+        if !have && bs.spec_graphs.len() >= SPEC_GRAPH_CAP {
+            return self.tree_verify_body(total, runs);
+        }
+        if !have {
+            self.tree_verify_body(total, runs)?;
+            let g = self.capture_body(|s| s.tree_verify_body(total, runs), "tree verify")?;
+            let bs = self.batch.as_mut().expect("batch enabled");
+            bs.spec_graphs.insert(key, g);
+            return Ok(());
+        }
+        bs.spec_graphs[&key]
+            .0
+            .launch()
+            .map_err(|e| GpuError::Driver(format!("tree verify graph launch: {e}")))?;
+        Ok(())
+    }
+
+    fn tree_verify_body(
+        &mut self,
+        total: usize,
+        runs: &[(usize, usize)],
+    ) -> Result<(), GpuModelError> {
+        self.embed_rows(total)?;
+        self.layer_walk(total, Some(&PfCuts::tree(runs.to_vec())))?;
+        self.head_rows(total)
     }
 
     /// One PF_ROWS chunk of a single slot's prompt: upload row streams, embed,
@@ -2063,6 +2182,7 @@ impl GpuLaguna {
         // graph body untouched; r1 GEMVs are decode-only for the same reason.
         // spec-verify rounds keep the DECODE numeric class (see PfCuts::spec)
         let spec = cuts.is_some_and(|c| c.spec);
+        let tree = cuts.is_some_and(|c| c.tree);
         let pf = cuts.is_some() && !spec && !no_w4a8_prefill();
         let r1 = r == 1 && !pf;
         // r1 k-quant projections ride the W4A8 dp4a GEMV (qwen35's
@@ -2085,8 +2205,12 @@ impl GpuLaguna {
         // laguna alternates G=6 (full-attn, nh=48) / G=9 (SWA, nh=72) and the
         // new v4 hd128 arm is ratio-specific (unlike the old generic WMMA
         // tile, which took any ratio, hence this was a single flag before).
+        // Ripple's verify rounds take it too: its wide verify rows are off
+        // the decode class already (W4A4 past 8 rows), and at G=10 the
+        // decode-batch kernel walks a slot's keys once per q head and row
+        // (four slots' 16-row blocks: ~680 us a layer, the tile ~80)
         let wmma_pf_base = cuts.is_some()
-            && !spec
+            && (!spec || hp.flavor == Flavor::Ripple)
             && hd == 128
             && exec.has_attn_prefill_f16_paged()
             && !no_wmma_prefill();
@@ -2101,10 +2225,13 @@ impl GpuLaguna {
         // aux-band row stride: the same scratch row capacity every plane is
         // sized at, so a fused tick's rows can never run off a band
         let cap = bs.cap;
-        let mut dtap = self.dflash.as_mut().and_then(|d| {
-            let ids = d.target_layer_ids.clone();
-            d.state.as_mut().map(|st| (&mut st.aux, ids))
-        });
+        let mut dtap = match self.dflash2.as_mut() {
+            Some(d) => d.state.as_mut().map(|st| (&mut st.aux, d.taps.clone())),
+            None => self.dflash.as_mut().and_then(|d| {
+                let ids = d.target_layer_ids.clone();
+                d.state.as_mut().map(|st| (&mut st.aux, ids))
+            }),
+        };
 
         // Kolibri's sandwich blocks fuse each post-norm with the next norm
         // (rmsnorm_add_scale_norm, bit-identical to the pair): `pre_normed`
@@ -2168,6 +2295,9 @@ impl GpuLaguna {
                 if !nr_done {
                     super::nv::qkv_rows(&exec, [wq, wk, wv], sc, self.w16r.as_mut(), pf, r)?;
                 }
+            } else if let Proj::Ripple { wqkg, wv, .. } = &layer.proj {
+                let t = layer.valres.unwrap_or(1.0);
+                super::ripple::qkgv_rows(&exec, wqkg, wv, sc, t, q_dim, kv_dim, r)?;
             } else if let Proj::Bf16 { wqkv, .. } = &layer.proj {
                 // the NVFP4 build's BF16 attention: q|k|v off one plane
                 super::head::bf16_qkv(
@@ -2403,7 +2533,7 @@ impl GpuLaguna {
             // (NoPE layers at freq_scale 0 - cos 1, sin 0, mscale 1: the
             // rotation is an exact identity); laguna keeps its chain bytes
             let kolibri_pf = pf
-                && matches!(hp.flavor, Flavor::Kolibri | Flavor::Flint)
+                && matches!(hp.flavor, Flavor::Kolibri | Flavor::Flint | Flavor::Ripple)
                 && exec.has_qkv_norm_rope_batch()
                 && paddock_models::dev_var_os!("PADDOCK_NO_KOLIBRI_NR").is_none();
             if nr_done {
@@ -2418,7 +2548,8 @@ impl GpuLaguna {
                 let q16 = wmma_pf
                     && kv_dtype == KvDtype::Fp16
                     && exec.attn_prefill_q16_ready(nh, n_kv, hd, kv_dtype);
-                let q16 = q16
+                // (Ripple's gate and o projection read the f32 attention rows)
+                let q16 = (q16 && hp.flavor != Flavor::Ripple)
                     .then(|| self.w16r.as_mut().and_then(|w| w.q16_plane()))
                     .flatten();
                 let (qw, kw) = (&layer.q_norm.buf, &layer.k_norm.buf);
@@ -2480,8 +2611,10 @@ impl GpuLaguna {
                     exec.rmsnorm_batch(&sc.k, &layer.k_norm.buf, &mut sc.kn, hd, eps, r * n_kv)?;
                 }
                 if layer.is_swa {
-                    exec.rope_yarn_batch(&mut sc.qn, &sc.d_pos, nh, hd, hp.rope_swa, r)?;
-                    exec.rope_yarn_batch(&mut sc.kn, &sc.d_pos, n_kv, hd, hp.rope_swa, r)?;
+                    // a tree's rows rotate at their logical positions
+                    let rp = if tree { &sc.d_tpos } else { &sc.d_pos };
+                    exec.rope_yarn_batch(&mut sc.qn, rp, nh, hd, hp.rope_swa, r)?;
+                    exec.rope_yarn_batch(&mut sc.kn, rp, n_kv, hd, hp.rope_swa, r)?;
                 } else if !layer.nope {
                     exec.mrope(
                         &mut sc.qn,
@@ -2528,9 +2661,11 @@ impl GpuLaguna {
                         scale,
                         kv_dtype,
                         wmma_pf,
+                        tree,
                     };
                     let swa = layer.is_swa.then_some((&c.swa[..], ring));
-                    let ws = self.w16r.as_mut();
+                    let ripple = matches!(layer.proj, Proj::Ripple { .. });
+                    let ws = self.w16r.as_mut().filter(|_| !ripple);
                     super::attend::attend_pf(&exec, sc, kvs, &a, swa, &c.runs, c.dec, r, ws)?;
                 }
                 None => {
@@ -2662,7 +2797,10 @@ impl GpuLaguna {
                     }
                 }
             }
-            if !layer.has_gate() {
+            if matches!(layer.proj, Proj::Ripple { .. }) {
+                // Ripple's elementwise gate, computed beside q (f32 rows)
+                exec.mul_sigmoid(&mut sc.attn, &sc.gfull, r * q_dim)?;
+            } else if !layer.has_gate() {
                 // no output gate (Kolibri)
             } else if qk_fused {
                 // gate rows live after q and k in the fused plane
@@ -2672,6 +2810,8 @@ impl GpuLaguna {
             }
             if let Proj::Nv { wo, .. } = &layer.proj {
                 super::nv::o_rows(&exec, wo, sc, self.w16r.as_mut(), pf, r)?;
+            } else if let Proj::Ripple { wo, .. } = &layer.proj {
+                super::ripple::o_rows(&exec, wo, sc, r)?;
             } else if let Proj::Bf16 { wo, .. } = &layer.proj {
                 super::head::bf16_rows(&exec, wo, &sc.attn, &mut sc.x16, &mut sc.proj, r)?;
             } else if let Some(q) = qp {
@@ -2895,9 +3035,22 @@ impl GpuLaguna {
                         )?;
                     }
                 }
-                Ffn::DenseNv { gate, up, down } => {
-                    super::nv::dense_rows(&exec, [gate, up, down], sc, self.w16r.as_mut(), pf, r)?
-                }
+                Ffn::DenseNv { gate, up, down } => super::nv::dense_rows(
+                    &exec,
+                    [gate, up, down],
+                    sc,
+                    self.w16r.as_mut(),
+                    pf,
+                    r,
+                    self.hp.ffn_clamp,
+                    // prompt rows and wide verify rounds ride W4A4: past a
+                    // few rows the W4A16 classes turn compute-bound on these
+                    // planes (a 64-row verify spent ~240 ms of its ~500 in
+                    // them on GB10), the fp4 class stays at the weight stream
+                    layer
+                        .ffn_act
+                        .filter(|_| self.hp.pf_w4a4 && (pf || (spec && r > 8))),
+                )?,
                 Ffn::MoeNv(w) => {
                     // the wide class in prefill mode and wide verify rounds,
                     // the W4A16 GEMVs at decode (nv.rs `moe_nv_any`)

@@ -175,6 +175,20 @@ pub fn elected(arch: &str) -> Option<Elected> {
             instruct: None,
             source: "RecursiveSI/flint generation_config.json (temperature 1.0, top_p 0.95, top_k 20) and the model card's evaluation settings",
         },
+        // Ripple-65B's generation_config.json and its cards agree: temperature
+        // 1.0, top-p 0.95 (top-k unstated, so off). The model decides per turn
+        // whether to reason, so there is no instruct row.
+        "ripple" => Elected {
+            thinking: Knobs {
+                temperature: 1.0,
+                top_k: 0,
+                top_p: 0.95,
+                min_p: 0.0,
+            },
+            instruct: None,
+            source: "ricursiveAI/Ripple-65B-Preview generation_config.json and the \
+                     Ripple-65B-Preview-NVFP4 card (temperature 1.0, top_p 0.95)",
+        },
         "kolibri1" => Elected {
             thinking: Knobs {
                 temperature: 1.0,

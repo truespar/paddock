@@ -3196,7 +3196,7 @@ __global__ void pd_quantize_e4m3_row_kernel(const TI* __restrict__ x,
     // BIT-IDENTICAL to the scalar walk.
     const uint32_t row = blockIdx.x;
     const uint32_t tid = threadIdx.x, nth = blockDim.x;
-    const TI* xr = x + (size_t)row * n_dim;
+    const TI* xr = pd_pdl_after(x) + (size_t)row * n_dim;   // read after the PDL wait
     __shared__ float wmax[32];
     __shared__ int s_e;
     const uint32_t n4 = n_dim >> 2;
@@ -3258,7 +3258,7 @@ __global__ void __launch_bounds__(1024) pd_quantize_e4m3_row1p_kernel(
         float* __restrict__ rscale, uint32_t n_dim) {
     PD_PDL_ARM();
     const uint32_t row = blockIdx.x, tid = threadIdx.x, nth = blockDim.x;
-    const TI* xr = x + (size_t)row * n_dim;
+    const TI* xr = pd_pdl_after(x) + (size_t)row * n_dim;   // read after the PDL wait
     __shared__ float wmax[32];
     __shared__ int s_e;
     const uint32_t n4 = n_dim >> 2;
@@ -3325,7 +3325,7 @@ __global__ void __launch_bounds__(1024) pd_quantize_e4m3_row1pc_kernel(
     PD_PDL_ARM();
     const uint32_t row = blockIdx.x, ch = blockIdx.y, C = gridDim.y;
     const uint32_t tid = threadIdx.x, nth = blockDim.x;
-    const TI* xr = x + (size_t)row * n_dim;
+    const TI* xr = pd_pdl_after(x) + (size_t)row * n_dim;   // read after the PDL wait
     __shared__ float wmax[32];
     __shared__ int s_e;
     const uint32_t n4 = n_dim >> 2;

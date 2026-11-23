@@ -1907,8 +1907,28 @@ impl GpuExecutor {
         y: &mut CudaSlice<f32>,
         bias: Option<&CudaSlice<f32>>,
         batch: usize,
+        part: Option<&mut CudaSlice<f32>>,
+    ) -> Result<(), GpuError> {
+        self.nvf4_gemm_f4_scaled(w, 1.0, xq, xs, y, bias, batch, part)
+    }
+
+    /// [`Self::nvf4_gemm_f4`] over activations quantized against a static
+    /// per-tensor scale (`quantize_nvf4_gs` at `1 / act_scale`, ModelOpt's
+    /// `input_scale`): the GEMM's factor becomes `scale2 * act_scale`, the
+    /// reference's `alpha`. 1.0 is the dynamic class exactly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn nvf4_gemm_f4_scaled(
+        &self,
+        w: &Nvf4Plane,
+        act_scale: f32,
+        xq: &CudaSlice<i8>,
+        xs: &CudaSlice<u8>,
+        y: &mut CudaSlice<f32>,
+        bias: Option<&CudaSlice<f32>>,
+        batch: usize,
         mut part: Option<&mut CudaSlice<f32>>,
     ) -> Result<(), GpuError> {
+        let s2 = w.scale2 * act_scale;
         if w.layout != Nvf4Layout::Row {
             return Err(GpuError::Unsupported(
                 "nvf4_gemm_f4 reads the row-major layout; tiled/frag plane refused".into(),
@@ -1959,7 +1979,7 @@ impl GpuExecutor {
                     xqp as *const _,
                     xsp as *const _,
                     yp as *mut _,
-                    w.scale2,
+                    s2,
                     w.in_dim as u32,
                     w.out_dim as u32,
                     batch as u32,
@@ -2042,7 +2062,7 @@ impl GpuExecutor {
                     xqp as *const _,
                     xsp as *const _,
                     yp as *mut _,
-                    w.scale2,
+                    s2,
                     w.in_dim as u32,
                     w.out_dim as u32,
                     batch as u32,
@@ -2065,7 +2085,7 @@ impl GpuExecutor {
                     xqp as *const _,
                     xsp as *const _,
                     yp as *mut _,
-                    w.scale2,
+                    s2,
                     w.in_dim as u32,
                     w.out_dim as u32,
                     batch as u32,
@@ -2119,7 +2139,7 @@ impl GpuExecutor {
                         xqp as *const _,
                         xsp as *const _,
                         yp as *mut _,
-                        w.scale2,
+                        s2,
                         w.in_dim as u32,
                         w.out_dim as u32,
                         batch as u32,
@@ -2138,7 +2158,7 @@ impl GpuExecutor {
                         xqp as *const _,
                         xsp as *const _,
                         yp as *mut _,
-                        w.scale2,
+                        s2,
                         w.in_dim as u32,
                         w.out_dim as u32,
                         batch as u32,
@@ -2146,6 +2166,35 @@ impl GpuExecutor {
                     )
                 });
             }
+        }
+        // f4tn64 (slot 972): f4tn over 64 columns for 33..64 rows, bit-exact
+        // vs f4c unsplit - so only where f4c below would not K-split
+        let room = part
+            .as_deref()
+            .is_some_and(|p| p.len() >= sk_e * batch * w.out_dim);
+        if f4t_dec
+            && f4t_on
+            && batch <= 64
+            && !(ntiles < 64 && sk_e >= 2 && room)
+            && w.in_dim.is_multiple_of(256)
+            && let Some(f) = self.kernels.nvf4_gemm_f4tn64
+        {
+            // SAFETY: ABI contract (slot 972); geometry validated above
+            return check(unsafe {
+                f(
+                    dp as *const _,
+                    sp as *const _,
+                    bp,
+                    xqp as *const _,
+                    xsp as *const _,
+                    yp as *mut _,
+                    s2,
+                    w.in_dim as u32,
+                    w.out_dim as u32,
+                    batch as u32,
+                    self.stream_ptr(),
+                )
+            });
         }
         // Decode narrow-tile arm: the BN=32 / WR=144 twin at
         // launch_bounds(256,2) => 2 CTA/SM. The wide f4c tile (88 KB smem,
@@ -2178,7 +2227,7 @@ impl GpuExecutor {
                     xsp as *const _,
                     core::ptr::null_mut(),
                     yp as *mut _,
-                    w.scale2,
+                    s2,
                     w.in_dim as u32,
                     w.out_dim as u32,
                     batch as u32,
@@ -2219,7 +2268,7 @@ impl GpuExecutor {
                         xsp as *const _,
                         pp,
                         yp as *mut _,
-                        w.scale2,
+                        s2,
                         w.in_dim as u32,
                         w.out_dim as u32,
                         batch as u32,
@@ -2253,7 +2302,7 @@ impl GpuExecutor {
                     xsp as *const _,
                     pp,
                     yp as *mut _,
-                    w.scale2,
+                    s2,
                     w.in_dim as u32,
                     w.out_dim as u32,
                     batch as u32,
@@ -2280,7 +2329,7 @@ impl GpuExecutor {
                     xsp as *const _,
                     pp as *mut _,
                     yp as *mut _,
-                    w.scale2,
+                    s2,
                     w.in_dim as u32,
                     w.out_dim as u32,
                     batch as u32,
@@ -2299,7 +2348,7 @@ impl GpuExecutor {
                     xqp as *const _,
                     xsp as *const _,
                     yp as *mut _,
-                    w.scale2,
+                    s2,
                     w.in_dim as u32,
                     w.out_dim as u32,
                     batch as u32,
@@ -2321,7 +2370,7 @@ impl GpuExecutor {
                 xqp as *const _,
                 xsp as *const _,
                 yp as *mut _,
-                w.scale2,
+                s2,
                 w.in_dim as u32,
                 w.out_dim as u32,
                 batch as u32,

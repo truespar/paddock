@@ -35,6 +35,7 @@ pub mod nemotron_vl;
 pub mod phonon;
 pub mod probe;
 pub mod qwen4exp;
+pub mod ripple;
 pub mod safetensors;
 pub mod sam3;
 pub mod sampling;

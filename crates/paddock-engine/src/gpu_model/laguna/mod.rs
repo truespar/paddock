@@ -36,6 +36,16 @@
 //! `post_ffw_norm` after routed + shared experts), MoE on every layer, and
 //! the `sigmoid_logit_add` router ([`Router::LogitSigmoid`]).
 //!
+//! Ricursive's **Ripple-65B** (the official NVFP4 safetensors build,
+//! [`Flavor::Ripple`]; `modeling_ricursive.py` is the study reference) is the
+//! dense member: Kolibri's attention plan at 80 Q heads over 8 KV heads and a
+//! 1024-key window, plus an elementwise sigmoid output gate
+//! ([`Proj::Ripple`]'s g rows), the value residual - each layer's v
+//! projection reads `lerp(e, x, sigmoid(lambda))` of the scaled token
+//! embedding `e` and its normed input `x` ([`LagunaLayer::valres`]) - the
+//! embedding scale, and a dense SwiGLU FFN on NVFP4 planes with the gate
+//! clamped to <= 20 and the up projection to [-20, 20] ([`Hparams::ffn_clamp`]).
+//!
 //! And Recursive's **Flint** (`flint` GGUFs, [`Flavor::Flint`];
 //! llama.cpp `src/models/flint.cpp` and the SGLang plugin's `model.py` are
 //! the study references). Kolibri's attention plan - the file's sliding
@@ -59,15 +69,21 @@ use crate::gpu::{
 mod attend;
 mod batch;
 mod dflash;
+mod dflash2;
+#[doc(hidden)]
+pub mod dflash2_tree;
 mod forward;
 mod head;
 mod load;
 mod load_flint;
 mod load_hf;
+mod load_ripple;
 mod moe_nv;
 mod nv;
 mod prefix;
 mod profile;
+mod ripple;
+mod tree;
 
 pub use dflash::DflashSelftest;
 
@@ -91,6 +107,7 @@ pub(crate) enum Flavor {
     Laguna,
     Kolibri,
     Flint,
+    Ripple,
 }
 
 impl Flavor {
@@ -100,6 +117,7 @@ impl Flavor {
             Flavor::Laguna => "laguna",
             Flavor::Kolibri => "kolibri1",
             Flavor::Flint => "flint",
+            Flavor::Ripple => "ripple",
         }
     }
 }
@@ -254,6 +272,14 @@ pub(crate) enum Proj {
         wv: Nvf4Plane,
         wo: Nvf4Plane,
     },
+    /// Ripple's BF16 attention: `[q | k | g]` rows fused over the normed
+    /// input (`g` the elementwise sigmoid gate, as wide as q), `v` on its own
+    /// - it reads the value-residual blend, not the normed input - and `wo`.
+    Ripple {
+        wqkg: QuantTensor,
+        wv: QuantTensor,
+        wo: QuantTensor,
+    },
 }
 
 impl Proj {
@@ -262,7 +288,7 @@ impl Proj {
     pub(crate) fn quant(&self) -> Option<&QProj> {
         match self {
             Proj::Quant(q) => Some(q),
-            Proj::Bf16 { .. } | Proj::Nv { .. } => None,
+            Proj::Bf16 { .. } | Proj::Nv { .. } | Proj::Ripple { .. } => None,
         }
     }
 }
@@ -300,6 +326,13 @@ pub(crate) struct LagunaLayer {
     pub nope: bool,
     /// This layer's Q-head count (48 full / 64 SWA on XS-2.1).
     pub n_heads: usize,
+    /// Ripple's value residual: the blend weight `sigmoid(lambda)` of the
+    /// layer's v-projection input `lerp(e, x, t)`. None elsewhere (v reads
+    /// the normed input).
+    pub valres: Option<f32>,
+    /// Ripple's static activation scales (ModelOpt `input_scale`) for the
+    /// W4A4 prefill FFN: [the gate|up input, the down input].
+    pub ffn_act: Option<[f32; 2]>,
 }
 
 impl LagunaLayer {
@@ -362,6 +395,15 @@ pub(crate) struct Hparams {
     pub rope_full: (f32, f32, f32, f32, f32, f32),
     pub rope_swa: (f32, f32, f32, f32, f32, f32),
     pub moe: MoeDims,
+    /// Multiplies the gathered embedding rows (Ripple: sqrt(width)); 1.0
+    /// elsewhere.
+    pub embed_scale: f32,
+    /// Ripple's FFN clamp: gate <= it, up in [-it, it] before SiLU(gate) * up.
+    pub ffn_clamp: Option<f32>,
+    /// Prefill runs the dense NVFP4 FFN W4A4 (nvfp4 rows on the block-scaled
+    /// fp4 GEMM) - the class the checkpoint was calibrated for (Ripple's
+    /// static input scales); decode keeps the W4A16 GEMVs.
+    pub pf_w4a4: bool,
 }
 
 /// Token-embedding residency: gathered from its file quant (Q4_K on the
@@ -412,6 +454,9 @@ pub struct GpuLaguna {
     /// official speculator checkpoint, attached via serving config. None =
     /// no model drafter (spec rounds fall back to the service's n-gram).
     pub(crate) dflash: Option<dflash::DflashDrafter>,
+    /// Ripple's DFlash2 drafter (dflash2.rs: conv + selector, pool-stripe
+    /// features); None on every other build.
+    pub(crate) dflash2: Option<dflash2::Dflash2>,
     /// Prompts mid-prefill, FIFO (batch.rs, stall-free batching). Each entry
     /// carries a CURSOR, so a tick advances a prompt partway and the next
     /// tick resumes it - decode rows never wait for a whole prompt, let

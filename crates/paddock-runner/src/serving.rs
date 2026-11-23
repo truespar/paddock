@@ -2556,6 +2556,13 @@ fn load_hf_dir(
                 .map_err(|e| ServeError::Open(dir.to_path_buf(), e))?;
             "kolibri1".to_owned()
         }
+        // Ricursive's Ripple-65B: the official NVFP4 build (MLP NVFP4, the
+        // rest BF16) on the laguna body, CUDA only
+        "ricursive" => {
+            paddock_models::ripple::RippleConfig::read_nvfp4(dir)
+                .map_err(|e| ServeError::Open(dir.to_path_buf(), e))?;
+            "ripple".to_owned()
+        }
         "diffusion_gemma" if device == "metal" => {
             paddock_models::mlx::DiffusionConfig::read(dir)
                 .map_err(|e| ServeError::Open(dir.to_path_buf(), e))?;
@@ -3398,10 +3405,10 @@ fn build_generator(
             return Err(format!("{arch} needs cuda (got {device:?})"));
         }
         let exec = make_exec(pack)?;
-        // Only nemotron consumes a sideloaded drafter in this lane; granite
-        // has none and qwen4exp's head ships in its own shards. Refuse one
-        // rather than serve as if it were attached.
-        if mtp.is_some() && arch != "nemotron" {
+        // Only nemotron and Ripple consume a sideloaded drafter in this lane;
+        // granite has none and qwen4exp's head ships in its own shards.
+        // Refuse one rather than serve as if it were attached.
+        if mtp.is_some() && !matches!(arch, "nemotron" | "ripple") {
             return Err(format!(
                 "{arch}: the safetensors lane takes no sideloaded drafter (--mtp / `mtp`)"
             ));
@@ -3425,6 +3432,20 @@ fn build_generator(
                 )
                 .map_err(|e| e.to_string())?;
                 apply_kv_dtype(|d| model.set_kv_dtype(d));
+                Ok(Box::new(model) as Box<dyn Generator>)
+            }
+            "ripple" => {
+                let mut model = paddock_engine::gpu_model::laguna::GpuLaguna::load_ripple_nvfp4(
+                    exec, path, max_ctx,
+                )
+                .map_err(|e| e.to_string())?;
+                apply_kv_dtype(|d| model.set_kv_dtype(d));
+                // the official DFlash2 drafter (a safetensors DIR), on the
+                // same `mtp` drafter-sideload key; lib.rs leaves it None
+                // when spec is off
+                if let Some(dp) = mtp {
+                    model.attach_dflash2(dp).map_err(|e| e.to_string())?;
+                }
                 Ok(Box::new(model) as Box<dyn Generator>)
             }
             "nemotron-parse" => {
