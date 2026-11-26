@@ -9996,7 +9996,855 @@ pub struct KernelTableV1 {
     /// layers, bt0, bps0, bt1, bps1, plan, n_groups, stride, row_bytes,
     /// stream)`; plan records `[slot, n, (src, dst) x n]` in depth order.
     pub kv_tree_move: Option<KvTreeMoveFn>,
+    /// Slot 977: Inkling 2's block attention residual - per row the `ns`
+    /// block states and the partial sum at unit RMS, mixed by softmax over
+    /// `nq` learned queries: `(states, ns, partial, query, nq, out, rows,
+    /// width, qstride, eps, stream)`; query `q`'s rows at `out + q * qstride`.
+    pub inkling2_attn_res: Option<Inkling2AttnResFn>,
+    /// Slot 978: the loop controller's gate input `[bf16(rms(h)),
+    /// bf16(rms(m))]` a row: `(h, m, out, rows, width, eps, stream)`.
+    pub inkling2_msg_cat: Option<Inkling2MsgCatFn>,
+    /// Slot 979: the loop controller's mix `(1 - tanh(F z)) h + tanh(G z) m`
+    /// over z = bf16(down output): `(z, F, G, h, m, out, rows, width, rank,
+    /// stream)`; F / G bf16 [width][rank].
+    pub inkling2_msg_mix: Option<Inkling2MsgMixFn>,
+    /// Slot 980: the attention's per-head prep in place - optional bf16
+    /// scale, then an L2 clip (or unit RMS), then the log scale over `pos`:
+    /// `(x, rows, heads, d, stride, scale, clip, rms, eps, pos, alpha,
+    /// floor, stream)`.
+    pub inkling2_head_prep: Option<Inkling2HeadPrepFn>,
+    /// Slot 981: the short causal conv (4 taps) with carried state over
+    /// runs of one sequence each, static (`w` [C][4]) or dynamic (`w` [4][C]
+    /// by lag + per-token head taps `dyn`): `(x, xstride, out, ostride, C, w,
+    /// dyn, dstride, heads, state, run_off, run_slot, n_runs, max_run,
+    /// stream)`; out = (x + conv) / sqrt(5) (static) or / 3 (dynamic).
+    pub inkling2_sconv: Option<Inkling2SconvFn>,
+    /// Slot 982: the softcapped SwiGLU `gc tanh(g / gc) sigmoid(g) uc tanh(u
+    /// / uc)`: `(g, u, out, n, gc, uc, stream)`.
+    pub inkling2_swiglu_cap: Option<Inkling2SwigluCapFn>,
+    /// Slot 983: per-row activation quantize, NVFP4 four-over-six (fmt 0:
+    /// codes, e4m3 scales, outer = amax / 1536) or MXFP8 (1: e4m3, ue8m0),
+    /// optionally times gamma[row] and through bf16 first: `(x, xstride,
+    /// gamma, bf16_in, fmt, q, scales, outer, rows, K, stream)`; `bf16_in`
+    /// 2 (packs with slot 1006): x holds bf16 rows, read as they are (no
+    /// gamma).
+    pub inkling2_quant: Option<Inkling2QuantFn>,
+    /// Slot 984: the experts' gate|up at decode widths, every (row, slot)
+    /// pair, softcapped SwiGLU in the epilogue: `(w, wscale, wfac, xq, xs,
+    /// xo, idx, topk, act, rows, K, ff, fmt, gcap, ucap, stream)`.
+    pub inkling2_moe_gu: Option<Inkling2MoeGuFn>,
+    /// Slot 985: the experts' down at decode widths, a row's topk pairs
+    /// summed in slot order: `(w, wscale, wfac, aq, as, ao, idx, topk, out,
+    /// rows, ff, hidden, fmt, stream)`.
+    pub inkling2_moe_dn: Option<Inkling2MoeDnFn>,
+    /// Slot 986: Inkling 2's relative-bias attention with per-token sinks
+    /// over a contiguous f32 history: `(q, qs, rel, rs, sink, ss, k, v,
+    /// proj, out, rows, p0, heads, kv_heads, head_dim, d_rel, window,
+    /// extent, scale, stream)`.
+    pub inkling2_attn: Option<Inkling2AttnFn>,
+    /// Slot 987: the experts' gate|up at prompt widths over moe_align's
+    /// 32-row blocks (one weight tile a block's pairs): `(w, wscale, wfac,
+    /// xq, xs, xo, sorted_row, sorted_slot, block_expert, max_blocks, topk,
+    /// act, K, ff, fmt, gcap, ucap, stream)`; act as slot 984's.
+    pub inkling2_moe_gu_grp: Option<Inkling2MoeGuGrpFn>,
+    /// Slot 988: the experts' down at prompt widths into per-pair partials
+    /// `part[token * topk + slot]` (moe_slot_combine folds them): `(w,
+    /// wscale, wfac, aq, as, ao, sorted_row, sorted_slot, block_expert,
+    /// max_blocks, topk, part, ff, hidden, fmt, stream)`.
+    pub inkling2_moe_dn_grp: Option<Inkling2MoeDnGrpFn>,
+    /// Slot 989: Inkling 2's serving K / V store - `rows` prepped rows at
+    /// their (slot, pos) in a visit's paged pool (`bt` the block tables,
+    /// 16-row blocks) or rings (`bt` null, `ring` rows a slot): `(src,
+    /// stride, slots, pos, base, bt, bps, ring, dtype, kv_dim, rows,
+    /// stream)`; dtype 0 f16, 1 fp8 e4m3, 2 f32.
+    pub inkling2_kv_store: Option<Inkling2KvStoreFn>,
+    /// Slot 990: the relative-bias attention over those stores, a row at its
+    /// own (slot, pos), keys split `splits` ways and folded with the sink
+    /// (the combine runs inside when splits > 1): `(q, qs, rel, rs, sink, ss,
+    /// kbase, vbase, bt, bps, ring, dtype, slots, pos, proj, out, part_o,
+    /// part_ml, rows, heads, kv_heads, window, extent, splits, scale,
+    /// stream)`.
+    pub inkling2_attn_kv: Option<Inkling2AttnKvFn>,
+    /// Slot 991: slot 987 (gate|up of a sorted wave) on the block-scale
+    /// tensor cores - the codes and their block scales straight into the
+    /// MMA (NVFP4: e2m1 + e4m3 a 16, the outer scale and expert factor in
+    /// the epilogue; MXFP8: e4m3 + ue8m0 a 32): `(w, wsc, wfac, xq, xsc, xo,
+    /// sorted_row, sorted_slot, block_expert, max_blocks, topk, act, K, ff,
+    /// fmt, gcap, ucap, stream)`. Not supported where the die has no
+    /// block-scale MMA.
+    pub inkling2_moe_gu_tc: Option<Inkling2MoeGuTcFn>,
+    /// Slot 992: slot 988 (down into per-pair partials) likewise: `(w, wsc,
+    /// wfac, aq, asc, ao, sorted_row, sorted_slot, block_expert, max_blocks,
+    /// topk, part, ff, hidden, fmt, stream)`.
+    pub inkling2_moe_dn_tc: Option<Inkling2MoeDnTcFn>,
+    /// Slot 993: slot 990's attention for runs of consecutive positions
+    /// (prompt rows) on the tensor cores, f16 / fp8 stores: `(q, qs, rel,
+    /// rs, sink, ss, kbase, vbase, bt, bps, ring, dtype, tiles, n_tiles,
+    /// projT, out, heads, kv_heads, window, extent, scale, stream)` - `tiles`
+    /// [n][4] of (first row, rows <= 32, slot, first position), `projT` the
+    /// relative-bias bank transposed to [extent][16] bf16; up to 3 query
+    /// heads a K / V head.
+    pub inkling2_attn_tile: Option<Inkling2AttnTileFn>,
+    /// Slot 994: the DSpark draft's tap mix, `out[r] = bf16(rmsnorm(sum_t
+    /// alpha[t] feat[r][t]) * weight)`: `(feat, fstride, taps, alpha,
+    /// weight, out, rows, width, eps, stream)`.
+    pub inkling2_mix_norm: Option<Inkling2MixNormFn>,
+    /// Slot 995: per (row, 128-wide head) in place, an optional RMSNorm x
+    /// bf16 weight (rounded to bf16), then neox RoPE at the row's position:
+    /// `(x, xs, col0, rows, heads, weight, pos, inv_freq, eps, stream)`.
+    pub inkling2_qk_rope: Option<Inkling2QkRopeFn>,
+    /// Slot 996: the draft block's attention (8 query rows a block, each
+    /// seeing its slot's keys up to the block's end, a window optional) over
+    /// a slot-989 store: `(q, qs, blk, n_blocks, kbase, vbase, bt, bps, ring,
+    /// dtype, out, os, part_o, part_ml, heads, kv_heads, window, splits,
+    /// scale, stream)`; `blk` [n][2] = (slot, first position).
+    pub inkling2_draft_attn: Option<Inkling2DraftAttnFn>,
+    /// Slot 997: the draft's recurrent gate over its f32 projection (the
+    /// step's input term + its context term), the state in place at row
+    /// stride `ss`: `(raw, ctx, state, ss, latent, rows, rank, stream)`.
+    pub inkling2_markov_gate: Option<Inkling2MarkovGateFn>,
+    /// Slot 998: a draft step's pick, the first index of the largest
+    /// `bf16(cap tanh(bf16(bf16(base) + bf16(gemm + fold_bias)) / cap))` a
+    /// row: `(base, gemm, fold_bias, best, ids, rows, vocab, stride, cap,
+    /// stream)`; `best` [rows] u64 scratch.
+    pub inkling2_markov_argmax: Option<Inkling2MarkovArgmaxFn>,
+    /// Slot 999: strided f32 rows into f32 or (rounded) bf16 rows, a zero
+    /// source stride broadcasting one row: `(src, src_off, ss, dst, dst_off,
+    /// ds, width, rows, bf16, stream)`, offsets and strides in elements.
+    pub inkling2_copy2d: Option<Inkling2Copy2dFn>,
+    /// Slot 1000: before a verify pass's short conv, each run's 3 carried
+    /// rows and its (<= 8) input rows into `stash` [slot][11][C]: `(x, xs,
+    /// C, state, run_off, run_slot, n_runs, stash, stream)`.
+    pub inkling2_conv_stash: Option<Inkling2ConvStashFn>,
+    /// Slot 1001: a slot's carried rows after `keep` accepted rows of its
+    /// stashed run (`items` [n][2] = (slot, keep)): `(stash, state, C,
+    /// items, n_items, stream)`.
+    pub inkling2_conv_restore: Option<Inkling2ConvRestoreFn>,
+    /// Slot 1002: slot 991's NVFP4 class on 64-pair blocks (`moe_align_bm`
+    /// with bm 64) through a 3-deep ring: same arguments less `fmt`; K a
+    /// multiple of 128.
+    pub inkling2_moe_gu_ms: Option<Inkling2MoeGuMsFn>,
+    /// Slot 1003: slot 992's NVFP4 class on 64-pair blocks, a block's pairs
+    /// resident for the whole K: same arguments less `fmt`; ff a multiple of
+    /// 128 and at most 1664.
+    pub inkling2_moe_dn_ms: Option<Inkling2MoeDnMsFn>,
+    /// Slot 1004: slot 981's static-tap conv over the sum of `k` (1 or 8)
+    /// partial rows (folded from 0 in slot order, slot_combine's fold), onto
+    /// a residual: `out[t] = res[t] + conv(x)[t]` (`res` null: the conv
+    /// alone): `(in, k, res, out, C, w, state, run_off, run_slot, n_runs,
+    /// max_run, stream)`, planes C wide; `res` may be `out`.
+    pub inkling2_sconv_sum: Option<Inkling2SconvSumFn>,
+    /// Slot 1005: slot 993 with the attention's output gate folded in, out =
+    /// attention x sigmoid(gate): slot 993's arguments, then `(gate,
+    /// gstride, out_bf16)` before the stream (`out_bf16`: the rows land as
+    /// bf16, the next GEMM's narrowing).
+    pub inkling2_attn_tile_g: Option<Inkling2AttnTileGFn>,
+    /// Slot 1006: slot 1002 with `act` as bf16(act x gamma[pair]), gamma the
+    /// router weights [pairs] (what slot 983 forms from an f32 act; read it
+    /// back with `bf16_in` 2): slot 1002's arguments with `gamma` after
+    /// `act`.
+    pub inkling2_moe_gu_ms16: Option<Inkling2MoeGuMs16Fn>,
+    /// Slot 1007: `rmsnorm_batch` with its rows rounded to bf16 on the way
+    /// out (the same width election and accumulator: convert_f32_bf16 of its
+    /// output to the bit): `(x, w, out16, n, eps, batch, stream)`.
+    pub rmsnorm_batch_bf16: Option<RmsnormBatchBf16Fn>,
+    /// Slot 1008: a loop controller's slot 978 (cat) and its down
+    /// projection in one pass, `z [rows][rank] = D [bf16(h ia) | bf16(m
+    /// ib)]` (D [rank][2 width] bf16; ia / ib slot 978's): `(h, m, dw, z,
+    /// rows, width, rank, eps, stream)`; width % 32 == 0, rank <= 64 and %
+    /// 8 == 0.
+    pub inkling2_msg_down: Option<Inkling2MsgDownFn>,
+    /// Slot 1009: slot 993 split over keys, `(q, qs, rel, rs, sink, ss,
+    /// kbase, vbase, bt, bps, ring, dtype, tiles, n_tiles, projT, out,
+    /// part_o, part_ml, rows, heads, kv_heads, window, extent, scale,
+    /// splits, stream)`: each (tile, K / V head, split) into slot 990's
+    /// partials, folded with the sinks by its combine over rows [0, rows) -
+    /// the tiles cover them all, splits <= 64 (rows x splits within the
+    /// partials); ungated f32 out.
+    pub inkling2_attn_tile_split: Option<Inkling2AttnTileSplitFn>,
+    /// Slot 1010: slot 996 (the draft block's attention) on the tensor
+    /// cores - slot 996's arguments; the bf16 draft stores and three query
+    /// heads a K / V head, else NotSupported.
+    pub inkling2_draft_attn_tc: Option<Inkling2DraftAttnFn>,
+    /// Slot 1011: Inkling 2's picture processor, `(rgb, w, h, trows, cols,
+    /// out, stream)`: the w x h 8-bit RGB picture padded to the 40-pixel cell
+    /// grid (trows x cols cells) with -1, rescaled + normalized (mean = std =
+    /// 0.5), cut into 4 trows cols native 20 x 20 patches in token-major
+    /// order, one (py, px, c) row of 1200 halves each.
+    pub inkling2_vis_patches: Option<Inkling2VisPatchesFn>,
+    /// Slot 1012: Inkling 2's tower embedding in place, `(x, grid, cls, ln_w,
+    /// ln_b, trows, cols, side, eps, stream)`: patch row r (holding its patch
+    /// GEMM row) + the side x side position field resampled (bilinear,
+    /// align_corners False) onto the 2 trows x 2 cols native grid; row
+    /// 4 trows cols = cls; then ln_pre, over x [4T + 1][1024] f32.
+    pub inkling2_vis_embed: Option<Inkling2VisEmbedFn>,
+    /// Slot 1013: Inkling 2's q | k | v split, `(qkv, bq, bk, bv, q, k, v,
+    /// trows, cols, hd, theta, qscale, stream)`: the f16 [4T + 1][3072]
+    /// landing plus every bias into half [row][heads][hd] planes, q and k on
+    /// the axial interleaved rope (x for the first hd / 4 pairs, y above,
+    /// patches at (y + 1, x + 1), the class row at 0), q times qscale.
+    pub inkling2_vis_qkv_rope: Option<Inkling2VisQkvRopeFn>,
+    /// Slot 1014: a short conv's carried state at a cut inside a run, `(x,
+    /// k, xstride, C, state, items, n_items, out, dst, stream)`: item i =
+    /// {r0, kk, slot, off} u32 writes out[off + dst + j C + c], j < 3, = the
+    /// conv input at run row kk - 3 + j (k = 1 reads x[t xstride + c]; k = 8
+    /// folds 8 partial rows from 0.0 as slot 1004 does, xstride = C) or the
+    /// run's old state row (state + slot 3 C) before the run. Launched before
+    /// the conv overwrites the state.
+    pub inkling2_conv_capture: Option<Inkling2ConvCaptureFn>,
 }
+
+/// See [`KernelTableV1::inkling2_conv_capture`] (slot 1014).
+pub type Inkling2ConvCaptureFn = unsafe extern "C" fn(
+    x: *const core::ffi::c_void,
+    k: u32,
+    xstride: u32,
+    c: u32,
+    state: *const core::ffi::c_void,
+    items: *const core::ffi::c_void,
+    n_items: u32,
+    out: *mut core::ffi::c_void,
+    dst: u32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::inkling2_vis_patches`] (slot 1011).
+pub type Inkling2VisPatchesFn = unsafe extern "C" fn(
+    rgb: *const core::ffi::c_void,
+    w: u32,
+    h: u32,
+    trows: u32,
+    cols: u32,
+    out: *mut core::ffi::c_void,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::inkling2_vis_embed`] (slot 1012).
+pub type Inkling2VisEmbedFn = unsafe extern "C" fn(
+    x: *mut core::ffi::c_void,
+    grid: *const core::ffi::c_void,
+    cls: *const core::ffi::c_void,
+    ln_w: *const core::ffi::c_void,
+    ln_b: *const core::ffi::c_void,
+    trows: u32,
+    cols: u32,
+    side: u32,
+    eps: f32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::inkling2_vis_qkv_rope`] (slot 1013).
+pub type Inkling2VisQkvRopeFn = unsafe extern "C" fn(
+    qkv: *const core::ffi::c_void,
+    bq: *const core::ffi::c_void,
+    bk: *const core::ffi::c_void,
+    bv: *const core::ffi::c_void,
+    q: *mut core::ffi::c_void,
+    k: *mut core::ffi::c_void,
+    v: *mut core::ffi::c_void,
+    trows: u32,
+    cols: u32,
+    hd: u32,
+    theta: f32,
+    qscale: f32,
+    stream: *mut core::ffi::c_void,
+) -> i32;
+
+/// See [`KernelTableV1::inkling2_moe_gu_tc`] (slot 991).
+pub type Inkling2MoeGuTcFn = unsafe extern "C" fn(
+    w: *const core::ffi::c_void,
+    wsc: *const core::ffi::c_void,
+    wfac: *const core::ffi::c_void,
+    xq: *const core::ffi::c_void,
+    xsc: *const core::ffi::c_void,
+    xo: *const core::ffi::c_void,
+    sorted_row: *const core::ffi::c_void,
+    sorted_slot: *const core::ffi::c_void,
+    block_expert: *const core::ffi::c_void,
+    max_blocks: u32,
+    topk: u32,
+    act: *mut core::ffi::c_void,
+    k: u32,
+    ff: u32,
+    fmt: u32,
+    gcap: f32,
+    ucap: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_moe_dn_tc`] (slot 992).
+pub type Inkling2MoeDnTcFn = unsafe extern "C" fn(
+    w: *const core::ffi::c_void,
+    wsc: *const core::ffi::c_void,
+    wfac: *const core::ffi::c_void,
+    aq: *const core::ffi::c_void,
+    asc: *const core::ffi::c_void,
+    ao: *const core::ffi::c_void,
+    sorted_row: *const core::ffi::c_void,
+    sorted_slot: *const core::ffi::c_void,
+    block_expert: *const core::ffi::c_void,
+    max_blocks: u32,
+    topk: u32,
+    part: *mut core::ffi::c_void,
+    ff: u32,
+    hidden: u32,
+    fmt: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_moe_gu_ms`] (slot 1002).
+pub type Inkling2MoeGuMsFn = unsafe extern "C" fn(
+    w: *const core::ffi::c_void,
+    wsc: *const core::ffi::c_void,
+    wfac: *const core::ffi::c_void,
+    xq: *const core::ffi::c_void,
+    xsc: *const core::ffi::c_void,
+    xo: *const core::ffi::c_void,
+    sorted_row: *const core::ffi::c_void,
+    sorted_slot: *const core::ffi::c_void,
+    block_expert: *const core::ffi::c_void,
+    max_blocks: u32,
+    topk: u32,
+    act: *mut core::ffi::c_void,
+    k: u32,
+    ff: u32,
+    gcap: f32,
+    ucap: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_moe_dn_ms`] (slot 1003).
+pub type Inkling2MoeDnMsFn = unsafe extern "C" fn(
+    w: *const core::ffi::c_void,
+    wsc: *const core::ffi::c_void,
+    wfac: *const core::ffi::c_void,
+    aq: *const core::ffi::c_void,
+    asc: *const core::ffi::c_void,
+    ao: *const core::ffi::c_void,
+    sorted_row: *const core::ffi::c_void,
+    sorted_slot: *const core::ffi::c_void,
+    block_expert: *const core::ffi::c_void,
+    max_blocks: u32,
+    topk: u32,
+    part: *mut core::ffi::c_void,
+    ff: u32,
+    hidden: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_sconv_sum`] (slot 1004).
+pub type Inkling2SconvSumFn = unsafe extern "C" fn(
+    input: *const core::ffi::c_void,
+    k: u32,
+    res: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    c: u32,
+    w: *const core::ffi::c_void,
+    state: *mut core::ffi::c_void,
+    run_off: *const core::ffi::c_void,
+    run_slot: *const core::ffi::c_void,
+    n_runs: u32,
+    max_run: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_moe_gu_ms16`] (slot 1006).
+pub type Inkling2MoeGuMs16Fn = unsafe extern "C" fn(
+    w: *const core::ffi::c_void,
+    wsc: *const core::ffi::c_void,
+    wfac: *const core::ffi::c_void,
+    xq: *const core::ffi::c_void,
+    xsc: *const core::ffi::c_void,
+    xo: *const core::ffi::c_void,
+    sorted_row: *const core::ffi::c_void,
+    sorted_slot: *const core::ffi::c_void,
+    block_expert: *const core::ffi::c_void,
+    max_blocks: u32,
+    topk: u32,
+    act16: *mut core::ffi::c_void,
+    gamma: *const core::ffi::c_void,
+    k: u32,
+    ff: u32,
+    gcap: f32,
+    ucap: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_attn_tile_split`] (slot 1009).
+pub type Inkling2AttnTileSplitFn = unsafe extern "C" fn(
+    q: *const core::ffi::c_void,
+    qs: u32,
+    rel: *const core::ffi::c_void,
+    rs: u32,
+    sink: *const core::ffi::c_void,
+    ss: u32,
+    kbase: *mut core::ffi::c_void,
+    vbase: *mut core::ffi::c_void,
+    bt: *const core::ffi::c_void,
+    bps: u32,
+    ring: u32,
+    dtype: u32,
+    tiles: *const core::ffi::c_void,
+    n_tiles: u32,
+    proj_t: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    part_o: *mut core::ffi::c_void,
+    part_ml: *mut core::ffi::c_void,
+    rows: u32,
+    heads: u32,
+    kv_heads: u32,
+    window: u32,
+    extent: u32,
+    scale: f32,
+    splits: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_msg_down`] (slot 1008).
+pub type Inkling2MsgDownFn = unsafe extern "C" fn(
+    h: *const core::ffi::c_void,
+    m: *const core::ffi::c_void,
+    dw: *const core::ffi::c_void,
+    z: *mut core::ffi::c_void,
+    rows: u32,
+    width: u32,
+    rank: u32,
+    eps: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::rmsnorm_batch_bf16`] (slot 1007).
+pub type RmsnormBatchBf16Fn = unsafe extern "C" fn(
+    x: *const core::ffi::c_void,
+    w: *const core::ffi::c_void,
+    out16: *mut core::ffi::c_void,
+    n: u32,
+    eps: f32,
+    batch: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_attn_tile_g`] (slot 1005).
+pub type Inkling2AttnTileGFn = unsafe extern "C" fn(
+    q: *const core::ffi::c_void,
+    qs: u32,
+    rel: *const core::ffi::c_void,
+    rs: u32,
+    sink: *const core::ffi::c_void,
+    ss: u32,
+    kbase: *mut core::ffi::c_void,
+    vbase: *mut core::ffi::c_void,
+    bt: *const core::ffi::c_void,
+    bps: u32,
+    ring: u32,
+    dtype: u32,
+    tiles: *const core::ffi::c_void,
+    n_tiles: u32,
+    proj_t: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    heads: u32,
+    kv_heads: u32,
+    window: u32,
+    extent: u32,
+    scale: f32,
+    gate: *const core::ffi::c_void,
+    gstride: u32,
+    out_bf16: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_conv_stash`] (slot 1000).
+pub type Inkling2ConvStashFn = unsafe extern "C" fn(
+    x: *const core::ffi::c_void,
+    xs: u32,
+    c: u32,
+    state: *const core::ffi::c_void,
+    run_off: *const core::ffi::c_void,
+    run_slot: *const core::ffi::c_void,
+    n_runs: u32,
+    stash: *mut core::ffi::c_void,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_conv_restore`] (slot 1001).
+pub type Inkling2ConvRestoreFn = unsafe extern "C" fn(
+    stash: *const core::ffi::c_void,
+    state: *mut core::ffi::c_void,
+    c: u32,
+    items: *const core::ffi::c_void,
+    n_items: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_copy2d`] (slot 999).
+pub type Inkling2Copy2dFn = unsafe extern "C" fn(
+    src: *const core::ffi::c_void,
+    src_off: u64,
+    ss: u32,
+    dst: *mut core::ffi::c_void,
+    dst_off: u64,
+    ds: u32,
+    width: u32,
+    rows: u32,
+    bf16: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_mix_norm`] (slot 994).
+pub type Inkling2MixNormFn = unsafe extern "C" fn(
+    feat: *const core::ffi::c_void,
+    fstride: u32,
+    taps: u32,
+    alpha: *const core::ffi::c_void,
+    weight: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    rows: u32,
+    width: u32,
+    eps: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_qk_rope`] (slot 995).
+pub type Inkling2QkRopeFn = unsafe extern "C" fn(
+    x: *mut core::ffi::c_void,
+    xs: u32,
+    col0: u32,
+    rows: u32,
+    heads: u32,
+    weight: *const core::ffi::c_void,
+    pos: *const core::ffi::c_void,
+    inv_freq: *const core::ffi::c_void,
+    eps: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_draft_attn`] (slot 996).
+pub type Inkling2DraftAttnFn = unsafe extern "C" fn(
+    q: *const core::ffi::c_void,
+    qs: u32,
+    blk: *const core::ffi::c_void,
+    n_blocks: u32,
+    kbase: *mut core::ffi::c_void,
+    vbase: *mut core::ffi::c_void,
+    bt: *const core::ffi::c_void,
+    bps: u32,
+    ring: u32,
+    dtype: u32,
+    out: *mut core::ffi::c_void,
+    os: u32,
+    part_o: *mut core::ffi::c_void,
+    part_ml: *mut core::ffi::c_void,
+    heads: u32,
+    kv_heads: u32,
+    window: u32,
+    splits: u32,
+    scale: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_markov_gate`] (slot 997).
+pub type Inkling2MarkovGateFn = unsafe extern "C" fn(
+    raw: *const core::ffi::c_void,
+    ctx: *const core::ffi::c_void,
+    state: *mut core::ffi::c_void,
+    ss: u32,
+    latent: *mut core::ffi::c_void,
+    rows: u32,
+    rank: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_markov_argmax`] (slot 998).
+pub type Inkling2MarkovArgmaxFn = unsafe extern "C" fn(
+    base: *const core::ffi::c_void,
+    gemm: *const core::ffi::c_void,
+    fold_bias: *const core::ffi::c_void,
+    best: *mut core::ffi::c_void,
+    ids: *mut core::ffi::c_void,
+    rows: u32,
+    vocab: u32,
+    stride: u32,
+    cap: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_attn_tile`] (slot 993).
+pub type Inkling2AttnTileFn = unsafe extern "C" fn(
+    q: *const core::ffi::c_void,
+    qs: u32,
+    rel: *const core::ffi::c_void,
+    rs: u32,
+    sink: *const core::ffi::c_void,
+    ss: u32,
+    kbase: *mut core::ffi::c_void,
+    vbase: *mut core::ffi::c_void,
+    bt: *const core::ffi::c_void,
+    bps: u32,
+    ring: u32,
+    dtype: u32,
+    tiles: *const core::ffi::c_void,
+    n_tiles: u32,
+    proj_t: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    heads: u32,
+    kv_heads: u32,
+    window: u32,
+    extent: u32,
+    scale: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_kv_store`] (slot 989).
+pub type Inkling2KvStoreFn = unsafe extern "C" fn(
+    src: *const core::ffi::c_void,
+    stride: u32,
+    slots: *const core::ffi::c_void,
+    pos: *const core::ffi::c_void,
+    base: *mut core::ffi::c_void,
+    bt: *const core::ffi::c_void,
+    bps: u32,
+    ring: u32,
+    dtype: u32,
+    kv_dim: u32,
+    rows: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_attn_kv`] (slot 990).
+pub type Inkling2AttnKvFn = unsafe extern "C" fn(
+    q: *const core::ffi::c_void,
+    qs: u32,
+    rel: *const core::ffi::c_void,
+    rs: u32,
+    sink: *const core::ffi::c_void,
+    ss: u32,
+    kbase: *mut core::ffi::c_void,
+    vbase: *mut core::ffi::c_void,
+    bt: *const core::ffi::c_void,
+    bps: u32,
+    ring: u32,
+    dtype: u32,
+    slots: *const core::ffi::c_void,
+    pos: *const core::ffi::c_void,
+    proj: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    part_o: *mut core::ffi::c_void,
+    part_ml: *mut core::ffi::c_void,
+    rows: u32,
+    heads: u32,
+    kv_heads: u32,
+    window: u32,
+    extent: u32,
+    splits: u32,
+    scale: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_moe_gu_grp`] (slot 987).
+pub type Inkling2MoeGuGrpFn = unsafe extern "C" fn(
+    w: *const core::ffi::c_void,
+    wscale: *const core::ffi::c_void,
+    wfac: *const core::ffi::c_void,
+    xq: *const core::ffi::c_void,
+    xs: *const core::ffi::c_void,
+    xo: *const core::ffi::c_void,
+    sorted_row: *const core::ffi::c_void,
+    sorted_slot: *const core::ffi::c_void,
+    block_expert: *const core::ffi::c_void,
+    max_blocks: u32,
+    topk: u32,
+    act: *mut core::ffi::c_void,
+    k: u32,
+    ff: u32,
+    fmt: u32,
+    gcap: f32,
+    ucap: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_moe_dn_grp`] (slot 988).
+pub type Inkling2MoeDnGrpFn = unsafe extern "C" fn(
+    w: *const core::ffi::c_void,
+    wscale: *const core::ffi::c_void,
+    wfac: *const core::ffi::c_void,
+    aq: *const core::ffi::c_void,
+    as_: *const core::ffi::c_void,
+    ao: *const core::ffi::c_void,
+    sorted_row: *const core::ffi::c_void,
+    sorted_slot: *const core::ffi::c_void,
+    block_expert: *const core::ffi::c_void,
+    max_blocks: u32,
+    topk: u32,
+    part: *mut core::ffi::c_void,
+    ff: u32,
+    hidden: u32,
+    fmt: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_attn_res`] (slot 977).
+pub type Inkling2AttnResFn = unsafe extern "C" fn(
+    states: *const *const core::ffi::c_void,
+    ns: u32,
+    partial: *const core::ffi::c_void,
+    query: *const core::ffi::c_void,
+    nq: u32,
+    out: *mut core::ffi::c_void,
+    rows: u32,
+    width: u32,
+    qstride: u32,
+    eps: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_msg_cat`] (slot 978).
+pub type Inkling2MsgCatFn = unsafe extern "C" fn(
+    h: *const core::ffi::c_void,
+    m: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    rows: u32,
+    width: u32,
+    eps: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_msg_mix`] (slot 979).
+pub type Inkling2MsgMixFn = unsafe extern "C" fn(
+    z: *const core::ffi::c_void,
+    fw: *const core::ffi::c_void,
+    gw: *const core::ffi::c_void,
+    h: *const core::ffi::c_void,
+    m: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    rows: u32,
+    width: u32,
+    rank: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_head_prep`] (slot 980).
+pub type Inkling2HeadPrepFn = unsafe extern "C" fn(
+    x: *mut core::ffi::c_void,
+    rows: u32,
+    heads: u32,
+    d: u32,
+    stride: u32,
+    scale: *const core::ffi::c_void,
+    clip: f32,
+    rms: u32,
+    eps: f32,
+    pos: *const core::ffi::c_void,
+    alpha: f32,
+    floor: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_sconv`] (slot 981).
+pub type Inkling2SconvFn = unsafe extern "C" fn(
+    x: *const core::ffi::c_void,
+    xstride: u32,
+    out: *mut core::ffi::c_void,
+    ostride: u32,
+    c: u32,
+    w: *const core::ffi::c_void,
+    dyn_taps: *const core::ffi::c_void,
+    dstride: u32,
+    heads: u32,
+    state: *mut core::ffi::c_void,
+    run_off: *const core::ffi::c_void,
+    run_slot: *const core::ffi::c_void,
+    n_runs: u32,
+    max_run: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_swiglu_cap`] (slot 982).
+pub type Inkling2SwigluCapFn = unsafe extern "C" fn(
+    g: *const core::ffi::c_void,
+    u: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    n: u32,
+    gc: f32,
+    uc: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_quant`] (slot 983).
+pub type Inkling2QuantFn = unsafe extern "C" fn(
+    x: *const core::ffi::c_void,
+    xstride: u32,
+    gamma: *const core::ffi::c_void,
+    bf16_in: u32,
+    fmt: u32,
+    q: *mut core::ffi::c_void,
+    scales: *mut core::ffi::c_void,
+    outer: *mut core::ffi::c_void,
+    rows: u32,
+    k: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_moe_gu`] (slot 984).
+pub type Inkling2MoeGuFn = unsafe extern "C" fn(
+    w: *const core::ffi::c_void,
+    wscale: *const core::ffi::c_void,
+    wfac: *const core::ffi::c_void,
+    xq: *const core::ffi::c_void,
+    xs: *const core::ffi::c_void,
+    xo: *const core::ffi::c_void,
+    idx: *const core::ffi::c_void,
+    topk: u32,
+    act: *mut core::ffi::c_void,
+    rows: u32,
+    k: u32,
+    ff: u32,
+    fmt: u32,
+    gcap: f32,
+    ucap: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_moe_dn`] (slot 985).
+pub type Inkling2MoeDnFn = unsafe extern "C" fn(
+    w: *const core::ffi::c_void,
+    wscale: *const core::ffi::c_void,
+    wfac: *const core::ffi::c_void,
+    aq: *const core::ffi::c_void,
+    as_: *const core::ffi::c_void,
+    ao: *const core::ffi::c_void,
+    idx: *const core::ffi::c_void,
+    topk: u32,
+    out: *mut core::ffi::c_void,
+    rows: u32,
+    ff: u32,
+    hidden: u32,
+    fmt: u32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
+
+/// See [`KernelTableV1::inkling2_attn`] (slot 986).
+pub type Inkling2AttnFn = unsafe extern "C" fn(
+    q: *const core::ffi::c_void,
+    qs: u32,
+    rel: *const core::ffi::c_void,
+    rs: u32,
+    sink: *const core::ffi::c_void,
+    ss: u32,
+    k: *const core::ffi::c_void,
+    v: *const core::ffi::c_void,
+    proj: *const core::ffi::c_void,
+    out: *mut core::ffi::c_void,
+    rows: u32,
+    p0: u32,
+    heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    d_rel: u32,
+    window: u32,
+    extent: u32,
+    scale: f32,
+    stream: *mut core::ffi::c_void,
+) -> KernelStatus;
 
 /// See [`KernelTableV1::attn_prefill_tree`] (slot 975).
 pub type AttnPrefillTreeFn = unsafe extern "C" fn(
@@ -12979,7 +13827,7 @@ pub type AddRmsnormQ8XnFn = unsafe extern "C" fn(
 /// the copy to the smaller of declared and expected, so an old pack against a
 /// new engine (or the reverse) reads missing entries as None rather than a
 /// shifted slot.
-pub const KERNEL_TABLE_SLOTS: usize = 962;
+pub const KERNEL_TABLE_SLOTS: usize = 1000;
 
 const _: () = assert!(
     core::mem::size_of::<KernelTableV1>() == 8 + KERNEL_TABLE_SLOTS * 8,

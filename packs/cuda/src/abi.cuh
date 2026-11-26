@@ -4539,6 +4539,125 @@ struct KernelTableV1 {
     // in one launch (attn/prefill_tree.cuh)
     int (*kv_tree_move)(const void*, const void*, const void*, uint32_t, const void*, uint32_t,
                         const void*, uint32_t, const void*, uint32_t, uint32_t, uint32_t, void*);
+    // 977-982: Inkling 2 Mini glue (inkling2.cuh)
+    int (*inkling2_attn_res)(const void* const*, uint32_t, const void*, const void*, uint32_t,
+                             void*, uint32_t, uint32_t, uint32_t, float, void*);
+    int (*inkling2_msg_cat)(const void*, const void*, void*, uint32_t, uint32_t, float, void*);
+    int (*inkling2_msg_mix)(const void*, const void*, const void*, const void*, const void*, void*,
+                            uint32_t, uint32_t, uint32_t, void*);
+    int (*inkling2_head_prep)(void*, uint32_t, uint32_t, uint32_t, uint32_t, const void*, float,
+                              uint32_t, float, const void*, float, float, void*);
+    int (*inkling2_sconv)(const void*, uint32_t, void*, uint32_t, uint32_t, const void*,
+                          const void*, uint32_t, uint32_t, void*, const void*, const void*,
+                          uint32_t, uint32_t, void*);
+    int (*inkling2_swiglu_cap)(const void*, const void*, void*, uint32_t, float, float, void*);
+    // 983-985: Inkling 2 Mini experts at decode widths (moe/inkling2_experts.cuh)
+    int (*inkling2_quant)(const void*, uint32_t, const void*, uint32_t, uint32_t, void*, void*,
+                          void*, uint32_t, uint32_t, void*);
+    int (*inkling2_moe_gu)(const void*, const void*, const void*, const void*, const void*,
+                           const void*, const void*, uint32_t, void*, uint32_t, uint32_t,
+                           uint32_t, uint32_t, float, float, void*);
+    int (*inkling2_moe_dn)(const void*, const void*, const void*, const void*, const void*,
+                           const void*, const void*, uint32_t, void*, uint32_t, uint32_t,
+                           uint32_t, uint32_t, void*);
+    // 986: Inkling 2 Mini relative-bias attention (attn/inkling2_attn.cuh)
+    int (*inkling2_attn)(const void*, uint32_t, const void*, uint32_t, const void*, uint32_t,
+                         const void*, const void*, const void*, void*, uint32_t, uint32_t,
+                         uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float, void*);
+    // 987-988: Inkling 2 Mini experts at prompt widths, over moe_align's blocks
+    int (*inkling2_moe_gu_grp)(const void*, const void*, const void*, const void*, const void*,
+                               const void*, const void*, const void*, const void*, uint32_t,
+                               uint32_t, void*, uint32_t, uint32_t, uint32_t, float, float, void*);
+    int (*inkling2_moe_dn_grp)(const void*, const void*, const void*, const void*, const void*,
+                               const void*, const void*, const void*, const void*, uint32_t,
+                               uint32_t, void*, uint32_t, uint32_t, uint32_t, void*);
+    // 989-990: Inkling 2 Mini's serving K / V store and split attention (attn/inkling2_attn.cuh)
+    int (*inkling2_kv_store)(const void*, uint32_t, const void*, const void*, void*, const void*,
+                             uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, void*);
+    int (*inkling2_attn_kv)(const void*, uint32_t, const void*, uint32_t, const void*, uint32_t,
+                            void*, void*, const void*, uint32_t, uint32_t, uint32_t, const void*,
+                            const void*, const void*, void*, void*, void*, uint32_t, uint32_t,
+                            uint32_t, uint32_t, uint32_t, uint32_t, float, void*);
+    // 991-992: Inkling 2 Mini's experts at prompt widths on the block-scale tensor cores
+    // (moe/inkling2_experts_tc.cuh)
+    int (*inkling2_moe_gu_tc)(const void*, const void*, const void*, const void*, const void*,
+                              const void*, const void*, const void*, const void*, uint32_t,
+                              uint32_t, void*, uint32_t, uint32_t, uint32_t, float, float, void*);
+    int (*inkling2_moe_dn_tc)(const void*, const void*, const void*, const void*, const void*,
+                              const void*, const void*, const void*, const void*, uint32_t,
+                              uint32_t, void*, uint32_t, uint32_t, uint32_t, void*);
+    // 993: Inkling 2 Mini's prompt-row attention on the tensor cores (attn/inkling2_attn.cuh)
+    int (*inkling2_attn_tile)(const void*, uint32_t, const void*, uint32_t, const void*, uint32_t,
+                              void*, void*, const void*, uint32_t, uint32_t, uint32_t, const void*,
+                              uint32_t, const void*, void*, uint32_t, uint32_t, uint32_t, uint32_t,
+                              float, void*);
+    // 994-999: Inkling 2 Mini's DSpark draft (inkling2_draft.cuh)
+    int (*inkling2_mix_norm)(const void*, uint32_t, uint32_t, const void*, const void*, void*,
+                             uint32_t, uint32_t, float, void*);
+    int (*inkling2_qk_rope)(void*, uint32_t, uint32_t, uint32_t, uint32_t, const void*,
+                            const void*, const void*, float, void*);
+    int (*inkling2_draft_attn)(const void*, uint32_t, const void*, uint32_t, void*, void*,
+                               const void*, uint32_t, uint32_t, uint32_t, void*, uint32_t, void*,
+                               void*, uint32_t, uint32_t, uint32_t, uint32_t, float, void*);
+    int (*inkling2_markov_gate)(const void*, const void*, void*, uint32_t, void*, uint32_t,
+                                uint32_t, void*);
+    int (*inkling2_markov_argmax)(const void*, const void*, const void*, void*, void*, uint32_t,
+                                  uint32_t, uint32_t, float, void*);
+    int (*inkling2_copy2d)(const void*, uint64_t, uint32_t, void*, uint64_t, uint32_t, uint32_t,
+                           uint32_t, uint32_t, void*);
+    // 1000-1001: the short convs' rollback across speculative rounds (inkling2_draft.cuh)
+    int (*inkling2_conv_stash)(const void*, uint32_t, uint32_t, const void*, const void*,
+                               const void*, uint32_t, void*, void*);
+    int (*inkling2_conv_restore)(const void*, void*, uint32_t, const void*, uint32_t, void*);
+    // 1002-1003: Inkling 2 Mini's NVFP4 experts at prompt widths on 64-pair
+    // blocks (moe/inkling2_experts_tc.cuh)
+    int (*inkling2_moe_gu_ms)(const void*, const void*, const void*, const void*, const void*,
+                              const void*, const void*, const void*, const void*, uint32_t,
+                              uint32_t, void*, uint32_t, uint32_t, float, float, void*);
+    int (*inkling2_moe_dn_ms)(const void*, const void*, const void*, const void*, const void*,
+                              const void*, const void*, const void*, const void*, uint32_t,
+                              uint32_t, void*, uint32_t, uint32_t, void*);
+    // 1004: the branch tails' fold + conv + residual in one pass (inkling2.cuh)
+    int (*inkling2_sconv_sum)(const void*, uint32_t, const void*, void*, uint32_t, const void*,
+                              void*, const void*, const void*, uint32_t, uint32_t, void*);
+    // 1005: slot 993 with the output gate folded in (attn/inkling2_attn.cuh)
+    int (*inkling2_attn_tile_g)(const void*, uint32_t, const void*, uint32_t, const void*,
+                                uint32_t, void*, void*, const void*, uint32_t, uint32_t, uint32_t,
+                                const void*, uint32_t, const void*, void*, uint32_t, uint32_t,
+                                uint32_t, uint32_t, float, const void*, uint32_t, uint32_t,
+                                void*);
+    // 1006: slot 1002 with bf16 act x the router weight (moe/inkling2_experts_tc.cuh)
+    int (*inkling2_moe_gu_ms16)(const void*, const void*, const void*, const void*, const void*,
+                                const void*, const void*, const void*, const void*, uint32_t,
+                                uint32_t, void*, const void*, uint32_t, uint32_t, float, float,
+                                void*);
+    // 1007: rmsnorm_batch's rows rounded to bf16 on the way out (norm/add_norm16.cuh)
+    int (*rmsnorm_batch_bf16)(const void*, const void*, void*, uint32_t, float, uint32_t, void*);
+    // 1008: a loop controller's cat + down projection in one pass (inkling2.cuh)
+    int (*inkling2_msg_down)(const void*, const void*, const void*, void*, uint32_t, uint32_t,
+                             uint32_t, float, void*);
+    // 1009: slot 993 split over keys, folded by slot 990's combine (attn/inkling2_attn.cuh)
+    int (*inkling2_attn_tile_split)(const void*, uint32_t, const void*, uint32_t, const void*,
+                                    uint32_t, void*, void*, const void*, uint32_t, uint32_t,
+                                    uint32_t, const void*, uint32_t, const void*, void*, void*,
+                                    void*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                                    float, uint32_t, void*);
+    // 1010: slot 996 on the tensor cores (inkling2_draft.cuh)
+    int (*inkling2_draft_attn_tc)(const void*, uint32_t, const void*, uint32_t, void*, void*,
+                                  const void*, uint32_t, uint32_t, uint32_t, void*, uint32_t,
+                                  void*, void*, uint32_t, uint32_t, uint32_t, uint32_t, float,
+                                  void*);
+    // 1011: the picture processor - pad, normalize, native patches (inkling2_vision.cuh)
+    int (*inkling2_vis_patches)(const void*, uint32_t, uint32_t, uint32_t, uint32_t, void*, void*);
+    // 1012: patch rows + the resampled position field, the class row, ln_pre, in place (inkling2_vision.cuh)
+    int (*inkling2_vis_embed)(void*, const void*, const void*, const void*, const void*, uint32_t,
+                              uint32_t, uint32_t, float, void*);
+    // 1013: q | k | v split, biases, axial interleaved rope, q scale (inkling2_vision.cuh)
+    int (*inkling2_vis_qkv_rope)(const void*, const void*, const void*, const void*, void*, void*,
+                                 void*, uint32_t, uint32_t, uint32_t, float, float, void*);
+    // 1014: a short conv's carried state at a cut inside a run (inkling2.cuh)
+    int (*inkling2_conv_capture)(const void*, uint32_t, uint32_t, uint32_t, const void*,
+                                 const void*, uint32_t, void*, uint32_t, void*);
 };
 
 } // extern "C"

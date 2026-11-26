@@ -1,5 +1,6 @@
 // norm/add_norm16.cuh - the residual tails of a prefill layer in one pass, with the bf16 rows
-// the next tensor-core GEMM reads (slot 924). Textually-included segment of the single pack
+// the next tensor-core GEMM reads (slot 924), and the plain batched norm with bf16 rows out
+// (slot 1007). Textually-included segment of the single pack
 // translation unit, after norm/add_rmsnorm.cuh (needs elementwise.cuh's pd_df / pd_acc_of and
 // abi.cuh's width rules).
 //
@@ -178,5 +179,30 @@ int pd_add_norm16(void* x, const void* proj, const void* part, uint32_t k, const
     else if (accm == PD_ACC_F64) PD_AN16_GO(PD_ACC_F64);
     else PD_AN16_GO(PD_ACC_F32);
 #undef PD_AN16_GO
+    return pd_launch_status();
+}
+
+// slot 1007: pd_rmsnorm_batch's rows rounded to bf16 on the way out (the
+// same width election and accumulator, so convert_f32_bf16 of its output to
+// the bit) - for a GEMM that takes bf16 rows, one plane pass fewer.
+PD_EXPORT
+int pd_rmsnorm_batch_bf16(const void* x, const void* w, void* out16, uint32_t n, float eps,
+                          uint32_t batch, void* stream) {
+    if (n == 0 || batch == 0) return 0;
+    const uint32_t nth = batch >= 64u ? pd_norm_wide_nth_ws(batch) : pd_norm_decode_nth();
+    const int accm = pd_norm_acc_mode();
+    if (accm == PD_ACC_DF) {
+        pd_pdl_go(pd_rmsnorm_batch_kernel_t<PD_ACC_DF, __nv_bfloat16>, batch, nth, 0u,
+                  (cudaStream_t)stream, (const float*)x, (const float*)w, (__nv_bfloat16*)out16, n,
+                  eps);
+    } else if (accm == PD_ACC_F64) {
+        pd_pdl_go(pd_rmsnorm_batch_kernel_t<PD_ACC_F64, __nv_bfloat16>, batch, nth, 0u,
+                  (cudaStream_t)stream, (const float*)x, (const float*)w, (__nv_bfloat16*)out16, n,
+                  eps);
+    } else {
+        pd_pdl_go(pd_rmsnorm_batch_kernel_t<PD_ACC_F32, __nv_bfloat16>, batch, nth, 0u,
+                  (cudaStream_t)stream, (const float*)x, (const float*)w, (__nv_bfloat16*)out16, n,
+                  eps);
+    }
     return pd_launch_status();
 }

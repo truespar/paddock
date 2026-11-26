@@ -118,6 +118,10 @@ Every model below runs on the engine today. Sizes are the checkpoint's own, and
 - **Ripple 65B Preview** (Ricursive) - 65B dense, for agentic coding, with its
   own draft model for faster replies; text only. About 65 GB with the draft
   model, on a DGX Spark or a 96 GB RTX PRO Blackwell card; not yet on the B200
+- **Inkling 2 Mini** (Thinking Machines) - 26.4B with 5.4B active, for agents,
+  tools and coding; reads pictures and screenshots, lets you pick how long it
+  thinks, and drafts with its own draft model. On RTX 50-series and RTX PRO
+  Blackwell cards and the DGX Spark; not yet on the B200
 
 **Images**
 

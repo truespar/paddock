@@ -892,14 +892,23 @@ template <int ACC> struct pd_acc_of      { using type = float; };
 template <>        struct pd_acc_of<PD_ACC_F64> { using type = double; };
 template <>        struct pd_acc_of<PD_ACC_DF>  { using type = pd_df; };
 
-template <int ACC>
+// TO = __nv_bfloat16 (slot 1007): the same row, rounded to bf16 on the way
+// out - convert_f32_bf16 of the f32 row, without the f32 row.
+__device__ __forceinline__ void pd_norm_store4(float* o, uint32_t i, float4 r) {
+    reinterpret_cast<float4*>(o)[i] = r;
+}
+__device__ __forceinline__ void pd_norm_store4(__nv_bfloat16* o, uint32_t i, float4 r) {
+    const __nv_bfloat162 h[2] = {__floats2bfloat162_rn(r.x, r.y), __floats2bfloat162_rn(r.z, r.w)};
+    reinterpret_cast<uint2*>(o)[i] = *reinterpret_cast<const uint2*>(h);
+}
+template <int ACC, typename TO = float>
 __global__ void pd_rmsnorm_batch_kernel_t(const float* __restrict__ x, const float* __restrict__ w,
-                                        float* __restrict__ out, uint32_t n, float eps) {
+                                        TO* __restrict__ out, uint32_t n, float eps) {
     using A = typename pd_acc_of<ACC>::type;
     PD_PDL_ARM();  // cascade (granite chain)
     uint32_t b = blockIdx.x;
     const float* xb = x + (size_t)b * n;
-    float* ob = out + (size_t)b * n;
+    TO* ob = out + (size_t)b * n;
     uint32_t tid = threadIdx.x, nth = blockDim.x;
     // width-stable sumsq (f32 products) - see pd_norm_wide_nth_ws.
     __shared__ A wsum[32];
@@ -963,17 +972,16 @@ __global__ void pd_rmsnorm_batch_kernel_t(const float* __restrict__ x, const flo
         uint32_t n4 = n >> 2;
         const float4* x4 = reinterpret_cast<const float4*>(xb);
         const float4* w4 = reinterpret_cast<const float4*>(w);
-        float4* o4 = reinterpret_cast<float4*>(ob);
         for (uint32_t i = tid; i < n4; i += nth) {
             float4 v = x4[i], wv = w4[i], r;
             r.x = v.x * inv * wv.x;
             r.y = v.y * inv * wv.y;
             r.z = v.z * inv * wv.z;
             r.w = v.w * inv * wv.w;
-            o4[i] = r;
+            pd_norm_store4(ob, i, r);
         }
     } else {
-        for (uint32_t i = tid; i < n; i += nth) ob[i] = xb[i] * inv * w[i];
+        for (uint32_t i = tid; i < n; i += nth) ob[i] = (TO)(xb[i] * inv * w[i]);
     }
 }
 

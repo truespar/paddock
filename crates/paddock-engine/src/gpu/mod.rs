@@ -47,11 +47,19 @@ mod fp8_tiled;
 mod fused_gemv;
 mod graph;
 mod hadamard;
+mod inkling2;
+mod inkling2_draft;
+mod inkling2_prefix;
+mod inkling2_vision;
 mod spec_ops;
 mod spec_tree;
 pub use attention::PfQ;
 pub use canvas::CanvasStatus;
 pub use hadamard::HadamardGdnHeads;
+pub use inkling2::{
+    INKLING2_KV_F32, Inkling2Act, Inkling2AttnOut, Inkling2Experts, Inkling2KvLayout,
+    Inkling2Sorted,
+};
 mod host_plane;
 pub use host_plane::{HostMappedKq, HostMirror};
 mod moe_cache;

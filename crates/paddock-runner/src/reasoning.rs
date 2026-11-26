@@ -80,6 +80,15 @@ pub struct ReasoningCaps {
     /// unset render, which would mean the template's default is unreachable
     /// through the variable.
     pub default_level: Option<String>,
+    /// Every effort name the variable takes as it is, aliases included -
+    /// Qwen3.8 takes `high` and renders it as `xhigh`, Inkling 2 takes all
+    /// seven wire names (its five rungs, `xhigh` as `max`'s alias, and `none`
+    /// as an effort of 0.0 - which its card says still reasons, so it is the
+    /// bottom of the dial, not an off switch). A request naming one of these
+    /// goes to the template verbatim; only a name it refuses is ranked onto
+    /// `levels`. A ladder that interpolates freely accepts exactly its
+    /// `levels`.
+    pub accepted: Vec<String>,
     /// `enable_thinking` measurably changes what this template renders, so
     /// reasoning can be turned off. Measured, which is the point: the old
     /// dialect list had already been wrong twice (gemma4 and laguna both read
@@ -108,6 +117,7 @@ impl ReasoningCaps {
             kwarg: None,
             levels: Vec::new(),
             default_level: None,
+            accepted: Vec::new(),
             off: false,
             preserve: false,
             source: LadderSource::Template,
@@ -140,6 +150,18 @@ impl ReasoningCaps {
         self.levels
             .get(rank.min(self.levels.len().saturating_sub(1)))
             .map(String::as_str)
+    }
+
+    /// The value a request's `effort` sends: the name itself where the
+    /// template takes it, else its rank clamped onto the rungs. Name first
+    /// because the rank has four steps and a ladder can have more - Inkling
+    /// 2's five rungs put every ranked request one rung low (`high` rendered
+    /// as `medium`).
+    pub fn rung_for(&self, effort: &str, rank: usize) -> Option<&str> {
+        match self.accepted.iter().find(|a| *a == effort) {
+            Some(a) => Some(a.as_str()),
+            None => self.clamp(rank),
+        }
     }
 }
 
@@ -254,10 +276,11 @@ pub fn probe(template: &str, dialect: Dialect) -> ReasoningCaps {
     // The rungs. A validating template has already told us its accepted set -
     // read it. An interpolating one accepts everything, so measurement would
     // invent levels; take the cited ones instead.
-    let (levels, source) = if validating {
-        (measure_levels(&render, kwarg), LadderSource::Template)
+    let (levels, mut accepted, source) = if validating {
+        let (levels, accepted) = measure_levels(&render, kwarg);
+        (levels, accepted, LadderSource::Template)
     } else {
-        match dialect.effort_kwarg() {
+        let (levels, source): (Vec<String>, _) = match dialect.effort_kwarg() {
             // the citation has to be for this variable, or it is a different
             // family's ladder wearing the same name
             Some((cited, ladder)) if cited == kwarg => (
@@ -271,7 +294,10 @@ pub fn probe(template: &str, dialect: Dialect) -> ReasoningCaps {
                     .collect(),
                 LadderSource::Wire,
             ),
-        }
+        };
+        // an interpolating template renders any name; the ones it grades
+        // are its ladder
+        (levels.clone(), levels, source)
     };
     if levels.is_empty() {
         return ReasoningCaps {
@@ -289,10 +315,20 @@ pub fn probe(template: &str, dialect: Dialect) -> ReasoningCaps {
         .find(|l| render(kwarg, l).as_deref().ok() == Some(base.as_str()))
         .cloned();
 
+    // A validating template that takes the spec's `none` itself (Inkling 2:
+    // an effort of 0.0) gets it verbatim. Not a rung and not `off`: where the
+    // flag turns thinking off, `none` still goes there (chat's merge checks
+    // `off` first), and where it does not, nothing says the variable's
+    // bottom stops the reasoning - Inkling's card says it does not.
+    if validating && render(kwarg, "none").is_ok() {
+        accepted.push("none".to_owned());
+    }
+
     ReasoningCaps {
         kwarg: Some(kwarg),
         levels,
         default_level,
+        accepted,
         off,
         preserve,
         source,
@@ -300,7 +336,8 @@ pub fn probe(template: &str, dialect: Dialect) -> ReasoningCaps {
 }
 
 /// Read a validating template's accepted set: render every candidate, drop the
-/// ones it refuses, and collapse aliases.
+/// ones it refuses, and collapse aliases. Returns the rungs and every name
+/// the template took (aliases included).
 ///
 /// Two candidates that render IDENTICALLY are one rung wearing two names -
 /// Qwen3.8 rewrites `high` to `xhigh` before it does anything with it. The
@@ -310,19 +347,21 @@ pub fn probe(template: &str, dialect: Dialect) -> ReasoningCaps {
 fn measure_levels(
     render: &impl Fn(&str, &str) -> Result<String, String>,
     kwarg: &str,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<String>) {
     let mut rungs: Vec<(String, String)> = Vec::new(); // (rendered, name)
+    let mut accepted = Vec::new();
     for cand in CANDIDATES {
         let Ok(out) = render(kwarg, cand) else {
             continue;
         };
+        accepted.push(cand.to_owned());
         match rungs.iter_mut().find(|(seen, _)| *seen == out) {
             // CANDIDATES ascends, so a later match is the higher-ranked name
             Some(slot) => slot.1 = cand.to_owned(),
             None => rungs.push((out, cand.to_owned())),
         }
     }
-    rungs.into_iter().map(|(_, name)| name).collect()
+    (rungs.into_iter().map(|(_, name)| name).collect(), accepted)
 }
 
 /// The reasoning-stop policy for a request whose render opened a think block
@@ -385,6 +424,7 @@ mod tests {
     const GEMMA4: &str = include_str!("../tests/fixtures/gemma4_chat_template.jinja");
     const LAGUNA: &str = include_str!("../tests/fixtures/laguna_chat_template.jinja");
     const GRANITE: &str = include_str!("../tests/fixtures/granite_chat_template.jinja");
+    const INKLING2: &str = include_str!("../tests/fixtures/inkling2_chat_template.jinja");
 
     #[test]
     fn qwen38_grades_low_medium_xhigh_and_defaults_to_xhigh() {
@@ -407,6 +447,42 @@ mod tests {
         let c = probe(QWEN38, Dialect::QwenXml);
         assert!(!c.levels.contains(&"high".to_owned()));
         assert_eq!(c.levels.len(), 3);
+    }
+
+    #[test]
+    fn inkling2_takes_every_wire_name_and_its_own_none() {
+        let c = probe(INKLING2, Dialect::Inkling);
+        assert_eq!(c.kwarg, Some("reasoning_effort"));
+        // effort 0.1 / 0.2 / 0.7 / 0.9 / 0.99, xhigh being max's alias
+        assert_eq!(c.levels, ["minimal", "low", "medium", "high", "max"]);
+        // the template's unset effort is 0.9
+        assert_eq!(c.default_level.as_deref(), Some("high"));
+        // no enable_thinking, and its card: the lowest effort "does not fully
+        // disable reasoning" - so no off switch to draw
+        assert!(!c.off);
+        assert_eq!(c.style(), "effort");
+        // five rungs are more than the rank's four steps: every name must
+        // reach the template as itself, or `high` renders as `medium`
+        for (name, level) in [
+            ("none", "0"),
+            ("minimal", "0.1"),
+            ("low", "0.2"),
+            ("medium", "0.7"),
+            ("high", "0.9"),
+            ("xhigh", "0.99"),
+            ("max", "0.99"),
+        ] {
+            let kw = crate::chat::merge_reasoning_effort(&c, name, None)
+                .expect("valid")
+                .expect("kwargs");
+            assert_eq!(kw["reasoning_effort"], name, "{name}");
+            assert!(kw.get("enable_thinking").is_none(), "{name}");
+            let out = probe_render(INKLING2, kw).expect("renders");
+            assert!(
+                out.contains(&format!("Thinking effort level: {level}<")),
+                "{name}: {out}"
+            );
+        }
     }
 
     #[test]

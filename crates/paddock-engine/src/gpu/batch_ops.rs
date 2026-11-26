@@ -917,6 +917,50 @@ impl GpuExecutor {
         })
     }
 
+    /// Slot 1007 is here.
+    pub fn has_rmsnorm_batch_bf16(&self) -> bool {
+        self.kernels.rmsnorm_batch_bf16.is_some()
+    }
+
+    /// [`Self::rmsnorm_batch_at`] with the rows rounded to bf16 into `out16`
+    /// (slot 1007): `convert_f32_bf16` of its f32 output, bit for bit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_batch_bf16_at(
+        &self,
+        x: &CudaSlice<f32>,
+        x_off: usize,
+        w: &CudaSlice<f32>,
+        out16: &mut CudaSlice<half::bf16>,
+        n: usize,
+        eps: f32,
+        batch: usize,
+    ) -> Result<(), GpuError> {
+        let f = self
+            .kernels
+            .rmsnorm_batch_bf16
+            .ok_or(GpuError::MissingOp("rmsnorm_batch_bf16"))?;
+        if x.len() < x_off + batch * n || w.len() < n || out16.len() < batch * n {
+            return Err(GpuError::Unsupported(format!(
+                "rmsnorm_batch_bf16: {batch} rows of {n} past a plane"
+            )));
+        }
+        let (xp, _g1) = x.device_ptr(&self.stream);
+        let (wp, _g2) = w.device_ptr(&self.stream);
+        let (op, _g3) = out16.device_ptr_mut(&self.stream);
+        // SAFETY: ABI contract (slot 1007); planes checked above
+        check(unsafe {
+            f(
+                (xp + (x_off * 4) as u64) as *const _,
+                wp as *const _,
+                op as *mut _,
+                n as u32,
+                eps,
+                batch as u32,
+                self.stream_ptr(),
+            )
+        })
+    }
+
     /// Batched YaRN rope in place over `x` [batch, n_heads*head_dim], each
     /// sequence rotated at its own `positions[b]`.
     #[allow(clippy::too_many_arguments)]

@@ -2563,6 +2563,13 @@ fn load_hf_dir(
                 .map_err(|e| ServeError::Open(dir.to_path_buf(), e))?;
             "ripple".to_owned()
         }
+        // Thinking Machines' Inkling 2 Mini: the official release (routed
+        // experts NVFP4 / MXFP8, the rest BF16), CUDA only
+        "inkling2_loop" => {
+            paddock_models::inkling2::Inkling2Config::read(dir)
+                .map_err(|e| ServeError::Open(dir.to_path_buf(), e))?;
+            "inkling2".to_owned()
+        }
         "diffusion_gemma" if device == "metal" => {
             paddock_models::mlx::DiffusionConfig::read(dir)
                 .map_err(|e| ServeError::Open(dir.to_path_buf(), e))?;
@@ -2725,8 +2732,15 @@ fn load_hf_dir(
     }
     // Super VL's tower ships inside the checkpoint (CUDA only, gated above)
     let super_vl = model_type == "nemotron_h_omni";
+    // so does Inkling 2's (`vision_config`); the engine loads it unless
+    // `vision = false`, which the request side answers through `vision_off`
+    let inkling_vision = arch == "inkling2"
+        && device != "metal"
+        && paddock_models::inkling2::Inkling2Config::read(dir)
+            .is_ok_and(|c| c.value().get("vision_config").is_some());
     let supports_vision = nemotron_parse
         || super_vl
+        || inkling_vision
         || device == "metal"
             && (splash
                 || bonsai
@@ -2737,6 +2751,10 @@ fn load_hf_dir(
     } else if super_vl {
         // the template's bare `<image>`; the engine wraps it in <img>..</img>
         tokenizer.token_to_id("<image>")
+    } else if inkling_vision {
+        // one per picture in the render; the engine expands it a cell at a
+        // time
+        tokenizer.token_to_id("<|unused_200054|>")
     } else if supports_vision {
         tokenizer.token_to_id(if splash || bonsai || small_mlx_vision {
             "<|image_pad|>"
@@ -3446,6 +3464,20 @@ fn build_generator(
                 if let Some(dp) = mtp {
                     model.attach_dflash2(dp).map_err(|e| e.to_string())?;
                 }
+                Ok(Box::new(model) as Box<dyn Generator>)
+            }
+            "inkling2" => {
+                // fp8 e4m3 K / V unless the config asks for f16
+                let mut kv = paddock_engine::gpu::KvDtype::Fp8E4m3;
+                apply_kv_dtype(|d| kv = d);
+                // 4096-row prompt chunks: the experts stream a visit's 573 MB
+                // of planes once a chunk, so twice the rows halve that a token
+                // (GB10, 22.5K prompt: 7.26 -> 6.93 s) for 1.4 GiB more of
+                // rings and scratch at 32K x 4
+                let model = paddock_engine::gpu_model::inkling2::GpuInkling2::load(
+                    exec, path, max_ctx, 4096, kv as u32,
+                )
+                .map_err(|e| e.to_string())?;
                 Ok(Box::new(model) as Box<dyn Generator>)
             }
             "nemotron-parse" => {

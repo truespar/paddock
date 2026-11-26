@@ -39,6 +39,7 @@ mod gemma_tools;
 pub mod generation_residency;
 pub mod harmony;
 pub mod images;
+pub mod inkling;
 pub mod language;
 pub mod lighton_ocr;
 pub mod mask_sessions;
@@ -1051,6 +1052,12 @@ pub async fn run(
             if spec_off {
                 unsafe { std::env::set_var("PADDOCK_NO_SPEC", "1") };
             }
+            // `vision = false` on a checkpoint whose tower ships inside it
+            // (Inkling 2): the engine leaves the tower and its workspace
+            // unloaded, which is the memory the manager stopped pricing
+            if cfg.vision == Some(false) {
+                unsafe { std::env::set_var("PADDOCK_NO_VISION", "1") };
+            }
             // spec "off" documents "no drafter loaded" - honor it. Loading
             // anyway is not inert: attach_mtp trades the nospec F8CUT lane
             // away process-wide (set_f8cut_spec_off) and pays the drafter's
@@ -1103,6 +1110,13 @@ pub async fn run(
                 resident_options,
             )?;
             m.vision_off = cfg.vision == Some(false);
+            // a tower inside the checkpoint (Inkling 2) is switched off by
+            // the engine, not by leaving a companion out, so the serving
+            // flag has to follow the switch here: /v1/models and the refusal
+            // then say what the operator chose
+            if m.vision_off {
+                m.supports_vision = false;
+            }
             // `audio = false` on Gemma 4 12B: its one mmproj holds both
             // embedders, so the switch closes the clip surface (the 5 MB
             // projection stays resident) instead of leaving a file out

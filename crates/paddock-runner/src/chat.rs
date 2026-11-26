@@ -281,6 +281,11 @@ pub(crate) fn think_budget(
     let close = match model.dialect {
         Dialect::QwenXml | Dialect::Laguna => "</think>",
         Dialect::GemmaChannel => crate::parsers::G_CLOSE,
+        // Inkling 2 opens its own thinking part (`<|message_model|>
+        // <|content_thinking|>`, its first tokens - its card: even the lowest
+        // effort reasons) and the part's `<|end_message|>` closes it; the
+        // first one a reply writes is that close
+        Dialect::Inkling => "<|end_message|>",
         // Harmony and muse reason in channel structures whose exit is a
         // multi-token header interleaved with stop semantics - an injected
         // close needs its own recipe there, not this one. Honest refusal
@@ -292,7 +297,8 @@ pub(crate) fn think_budget(
             ));
         }
     };
-    if !thinking_open {
+    // the prompt opens the think block - or the model always opens its own
+    if !thinking_open && model.dialect != Dialect::Inkling {
         return Err(format!(
             "{knob} was sent but thinking is not enabled on this request \
              (the rendered prompt does not open a think block)"
@@ -1024,6 +1030,11 @@ pub(crate) fn parse_logit_bias(
 ///   differently from `low` would be exactly the plausible-but-wrong behavior
 ///   this project bans; what it can answer is the question a client asks with
 ///   `none`.
+/// - **A ladder that spells all seven names itself** (Inkling 2: five rungs,
+///   `none` an effort of 0.0 that still reasons, no `enable_thinking`).
+///   Every name the template takes goes to it verbatim - the ranked clamp is
+///   only for names a template refuses, and it has four steps where this
+///   ladder has five.
 ///
 /// The vocabulary is validated on every path, so an invalid level is a 400 even
 /// where the value then collapses.
@@ -1047,9 +1058,10 @@ pub(crate) fn merge_reasoning_effort(
     let (key, value): (&str, serde_json::Value) = if effort == "none" && caps.off {
         ("enable_thinking", serde_json::json!(false))
     } else if let Some(kw) = caps.kwarg {
-        // `clamp` cannot be None here: a model with a kwarg has rungs
+        // `rung_for` cannot be None here: a model with a kwarg has rungs. A
+        // template that spells `none` itself takes it here, verbatim
         let rung = caps
-            .clamp(rank)
+            .rung_for(effort, rank)
             .ok_or("this model grades reasoning effort but publishes no levels")?;
         (kw, serde_json::json!(rung))
     } else {
@@ -2920,6 +2932,7 @@ mod tests {
                 .map(|s| (*s).to_owned())
                 .collect(),
             default_level: Some("medium".to_owned()),
+            accepted: Vec::new(),
             off: false,
             preserve: false,
             source: crate::reasoning::LadderSource::Card,
@@ -2948,6 +2961,7 @@ mod tests {
             kwarg,
             levels: levels.iter().map(|s| (*s).to_owned()).collect(),
             default_level: levels.last().map(|s| (*s).to_owned()),
+            accepted: levels.iter().map(|s| (*s).to_owned()).collect(),
             off,
             preserve: false,
             source: crate::reasoning::LadderSource::Template,

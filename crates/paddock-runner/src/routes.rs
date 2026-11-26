@@ -925,6 +925,9 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
                         s.tokenizer.token_to_id("</think>").is_some(),
                     crate::parsers::Dialect::GemmaChannel =>
                         s.tokenizer.token_to_id(crate::parsers::G_CLOSE).is_some(),
+                    crate::parsers::Dialect::Inkling => {
+                        s.tokenizer.token_to_id("<|end_message|>").is_some()
+                    }
                     _ => false,
                 }
         }),
@@ -1448,6 +1451,9 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Response {
                         s.tokenizer.token_to_id("</think>").is_some(),
                     crate::parsers::Dialect::GemmaChannel =>
                         s.tokenizer.token_to_id(crate::parsers::G_CLOSE).is_some(),
+                    crate::parsers::Dialect::Inkling => {
+                        s.tokenizer.token_to_id("<|end_message|>").is_some()
+                    }
                     _ => false,
                 }
         );

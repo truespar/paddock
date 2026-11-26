@@ -89,6 +89,12 @@ pub enum Dialect {
     /// format. The marker pair `<function name="` + `<param name="` is the
     /// same test llama.cpp's chat layer applies.
     MiniCpmXml,
+    /// Inkling 2's parts: the turn is a run of
+    /// `<|message_model|>[NAME]<|content_KIND|>BODY<|end_message|>` messages -
+    /// `thinking` is reasoning, `text` the answer, `invoke_tool_json` a call
+    /// whose body is the whole `{"name", "args"}` object. Every marker is a
+    /// single special token; see `crate::inkling`.
+    Inkling,
     /// No known structure: the whole text is content.
     Plain,
     /// Transcript text is not chat framing. Preserve generated whitespace
@@ -114,6 +120,7 @@ impl Dialect {
             // Ripple's template: Hermes JSON calls in `<tool_call>` and a
             // `<think>` block the model opens itself
             "kolibri1" | "ripple" => Dialect::JsonThinking,
+            "inkling2" => Dialect::Inkling,
             _ => Dialect::Plain,
         }
     }
@@ -215,8 +222,10 @@ impl Dialect {
             Dialect::Laguna => prompt.ends_with("<think>"),
             Dialect::JsonThinking => prompt.trim_end().ends_with("<think>"),
             // granite 4.1's template has no thinking region to open - say so
-            // rather than leaning on a `<think>\n` probe that can't match
-            Dialect::JsonToolCall | Dialect::Transcript => false,
+            // rather than leaning on a `<think>\n` probe that can't match;
+            // Inkling's prompt ends at a closed message, the model opens its
+            // own thinking part
+            Dialect::JsonToolCall | Dialect::Transcript | Dialect::Inkling => false,
             // muse-glimmer's generation prompt is a bare `<|start|>assistant`
             // and the model types its own ` to=self<|message|>` - Unless the
             // render pre-opened it (crate::muse::PREOPEN, the g4_preopen
@@ -477,6 +486,7 @@ pub fn parse(
         Dialect::GemmaChannel => gemma_parse(text, thinking_open, hints),
         Dialect::Laguna => laguna_parse(text, thinking_open, hints),
         Dialect::MuseChannel => crate::muse::parse(text, thinking_open, hints),
+        Dialect::Inkling => crate::inkling::parse(text, hints),
         Dialect::JsonToolCall => json_tool_parse(text, hints),
         Dialect::JsonThinking => {
             let split = qwen_parse(text, thinking_open, None);

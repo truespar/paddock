@@ -1348,10 +1348,35 @@ mod tests {
         let reg = Registry::new(std::path::PathBuf::from("./this-dir-does-not-exist"));
         let mut priced = 0;
         for m in &reg.catalog().models {
-            // every tower switched on
-            let tower = super::towers_bytes_for(m, &reg, None, true, Some(true));
-            let has_vision = m.artifacts.iter().any(|a| a.kind == ArtifactKind::Vision);
-            let has_audio = m.artifacts.iter().any(|a| a.kind == ArtifactKind::Audio);
+            // every tower switched on - the companions, and the towers a
+            // weights artifact switches inside its checkpoint (priced with
+            // that artifact selected)
+            let tower = m
+                .weights()
+                .filter(|a| a.runtime.optional_towers.is_some())
+                .map(|a| super::towers_bytes_for(m, &reg, Some(a), true, Some(true)))
+                .fold(
+                    super::towers_bytes_for(m, &reg, None, true, Some(true)),
+                    u64::max,
+                );
+            // a tower is an mmproj artifact, or one a weights artifact carries
+            // inside its checkpoint behind a switch (`optional_towers`:
+            // Inkling 2's picture tower) - priced the same, labelled the same
+            let optional = |audio: bool| {
+                m.weights().any(|a| {
+                    a.runtime.optional_towers.as_ref().is_some_and(|t| {
+                        if audio {
+                            t.audio.is_some()
+                        } else {
+                            t.vision.is_some()
+                        }
+                    })
+                })
+            };
+            let has_vision =
+                m.artifacts.iter().any(|a| a.kind == ArtifactKind::Vision) || optional(false);
+            let has_audio =
+                m.artifacts.iter().any(|a| a.kind == ArtifactKind::Audio) || optional(true);
             let has_tower = has_vision || has_audio;
             // A weights artifact can carry its tower inside the checkpoint
             // (Nemotron 3.5 Parse on CUDA): no tower file to charge - its bytes

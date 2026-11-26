@@ -189,6 +189,19 @@ pub fn elected(arch: &str) -> Option<Elected> {
             source: "ricursiveAI/Ripple-65B-Preview generation_config.json and the \
                      Ripple-65B-Preview-NVFP4 card (temperature 1.0, top_p 0.95)",
         },
+        // Inkling 2 Mini's generation_config.json: do_sample with temperature
+        // 1.0 and nothing else - no top-p, no top-k. Reasoning is graded by the
+        // template's thinking-effort line, not a separate instruct row.
+        "inkling2" => Elected {
+            thinking: Knobs {
+                temperature: 1.0,
+                top_k: 0,
+                top_p: 1.0,
+                min_p: 0.0,
+            },
+            instruct: None,
+            source: "thinkingmachines/Inkling-2-Mini generation_config.json (do_sample, temperature 1.0)",
+        },
         "kolibri1" => Elected {
             thinking: Knobs {
                 temperature: 1.0,

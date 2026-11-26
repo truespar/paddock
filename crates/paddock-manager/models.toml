@@ -12449,3 +12449,205 @@ revision = "2026-11-22"
     dest = "Ripple-65B-Preview-DFlash2/config.json"
     sha256 = "868841f16379f34f97e8a17575c6a9f1f4cab4eae214e6d947e2641c38962171"
     size = 1348
+
+# Thinking Machines' Inkling 2 Mini, the official release (one build, no
+# BF16 original published): the routed experts NVFP4 in layers 0-19 and
+# MXFP8 in 20-23, attention, loop controllers, embeddings and head BF16, and
+# the DSpark draft model beside them (mtp.safetensors) - 20.2 GB. CUDA serves
+# the checkpoint's own bytes: experts W4A4 / MXFP8 on block-scaled tensor
+# cores for prompt rows and verify rounds, the e2m1 GEMVs at decode, fp8 KV,
+# DSpark drafts rolled back exactly. Teacher-forced against vLLM on this
+# checkpoint: 95.8-96.2% top-1, inside the 95.8-96.3% band the reference
+# implementations reach against each other (the looped model is chaotic at its
+# own noise). Its picture tower against transformers' own in float64: 15x
+# closer than the reference's bfloat16, a picture's rows the same whatever
+# shares its pass; picture prompts teacher-forced against the reference model
+# 95.1% top-1. Mirrored under models/Inkling-2-Mini/ - the weights and their
+# index, the draft model, configs, both tokenizer files, chat template and
+# card, every byte matching revision c9d02830's LFS ids and git blobs (the
+# repo's .eval_results/ and .gitattributes are left out). The release ships
+# no LICENSE file and declares Apache-2.0 on its card, so the Apache-2.0 text
+# rides beside it.
+[[model]]
+id = "inkling-2-mini"
+# KV8 by default, the class every gate passed in
+kv_default = "fp8_e4m3"
+# the DSpark draft ships in the checkpoint directory (mtp.safetensors) and
+# loads with it
+mtp_in_file = true
+vendor = "Thinking Machines"
+display = "Inkling 2 Mini"
+family = "inkling-2"
+capability = ["chat", "vision", "tools", "reasoning", "speculative"]
+license = "apache-2.0"
+revision = "2026-11-25"
+
+  [model.specs]
+  params = "26.4B total, 5.4B active"
+  context = "1M native; 256K default on CUDA"
+  published_at = "2026-11-20"
+  published_source = "https://huggingface.co/thinkingmachines/Inkling-2-Mini"
+  homepage = "https://huggingface.co/thinkingmachines/Inkling-2-Mini"
+  about = "Thinking Machines' first open model - a looped mixture-of-experts that runs its middle layers three times over, built for agents, tool use, coding and chat, reads pictures and screenshots at their own resolution, with a graded thinking effort."
+  strengths = [
+    "Agentic work: tool calls (several at once), coding, long multi-step tasks",
+    "Reads pictures and screenshots without shrinking them - one token a 40 x 40 pixel cell",
+    "Thinking effort from minimal to max - pick how long it reasons",
+    "Its own draft model speculates for it - single chats decode faster than the model alone",
+  ]
+  tradeoffs = [
+    "Needs a Blackwell card (NVFP4) and about 20 GB of weights",
+    "Can get stuck re-checking its own work in long reasoning - set output and turn limits",
+    "Even its lowest thinking effort still reasons; it cannot be switched off",
+  ]
+
+  [[model.artifact]]
+  id = "nvfp4"
+  kind = "weights"
+  format = "safetensors"
+  label = "NVFP4 (Blackwell)"
+  quant = "NVFP4"
+  default = true
+  # sm_120a or better: the block-scaled fp4 / fp8 expert GEMMs and the e2m1
+  # decode GEMVs compile under PD_BS_OK.
+  min_cc = [12, 0]
+  # The engine's own ledger serving the registry pull at 262144 x 4 on GB10
+  # (2026-11-25): 46.69 GB after enable_batch, warm-up 0 beyond plan, less
+  # the weights below and the KV the shape prices (the 21.47 GB pool, the
+  # 2.95 GB of sliding rings) = 2.63 GB - the 4096-row prompt scratch, the
+  # draft's round planes, and each slot's conv states and feature ring
+  # (18.5 MB a slot, here at four) - plus the prefix cache's checkpoint pool,
+  # 1,537,740,800 bytes (16 checkpoints of every visit's conv rows and the
+  # sliding visits' and the draft's 1024-row windows; flat past four slots).
+  workspace = 4180000000
+
+  [model.artifact.source]
+  repo = "thinkingmachines/Inkling-2-Mini"
+  base_model = "thinkingmachines/Inkling-2-Mini"
+  revision = "c9d028302cd0f035fdf8e7e91f089a4ce94d2195"
+  license = "apache-2.0"
+  license_url = "https://www.apache.org/licenses/LICENSE-2.0"
+
+  [model.artifact.runtime]
+  backends = ["cuda"]
+  checkpoint_dir = true
+  companions = []
+  # 256K for four sessions, fitted at admission: a 20 GiB pool, 71 GiB of
+  # the box free once warm. Retrieval checked on the registry pull at 131K
+  # and 257K prompt tokens (exact; 257K TTFT 160 s).
+  default_max_ctx = 262144
+  default_max_batch = 4
+
+  # The picture tower ships inside the checkpoint (`model.visual.*`, bf16,
+  # held as f16 planes) and loads unless `vision = false`: measured at load
+  # 1,914,435,584 bytes - the planes, and the pass workspace sized for the
+  # largest picture this lane takes (8192 tokens + its class row, 32769
+  # rows). A queued picture's language-model rows (9 KB a token) ride
+  # beside it until its prompt lands.
+  [model.artifact.runtime.optional_towers.vision]
+  weight_bytes = 639336448
+  workspace_bytes = 1275099136
+  default = true
+
+  # weight_bytes is the device-resident count, the DSpark draft's planes
+  # (nextn_bytes: its bf16 layers + the Markov head folded through the LM
+  # head) included. KV: 8 full-attention visits in the paged pool, plus the
+  # draft's full layer at bf16 = two more at the fp8 element size; the 40
+  # sliding visits keep per-slot rings of next_pow2(1024 + the 4096-row
+  # prompt chunk) = 8192 rows, and the draft's two sliding layers ride rings
+  # of the same depth at bf16 = four more.
+  [model.artifact.shape]
+  weight_bytes = 19627888948
+  kind = "generative"
+  vocab = 201024
+  max_ctx = 1048576
+  nextn_bytes = 737476916
+  source = "measured"
+  kv_layers = [
+    { k_dim = 1024, v_dim = 1024, count = 10 },
+    { k_dim = 1024, v_dim = 1024, window = 8192, count = 44 },
+  ]
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Inkling-2-Mini/model-00001-of-00001.safetensors"
+    dest = "Inkling-2-Mini/model-00001-of-00001.safetensors"
+    sha256 = "65e60f51aa1284d4fb022584908c315270334d991828bb774af60584523539d1"
+    size = 19526019168
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Inkling-2-Mini/LICENSE"
+    dest = "Inkling-2-Mini/LICENSE"
+    sha256 = "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    size = 11358
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Inkling-2-Mini/README.md"
+    dest = "Inkling-2-Mini/README.md"
+    sha256 = "ab4fbc79a26f57a4160eae83ff33f7ec5442f4a6cae21478fdda36b4a0c13592"
+    size = 54898
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Inkling-2-Mini/chat_template.jinja"
+    dest = "Inkling-2-Mini/chat_template.jinja"
+    sha256 = "53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc"
+    size = 6868
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Inkling-2-Mini/config.json"
+    dest = "Inkling-2-Mini/config.json"
+    sha256 = "a7a349601f0984c4abf999c480ef775d8567d21f5f84b4e8a3e035b44f288dc2"
+    size = 2722
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Inkling-2-Mini/generation_config.json"
+    dest = "Inkling-2-Mini/generation_config.json"
+    sha256 = "a08737c07a65a8fdf69f7cf086576210e5aad4b241437090b26d7b0c4f7905f7"
+    size = 98
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Inkling-2-Mini/hf_quant_config.json"
+    dest = "Inkling-2-Mini/hf_quant_config.json"
+    sha256 = "7c656207d3ce37879c7be209a036b0dde43bf01f78159bff06880b868ed57143"
+    size = 67924
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Inkling-2-Mini/model.safetensors.index.json"
+    dest = "Inkling-2-Mini/model.safetensors.index.json"
+    sha256 = "c1631065b7b00787993522dddc66a68b3abee869192977fb3dcb796e63bc5838"
+    size = 109300
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Inkling-2-Mini/mtp.safetensors"
+    dest = "Inkling-2-Mini/mtp.safetensors"
+    sha256 = "7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2"
+    size = 635801416
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Inkling-2-Mini/processor_config.json"
+    dest = "Inkling-2-Mini/processor_config.json"
+    sha256 = "d7350adce18c8be4b607f261c8f0f7eabbf720bb7aaf648a43d4f8372bbacc2d"
+    size = 461
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Inkling-2-Mini/special_tokens_map.json"
+    dest = "Inkling-2-Mini/special_tokens_map.json"
+    sha256 = "c16f44b3594563d82743ddb0417a2be1bfe3e2000dfad2da4b8f32554593e1a0"
+    size = 529
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Inkling-2-Mini/tiktoken/tokenizer.model"
+    dest = "Inkling-2-Mini/tiktoken/tokenizer.model"
+    sha256 = "f170372dd655728909228220d77cf6b8104a59f38a91262a7d2c4027906ec0d8"
+    size = 3386494
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Inkling-2-Mini/tokenizer.json"
+    dest = "Inkling-2-Mini/tokenizer.json"
+    sha256 = "7f332727f9a3f093dd452a39cc978e6757627e5dad1b0673aa4e75174f236dd6"
+    size = 26178678
+
+    [[model.artifact.file]]
+    url = "https://models.truespar.io/models/Inkling-2-Mini/tokenizer_config.json"
+    dest = "Inkling-2-Mini/tokenizer_config.json"
+    sha256 = "bf09342d285139fd37ce10c70878af1d52cb390e9901e10248654293a80ee636"
+    size = 13235

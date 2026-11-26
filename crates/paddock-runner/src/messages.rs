@@ -614,6 +614,14 @@ fn render_prompt(
     // means or on which models can be graded at all.
     if let Some(e) = effort {
         kwargs = crate::chat::merge_reasoning_effort(&model.reasoning, e, kwargs)?;
+    } else if !enabled
+        && !model.reasoning.off
+        && model.reasoning.accepted.iter().any(|a| a == "none")
+    {
+        // no off switch, but a dial that spells `none` (Inkling 2: an effort
+        // of 0.0 - its card says it still reasons): thinking off is the least
+        // reasoning the model offers, not its published default
+        kwargs = crate::chat::merge_reasoning_effort(&model.reasoning, "none", kwargs)?;
     }
     let kwargs = model.template_defaults(kwargs);
 
